@@ -418,6 +418,8 @@ class StructureDetector:
                 continue
             if self._looks_like_inline_date_fragment(text, match):
                 continue
+            if self._looks_like_inline_paragraph_item_reference(text, match):
+                continue
             starts.append(match.start())
         if not starts:
             return [text]
@@ -441,6 +443,27 @@ class StructureDetector:
         if re.match(r"\s*제\s*\d+\s*(?:항|호)", after):
             return True
         if re.match(r"\s*\([^)]{1,80}\)\s*(?:의|에|에서|으로|로|을|를|은|는|과|와|및|관련|따라|중)", after):
+            return True
+        if re.search(r"(?:따라|관련|준용|의한다|정한다|개정|삭제|신설|변경|중)\s*$", before):
+            return True
+        return False
+
+    def _looks_like_inline_paragraph_item_reference(self, text: str, match: re.Match[str]) -> bool:
+        """Treat a 제N항/제N호 marker as a cross-reference, not a new node.
+
+        Genuine flattened enumeration items follow a clause end or plain prose
+        ("... 같다. 제1호 본부"), whereas a citation follows another 조/항/호
+        marker or a reference-list connector ("제5조 제1항", "제5호 및 제6호",
+        "종전의 제6호").  Only the citation forms are suppressed here; the split
+        pattern already ignores the particle form ("제1항의").
+        """
+
+        if not re.match(r"제\s*\d+\s*(?:항|호)", match.group(0)):
+            return False
+        before = text[: match.start()].rstrip()
+        if re.search(r"제\s*\d+\s*(?:조|항|호)$", before):
+            return True
+        if re.search(r"(?:및|또는|내지|과|와|·|ㆍ|각각|종전의)$", before):
             return True
         if re.search(r"(?:따라|관련|준용|의한다|정한다|개정|삭제|신설|변경|중)\s*$", before):
             return True
