@@ -29,6 +29,27 @@ def parsed_fixture() -> ParsedDocument:
 
 
 class ChunkerTests(unittest.TestCase):
+    def test_split_node_splits_paragraph_symbols_beyond_fifteen(self) -> None:
+        # An oversized article was split at circled paragraph markers ①–⑮ only,
+        # so ⑯–⑳ were lumped into the ⑮ chunk even though structure detection
+        # recognizes ①–㉚.  Each paragraph should become its own chunk.
+        symbols = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+        body = "가" * 100
+        text = "\n".join(f"{symbol} {body}" for symbol in symbols)
+        node = StructureNode(
+            node_id="n1",
+            document_id="doc_split",
+            order_index=0,
+            node_type="article",
+            title="제1조",
+            text=text,
+        )
+
+        parts = Chunker()._split_node(node, ChunkOptions(include_context_header=False))
+
+        self.assertEqual(len(symbols), len(parts))
+        self.assertEqual(list(symbols), [part[0] for part in parts])
+
     def test_reports_each_regulation_while_chunking_integrated_book(self) -> None:
         parsed = ParsedDocument(
             document_id="doc_integrated",
