@@ -1536,7 +1536,10 @@ def _candidate_references_any_label(record: dict[str, Any], labels: set[str]) ->
         " ".join(str(value or "") for value in (record.get("text"), metadata.get("retrieval_text")))
     )
     for label in sorted(labels):
-        if label and label in compact_text:
+        # Bounded match: labels are space-stripped, so a plain substring test
+        # treats "별표2" as a prefix of "별표21".  Require the label not be
+        # followed by another digit so numbered siblings don't collide.
+        if label and re.search(re.escape(label) + r"(?!\d)", compact_text):
             return label
     return ""
 
