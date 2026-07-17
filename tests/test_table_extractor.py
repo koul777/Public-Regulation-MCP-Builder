@@ -62,6 +62,15 @@ class TableExtractorTests(unittest.TestCase):
         self.assertIn("table_cell_rows", analysis)
         self.assertIn("181,425.08", analysis["table_cell_rows"][1]["raw"])
 
+    def test_performance_grade_table_survives_without_headcount_row(self) -> None:
+        rows = ["등 급", "S", "A", "B", "지급률", "134%", "115%", "100%"]
+
+        cell_rows = TableExtractor().extract_cell_rows(rows, "appendix")
+
+        cells = [row["cells"] for row in cell_rows]
+        self.assertIn(["등급", "S", "A", "B"], cells)
+        self.assertIn(["지급률", "134%", "115%", "100%"], cells)
+
     def test_does_not_structure_appendix_title_or_revision_history_as_table_rows(self) -> None:
         rows = [
             "[\ubcc4\ud45c] <\uc2e0\uc124 2018. 4. 24.>",

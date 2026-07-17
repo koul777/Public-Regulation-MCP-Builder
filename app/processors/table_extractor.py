@@ -809,7 +809,7 @@ class TableExtractor:
             item.strip()
             for item in rows[rate_index + 1 : headcount_index]
             if self._percentage_cell(item.strip())
-        ] if headcount_index is not None else []
+        ]
         headcount_values: list[str] = []
         if headcount_index is not None:
             for item in rows[headcount_index + 1 : headcount_index + 1 + len(categories)]:
