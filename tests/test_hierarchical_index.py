@@ -27,6 +27,52 @@ from app.retrieval.hierarchical_index import (
 
 
 class HierarchicalIndexTests(unittest.TestCase):
+    def test_as_of_uses_effective_date_not_inflated_revision_date(self) -> None:
+        # A retroactive amendment is promulgated (revision_date) after it takes
+        # effect (effective_from).  effective_from must stay the real effective
+        # date, not be inflated up to the later revision date, or a point-in-time
+        # query between the two dates wrongly finds the regulation not yet in
+        # force.
+        record = _record(
+            "doc-a",
+            "art-1",
+            regulation_no="4-4-1",
+            regulation_title="복무규정",
+            article_no="제10조",
+            article_title="육아휴직",
+            text="육아휴직 기간은 3년 이내로 한다.",
+            revision_date="2024-03-01",
+        )
+        record["metadata"]["effective_from"] = "2024-01-01"
+        record["content_hash"] = stable_content_hash(record["text"], record["metadata"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, [record])
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="복무규정",
+                regulation_no="4-4-1",
+            )
+            in_force = load_article_records(
+                index_path,
+                vector_path,
+                regulation_unit_id=unit_id,
+                article_no="제10조",
+                as_of_date="2024-02-01",
+            )
+
+        self.assertEqual(1, len(in_force))
+
     def test_logical_corpus_fingerprint_is_stable_across_reupload_ids_and_input_order(self) -> None:
         first_records = [
             _record(
