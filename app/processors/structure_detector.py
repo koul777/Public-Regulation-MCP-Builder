@@ -587,7 +587,7 @@ class StructureDetector:
         refs = self._attachment_refs_in_text(detected.text, container.node_type)
         if not refs:
             return False
-        return any(ref != container_label for ref in refs)
+        return any(ref != container_label and re.search(r"\d", ref) for ref in refs)
 
     def _attachment_refs_in_text(self, text: str, container_type: str) -> list[str]:
         pattern = ATTACHMENT_REF_PATTERNS["form"] if container_type == "form" else ATTACHMENT_REF_PATTERNS["appendix"]
