@@ -1338,11 +1338,12 @@ def transition_regulation_status(
         event["vector_sync"] = vector_sync
         event["outcome"] = "completed" if vector_sync.get("status") != "failed" else "failed_reindex_required"
         repository.append_maintenance_event(event)
+        audit_outcome = "failure" if event["outcome"] == "failed_reindex_required" else "success"
         audit_api_event(
             request_settings,
             auth,
             action="document.regulation.lifecycle",
-            outcome=event["outcome"],
+            outcome=audit_outcome,
             status_code=500 if event["outcome"] == "failed_reindex_required" else 200,
             resource_type="document",
             document_id=document_id,

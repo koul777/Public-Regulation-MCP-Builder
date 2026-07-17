@@ -2728,6 +2728,54 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(reindex["upsert_summary"]["removed_count"], 0)
         self.assertEqual(stored.strip(), "")
 
+    def test_transition_regulation_status_records_valid_audit_outcome_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_lifecycle",
+                    filename="lifecycle.pdf",
+                    document_name="Lifecycle",
+                    file_type="pdf",
+                    file_hash="hash",
+                    profile_id="institution-a",
+                    tenant_id="tenant-a",
+                    regulation_id="reg-1",
+                    regulation_version="v1",
+                    effective_from="2025-01-01",
+                    regulation_status="approved",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc_lifecycle",
+                [],
+                [Chunk(chunk_id="chunk-1", document_id="doc_lifecycle", chunk_type="article", text="body")],
+                [],
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings), patch.object(
+                routes_documents,
+                "_sync_vector_index_after_review_change",
+                return_value={"status": "completed"},
+            ):
+                response = routes_documents.transition_regulation_status(
+                    "doc_lifecycle",
+                    routes_documents.RegulationLifecycleRequest(status="repealed", reason="정기 정비"),
+                    _auth_context(),
+                )
+            rows = [
+                json.loads(line)
+                for line in api_audit_path(settings).read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual("repealed", response["document"]["regulation_status"])
+        lifecycle_rows = [row for row in rows if row["action"] == "document.regulation.lifecycle"]
+        self.assertEqual(1, len(lifecycle_rows))
+        self.assertEqual("success", lifecycle_rows[0]["outcome"])
+
 
 class _RepositoryWithDocument:
     def __init__(self, document: Document):
