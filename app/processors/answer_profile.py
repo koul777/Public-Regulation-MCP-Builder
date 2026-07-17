@@ -153,7 +153,7 @@ def _answer_facts(sentences: list[str]) -> list[dict[str, str]]:
 def _procedure_steps(sentence: str) -> list[str]:
     if not re.search(r"(절차|단계|심사|공고|접수|선정|선발|임용|채용)", sentence):
         return []
-    matches = list(re.finditer(r"(?:^|\s)(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])\s*([^\d①②③④⑤⑥⑦⑧⑨⑩]+?)(?=\s+(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])|$)", sentence))
+    matches = list(re.finditer(r"(?:^|\s)(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])\s*([^①②③④⑤⑥⑦⑧⑨⑩]+?)(?=\s+(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])|$)", sentence))
     steps = [_clean_fact_value(match.group(1)) for match in matches]
     steps = [step for step in steps if step]
     if steps:
