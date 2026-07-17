@@ -58,6 +58,16 @@ class TextNormalizerTests(unittest.TestCase):
         self.assertNotIn("湯湷", normalized)
         self.assertIn("정상 본문", normalized)
 
+    def test_repair_line_breaks_keeps_paragraph_symbols_past_fifteen(self) -> None:
+        text = "⑮ 지급 기준은 별표 3과 같다\n⑯ 이 규정 시행에 필요한 사항은 따로 정한다."
+
+        repaired = TextNormalizer().repair_line_breaks(text)
+
+        self.assertEqual(
+            ["⑮ 지급 기준은 별표 3과 같다", "⑯ 이 규정 시행에 필요한 사항은 따로 정한다."],
+            repaired.splitlines(),
+        )
+
     def test_removes_simple_page_footer_lines(self) -> None:
         text = "제1조(목적) 본문\n- 12 -\n다음 문장"
         normalizer = TextNormalizer()

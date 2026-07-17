@@ -7,7 +7,7 @@ from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 
 HEADING_PREFIX = re.compile(
-    r"^\s*(제\s*\d+\s*(?:편|장|절|관|조)|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]|\(\d+\)|\d+\.|[가-힣][\.\)])"
+    r"^\s*(제\s*\d+\s*(?:편|장|절|관|조)|[①-⑳㉑-㉚]|\(\d+\)|\d+\.|[가-힣][\.\)])"
 )
 PRIVATE_USE_REPEAT = re.compile(r"([\ue000-\uf8ff])\1{2,}")
 HWP_INLINE_ARTIFACT = re.compile(
