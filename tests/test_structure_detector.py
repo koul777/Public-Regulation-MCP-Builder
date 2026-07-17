@@ -642,6 +642,26 @@ class StructureDetectorTests(unittest.TestCase):
             parts,
         )
 
+    def test_inline_spaced_je_hang_je_ho_citations_are_not_split(self) -> None:
+        # A spaced citation ("\uc81c5\uc870 \uc81c1\ud56d \ubc0f \uc81c2\ud56d", "\uc885\uc804\uc758 \uc81c5\ud638 \ubc0f \uc81c6\ud638")
+        # puts the \ud56d/\ud638 marker before a space, so unlike the "\uc81c1\ud56d\uc758" form it
+        # matches the split pattern.  The article marker already has a reference
+        # guard; the \ud56d/\ud638 markers must too, or the host clause is torn apart.
+        detector = StructureDetector()
+
+        self.assertEqual(
+            ["\uc81c1\uc870(\uc608\uc2dc) \uc704\uc6d0\uc7a5\uc740 \uc81c5\uc870 \uc81c1\ud56d \ubc0f \uc81c2\ud56d\uc5d0 \ub530\ub77c \uc9c1\ubb34\ub97c \uc218\ud589\ud55c\ub2e4."],
+            detector._split_inline_structure_lines(
+                "\uc81c1\uc870(\uc608\uc2dc) \uc704\uc6d0\uc7a5\uc740 \uc81c5\uc870 \uc81c1\ud56d \ubc0f \uc81c2\ud56d\uc5d0 \ub530\ub77c \uc9c1\ubb34\ub97c \uc218\ud589\ud55c\ub2e4."
+            ),
+        )
+        self.assertEqual(
+            ["\uc885\uc804\uc758 \uc81c5\ud638 \ubc0f \uc81c6\ud638\ub294 \uac01\uac01 \uc81c6\ud638 \ubc0f \uc81c7\ud638\ub85c \ud55c\ub2e4."],
+            detector._split_inline_structure_lines(
+                "\uc885\uc804\uc758 \uc81c5\ud638 \ubc0f \uc81c6\ud638\ub294 \uac01\uac01 \uc81c6\ud638 \ubc0f \uc81c7\ud638\ub85c \ud55c\ub2e4."
+            ),
+        )
+
     def test_regulation_level_subitems_are_detected_as_nodes(self) -> None:
         text = "\n".join(
             [
