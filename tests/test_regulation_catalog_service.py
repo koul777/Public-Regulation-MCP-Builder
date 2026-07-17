@@ -121,6 +121,53 @@ class RegulationCatalogServiceTests(unittest.TestCase):
 
         self.assertEqual([], [item["document_id"] for item in visible])
 
+    def test_filter_to_latest_active_versions_hides_incomplete_dead_status_records(self) -> None:
+        # Residual hole after the pre-catalog fail-open fix: a repealed or
+        # superseded record that also happens to lack ``version`` or
+        # ``effective_from`` must not fall through the pre-catalog exception as
+        # current evidence, while a genuinely approved pre-catalog record still
+        # does.  Each record sits in its own regulation group with no active
+        # sibling, so ``latest_pair`` is ``None`` and the fail-open branch runs.
+        documents = [
+            {
+                "document_id": "doc-approved-sparse",
+                "metadata": {
+                    "profile_id": "profile-a",
+                    "regulation_id": "reg-approved",
+                    "version": "",
+                    "effective_from": None,
+                    "status": "approved",
+                },
+            },
+            {
+                "document_id": "doc-repealed-sparse",
+                "metadata": {
+                    "profile_id": "profile-a",
+                    "regulation_id": "reg-repealed",
+                    "version": "v1",
+                    "effective_from": None,
+                    "status": "repealed",
+                },
+            },
+            {
+                "document_id": "doc-superseded-sparse",
+                "metadata": {
+                    "profile_id": "profile-a",
+                    "regulation_id": "reg-superseded",
+                    "version": "",
+                    "effective_from": "2020-01-01",
+                    "status": "superseded",
+                },
+            },
+        ]
+
+        visible = filter_to_latest_active_versions(documents, include_legacy=True)
+
+        self.assertEqual(
+            ["doc-approved-sparse"],
+            [item["document_id"] for item in visible],
+        )
+
     def test_read_regulation_metadata_normalizes_legacy_lifecycle_aliases(self) -> None:
         metadata = read_regulation_metadata(
             {
