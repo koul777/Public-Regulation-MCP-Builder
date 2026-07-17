@@ -4,12 +4,25 @@ import unittest
 
 from app.rag.extractive_answer import (
     NO_EVIDENCE_ANSWER,
+    _sentences,
     build_structured_extractive_answer,
     select_supporting_answer_results,
 )
 
 
 class ExtractiveAnswerTests(unittest.TestCase):
+    def test_sentences_preserve_korean_spaced_effective_date(self) -> None:
+        # Official Korean dates are written "YYYY. M. D." with spaces.  The
+        # sentence splitter treats digit-period-space as a boundary, which
+        # shatters the date and drops its year, destroying the effective date.
+        text = "제24조(수당 지급) 이 수당은 2025. 7. 1.부터 월 30만원을 지급한다."
+        sentences = _sentences(text)
+        self.assertTrue(
+            any("2025.7.1.부터 월 30만원을 지급한다" in sentence for sentence in sentences),
+            sentences,
+        )
+        self.assertNotIn("7. 1.부터 월 30만원을 지급한다.", sentences)
+
     def test_aks_lecturer_screening_preserves_governing_article_steps(self) -> None:
         answer = build_structured_extractive_answer(
             "신규채용후보자 심사절차는 단계별로 어떻게 진행되나요?",

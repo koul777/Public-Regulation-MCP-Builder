@@ -223,12 +223,27 @@ def _answer_outline(sentences: list[str], facts: list[dict[str, str]]) -> list[s
     return [sentence for _, _, sentence in sorted(scored)[:5]]
 
 
+_SPACED_NUMERIC_DATE_PATTERN = re.compile(r"(\d{4})\.\s+(\d{1,2})\.\s+(\d{1,2})\.")
+
+
+def _merge_spaced_numeric_dates(text: str) -> str:
+    """Collapse spaces inside official Korean dates ("YYYY. M. D.").
+
+    The digit-period-space boundary in ``_sentences`` otherwise shreds a
+    spaced date into digit fragments.  The 4-digit year anchor leaves genuine
+    list markers untouched.
+    """
+
+    return _SPACED_NUMERIC_DATE_PATTERN.sub(r"\1.\2.\3.", text)
+
+
 def _sentences(text: str) -> list[str]:
     cleaned = str(text or "")
     cleaned = re.sub(r"\[[^\]]+\]", "\n", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return []
+    cleaned = _merge_spaced_numeric_dates(cleaned)
     raw = re.split(r"(?:(?<=[.!?。])\s+|(?=제\s*\d+\s*조\s*\()|(?=\d+\.\s)|(?=[①②③④⑤⑥⑦⑧⑨⑩]))", cleaned)
     sentences: list[str] = []
     for part in raw:
