@@ -806,7 +806,7 @@ def _search_chunk_rows(
         match_query = " OR ".join(f'"{term}"' for term in fts_terms)
         rows = connection.execute(
             f"""
-            SELECT c.*, (1.0 / (1.0 + abs(bm25(chunks_fts, 8.0, 4.0, 6.0, 1.0)))) AS retrieval_score
+            SELECT c.*, (1.0 - (1.0 / (1.0 + abs(bm25(chunks_fts, 8.0, 4.0, 6.0, 1.0))))) AS retrieval_score
             FROM chunks_fts
             JOIN chunks c ON c.rowid=chunks_fts.rowid
             WHERE chunks_fts MATCH ? AND c.version_id IN ({placeholders})

@@ -290,6 +290,56 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertIn("3년", article["articles"][0]["text"])
 
 
+    def test_body_search_ranks_stronger_bm25_match_first(self) -> None:
+        records = [
+            _record(
+                "doc-current",
+                "leave-strong",
+                regulation_no="4-4-1",
+                regulation_title="복무규정",
+                article_no="제10조",
+                article_title="육아휴직",
+                text="육아휴직 육아휴직 육아휴직 육아휴직 육아휴직 육아휴직 육아휴직 육아휴직",
+                revision_date="2026-05-20",
+            ),
+            _record(
+                "doc-current",
+                "leave-weak",
+                regulation_no="4-4-1",
+                regulation_title="복무규정",
+                article_no="제11조",
+                article_title="기타 휴가",
+                text="육아휴직 " + "그 밖의 사항은 따로 정한다. " * 40,
+                revision_date="2026-05-20",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            vector_path = data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = data_dir / "hierarchy" / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            results, _ = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="육아휴직",
+                top_k=2,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(
+            ["leave-strong", "leave-weak"],
+            [record["chunk_id"] for _, record in results],
+        )
+
+
 def _record(
     document_id: str,
     chunk_id: str,
