@@ -61,6 +61,26 @@ class ApiAuditTests(unittest.TestCase):
         self.assertIn("secret.pdf", raw)
         self.assertNotIn(r"C:\Users", raw)
 
+    def test_audit_api_event_records_only_filename_for_posix_upload_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+
+            audit_api_event(
+                settings,
+                auth,
+                action="document.export",
+                outcome="success",
+                status_code=200,
+                resource_type="document",
+                document_id="doc_1",
+                filename="/home/example/Desktop/secret.pdf",
+                export_format="jsonl",
+            )
+            rows = [json.loads(line) for line in api_audit_path(settings).read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(rows[0]["filename"], "secret.pdf")
+
     def test_append_api_audit_record_rejects_unexpected_local_path_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
