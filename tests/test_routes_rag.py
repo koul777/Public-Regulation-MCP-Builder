@@ -35,6 +35,16 @@ class RoutesRagTests(unittest.TestCase):
         routes_rag._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
         routes_rag._RAG_VISIBLE_RECORDS_CACHE.clear()
 
+    def test_candidate_reference_label_does_not_match_longer_numbered_appendix(self) -> None:
+        # Labels normalize by stripping spaces, so "별표2" is a substring of
+        # "별표21".  A chunk that only cites 별표 21 must not be treated as a
+        # reference to 별표 2, while a genuine 별표 2 citation still matches.
+        collides = {"text": "경력은 별표 21에 따라 환산한다.", "metadata": {}}
+        genuine = {"text": "경력은 별표 2에 따라 환산한다.", "metadata": {}}
+
+        self.assertEqual("", routes_rag._candidate_references_any_label(collides, {"별표2"}))
+        self.assertEqual("별표2", routes_rag._candidate_references_any_label(genuine, {"별표2"}))
+
     def test_load_local_vector_record_by_chunk_uses_latest_duplicate_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
