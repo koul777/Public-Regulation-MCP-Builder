@@ -1145,8 +1145,23 @@ def _clean_table_candidate(value: Any) -> str:
     return sentence.strip()
 
 
+_SPACED_NUMERIC_DATE_PATTERN = re.compile(r"(\d{4})\.\s+(\d{1,2})\.\s+(\d{1,2})\.")
+
+
+def _merge_spaced_numeric_dates(text: str) -> str:
+    """Collapse spaces inside official Korean dates ("YYYY. M. D.").
+
+    The sentence splitter treats digit-period-space as a list/sentence
+    boundary, so a spaced date is cut at its month and day and its year is
+    dropped.  Removing the intra-date spaces keeps the date and its clause
+    together.  The 4-digit year anchor leaves genuine list markers untouched.
+    """
+
+    return _SPACED_NUMERIC_DATE_PATTERN.sub(r"\1.\2.\3.", text)
+
+
 def _sentences(text: str) -> list[str]:
-    cleaned = _clean_text(text)
+    cleaned = _merge_spaced_numeric_dates(_clean_text(text))
     if not cleaned:
         return []
     raw_parts = re.split(r"(?:(?<=[.?!。])\s+|\n+|(?=\d+\.\s)|(?=제\d+조(?:의\d+)?\s*\())", cleaned)
