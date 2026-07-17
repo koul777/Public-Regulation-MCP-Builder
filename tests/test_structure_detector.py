@@ -488,6 +488,25 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertIn("[별표 3]의", amendment.text)
         self.assertIn("별지 제2호서식 중", amendment.text)
 
+    def test_bare_self_reference_does_not_close_its_own_appendix(self) -> None:
+        text = "\n".join(
+            [
+                "제5조(별표) 세부사항은 별표와 같다.",
+                "[별표 1]",
+                "평가 기준표",
+                "1. 이 별표에서 정하지 아니한 사항은 위원회가 정한다.",
+                "2. 배점은 100점을 만점으로 한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        appendix = next(node for node in nodes if node.node_type == "appendix")
+        article = next(node for node in nodes if node.node_type == "article")
+
+        self.assertIn("이 별표에서 정하지 아니한 사항은", appendix.text)
+        self.assertIn("배점은 100점을 만점으로 한다.", appendix.text)
+        self.assertNotIn("배점은 100점을 만점으로 한다.", article.text)
+
     def test_bare_appendix_reference_with_chamjo_is_kept_as_prose(self) -> None:
         text = "\n".join(
             [
