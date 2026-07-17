@@ -51,6 +51,19 @@ class Bm25IndexTests(unittest.TestCase):
 
         self.assertEqual(round(single_score * 2, 8), repeated_score)
 
+    def test_repeated_document_term_outranks_single_occurrence(self) -> None:
+        # Both documents tokenize to the same length, so only term frequency
+        # separates them; deduping the body would make the scores identical.
+        records = [
+            _record("doc:many", "병가 병가 병가 출장 출장 교육"),
+            _record("doc:one", "병가 출장 출장 교육 교육 교육"),
+        ]
+        index = Bm25Index.build(records)
+
+        scores = index.score("병가")
+
+        self.assertGreater(scores["doc:many"], scores["doc:one"])
+
     def test_score_uses_the_tokenizer_recorded_in_the_index(self) -> None:
         records = [_record("doc:effective-date", "제44조제2항은 2026년 7월 1일부터 시행한다.")]
         index = Bm25Index.build(records)
