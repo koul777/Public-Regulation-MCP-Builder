@@ -258,7 +258,15 @@ def filter_to_latest_active_versions(
         )
         if latest_pair is None:
             if include_legacy:
-                visible.extend(document for document, _metadata in group)
+                # Keep only genuine pre-catalog records (missing version or
+                # effective start) visible for remediation.  A fully catalogued
+                # group with no active version is inactive (e.g. repealed) and
+                # must not fall open as current evidence.
+                visible.extend(
+                    document
+                    for document, metadata in group
+                    if not (metadata.version and metadata.effective_from)
+                )
             continue
         latest, latest_metadata = latest_pair
         if not include_legacy and (not latest_metadata.profile_id or not latest_metadata.version):
