@@ -255,6 +255,28 @@ class HwpxParserTests(unittest.TestCase):
         self.assertEqual(metadata["source_hwpx_xml_block_indices"], [4])
         self.assertIn("nested_table", metadata["source_hwpx_parser_review_flags"])
 
+    def test_sections_are_read_in_numeric_not_lexicographic_order(self) -> None:
+        def _section(label: str) -> str:
+            return (
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                f"<hp:p><hp:run><hp:t>{label}</hp:t></hp:run></hp:p></root>"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "multi_section.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                # Written out of order on purpose; reading order must follow the number.
+                archive.writestr("Contents/section10.xml", _section("Section Ten"))
+                archive.writestr("Contents/section2.xml", _section("Section Two"))
+                archive.writestr("Contents/section0.xml", _section("Section Zero"))
+
+            parsed = HwpxParser().parse(path, "doc_multi_section")
+
+        self.assertEqual(
+            ["Section Zero", "Section Two", "Section Ten"],
+            [block.text for block in parsed.pages[0].blocks],
+        )
+
     def _write_hwpx(self, path: Path, section_xml: str) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("Contents/section0.xml", section_xml)
