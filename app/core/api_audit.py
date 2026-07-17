@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 from threading import Lock
 import time
@@ -82,7 +82,7 @@ def audit_api_event(
             "resource_type": resource_type,
             "document_id": document_id,
             "job_id": job_id,
-            "filename": Path(filename).name if filename else "",
+            "filename": PureWindowsPath(filename).name if filename else "",
             "export_format": export_format,
             "source_system": source_system,
             "source_record_id": source_record_id,
