@@ -138,6 +138,36 @@ class JsonRequestBodyLimitMiddlewareTests(unittest.TestCase):
 
         self.assertEqual(200, sent[0]["status"])
 
+    def test_forged_non_json_content_type_cannot_bypass_declared_limit(self) -> None:
+        # A forged non-multipart Content-Type (text/plain) must not skip the
+        # byte cap; otherwise an oversized body is buffered in full on any
+        # body-reading endpoint (memory-exhaustion DoS).
+        sent, receive_count = asyncio.run(
+            _invoke(
+                content_type="text/plain",
+                content_length=1000,
+                messages=[{"type": "http.request", "body": b"x" * 1000, "more_body": False}],
+                max_body_bytes=10,
+            )
+        )
+
+        self.assertEqual(413, sent[0]["status"])
+        self.assertEqual(0, receive_count)
+
+    def test_forged_non_json_content_type_cannot_bypass_streamed_limit(self) -> None:
+        sent, _ = asyncio.run(
+            _invoke(
+                content_type="application/octet-stream",
+                messages=[
+                    {"type": "http.request", "body": b"123456", "more_body": True},
+                    {"type": "http.request", "body": b"78901", "more_body": False},
+                ],
+                max_body_bytes=10,
+            )
+        )
+
+        self.assertEqual(413, sent[0]["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

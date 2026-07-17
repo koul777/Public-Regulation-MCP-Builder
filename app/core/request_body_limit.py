@@ -15,11 +15,14 @@ class RequestBodyTooLarge(RuntimeError):
 
 
 class JsonRequestBodyLimitMiddleware:
-    """Bound JSON request bytes before Starlette decodes the request body.
+    """Bound request bytes before Starlette decodes the request body.
 
-    Multipart document uploads are intentionally outside this middleware and
-    remain governed by FileStore's streaming upload limits. Both declared
-    Content-Length and chunked/streamed bodies are enforced.
+    Every request is capped except streamed multipart uploads, which are
+    intentionally governed by FileStore's streaming upload limits instead.
+    Gating on the JSON Content-Type would let a forged non-JSON header (e.g.
+    ``text/plain``) skip the cap while the framework still buffers the whole
+    body for a body-model endpoint. Both declared Content-Length and
+    chunked/streamed bodies are enforced.
     """
 
     def __init__(self, app: AsgiApp, *, max_body_bytes: int) -> None:
@@ -29,7 +32,7 @@ class JsonRequestBodyLimitMiddleware:
             raise ValueError("max_body_bytes must be a positive integer.")
 
     async def __call__(self, scope: AsgiScope, receive: AsgiReceive, send: AsgiSend) -> None:
-        if scope.get("type") != "http" or not _is_json_content_type(scope):
+        if scope.get("type") != "http" or _is_streamed_multipart(scope):
             await self.app(scope, receive, send)
             return
 
@@ -64,9 +67,9 @@ class JsonRequestBodyLimitMiddleware:
             await _send_too_large(scope, receive, send, self.max_body_bytes)
 
 
-def _is_json_content_type(scope: dict[str, Any]) -> bool:
+def _is_streamed_multipart(scope: dict[str, Any]) -> bool:
     content_type = _header_value(scope, b"content-type").split(";", 1)[0].strip().lower()
-    return content_type == "application/json" or content_type.endswith("+json")
+    return content_type == "multipart/form-data"
 
 
 def _content_length(scope: dict[str, Any]) -> int | None:
