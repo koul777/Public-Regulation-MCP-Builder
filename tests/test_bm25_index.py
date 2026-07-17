@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,16 @@ from app.retrieval.searcher import search
 
 
 class Bm25IndexTests(unittest.TestCase):
+    def test_nfd_query_matches_nfc_indexed_document(self) -> None:
+        # A document indexed in NFC must still be found by an NFD query; Unicode
+        # composition differences must not silently drop an obvious match.
+        records = [_record("doc:leave", "제29조 육아휴직 기간은 3년 이내로 한다.")]
+        index = Bm25Index.build(records)
+
+        nfd_query = unicodedata.normalize("NFD", "육아휴직")
+
+        self.assertIn("doc:leave", index.score(nfd_query))
+
     def test_particle_variant_query_ranks_base_noun_chunk_first(self) -> None:
         records = [
             _record("doc:병가", "직원은 병가 사용을 신청할 수 있다.", article_title="병가"),

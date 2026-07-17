@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +8,19 @@ from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL, TOKENIZER_MODEL, t
 
 
 class RetrievalTokenizerTests(unittest.TestCase):
+    def test_tokenize_normalizes_unicode_so_nfd_matches_nfc(self) -> None:
+        # Korean text from PDF/DOCX extraction or macOS filenames can arrive
+        # decomposed (NFD).  Indexing and querying both flow through tokenize,
+        # so it must yield identical tokens regardless of composition; otherwise
+        # an NFD document is invisible to an NFC query and vice versa.
+        nfc = "육아휴직"
+        nfd = unicodedata.normalize("NFD", nfc)
+        self.assertNotEqual(nfc, nfd)
+        self.assertEqual(
+            tokenize(nfc, tokenizer_model=FALLBACK_TOKENIZER_MODEL),
+            tokenize(nfd, tokenizer_model=FALLBACK_TOKENIZER_MODEL),
+        )
+
     def test_korean_particle_variant_includes_base_noun(self) -> None:
         tokens = tokenize("병가를 사용한 직원")
 

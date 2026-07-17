@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from functools import lru_cache
 from typing import Any
 
@@ -79,7 +80,11 @@ def tokenize(
     prefer_regex_if_kiwi_cold: bool = False,
     tokenizer_model: str | None = None,
 ) -> list[str]:
-    raw_text = str(text or "")
+    # Fold to NFC so decomposed (NFD) input — common from PDF/DOCX extraction
+    # and macOS filenames — produces the same tokens as its composed form.
+    # Both indexing and querying flow through here, keeping the two sides
+    # consistent regardless of the source's Unicode composition.
+    raw_text = unicodedata.normalize("NFC", str(text or ""))
     article_tokens = [_normalize_article_no(match.group(0)) for match in _ARTICLE_NO_RE.finditer(raw_text)]
     if tokenizer_model == FALLBACK_TOKENIZER_MODEL:
         kiwi = None
