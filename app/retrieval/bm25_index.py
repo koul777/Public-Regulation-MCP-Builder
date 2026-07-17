@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from app.retrieval.tokenizer import tokenize, tokenizer_name
 
 
-BM25_INDEX_VERSION = "reg-rag-bm25-index-v1"
+BM25_INDEX_VERSION = "reg-rag-bm25-index-v2"
 BM25_RETRIEVAL_MODEL = "kiwi-bm25-v1"
 DEFAULT_BM25_FILENAME = "bm25_index.json"
 BM25_STRUCTURED_METADATA_VERSION = 2
@@ -229,7 +229,7 @@ def source_content_hashes(records: Iterable[dict[str, Any]]) -> str:
 
 def _weighted_term_frequencies(record: dict[str, Any], *, title_weight: int) -> Counter[str]:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    counter: Counter[str] = Counter(tokenize(str(record.get("text") or "")))
+    counter: Counter[str] = Counter(tokenize(str(record.get("text") or ""), dedupe=False))
     for field in ("regulation_title", "article_title"):
         for token in tokenize(str(metadata.get(field) or "")):
             counter[token] += max(1, int(title_weight))
