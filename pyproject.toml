@@ -1,0 +1,122 @@
+[project]
+name = "reg-rag-preprocessor"
+version = "0.1.0"
+description = "Korean regulation preprocessor and local MCP server builder."
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.0",
+  "python-multipart>=0.0.9",
+  "streamlit>=1.35",
+  "pandas>=2.0",
+  "pymupdf>=1.24",
+  "python-docx>=1.1",
+  "olefile>=0.47",
+  "mcp>=1.26",
+  "kiwipiepy>=0.21",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8.0",
+]
+
+[project.scripts]
+reg-rag-batch = "scripts.batch_process_regulations:main"
+reg-rag-public-batch-pipeline = "scripts.run_public_batch_pipeline:main"
+reg-rag-ci-gate = "scripts.run_ci_regression_gate:main"
+reg-rag-nightly-smoke = "scripts.run_nightly_smoke:main"
+reg-rag-audit-release = "scripts.audit_release_hygiene:main"
+reg-rag-audit-public-release = "scripts.audit_public_release_readiness:main"
+reg-rag-plan-public-release-cleanup = "scripts.plan_public_release_cleanup:main"
+reg-rag-public-release-gate = "scripts.run_public_release_gate:main"
+reg-rag-github-publish-readiness = "scripts.build_github_publish_readiness_summary:main"
+reg-rag-github-publish-owner-decisions = "scripts.check_github_publish_owner_decisions:main"
+reg-rag-github-publish-plan = "scripts.build_github_publish_execution_plan:main"
+reg-rag-strict-readiness-gaps = "scripts.summarize_strict_public_readiness_gaps:main"
+reg-rag-temporal-ambiguity-scope = "scripts.build_temporal_ambiguity_review_scope:main"
+reg-rag-temporal-ambiguity-policy-sheet = "scripts.build_temporal_ambiguity_policy_decision_sheet:main"
+reg-rag-temporal-ambiguity-policy-check = "scripts.validate_temporal_ambiguity_policy_decisions:main"
+reg-rag-check-private-release = "scripts.check_private_release_readiness:main"
+reg-rag-check-github-private = "scripts.check_github_private_visibility:main"
+reg-rag-check-console-scripts = "scripts.check_installed_console_scripts:main"
+reg-rag-release-harness = "scripts.run_release_harness:main"
+reg-rag-hermes = "scripts.run_hermes:main"
+reg-rag-sdist-rehearsal = "scripts.run_sdist_rehearsal:main"
+reg-rag-fresh-clone-rehearsal = "scripts.run_fresh_clone_rehearsal:main"
+reg-rag-private-release-gate = "scripts.run_private_release_gate:main"
+reg-rag-private-release-manifest = "scripts.build_private_release_manifest:main"
+reg-rag-release-evidence-index = "scripts.build_release_evidence_index:main"
+reg-rag-verify-release-evidence = "scripts.verify_release_evidence_bundle:main"
+reg-rag-private-release-smoke = "scripts.run_private_release_smoke:main"
+reg-rag-public-readiness = "scripts.validate_public_batch_readiness:main"
+reg-rag-review-queue-triage = "scripts.build_review_queue_triage:main"
+reg-rag-review-triage-summary = "scripts.summarize_review_triage_labels:main"
+reg-rag-human-review-evidence = "scripts.build_human_review_evidence_bundle:main"
+reg-rag-approval-evidence = "scripts.build_approval_evidence:main"
+reg-rag-approval-worklist = "scripts.build_approval_worklist:main"
+reg-rag-approval-review-batches = "scripts.build_approval_review_batches:main"
+reg-rag-approval-review-triage = "scripts.build_approval_review_triage:main"
+reg-rag-approval-sha-drift-plan = "scripts.build_approval_sha_drift_repair_plan:main"
+reg-rag-table-risk-report = "scripts.build_table_preprocessing_risk_report:main"
+reg-rag-table-unit-review-packet = "scripts.build_table_unit_review_packet:main"
+reg-rag-parsing-goldset-board = "scripts.build_parsing_goldset_completion_board:main"
+reg-rag-parsing-goldset-start-here = "scripts.build_parsing_goldset_start_here:main"
+reg-rag-parsing-goldset-table-sheet = "scripts.build_parsing_goldset_table_candidate_sheet:main"
+reg-rag-parsing-goldset-table-units = "scripts.build_parsing_goldset_table_unit_packet:main"
+reg-rag-parsing-goldset-table-review-batches = "scripts.build_parsing_goldset_table_review_batches:main"
+reg-rag-parsing-goldset-table-review-summary = "scripts.summarize_parsing_goldset_table_unit_review:main"
+reg-rag-parsing-goldset-table-transfer-check = "scripts.validate_parsing_goldset_table_count_transfer:main"
+reg-rag-parsing-goldset-table-source-check = "scripts.verify_table_review_source_traceability:main"
+reg-rag-parsing-goldset-table-drift-check = "scripts.check_parsing_goldset_table_drift:main"
+reg-rag-table-preprocessing-claim-gate = "scripts.audit_table_preprocessing_claim_gate:main"
+reg-rag-pilot-blocker-action-board = "scripts.build_pilot_blocker_action_board:main"
+reg-rag-reapproval-evidence = "scripts.build_reapproval_evidence_bundle:main"
+reg-rag-reapproval-worklist = "scripts.build_reapproval_worklist:main"
+reg-rag-reapproval-review-batches = "scripts.build_reapproval_review_batches:main"
+reg-rag-reapproval-review-burden = "scripts.build_reapproval_review_burden_report:main"
+reg-rag-reapproval-decision-check = "scripts.validate_reapproval_decisions:main"
+reg-rag-reapproval-apply-plan = "scripts.build_reapproval_apply_plan:main"
+reg-rag-reapproval-shadow-apply = "scripts.apply_reapproval_plan_shadow:main"
+reg-rag-profile-registry-from-batch = "scripts.build_institution_profile_registry_from_batch:main"
+reg-rag-export-public-report = "scripts.export_public_batch_report:main"
+reg-rag-export-vectordb = "scripts.export_vectordb_ingestion:main"
+reg-rag-export-relations = "scripts.export_relation_graph:main"
+reg-rag-estimate-agent-review-cost = "scripts.estimate_agent_review_cost:main"
+reg-rag-estimate-embedding-cost = "scripts.estimate_embedding_cost:main"
+reg-rag-embed-vectors = "scripts.embed_vectordb_records:main"
+reg-rag-upsert-vectordb = "scripts.upsert_vectordb_ingestion:main"
+reg-rag-rag-security-evidence = "scripts.build_rag_security_evidence:main"
+reg-rag-secure-rag-smoke = "scripts.run_secure_rag_smoke:main"
+reg-rag-mcp-server = "scripts.run_regulation_mcp:main"
+reg-rag-mcp-smoke = "scripts.run_mcp_smoke:main"
+reg-rag-mcp-transport-smoke = "scripts.run_mcp_transport_smoke:main"
+reg-rag-mcp-client-config-smoke = "scripts.run_mcp_client_config_smoke:main"
+reg-rag-mcp-bundle-zip-extract-smoke = "scripts.run_mcp_bundle_zip_extract_smoke:main"
+reg-rag-mcp-prepare-runtime = "scripts.prepare_mcp_publish_runtime:main"
+reg-rag-mcp-product-readiness = "scripts.audit_mcp_product_readiness:main"
+reg-rag-mcp-temporal-readiness-bundle = "scripts.build_mcp_temporal_product_readiness_bundle:main"
+reg-rag-mcp-config = "scripts.generate_mcp_client_config:main"
+reg-rag-mcp-doctor = "scripts.check_mcp_connection_readiness:main"
+reg-rag-mcp-handoff-report = "scripts.build_mcp_handoff_report:main"
+reg-rag-mcp-authority = "scripts.build_mcp_readiness_authority:main"
+reg-rag-mcp-remediation-plan = "scripts.build_mcp_readiness_remediation_plan:main"
+reg-rag-mcp-demo-answers = "scripts.export_mcp_demo_answers:main"
+reg-rag-mcp-answer-evidence-bundle = "scripts.build_mcp_answer_evidence_bundle:main"
+reg-rag-mcp-answer-blocker-map = "scripts.build_answer_blocker_review_map:main"
+reg-rag-mcp-performance-load-evidence = "scripts.build_mcp_performance_load_evidence:main"
+reg-rag-mcp-cold-start-benchmark = "scripts.benchmark_mcp_cold_start:main"
+reg-rag-mcp-concurrent-benchmark = "scripts.benchmark_mcp_concurrent_queries:main"
+reg-rag-mcp-index-visibility = "scripts.audit_mcp_index_visibility:main"
+reg-rag-mcp-query-benchmark = "scripts.benchmark_mcp_queries:main"
+reg-rag-revision-impact = "scripts.build_revision_impact_report:main"
+reg-rag-real-parser-fixtures = "scripts.verify_real_parser_regression_fixtures:main"
+
+[tool.setuptools.packages.find]
+include = ["app*", "frontend*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

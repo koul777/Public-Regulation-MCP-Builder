@@ -1,0 +1,342 @@
+# MCP 빠른 연결 안내
+
+> 미검수 PoC Review(`UNREVIEWED_POC_REVIEW`, legacy `UNREVIEWED_PREVIEW`)는 빠른 파싱, 검색, 품질, 연결 화면 확인용 격리 모드입니다. 공식 approved vector, release evidence, 기관 배포 handoff 산출물에는 기록하지 않으며, 공식 RAG/MCP 사용 전에는 사람 검토, 승인, index/reindex, MCP visibility audit을 다시 거칩니다.
+
+한 줄 요약: 전처리만 끝난 자료는 연결하지 말고, 사람이 승인하고 인덱싱까지 끝난 런타임만 Claude, ChatGPT, 내부 AI에 연결합니다.
+
+공식 연결 준비 상태는 append-only approval journal coverage까지 일치해야 합니다. `reg-rag-mcp-doctor --audit-index-visibility` 리포트의 `approval_provenance_coverage`와 `approval_journal_coverage`를 확인하고, journal coverage가 빠진 런타임은 클라이언트 연결을 막습니다.
+
+연결 전 게이트: MCP 클라이언트 연결 산출물은 전처리, 사람 승인, approved chunk 인덱싱까지 끝난 런타임에서만 ready로 취급합니다. 승인만 있고 `Index approved chunks` 또는 `Reindex approved chunks`가 끝나지 않은 상태는 연결 전 단계입니다.
+
+미검수 프리뷰는 `UNREVIEWED_PREVIEW`로 분리합니다. 이 모드는 품질과 연결 UX를 빠르게 확인하기 위한 경고 상태이며, 정식 MCP handoff, 외부 AI 연결, 기관 업무 사용, release evidence에는 사용할 수 없습니다.
+
+PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 Codex 통합형 ChatGPT Desktop, Codex CLI, Claude Desktop, Claude Code, ChatGPT 웹, Claude API에 빠르게 연결하기 위한 최소 절차입니다.
+
+## 용어 정리
+
+- MCP는 Claude Desktop 같은 생성형 AI가 로컬 규정 DB를 호출하는 연결 방식입니다.
+- `search`는 질문과 관련된 승인 규정 조항을 찾는 도구입니다.
+- `fetch`는 `search` 결과의 `id`로 원문 근거와 citation metadata를 가져오는 도구입니다.
+- RAG/Vector DB는 MCP 안쪽에서 근거를 찾는 검색 엔진 역할을 합니다. 외부 AI에는 승인된 MCP 도구만 보입니다.
+
+## 성능과 캐시 예열
+
+MCP 서버는 시작할 때 승인 Vector DB, 승인 스냅샷, BM25 검색 인덱스, 대표 scoring 경로를 기본 예열할 수 있습니다. 다만 생성된 handoff 번들의 stdio/터널 스크립트는 Claude Desktop, Claude Code, ChatGPT 등록이 느려지지 않도록 `--no-warm-cache`를 붙여 빠르게 시작합니다. 원인을 분리하거나 서버 상주형 HTTP 운영에서 첫 검색 속도를 더 중시할 때만 예열을 켭니다.
+
+`python scripts\run_mcp_transport_smoke.py ... --out-json ...` 결과에서 볼 핵심 필드는 다음과 같습니다.
+
+- `search_elapsed_ms`: MCP `search` 한 번의 실제 응답 시간
+- `fetch_elapsed_ms`: 검색 결과 `id`로 원문 근거를 가져오는 시간
+- `warm_search_elapsed_ms`: 같은 서버 프로세스에서 재검색했을 때의 응답 시간
+- `full_profile_search_timing_ms`: vector load, approval snapshot, visibility filter, scoring, trace write 단계별 시간
+
+Claude에서 smoke-test 문서만 보이면 연결보다 운영 데이터 상태를 먼저 봅니다. MCP 실행 `--data-dir`, `--tenant-id`, Streamlit의 `MCP-visible records`, `get_index_status` 결과가 전처리ㆍ승인ㆍ인덱싱한 런타임과 같은지 확인하고, 필요하면 `Reindex approved chunks`를 실행합니다. 연결 전에는 `reg-rag-mcp-index-visibility --data-dir <runtime> --tenant-id <tenant> --forbid-smoke-docs --require-indexed --fail-on-issue`로 로컬 런타임을 먼저 감사할 수 있습니다.
+
+승인 worklist/review-batch SHA가 source artifact, approved vector metadata, approval journal 사이에서 어긋나면 직접 JSONL을 패치하지 말고 `reg-rag-approval-sha-drift-plan --publish-runtime-report reports\aks_mcp_publish_runtime_report.json --out-json reports\approval_sha_drift_repair_plan_current.json --out-md reports\approval_sha_drift_repair_plan_current.md`로 read-only 복구 순서를 먼저 산출합니다.
+
+## 1. 연결 번들 생성
+
+```powershell
+reg-rag-mcp-config `
+  --client-profile bundle `
+  --server-name regulation_mcp `
+  --tenant-id default `
+  --host 0.0.0.0 `
+  --public-url https://mcp.example.go.kr `
+  --out-dir reports/mcp_connection_bundle `
+  --zip-out reports/mcp_connection_bundle.zip `
+  --include-wheel
+```
+
+`--public-url`은 ChatGPT 웹이나 Claude API처럼 원격 HTTPS MCP가 필요한 클라이언트에만 필요합니다. 통합형 ChatGPT Desktop, Codex CLI, 로컬 Claude Desktop/Claude Code만 쓸 때는 생략합니다. Streamlit 운영 화면에서는 MCP 영역의 `MCP로 쓸 파일 묶음 만들기` 버튼으로 같은 번들을 만들 수 있습니다.
+
+Streamlit의 MCP 설정 JSON 다운로드와 `Write MCP setup bundle now`는 approved chunks, indexed status, MCP-visible records, stale vector count를 같은 기준으로 확인합니다. 준비 전 서버 명령은 draft command이며, 승인ㆍ인덱싱이 끝나기 전에는 클라이언트 연결용 산출물로 취급하지 않습니다.
+
+생성되는 주요 파일:
+
+번들의 `data/` 폴더는 설정 예시가 아니라 실제 approved runtime payload입니다. 포함 대상은 approved chunks, approved vectors, BM25 index, approval/indexing journal, `mcp_runtime_manifest.json`이며, raw `*_nodes.json`, `*_issues.json`, `*_quality.json` 전처리 산출물은 handoff zip에 포함하지 않습니다.
+
+승인 전 단계에서는 `Approval worklist evidence`에서 `approval_review_batch_manifest`를 불러오고, 필요하면 `Review batch ID to load`로 실제 검토한 batch를 선택합니다. 선택 batch의 `approval_request_template.chunk_ids`만 `Approve selected review batch for RAG` 범위가 되며, `review_flags_acknowledged`는 자동으로 체크되지 않습니다. batch 승인 후 `Index approved chunks` 또는 `Reindex approved chunks`를 실행해야 MCP 연결 산출물이 준비 상태가 됩니다.
+
+통합형 ChatGPT Desktop, Codex CLI, Claude Desktop, Claude Code용 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 실행하지 않고 번들 안의 `run_mcp_stdio_server.ps1` launcher를 실행합니다. 이 launcher는 번들 `data` 폴더를 기준으로 서버를 띄우고, 저장소 checkout 안에 번들이 있으면 현재 checkout의 `scripts\run_regulation_mcp.py`를 설치된 콘솔 명령보다 먼저 실행합니다. checkout을 찾지 못할 때만 PATH의 `reg-rag-mcp-server`로 fallback하며, 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다. 이렇게 해야 클라이언트가 오래된 전역 MCP 서버나 “명령 없음” 상태를 물고 도구를 못 띄우는 문제를 줄일 수 있습니다.
+
+GitHub private push 또는 배포 직전에는 release harness로 실제 runtime data를 다시 번들화하고, 생성된 번들 자체의 local stdio doctor와 transport smoke까지 확인합니다. 이 검사는 GitHub에서 받은 코드와 로컬 번들이 같은 방식으로 빠르게 연결되는지 보는 최소 회귀입니다.
+
+```powershell
+python scripts\run_release_harness.py `
+  --mode mcp `
+  --artifact-dir reports\overnight_runs\<run-id>\release\harness `
+  --skip-tests --skip-build --skip-console-check --skip-mcp-smoke --skip-mcp-transport-smoke `
+  --mcp-runtime-data-dir C:\mcp_connection_bundle\data `
+  --mcp-bundle-profile-id <profile-id> `
+  --tenant-id default `
+  --mcp-min-visible-records 100 `
+  --bundle-dir reports\mcp_connection_bundle_harness_local_check `
+  --bundle-zip reports\mcp_connection_bundle_harness_local_check.zip `
+  --out-json reports\overnight_runs\<run-id>\release\harness\release_harness_mcp_bundle_local_check.json `
+  --keep-going
+```
+
+`--artifact-dir`를 지정하면 하네스의 기본 보고서, MCP 번들, zip, wheel/sdist 출력과 sdist rehearsal 입력이 모두 해당 디렉터리 아래로 재배치됩니다. 밤샘·장시간 검증에서는 run-id별 디렉터리를 반드시 사용하고, `--out-json`도 같은 run-id 아래에 둡니다.
+
+현재 환경에 `python -m build`가 설치되어 있지 않으면 `--build-python <build-tool-venv>\Scripts\python.exe`로 빌드 전용 Python을 지정할 수 있습니다. 이 옵션은 package build 단계에만 적용됩니다.
+
+동일 소스의 wheel과 sdist를 바이트 단위로 재현해야 할 때만 `--source-date-epoch <고정된 UTC 초>`를 추가합니다. 이 값은 build 환경의 `SOURCE_DATE_EPOCH`로 전달되며, build 직후 sdist 경로 안전성 검사와 gzip/tar 메타데이터 정규화를 거쳐 `sdist_normalization_harness.json`을 남깁니다. 재현성 비교에서는 두 build에 반드시 같은 epoch를 사용합니다.
+
+하네스가 package build를 수행할 때는 기본적으로 clean Git tree 검사를 먼저 통과해야 합니다. 개발 중 dirty tree에서 구조만 검증하려면 `--allow-dirty-build`를 명시할 수 있지만, 그 결과물은 릴리스 산출물로 사용할 수 없습니다.
+
+실 HWP/PDF parser 회귀 증적은 `reg-rag-real-parser-fixtures --fixture-root <curated-root>`로 별도 확인합니다. public 하네스에서는 이 검사가 필수이며, 데이터 없는 sdist에서 관련 unittest가 명시적으로 skip된 것만으로는 통과로 인정하지 않습니다.
+
+- `README.md`, `README.ko.md`
+- `connect_mcp_client.ps1`
+- `MCP 사용 시작하기.txt`
+- `설치 후 MCP 사용 방법 보기.bat`
+- `Codex 플러그인 MCP 입력값.txt`
+- `ChatGPT Desktop에 연결하기.bat`
+- `Codex에 연결하기.bat`
+- `Claude Desktop에 연결하기.bat`
+- `Claude Code에 연결하기.bat`
+- `ChatGPT HTTPS에 연결하기.bat`
+- `ChatGPT 보안 Tunnel에 연결하기.bat`
+- `Claude HTTPS에 연결하기.bat`
+- `연결 상태 확인하기.bat`
+- `install_local_package.ps1`
+- `claude_desktop_config.json`
+- `codex_config_snippet.toml`
+- `chatgpt_desktop_local_mcp.json`
+- `run_mcp_stdio_server.ps1`
+- `claude_code_add_stdio.ps1`
+- `claude_code_add_http.ps1`
+- `run_http_server.ps1`
+- `run_chatgpt_data_server.ps1`
+- `run_openai_secure_tunnel.ps1`
+- `doctor_mcp_connection.ps1`
+- `validate_client_config_smoke.ps1`
+- `chatgpt_connector.json`
+- `claude_api_fragment.json`
+- `data/mcp_runtime_manifest.json`
+- `data/repository/*_chunks.json`
+- `data/vector_db/<tenant>/approved_vectors.jsonl`
+- `data/vector_db/<tenant>/bm25_index.json`
+
+생성된 번들이 Codex/Claude에서 바로 인식되는지까지 보려면 클라이언트 설정 파일 자체를 실행하는 smoke를 추가로 돌립니다. 이 검사는 `codex_config_snippet.toml`과 `claude_desktop_config.json`을 읽어 실제 stdio MCP 프로세스를 띄운 뒤 `list_tools`, `search`, `fetch`를 호출합니다.
+압축을 다른 폴더에 풀었을 때 생기는 오래된 절대경로 문제를 피하기 위해, 이 smoke 스크립트는 실행 전에 번들 안의 Codex/Claude 설정 파일을 현재 추출 폴더 기준으로 다시 씁니다.
+
+```powershell
+python scripts\run_mcp_client_config_smoke.py `
+  --server-name regulation_mcp `
+  --codex-config reports\mcp_connection_bundle\codex_config_snippet.toml `
+  --claude-desktop-config reports\mcp_connection_bundle\claude_desktop_config.json `
+  --out-json reports\mcp_client_config_smoke_bundle.json `
+  --fail-on-issue
+```
+
+## 2. 가장 빠른 연결
+
+비개발자는 연결 마법사나 `.ps1`을 직접 실행하지 않습니다. 프로그램에서 입력한 MCP 이름이 `aks_mcp`라면 앱을 완전히 종료한 뒤 해당 BAT 하나를 실행합니다.
+
+- 통합형 ChatGPT Desktop: `ChatGPT Desktop에 연결하기.bat`
+- Claude Desktop: `Claude Desktop에 연결하기.bat`
+- Claude Code: `Claude Code에 연결하기.bat`
+- Codex CLI 호환: `Codex에 연결하기.bat`
+
+오류 없이 끝나면 앱을 다시 시작하고 새 대화 또는 task에서 다음처럼 호출합니다.
+
+```text
+aks_mcp MCP를 사용해서 등록된 규정 목록을 보여줘.
+```
+
+같은 이름으로 번들을 다시 생성하고 같은 BAT를 실행하면 기존 클라이언트 항목을 교체합니다. 새 번들은 현재 승인된 전체 청크를 다시 내보내므로 추가 규정과 개정판도 같은 `aks_mcp`에서 조회됩니다. 저장 폴더가 바뀌었다면 새 폴더에서 BAT를 다시 실행합니다.
+
+전산 담당자는 필요할 때만 번들 폴더에서 연결 마법사를 실행합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_mcp_client.ps1
+```
+
+`reg-rag-mcp-*` 명령이 보이지 않으면 먼저 설치 보조 스크립트를 실행합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/install_local_package.ps1
+```
+
+비대화형으로 바로 실행할 수도 있습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_mcp_client.ps1 -Target claude-code
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_mcp_client.ps1 -Target chatgpt-https
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_mcp_client.ps1 -Target chatgpt-tunnel
+```
+
+Claude Desktop은 먼저 기존 설정 JSON을 검증한 뒤, 자동 병합 옵션을 쓰면 기존 설정을 백업하고 `mcpServers`를 병합합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_mcp_client.ps1 -Target claude-desktop -InstallClaudeDesktop
+```
+
+## 3. ChatGPT Desktop 통합 Codex와 Codex CLI
+
+최신 ChatGPT Desktop은 Codex 플러그인 MCP 설정을 통합합니다. 앱을 완전히 종료하고 `ChatGPT Desktop에 연결하기.bat`를 실행하면 `$HOME\.codex\config.toml`을 백업한 뒤 입력한 이름의 블록을 교체합니다. 다시 실행한 뒤 `설정 > 플러그인 > MCP`에서 이름, `powershell.exe` 실행 명령, `run_mcp_stdio_server.ps1` 인자와 번들 작업 폴더를 확인할 수 있습니다. 사용자가 직접 입력할 필요는 없습니다.
+
+자동 등록이 되지 않을 때만 `Codex 플러그인 MCP 입력값.txt`를 열어 화면의 각 칸에 그대로 입력합니다. Codex CLI는 `Codex에 연결하기.bat`를 사용하며 같은 `$HOME\.codex\config.toml` 설정을 사용합니다.
+
+생성된 `codex_config_snippet.toml`의 `[mcp_servers.regulation_mcp]` 블록은 번들의 실제 `data` 폴더를 가리키고, 시작 지연을 줄이기 위해 `--flat-storage`와 `--no-warm-cache`를 포함합니다.
+
+붙여 넣은 뒤에는 실제 설치 설정이 오래된 `data-dir`를 보고 있지 않은지 doctor로 확인합니다.
+
+```powershell
+reg-rag-mcp-doctor `
+  --client-profile bundle `
+  --bundle-dir reports\mcp_connection_bundle `
+  --allow-local-only-bundle `
+  --codex-config $HOME\.codex\config.toml
+```
+
+doctor가 통과해도 Codex가 도구를 늦게 보거나 못 본다면, 설치된 Codex 설정 파일 그대로 실제 MCP를 띄워 확인합니다.
+
+```powershell
+python scripts\run_mcp_client_config_smoke.py `
+  --server-name regulation_mcp `
+  --codex-config $HOME\.codex\config.toml `
+  --out-json reports\codex_installed_mcp_config_smoke.json `
+  --fail-on-issue
+```
+
+## 4. Claude Desktop
+
+`reports/mcp_connection_bundle/claude_desktop_config.json`의 `mcpServers` 값을 Claude Desktop 설정 파일에 병합합니다.
+
+Windows 기본 위치:
+
+```text
+%APPDATA%\Claude\claude_desktop_config.json
+```
+
+JSON 오류가 나면 쉼표, 중괄호 위치, `mcpServers` 중복 여부를 먼저 확인합니다. `Unexpected token "{", "m"... is not valid JSON` 오류는 기존 JSON 안에 새 JSON 전체를 한 번 더 붙여 넣거나, `mcpServers` 블록만 병합하지 않았을 때 자주 발생합니다. 이때는 `connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop`로 기존 설정 파일을 먼저 검증하고, 가능하면 `-InstallClaudeDesktop` 자동 병합을 사용합니다. 설정 변경 뒤에는 Claude Desktop을 완전히 종료했다가 다시 실행해야 도구가 로드됩니다.
+
+병합 뒤에는 설치된 Claude Desktop 설정 파일도 같은 방식으로 실제 실행 검증을 합니다.
+
+```powershell
+python scripts\run_mcp_client_config_smoke.py `
+  --server-name regulation_mcp `
+  --claude-desktop-config "$env:APPDATA\Claude\claude_desktop_config.json" `
+  --out-json reports\claude_desktop_installed_mcp_config_smoke.json `
+  --fail-on-issue
+```
+
+## 5. Claude Code
+
+로컬 stdio 연결은 이 파일 하나로 등록합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/claude_code_add_stdio.ps1
+```
+
+원격 HTTPS MCP를 Claude Code에 붙일 때는 `claude_code_add_http.ps1`을 사용하고, 먼저 `MCP_AUTH_TOKEN`을 승인된 환경변수로 설정합니다.
+
+## 6. ChatGPT 웹 HTTPS
+
+이 절차는 위의 통합형 ChatGPT Desktop 로컬 플러그인과 별개입니다. ChatGPT 웹 Apps/Connectors는 ChatGPT에서 접근 가능한 HTTPS `/mcp` endpoint가 필요합니다. 데이터형 연결에서는 `search`와 `fetch`만 노출합니다.
+이 경로는 MCP `chatgpt-data` profile로 실행해 내부 식별자와 로컬 증적 경로를 줄입니다. 외부 connector 응답에는 `source_record_id`, `source_file_id`, `approval_review_batch_manifest_path` 같은 내부 운영 metadata가 포함되면 안 됩니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/run_chatgpt_data_server.ps1
+```
+
+ChatGPT Settings > Apps/Connectors > Create에서 앱 이름을 프로그램에서 입력한 MCP 이름으로 지정하고 `chatgpt_connector.json`의 `connector_url`을 등록합니다. `Scan tools`와 `Create`를 승인한 뒤 새 대화에서 해당 앱을 선택하거나 `@MCP이름`으로 호출합니다.
+
+## 7. ChatGPT Secure MCP Tunnel
+
+기관 내부 MCP 서버를 인터넷에 직접 공개하지 않으려면 OpenAI Secure MCP Tunnel 템플릿을 사용합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/run_openai_secure_tunnel.ps1
+```
+
+실행 전에 `CONTROL_PLANE_API_KEY`와 `OPENAI_TUNNEL_ID`를 승인된 환경변수로 설정합니다. 값을 스크립트 파일에 저장하지 않습니다. ChatGPT에서는 Connector/App 생성 단계에서 Tunnel connection을 선택합니다.
+
+터널 설정 점검 예시:
+
+```powershell
+reg-rag-mcp-doctor `
+  --client-profile chatgpt `
+  --connection-mode openai-tunnel `
+  --transport stdio `
+  --skip-data-check
+```
+
+## 8. Claude API
+
+`claude_api_fragment.json`의 `mcp_servers`, `tools`, `betas` 값을 Messages API 요청에 포함합니다. Claude API의 원격 MCP connector는 URL 기반 MCP 서버가 필요하며, 로컬 stdio 서버를 직접 연결하지 않습니다.
+
+## 9. 사전 진단
+
+```powershell
+reg-rag-mcp-doctor `
+  --client-profile chatgpt `
+  --transport streamable-http `
+  --host 0.0.0.0 `
+  --public-url https://mcp.example.go.kr/mcp `
+  --bundle-dir reports/mcp_connection_bundle `
+  --skip-data-check
+```
+
+`--bundle-dir reports/mcp_connection_bundle`는 필수 번들 파일 누락, JSON 구문 오류, Claude Desktop `mcpServers` 구조 오류, secret placeholder, 파일 안 토큰 assignment를 함께 검사합니다. 기본 검사는 설정 검증이며 실제 HTTPS 도달성은 확인하지 않습니다. 배포 직전 실제 endpoint까지 확인하려면 `--probe-public-url`을 추가하고 report의 `deploy_ready`를 확인합니다.
+
+로컬 Claude Desktop/Claude Code만 사용할 번들은 public URL이 없어도 됩니다. 이 경우 원격 ChatGPT/Claude API 준비 상태를 실패로 보지 않도록 다음 옵션을 추가합니다.
+
+```powershell
+reg-rag-mcp-doctor `
+  --client-profile bundle `
+  --bundle-dir reports/mcp_connection_bundle `
+  --allow-local-only-bundle `
+  --skip-data-check
+```
+
+## 10. 한국학중앙연구원 MVP 예시
+
+현재 AKS MVP 런타임을 로컬 Claude Desktop에 붙일 때의 핵심 값은 다음과 같습니다.
+
+```powershell
+reg-rag-mcp-config `
+  --client-profile claude-desktop `
+  --server-name aks-regulation-mcp `
+  --data-dir data\aks_mcp_publish_runtime `
+  --tenant-id tenant-aks-publish `
+  --tenant-storage-isolation `
+  --transport stdio `
+  --out-json reports\aks_claude_desktop_config.json
+```
+
+연결 전 검증:
+
+```powershell
+reg-rag-mcp-doctor `
+  --client-profile bundle `
+  --bundle-dir reports\aks_mcp_connection_bundle_20260708 `
+  --allow-local-only-bundle `
+  --skip-data-check
+
+python scripts\run_mcp_transport_smoke.py `
+  --data-dir data\aks_mcp_publish_runtime `
+  --tenant-id tenant-aks-publish `
+  --skip-preparation `
+  --query "전임 교원 채용 절차는?" `
+  --fail-on-issue
+```
+
+실제 승인ㆍ인덱싱된 runtime에는 `--skip-preparation`을 유지합니다. 준비 단계를 생략하지 않는
+MCP smoke/transport smoke는 합성 승인 문서를 쓰는 scratch-only 점검이며, 명시적 `--data-dir`에
+쓰려면 `--allow-persistent-smoke-data`가 필요합니다. 운영 runtime에서는 먼저
+`reg-rag-mcp-index-visibility --forbid-smoke-docs`로 smoke 문서가 섞이지 않았는지 확인합니다.
+
+현재 AKS handoff 기준은 `ready_for_local_claude_desktop_mvp`입니다. 최근 transport smoke 기준으로 예열 후 AKS 첫 `search`는 약 143ms, `fetch`는 약 30ms 수준입니다. 연결 뒤 Claude Desktop에서는 “육아휴직의 요건과 기간, 수당은?”, “전임 교원 채용 절차는?”, “성과연봉은 언제 어떻게 지급되나?” 같은 질문으로 `search`와 `fetch` 호출 여부를 확인합니다.
+
+## 11. 공식 참고
+
+- OpenAI Secure MCP Tunnel: https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
+- ChatGPT Apps/Connectors: https://developers.openai.com/apps-sdk/deploy/connect-chatgpt
+- Claude API MCP connector: https://docs.anthropic.com/en/docs/agents-and-tools/mcp-connector
+- Claude Code MCP: https://docs.anthropic.com/en/docs/claude-code/mcp
+- 비개발자 연결 버튼: Windows 번들에는 `ChatGPT Desktop에 연결하기.bat`, `Codex에 연결하기.bat`, `Claude Desktop에 연결하기.bat`, `Claude Code에 연결하기.bat`, `ChatGPT HTTPS에 연결하기.bat`, `ChatGPT 보안 Tunnel에 연결하기.bat`, `Claude HTTPS에 연결하기.bat`, `연결 상태 확인하기.bat`가 함께 생성됩니다. 프로그램에서 대상 앱과 연결 방식을 선택한 뒤 생성된 대상 버튼만 실행합니다. HTTPS는 공개 `/mcp` URL을 사용하고, Tunnel은 공개 URL 없이 OpenAI Tunnel ID와 API 키를 실행 환경에 한 번 설정해 사용합니다. 연결 후 새 대화에서 `입력한이름 MCP를 사용해서 등록된 규정 목록을 보여줘.`라고 호출하며, 사용자는 `.ps1` 파일을 직접 실행하지 않습니다.

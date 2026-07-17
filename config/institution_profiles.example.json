@@ -1,0 +1,38 @@
+{
+  "default_profile_id": "default-public-institution",
+  "profiles": {
+    "default-public-institution": {
+      "display_name": "Default public institution regulation batch",
+      "required_row_fields": [
+        "profile_id"
+      ],
+      "max_upload_mb": 1000
+    },
+    "generic-public-regulation": {
+      "display_name": "Generic public institution regulation attachments",
+      "institution_name": "Example public institution",
+      "source_system": "institution-website",
+      "source_url": "https://example.org/regulations",
+      "required_row_fields": [
+        "source_system",
+        "source_url",
+        "source_record_id",
+        "source_file_id",
+        "source_disclosure_date",
+        "source_posted_date",
+        "profile_id"
+      ],
+      "max_upload_mb": 1000
+    },
+    "strict-public": {
+      "display_name": "Strict public institution rollout profile",
+      "required_row_fields": [
+        "institution_name",
+        "source_system",
+        "source_url",
+        "profile_id"
+      ],
+      "max_upload_mb": 1000
+    }
+  }
+}

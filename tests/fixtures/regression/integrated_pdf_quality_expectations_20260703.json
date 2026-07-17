@@ -1,0 +1,34 @@
+﻿{
+    "generated_from":  "synthetic regression baseline",
+    "fixture_source":  "checked-in public regression fixture",
+    "fixture_count":  1,
+    "fixtures":  [
+                     {
+                         "identity":  "SYNTHETIC:integrated-record-0001:integrated-file-0001",
+                         "document_id":  "doc_d62556b2d54f",
+                         "filename":  "synthetic-integrated-regression-0001.json",
+                         "metrics":  {
+                                         "quality_score":  100.0,
+                                         "warning_count":  0,
+                                         "failed_info_check_count":  0,
+                                         "recommendation_count":  0,
+                                         "chunk_count":  6708,
+                                         "node_count":  13212,
+                                         "chunk_to_source_char_ratio":  0.973,
+                                         "table_like_chunks":  653,
+                                         "table_like_without_cell_rows":  0,
+                                         "table_cell_row_count":  2830,
+                                         "probable_table_false_positive_chunks":  10,
+                                         "stable_table_false_positive_chunks":  10,
+                                         "table_false_positive_attention_chunks":  0,
+                                         "probable_table_extraction_failed_chunks":  0,
+                                         "duplicate_regulation_node_count":  0,
+                                         "zero_chunk_regulation_node_count":  0,
+                                         "detected_reg_no_without_chunk_metadata_count":  0
+                                     },
+                         "tolerances":  {
+                                            "chunk_to_source_char_ratio":  0.005
+                                        }
+                     }
+                 ]
+}

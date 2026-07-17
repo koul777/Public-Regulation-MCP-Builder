@@ -1,0 +1,17 @@
+# Shared API overlay. Run with:
+#   docker compose -f docker-compose.yml -f docker-compose.shared.yml up --build api
+# Supply API_AUTH_TOKEN in the shell/secret manager; API_AUTH_TOKENS may also be used for role metadata.
+services:
+  api:
+    env_file:
+      - .env.shared
+    environment:
+      APP_ENV: production
+      API_AUTH_REQUIRED: "true"
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN or use API_AUTH_TOKENS through the deployment secret manager}
+      API_AUTH_TOKENS: ${API_AUTH_TOKENS:-}
+      API_AUDIT_ENABLED: "true"
+      TENANT_STORAGE_ISOLATION: "true"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

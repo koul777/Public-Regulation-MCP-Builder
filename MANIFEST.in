@@ -1,0 +1,20 @@
+include README.md
+include AGENTS.md
+include CONTRIBUTING.md
+include SECURITY.md
+include THIRD_PARTY_NOTICES.md
+include docs/mcp_client_config_examples_ko.md
+include docs/mcp_quickconnect_ko.md
+include docs/mcp_tool_contract_ko.md
+include docs/harness_engineering_plan_ko.md
+include docs/hermes_engineering_plan_ko.md
+include docs/prd_integrated_rag_chatbot_ko.md
+include docs/public_github_release_checklist_ko.md
+include docs/public_release_report_allowlist.json
+include docs/public_release_report_allowlist.example.json
+include docs/ui_ux_release_scope_ko.md
+recursive-include tests *.py
+prune build
+prune data
+prune dist
+prune reports

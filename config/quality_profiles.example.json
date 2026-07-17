@@ -1,0 +1,28 @@
+{
+  "default": {
+    "coverage_ratio_min": 0.8,
+    "coverage_ratio_max": 1.3,
+    "table_false_positive_attention_max_count": 6,
+    "table_false_positive_attention_max_ratio": 0.15
+  },
+  "profiles": {
+    "default-public-institution": {
+      "coverage_ratio_min": 0.8,
+      "coverage_ratio_max": 1.3,
+      "table_false_positive_attention_max_count": 6,
+      "table_false_positive_attention_max_ratio": 0.15
+    },
+    "generic-public-regulation": {
+      "coverage_ratio_min": 0.8,
+      "coverage_ratio_max": 1.3,
+      "table_false_positive_attention_max_count": 6,
+      "table_false_positive_attention_max_ratio": 0.15
+    },
+    "strict-public": {
+      "coverage_ratio_min": 0.95,
+      "coverage_ratio_max": 1.05,
+      "table_false_positive_attention_max_count": 2,
+      "table_false_positive_attention_max_ratio": 0.05
+    }
+  }
+}

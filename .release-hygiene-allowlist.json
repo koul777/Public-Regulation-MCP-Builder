@@ -1,0 +1,76 @@
+{
+    "allowed_findings":  [
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_api_audit.py",
+                                 "reason":  "Intentional API audit redaction fixtures use local paths to prove path leakage is rejected.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_audit_release_hygiene.py",
+                                 "reason":  "Intentional release hygiene fixtures use local paths to prove detection and allowlist behavior.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_embed_vectordb_records.py",
+                                 "reason":  "Intentional vector export redaction fixture.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_embedding_adapter.py",
+                                 "reason":  "Intentional embedding metadata redaction fixture.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_emit_batch_failure_alert.py",
+                                 "reason":  "Intentional failure alert local path fixture.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_export_public_batch_report.py",
+                                 "reason":  "Intentional public report path-redaction fixtures.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_export_vectordb_ingestion.py",
+                                 "reason":  "Intentional VectorDB export path-redaction fixture.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_vector_ingestion_adapter.py",
+                                 "reason":  "Intentional VectorDB ingestion path-leak rejection fixture.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             },
+                             {
+                                 "code":  "local-path-leak",
+                                 "path":  "tests/test_vector_upsert.py",
+                                 "reason":  "Intentional VectorDB upsert path-leak rejection fixture.",
+                                 "approved_by":  "koul777",
+                                 "approved_at":  "2026-07-07",
+                                 "approval_reference":  "PRE-COMMIT-HARDENING"
+                             }
+                         ]
+}

@@ -1,0 +1,5 @@
+{
+  "allowed_reports": [
+    "reports/public_readiness_redacted.md"
+  ]
+}
