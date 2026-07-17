@@ -84,14 +84,31 @@ def audit_api_event(
             "job_id": job_id,
             "filename": PureWindowsPath(filename).name if filename else "",
             "export_format": export_format,
-            "source_system": source_system,
-            "source_record_id": source_record_id,
-            "source_file_id": source_file_id,
+            "source_system": _redacted_provenance(source_system),
+            "source_record_id": _redacted_provenance(source_record_id),
+            "source_file_id": _redacted_provenance(source_file_id),
             "outcome": outcome,
             "status_code": status_code,
             "detail": redact_sensitive_paths(detail),
         },
     )
+
+
+def _redacted_provenance(value: str) -> str:
+    """Sanitize a user-controlled provenance field for the audit record.
+
+    ``source_system``/``source_record_id``/``source_file_id`` come straight
+    from the upload request, so a path-shaped value would otherwise fail
+    ``validate_api_audit_record`` and crash the write — leaving the committed
+    upload with no audit record.  Redact embedded paths, then flag any residual
+    bare prefix (e.g. ``/tmp/``) that redaction leaves intact so the field can
+    never look like a local path.
+    """
+
+    redacted = redact_sensitive_paths(value)
+    if _looks_like_sensitive_path(redacted):
+        return "[local-path-redacted]"
+    return redacted
 
 
 def redact_sensitive_paths(value: str) -> str:

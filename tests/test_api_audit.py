@@ -99,6 +99,71 @@ class ApiAuditTests(unittest.TestCase):
                     },
                 )
 
+    def test_audit_api_event_redacts_path_shaped_provenance_fields(self) -> None:
+        # source_system / source_record_id / source_file_id are user-controlled
+        # on upload.  A path-shaped value must be redacted like detail, not
+        # crash the audit write (which the append validator rejects, leaving the
+        # committed upload with no audit record and a 500).
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+
+            record = audit_api_event(
+                settings,
+                auth,
+                action="document.upload",
+                outcome="success",
+                status_code=201,
+                source_system="/var/secret/system",
+                source_record_id="/tmp/rec/123",
+                source_file_id=r"C:\data\file",
+            )
+
+        serialized = json.dumps(record, ensure_ascii=False)
+        self.assertNotIn("/var/secret", serialized)
+        self.assertNotIn("/tmp/rec", serialized)
+        self.assertNotIn(r"C:\data", serialized)
+        self.assertEqual("[local-path-redacted]", record["source_record_id"])
+
+    def test_audit_api_event_neutralizes_bare_path_prefix_provenance(self) -> None:
+        # A bare prefix ("/tmp/") survives content redaction, but the field must
+        # still never look like a local path or the append validator would
+        # reject the record and crash the request.
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+
+            record = audit_api_event(
+                settings,
+                auth,
+                action="document.upload",
+                outcome="success",
+                status_code=201,
+                source_record_id="/tmp/",
+            )
+
+        self.assertFalse(record["source_record_id"].startswith(("/tmp/", "/var/", "/Users/")))
+
+    def test_audit_api_event_keeps_normal_provenance_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+
+            record = audit_api_event(
+                settings,
+                auth,
+                action="document.upload",
+                outcome="success",
+                status_code=201,
+                source_system="PUBLIC_PORTAL",
+                source_record_id="record-doc-mcp",
+                source_file_id="file-123",
+            )
+
+        self.assertEqual("PUBLIC_PORTAL", record["source_system"])
+        self.assertEqual("record-doc-mcp", record["source_record_id"])
+        self.assertEqual("file-123", record["source_file_id"])
+
     def test_audit_api_event_redacts_local_path_detail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
