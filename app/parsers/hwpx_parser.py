@@ -52,7 +52,7 @@ class HwpxParser(BaseParser):
                             or "contents" in info.filename.lower()
                         )
                     ),
-                    key=lambda info: info.filename,
+                    key=lambda info: self._section_sort_key(info.filename),
                 )
                 for info in xml_infos:
                     payload = read_archive_member_bounded(
@@ -97,6 +97,10 @@ class HwpxParser(BaseParser):
                 ),
             ),
         )
+
+    def _section_sort_key(self, filename: str) -> tuple[int, str]:
+        match = re.search(r"section(\d+)", filename, flags=re.IGNORECASE)
+        return (int(match.group(1)) if match else 0, filename.lower())
 
     def _has_parser_review_flags(self, blocks: list[ParsedBlock]) -> bool:
         return any((block.metadata or {}).get("hwpx_parser_review_flags") for block in blocks)
