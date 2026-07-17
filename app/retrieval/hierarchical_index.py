@@ -689,11 +689,12 @@ def _finalize_versions(groups: dict[tuple[str, str], dict[str, Any]]) -> dict[st
     by_unit: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for group in groups.values():
         revision_date = max(group["revision_dates"], default="")
-        effective_from = max(
-            value
-            for value in (max(group["effective_dates"], default=""), revision_date)
-            if value
-        ) if (group["effective_dates"] or revision_date) else ""
+        # Use the actual effective date when present; fall back to the revision
+        # date only when no effective date exists.  max(effective, revision)
+        # would inflate a retroactive amendment's effective_from up to its later
+        # revision date, hiding the version from point-in-time queries between
+        # the two dates.
+        effective_from = max(group["effective_dates"], default="") or revision_date
         source_version = str(group["source_version"] or "")
         version_label = f"rev-{revision_date.replace('-', '')}" if revision_date else source_version
         search_text = " ".join(dict.fromkeys(value.strip() for value in group["search_values"] if value.strip()))
