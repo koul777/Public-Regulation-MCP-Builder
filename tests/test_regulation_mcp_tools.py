@@ -12,6 +12,7 @@ from app.api import routes_documents, routes_rag
 from app.core.api_audit import api_audit_path
 from app.core.config import Settings
 from app.core.security import AuthContext
+from app.mcp_server import regulation_tools
 from app.mcp_server.regulation_server import create_regulation_mcp_server
 from app.mcp_server.regulation_tools import (
     _FETCH_CHUNK_INDEX_CACHE,
@@ -470,6 +471,17 @@ class RegulationMcpToolsTests(unittest.TestCase):
         )
 
         self.assertFalse(guard["refused"])
+
+    def test_mcp_normalize_query_token_strips_stacked_particles(self) -> None:
+        # The relevance guard tokenizes with the regex fallback on cold start,
+        # which removes only a single trailing particle.  The normalizer must
+        # strip stacked particles fully ("명부에는" -> "명부") so a malformed
+        # token like "명부에" is never chosen as the primary anchor.  This is
+        # kiwi-independent, so it locks the cold-start behavior deterministically.
+        self.assertEqual("명부", regulation_tools._mcp_normalize_query_token("명부에는"))
+        self.assertEqual("겸직자", regulation_tools._mcp_normalize_query_token("겸직자에게는"))
+        # A single trailing particle is still stripped as before.
+        self.assertEqual("겸직자", regulation_tools._mcp_normalize_query_token("겸직자를"))
 
     def test_mcp_relevance_guard_allows_spaced_table_header_anchor(self) -> None:
         guard = _mcp_relevance_guard(
