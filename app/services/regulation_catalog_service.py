@@ -467,8 +467,13 @@ def _latest_sort_key(document: DocumentLike, metadata: RegulationMetadata) -> tu
         _value(document, "document_id"),
         _value(document, "id"),
     ) or ""
+    # On a shared effective date an approved version must outrank a superseded
+    # one; version tokens ("v2" vs "rev-20250701") are not a reliable currency
+    # signal, so status precedes the version comparison.
+    status_rank = 1 if _normalize_status(metadata.status) == "approved" else 0
     return (
         metadata.effective_from or date.min,
+        status_rank,
         _version_sort_key(metadata.version),
         metadata.effective_to or date.min,
         document_id,

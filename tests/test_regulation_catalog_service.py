@@ -7,6 +7,7 @@ from unittest.mock import patch
 from app.services.regulation_catalog_service import (
     RegulationMetadata,
     filter_to_latest_active_versions,
+    latest_history_version,
     read_regulation_metadata,
 )
 
@@ -212,6 +213,41 @@ class RegulationCatalogServiceTests(unittest.TestCase):
         visible = filter_to_latest_active_versions(documents, as_of="2025-06-01", include_legacy=False)
 
         self.assertEqual(["doc-legacy-new"], [item["document_id"] for item in visible])
+
+    def test_latest_history_version_prefers_approved_over_superseded_on_shared_effective_date(self) -> None:
+        # Auto-supersede backfills the prior version's effective_from to the
+        # revision's effective_from, so a superseded and the current approved
+        # version routinely share an effective date.  On that tie the current
+        # approved version must win, not the superseded one via a version-token
+        # comparison ("v2" sorting above "rev-20250701").
+        documents = [
+            {
+                "document_id": "doc-superseded",
+                "metadata": {
+                    "profile_id": "profile-a",
+                    "regulation_id": "reg-y",
+                    "version": "v2",
+                    "effective_from": "2025-07-01",
+                    "effective_to": "2025-07-01",
+                    "status": "superseded",
+                },
+            },
+            {
+                "document_id": "doc-current",
+                "metadata": {
+                    "profile_id": "profile-a",
+                    "regulation_id": "reg-y",
+                    "version": "rev-20250701",
+                    "effective_from": "2025-07-01",
+                    "effective_to": None,
+                    "status": "approved",
+                },
+            },
+        ]
+
+        current = latest_history_version(documents, as_of="2025-07-01")
+
+        self.assertEqual("doc-current", current["document_id"])
 
 
 if __name__ == "__main__":
