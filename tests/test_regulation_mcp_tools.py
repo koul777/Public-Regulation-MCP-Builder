@@ -12,6 +12,7 @@ from app.api import routes_documents, routes_rag
 from app.core.api_audit import api_audit_path
 from app.core.config import Settings
 from app.core.security import AuthContext
+from app.mcp_server import regulation_tools
 from app.mcp_server.regulation_server import create_regulation_mcp_server
 from app.mcp_server.regulation_tools import (
     _FETCH_CHUNK_INDEX_CACHE,
@@ -860,6 +861,71 @@ class RegulationMcpToolsTests(unittest.TestCase):
 
         self.assertEqual(fetched["metadata"]["chunk_id"], "approved-1")
         self.assertEqual(0, load_records.call_count)
+
+    def test_visible_record_by_chunk_hides_superseded_but_keeps_current(self) -> None:
+        # fetch resolves a single chunk by id and must not serve a superseded or
+        # repealed version as current evidence just because the chunk itself is
+        # still approved.  The currency gate runs over the one fetched record so
+        # the targeted lookup is preserved (no full vector load).
+        def _record(document_id: str, chunk_id: str, *, status: str, effective_to: str | None) -> dict:
+            return {
+                "document_id": document_id,
+                "chunk_id": chunk_id,
+                "text": f"{document_id} 본문: 육아휴직 3년.",
+                "metadata": {
+                    "document_id": document_id,
+                    "chunk_id": chunk_id,
+                    "approval_status": "approved",
+                    "regulation_id": "reg-x",
+                    "regulation_version": "v1" if status != "approved" else "v2",
+                    "effective_from": "2024-01-01" if status != "approved" else "2025-01-01",
+                    "effective_to": effective_to,
+                    "regulation_status": status,
+                    "profile_id": "institution-a",
+                },
+            }
+
+        superseded = _record("doc-old", "old-1", status="superseded", effective_to="2025-01-01")
+        current = _record("doc-new", "new-1", status="approved", effective_to=None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            mcp_auth = mcp_auth_context(tenant_id="tenant-a")
+
+            def resolve(*_args, document_id: str, chunk_id: str, **_kwargs):
+                return superseded if document_id == "doc-old" else current
+
+            with (
+                patch.object(regulation_tools, "_indexed_vector_record_by_chunk", side_effect=resolve),
+                patch.object(regulation_tools, "_validate_mcp_security_scope"),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "get_visible_record_by_chunk",
+                    side_effect=lambda *, candidate, **_kwargs: candidate,
+                ),
+            ):
+                hidden = regulation_tools._visible_record_by_chunk(
+                    settings=settings,
+                    auth=mcp_auth,
+                    document_id="doc-old",
+                    chunk_id="old-1",
+                    security_levels=["internal"],
+                    department_ids=[],
+                    profile_id="institution-a",
+                )
+                kept = regulation_tools._visible_record_by_chunk(
+                    settings=settings,
+                    auth=mcp_auth,
+                    document_id="doc-new",
+                    chunk_id="new-1",
+                    security_levels=["internal"],
+                    department_ids=[],
+                    profile_id="institution-a",
+                )
+
+        self.assertIsNone(hidden)
+        self.assertIsNotNone(kept)
+        self.assertEqual("new-1", kept["chunk_id"])
 
     def test_vector_record_loader_streams_jsonl_without_read_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

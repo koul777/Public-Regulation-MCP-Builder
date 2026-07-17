@@ -27,7 +27,10 @@ from app.core.security import AuthContext, API_ROLE_ADMIN, API_ROLE_OPERATOR
 from app.core.tenant_access import settings_for_tenant, tenant_storage_key
 from app.processors.answer_profile import clean_answer_profile_text
 from app.processors.exporter import Exporter
-from app.services.regulation_catalog_service import latest_history_version
+from app.services.regulation_catalog_service import (
+    filter_to_latest_active_versions,
+    latest_history_version,
+)
 from app.retrieval.tokenizer import tokenize
 from app.retrieval.hierarchical_index import (
     hierarchical_index_path,
@@ -2251,13 +2254,26 @@ def _visible_record_by_chunk(
         chunk_id=chunk_id,
     )
     repository = JsonRepository(settings)
-    return routes_rag.get_visible_record_by_chunk(
+    record = routes_rag.get_visible_record_by_chunk(
         query=query_request,
         auth=auth,
         settings=settings,
         repository=repository,
         candidate=candidate,
     )
+    if record is None:
+        return None
+    # Approval and scope alone do not prove currency.  Every other content tool
+    # filters to the latest active version; fetch must apply the same gate or it
+    # serves a superseded or repealed chunk as current evidence.  Run the same
+    # filter over just the fetched record so the targeted lookup is preserved (no
+    # full vector load): a record with a dead status or an elapsed effective/
+    # repeal date is dropped, while a current or pre-catalog record is kept.
+    if not filter_to_latest_active_versions(
+        [record], as_of=as_of_date, include_legacy=True
+    ):
+        return None
+    return record
 
 
 def _needs_governing_article_enrichment(record: dict[str, Any]) -> bool:
