@@ -102,6 +102,25 @@ class RegulationCatalogServiceTests(unittest.TestCase):
 
         self.assertEqual(["doc-legacy-1", "doc-legacy-2"], [item["document_id"] for item in visible])
 
+    def test_filter_to_latest_active_versions_hides_fully_catalogued_repealed_group(self) -> None:
+        documents = [
+            {
+                "document_id": "doc-repealed",
+                "id": "doc-repealed",
+                "metadata": {
+                    "profile_id": "profile-a",
+                    "regulation_id": "reg-repealed",
+                    "version": "v1",
+                    "effective_from": "2024-01-01",
+                    "status": "repealed",
+                },
+            }
+        ]
+
+        visible = filter_to_latest_active_versions(documents, include_legacy=True)
+
+        self.assertEqual([], [item["document_id"] for item in visible])
+
     def test_read_regulation_metadata_normalizes_legacy_lifecycle_aliases(self) -> None:
         metadata = read_regulation_metadata(
             {
