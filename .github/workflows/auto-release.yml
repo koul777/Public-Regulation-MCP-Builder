@@ -16,7 +16,8 @@ concurrency:
 jobs:
   release:
     if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip auto-release]')
-    runs-on: ubuntu-latest
+    # The project and its regression fixtures exercise Windows paths and shims.
+    runs-on: windows-latest
 
     steps:
       - name: Check out main
@@ -82,6 +83,7 @@ jobs:
         run: python -m build --sdist --wheel
 
       - name: Commit the release version and tag it
+        shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -99,6 +101,7 @@ jobs:
           fi
 
       - name: Publish GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
