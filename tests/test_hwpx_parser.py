@@ -277,6 +277,24 @@ class HwpxParserTests(unittest.TestCase):
             [block.text for block in parsed.pages[0].blocks],
         )
 
+    def test_unparsable_section_is_flagged_not_silently_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken_section.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/section0.xml",
+                    '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    "<hp:p><hp:run><hp:t>정상 섹션</hp:t></hp:run></hp:p></root>",
+                )
+                archive.writestr("Contents/section1.xml", "<root><hp:p>깨진 XML")
+
+            parsed = HwpxParser().parse(path, "doc_broken_section")
+
+        self.assertIn("정상 섹션", parsed.raw_text)
+        self.assertEqual(parsed.metadata["parser_uncertainty_risk_level"], "medium")
+        self.assertIn("hwpx_section_parse_error", parsed.metadata["parser_uncertainty_flags"])
+        self.assertLess(parsed.metadata["parser_uncertainty_confidence"], 0.92)
+
     def _write_hwpx(self, path: Path, section_xml: str) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("Contents/section0.xml", section_xml)
