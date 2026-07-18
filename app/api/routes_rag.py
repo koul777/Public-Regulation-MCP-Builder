@@ -26,8 +26,8 @@ from app.core.input_limits import (
 from app.core.security import (
     API_READ_ROLES,
     API_ROLE_ADMIN,
-    API_ROLE_OPERATOR,
-    API_ROLE_VIEWER,
+    ROLE_SECURITY_LEVELS,
+    SECURITY_LEVEL_ORDER,
     AuthContext,
     coerce_auth_context,
     get_auth_context,
@@ -58,12 +58,6 @@ from app.storage.repository import JsonRepository
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
-SECURITY_LEVEL_ORDER = ("public", "internal", "sensitive", "confidential")
-ROLE_SECURITY_LEVELS = {
-    API_ROLE_ADMIN: frozenset(SECURITY_LEVEL_ORDER),
-    API_ROLE_OPERATOR: frozenset({"public", "internal", "sensitive"}),
-    API_ROLE_VIEWER: frozenset({"public"}),
-}
 BLOCKED_QUERY_PATTERNS = (
     re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions", re.IGNORECASE),
     re.compile(r"(?:show|reveal|print|dump)\s+(?:the\s+)?(?:system\s+)?prompt", re.IGNORECASE),

@@ -54,6 +54,7 @@ from app.core.security import (
     API_ROLE_ADMIN,
     API_READ_ROLES,
     API_WRITE_ROLES,
+    ROLE_SECURITY_LEVELS,
     AuthContext,
     coerce_auth_context,
     get_auth_context,
@@ -308,11 +309,18 @@ def _chunks_visible_to_auth(
     require_api_role(auth, API_READ_ROLES)
     if _has_review_chunk_access(auth):
         return chunks
+    # Read-only (non-review) callers must be filtered by clearance exactly like
+    # the RAG path (_record_visible_to_request); otherwise a viewer restricted
+    # to "public" can read confidential chunk text here that /api/rag/search
+    # hides.  Review roles bypass above, so only viewers reach this filter.
+    allowed_levels = ROLE_SECURITY_LEVELS.get(auth.role, frozenset())
+    auth_departments = set(auth.department_ids)
     approval_journal_records = repository.list_approval_journal_records(document_id)
     return [
         chunk
         for chunk in chunks
         if chunk.approval_status == APPROVED_CHUNK_STATUS
+        and _chunk_within_security_clearance(chunk, allowed_levels, auth_departments)
         and _has_matching_approval_journal_record(
             approval_journal_records,
             chunk=chunk,
@@ -320,6 +328,20 @@ def _chunks_visible_to_auth(
             auth=auth,
         )
     ]
+
+
+def _chunk_within_security_clearance(
+    chunk: Chunk,
+    allowed_levels: frozenset[str],
+    auth_departments: set[str],
+) -> bool:
+    security_level = str(chunk.security_level or "").strip().lower()
+    if security_level not in allowed_levels:
+        return False
+    department_acl = _department_acl_set(chunk.department_acl)
+    if department_acl and not auth_departments.intersection(department_acl):
+        return False
+    return True
 
 
 def _filter_documents_for_tenant(documents: list[Document], auth: AuthContext) -> list[Document]:

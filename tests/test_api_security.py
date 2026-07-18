@@ -277,6 +277,19 @@ class ApiSecurityTests(unittest.TestCase):
 
         self.assertEqual([], rows)
 
+    def test_viewer_chunks_endpoint_hides_confidential_chunk_above_clearance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            _seed_document_with_public_and_confidential_approved_chunks(settings)
+            viewer = AuthContext(actor="auditor", tenant_id="tenant-a", auth_mode="api_token", role="viewer")
+
+            with patch_routes_settings(settings):
+                rows = routes_documents.get_chunks("doc_review", offset=0, limit=None, auth_context=viewer)
+
+        chunk_ids = [row["chunk_id"] for row in rows]
+        self.assertEqual(["approved-public"], chunk_ids)
+        self.assertNotIn("confidential body", json.dumps(rows, ensure_ascii=False))
+
     def test_viewer_export_generates_approved_only_content_instead_of_persisted_review_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
@@ -406,6 +419,73 @@ def _seed_document_with_mixed_approval_chunks(settings: Settings, *, include_app
                         "approved_content_hash": approved_content_hash,
                     }
                 ],
+                "approved_by": "reviewer",
+                "approved_at": "2026-07-10T00:00:00+00:00",
+                "worklist_evidence": _approval_worklist_evidence(),
+            }
+        )
+
+
+def _seed_document_with_public_and_confidential_approved_chunks(settings: Settings) -> None:
+    repository = JsonRepository(settings)
+    approval_metadata = _approval_provenance_metadata()
+    hashes = {"approved-public": "d" * 64, "approved-confidential": "e" * 64}
+    repository.upsert_document(
+        Document(
+            document_id="doc_review",
+            filename="doc_review.pdf",
+            document_name="doc_review",
+            file_type="pdf",
+            file_hash="hash",
+            tenant_id="tenant-a",
+            status="completed",
+        )
+    )
+    repository.save_chunks(
+        "doc_review",
+        [
+            Chunk(
+                chunk_id="approved-public",
+                document_id="doc_review",
+                source_node_ids=["node-public"],
+                chunk_type="article",
+                text="public body",
+                normalized_text="public body",
+                retrieval_text="public body",
+                metadata=approval_metadata,
+                approval_status="approved",
+                approval_id="approval-public",
+                approved_by="reviewer",
+                approved_content_hash=hashes["approved-public"],
+                security_level="public",
+            ),
+            Chunk(
+                chunk_id="approved-confidential",
+                document_id="doc_review",
+                source_node_ids=["node-confidential"],
+                chunk_type="article",
+                text="confidential body",
+                normalized_text="confidential body",
+                retrieval_text="confidential body",
+                metadata=approval_metadata,
+                approval_status="approved",
+                approval_id="approval-confidential",
+                approved_by="reviewer",
+                approved_content_hash=hashes["approved-confidential"],
+                security_level="confidential",
+            ),
+        ],
+    )
+    for chunk_id, approval_id in (("approved-public", "approval-public"), ("approved-confidential", "approval-confidential")):
+        repository.append_approval_record(
+            {
+                "approval_record_id": f"record_{chunk_id}",
+                "approval_id": approval_id,
+                "document_id": "doc_review",
+                "tenant_id": "tenant-a",
+                "chunk_ids": [chunk_id],
+                "approved_content_hashes": {chunk_id: hashes[chunk_id]},
+                "approved_chunks": [{"chunk_id": chunk_id, "approved_content_hash": hashes[chunk_id]}],
                 "approved_by": "reviewer",
                 "approved_at": "2026-07-10T00:00:00+00:00",
                 "worklist_evidence": _approval_worklist_evidence(),
