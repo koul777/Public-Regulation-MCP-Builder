@@ -41,6 +41,26 @@ class DocxParserTests(unittest.TestCase):
         self.assertEqual(parsed.raw_text, "제1조 목적\n구분 | 내용\n가 | 본문\n제2조 적용")
 
     @unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
+    def test_horizontally_merged_cell_is_not_repeated_per_column(self) -> None:
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "merged.docx"
+            doc = Document()
+            table = doc.add_table(rows=2, cols=3)
+            header = table.cell(0, 0).merge(table.cell(0, 2))
+            header.text = "공통 기준"
+            table.cell(1, 0).text = "A"
+            table.cell(1, 1).text = "B"
+            table.cell(1, 2).text = "C"
+            doc.save(path)
+
+            parsed = DocxParser().parse(path, "doc_merged")
+
+        table_block = next(block for block in parsed.pages[0].blocks if block.type == "table")
+        self.assertEqual(table_block.text, "공통 기준\nA | B | C")
+
+    @unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
     def test_invalid_docx_raises_parser_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "invalid.docx"
