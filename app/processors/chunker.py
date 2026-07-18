@@ -15,7 +15,7 @@ from app.processors.kordoc_table_matcher import (
     prepare_kordoc_table_match_index,
 )
 from app.processors.metadata_extractor import MetadataExtractor
-from app.processors.table_extractor import TableExtractor
+from app.processors.table_extractor import TableExtractor, disambiguate_table_headers
 from app.schemas.chunk import Chunk, ChunkOptions
 from app.schemas.parsed import ParsedDocument
 from app.schemas.structure import StructureNode
@@ -623,11 +623,12 @@ class Chunker:
     def _kordoc_table_records(cell_rows: list[dict], header_cells: list[str]) -> list[dict]:
         if not header_cells:
             return []
+        keys = disambiguate_table_headers(header_cells)
         records: list[dict] = []
         for row in cell_rows[1:]:
             cells = row.get("cells") or []
             record = {
-                header: cells[index] if index < len(cells) else ""
+                keys[index]: cells[index] if index < len(cells) else ""
                 for index, header in enumerate(header_cells)
                 if str(header).strip()
             }
