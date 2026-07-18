@@ -75,8 +75,8 @@ jobs:
               path.write_text(contents, encoding="utf-8")
           version_text = ".".join(str(value) for value in release_version)
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-              output.write(f"version={version_text}\\n")
-              output.write(f"tag=v{version_text}\\n")
+              output.write(f"version={version_text}\n")
+              output.write(f"tag=v{version_text}\n")
           PY
 
       - name: Build release artifacts
