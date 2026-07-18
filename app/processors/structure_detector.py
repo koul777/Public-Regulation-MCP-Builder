@@ -412,7 +412,16 @@ class StructureDetector:
         for match in INLINE_STRUCTURE_MARKER_PATTERN.finditer(text):
             if match.start() == 0:
                 continue
-            if self._line_starts_with_paragraph_marker(text) and self._is_circled_marker(match.group(0)):
+            if (
+                self._line_starts_with_paragraph_marker(text)
+                and not self._line_starts_with_circled_marker(text)
+                and self._is_circled_marker(match.group(0))
+            ):
+                # A circled marker inside a line that opens with □ or (N) is a
+                # sub-enumeration of that paragraph, so keep it inline.  But when
+                # the line itself opens with a circled marker (①), a following
+                # circled marker (②) is a sibling 항 flattened onto one line and
+                # must be split off.
                 continue
             if self._looks_like_inline_hangul_sentence_word(text, match):
                 continue
@@ -474,6 +483,9 @@ class StructureDetector:
 
     def _is_circled_marker(self, value: str) -> bool:
         return bool(re.match(r"^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚]$", value))
+
+    def _line_starts_with_circled_marker(self, text: str) -> bool:
+        return bool(re.match(r"^\s*[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚]", text))
 
     def _looks_like_inline_date_fragment(self, text: str, match: re.Match[str]) -> bool:
         marker = match.group(0)
