@@ -297,24 +297,21 @@ class KordocCrosscheckTests(unittest.TestCase):
             fallback_sentinel = fallback_parent / "keep.txt"
             denied_sentinel.write_text("denied", encoding="utf-8")
             fallback_sentinel.write_text("fallback", encoding="utf-8")
-            attempted_probe_parents: list[Path] = []
-            original_mkdir = Path.mkdir
-
-            def guarded_mkdir(path: Path, *args, **kwargs) -> None:
-                if path.parent in {denied_parent, fallback_parent}:
-                    attempted_probe_parents.append(path.parent)
-                    if path.parent == denied_parent:
-                        raise PermissionError("child creation denied")
-                original_mkdir(path, *args, **kwargs)
-
             with patch(
                 "scripts.run_kordoc_crosscheck._ascii_temp_parent_candidates",
                 return_value=[denied_parent, fallback_parent],
-            ), patch.object(Path, "mkdir", autospec=True, side_effect=guarded_mkdir):
+            ), patch(
+                "scripts.run_kordoc_crosscheck._can_create_child_directory",
+                side_effect=[False, True],
+            ) as can_create_child:
                 selected = _ascii_safe_temp_parent()
 
             self.assertEqual(selected, fallback_parent.resolve())
-            self.assertEqual(attempted_probe_parents, [denied_parent, fallback_parent])
+            self.assertEqual(2, can_create_child.call_count)
+            self.assertEqual(
+                [denied_parent.resolve(), fallback_parent.resolve()],
+                [call.args[0] for call in can_create_child.call_args_list],
+            )
             self.assertTrue(denied_parent.is_dir())
             self.assertTrue(fallback_parent.is_dir())
             self.assertEqual(denied_sentinel.read_text(encoding="utf-8"), "denied")

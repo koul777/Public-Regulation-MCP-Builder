@@ -854,11 +854,13 @@ def load_manifest_entries(
                 row,
                 ("source_disclosure_date", "disclosure_date", "revision_date"),
             )
-            path = Path(raw_path)
+            path = Path(raw_path).expanduser()
             if not path.is_absolute():
                 manifest_candidate = (manifest_dir / path).resolve()
                 cwd_candidate = path.resolve()
                 path = manifest_candidate if manifest_candidate.exists() else cwd_candidate
+            else:
+                path = path.resolve()
             if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 raise ValueError(f"Manifest row points to unsupported file extension: {path.suffix.lower()}")
             entries.append(

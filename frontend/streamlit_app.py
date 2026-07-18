@@ -988,8 +988,13 @@ def _render_operator_project_dialog(page: str) -> None:
             st.error(str(exc))
 
     projects = _list_operator_projects(projects_dir=projects_dir) if projects_dir is not None else []
-    project_options = [str(project.get("_path") or "") for project in projects]
-    project_by_path = {str(project.get("_path") or ""): project for project in projects}
+    project_by_path: dict[str, dict[str, object]] = {}
+    for project in projects:
+        project_path = Path(str(project.get("_path") or "")).expanduser()
+        for path_text in {str(project_path), str(project_path.resolve())}:
+            if path_text:
+                project_by_path[path_text] = project
+    project_options = list(project_by_path)
     selected_project_path = st.selectbox(
         "저장한 프로젝트",
         options=[""] + project_options,

@@ -63,7 +63,7 @@ class DeploymentDefaultsTests(unittest.TestCase):
         self.assertIn("API_AUTH_TOKEN=", shared)
         self.assertIn("Inject API_AUTH_TOKEN at deployment time", shared)
 
-    def test_github_workflows_are_not_tracked_or_staged(self):
+    def test_only_the_reviewed_auto_release_workflow_is_tracked(self):
         try:
             result = subprocess.run(
                 ["git", "ls-files", "--stage", "--", ".github/workflows"],
@@ -81,7 +81,12 @@ class DeploymentDefaultsTests(unittest.TestCase):
                 f"{exc.stderr.strip()}"
             )
 
-        self.assertEqual("", result.stdout.strip())
+        tracked_paths = [
+            line.rsplit("\t", 1)[-1]
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+        self.assertEqual([".github/workflows/auto-release.yml"], tracked_paths)
 
     def _read_env_example(self):
         env_path = REPO_ROOT / ".env.example"
