@@ -2542,7 +2542,7 @@ function Test-NamedCommands([string[]]$Names) {
 function Show-InstallHint([object[]]$Missing) {
   Write-Warning "MCP commands are unavailable from PATH and the generated project runtime: $($Missing -join ', ')"
   Write-Host "Install the bundled package once:"
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'install_local_package.ps1'))`""
+  Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}"' -f (BundlePath 'install_local_package.ps1'))
   Write-Host "Or rerun this wizard with -InstallPackage."
 }
 
@@ -2863,9 +2863,9 @@ function Show-ClaudeDesktop {
   }
   Write-Host "Generated JSON: $(BundlePath 'claude_desktop_config.json')"
   Write-Host "To validate the existing Claude Desktop config:"
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Target claude-desktop -ValidateClaudeDesktop"
+  Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}" -Target claude-desktop -ValidateClaudeDesktop' -f $PSCommandPath)
   Write-Host "To merge automatically:"
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Target claude-desktop -InstallClaudeDesktop"
+  Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}" -Target claude-desktop -InstallClaudeDesktop' -f $PSCommandPath)
 }
 
 function Register-ClaudeCode {
@@ -2899,7 +2899,7 @@ function Show-Codex {
   }
   Write-Host "Generated snippet: $(BundlePath 'codex_config_snippet.toml')"
   Write-Host "To install/update automatically:"
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Target codex -InstallCodex"
+  Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}" -Target codex -InstallCodex' -f $PSCommandPath)
 }
 
 function Show-ChatGptDesktop {
@@ -2915,7 +2915,7 @@ function Show-ChatGptDesktop {
   }
   Write-Host "The Codex-integrated ChatGPT Desktop uses the local Codex MCP config on this host."
   Write-Host "To install/update automatically:"
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Target chatgpt-desktop -InstallCodex"
+  Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}" -Target chatgpt-desktop -InstallCodex' -f $PSCommandPath)
 }
 
 function Show-ChatGptHttps {
