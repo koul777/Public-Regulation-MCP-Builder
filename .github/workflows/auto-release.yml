@@ -1,0 +1,110 @@
+name: Auto release on main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip auto-release]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install project and build dependencies
+        run: python -m pip install ".[dev]"
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Determine and write the release version
+        id: version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("pyproject.toml")
+          contents = path.read_text(encoding="utf-8")
+          match = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"$', contents)
+          if not match:
+              raise SystemExit("A semantic project version is required in pyproject.toml.")
+          source_version = tuple(int(value) for value in match.groups())
+          tags = []
+          for tag in os.popen("git tag --list").read().splitlines():
+              tag_match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+              if tag_match:
+                  tags.append((tuple(int(value) for value in tag_match.groups()), tag))
+          latest_version, latest_tag = max(tags, default=(None, None))
+          head = os.popen("git rev-parse HEAD").read().strip()
+          tagged_head = (
+              os.popen(f"git rev-list -n 1 {latest_tag}").read().strip()
+              if latest_tag
+              else ""
+          )
+          if latest_version is None or source_version > latest_version or (
+              source_version == latest_version and head == tagged_head
+          ):
+              release_version = source_version
+          else:
+              release_version = (latest_version[0], latest_version[1], latest_version[2] + 1)
+              next_version = ".".join(str(value) for value in release_version)
+              contents = contents[:match.start(1)] + next_version + contents[match.end(1):]
+              path.write_text(contents, encoding="utf-8")
+          version_text = ".".join(str(value) for value in release_version)
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"version={version_text}\\n")
+              output.write(f"tag=v{version_text}\\n")
+          PY
+
+      - name: Build release artifacts
+        run: python -m build --sdist --wheel
+
+      - name: Commit the release version and tag it
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- pyproject.toml; then
+            git add pyproject.toml
+            git commit -m "chore(release): ${TAG} [skip auto-release]"
+            git push origin HEAD:main
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null; then
+            git tag -a "${TAG}" -m "Release ${TAG}"
+            git push origin "${TAG}"
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release ${TAG} already exists."
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+          fi

@@ -8,6 +8,7 @@
 [![Kordoc](https://img.shields.io/badge/HWP%20표-Kordoc%20선택%20보강-6B7280)](https://github.com/chrisryugj/kordoc)
 [![승인 데이터만](https://img.shields.io/badge/색인-승인%20데이터만-15803D)](#처리-구조)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release target](https://img.shields.io/badge/release-v1.1.0-7C3AED)](#릴리스와-버전)
 
 PDF, HWP, HWPX, DOCX 형식의 공공기관 규정을 **기관 → 규정 → 개정 버전 → 장·절·조문** 구조로 정리하고, 사람이 승인한 내용만 검색 색인과 MCP 응답에 포함하는 Windows용 빌더입니다.
 
@@ -323,9 +324,31 @@ python scripts\audit_release_hygiene.py --workflow-scope available --include-unt
 Windows portable ZIP은 다음 명령으로 만듭니다.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_windows_portable.ps1 -Version 0.1.0
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_portable.ps1 -Version 1.1.0
 ```
 
-결과 파일은 `dist\PR-MCP-Builder-Windows-x64-0.1.0.zip`입니다. `data/`, `reports/`, `.tmp/`, `build/`, `dist/`, 가상환경과 실제 기관 문서는 Git에 커밋하지 않습니다.
+결과 파일은 `dist\PR-MCP-Builder-Windows-x64-1.1.0.zip`입니다. `data/`, `reports/`, `.tmp/`, `build/`, `dist/`, 가상환경과 실제 기관 문서는 Git에 커밋하지 않습니다.
+
+## 릴리스와 버전
+
+현재 공개 릴리스 기준은 **v1.1.0**입니다. `pyproject.toml`의 패키지 버전은 `1.1.0`으로 유지하고, GitHub 태그와 Release에는 `v1.1.0` 형식을 사용합니다.
+
+### v1.1.0 업데이트 내역
+
+- `/documents/{id}/chunks`와 검색 경로에서 보안등급·부서 ACL을 일관되게 적용해 상위 등급 청크가 viewer에게 노출되지 않도록 했습니다.
+- 폐지·대체 규정과 소급 개정의 효력일 처리를 fail-closed로 보강하고, 시점 조회와 현행 근거 선택의 정확도를 높였습니다.
+- HWPX 섹션 순서·실패 신호, DOCX 병합 셀, 표 헤더 중복, 시각표의 `시:분`, 원문자 항목 등 규정 문서 파싱 경계 사례를 보완했습니다.
+- Unicode 정규화, BM25/FTS 관련성 계산, RAG 가시성 캐시를 개선해 검색 결과의 일관성과 자원 사용을 높였습니다.
+- 업로드 provenance의 경로 노출과 JSON Content-Type 우회 등 공개·운영 경계의 보안 검사를 강화했습니다.
+
+### main 푸시 자동 릴리스
+
+`main`에 병합하거나 직접 푸시한 변경은 `.github/workflows/auto-release.yml`로 자동 릴리스됩니다. 워크플로는 Python 3.11 환경에서 전체 `unittest`를 통과한 경우에만 다음을 수행합니다.
+
+1. 아직 태그가 없는 새 버전(현재 `v1.1.0`)은 그대로 첫 GitHub Release로 발행합니다.
+2. 이후 `main` 변경은 patch 버전을 하나 올립니다. 예: `1.1.0` → `1.1.1`.
+3. source distribution과 wheel을 빌드하고, 새 태그의 GitHub Release에 첨부합니다.
+
+릴리스 커밋에는 `[skip auto-release]` 표식을 넣어 자체 푸시가 다시 버전을 올리는 무한 반복을 막습니다. 동일 커밋의 워크플로 재실행은 기존 태그와 Release를 재사용합니다. 테스트나 빌드가 실패하면 버전·태그·Release를 만들지 않습니다. 리포지토리의 **Settings → Actions → General → Workflow permissions**는 `Read and write permissions`를 허용해야 하며, `main` 브랜치 보호 규칙이 GitHub Actions의 릴리스 커밋 푸시를 막지 않도록 설정해야 합니다.
 
 자세한 설계와 운영 문서는 [docs](docs/)를 참고합니다. 소스 코드는 [MIT License](LICENSE)를 따르며 외부 구성요소의 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 정리되어 있습니다.
