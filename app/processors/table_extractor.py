@@ -14,6 +14,26 @@ def _normalize_label_spacing_cached(value: str) -> str:
     return _LABEL_SPACING_PATTERN.sub("", value)
 
 
+def disambiguate_table_headers(headers: list[str]) -> list[str]:
+    """Return header keys with exact duplicates suffixed.
+
+    Building a record dict keyed on the header collapses repeated headers
+    (common in Korean 별표, e.g. two 금액 columns) and loses every value but
+    the last.  Suffixing only the duplicates keeps the record lossless while
+    leaving the common no-duplicate case unchanged.
+    """
+    seen: dict[str, int] = {}
+    keys: list[str] = []
+    for header in headers:
+        if header in seen:
+            seen[header] += 1
+            keys.append(f"{header} ({seen[header]})")
+        else:
+            seen[header] = 1
+            keys.append(header)
+    return keys
+
+
 class TableExtractor:
     """Conservative table detection that preserves raw rows before deeper parsing."""
 
@@ -614,9 +634,10 @@ class TableExtractor:
                 continue
             if len(cells) < len(header_cells):
                 cells = [*cells, *([""] * (len(header_cells) - len(cells)))]
+            keys = disambiguate_table_headers(header_cells)
             record = {
-                header: value
-                for header, value in zip(header_cells, cells)
+                key: value
+                for key, header, value in zip(keys, header_cells, cells)
                 if header and value
             }
             if not record:

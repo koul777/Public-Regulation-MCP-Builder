@@ -707,6 +707,17 @@ class TableExtractorTests(unittest.TestCase):
         self.assertEqual(analysis["table_records"][0]["record"]["기준"], "1억원 미만")
         self.assertEqual(analysis["table_records"][0]["record"]["값"], "3명 이상")
 
+    def test_table_records_preserve_values_under_duplicate_headers(self) -> None:
+        cell_rows = [
+            {"row_index": 0, "cells": ["구분", "금액", "금액"]},
+            {"row_index": 1, "cells": ["항목A", "100", "200"]},
+        ]
+
+        records = TableExtractor()._table_records(cell_rows)
+
+        self.assertEqual(records[0]["record"]["금액"], "100")
+        self.assertEqual(records[0]["record"]["금액 (2)"], "200")
+
     def test_delegation_outline_conditions_are_structured(self) -> None:
         text = "\n".join(
             [

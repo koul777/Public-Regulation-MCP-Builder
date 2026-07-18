@@ -29,6 +29,17 @@ def parsed_fixture() -> ParsedDocument:
 
 
 class ChunkerTests(unittest.TestCase):
+    def test_kordoc_table_records_preserve_values_under_duplicate_headers(self) -> None:
+        cell_rows = [
+            {"row_index": 0, "cells": ["구분", "금액", "금액"]},
+            {"row_index": 1, "cells": ["항목A", "100", "200"]},
+        ]
+
+        records = Chunker._kordoc_table_records(cell_rows, ["구분", "금액", "금액"])
+
+        self.assertEqual(records[0]["record"]["금액"], "100")
+        self.assertEqual(records[0]["record"]["금액 (2)"], "200")
+
     def test_split_node_splits_paragraph_symbols_beyond_fifteen(self) -> None:
         # An oversized article was split at circled paragraph markers ①–⑮ only,
         # so ⑯–⑳ were lumped into the ⑮ chunk even though structure detection
