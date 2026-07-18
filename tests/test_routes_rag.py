@@ -118,6 +118,36 @@ class RoutesRagTests(unittest.TestCase):
         self.assertEqual(2, visible_mock.call_count)
         self.assertEqual(1, latest_mock.call_count)
 
+    def test_load_visible_records_cache_is_bounded_under_distinct_as_of_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token", role="admin")
+            records = [{"document_id": "doc-1", "chunk_id": "chunk-1"}]
+            approval_snapshot = {("doc-1", "chunk-1"): {"approval_id": "approval-1"}}
+
+            with patch.object(routes_rag, "_record_visible_to_request", return_value=True), patch.object(
+                routes_rag,
+                "filter_to_latest_active_versions",
+                side_effect=lambda items, **kwargs: list(items),
+            ):
+                for index in range(routes_rag._RAG_VISIBLE_RECORDS_MAX_ENTRIES + 50):
+                    request = routes_rag.RagSearchRequest(query="q", top_k=5, as_of_date=f"2025-01-{index}")
+                    routes_rag.load_visible_records(
+                        request=request,
+                        auth=auth,
+                        settings=settings,
+                        repository=object(),
+                        repository_cache=object(),
+                        records=records,
+                        approval_snapshot=approval_snapshot,
+                        requested_department_ids=frozenset(),
+                    )
+
+        self.assertLessEqual(
+            len(routes_rag._RAG_VISIBLE_RECORDS_CACHE),
+            routes_rag._RAG_VISIBLE_RECORDS_MAX_ENTRIES,
+        )
+
     def test_file_signature_detects_atomic_replacement_with_same_mtime_and_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "approved_vectors.jsonl"
