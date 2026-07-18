@@ -2491,13 +2491,21 @@ def _mcp_normalize_query_token(token: str) -> str:
         return ""
     if any(normalized.endswith(suffix) for suffix in _MCP_QUERY_QUESTION_SUFFIXES):
         return ""
-    for suffix in _MCP_QUERY_PARTICLE_SUFFIXES:
-        if normalized.endswith(suffix) and len(normalized) - len(suffix) >= 2:
-            stripped = normalized[: -len(suffix)]
-            if stripped in _MCP_COMMON_QUERY_TOKENS:
-                return ""
-            return stripped
-    return normalized
+    # Strip stacked particles iteratively ("서식에는" -> "서식에" -> "서식").
+    # The relevance guard tokenizes with the regex fallback on cold start, and
+    # that path removes only a single trailing particle, leaving a malformed
+    # token like "서식에" that would otherwise be picked as the primary anchor
+    # and wrongly refuse a relevant result.
+    while True:
+        for suffix in _MCP_QUERY_PARTICLE_SUFFIXES:
+            if normalized.endswith(suffix) and len(normalized) - len(suffix) >= 2:
+                stripped = normalized[: -len(suffix)]
+                if stripped in _MCP_COMMON_QUERY_TOKENS:
+                    return ""
+                normalized = stripped
+                break
+        else:
+            return normalized
 
 
 def _mcp_token_matches(query_token: str, result_tokens: set[str]) -> bool:

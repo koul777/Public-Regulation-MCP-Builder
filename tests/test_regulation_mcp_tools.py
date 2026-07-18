@@ -472,6 +472,17 @@ class RegulationMcpToolsTests(unittest.TestCase):
 
         self.assertFalse(guard["refused"])
 
+    def test_mcp_normalize_query_token_strips_stacked_particles(self) -> None:
+        # The relevance guard tokenizes with the regex fallback on cold start,
+        # which removes only a single trailing particle.  The normalizer must
+        # strip stacked particles fully ("명부에는" -> "명부") so a malformed
+        # token like "명부에" is never chosen as the primary anchor.  This is
+        # kiwi-independent, so it locks the cold-start behavior deterministically.
+        self.assertEqual("명부", regulation_tools._mcp_normalize_query_token("명부에는"))
+        self.assertEqual("겸직자", regulation_tools._mcp_normalize_query_token("겸직자에게는"))
+        # A single trailing particle is still stripped as before.
+        self.assertEqual("겸직자", regulation_tools._mcp_normalize_query_token("겸직자를"))
+
     def test_mcp_relevance_guard_allows_spaced_table_header_anchor(self) -> None:
         guard = _mcp_relevance_guard(
             "겸직자 명부 서식에는 어떤 항목을 기록하나요?",
