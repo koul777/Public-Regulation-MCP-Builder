@@ -34,6 +34,7 @@ class HwpxParser(BaseParser):
 
         blocks: list[ParsedBlock] = []
         raw_parts: list[str] = []
+        parse_error_sections: list[str] = []
         try:
             with zipfile.ZipFile(path) as archive:
                 infos = validate_office_archive(
@@ -64,6 +65,7 @@ class HwpxParser(BaseParser):
                     try:
                         root = ElementTree.fromstring(payload)
                     except ElementTree.ParseError:
+                        parse_error_sections.append(info.filename)
                         continue
                     for block in self._blocks(root, info.filename):
                         if block.text:
@@ -77,6 +79,26 @@ class HwpxParser(BaseParser):
         if not blocks:
             raise ParserError("No text blocks were extracted from the HWPX file.")
 
+        flagged_tables = self._has_parser_review_flags(blocks)
+        flags = self._document_uncertainty_flags(blocks)
+        if parse_error_sections:
+            flags = sorted({*flags, "hwpx_section_parse_error"})
+        needs_review = flagged_tables or bool(parse_error_sections)
+        if flagged_tables:
+            recommendation = "review_flagged_tables"
+            remediation_hint = (
+                "Review HWPX tables, captions, notes, images, and merged cells flagged by the parser before approval."
+            )
+        elif parse_error_sections:
+            recommendation = "review_dropped_sections"
+            remediation_hint = (
+                "One or more HWPX sections could not be parsed and were dropped; review the source before approval: "
+                + ", ".join(parse_error_sections)
+            )
+        else:
+            recommendation = "none"
+            remediation_hint = ""
+
         return ParsedDocument(
             document_id=document_id,
             source_file=path.name,
@@ -86,15 +108,11 @@ class HwpxParser(BaseParser):
             raw_text="\n".join(raw_parts),
             metadata=parser_uncertainty_metadata(
                 source="hwpx",
-                risk_level="low" if not self._has_parser_review_flags(blocks) else "medium",
-                flags=self._document_uncertainty_flags(blocks),
-                confidence=0.92 if not self._has_parser_review_flags(blocks) else 0.82,
-                recommendation="review_flagged_tables" if self._has_parser_review_flags(blocks) else "none",
-                remediation_hint=(
-                    "Review HWPX tables, captions, notes, images, and merged cells flagged by the parser before approval."
-                    if self._has_parser_review_flags(blocks)
-                    else ""
-                ),
+                risk_level="low" if not needs_review else "medium",
+                flags=flags,
+                confidence=0.92 if not needs_review else 0.82,
+                recommendation=recommendation,
+                remediation_hint=remediation_hint,
             ),
         )
 
