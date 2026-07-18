@@ -507,7 +507,14 @@ def _emit_report(report: dict[str, Any], out_json: Path | None) -> None:
     if out_json:
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(output + "\n", encoding="utf-8")
-    print(output)
+    try:
+        print(output)
+    except UnicodeEncodeError:
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is None:
+            raise
+        buffer.write((output + "\n").encode("utf-8"))
+        buffer.flush()
 
 
 if __name__ == "__main__":

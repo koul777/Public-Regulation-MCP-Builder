@@ -2934,7 +2934,7 @@ function Show-ChatGptHttps {
   }
   Write-Host ""
   Write-Host "Start the data-only MCP server with:"
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'run_chatgpt_data_server.ps1'))`""
+  Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}"' -f (BundlePath "run_chatgpt_data_server.ps1"))
   Write-Host ""
   Write-Host "Then open ChatGPT Settings > Apps/Connectors > Create and register the connector URL."
   Write-Host "Set MCP_AUTH_TOKEN in the approved runtime environment before starting the HTTP endpoint."

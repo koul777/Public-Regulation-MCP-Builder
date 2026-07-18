@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -423,6 +424,7 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(Path(captured["argv"][2]), shim)
         self.assertEqual(captured["argv"][-3:], ["--format", "json", "--silent"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX command invocation test")
     def test_parse_file_runs_resolved_binary_directly_off_windows(self) -> None:
         # On POSIX (or when the resolved command is a real binary) no cmd.exe wrapper.
         from types import SimpleNamespace
