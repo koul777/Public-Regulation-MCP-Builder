@@ -68,6 +68,28 @@ class TextNormalizerTests(unittest.TestCase):
             repaired.splitlines(),
         )
 
+    def test_single_line_page_edge_is_not_double_counted_as_repeated_header(self) -> None:
+        def page(text: str) -> ParsedPage:
+            return ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])
+
+        # "협의체 운영세칙" appears on only 2 of 6 pages (below the threshold of 3),
+        # but each is a single-line page whose only line is both first and last.
+        pages = [
+            page("협의체 운영세칙"),
+            page("제1조 본문내용 여기"),
+            page("제2조 다른내용 여기"),
+            page("협의체 운영세칙"),
+            page("제3조 또다른내용"),
+            page("제4조 마지막내용"),
+        ]
+        parsed = ParsedDocument(
+            document_id="doc", source_file="x.md", file_type="text", pages=pages, raw_text=""
+        )
+
+        repeated = TextNormalizer()._repeated_edge_lines(parsed)
+
+        self.assertNotIn("협의체 운영세칙", repeated)
+
     def test_removes_simple_page_footer_lines(self) -> None:
         text = "제1조(목적) 본문\n- 12 -\n다음 문장"
         normalizer = TextNormalizer()
