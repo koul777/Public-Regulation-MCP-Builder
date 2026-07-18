@@ -988,21 +988,19 @@ def _render_operator_project_dialog(page: str) -> None:
             st.error(str(exc))
 
     projects = _list_operator_projects(projects_dir=projects_dir) if projects_dir is not None else []
-    project_by_path: dict[str, dict[str, object]] = {}
+    project_path_by_option: dict[str, str] = {}
     for project in projects:
-        project_path = Path(str(project.get("_path") or "")).expanduser()
-        for path_text in {str(project_path), str(project_path.resolve())}:
-            if path_text:
-                project_by_path[path_text] = project
-    project_options = list(project_by_path)
-    selected_project_path = st.selectbox(
+        project_path = str(project.get("_path") or "")
+        if not project_path:
+            continue
+        project_option = f"{project.get('project_name')} · {project.get('saved_at')}"
+        project_path_by_option[project_option] = project_path
+    selected_project_option = st.selectbox(
         "저장한 프로젝트",
-        options=[""] + project_options,
+        options=[""] + list(project_path_by_option),
         key=f"load-operator-project-choice-{control_key}",
-        format_func=lambda value: "선택하세요" if not value else (
-            f"{project_by_path[value].get('project_name')} · {project_by_path[value].get('saved_at')}"
-        ),
     )
+    selected_project_path = project_path_by_option.get(selected_project_option, "")
     if st.button(
         "저장한 프로젝트 불러오기",
         key=f"load-operator-project-{control_key}",

@@ -256,7 +256,8 @@ class StreamlitApprovalAppTests(unittest.TestCase):
                 },
             )
             project_payload = json.loads(project_files[0].read_text(encoding="utf-8"))
-            next(item for item in app.selectbox if item.label == "저장한 프로젝트").select(str(project_files[0])).run()
+            project_selector = next(item for item in app.selectbox if item.label == "저장한 프로젝트")
+            project_selector.select(project_selector.options[1]).run()
             next(item for item in app.button if item.label == "저장한 프로젝트 불러오기").click().run()
             loaded_project_name = app.session_state["operator_project_name"]
 
