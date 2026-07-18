@@ -349,7 +349,13 @@ class TableExtractor:
             if inline_role:
                 flush()
                 current_role = inline_role
-                current_parts = [row[len(inline_role) :].strip()]
+                # The role was matched on the space-stripped row, so slice it off
+                # the raw row with a spacing-tolerant pattern instead of len(role);
+                # otherwise "교 수 ..." leaks a stray "수" into the value.
+                role_pattern = re.compile(r"\s*".join(re.escape(char) for char in inline_role))
+                role_match = role_pattern.match(row)
+                remainder = row[role_match.end() :] if role_match else row[len(inline_role) :]
+                current_parts = [remainder.strip()]
                 continue
             if not current_role or self._looks_like_table_caption_or_note_row(row):
                 continue

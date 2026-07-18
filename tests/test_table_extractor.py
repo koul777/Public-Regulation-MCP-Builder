@@ -725,6 +725,19 @@ class TableExtractorTests(unittest.TestCase):
         self.assertEqual(records[0]["record"]["금액"], "100")
         self.assertEqual(records[0]["record"]["금액 (2)"], "200")
 
+    def test_qualification_inline_role_with_spaces_does_not_leak_into_value(self) -> None:
+        rows = [
+            "구분 자격",
+            "교 수 1. 박사학위 소지자",
+            "부교수 1. 박사학위 소지 후 3년",
+            "조교수 1. 석사학위 소지자",
+        ]
+
+        records = TableExtractor()._extract_qualification_rows(rows, ("교수", "부교수", "조교수"))
+
+        cells = [record["cells"] for record in records]
+        self.assertIn(["교수", "1. 박사학위 소지자"], cells)
+
     def test_delegation_outline_conditions_are_structured(self) -> None:
         text = "\n".join(
             [
