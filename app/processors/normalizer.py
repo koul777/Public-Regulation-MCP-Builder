@@ -96,8 +96,8 @@ class TextNormalizer:
         for page in parsed.pages:
             lines = [line.strip() for block in page.blocks for line in block.text.splitlines() if line.strip()]
             if lines:
-                edges.extend(lines[:1])
-                edges.extend(lines[-1:])
+                # dedupe so a single-line page (first line == last line) counts once
+                edges.extend(dict.fromkeys([*lines[:1], *lines[-1:]]))
         counts = Counter(edges)
         threshold = max(3, len(parsed.pages) // 2)
         return {line for line, count in counts.items() if count >= threshold and not self._looks_like_structure(line)}
