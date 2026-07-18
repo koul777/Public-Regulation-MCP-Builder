@@ -327,7 +327,8 @@ def write_mcp_setup_bundle(
                 preferred_project_root=preferred_project_root,
             )
         path = output_dir / SETUP_BUNDLE_FILES[key]
-        path.write_text(text.rstrip() + "\n", encoding="utf-8")
+        encoding = "utf-8-sig" if path.suffix.lower() == ".ps1" else "utf-8"
+        path.write_text(text.rstrip() + "\n", encoding=encoding)
         files[key] = str(path)
 
     write_json("full_config", json_config)
