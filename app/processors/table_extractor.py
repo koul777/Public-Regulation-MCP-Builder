@@ -1121,11 +1121,11 @@ class TableExtractor:
         cells = [cell.strip() for cell in re.split(r"\s{2,}", row) if cell.strip()]
         if len(cells) >= 2:
             return cells
+        if self._looks_like_time_schedule_row(row):
+            return row.split()
         colon_cells = self._split_colon_label_row(row)
         if len(colon_cells) >= 2:
             return colon_cells
-        if self._looks_like_time_schedule_row(row):
-            return row.split()
         retention_cells = self._split_retention_period_row(row)
         if len(retention_cells) >= 2:
             return retention_cells

@@ -707,6 +707,13 @@ class TableExtractorTests(unittest.TestCase):
         self.assertEqual(analysis["table_records"][0]["record"]["기준"], "1억원 미만")
         self.assertEqual(analysis["table_records"][0]["record"]["값"], "3명 이상")
 
+    def test_time_schedule_row_is_not_split_at_the_clock_colon(self) -> None:
+        extractor = TableExtractor()
+
+        self.assertEqual(extractor._split_row("월 09:00 ~ 18:00"), ["월", "09:00", "~", "18:00"])
+        # A genuine "label : value" row must still split on the colon.
+        self.assertEqual(extractor._split_row("근무형태 : 시간선택제"), ["근무형태", "시간선택제"])
+
     def test_delegation_outline_conditions_are_structured(self) -> None:
         text = "\n".join(
             [
