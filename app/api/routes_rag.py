@@ -79,7 +79,8 @@ _RAG_VECTOR_RECORD_CACHE: dict[Path, tuple[_FileIdentitySignature, list[dict[str
 _RAG_BM25_INDEX_CACHE: dict[Path, tuple[_FileIdentitySignature, Any]] = {}
 _RAG_REBUILT_BM25_INDEX_CACHE: dict[Path, tuple[_FileIdentitySignature, str, Any]] = {}
 _RAG_VISIBLE_RECORDS_CACHE_LOCK = threading.Lock()
-_RAG_VISIBLE_RECORDS_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+_RAG_VISIBLE_RECORDS_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
+_RAG_VISIBLE_RECORDS_MAX_ENTRIES = 512
 _RAG_VECTOR_SOURCE_HASH_CACHE: dict[Path, tuple[_FileIdentitySignature, str]] = {}
 _RAG_REPOSITORY_DOCUMENT_SIGNATURE_CACHE: dict[
     tuple[Path, tuple[str, ...]],
@@ -503,6 +504,7 @@ def load_visible_records(
     with _RAG_VISIBLE_RECORDS_CACHE_LOCK:
         cached = _RAG_VISIBLE_RECORDS_CACHE.get(cache_key)
         if cached is not None:
+            _RAG_VISIBLE_RECORDS_CACHE.move_to_end(cache_key)
             return list(cached)
     visible_records = [
         record
@@ -528,6 +530,10 @@ def load_visible_records(
         )
     with _RAG_VISIBLE_RECORDS_CACHE_LOCK:
         _RAG_VISIBLE_RECORDS_CACHE[cache_key] = list(visible_records)
+        _RAG_VISIBLE_RECORDS_CACHE.move_to_end(cache_key)
+        entry_limit = max(1, int(_RAG_VISIBLE_RECORDS_MAX_ENTRIES))
+        while len(_RAG_VISIBLE_RECORDS_CACHE) > entry_limit:
+            _RAG_VISIBLE_RECORDS_CACHE.popitem(last=False)
     return visible_records
 
 

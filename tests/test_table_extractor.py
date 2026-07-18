@@ -714,6 +714,17 @@ class TableExtractorTests(unittest.TestCase):
         # A genuine "label : value" row must still split on the colon.
         self.assertEqual(extractor._split_row("근무형태 : 시간선택제"), ["근무형태", "시간선택제"])
 
+    def test_table_records_preserve_values_under_duplicate_headers(self) -> None:
+        cell_rows = [
+            {"row_index": 0, "cells": ["구분", "금액", "금액"]},
+            {"row_index": 1, "cells": ["항목A", "100", "200"]},
+        ]
+
+        records = TableExtractor()._table_records(cell_rows)
+
+        self.assertEqual(records[0]["record"]["금액"], "100")
+        self.assertEqual(records[0]["record"]["금액 (2)"], "200")
+
     def test_delegation_outline_conditions_are_structured(self) -> None:
         text = "\n".join(
             [

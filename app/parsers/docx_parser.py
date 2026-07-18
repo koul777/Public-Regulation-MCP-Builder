@@ -77,7 +77,15 @@ class DocxParser(BaseParser):
     def _table_text(self, table: Any) -> str:
         rows: list[str] = []
         for row in table.rows:
-            cells = [self._cell_text(cell.text) for cell in row.cells]
+            cells: list[str] = []
+            previous_tc = None
+            for cell in row.cells:
+                # A cell merged across grid columns is yielded once per column
+                # by python-docx, all sharing the same underlying <w:tc>.
+                if cell._tc is previous_tc:
+                    continue
+                previous_tc = cell._tc
+                cells.append(self._cell_text(cell.text))
             row_text = " | ".join(cells).strip()
             if row_text:
                 rows.append(row_text)

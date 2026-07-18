@@ -1041,6 +1041,21 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertEqual([node.metadata.get("paragraph_label") for node in paragraphs], ["시행일", "경과 조치"])
         self.assertEqual([node.title for node in paragraphs], ["시행일", "경과 조치"])
 
+    def test_inline_sibling_circled_paragraph_after_circled_start_is_split(self) -> None:
+        # "① … ② …" flattened onto one line are sibling 항 and must split,
+        # while a circled marker inside a □/(N) line stays inline (see
+        # test_square_bullet_hwp_paragraph_labels_are_preserved).
+        detector = StructureDetector()
+
+        self.assertEqual(
+            detector._split_inline_structure_lines("① 첫째 항 내용이다. ② 둘째 항 내용이다."),
+            ["① 첫째 항 내용이다.", "② 둘째 항 내용이다."],
+        )
+        self.assertEqual(
+            detector._split_inline_structure_lines("□ (연차휴가) ① 상임이사의 연차휴가는 연간 21일로 한다."),
+            ["□ (연차휴가) ① 상임이사의 연차휴가는 연간 21일로 한다."],
+        )
+
     def test_square_bullet_hwp_paragraph_labels_are_preserved(self) -> None:
         text = "\n".join(
             [
