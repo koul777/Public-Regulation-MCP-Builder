@@ -2876,7 +2876,7 @@ function Register-ClaudeCode {
   if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
     Write-Warning "Claude Code CLI was not found on PATH."
     Write-Host "After installing Claude Code, run:"
-    Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'claude_code_add_stdio.ps1'))`""
+    Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}"' -f (BundlePath 'claude_code_add_stdio.ps1'))
     return
   }
   Run-Script "claude_code_add_stdio.ps1"
