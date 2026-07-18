@@ -1,5 +1,13 @@
 # PR MCP Builder
 
+## v1.1.0 업데이트 내역
+
+- `/documents/{id}/chunks`와 검색 경로에서 보안등급·부서 ACL을 일관되게 적용해 상위 등급 청크가 viewer에게 노출되지 않도록 했습니다.
+- 폐지·대체 규정과 소급 개정의 효력일 처리를 fail-closed로 보강하고, 시점 조회와 현행 근거 선택의 정확도를 높였습니다.
+- HWPX 섹션 순서·실패 신호, DOCX 병합 셀, 표 헤더 중복, 시각표의 `시:분`, 원문자 항목 등 규정 문서 파싱 경계 사례를 보완했습니다.
+- Unicode 정규화, BM25/FTS 관련성 계산, RAG 가시성 캐시를 개선해 검색 결과의 일관성과 자원 사용을 높였습니다.
+- 업로드 provenance의 경로 노출과 JSON Content-Type 우회 등 공개·운영 경계의 보안 검사를 강화했습니다.
+
 ## 공공기관 규정 MCP 빌더
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&logoColor=white)](#windows-실행판)
@@ -8,7 +16,7 @@
 [![Kordoc](https://img.shields.io/badge/HWP%20표-Kordoc%20선택%20보강-6B7280)](https://github.com/chrisryugj/kordoc)
 [![승인 데이터만](https://img.shields.io/badge/색인-승인%20데이터만-15803D)](#처리-구조)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Release target](https://img.shields.io/badge/release-v1.1.0-7C3AED)](#릴리스와-버전)
+[![Release target](https://img.shields.io/badge/release-v1.1.0-7C3AED)](#릴리스-자동화와-버전)
 
 PDF, HWP, HWPX, DOCX 형식의 공공기관 규정을 **기관 → 규정 → 개정 버전 → 장·절·조문** 구조로 정리하고, 사람이 승인한 내용만 검색 색인과 MCP 응답에 포함하는 Windows용 빌더입니다.
 
@@ -329,17 +337,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows_portable.ps1 -Ver
 
 결과 파일은 `dist\PR-MCP-Builder-Windows-x64-1.1.0.zip`입니다. `data/`, `reports/`, `.tmp/`, `build/`, `dist/`, 가상환경과 실제 기관 문서는 Git에 커밋하지 않습니다.
 
-## 릴리스와 버전
+## 릴리스 자동화와 버전
 
 현재 공개 릴리스 기준은 **v1.1.0**입니다. `pyproject.toml`의 패키지 버전은 `1.1.0`으로 유지하고, GitHub 태그와 Release에는 `v1.1.0` 형식을 사용합니다.
-
-### v1.1.0 업데이트 내역
-
-- `/documents/{id}/chunks`와 검색 경로에서 보안등급·부서 ACL을 일관되게 적용해 상위 등급 청크가 viewer에게 노출되지 않도록 했습니다.
-- 폐지·대체 규정과 소급 개정의 효력일 처리를 fail-closed로 보강하고, 시점 조회와 현행 근거 선택의 정확도를 높였습니다.
-- HWPX 섹션 순서·실패 신호, DOCX 병합 셀, 표 헤더 중복, 시각표의 `시:분`, 원문자 항목 등 규정 문서 파싱 경계 사례를 보완했습니다.
-- Unicode 정규화, BM25/FTS 관련성 계산, RAG 가시성 캐시를 개선해 검색 결과의 일관성과 자원 사용을 높였습니다.
-- 업로드 provenance의 경로 노출과 JSON Content-Type 우회 등 공개·운영 경계의 보안 검사를 강화했습니다.
 
 ### main 푸시 자동 릴리스
 
