@@ -64,7 +64,7 @@ reg-rag-mcp-config `
   --include-wheel
 ```
 
-`--public-url`은 ChatGPT 원격 MCP나 Claude API처럼 원격 HTTPS MCP가 필요한 클라이언트에만 필요합니다. ChatGPT Desktop 로컬 플러그인, Codex CLI, 로컬 Claude Desktop/Claude Code만 쓸 때는 생략합니다. Streamlit 운영 화면에서는 MCP 영역의 `MCP로 쓸 파일 묶음 만들기` 버튼으로 같은 번들을 만들 수 있습니다.
+`--public-url`은 ChatGPT 원격 MCP나 Claude API처럼 원격 HTTPS MCP가 필요한 클라이언트에만 필요합니다. ChatGPT Desktop 로컬 플러그인, Codex CLI, 로컬 Claude Desktop/Claude Code만 쓸 때는 생략합니다. Claude Code의 stdio 서버는 `--scope user`로 등록되므로 같은 사용자의 프로젝트 전체에서 보입니다. Streamlit 운영 화면에서는 MCP 영역의 `MCP로 쓸 파일 묶음 만들기` 버튼으로 같은 번들을 만들 수 있습니다.
 
 Streamlit의 MCP 설정 JSON 다운로드와 `Write MCP setup bundle now`는 approved chunks, indexed status, MCP-visible records, stale vector count를 같은 기준으로 확인합니다. 준비 전 서버 명령은 draft command이며, 승인ㆍ인덱싱이 끝나기 전에는 클라이언트 연결용 산출물로 취급하지 않습니다.
 
@@ -202,7 +202,7 @@ powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_m
 
 ## 3. ChatGPT Desktop 로컬 플러그인과 Codex CLI
 
-`ChatGPT Desktop에 연결하기.bat`는 같은 이름의 기존 로컬 마켓플레이스를 제거하고 현재 번들 경로로 다시 등록한 뒤 플러그인을 설치합니다. 이어서 `codex plugin list --json`에서 새 cachebuster 버전과 공급 경로가 모두 일치하는지 확인하고 실제 stdio MCP 프로토콜 smoke를 실행합니다. 예전 경로나 `0.1.0` 같은 오래된 버전이 다시 발견되면 등록 성공으로 기록하지 않습니다. 앱을 완전히 종료하고 다시 실행한 뒤 새 대화에서 입력창의 `+` → `더 보기` → MCP 이름을 선택하거나 `@MCP이름`으로 멘션합니다. 플러그인 등록 완료와 현재 대화의 도구 첨부는 별개입니다.
+`ChatGPT Desktop에 연결하기.bat`는 같은 이름의 기존 로컬 마켓플레이스를 제거하고 현재 번들 경로로 다시 등록한 뒤 플러그인을 설치합니다. 설치가 겹치면 MCP별 잠금으로 직렬화하고, 등록 직후 마켓플레이스 인식이 늦으면 최대 3회 재시도합니다. 플러그인은 공식 구조인 `.codex-plugin/plugin.json` → `./.mcp.json`과 `.mcp.json`의 `mcp_servers` 컨테이너를 사용합니다. 이어서 `codex plugin list --json`에서 새 cachebuster 버전과 공급 경로가 모두 일치하는지 확인하고 실제 stdio MCP 프로토콜 smoke를 실행합니다. 예전 경로나 `0.1.0` 같은 오래된 버전이 다시 발견되면 등록 성공으로 기록하지 않습니다. 앱을 완전히 종료하고 다시 실행한 뒤 Plugins를 새로고침하고, 새 대화에서 입력창의 `+` → `더 보기` → MCP 이름을 선택하거나 `@MCP이름`으로 멘션합니다. 플러그인 등록 완료와 현재 대화의 도구 첨부는 별개입니다.
 
 ChatGPT 대화 화면이 로컬 stdio 플러그인을 노출하지 않는 제품 구성에서는 아래의 `chatgpt-remote` HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다. `Codex 플러그인 MCP 입력값.txt`는 Codex CLI 수동 호환 설정용이며, Codex CLI는 `Codex에 연결하기.bat`를 사용합니다.
 
@@ -252,7 +252,7 @@ python scripts\run_mcp_client_config_smoke.py `
 
 ## 5. Claude Code
 
-로컬 stdio 연결은 이 파일 하나로 등록합니다.
+로컬 stdio 연결은 이 파일 하나로 사용자 범위(`--scope user`)에 등록합니다. 스크립트는 예전 생성기가 만든 같은 이름의 local 항목과 기존 user 항목을 정리하고 다시 등록한 뒤 `claude mcp get`으로 확인합니다. 따라서 생성 폴더 밖에서 Claude Code를 시작해도 같은 사용자에게 보입니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/claude_code_add_stdio.ps1

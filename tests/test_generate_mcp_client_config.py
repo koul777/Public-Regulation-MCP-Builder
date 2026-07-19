@@ -197,7 +197,10 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertEqual(config["chatgpt_remote"]["connector_url"], "https://mcp.example.go.kr/mcp")
         self.assertEqual(config["claude_api"]["mcp_servers"][0]["url"], "https://mcp.example.go.kr/mcp")
         self.assertEqual(config["quickstart"]["claude_code"]["command"], "claude")
-        self.assertEqual(config["quickstart"]["claude_code"]["args"][:3], ["mcp", "add-json", "aks_mcp"])
+        self.assertEqual(
+            config["quickstart"]["claude_code"]["args"][:7],
+            ["mcp", "add", "--transport", "stdio", "--scope", "user", "aks_mcp"],
+        )
         claude_desktop_args = config["claude_desktop"]["mcpServers"]["aks_mcp"]["args"]
         claude_code_args = config["claude_code"]["args"]
         self.assertIn("--no-warm-cache", claude_desktop_args)
@@ -226,7 +229,10 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertEqual("full", config["quickstart"]["run_chatgpt_data_server"]["tool_profile"])
         self.assertIn("--no-warm-cache", config["quickstart"]["run_chatgpt_data_server"]["args"])
         self.assertIn("copy_paste", config["quickstart"])
-        self.assertIn("claude mcp add-json", config["quickstart"]["copy_paste"]["claude_code_stdio_ps"])
+        self.assertIn(
+            '$ClaudeAddArgs = @("mcp", "add", "--transport", "stdio", "--scope", "user"',
+            config["quickstart"]["copy_paste"]["claude_code_stdio_ps"],
+        )
         self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["claude_code_stdio_ps"])
         self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["run_local_stdio_server_ps"])
         self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["run_http_server_ps"])
@@ -384,7 +390,11 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 self.assertFalse(machine_path.read_bytes().startswith(b"\xef\xbb\xbf"), machine_path)
                 json.loads(machine_path.read_text(encoding="utf-8"))
             plugin_manifest = json.loads(plugin_manifest_path.read_text(encoding="utf-8"))
+            plugin_mcp = json.loads(plugin_mcp_path.read_text(encoding="utf-8"))
             self.assertRegex(plugin_manifest["version"], r"^0\.1\.0\+codex\.[0-9a-f]{12}$")
+            self.assertEqual("./.mcp.json", plugin_manifest["mcpServers"])
+            self.assertEqual({"govreg-local"}, set(plugin_mcp["mcp_servers"]))
+            self.assertNotIn("mcpServers", plugin_mcp)
             readme = (output_dir / "README.md").read_text(encoding="utf-8")
             readme_ko = (output_dir / "README.ko.md").read_text(encoding="utf-8")
             codex_snippet = tomllib.loads((output_dir / "codex_config_snippet.toml").read_text(encoding="utf-8"))
@@ -416,11 +426,19 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             )
             self.assertIn("install_local_package.ps1 once", stdio_launcher)
             self.assertIn(
-                "claude mcp add-json --scope local govreg-local",
+                '$ClaudeAddArgs = @("mcp", "add", "--transport", "stdio", "--scope", "user", "govreg-local"',
                 (output_dir / "claude_code_add_stdio.ps1").read_text(encoding="utf-8"),
             )
             self.assertIn(
-                'claude mcp remove "govreg-local" --scope local',
+                'Invoke-ClaudeMcpCli @("mcp", "remove", "govreg-local", "--scope", "local")',
+                (output_dir / "claude_code_add_stdio.ps1").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                'Invoke-ClaudeMcpCli @("mcp", "remove", "govreg-local", "--scope", "user")',
+                (output_dir / "claude_code_add_stdio.ps1").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                'Invoke-ClaudeMcpCli @("mcp", "get", "govreg-local")',
                 (output_dir / "claude_code_add_stdio.ps1").read_text(encoding="utf-8"),
             )
             self.assertIn(
@@ -542,7 +560,8 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertIn(str((output_dir / "data").resolve()), chatgpt_desktop_local["ui_fields"]["args"])
             chatgpt_desktop_bat = (output_dir / "ChatGPT Desktop에 연결하기.bat").read_text(encoding="utf-8")
             self.assertIn("-Target chatgpt-desktop-local -InstallChatGptDesktopPlugin", chatgpt_desktop_bat)
-            self.assertIn("+ > 더 보기 > govreg-local", chatgpt_desktop_bat)
+            self.assertIn("+ ^> 더 보기 ^> govreg-local", chatgpt_desktop_bat)
+            self.assertNotIn("+ > 더 보기 > govreg-local", chatgpt_desktop_bat)
             self.assertIn("@govreg-local MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", chatgpt_desktop_bat)
             self.assertIn("[다음 단계]", chatgpt_desktop_bat)
             self.assertIn("@govreg-local MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", chatgpt_desktop_bat)
@@ -624,8 +643,11 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertIn("function Show-ChatGptDesktop", wizard)
             self.assertIn("function Write-Utf8NoBom", wizard)
             self.assertIn("function Read-StrictUtf8Json", wizard)
-            self.assertIn("codex plugin list --json", wizard)
-            self.assertIn("codex plugin marketplace remove $PluginMarketplaceName --json", wizard)
+            self.assertIn('Invoke-CodexPluginCli @("plugin", "list", "--json")', wizard)
+            self.assertIn(
+                'Invoke-CodexPluginCli @("plugin", "marketplace", "remove", $PluginMarketplaceName, "--json")',
+                wizard,
+            )
             self.assertIn("Plugin discovery returned stale version", wizard)
             self.assertIn("Plugin discovery returned a stale marketplace source", wizard)
             self.assertIn("ChatGPT Secure MCP Tunnel", wizard)
@@ -687,8 +709,8 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             claude_code_stdio = (output_dir / "claude_code_add_stdio.ps1").read_text(encoding="utf-8")
             self.assertIn("$ClaudeCodeArgs = @(", claude_code_stdio)
             self.assertIn('$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"', claude_code_stdio)
-            self.assertIn('command = "powershell.exe"', claude_code_stdio)
-            self.assertIn("$ClaudeCodeJson = $ClaudeCodeConfig | ConvertTo-Json", claude_code_stdio)
+            self.assertIn('"--", "powershell.exe") + $LauncherArgs', claude_code_stdio)
+            self.assertIn('$ClaudeAdd = Invoke-ClaudeMcpCli $ClaudeAddArgs', claude_code_stdio)
             self.assertIn("--no-warm-cache", claude_code_stdio)
             self.assertIn(
                 "--no-warm-cache",
@@ -903,6 +925,88 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             )
             self.assertIn("Verified MCP server name and bundle paths: aks_mcp", completed.stdout)
 
+    @unittest.skipUnless(os.name == "nt", "Claude Code BAT automation test")
+    def test_claude_code_bat_ignores_missing_legacy_entries_and_verifies_user_scope(self) -> None:
+        config = build_mcp_client_config(
+            server_name="aksmcp",
+            client_profile="bundle",
+            data_dir="data",
+            tenant_id="tenant-a",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_project_root = root / "가짜 프로젝트"
+            fake_doctor = fake_project_root / "scripts" / "check_mcp_connection_readiness.py"
+            fake_doctor.parent.mkdir(parents=True)
+            fake_doctor.write_text('print("claude-code-doctor-ok")\n', encoding="utf-8")
+            bundle_dir = root / "한글 경로" / "Claude Code 번들"
+            files = write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="aksmcp",
+                preferred_python=sys.executable,
+                preferred_project_root=fake_project_root,
+            )
+            (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            claude_log = root / "claude-calls.txt"
+            (fake_bin / "claude.cmd").write_text(
+                "@echo off\r\n"
+                "echo %*>>\"%CLAUDE_TEST_LOG%\"\r\n"
+                "if \"%1 %2\"==\"mcp remove\" (\r\n"
+                "  echo No MCP server named aksmcp in requested scope 1>&2\r\n"
+                "  exit /b 1\r\n"
+                ")\r\n"
+                "if \"%1 %2\"==\"mcp add\" (\r\n"
+                "  echo Added MCP server aksmcp with user scope\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                "if \"%1 %2\"==\"mcp get\" (\r\n"
+                "  echo aksmcp: Scope: User config\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                "exit /b 2\r\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            env["PATH"] = os.pathsep.join(
+                [str(fake_bin), str(windows_dir / "System32"), str(powershell_dir)]
+            )
+            env["CLAUDE_TEST_LOG"] = str(claude_log)
+            completed = subprocess.run(
+                [
+                    str(windows_dir / "System32" / "cmd.exe"),
+                    "/d",
+                    "/c",
+                    files["connect_claude_code_bat"],
+                ],
+                cwd=root,
+                env=env,
+                input="\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertIn("claude-code-doctor-ok", completed.stdout)
+            self.assertIn("Added MCP server aksmcp with user scope", completed.stdout)
+            self.assertIn("aksmcp: Scope: User config", completed.stdout)
+            calls = claude_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any("mcp remove aksmcp --scope local" in call for call in calls))
+            self.assertTrue(any("mcp remove aksmcp --scope user" in call for call in calls))
+            self.assertTrue(
+                any("mcp add --transport stdio --scope user aksmcp -- powershell.exe" in call for call in calls)
+            )
+            self.assertTrue(any("mcp get aksmcp" in call for call in calls))
+
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop BAT automation test")
     def test_chatgpt_desktop_bat_registers_plugin_idempotently_from_korean_space_path(self) -> None:
         config = build_mcp_client_config(
@@ -955,6 +1059,18 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             (fake_bin / "codex.cmd").write_text(
                 "@echo off\r\n"
                 "echo %*>>\"%CODEX_TEST_LOG%\"\r\n"
+                "if \"%1 %2\"==\"plugin remove\" (\r\n"
+                "  echo Error: marketplace is not configured or installed 1>&2\r\n"
+                "  exit /b 9\r\n"
+                ")\r\n"
+                "if \"%1 %2 %3\"==\"plugin marketplace remove\" (\r\n"
+                "  echo Error: marketplace is not configured or installed 1>&2\r\n"
+                "  exit /b 9\r\n"
+                ")\r\n"
+                "if \"%1 %2\"==\"plugin add\" if not exist \"%CODEX_RETRY_MARKER%\" (\r\n"
+                "  type nul >\"%CODEX_RETRY_MARKER%\"\r\n"
+                "  exit /b 9\r\n"
+                ")\r\n"
                 "if \"%1 %2\"==\"plugin list\" (\r\n"
                 "  echo {\"installed\":[{\"pluginId\":\"aksmcp@aksmcp-local\",\"name\":\"aksmcp\",\"marketplaceName\":\"aksmcp-local\",\"version\":\"%CODEX_EXPECTED_VERSION%\",\"installed\":true,\"enabled\":true,\"source\":{\"source\":\"local\",\"path\":\"%CODEX_EXPECTED_PLUGIN_ROOT%\"},\"marketplaceSource\":{\"sourceType\":\"local\",\"source\":\"%CODEX_EXPECTED_MARKETPLACE_ROOT%\"}}],\"available\":[]}\r\n"
                 "  exit /b 0\r\n"
@@ -972,6 +1088,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             env["CODEX_EXPECTED_VERSION"] = plugin_manifest["version"]
             env["CODEX_EXPECTED_PLUGIN_ROOT"] = plugin_root.as_posix()
             env["CODEX_EXPECTED_MARKETPLACE_ROOT"] = marketplace_root.as_posix()
+            env["CODEX_RETRY_MARKER"] = str(root / "codex-plugin-retried")
             cmd_exe = windows_dir / "System32" / "cmd.exe"
             bat_path = Path(files["connect_chatgpt_desktop_bat"])
 
@@ -997,10 +1114,12 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 self.assertIn("bat-client-smoke-ok", completed.stdout)
                 self.assertIn("@aksmcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", completed.stdout)
             calls = codex_log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(2, sum("plugin marketplace add" in call for call in calls))
+            self.assertEqual(3, sum("plugin marketplace add" in call for call in calls))
             self.assertEqual(2, sum("plugin marketplace remove aksmcp-local" in call for call in calls))
-            self.assertEqual(2, sum("plugin add aksmcp@aksmcp-local" in call for call in calls))
+            self.assertEqual(3, sum("plugin add aksmcp@aksmcp-local" in call for call in calls))
             self.assertEqual(2, sum("plugin list --json" in call for call in calls))
+            connect_script = Path(files["connect"]).read_text(encoding="utf-8")
+            self.assertIn("System.Threading.Mutex", connect_script)
             status_path = bundle_dir / "bundle_status.json"
             self.assertFalse(status_path.read_bytes().startswith(b"\xef\xbb\xbf"))
             status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -1020,7 +1139,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             plugin_config_path = bundle_dir / "chatgpt-desktop-local-plugin" / "plugins" / "aksmcp" / ".mcp.json"
             self.assertFalse(plugin_config_path.read_bytes().startswith(b"\xef\xbb\xbf"))
             plugin_config = json.loads(plugin_config_path.read_text(encoding="utf-8"))
-            plugin_args = plugin_config["mcpServers"]["aksmcp"]["args"]
+            plugin_args = plugin_config["mcp_servers"]["aksmcp"]["args"]
             self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), plugin_args)
             self.assertIn(str((bundle_dir / "data").resolve()), plugin_args)
 
@@ -1316,8 +1435,10 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertNotIn(stale_data_dir, claude_args)
             bundle_config = json.loads((output_dir / "mcp_config.bundle.json").read_text(encoding="utf-8"))
             bundle_data_dir = str((output_dir / "data").resolve())
-            claude_code_payload = json.loads(bundle_config["quickstart"]["claude_code"]["args"][3])
-            self.assertIn(bundle_data_dir, claude_code_payload["args"])
+            claude_code_cli_args = bundle_config["quickstart"]["claude_code"]["args"]
+            self.assertIn("--scope", claude_code_cli_args)
+            self.assertIn("user", claude_code_cli_args)
+            self.assertIn(bundle_data_dir, claude_code_cli_args)
             self.assertNotIn(stale_data_dir, bundle_config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
             self.assertIn(
                 f"--data-dir {bundle_data_dir}",

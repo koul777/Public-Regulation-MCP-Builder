@@ -213,7 +213,7 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     elif client_key == "chatgpt_desktop_local":
         payload = _read_strict_utf8_json(config_path)
-        servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+        servers = payload.get("mcp_servers") if isinstance(payload, dict) else None
     else:
         raise ValueError(f"Unsupported client key: {client_key}")
     if not isinstance(servers, dict):

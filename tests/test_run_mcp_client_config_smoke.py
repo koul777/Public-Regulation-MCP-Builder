@@ -135,7 +135,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
             config.write_text(
                 json.dumps(
                     {
-                        "mcpServers": {
+                        "mcp_servers": {
                             "aksmcp": {
                                 "command": "powershell.exe",
                                 "args": ["-File", str(root / "run_mcp_stdio_server.ps1")],
@@ -180,7 +180,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
     def test_plugin_config_rejects_utf8_bom_before_process_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / ".mcp.json"
-            payload = {"mcpServers": {"aksmcp": {"command": "python", "args": []}}}
+            payload = {"mcp_servers": {"aksmcp": {"command": "python", "args": []}}}
             config.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
 
             report = run_mcp_client_config_smoke(plugin_mcp_config=config, server_name="aksmcp")
