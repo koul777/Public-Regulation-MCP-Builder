@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from scripts.run_mcp_client_config_smoke import (
     _validate_strict_jsonrpc_stdout,
+    _exception_message,
     _search_with_fallback,
     run,
     run_mcp_client_config_smoke,
@@ -19,6 +20,13 @@ from scripts.run_mcp_client_config_smoke import (
 
 
 class RunMcpClientConfigSmokeTests(unittest.TestCase):
+    def test_exception_group_message_includes_nested_cause(self) -> None:
+        message = _exception_message(ExceptionGroup("unhandled errors in a TaskGroup", [FileNotFoundError("server")]))
+
+        self.assertIn("ExceptionGroup", message)
+        self.assertIn("FileNotFoundError", message)
+        self.assertIn("server", message)
+
     def test_codex_config_uses_bundle_recommended_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

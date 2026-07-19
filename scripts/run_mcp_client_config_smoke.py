@@ -200,7 +200,7 @@ def _run_single_client_config_smoke(
             "config_encoding_verified": False,
             "strict_stdio_wire_verified": False,
             "end_to_end_verified": False,
-            "error": str(exc),
+            "error": _exception_message(exc),
         }
 
 
@@ -325,7 +325,7 @@ def _run_remote_client_smoke(
             "mcp_initialized": False,
             "tools_discovered": False,
             "end_to_end_verified": False,
-            "error": str(exc),
+            "error": _exception_message(exc),
         }
 
 
@@ -499,6 +499,16 @@ async def _search_with_fallback(
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def _exception_message(exc: BaseException) -> str:
+    """Flatten TaskGroup/ExceptionGroup errors into an actionable smoke detail."""
+    nested = getattr(exc, "exceptions", None)
+    if isinstance(nested, tuple) and nested:
+        details = [_exception_message(item) for item in nested]
+        return f"{exc.__class__.__name__}: {'; '.join(details)}"
+    message = str(exc).strip()
+    return f"{exc.__class__.__name__}: {message}" if message else exc.__class__.__name__
 
 
 def _tool_payload(result: Any) -> dict[str, Any]:
