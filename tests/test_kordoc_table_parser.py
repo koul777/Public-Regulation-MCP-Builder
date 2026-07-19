@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -355,6 +356,44 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(result["status"], "disabled")
         self.assertEqual(result["kordoc_input_extension"], ".hwpx")
         self.assertEqual(result["kordoc_timeout_seconds"], 7)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
+
+    def test_parse_file_reports_timeout_runtime_telemetry(self) -> None:
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=3,
+        )
+        timeout = subprocess.TimeoutExpired(["kordoc"], timeout=3)
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run", side_effect=timeout
+        ):
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["kordoc_input_extension"], ".hwp")
+        self.assertEqual(result["kordoc_timeout_seconds"], 3)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
+
+    def test_parse_file_reports_invalid_json_runtime_telemetry(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="not-json", stderr=""),
+        ):
+            result = KordocTableParser(settings).parse_file(Path("sample.pdf"))
+
+        self.assertEqual(result["status"], "invalid_json")
+        self.assertEqual(result["kordoc_input_extension"], ".pdf")
+        self.assertEqual(result["kordoc_timeout_seconds"], 4)
         self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
     def test_parse_file_runs_windows_cmd_shim_through_cmd_exe(self) -> None:
