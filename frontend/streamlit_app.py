@@ -1470,15 +1470,36 @@ def _powershell_command(command: str, args: list[object] | tuple[object, ...] | 
 
 def _build_mcp_http_url(*, host: str, port: int, public_url: str = "") -> str:
     """Build the client-facing Streamable HTTP /mcp URL shown in the operator UI."""
-    cleaned_public_url = public_url.strip().rstrip("/")
+    cleaned_public_url = public_url.strip()
     if cleaned_public_url:
-        if not cleaned_public_url.lower().startswith(("http://", "https://")):
-            cleaned_public_url = f"https://{cleaned_public_url}"
-        return (
+        from urllib.parse import urlsplit, urlunsplit
+
+        candidate = (
             cleaned_public_url
-            if cleaned_public_url.lower().endswith("/mcp")
-            else f"{cleaned_public_url}/mcp"
+            if "://" in cleaned_public_url
+            else f"https://{cleaned_public_url}"
         )
+        try:
+            parsed = urlsplit(candidate)
+            port_value = parsed.port
+        except ValueError:
+            return ""
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or (port_value is not None and not 1 <= port_value <= 65535)
+        ):
+            return ""
+        path = parsed.path.rstrip("/")
+        if not path:
+            path = "/mcp"
+        elif not path.endswith("/mcp"):
+            path = f"{path}/mcp"
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
 
     client_host = host.strip() or "127.0.0.1"
     if client_host in {"0.0.0.0", "::"}:

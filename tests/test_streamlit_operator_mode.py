@@ -37,6 +37,14 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             build_url(host="127.0.0.1", port=8000, public_url="https://mcp.example.go.kr/mcp/"),
             "https://mcp.example.go.kr/mcp",
         )
+        self.assertEqual(
+            build_url(host="127.0.0.1", port=8000, public_url="https://mcp.example.go.kr/base?tenant=default"),
+            "",
+        )
+        self.assertEqual(
+            build_url(host="127.0.0.1", port=8000, public_url="https://?tenant=default"),
+            "",
+        )
 
     def test_streamlit_uses_latest_four_step_navigation_and_windows_save_controls(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
