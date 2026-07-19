@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -43,6 +45,7 @@ def run_mcp_transport_smoke(
     query: str = DEFAULT_SEARCH_QUERY,
     allow_persistent_smoke_data: bool = False,
     no_warm_cache: bool = False,
+    http_bearer_token: str | None = None,
 ) -> dict[str, Any]:
     if data_dir is None:
         with tempfile.TemporaryDirectory(prefix="reg_rag_mcp_transport_smoke_") as tmp:
@@ -60,6 +63,7 @@ def run_mcp_transport_smoke(
                 query=query,
                 allow_persistent_smoke_data=False,
                 no_warm_cache=no_warm_cache,
+                http_bearer_token=http_bearer_token,
                 disposable_data_dir=True,
             )
     return _run_transport_smoke_with_data_dir(
@@ -76,6 +80,7 @@ def run_mcp_transport_smoke(
         query=query,
         allow_persistent_smoke_data=allow_persistent_smoke_data,
         no_warm_cache=no_warm_cache,
+        http_bearer_token=http_bearer_token,
         disposable_data_dir=False,
     )
 
@@ -95,11 +100,14 @@ def _run_transport_smoke_with_data_dir(
     query: str,
     allow_persistent_smoke_data: bool,
     no_warm_cache: bool,
+    http_bearer_token: str | None,
     disposable_data_dir: bool,
 ) -> dict[str, Any]:
     normalized_transport = transport.strip().lower()
     if normalized_transport not in {"stdio", "streamable-http"}:
         raise ValueError("transport must be stdio or streamable-http.")
+    if http_bearer_token and normalized_transport != "streamable-http":
+        raise ValueError("http_bearer_token is only supported with streamable-http transport.")
     if prepare:
         try:
             preparation = run_mcp_smoke(
@@ -119,6 +127,7 @@ def _run_transport_smoke_with_data_dir(
                 error=str(exc),
                 transport=normalized_transport,
                 persistent_smoke_data_opt_in=allow_persistent_smoke_data,
+                http_bearer_token=http_bearer_token,
             )
             if out_json:
                 out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +161,7 @@ def _run_transport_smoke_with_data_dir(
                 host=host,
                 port=port,
                 startup_timeout_seconds=min(timeout_seconds, 15.0),
+                http_bearer_token=http_bearer_token,
             )
         transport = asyncio.run(
             asyncio.wait_for(
@@ -190,6 +200,11 @@ def _run_transport_smoke_with_data_dir(
             and full_profile.get("history_tool_available")
             and full_profile.get("history_passed")
             and set(chatgpt_profile.get("tool_names") or []) == {"search", "fetch"}
+            and (
+                normalized_transport != "streamable-http"
+                or not http_bearer_token
+                or full_profile.get("auth_wire_verified")
+            )
         ),
         "process_started": bool(full_profile.get("process_started")),
         "mcp_initialized": bool(full_profile.get("mcp_initialized")),
@@ -207,6 +222,14 @@ def _run_transport_smoke_with_data_dir(
         },
         "full_profile": full_profile,
         "chatgpt_data_profile": chatgpt_profile,
+        "http_auth": {
+            "configured": bool(http_bearer_token) if normalized_transport == "streamable-http" else False,
+            "wire_verified": bool(
+                normalized_transport != "streamable-http"
+                or not http_bearer_token
+                or full_profile.get("auth_wire_verified")
+            ),
+        },
         "error": transport.get("error"),
     }
     if out_json:
@@ -224,6 +247,7 @@ def _preparation_failure_report(
     error: str,
     transport: str,
     persistent_smoke_data_opt_in: bool,
+    http_bearer_token: str | None,
 ) -> dict[str, Any]:
     return {
         "report_type": "mcp_transport_smoke",
@@ -248,6 +272,10 @@ def _preparation_failure_report(
         },
         "full_profile": {},
         "chatgpt_data_profile": {},
+        "http_auth": {
+            "configured": bool(http_bearer_token) if transport == "streamable-http" else False,
+            "wire_verified": False if http_bearer_token and transport == "streamable-http" else True,
+        },
         "error": error,
     }
 
@@ -297,6 +325,7 @@ async def _run_streamable_http_client_checks(
     host: str,
     port: int | None,
     startup_timeout_seconds: float,
+    http_bearer_token: str | None,
 ) -> dict[str, Any]:
     full_profile = await _call_streamable_http_profile(
         data_dir=data_dir,
@@ -309,6 +338,7 @@ async def _run_streamable_http_client_checks(
         host=host,
         port=port,
         startup_timeout_seconds=startup_timeout_seconds,
+        http_bearer_token=http_bearer_token,
     )
     chatgpt_data_profile = await _call_streamable_http_profile(
         data_dir=data_dir,
@@ -321,6 +351,7 @@ async def _run_streamable_http_client_checks(
         host=host,
         port=port,
         startup_timeout_seconds=startup_timeout_seconds,
+        http_bearer_token=http_bearer_token,
     )
     return {
         "passed": bool(full_profile.get("passed") and chatgpt_data_profile.get("passed")),
@@ -389,6 +420,7 @@ async def _call_streamable_http_profile(
     host: str,
     port: int | None,
     startup_timeout_seconds: float,
+    http_bearer_token: str | None,
 ) -> dict[str, Any]:
     server_script = PROJECT_ROOT / "scripts" / "run_regulation_mcp.py"
     selected_port = port or _find_free_tcp_port(host)
@@ -417,9 +449,14 @@ async def _call_streamable_http_profile(
         server_args.append("--flat-storage")
     if no_warm_cache:
         server_args.append("--no-warm-cache")
+    process_env = os.environ.copy()
+    if http_bearer_token:
+        process_env["MCP_TRANSPORT_SMOKE_TOKEN"] = http_bearer_token
+        server_args.extend(["--http-bearer-token-env", "MCP_TRANSPORT_SMOKE_TOKEN"])
     process = subprocess.Popen(
         [sys.executable, *server_args],
         cwd=str(PROJECT_ROOT),
+        env=process_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -428,21 +465,41 @@ async def _call_streamable_http_profile(
     )
     try:
         _wait_for_tcp_port(host, selected_port, process, timeout_seconds=startup_timeout_seconds)
-        async with streamable_http_client(endpoint_url) as (read, write, get_session_id):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                profile = await _call_profile_tools(
-                    session,
-                    tool_profile=tool_profile,
-                    profile_id=profile_id,
-                    query=query,
-                    no_warm_cache=no_warm_cache,
-                    profile_started_at=profile_started_at,
+        auth_wire_verified = True
+        if http_bearer_token:
+            async with httpx.AsyncClient(timeout=startup_timeout_seconds) as unauthenticated_client:
+                unauthorized = await unauthenticated_client.get(
+                    endpoint_url,
+                    headers={"Accept": "application/json, text/event-stream"},
                 )
-                profile["server_url"] = endpoint_url
-                profile["server_port"] = selected_port
-                profile["session_id_present"] = bool(get_session_id())
-                return profile
+            auth_wire_verified = unauthorized.status_code == 401
+            http_client = httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {http_bearer_token}"},
+                timeout=startup_timeout_seconds,
+            )
+        else:
+            http_client = None
+        try:
+            client_kwargs = {"http_client": http_client} if http_client is not None else {}
+            async with streamable_http_client(endpoint_url, **client_kwargs) as (read, write, get_session_id):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    profile = await _call_profile_tools(
+                        session,
+                        tool_profile=tool_profile,
+                        profile_id=profile_id,
+                        query=query,
+                        no_warm_cache=no_warm_cache,
+                        profile_started_at=profile_started_at,
+                    )
+                    profile["server_url"] = endpoint_url
+                    profile["server_port"] = selected_port
+                    profile["session_id_present"] = bool(get_session_id())
+                    profile["auth_wire_verified"] = auth_wire_verified
+                    return profile
+        finally:
+            if http_client is not None:
+                await http_client.aclose()
     finally:
         _terminate_process(process)
 
@@ -684,6 +741,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-on-issue", action="store_true")
     parser.add_argument("--allow-persistent-smoke-data", action="store_true")
     parser.add_argument("--no-warm-cache", action="store_true")
+    parser.add_argument(
+        "--http-bearer-token-env",
+        default=None,
+        help="Environment variable containing a bearer token for authenticated streamable-http smoke.",
+    )
     return parser
 
 
@@ -706,6 +768,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         query=args.query,
         allow_persistent_smoke_data=args.allow_persistent_smoke_data,
         no_warm_cache=args.no_warm_cache,
+        http_bearer_token=os.getenv(args.http_bearer_token_env) if args.http_bearer_token_env else None,
     )
     stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     if args.fail_on_issue and not report["passed"]:

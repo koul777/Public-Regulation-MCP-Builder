@@ -5,10 +5,15 @@ import unittest
 from pathlib import Path
 
 from scripts.run_mcp_smoke import run_mcp_smoke
-from scripts.run_mcp_transport_smoke import run_mcp_transport_smoke
+from scripts.run_mcp_transport_smoke import build_parser, run_mcp_transport_smoke
 
 
 class RunMcpTransportSmokeTests(unittest.TestCase):
+    def test_cli_accepts_bearer_token_environment_selector(self) -> None:
+        args = build_parser().parse_args(["--transport", "streamable-http", "--http-bearer-token-env", "MCP_TOKEN"])
+
+        self.assertEqual(args.http_bearer_token_env, "MCP_TOKEN")
+
     def test_run_mcp_transport_smoke_passes_with_synthetic_data(self) -> None:
         report = run_mcp_transport_smoke(
             tenant_id="tenant-mcp-transport-smoke",
@@ -60,6 +65,21 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         self.assertTrue(report["full_profile"]["session_id_present"])
         self.assertEqual(set(report["chatgpt_data_profile"]["tool_names"]), {"search", "fetch"})
         self.assertTrue(report["chatgpt_data_profile"]["session_id_present"])
+
+    def test_authenticated_streamable_http_transport_verifies_bearer_wire(self) -> None:
+        report = run_mcp_transport_smoke(
+            tenant_id="tenant-mcp-authenticated-http-smoke",
+            tenant_storage_isolation=True,
+            transport="streamable-http",
+            http_bearer_token="smoke-token",
+            no_warm_cache=True,
+            timeout_seconds=30.0,
+        )
+
+        self.assertTrue(report["passed"], report.get("error"))
+        self.assertEqual(report["http_auth"], {"configured": True, "wire_verified": True})
+        self.assertTrue(report["full_profile"]["auth_wire_verified"])
+        self.assertTrue(report["full_profile"]["fetch_has_text"])
 
     def test_skip_preparation_does_not_seed_existing_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
