@@ -752,7 +752,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
             powershell_exe = windows_dir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
             env["PATH"] = os.pathsep.join(
-                [str(Path(sys.executable).parent), str(windows_dir / "System32"), str(powershell_exe.parent)]
+                [str(windows_dir / "System32"), str(powershell_exe.parent)]
             )
 
             completed = subprocess.run(
@@ -842,7 +842,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             powershell_exe = windows_dir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
             env["APPDATA"] = str(appdata_dir)
             env["PATH"] = os.pathsep.join(
-                [str(Path(sys.executable).parent), str(windows_dir / "System32"), str(powershell_exe.parent)]
+                [str(windows_dir / "System32"), str(powershell_exe.parent)]
             )
 
             completed = subprocess.run(
@@ -933,7 +933,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
             powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
             env["PATH"] = os.pathsep.join(
-                [str(fake_bin), str(Path(sys.executable).parent), str(windows_dir / "System32"), str(powershell_dir)]
+                [str(fake_bin), str(windows_dir / "System32"), str(powershell_dir)]
             )
             env["CODEX_TEST_LOG"] = str(codex_log)
             cmd_exe = windows_dir / "System32" / "cmd.exe"
@@ -1014,7 +1014,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
             powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
             env["PATH"] = os.pathsep.join(
-                [str(fake_bin), str(Path(sys.executable).parent), str(windows_dir / "System32"), str(powershell_dir)]
+                [str(fake_bin), str(windows_dir / "System32"), str(powershell_dir)]
             )
             completed = subprocess.run(
                 [str(windows_dir / "System32" / "cmd.exe"), "/d", "/c", files["connect_chatgpt_desktop_bat"]],
@@ -1070,7 +1070,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
             env["APPDATA"] = str(appdata_dir)
             env["PATH"] = os.pathsep.join(
-                [str(Path(sys.executable).parent), str(windows_dir / "System32"), str(powershell_dir)]
+                [str(windows_dir / "System32"), str(powershell_dir)]
             )
             completed = subprocess.run(
                 [str(windows_dir / "System32" / "cmd.exe"), "/d", "/c", files["connect_claude_desktop_bat"]],
