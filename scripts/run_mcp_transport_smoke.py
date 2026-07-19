@@ -15,7 +15,7 @@ from typing import Any, Sequence, TextIO
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 
@@ -391,9 +391,17 @@ async def _call_stdio_profile(
         server_args.append("--flat-storage")
     if no_warm_cache:
         server_args.append("--no-warm-cache")
+    stdio_env = get_default_environment()
+    configured_python_path = os.environ.get("PYTHONPATH")
+    if configured_python_path:
+        # mcp's safe default environment intentionally excludes PYTHONPATH. Keep
+        # that default, but preserve an explicitly configured interpreter path so
+        # smoke subprocesses use the same isolated dependency set as the caller.
+        stdio_env["PYTHONPATH"] = configured_python_path
     params = StdioServerParameters(
         command=sys.executable,
         args=server_args,
+        env=stdio_env,
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
