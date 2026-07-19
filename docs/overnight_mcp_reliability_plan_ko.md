@@ -19,7 +19,7 @@
 
 ## 현재 확인된 수용 기준
 
-- 전체 회귀: `python -m unittest discover -s tests -v` 2111개 통과, 14개 skip (178.3초).
+- 전체 회귀: `python -m unittest discover -s tests -v` 2114개 통과, 14개 skip (171.8초).
 - 깨끗한 승인 MCP bundle: readiness/index visibility 277/277, stdio와 bearer 인증 HTTP smoke 통과.
 - 계층형 SQLite 검색: BM25가 없어도 유효한 retrieval runtime으로 진단되며, 동시성 benchmark가 이를 오류로 오판하지 않음.
 - 파서: HWP 잘림/UTF-16 손실, HWPML/HWPX DTD·entity, PDF 텍스트+이미지 혼합 페이지, HWPX 비본문 XML, 짧은 구조화 표를 review 신호로 보존.
