@@ -541,6 +541,28 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertNotIn(str(root), encoded)
 
+    def test_parse_file_redacts_ascii_temp_creation_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "규정.hwp"
+            source.write_bytes(b"dummy")
+            settings = Settings(
+                data_dir=root / "data",
+                enable_kordoc_table_parser=True,
+                kordoc_table_command="kordoc",
+                kordoc_table_timeout_seconds=10,
+            )
+            with patch(
+                "app.processors.kordoc_table_parser.tempfile.TemporaryDirectory",
+                side_effect=OSError(f"SECRET_PATH:{root}"),
+            ), patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"):
+                result = KordocTableParser(settings).parse_file(source)
+
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "ascii_temp_unavailable")
+        self.assertNotIn("SECRET_PATH", encoded)
+
 
 if __name__ == "__main__":
     unittest.main()

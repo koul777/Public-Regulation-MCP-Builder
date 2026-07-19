@@ -61,7 +61,7 @@ class KordocTableParser:
                     preferred_parent=self.settings.data_dir / ".tmp" / "kordoc",
                 )
                 copied_to_ascii_path = True
-            except OSError as exc:
+            except OSError:
                 if temp_dir is not None:
                     temp_dir.cleanup()
                 return finish({
@@ -69,7 +69,10 @@ class KordocTableParser:
                     "parser": "kordoc",
                     "table_count": 0,
                     "tables": [],
-                    "error": f"ascii_temp_unavailable:{exc}",
+                    # The exception may contain an absolute local path. Keep
+                    # runtime exports and authenticated document responses
+                    # free of host-specific filesystem details.
+                    "error": "ascii_temp_unavailable",
                 })
         argv = [resolved, *parts[1:], str(run_path), "--format", "json", "--silent"]
         # Windows npm shims need an explicit shell host when launched from
