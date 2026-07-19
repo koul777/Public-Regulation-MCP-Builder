@@ -55,6 +55,7 @@ class PDFParser(BaseParser):
         pages: list[ParsedPage] = []
         raw_parts: list[str] = []
         blank_pages: list[int] = []
+        missing_content_pages: list[int] = []
         table_regions: list[dict] = []
         footnote_links: list[dict] = []
         footnote_marker_references: list[dict] = []
@@ -67,6 +68,18 @@ class PDFParser(BaseParser):
                         blocks = self._text_block_fallback(page)
                     if not blocks:
                         blank_pages.append(page_index)
+                        # A page with no extractable text may be an intentionally
+                        # blank page, or it may be a scanned/image-only page. Keep
+                        # image-only pages explicitly visible so a mixed PDF cannot
+                        # be treated as a low-risk text document.
+                        try:
+                            if page.get_images(full=True):
+                                missing_content_pages.append(page_index)
+                        except (AttributeError, TypeError, RuntimeError):
+                            # Some lightweight/fake page implementations do not
+                            # expose image inspection; uncertainty below still
+                            # records the blank page for manual review.
+                            pass
                     table_regions.extend(self._table_regions(page, page_index, blocks))
                     footnote_links.extend(self._footnote_links(page, page_index))
                     footnote_marker_references.extend(self._footnote_marker_references(page, page_index))
@@ -113,27 +126,52 @@ class PDFParser(BaseParser):
                 )["parser_uncertainty"],
             )
 
+        uncertainty_flags = ["embedded_text_extracted"]
+        remediation_hints: list[str] = []
+        recommendation = "none"
+        risk_level = "low"
+        confidence = 0.95
         if ambiguous_two_column_pages:
-            uncertainty = parser_uncertainty_metadata(
-                source="pdf",
-                risk_level="medium",
-                flags=["embedded_text_extracted", "pdf_two_column_reading_order_ambiguous"],
-                confidence=0.7,
-                recommendation="manual_review",
-                remediation_hint=(
-                    "Review two-column reading order before approval on PDF page(s): "
-                    + ", ".join(str(page_no) for page_no in ambiguous_two_column_pages)
-                    + "."
-                ),
+            uncertainty_flags.append("pdf_two_column_reading_order_ambiguous")
+            remediation_hints.append(
+                "Review two-column reading order before approval on PDF page(s): "
+                + ", ".join(str(page_no) for page_no in ambiguous_two_column_pages)
+                + "."
             )
-        else:
-            uncertainty = parser_uncertainty_metadata(
-                source="pdf",
-                risk_level="low",
-                flags=["embedded_text_extracted"],
-                confidence=0.95,
-                recommendation="none",
+            recommendation = "manual_review"
+            risk_level = "medium"
+            confidence = min(confidence, 0.7)
+        if blank_pages:
+            uncertainty_flags.append("pdf_blank_pages_detected")
+            remediation_hints.append(
+                "Review blank or image-only PDF page(s) before approval: "
+                + ", ".join(str(page_no) for page_no in blank_pages)
+                + "."
             )
+            # A mixed text/scanned document previously returned low uncertainty
+            # whenever any text was present. Require explicit review even when a
+            # blank page is intentional; this is fail-closed for OCR coverage.
+            recommendation = "review_blank_pages" if recommendation == "none" else recommendation
+            risk_level = "medium"
+            confidence = min(confidence, 0.8)
+        if missing_content_pages:
+            uncertainty_flags.append("pdf_missing_content_pages")
+            remediation_hints.append(
+                "Run OCR and review image-only PDF page(s) before approval: "
+                + ", ".join(str(page_no) for page_no in missing_content_pages)
+                + "."
+            )
+            recommendation = "review_ocr_text"
+            risk_level = "medium"
+            confidence = min(confidence, 0.72)
+        uncertainty = parser_uncertainty_metadata(
+            source="pdf",
+            risk_level=risk_level,
+            flags=uncertainty_flags,
+            confidence=confidence,
+            recommendation=recommendation,
+            remediation_hint=" ".join(remediation_hints),
+        )
 
         return ParsedDocument(
             document_id=document_id,
@@ -146,7 +184,7 @@ class PDFParser(BaseParser):
                 **uncertainty,
                 "pdf_parser_version": "layout-lines-v1",
                 "blank_pages": blank_pages,
-                "missing_content_pages": [],
+                "missing_content_pages": missing_content_pages,
                 "pdf_two_column_reading_order_ambiguous_pages": ambiguous_two_column_pages,
                 "pdf_table_regions": table_regions,
                 "pdf_footnote_links": footnote_links,

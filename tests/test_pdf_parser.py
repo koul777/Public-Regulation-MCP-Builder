@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.core.config import Settings
@@ -118,6 +120,36 @@ class PDFParserTests(unittest.TestCase):
             parsed.metadata["parser_uncertainty_flags"],
         )
         self.assertEqual([], parsed.metadata["pdf_two_column_reading_order_ambiguous_pages"])
+
+    def test_mixed_text_and_image_only_pages_emit_missing_content_review_signal(self) -> None:
+        class FakePdfDocument:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def __iter__(self):
+                return iter(
+                    [
+                        _FakePdfPage(
+                            width=600,
+                            height=800,
+                            lines=[[_fake_chars("text page", x=40, y=100)]],
+                        ),
+                        _ImageOnlyFakePdfPage(width=600, height=800),
+                    ]
+                )
+
+        fake_fitz = SimpleNamespace(open=lambda path: FakePdfDocument())
+        with patch.dict(sys.modules, {"fitz": fake_fitz}):
+            parsed = PDFParser().parse(Path("mixed.pdf"), "doc_mixed_pdf")
+
+        self.assertEqual([2], parsed.metadata["blank_pages"])
+        self.assertEqual([2], parsed.metadata["missing_content_pages"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertIn("pdf_missing_content_pages", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("review_ocr_text", parsed.metadata["parser_uncertainty_recommendation"])
 
     def test_layout_line_blocks_split_wide_two_column_lines(self) -> None:
         page = _FakePdfPage(
@@ -320,6 +352,8 @@ class _FakePdfPage:
         self._drawings = drawings or []
 
     def get_text(self, mode: str):
+        if mode == "blocks":
+            return []
         if mode != "rawdict":
             raise AssertionError(f"unexpected mode: {mode}")
         return {
@@ -343,6 +377,17 @@ class _FakePdfPage:
 
     def get_drawings(self) -> list[dict]:
         return self._drawings
+
+    def get_images(self, *, full: bool = False) -> list[tuple]:
+        return []
+
+
+class _ImageOnlyFakePdfPage(_FakePdfPage):
+    def __init__(self, *, width: float, height: float) -> None:
+        super().__init__(width=width, height=height, lines=[])
+
+    def get_images(self, *, full: bool = False) -> list[tuple]:
+        return [("image-x",)]
 
 
 def _fake_chars(text: str, *, x: float, y: float, width: float = 5.0) -> list[dict]:
