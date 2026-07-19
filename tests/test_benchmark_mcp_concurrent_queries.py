@@ -17,10 +17,11 @@ class BenchmarkMcpConcurrentQueriesTests(unittest.TestCase):
             root = Path(tmp)
             out_json = root / "concurrent.json"
             out_md = root / "concurrent.md"
-            with _patched_runtime():
+            with _patched_runtime() as mocks:
                 report = benchmark_mcp_concurrent_queries(
                     data_dir=root / "data",
                     tenant_id="tenant-demo",
+                    profile_id="profile-demo",
                     queries=["childcare", "faculty"],
                     rounds=2,
                     concurrency=2,
@@ -34,11 +35,14 @@ class BenchmarkMcpConcurrentQueriesTests(unittest.TestCase):
             json_written = out_json.is_file()
 
         self.assertTrue(report["passed"])
+        self.assertEqual("profile-demo", report["profile_id"])
         self.assertEqual(4, report["task_count"])
         self.assertEqual(4, report["summary"]["successful_count"])
         self.assertEqual(1, report["summary"]["search_result_count_min"])
         self.assertIn("MCP Concurrent Query Benchmark", markdown)
         self.assertTrue(json_written)
+        self.assertTrue(all(call.kwargs["profile_id"] == "profile-demo" for call in mocks["search_regulations"].call_args_list))
+        self.assertTrue(all(call.kwargs["profile_id"] == "profile-demo" for call in mocks["fetch_regulation"].call_args_list))
 
     def test_records_query_spec_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

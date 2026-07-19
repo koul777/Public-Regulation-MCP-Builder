@@ -27,6 +27,7 @@ def benchmark_mcp_cold_start(
     tenant_storage_isolation: bool | None = None,
     min_record_count: int | None = None,
     max_process_elapsed_ms: float | None = None,
+    require_full_warmup: bool = True,
     out_json: Path | None = None,
     out_md: Path | None = None,
 ) -> dict[str, Any]:
@@ -44,6 +45,7 @@ def benchmark_mcp_cold_start(
         measurements,
         min_record_count=min_record_count,
         max_process_elapsed_ms=max_process_elapsed_ms,
+        require_full_warmup=require_full_warmup,
     )
     blocker_count = sum(1 for item in findings if item["severity"] == "blocker")
     report = {
@@ -56,6 +58,7 @@ def benchmark_mcp_cold_start(
         "iterations": max(1, int(iterations or 1)),
         "min_record_count": min_record_count,
         "max_process_elapsed_ms": max_process_elapsed_ms,
+        "require_full_warmup": require_full_warmup,
         "summary": summary,
         "finding_count": len(findings),
         "blocking_count": blocker_count,
@@ -121,7 +124,16 @@ def _run_child_warmup(
         measurement["stdout_tail"] = _tail(completed.stdout)
         payload = {}
     measurement["warmup"] = payload
-    measurement["record_count"] = int(payload.get("record_count") or 0)
+    record_count = payload.get("record_count")
+    if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 0:
+        record_count = None
+    measurement["record_count"] = record_count
+    measurement["record_count_available"] = record_count is not None
+    measurement["warmed"] = bool(payload.get("warmed"))
+    measurement["warmup_skipped"] = bool(payload.get("skipped"))
+    measurement["skip_reason"] = payload.get("skip_reason")
+    measurement["vector_byte_count"] = payload.get("vector_byte_count")
+    measurement["warmup_max_vector_bytes"] = payload.get("warmup_max_vector_bytes")
     measurement["bm25_index_ready"] = bool(payload.get("bm25_index_ready"))
     timing = payload.get("timing_ms") if isinstance(payload.get("timing_ms"), dict) else {}
     measurement["warmup_total_elapsed_ms"] = timing.get("total_elapsed_ms")
@@ -155,8 +167,9 @@ def _summarize_measurements(measurements: list[dict[str, Any]]) -> dict[str, Any
     return {
         "measurement_count": len(measurements),
         "successful_count": sum(1 for item in measurements if int(item.get("returncode") or 0) == 0 and not item.get("parse_error")),
-        "record_count_min": min([int(item.get("record_count") or 0) for item in measurements] or [0]),
-        "record_count_max": max([int(item.get("record_count") or 0) for item in measurements] or [0]),
+        "record_count_min": min(_record_counts(measurements), default=None),
+        "record_count_max": max(_record_counts(measurements), default=None),
+        "warmup_skipped_count": sum(1 for item in measurements if item.get("warmup_skipped")),
         "process_elapsed_ms": _stats(
             [float(item["process_elapsed_ms"]) for item in measurements if isinstance(item.get("process_elapsed_ms"), (int, float))]
         ),
@@ -172,11 +185,16 @@ def _numeric_values(measurements: list[dict[str, Any]], key: str) -> list[float]
     return [float(item[key]) for item in measurements if isinstance(item.get(key), (int, float))]
 
 
+def _record_counts(measurements: list[dict[str, Any]]) -> list[int]:
+    return [int(item["record_count"]) for item in measurements if isinstance(item.get("record_count"), int)]
+
+
 def _findings(
     measurements: list[dict[str, Any]],
     *,
     min_record_count: int | None,
     max_process_elapsed_ms: float | None,
+    require_full_warmup: bool,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for item in measurements:
@@ -211,6 +229,18 @@ def _findings(
                     iteration=iteration,
                     actual_record_count=item.get("record_count"),
                     threshold_record_count=int(min_record_count),
+                )
+            )
+        if require_full_warmup and bool(item.get("warmup_skipped")):
+            findings.append(
+                _finding(
+                    "blocker",
+                    "cold-start-warmup-skipped",
+                    "Cold-start benchmark skipped full runtime warmup because the vector store exceeded the startup budget.",
+                    iteration=iteration,
+                    skip_reason=item.get("skip_reason"),
+                    vector_byte_count=item.get("vector_byte_count"),
+                    warmup_max_vector_bytes=item.get("warmup_max_vector_bytes"),
                 )
             )
         if not bool(item.get("bm25_index_ready")):
@@ -290,6 +320,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flat-storage", action="store_true")
     parser.add_argument("--min-record-count", type=int, default=None)
     parser.add_argument("--max-process-elapsed-ms", type=float, default=None)
+    parser.add_argument(
+        "--allow-lightweight-skip",
+        action="store_true",
+        help="Allow a benchmark to pass when the runtime intentionally skips full warmup for oversized vector stores.",
+    )
     parser.add_argument("--out-json", default=None)
     parser.add_argument("--out-md", default=None)
     parser.add_argument("--fail-on-threshold", action="store_true")
@@ -321,6 +356,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         tenant_storage_isolation=tenant_storage_isolation,
         min_record_count=args.min_record_count,
         max_process_elapsed_ms=args.max_process_elapsed_ms,
+        require_full_warmup=not args.allow_lightweight_skip,
         out_json=Path(args.out_json) if args.out_json else None,
         out_md=Path(args.out_md) if args.out_md else None,
     )

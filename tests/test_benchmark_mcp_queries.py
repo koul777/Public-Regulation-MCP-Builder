@@ -60,6 +60,7 @@ class BenchmarkMcpQueriesTests(unittest.TestCase):
                 report = benchmark_mcp_queries(
                     data_dir=root / "data",
                     tenant_id="tenant-demo",
+                    profile_id="profile-demo",
                     queries=["childcare leave"],
                     iterations=2,
                     out_json=out_json,
@@ -73,10 +74,13 @@ class BenchmarkMcpQueriesTests(unittest.TestCase):
 
         self.assertTrue(report["passed"])
         self.assertEqual("mcp_query_benchmark", report["report_type"])
+        self.assertEqual("profile-demo", report["profile_id"])
         self.assertEqual(2, report["summary"]["measurement_count"])
         self.assertEqual(1, report["query_count"])
         self.assertEqual(2, search_mock.call_count)
         self.assertEqual(2, fetch_mock.call_count)
+        self.assertTrue(all(call.kwargs["profile_id"] == "profile-demo" for call in search_mock.call_args_list))
+        self.assertTrue(all(call.kwargs["profile_id"] == "profile-demo" for call in fetch_mock.call_args_list))
         self.assertEqual(1, report["items"][0]["measurements"][0]["search_result_count"])
         self.assertEqual(
             {"scoring_elapsed_ms": 2.5, "trace_write_elapsed_ms": 1.25},

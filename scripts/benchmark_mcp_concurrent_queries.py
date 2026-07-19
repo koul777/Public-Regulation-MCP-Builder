@@ -32,6 +32,7 @@ def benchmark_mcp_concurrent_queries(
     *,
     data_dir: Path,
     tenant_id: str,
+    profile_id: str | None = None,
     queries: list[str] | None = None,
     query_specs: list[dict[str, Any]] | None = None,
     top_k: int = 5,
@@ -81,6 +82,7 @@ def benchmark_mcp_concurrent_queries(
                 expect_no_evidence=task["expect_no_evidence"],
                 top_k=top_k,
                 security_levels=levels,
+                profile_id=profile_id,
                 round_index=task["round"],
                 query_index=task["query_index"],
             ): task
@@ -120,6 +122,7 @@ def benchmark_mcp_concurrent_queries(
         "repo_commit": current_repo_commit(PROJECT_ROOT),
         "data_dir": str(data_dir),
         "tenant_id": tenant_id,
+        "profile_id": profile_id,
         "tenant_storage_isolation": tenant_storage_isolation,
         "security_levels": levels,
         "top_k": top_k,
@@ -157,6 +160,7 @@ def _run_query_task(
     expect_no_evidence: bool,
     top_k: int,
     security_levels: list[str],
+    profile_id: str | None,
     round_index: int,
     query_index: int,
 ) -> dict[str, Any]:
@@ -168,6 +172,7 @@ def _run_query_task(
         query=query,
         top_k=top_k,
         security_levels=security_levels,
+        profile_id=profile_id,
     )
     search_elapsed_ms = _elapsed_ms(search_started_at)
     results = search.get("results") if isinstance(search.get("results"), list) else []
@@ -177,8 +182,9 @@ def _run_query_task(
         fetch_regulation(
             settings=settings,
             auth=auth,
-            result_id=str(result.get("id") or ""),
-            security_levels=security_levels,
+                result_id=str(result.get("id") or ""),
+                security_levels=security_levels,
+                profile_id=profile_id,
         )
         for result in results
         if result.get("id")
@@ -353,6 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark concurrent approved local MCP query tasks.")
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--tenant-id", default="default")
+    parser.add_argument("--profile-id", default=None, help="Institution profile scope when a tenant has multiple profiles.")
     parser.add_argument("--query", action="append", default=[])
     parser.add_argument("--query-spec-json", default=None)
     parser.add_argument("--top-k", type=int, default=5)
@@ -385,6 +392,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
     report = benchmark_mcp_concurrent_queries(
         data_dir=Path(args.data_dir),
         tenant_id=args.tenant_id,
+        profile_id=args.profile_id,
         queries=args.query or None,
         query_specs=query_specs,
         top_k=args.top_k,

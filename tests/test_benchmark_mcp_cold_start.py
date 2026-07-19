@@ -68,6 +68,44 @@ class BenchmarkMcpColdStartTests(unittest.TestCase):
         self.assertIn("cold-start-child-failed", codes)
         self.assertIn("cold-start-bm25-index-not-ready", codes)
 
+    def test_full_warmup_requirement_blocks_lightweight_skip(self) -> None:
+        skipped = _measurement(process_elapsed=800.0)
+        skipped.update(
+            {
+                "warmup_skipped": True,
+                "skip_reason": "vector_store_exceeds_startup_warmup_budget",
+                "vector_byte_count": 70_000_000,
+                "warmup_max_vector_bytes": 64 * 1024 * 1024,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("scripts.benchmark_mcp_cold_start._run_child_warmup", return_value=skipped):
+                report = benchmark_mcp_cold_start(
+                    data_dir=root / "data",
+                    tenant_id="tenant-demo",
+                    iterations=1,
+                )
+
+        self.assertFalse(report["passed"])
+        self.assertIn("cold-start-warmup-skipped", {item["code"] for item in report["findings"]})
+
+    def test_lightweight_skip_can_be_explicitly_allowed(self) -> None:
+        skipped = _measurement(process_elapsed=800.0)
+        skipped["warmup_skipped"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("scripts.benchmark_mcp_cold_start._run_child_warmup", return_value=skipped):
+                report = benchmark_mcp_cold_start(
+                    data_dir=root / "data",
+                    tenant_id="tenant-demo",
+                    iterations=1,
+                    require_full_warmup=False,
+                )
+
+        self.assertTrue(report["passed"])
+        self.assertFalse(report["require_full_warmup"])
+
     def test_child_warmup_mode_writes_json(self) -> None:
         stdout = io.StringIO()
         with (

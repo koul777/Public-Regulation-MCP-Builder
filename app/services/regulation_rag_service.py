@@ -121,6 +121,8 @@ def search_records(*, query: RegulationQuery, auth, settings):
         auth,
         enabled=True,
     )
+    timing_ms["approval_snapshot_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    step_started_at = time.perf_counter()
     visible_records = routes_rag.load_visible_records(
         request=request,
         auth=auth,
