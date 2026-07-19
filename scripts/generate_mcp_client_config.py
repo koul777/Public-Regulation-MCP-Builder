@@ -12,7 +12,7 @@ import sys
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -4094,7 +4094,6 @@ def _chatgpt_connector_config(
                     tenant_storage_isolation=tenant_storage_isolation,
                 )
                 + ["--host", host, "--port", str(int(port))]
-                + ["--tool-profile", "full"]
                 + _http_auth_args(remote_auth_token_env)
                 + _auth_issuer_args(public_url)
             ),
@@ -4322,8 +4321,12 @@ def _claude_api_connector_config(
 
 def _connector_url(*, host: str, port: int, public_url: str | None) -> str:
     if public_url:
-        cleaned = public_url.strip().rstrip("/")
-        return cleaned if cleaned.endswith("/mcp") else f"{cleaned}/mcp"
+        normalized = _remote_connector_url(public_url=public_url)
+        if normalized is None:
+            raise ValueError(
+                "public_url must be a valid HTTP(S) URL with a hostname and no query or fragment."
+            )
+        return normalized
     client_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     return f"http://{client_host}:{int(port)}/mcp"
 
@@ -4331,10 +4334,31 @@ def _connector_url(*, host: str, port: int, public_url: str | None) -> str:
 def _remote_connector_url(*, public_url: str | None) -> str | None:
     if not public_url:
         return None
-    cleaned = public_url.strip().rstrip("/")
+    cleaned = public_url.strip()
     if not cleaned:
         return None
-    return cleaned if cleaned.endswith("/mcp") else f"{cleaned}/mcp"
+    try:
+        parsed = urlsplit(cleaned)
+        # Accessing ``port`` validates malformed/non-numeric ports.
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        return None
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/mcp"
+    elif not path.endswith("/mcp"):
+        path = f"{path}/mcp"
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
 
 
 def _auth_issuer_args(public_url: str | None) -> list[str]:

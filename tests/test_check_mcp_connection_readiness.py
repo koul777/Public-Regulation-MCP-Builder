@@ -139,6 +139,27 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertTrue(report["remote_probe"]["performed"])
         self.assertIn("public-url-probe-failed", codes)
 
+    def test_malformed_public_url_blocks_remote_configuration(self) -> None:
+        for public_url in ("https://", "https://?tenant=default", "https://mcp.example.go.kr/mcp?tenant=default"):
+            with self.subTest(public_url=public_url), patch.dict(
+                os.environ,
+                {"MCP_AUTH_TOKEN": "token"},
+                clear=True,
+            ):
+                report = check_mcp_connection_readiness(
+                    client_profile="chatgpt-remote",
+                    transport="streamable-http",
+                    host="0.0.0.0",
+                    public_url=public_url,
+                    check_data=False,
+                    check_cli=False,
+                )
+
+            codes = {finding["code"] for finding in report["findings"]}
+            self.assertFalse(report["passed"])
+            self.assertIn("public-url-invalid", codes)
+            self.assertIsNone(report["remote_probe"]["url"])
+
     def test_openai_tunnel_allows_chatgpt_with_stdio_and_tunnel_warnings(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             report = check_mcp_connection_readiness(
