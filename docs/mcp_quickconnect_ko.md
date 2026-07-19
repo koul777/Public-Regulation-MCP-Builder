@@ -26,7 +26,7 @@ PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 ChatGPT Desktop 로
 - `desktop_tool_scan_verified`: ChatGPT Desktop 도구 scan에서 MCP 도구 노출 확인
 - `conversation_attachment_verified`: 현재 대화에서 플러그인 도구 첨부 확인
 - `conversation_attachment_unverified`: 현재 대화의 플러그인 선택/멘션은 아직 제품 UI에서 확인되지 않음
-- `end_to_end_verified`: `initialize`, `tools/list`, `get_index_status`가 모두 성공함
+- `end_to_end_verified`: local/full은 `initialize`, `tools/list`, `get_index_status`; 외부 `chatgpt-data`는 `initialize`, `tools/list`, `search`, `fetch` 계약이 모두 성공함
 
 ## 용어 정리
 
@@ -262,13 +262,13 @@ powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/claude_co
 
 ## 6. ChatGPT 원격 HTTPS
 
-이 절차는 위의 ChatGPT Desktop 로컬 플러그인과 별개입니다. ChatGPT Apps/Connectors는 ChatGPT에서 접근 가능한 인증된 HTTPS `/mcp` endpoint가 필요하며 localhost에 직접 연결하지 않습니다. 생성된 `chatgpt-remote` 프로필은 연결 검증을 위해 `get_index_status`를 포함한 전체 읽기 전용 도구를 명시적으로 노출합니다. 외부 connector 응답에는 `source_record_id`, `source_file_id`, `approval_review_batch_manifest_path` 같은 내부 운영 metadata가 포함되면 안 됩니다.
+이 절차는 위의 ChatGPT Desktop 로컬 플러그인과 별개입니다. ChatGPT Apps/Connectors는 ChatGPT에서 접근 가능한 인증된 HTTPS `/mcp` endpoint가 필요하며 localhost에 직접 연결하지 않습니다. 생성된 `chatgpt-remote` 프로필은 외부 응답 경계를 위해 `chatgpt-data` 프로필(search/fetch)만 명시적으로 노출합니다. 외부 connector 응답에는 `source_record_id`, `source_file_id`, `approval_review_batch_manifest_path` 같은 내부 운영 metadata가 포함되면 안 됩니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/run_chatgpt_data_server.ps1
 ```
 
-ChatGPT Settings > Apps/Connectors > Create에서 앱 이름을 프로그램에서 입력한 MCP 이름으로 지정하고 `chatgpt_connector.json`의 `connector_url`을 등록합니다. `Scan tools`에서 `get_index_status`를 확인하고 `Create`를 승인합니다. ChatGPT Desktop을 완전히 재시작한 뒤 새 대화에서 해당 앱을 선택하거나 `@MCP이름`으로 호출합니다. 현재 대화에서 보이지 않으면 입력창의 `+` → `더 보기` → MCP 이름을 선택합니다.
+ChatGPT Settings > Apps/Connectors > Create에서 앱 이름을 프로그램에서 입력한 MCP 이름으로 지정하고 `chatgpt_connector.json`의 `connector_url`을 등록합니다. `Scan tools`에서 `search`와 `fetch`를 확인하고 `Create`를 승인합니다. `get_index_status` 같은 내부 진단은 로컬/full 프로필에서만 실행합니다. ChatGPT Desktop을 완전히 재시작한 뒤 새 대화에서 해당 앱을 선택하거나 `@MCP이름`으로 호출합니다. 현재 대화에서 보이지 않으면 입력창의 `+` → `더 보기` → MCP 이름을 선택합니다.
 
 배포된 HTTPS endpoint 자체는 다음 스크립트로 검증합니다. 이 스크립트가 성공해도 ChatGPT 대화 첨부와 Apps의 도구 scan 상태는 별도입니다.
 

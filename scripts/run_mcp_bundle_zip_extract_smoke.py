@@ -4,8 +4,10 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -28,6 +30,7 @@ def run_mcp_bundle_zip_extract_smoke(
     server_name: str = "regulation_mcp",
     timeout_seconds: float = 60.0,
     overwrite: bool = False,
+    require_console_scripts: bool = False,
 ) -> dict[str, Any]:
     # The installed console script can run from any working directory while
     # ``PROJECT_ROOT`` points inside site-packages.  Resolve operator-provided
@@ -41,8 +44,18 @@ def run_mcp_bundle_zip_extract_smoke(
             raise FileExistsError(f"Extract dir already exists: {target_dir}. Pass --overwrite to replace it.")
         _safe_remove_dir(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(target_dir)
+    _extract_archive_safely(zip_path, target_dir)
+
+    required_console_scripts = (
+        "reg-rag-mcp-client-config-smoke",
+        "reg-rag-mcp-server",
+    )
+    console_script_resolution = {
+        name: shutil.which(name) for name in required_console_scripts
+    }
+    missing_console_scripts = [
+        name for name, resolved in console_script_resolution.items() if not resolved
+    ]
 
     script_path = target_dir / "validate_client_config_smoke.ps1"
     powershell = _powershell_command()
@@ -82,7 +95,17 @@ def run_mcp_bundle_zip_extract_smoke(
         "client_smoke_report": str(client_smoke_path),
         "client_smoke_passed": bool(client_smoke.get("passed")),
         "path_checks": path_checks,
-        "passed": bool(completed.returncode == 0 and client_smoke.get("passed") and path_checks.get("passed")),
+        "required_console_scripts": list(required_console_scripts),
+        "console_script_resolution": console_script_resolution,
+        "missing_console_scripts": missing_console_scripts,
+        "require_console_scripts": bool(require_console_scripts),
+        "environment_checks_passed": not (require_console_scripts and missing_console_scripts),
+        "passed": bool(
+            completed.returncode == 0
+            and client_smoke.get("passed")
+            and path_checks.get("passed")
+            and not (require_console_scripts and missing_console_scripts)
+        ),
     }
     if out_json is not None:
         out_path = Path(out_json)
@@ -98,6 +121,55 @@ def _safe_remove_dir(path: Path) -> None:
     if len(resolved.parts) < 4:
         raise ValueError(f"Refusing to remove shallow directory: {path}")
     shutil.rmtree(resolved)
+
+
+def _extract_archive_safely(
+    archive_path: Path,
+    destination: Path,
+    *,
+    max_entries: int = 2048,
+    max_entry_bytes: int = 64 * 1024 * 1024,
+    max_total_bytes: int = 256 * 1024 * 1024,
+) -> None:
+    """Extract only regular, bounded members into the requested directory."""
+    destination = destination.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        members = archive.infolist()
+        if len(members) > max_entries:
+            raise ValueError(f"Bundle archive has too many entries: {len(members)} > {max_entries}.")
+        total_bytes = 0
+        for member in members:
+            posix_name = PurePosixPath(member.filename)
+            windows_name = PureWindowsPath(member.filename)
+            if (
+                not member.filename
+                or posix_name.is_absolute()
+                or windows_name.is_absolute()
+                or ".." in posix_name.parts
+                or ".." in windows_name.parts
+                or "\x00" in member.filename
+                or (windows_name.drive and windows_name.drive != "")
+            ):
+                raise ValueError(f"Unsafe bundle archive member: {member.filename}")
+            mode = (member.external_attr >> 16) & 0o170000
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"Symlink bundle archive member is not allowed: {member.filename}")
+            if member.file_size > max_entry_bytes:
+                raise ValueError(
+                    f"Bundle archive member is too large: {member.filename} ({member.file_size} bytes)."
+                )
+            total_bytes += member.file_size
+            if total_bytes > max_total_bytes:
+                raise ValueError(f"Bundle archive exceeds the uncompressed size limit ({max_total_bytes} bytes).")
+            target = (destination / Path(*posix_name.parts)).resolve()
+            if target != destination and destination not in target.parents:
+                raise ValueError(f"Bundle archive member escapes extraction directory: {member.filename}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member, "r") as source, target.open("wb") as sink:
+                shutil.copyfileobj(source, sink, length=1024 * 1024)
 
 
 def _powershell_command() -> str | None:
@@ -224,6 +296,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--out-json", default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--require-console-scripts",
+        action="store_true",
+        help="Fail unless the client smoke and server console scripts resolve from the active environment.",
+    )
     parser.add_argument("--fail-on-issue", action="store_true")
     return parser
 
@@ -241,6 +318,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
             timeout_seconds=args.timeout_seconds,
             out_json=args.out_json,
             overwrite=args.overwrite,
+            require_console_scripts=args.require_console_scripts,
         )
     except Exception as exc:
         report = {
