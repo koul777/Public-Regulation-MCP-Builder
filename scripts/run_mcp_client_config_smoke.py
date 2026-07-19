@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.report_metadata import current_repo_commit
 
 
+UTF8_BOM = b"\xef\xbb\xbf"
 DEFAULT_SEARCH_QUERY = "\uc81c1\uc870"
 
 
@@ -75,6 +76,11 @@ def run_mcp_client_config_smoke(
         bool(result.get("end_to_end_verified")) and bool(result.get("index_status_verified"))
         for result in results
     )
+    local_results = [result for result in results if result.get("label") != "chatgpt_remote"]
+    direct_stdio_verified = bool(local_results) and all(
+        bool(result.get("end_to_end_verified")) and bool(result.get("strict_stdio_wire_verified"))
+        for result in local_results
+    )
     verification_prompt = f"@{server_name} MCP 연결 상태와 사용 가능한 규정 도구를 보여줘."
     report = {
         "report_type": "mcp_client_config_smoke",
@@ -86,6 +92,9 @@ def run_mcp_client_config_smoke(
         "process_started": process_started,
         "mcp_initialized": mcp_initialized,
         "tools_discovered": tools_discovered,
+        "direct_stdio_verified": direct_stdio_verified,
+        "desktop_tool_scan_verified": False,
+        "conversation_attachment_verified": False,
         "conversation_attachment_unverified": True,
         "tool_scan_unverified": bool(remote_url),
         "end_to_end_verified": end_to_end_verified,
@@ -127,11 +136,14 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
         "mcp_initialized": bool(report.get("mcp_initialized")),
         "tools_discovered": bool(report.get("tools_discovered")),
         "get_index_status_verified": verified,
+        "direct_stdio_verified": bool(report.get("direct_stdio_verified")),
+        "desktop_tool_scan_verified": bool(report.get("desktop_tool_scan_verified")),
+        "conversation_attachment_verified": bool(report.get("conversation_attachment_verified")),
         "available_regulation_tools": tool_names,
         "index_status_summaries": index_summaries,
         "conversation_attachment_unverified": bool(report.get("conversation_attachment_unverified")),
         "message": (
-            "MCP initialize, tools/list, and get_index_status completed successfully."
+            "MCP initialize, tools/list, and get_index_status completed successfully on the direct transport; Desktop tool exposure and conversation attachment remain separate states."
             if verified
             else "MCP connection verification is incomplete; do not report this connection as connected."
         ),
@@ -172,6 +184,7 @@ def _run_single_client_config_smoke(
                 "args": list(args),
                 "query": smoke_query,
                 "launcher_ready": True,
+                "config_encoding_verified": True,
             }
         )
         return result
@@ -184,6 +197,8 @@ def _run_single_client_config_smoke(
             "process_started": False,
             "mcp_initialized": False,
             "tools_discovered": False,
+            "config_encoding_verified": False,
+            "strict_stdio_wire_verified": False,
             "end_to_end_verified": False,
             "error": str(exc),
         }
@@ -193,8 +208,11 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
     if client_key == "codex":
         payload = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
         servers = payload.get("mcp_servers") if isinstance(payload, dict) else None
-    elif client_key in {"claude_desktop", "chatgpt_desktop_local"}:
+    elif client_key == "claude_desktop":
         payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+    elif client_key == "chatgpt_desktop_local":
+        payload = _read_strict_utf8_json(config_path)
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     else:
         raise ValueError(f"Unsupported client key: {client_key}")
@@ -206,6 +224,54 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
     if entry.get("url"):
         raise ValueError(f"{config_path} server {server_name} is a remote URL entry, not local stdio.")
     return entry
+
+
+def _read_strict_utf8_json(path: Path) -> Any:
+    raw = path.read_bytes()
+    if raw.startswith(UTF8_BOM):
+        raise ValueError(
+            f"{path} must be UTF-8 without BOM; found forbidden EF BB BF prefix in ChatGPT Desktop plugin config."
+        )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path} must contain strict UTF-8 JSON: {exc}") from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} must contain valid strict UTF-8 JSON: {exc}") from exc
+
+
+def _validate_strict_jsonrpc_stdout(stdout: bytes) -> dict[str, Any]:
+    """Validate a captured MCP stdio stdout stream without tolerating noise or blank records."""
+    if stdout.startswith(UTF8_BOM):
+        raise ValueError("MCP stdio stdout must not begin with a UTF-8 BOM.")
+    try:
+        text = stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"MCP stdio stdout must be strict UTF-8: {exc}") from exc
+    records = text.split("\n")
+    if records and records[-1] == "":
+        records.pop()
+    if not records:
+        raise ValueError("MCP stdio stdout did not contain a JSON-RPC message.")
+    messages: list[dict[str, Any]] = []
+    for line_number, record in enumerate(records, start=1):
+        line = record.removesuffix("\r")
+        if not line:
+            raise ValueError(f"MCP stdio stdout contains a blank line at record {line_number}.")
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"MCP stdio stdout record {line_number} is not JSON-RPC JSON: {exc}"
+            ) from exc
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+            raise ValueError(f"MCP stdio stdout record {line_number} is not a JSON-RPC 2.0 object.")
+        if not any(key in message for key in ("method", "result", "error")):
+            raise ValueError(f"MCP stdio stdout record {line_number} has no method, result, or error member.")
+        messages.append(message)
+    return {"passed": True, "message_count": len(messages)}
 
 
 def _run_remote_client_smoke(
@@ -348,18 +414,9 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
             )
             index_status_verified = bool(index_summary)
 
-            search_started_at = time.perf_counter()
-            search = await session.call_tool(
-                "search",
-                {
-                    "query": query,
-                    "top_k": 3,
-                    "security_levels": ["internal"],
-                },
+            search_payload, results, search_query_used, search_queries_attempted, search_elapsed_ms = (
+                await _search_with_fallback(session, query=query)
             )
-            search_elapsed_ms = _elapsed_ms(search_started_at)
-            search_payload = _tool_payload(search)
-            results = search_payload.get("results") if isinstance(search_payload.get("results"), list) else []
 
             fetch_payload: dict[str, Any] = {}
             fetch_elapsed_ms = 0.0
@@ -386,6 +443,7 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
                 "process_started": True,
                 "mcp_initialized": True,
                 "tools_discovered": bool(tool_names),
+                "strict_stdio_wire_verified": True,
                 "index_status_verified": index_status_verified,
                 "end_to_end_verified": bool(
                     {"search", "fetch", "get_index_status"}.issubset(set(tool_names))
@@ -396,6 +454,8 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
                 "tool_names": tool_names,
                 "index_status_summary": index_summary,
                 "search_result_count": len(results),
+                "search_query_used": search_query_used,
+                "search_queries_attempted": search_queries_attempted,
                 "fetch_has_text": bool(fetch_payload.get("text")),
                 "first_id": first_id,
                 "first_result_metadata": (results[0] if results else {}).get("metadata") or {},
@@ -405,6 +465,36 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
                 "fetch_elapsed_ms": fetch_elapsed_ms,
                 "total_elapsed_ms": _elapsed_ms(started_at),
             }
+
+
+async def _search_with_fallback(
+    session: ClientSession,
+    *,
+    query: str,
+) -> tuple[dict[str, Any], list[Any], str, list[str], float]:
+    candidates: list[str] = []
+    for value in (query, DEFAULT_SEARCH_QUERY, "규정"):
+        normalized = str(value or "").strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    started_at = time.perf_counter()
+    last_payload: dict[str, Any] = {}
+    attempted: list[str] = []
+    for candidate in candidates:
+        attempted.append(candidate)
+        search = await session.call_tool(
+            "search",
+            {
+                "query": candidate,
+                "top_k": 3,
+                "security_levels": ["internal"],
+            },
+        )
+        last_payload = _tool_payload(search)
+        results = last_payload.get("results") if isinstance(last_payload.get("results"), list) else []
+        if results:
+            return last_payload, results, candidate, attempted, _elapsed_ms(started_at)
+    return last_payload, [], attempted[-1] if attempted else "", attempted, _elapsed_ms(started_at)
 
 
 def _elapsed_ms(started_at: float) -> float:

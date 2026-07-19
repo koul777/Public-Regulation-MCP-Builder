@@ -54,10 +54,40 @@ RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES = {
     "rag_traces.jsonl",
     "rag_feedback.jsonl",
 }
+BUNDLE_ZIP_EXCLUDED_DIR_NAMES = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "cache",
+    "caches",
+    "dist",
+    "node_modules",
+    "venv",
+}
 STALE_BUNDLE_STATUS_REPORT_FILENAMES = (
     "mcp_connection_readiness.json",
     "mcp_transport_smoke.json",
 )
+UTF8_BOM = b"\xef\xbb\xbf"
+CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION = "chatgpt-desktop-local-plugin-v2"
+
+
+def _write_utf8_no_bom(path: Path, text: str) -> None:
+    """Write machine-readable text as strict UTF-8 without a byte-order mark."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = text.encode("utf-8")
+    if encoded.startswith(UTF8_BOM):
+        raise ValueError(f"Refusing to write a UTF-8 BOM to machine-readable file: {path}")
+    path.write_bytes(encoded)
+
+
+def _write_json_utf8_no_bom(path: Path, payload: Any) -> None:
+    _write_utf8_no_bom(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def build_mcp_client_config(
@@ -344,7 +374,7 @@ def write_mcp_setup_bundle(
 
     def write_json(key: str, payload: Any) -> None:
         path = output_dir / SETUP_BUNDLE_FILES[key]
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_utf8_no_bom(path, payload)
         files[key] = str(path)
 
     def write_text(key: str, text: str) -> None:
@@ -370,7 +400,13 @@ def write_mcp_setup_bundle(
         # code page. A UTF-8 BOM is therefore required when generated paths or
         # server names contain Korean characters.
         encoding = "utf-8-sig" if path.suffix.lower() == ".ps1" else "utf-8"
-        path.write_text(text.rstrip() + "\n", encoding=encoding)
+        rendered = text.rstrip() + "\n"
+        if encoding == "utf-8-sig":
+            path.write_text(rendered, encoding=encoding)
+        elif path.suffix.lower() == ".bat":
+            _write_utf8_no_bom(path, rendered.replace("\r\n", "\n").replace("\n", "\r\n"))
+        else:
+            _write_utf8_no_bom(path, rendered)
         files[key] = str(path)
 
     write_json("full_config", json_config)
@@ -626,20 +662,44 @@ def _bundle_status_payload(
         "process_started": False,
         "mcp_initialized": False,
         "tools_discovered": False,
+        "plugin_install_command_succeeded": False,
+        "plugin_manifest_validated": False,
+        "plugin_discoverable": False,
         "plugin_registered": False,
+        "direct_stdio_verified": False,
+        "desktop_tool_scan_verified": False,
+        "conversation_attachment_verified": False,
         "conversation_attachment_unverified": True,
         "end_to_end_verified": False,
         "remote_endpoint_verified": False,
         "tool_scan_unverified": True,
         "connection_state_notes": {
+            "plugin_install_command_succeeded": (
+                "The Codex plugin install command exited successfully; this alone is not registration proof."
+            ),
+            "plugin_manifest_validated": (
+                "plugin.json, .mcp.json, and marketplace.json passed strict UTF-8-without-BOM JSON validation."
+            ),
+            "plugin_discoverable": (
+                "An enabled selector with this bundle's exact cachebuster version and marketplace source was found in Codex plugin list JSON."
+            ),
             "plugin_registered": (
-                "The local plugin package was registered. It does not prove that a particular conversation attached it."
+                "True only after manifest validation, install command success, and exact version/source discoverability all succeed."
+            ),
+            "direct_stdio_verified": (
+                "The generated launcher passed initialize, tools/list, and get_index_status directly over stdio."
+            ),
+            "desktop_tool_scan_verified": (
+                "A ChatGPT Desktop tool scan exposed the expected MCP tools; direct stdio smoke does not set this."
+            ),
+            "conversation_attachment_verified": (
+                "The plugin was selected or mentioned and its tools were observed in the current conversation."
             ),
             "conversation_attachment_unverified": (
                 "Select the plugin from + > More or mention it in each new conversation when required."
             ),
             "end_to_end_verified": (
-                "True only after initialize, tools/list, and get_index_status succeed through the generated launcher."
+                "Protocol end-to-end verification through the generated transport; Desktop exposure is tracked separately."
             ),
         },
         "profiles": {
@@ -709,19 +769,14 @@ def _write_bundle_status(
     runtime_manifest: dict[str, Any] | None = None,
 ) -> Path:
     path = output_dir / SETUP_BUNDLE_FILES["bundle_status"]
-    path.write_text(
-        json.dumps(
-            _bundle_status_payload(
-                output_dir,
-                config=config,
-                setup_manifest=setup_manifest,
-                runtime_manifest=runtime_manifest,
-            ),
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_json_utf8_no_bom(
+        path,
+        _bundle_status_payload(
+            output_dir,
+            config=config,
+            setup_manifest=setup_manifest,
+            runtime_manifest=runtime_manifest,
+        ),
     )
     return path
 
@@ -1028,7 +1083,13 @@ def _chatgpt_desktop_local_config(
         "plugin_marketplace_root": "chatgpt-desktop-local-plugin",
         "plugin_manifest": f"chatgpt-desktop-local-plugin/plugins/{plugin_name}/.codex-plugin/plugin.json",
         "plugin_mcp_config": f"chatgpt-desktop-local-plugin/plugins/{plugin_name}/.mcp.json",
+        "plugin_install_command_succeeded": False,
+        "plugin_manifest_validated": False,
+        "plugin_discoverable": False,
         "plugin_registered": False,
+        "direct_stdio_verified": False,
+        "desktop_tool_scan_verified": False,
+        "conversation_attachment_verified": False,
         "conversation_attachment_unverified": True,
         "end_to_end_verified": False,
         "ui_fields": {
@@ -1047,9 +1108,15 @@ def _chatgpt_desktop_local_config(
             f"Verification prompt: @{server_name} MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.",
         ],
         "status_semantics": {
-            "plugin_registered": "The plugin package was registered; this does not prove conversation attachment.",
+            "plugin_install_command_succeeded": "The plugin install command returned success; this is not discoverability proof.",
+            "plugin_manifest_validated": "All companion JSON files passed strict UTF-8-without-BOM validation.",
+            "plugin_discoverable": "An enabled selector with the exact cachebuster version and marketplace source appeared in Codex plugin list JSON.",
+            "plugin_registered": "Manifest validation, install command success, and exact version/source discoverability all succeeded.",
+            "direct_stdio_verified": "Direct initialize, tools/list, and get_index_status succeeded over stdio.",
+            "desktop_tool_scan_verified": "ChatGPT Desktop exposed the expected tools after its own tool scan.",
+            "conversation_attachment_verified": "The plugin tools were observed in the current conversation.",
             "conversation_attachment_unverified": "The current conversation must still select or mention the plugin.",
-            "end_to_end_verified": "A separate smoke completed initialize, tools/list, and get_index_status.",
+            "end_to_end_verified": "The generated transport passed the MCP protocol chain; Desktop exposure is separate.",
         },
         "troubleshooting": [
             "입력창의 + 버튼 선택",
@@ -1115,9 +1182,19 @@ def _write_chatgpt_desktop_local_plugin(
     if not isinstance(mcp_servers, dict) or not isinstance(mcp_servers.get(server_name), dict):
         raise ValueError(f"Local stdio config does not contain MCP server {server_name}.")
 
+    plugin_mcp_config = {"mcpServers": {server_name: mcp_servers[server_name]}}
+    cachebuster_source = {
+        "template_revision": CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION,
+        "plugin_name": plugin_name,
+        "server_name": server_name,
+        "mcp_config": plugin_mcp_config,
+    }
+    cachebuster = hashlib.sha256(
+        json.dumps(cachebuster_source, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
     plugin_manifest = {
         "name": plugin_name,
-        "version": "0.1.0",
+        "version": f"0.1.0+codex.{cachebuster}",
         "description": "Korean public-institution regulation search and index-status tools over local MCP.",
         "author": {"name": "Public Regulation MCP Builder contributors"},
         "mcpServers": "./.mcp.json",
@@ -1148,12 +1225,9 @@ def _write_chatgpt_desktop_local_plugin(
             }
         ],
     }
-    manifest_path.write_text(json.dumps(plugin_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    mcp_path.write_text(
-        json.dumps({"mcpServers": {server_name: mcp_servers[server_name]}}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    marketplace_path.write_text(json.dumps(marketplace, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_json_utf8_no_bom(manifest_path, plugin_manifest)
+    _write_json_utf8_no_bom(mcp_path, plugin_mcp_config)
+    _write_json_utf8_no_bom(marketplace_path, marketplace)
     return {
         "chatgpt_desktop_plugin_manifest": str(manifest_path),
         "chatgpt_desktop_plugin_mcp": str(mcp_path),
@@ -2032,6 +2106,24 @@ def write_mcp_setup_bundle_zip(
         for path in sorted(source_dir.iterdir())
         if path.is_file() and path.name in expected_names and path.resolve() != zip_path_resolved
     ]
+    plugin_root = source_dir / "chatgpt-desktop-local-plugin"
+    if plugin_root.is_dir():
+        plugin_manifests = sorted((plugin_root / "plugins").glob("*/.codex-plugin/plugin.json"))
+        plugin_mcp_configs = sorted((plugin_root / "plugins").glob("*/.mcp.json"))
+        if len(plugin_manifests) != 1 or len(plugin_mcp_configs) != 1:
+            raise ValueError(
+                "Generated ChatGPT Desktop plugin bundle must contain exactly one plugin.json and one .mcp.json."
+            )
+        plugin_json_paths = [
+            *plugin_manifests,
+            *plugin_mcp_configs,
+            plugin_root / ".agents" / "plugins" / "marketplace.json",
+        ]
+        for path in plugin_json_paths:
+            if not path.is_file():
+                raise FileNotFoundError(f"Generated ChatGPT Desktop plugin companion file is missing: {path}")
+            _load_strict_utf8_json_for_bundle(path)
+            archive_files.append((path, path.relative_to(source_dir).as_posix()))
     runtime_data_dir = source_dir / "data"
     if runtime_data_dir.is_dir():
         _validate_runtime_data_bundle_consistency(runtime_data_dir)
@@ -2041,7 +2133,7 @@ def write_mcp_setup_bundle_zip(
             if (
                 path.is_file()
                 and path.resolve() != zip_path_resolved
-                and _include_runtime_data_file_in_zip(path)
+                and _include_runtime_data_file_in_zip(path, runtime_data_dir=runtime_data_dir)
             )
         )
     if wheel is not None and wheel.resolve() != zip_path_resolved:
@@ -2062,6 +2154,16 @@ def write_mcp_setup_bundle_zip(
                     if progress_callback is not None:
                         progress_callback(bytes_written, total_bytes, arcname)
     return str(zip_path)
+
+
+def _load_strict_utf8_json_for_bundle(path: Path) -> Any:
+    raw = path.read_bytes()
+    if raw.startswith(UTF8_BOM):
+        raise ValueError(f"Generated plugin companion JSON must be UTF-8 without BOM: {path}")
+    try:
+        return json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Generated plugin companion file must contain strict UTF-8 JSON: {path}: {exc}") from exc
 
 
 def _validate_runtime_data_bundle_consistency(runtime_data_dir: Path) -> None:
@@ -2280,7 +2382,10 @@ def _approval_snapshot_document_ids(runtime_data_dir: Path) -> set[str]:
     return document_ids
 
 
-def _include_runtime_data_file_in_zip(path: Path) -> bool:
+def _include_runtime_data_file_in_zip(path: Path, *, runtime_data_dir: Path) -> bool:
+    relative_parts = path.relative_to(runtime_data_dir).parts
+    if any(part.casefold() in BUNDLE_ZIP_EXCLUDED_DIR_NAMES for part in relative_parts[:-1]):
+        return False
     if path.name.startswith(".") or path.name in RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES:
         return False
     if path.name == "mcp_runtime_manifest.json":
@@ -2712,6 +2817,28 @@ function BundlePath([string]$Name) {
   return Join-Path $BundleDir $Name
 }
 
+function Write-Utf8NoBom([string]$LiteralPath, [string]$Value) {
+  $Parent = Split-Path -Parent $LiteralPath
+  if ($Parent) { New-Item -ItemType Directory -Force -Path $Parent | Out-Null }
+  $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($LiteralPath, $Value, $Utf8NoBom)
+}
+
+function Write-JsonUtf8NoBom([string]$LiteralPath, [object]$Value, [int]$Depth = 50) {
+  $Json = ($Value | ConvertTo-Json -Depth $Depth) + [Environment]::NewLine
+  Write-Utf8NoBom $LiteralPath $Json
+}
+
+function Read-StrictUtf8Json([string]$LiteralPath) {
+  $Bytes = [System.IO.File]::ReadAllBytes($LiteralPath)
+  if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+    throw "$LiteralPath must be UTF-8 without BOM."
+  }
+  $StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+  $Json = $StrictUtf8.GetString($Bytes)
+  return $Json | ConvertFrom-Json
+}
+
 function Read-JsonFile([string]$Name) {
   return Get-Content -LiteralPath (BundlePath $Name) -Raw -Encoding UTF8 | ConvertFrom-Json
 }
@@ -2749,7 +2876,7 @@ function Update-BundleStatus([hashtable]$Values) {
     } else {
       Add-Member -InputObject $Status -MemberType NoteProperty -Name "updated_at" -Value $UpdatedAt
     }
-    $Status | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $StatusPath -Encoding UTF8
+    Write-JsonUtf8NoBom $StatusPath $Status 50
   } catch {
     Write-Warning "Could not update bundle_status.json: $($_.Exception.Message)"
   }
@@ -2761,6 +2888,14 @@ function Get-ChatGptDesktopPluginRoot {
 
 function Get-ChatGptDesktopPluginMcpPath {
   return Join-Path (Join-Path (Join-Path (Get-ChatGptDesktopPluginRoot) "plugins") $PluginName) ".mcp.json"
+}
+
+function Get-ChatGptDesktopPluginManifestPath {
+  return Join-Path (Join-Path (Join-Path (Join-Path (Get-ChatGptDesktopPluginRoot) "plugins") $PluginName) ".codex-plugin") "plugin.json"
+}
+
+function Get-ChatGptDesktopMarketplaceManifestPath {
+  return Join-Path (Join-Path (Join-Path (Get-ChatGptDesktopPluginRoot) ".agents") "plugins") "marketplace.json"
 }
 
 function Get-BundleDataDir {
@@ -2813,15 +2948,15 @@ function Test-DoctorCommands {
 }
 
 function Get-McpCommandInvocation([string]$Name) {
-  $Resolved = Get-Command $Name -ErrorAction SilentlyContinue
-  if ($Resolved) {
-    return @($Resolved.Source)
-  }
   if ($PreferredPython -and $PreferredProjectRoot -and $McpCommandScripts.ContainsKey($Name)) {
     $ScriptPath = Join-Path $PreferredProjectRoot $McpCommandScripts[$Name]
     if ((Test-Path -LiteralPath $PreferredPython) -and (Test-Path -LiteralPath $ScriptPath)) {
       return @($PreferredPython, $ScriptPath)
     }
+  }
+  $Resolved = Get-Command $Name -ErrorAction SilentlyContinue
+  if ($Resolved) {
+    return @($Resolved.Source)
   }
   return @()
 }
@@ -3013,7 +3148,7 @@ function Install-CodexConfig {
     return $Match.Value
   }).TrimEnd()
   $Output = if ([string]::IsNullOrWhiteSpace($Clean)) { $Snippet } else { $Clean + [Environment]::NewLine + [Environment]::NewLine + $Snippet }
-  $Output | Set-Content -LiteralPath $TargetPath -Encoding UTF8
+  Write-Utf8NoBom $TargetPath ($Output + [Environment]::NewLine)
   $Written = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8
   $InstalledBlock = ""
   foreach ($Match in [regex]::Matches($Written, $Pattern)) {
@@ -3077,7 +3212,7 @@ function Install-ClaudeDesktopConfig {
   }
   # Self-heal a damaged generated JSON file after the embedded UTF-8 fallback
   # succeeds, so later validation and reruns use a valid source file.
-  $Source | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath (BundlePath "claude_desktop_config.json") -Encoding UTF8
+  Write-JsonUtf8NoBom (BundlePath "claude_desktop_config.json") $Source 50
 
   $TargetPath = Get-ClaudeDesktopConfigPath
   $TargetDir = Split-Path -Parent $TargetPath
@@ -3139,7 +3274,7 @@ function Install-ClaudeDesktopConfig {
     Add-Member -InputObject $Target.mcpServers -MemberType NoteProperty -Name $Server.Name -Value $Server.Value
   }
 
-  $Target | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $TargetPath -Encoding UTF8
+  Write-JsonUtf8NoBom $TargetPath $Target 50
   $WrittenTarget = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8 | ConvertFrom-Json
   $InstalledProperty = $WrittenTarget.mcpServers.PSObject.Properties[$ServerName]
   if (-not $InstalledProperty) {
@@ -3247,7 +3382,8 @@ function Show-ChatGptDesktop {
 function Install-ChatGptDesktopPlugin {
   $MarketplaceRoot = Get-ChatGptDesktopPluginRoot
   $PluginMcpPath = Get-ChatGptDesktopPluginMcpPath
-  $MarketplaceManifest = Join-Path (Join-Path (Join-Path $MarketplaceRoot ".agents") "plugins") "marketplace.json"
+  $PluginManifestPath = Get-ChatGptDesktopPluginManifestPath
+  $MarketplaceManifest = Get-ChatGptDesktopMarketplaceManifestPath
   if (-not (Test-Path -LiteralPath $MarketplaceManifest)) {
     throw "Generated plugin marketplace is missing: $MarketplaceManifest"
   }
@@ -3260,26 +3396,108 @@ function Install-ChatGptDesktopPlugin {
 
   $Source = Read-BundleServerConfig
   $Source = Set-McpBundlePaths $Source (Get-BundleDataDir) (BundlePath "run_mcp_stdio_server.ps1")
-  $Source | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath (BundlePath "claude_desktop_config.json") -Encoding UTF8
-  $Source | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $PluginMcpPath -Encoding UTF8
+  Write-JsonUtf8NoBom (BundlePath "claude_desktop_config.json") $Source 50
+  Write-JsonUtf8NoBom $PluginMcpPath $Source 50
 
-  & codex plugin marketplace add $MarketplaceRoot --json | Out-Host
-  if ($LASTEXITCODE -ne 0) {
-    Write-Warning "The marketplace may already be registered; continuing with plugin replacement."
+  $PluginManifest = Read-StrictUtf8Json $PluginManifestPath
+  $PluginMcp = Read-StrictUtf8Json $PluginMcpPath
+  $Marketplace = Read-StrictUtf8Json $MarketplaceManifest
+  if ($PluginManifest.name -ne $PluginName) { throw "Plugin manifest name mismatch: $PluginManifestPath" }
+  if ([string]$PluginManifest.mcpServers -ne "./.mcp.json") { throw "Plugin manifest mcpServers must point to ./.mcp.json." }
+  if ([string]$PluginManifest.version -notmatch '^0\.1\.0\+codex\.[0-9a-f]{12}$') { throw "Plugin manifest is missing the required cachebuster version." }
+  if (-not $PluginMcp.mcpServers.PSObject.Properties[$ServerName]) { throw "Plugin MCP config does not contain server $ServerName." }
+  $MarketplacePlugin = @($Marketplace.plugins | Where-Object { $_.name -eq $PluginName })
+  if ($MarketplacePlugin.Count -ne 1) { throw "Marketplace manifest does not contain exactly one $PluginName plugin entry." }
+  $ExpectedPluginVersion = [string]$PluginManifest.version
+  Update-BundleStatus @{
+    plugin_manifest_validated = $true
+    plugin_install_command_succeeded = $false
+    plugin_discoverable = $false
+    plugin_registered = $false
   }
+
   $PluginSelector = "$PluginName@$PluginMarketplaceName"
   & codex plugin remove $PluginSelector --json 2>$null | Out-Null
+  & codex plugin marketplace remove $PluginMarketplaceName --json 2>$null | Out-Null
+  & codex plugin marketplace add $MarketplaceRoot --json | Out-Host
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to register the current marketplace source: $MarketplaceRoot"
+  }
   & codex plugin add $PluginSelector --json | Out-Host
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to register ChatGPT Desktop local plugin $PluginSelector."
   }
   Update-BundleStatus @{
     launcher_ready = $true
+    plugin_install_command_succeeded = $true
+    plugin_discoverable = $false
+    plugin_registered = $false
+  }
+  $ListOutput = @(& codex plugin list --json 2>&1)
+  $ListExitCode = $LASTEXITCODE
+  if ($ListExitCode -ne 0) {
+    Update-BundleStatus @{
+      plugin_discoverable = $false
+      plugin_registered = $false
+    }
+    throw "Plugin install command succeeded, but codex plugin list --json failed. Do not report it as registered."
+  }
+  $ListText = ($ListOutput | Out-String)
+  try {
+    $PluginInventory = $ListText | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    Update-BundleStatus @{
+      plugin_discoverable = $false
+      plugin_registered = $false
+    }
+    throw "Plugin install command succeeded, but codex plugin list --json returned invalid JSON. Do not report it as registered."
+  }
+  $InstalledPlugin = @($PluginInventory.installed | Where-Object {
+    $_.pluginId -eq $PluginSelector -and $_.installed -eq $true -and $_.enabled -eq $true
+  })
+  if ($InstalledPlugin.Count -ne 1) {
+    Update-BundleStatus @{
+      plugin_discoverable = $false
+      plugin_registered = $false
+    }
+    throw "Plugin install command succeeded, but exactly one enabled $PluginSelector entry was not discoverable. Do not report it as registered."
+  }
+  if ([string]$InstalledPlugin[0].version -ne $ExpectedPluginVersion) {
+    Update-BundleStatus @{
+      plugin_discoverable = $false
+      plugin_registered = $false
+    }
+    throw "Plugin discovery returned stale version $($InstalledPlugin[0].version); expected $ExpectedPluginVersion."
+  }
+  $ExpectedMarketplaceRoot = [System.IO.Path]::GetFullPath($MarketplaceRoot).TrimEnd('\')
+  $DiscoveredMarketplaceRoot = [string]$InstalledPlugin[0].marketplaceSource.source
+  if ($DiscoveredMarketplaceRoot.StartsWith('\\?\')) {
+    $DiscoveredMarketplaceRoot = $DiscoveredMarketplaceRoot.Substring(4)
+  }
+  try {
+    $DiscoveredMarketplaceRoot = [System.IO.Path]::GetFullPath($DiscoveredMarketplaceRoot).TrimEnd('\')
+  } catch {
+    $DiscoveredMarketplaceRoot = ""
+  }
+  if (-not [string]::Equals($ExpectedMarketplaceRoot, $DiscoveredMarketplaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Update-BundleStatus @{
+      plugin_discoverable = $false
+      plugin_registered = $false
+    }
+    throw "Plugin discovery returned a stale marketplace source: $DiscoveredMarketplaceRoot; expected $ExpectedMarketplaceRoot."
+  }
+  Update-BundleStatus @{
+    launcher_ready = $true
+    plugin_install_command_succeeded = $true
+    plugin_manifest_validated = $true
+    plugin_discoverable = $true
     plugin_registered = $true
+    desktop_tool_scan_verified = $false
+    conversation_attachment_verified = $false
     conversation_attachment_unverified = $true
     end_to_end_verified = $false
   }
-  Write-Host "Plugin registered in the unified ChatGPT/Codex plugin directory: $PluginSelector"
+  Write-Host "Plugin registered in the unified ChatGPT/Codex plugin directory: $PluginSelector ($ExpectedPluginVersion)"
   Write-Host "Registration is complete; attachment to the current conversation remains unverified."
 }
 
@@ -4117,8 +4335,10 @@ first when Claude Desktop reports a JSON parsing error.
 
 Check `{files.get("bundle_status", SETUP_BUNDLE_FILES["bundle_status"])}` first when a client appears slow to recognize the MCP.
 It is regenerated from `data/mcp_runtime_manifest.json` and shows the current approved record count and `recommended_smoke_query`.
-`plugin_registered=true` only means the plugin package was registered. It does not mean the current conversation attached
-the plugin. `end_to_end_verified=true` is reserved for a successful MCP `initialize`, `tools/list`, and `get_index_status` chain.
+`plugin_registered=true` requires strict companion JSON validation, a successful install command, and an enabled entry in
+`codex plugin list --json` whose cachebuster version and marketplace source match this bundle. It still does not mean the current conversation attached the plugin. `direct_stdio_verified` records
+the generated launcher's MCP chain, while `desktop_tool_scan_verified` and `conversation_attachment_verified` remain
+separate. `end_to_end_verified=true` is reserved for a successful MCP `initialize`, `tools/list`, and `get_index_status` chain.
 Older `mcp_connection_readiness.json` and `mcp_transport_smoke.json` run outputs are cleared on generation so stale evidence does not
 look like the current bundle state.
 After installing or merging a client config, rerun doctor with the installed config path when a client still opens the old runtime:
@@ -4304,7 +4524,7 @@ powershell -ExecutionPolicy Bypass -File "{files.get('connect', SETUP_BUNDLE_FIL
 
 - ChatGPT Desktop 로컬 방식: 생성 플러그인을 등록한 뒤 완전히 재시작하고 새 대화에서 선택하거나 멘션합니다. 제품 화면이 로컬 stdio 플러그인을 ChatGPT 대화에 노출하지 않으면 원격 HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다.
 - HTTPS 방식: `{files.get('run_chatgpt', SETUP_BUNDLE_FILES['run_chatgpt'])}`로 전체 읽기 전용 도구 MCP 서버를 실행하고, `{files.get('chatgpt', SETUP_BUNDLE_FILES['chatgpt'])}`의 `connector_url`을 ChatGPT Settings > Apps/Connectors에 등록합니다. ChatGPT는 localhost MCP에 직접 연결하지 않습니다. Ready: `{str(chatgpt_ready).lower()}`.
-- 상태 판정: `plugin_registered=true`만으로 현재 대화에서 사용 가능하다고 보지 않습니다. `end_to_end_verified=true`는 실제 `initialize`, `tools/list`, `get_index_status`가 모두 성공한 경우에만 기록합니다.
+- 상태 판정: `plugin_registered=true`는 companion JSON 검증, 설치 명령 성공, `codex plugin list --json`의 활성 플러그인 cachebuster 버전과 공급 마켓플레이스 경로가 현재 번들과 정확히 일치하는 경우에만 기록합니다. `direct_stdio_verified`, `desktop_tool_scan_verified`, `conversation_attachment_verified`는 서로 별도이며, `end_to_end_verified=true`는 실제 `initialize`, `tools/list`, `get_index_status`가 모두 성공한 경우에만 기록합니다.
 - 내부망/비공개 방식: 외부 inbound 방화벽을 열지 않아야 하면 `{files.get('openai_tunnel', SETUP_BUNDLE_FILES['openai_tunnel'])}`를 사용합니다. `CONTROL_PLANE_API_KEY`와 `OPENAI_TUNNEL_ID`는 파일에 쓰지 말고 실행 환경변수로 설정합니다.
 
 ## 사전 진단
@@ -4474,6 +4694,8 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '$BundleStatus = Join-Path $BundleDir "bundle_status.json"',
         '$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"',
         'function Assert-Command([string]$Name) { if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { throw "$Name was not found on PATH. Install this package in the active Python environment first." } }',
+        'function Write-Utf8NoBom([string]$LiteralPath, [string]$Value) { $Utf8NoBom = New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($LiteralPath, $Value, $Utf8NoBom) }',
+        'function Write-JsonUtf8NoBom([string]$LiteralPath, [object]$Value, [int]$Depth = 50) { Write-Utf8NoBom $LiteralPath (($Value | ConvertTo-Json -Depth $Depth) + [Environment]::NewLine) }',
         'function ConvertTo-TomlString([string]$Value) { return ($Value | ConvertTo-Json -Compress) }',
         'function ConvertTo-TomlKey([string]$Value) { if ($Value -match "^[A-Za-z0-9_-]+$") { return $Value }; return (ConvertTo-TomlString $Value) }',
         'function Set-McpBundlePaths([string[]]$ArgsToPatch) {',
@@ -4495,7 +4717,7 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '  )',
         '  foreach ($Arg in $ArgsToWrite) { $Lines += "  $(ConvertTo-TomlString $Arg)," }',
         '  $Lines += "]"',
-        '  Set-Content -LiteralPath $CodexConfig -Value ($Lines -join [Environment]::NewLine) -Encoding UTF8',
+        '  Write-Utf8NoBom $CodexConfig (($Lines -join [Environment]::NewLine) + [Environment]::NewLine)',
         '}',
         'function Update-ClaudeDesktopBundleConfig {',
         '  $Claude = Get-Content -LiteralPath $ClaudeDesktopConfig -Raw -Encoding UTF8 | ConvertFrom-Json',
@@ -4505,7 +4727,18 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '  $Server = $ServerProperty.Value',
         '  $Server.command = "powershell.exe"',
         '  $Server.args = @(Set-McpBundlePaths @($Server.args))',
-        '  Set-Content -LiteralPath $ClaudeDesktopConfig -Value ($Claude | ConvertTo-Json -Depth 40) -Encoding UTF8',
+        '  Write-JsonUtf8NoBom $ClaudeDesktopConfig $Claude 40',
+        '  return @($Server.args)',
+        '}',
+        'function Update-PluginBundleConfig {',
+        '  $Plugin = Get-Content -LiteralPath $PluginMcpConfig -Raw -Encoding UTF8 | ConvertFrom-Json',
+        '  if (-not $Plugin.mcpServers) { throw "Generated ChatGPT Desktop plugin config is missing mcpServers." }',
+        '  $ServerProperty = $Plugin.mcpServers.PSObject.Properties[$ServerName]',
+        '  if (-not $ServerProperty) { throw "Generated ChatGPT Desktop plugin config is missing MCP server $ServerName." }',
+        '  $Server = $ServerProperty.Value',
+        '  $Server.command = "powershell.exe"',
+        '  $Server.args = @(Set-McpBundlePaths @($Server.args))',
+        '  Write-JsonUtf8NoBom $PluginMcpConfig $Plugin 40',
         '  return @($Server.args)',
         '}',
         'Assert-Command "reg-rag-mcp-client-config-smoke"',
@@ -4514,7 +4747,9 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         'if (-not (Test-Path -LiteralPath $PluginMcpConfig)) { throw "Missing generated ChatGPT Desktop plugin MCP config: $PluginMcpConfig" }',
         'if (-not (Test-Path -LiteralPath $StdioLauncher)) { throw "Missing generated stdio launcher: $StdioLauncher" }',
         '$CurrentArgs = Update-ClaudeDesktopBundleConfig',
+        '$PluginArgs = Update-PluginBundleConfig',
         'Write-CodexBundleConfig $CurrentArgs',
+        'if (($PluginArgs -join "`n") -ne ($CurrentArgs -join "`n")) { throw "Generated plugin and Claude Desktop MCP args diverged after bundle path update." }',
         '$SmokeArgs = @("--server-name", $ServerName, "--codex-config", $CodexConfig, "--claude-desktop-config", $ClaudeDesktopConfig, "--plugin-mcp-config", $PluginMcpConfig, "--out-json", $SmokeReport, "--fail-on-issue")',
         '& reg-rag-mcp-client-config-smoke @SmokeArgs',
         '$SmokeExitCode = $LASTEXITCODE',
@@ -4524,7 +4759,8 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '  foreach ($Name in @("launcher_ready", "process_started", "mcp_initialized", "tools_discovered", "end_to_end_verified")) {',
         '    if ($Status.PSObject.Properties[$Name]) { $Status.$Name = [bool]$Smoke.$Name } else { Add-Member -InputObject $Status -MemberType NoteProperty -Name $Name -Value ([bool]$Smoke.$Name) }',
         '  }',
-        '  $Status | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $BundleStatus -Encoding UTF8',
+        '  $Status.direct_stdio_verified = [bool]$Smoke.end_to_end_verified',
+        '  Write-JsonUtf8NoBom $BundleStatus $Status 50',
         '}',
         'Write-Host "Client config smoke report: $SmokeReport"',
         "if ($SmokeExitCode -ne 0) { exit $SmokeExitCode }",
@@ -4548,6 +4784,8 @@ def _powershell_chatgpt_remote_validation_script(
         f'$TokenEnv = {_powershell_single_quoted_json(token_name)}',
         '$SmokeReport = Join-Path $BundleDir "mcp_chatgpt_remote_smoke.json"',
         '$BundleStatus = Join-Path $BundleDir "bundle_status.json"',
+        'function Write-Utf8NoBom([string]$LiteralPath, [string]$Value) { $Utf8NoBom = New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($LiteralPath, $Value, $Utf8NoBom) }',
+        'function Write-JsonUtf8NoBom([string]$LiteralPath, [object]$Value, [int]$Depth = 50) { Write-Utf8NoBom $LiteralPath (($Value | ConvertTo-Json -Depth $Depth) + [Environment]::NewLine) }',
         'if ([string]::IsNullOrWhiteSpace($RemoteUrl)) { throw "No ChatGPT remote HTTPS endpoint is configured. Regenerate with --public-url https://your-host.example/mcp or use Secure MCP Tunnel." }',
         'if (-not $RemoteUrl.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) { throw "ChatGPT remote MCP requires an https:// endpoint." }',
         'if (-not (Get-Command reg-rag-mcp-client-config-smoke -ErrorAction SilentlyContinue)) { throw "reg-rag-mcp-client-config-smoke was not found on PATH." }',
@@ -4564,7 +4802,7 @@ def _powershell_chatgpt_remote_validation_script(
         '  $Status.remote_endpoint_verified = [bool]$Smoke.end_to_end_verified',
         '  $Status.tool_scan_unverified = $true',
         '  $Status.conversation_attachment_unverified = $true',
-        '  $Status | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $BundleStatus -Encoding UTF8',
+        '  Write-JsonUtf8NoBom $BundleStatus $Status 50',
         '}',
         'Write-Host "Remote MCP validation report: $SmokeReport"',
         'Write-Host "Protocol validation does not replace ChatGPT Settings > Apps > Scan Tools or per-conversation attachment."',

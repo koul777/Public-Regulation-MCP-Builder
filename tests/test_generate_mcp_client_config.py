@@ -376,6 +376,15 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertIn("install", files)
             manifest = (output_dir / "manifest.json").read_text(encoding="utf-8")
             bundle_status = json.loads((output_dir / "bundle_status.json").read_text(encoding="utf-8"))
+            plugin_root = output_dir / "chatgpt-desktop-local-plugin"
+            plugin_manifest_path = plugin_root / "plugins" / "govreg-local" / ".codex-plugin" / "plugin.json"
+            plugin_mcp_path = plugin_root / "plugins" / "govreg-local" / ".mcp.json"
+            marketplace_path = plugin_root / ".agents" / "plugins" / "marketplace.json"
+            for machine_path in [plugin_manifest_path, plugin_mcp_path, marketplace_path]:
+                self.assertFalse(machine_path.read_bytes().startswith(b"\xef\xbb\xbf"), machine_path)
+                json.loads(machine_path.read_text(encoding="utf-8"))
+            plugin_manifest = json.loads(plugin_manifest_path.read_text(encoding="utf-8"))
+            self.assertRegex(plugin_manifest["version"], r"^0\.1\.0\+codex\.[0-9a-f]{12}$")
             readme = (output_dir / "README.md").read_text(encoding="utf-8")
             readme_ko = (output_dir / "README.ko.md").read_text(encoding="utf-8")
             codex_snippet = tomllib.loads((output_dir / "codex_config_snippet.toml").read_text(encoding="utf-8"))
@@ -518,6 +527,11 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertEqual("ChatGPT Desktop", chatgpt_desktop_local["client"])
             self.assertFalse(chatgpt_desktop_local["chatgpt_direct_local_mcp_supported"])
             self.assertTrue(chatgpt_desktop_local["conversation_attachment_unverified"])
+            self.assertFalse(chatgpt_desktop_local["plugin_install_command_succeeded"])
+            self.assertFalse(chatgpt_desktop_local["plugin_manifest_validated"])
+            self.assertFalse(chatgpt_desktop_local["plugin_discoverable"])
+            self.assertFalse(chatgpt_desktop_local["desktop_tool_scan_verified"])
+            self.assertFalse(chatgpt_desktop_local["conversation_attachment_verified"])
             self.assertEqual("local_stdio", chatgpt_desktop_local["mode"])
             self.assertEqual("powershell.exe", chatgpt_desktop_local["ui_fields"]["command"])
             self.assertEqual(str(output_dir.resolve()), chatgpt_desktop_local["ui_fields"]["cwd"])
@@ -608,6 +622,12 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 wizard,
             )
             self.assertIn("function Show-ChatGptDesktop", wizard)
+            self.assertIn("function Write-Utf8NoBom", wizard)
+            self.assertIn("function Read-StrictUtf8Json", wizard)
+            self.assertIn("codex plugin list --json", wizard)
+            self.assertIn("codex plugin marketplace remove $PluginMarketplaceName --json", wizard)
+            self.assertIn("Plugin discovery returned stale version", wizard)
+            self.assertIn("Plugin discovery returned a stale marketplace source", wizard)
             self.assertIn("ChatGPT Secure MCP Tunnel", wizard)
             self.assertIn("Claude API MCP server URL", wizard)
             self.assertIn("Get-ClaudeDesktopConfigPath", wizard)
@@ -687,6 +707,8 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertIn("--claude-desktop-config", client_config_smoke_script)
             self.assertIn("Set-McpBundlePaths", client_config_smoke_script)
             self.assertIn("Write-CodexBundleConfig", client_config_smoke_script)
+            self.assertIn("Update-PluginBundleConfig", client_config_smoke_script)
+            self.assertIn("Write-JsonUtf8NoBom $PluginMcpConfig", client_config_smoke_script)
             self.assertIn('$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"', client_config_smoke_script)
             self.assertIn("Set-McpBundlePaths", wizard)
             self.assertIn(
@@ -922,11 +944,22 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            marketplace_root = bundle_dir / "chatgpt-desktop-local-plugin"
+            plugin_root = marketplace_root / "plugins" / "aksmcp"
+            plugin_manifest = json.loads(
+                (plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+            )
             fake_bin = root / "fake-bin"
             fake_bin.mkdir()
             codex_log = root / "codex-calls.txt"
             (fake_bin / "codex.cmd").write_text(
-                "@echo off\r\necho %*>>\"%CODEX_TEST_LOG%\"\r\nexit /b 0\r\n",
+                "@echo off\r\n"
+                "echo %*>>\"%CODEX_TEST_LOG%\"\r\n"
+                "if \"%1 %2\"==\"plugin list\" (\r\n"
+                "  echo {\"installed\":[{\"pluginId\":\"aksmcp@aksmcp-local\",\"name\":\"aksmcp\",\"marketplaceName\":\"aksmcp-local\",\"version\":\"%CODEX_EXPECTED_VERSION%\",\"installed\":true,\"enabled\":true,\"source\":{\"source\":\"local\",\"path\":\"%CODEX_EXPECTED_PLUGIN_ROOT%\"},\"marketplaceSource\":{\"sourceType\":\"local\",\"source\":\"%CODEX_EXPECTED_MARKETPLACE_ROOT%\"}}],\"available\":[]}\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                "exit /b 0\r\n",
                 encoding="utf-8",
             )
             env = dict(os.environ)
@@ -936,6 +969,9 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 [str(fake_bin), str(windows_dir / "System32"), str(powershell_dir)]
             )
             env["CODEX_TEST_LOG"] = str(codex_log)
+            env["CODEX_EXPECTED_VERSION"] = plugin_manifest["version"]
+            env["CODEX_EXPECTED_PLUGIN_ROOT"] = plugin_root.as_posix()
+            env["CODEX_EXPECTED_MARKETPLACE_ROOT"] = marketplace_root.as_posix()
             cmd_exe = windows_dir / "System32" / "cmd.exe"
             bat_path = Path(files["connect_chatgpt_desktop_bat"])
 
@@ -962,23 +998,93 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 self.assertIn("@aksmcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", completed.stdout)
             calls = codex_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(2, sum("plugin marketplace add" in call for call in calls))
+            self.assertEqual(2, sum("plugin marketplace remove aksmcp-local" in call for call in calls))
             self.assertEqual(2, sum("plugin add aksmcp@aksmcp-local" in call for call in calls))
-            status = json.loads((bundle_dir / "bundle_status.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(2, sum("plugin list --json" in call for call in calls))
+            status_path = bundle_dir / "bundle_status.json"
+            self.assertFalse(status_path.read_bytes().startswith(b"\xef\xbb\xbf"))
+            status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertTrue(status["launcher_ready"])
             self.assertTrue(status["process_started"])
             self.assertTrue(status["mcp_initialized"])
             self.assertTrue(status["tools_discovered"])
+            self.assertTrue(status["plugin_install_command_succeeded"])
+            self.assertTrue(status["plugin_manifest_validated"])
+            self.assertTrue(status["plugin_discoverable"])
             self.assertTrue(status["plugin_registered"])
+            self.assertTrue(status["direct_stdio_verified"])
+            self.assertFalse(status["desktop_tool_scan_verified"])
+            self.assertFalse(status["conversation_attachment_verified"])
             self.assertTrue(status["conversation_attachment_unverified"])
             self.assertTrue(status["end_to_end_verified"])
-            plugin_config = json.loads(
-                (bundle_dir / "chatgpt-desktop-local-plugin" / "plugins" / "aksmcp" / ".mcp.json").read_text(
-                    encoding="utf-8-sig"
-                )
-            )
+            plugin_config_path = bundle_dir / "chatgpt-desktop-local-plugin" / "plugins" / "aksmcp" / ".mcp.json"
+            self.assertFalse(plugin_config_path.read_bytes().startswith(b"\xef\xbb\xbf"))
+            plugin_config = json.loads(plugin_config_path.read_text(encoding="utf-8"))
             plugin_args = plugin_config["mcpServers"]["aksmcp"]["args"]
             self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), plugin_args)
             self.assertIn(str((bundle_dir / "data").resolve()), plugin_args)
+
+    @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop stale discovery test")
+    def test_chatgpt_desktop_installer_rejects_stale_discovered_plugin_version(self) -> None:
+        config = build_mcp_client_config(
+            server_name="aksmcp",
+            client_profile="bundle",
+            data_dir="data",
+            tenant_id="tenant-a",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_project_root = root / "project"
+            fake_doctor = fake_project_root / "scripts" / "check_mcp_connection_readiness.py"
+            fake_doctor.parent.mkdir(parents=True)
+            fake_doctor.write_text('print("doctor-before-stale-discovery")\n', encoding="utf-8")
+            bundle_dir = root / "stale-plugin-bundle"
+            files = write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="aksmcp",
+                preferred_python=sys.executable,
+                preferred_project_root=fake_project_root,
+            )
+            (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            marketplace_root = bundle_dir / "chatgpt-desktop-local-plugin"
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            (fake_bin / "codex.cmd").write_text(
+                "@echo off\r\n"
+                "if \"%1 %2\"==\"plugin list\" (\r\n"
+                "  echo {\"installed\":[{\"pluginId\":\"aksmcp@aksmcp-local\",\"name\":\"aksmcp\",\"marketplaceName\":\"aksmcp-local\",\"version\":\"0.1.0\",\"installed\":true,\"enabled\":true,\"marketplaceSource\":{\"sourceType\":\"local\",\"source\":\"%CODEX_EXPECTED_MARKETPLACE_ROOT%\"}}],\"available\":[]}\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                "exit /b 0\r\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            env["PATH"] = os.pathsep.join(
+                [str(fake_bin), str(Path(sys.executable).parent), str(windows_dir / "System32"), str(powershell_dir)]
+            )
+            env["CODEX_EXPECTED_MARKETPLACE_ROOT"] = marketplace_root.as_posix()
+            completed = subprocess.run(
+                [str(windows_dir / "System32" / "cmd.exe"), "/d", "/c", files["connect_chatgpt_desktop_bat"]],
+                cwd=root,
+                env=env,
+                input="\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+            self.assertNotEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertIn("stale version 0.1.0", completed.stdout + completed.stderr)
+            status = json.loads((bundle_dir / "bundle_status.json").read_text(encoding="utf-8"))
+            self.assertTrue(status["plugin_install_command_succeeded"])
+            self.assertFalse(status["plugin_discoverable"])
+            self.assertFalse(status["plugin_registered"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop BAT failure-state test")
     def test_chatgpt_desktop_bat_does_not_mark_failed_plugin_registration_connected(self) -> None:
@@ -1030,6 +1136,9 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
 
             self.assertNotEqual(0, completed.returncode, completed.stdout + completed.stderr)
             status = json.loads((bundle_dir / "bundle_status.json").read_text(encoding="utf-8-sig"))
+            self.assertTrue(status["plugin_manifest_validated"])
+            self.assertFalse(status["plugin_install_command_succeeded"])
+            self.assertFalse(status["plugin_discoverable"])
             self.assertFalse(status["plugin_registered"])
             self.assertFalse(status["mcp_initialized"])
             self.assertFalse(status["tools_discovered"])
@@ -1309,6 +1418,17 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             zip_path = Path(tmp) / "bundle.zip"
             write_mcp_setup_bundle(config, output_dir, server_name="govreg-local")
             (output_dir / "operator_notes.tmp").write_text("do not ship", encoding="utf-8")
+            (output_dir / ".venv" / "Scripts").mkdir(parents=True)
+            (output_dir / ".venv" / "Scripts" / "python.exe").write_bytes(b"not-a-runtime")
+            (output_dir / "__pycache__").mkdir()
+            (output_dir / "__pycache__" / "module.pyc").write_bytes(b"cache")
+            (output_dir / ".pytest_cache").mkdir()
+            (output_dir / ".pytest_cache" / "README.md").write_text("cache", encoding="utf-8")
+            (output_dir / "data" / ".venv" / "vector_db").mkdir(parents=True)
+            (output_dir / "data" / ".venv" / "vector_db" / "approved_vectors.jsonl").write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
             zip_progress: list[tuple[int, int, str]] = []
             result = write_mcp_setup_bundle_zip(
                 output_dir,
@@ -1333,7 +1453,22 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertIn("chatgpt_connector.json", names)
             self.assertIn("claude_api_fragment.json", names)
             self.assertIn("run_openai_secure_tunnel.ps1", names)
+            self.assertIn(
+                "chatgpt-desktop-local-plugin/plugins/govreg-local/.codex-plugin/plugin.json",
+                names,
+            )
+            self.assertIn(
+                "chatgpt-desktop-local-plugin/plugins/govreg-local/.mcp.json",
+                names,
+            )
+            self.assertIn(
+                "chatgpt-desktop-local-plugin/.agents/plugins/marketplace.json",
+                names,
+            )
             self.assertNotIn("operator_notes.tmp", names)
+            self.assertFalse(any(".venv" in name.split("/") for name in names))
+            self.assertFalse(any("__pycache__" in name.split("/") for name in names))
+            self.assertFalse(any(".pytest_cache" in name.split("/") for name in names))
             self.assertTrue(zip_progress)
             self.assertEqual(zip_progress[-1][0], zip_progress[-1][1])
             self.assertEqual(sorted(item[0] for item in zip_progress), [item[0] for item in zip_progress])

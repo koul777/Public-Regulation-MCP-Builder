@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -112,9 +113,14 @@ def _client_config_path_checks(*, target_dir: Path, server_name: str) -> dict[st
     expected_data_dir = str((target_dir / "data").resolve())
     codex = _codex_server(target_dir / "codex_config_snippet.toml", server_name)
     claude = _claude_desktop_server(target_dir / "claude_desktop_config.json", server_name)
+    plugin, plugin_encoding = _chatgpt_desktop_plugin_server(target_dir, server_name)
     clients = {
         "codex": _entry_path_check(codex, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
         "claude_desktop": _entry_path_check(claude, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
+        "chatgpt_desktop_local": {
+            **_entry_path_check(plugin, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
+            **plugin_encoding,
+        },
     }
     return {
         "passed": all(bool(client.get("passed")) for client in clients.values()),
@@ -136,6 +142,32 @@ def _claude_desktop_server(path: Path, server_name: str) -> dict[str, Any]:
     servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     entry = servers.get(server_name) if isinstance(servers, dict) else None
     return entry if isinstance(entry, dict) else {}
+
+
+def _chatgpt_desktop_plugin_server(
+    target_dir: Path,
+    server_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    plugin_name = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-", server_name.lower()).strip("-"))
+    plugin_name = (plugin_name or "regulation-mcp")[:64].rstrip("-")
+    path = target_dir / "chatgpt-desktop-local-plugin" / "plugins" / plugin_name / ".mcp.json"
+    try:
+        raw = path.read_bytes()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise ValueError("forbidden UTF-8 BOM EF BB BF")
+        payload = json.loads(raw.decode("utf-8", errors="strict"))
+        servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+        entry = servers.get(server_name) if isinstance(servers, dict) else None
+        return (
+            entry if isinstance(entry, dict) else {},
+            {"plugin_config_path": str(path), "strict_utf8_without_bom": True},
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return {}, {
+            "plugin_config_path": str(path),
+            "strict_utf8_without_bom": False,
+            "encoding_error": str(exc),
+        }
 
 
 def _entry_path_check(entry: dict[str, Any], *, expected_launcher: str, expected_data_dir: str) -> dict[str, Any]:
