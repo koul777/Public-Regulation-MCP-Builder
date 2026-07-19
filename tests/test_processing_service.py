@@ -172,7 +172,20 @@ class ProcessingServiceTests(unittest.TestCase):
             service = ProcessingService(settings=settings, repository=repo)
             progress_events: list[tuple[int, str]] = []
 
-            with patch("app.services.processing_service.get_parser", return_value=Parser()):
+            with patch("app.services.processing_service.get_parser", return_value=Parser()), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={
+                    "status": "parsed",
+                    "parser": "kordoc",
+                    "table_count": 2,
+                    "tables": [],
+                    "tables_truncated": True,
+                    "kordoc_elapsed_ms": 12.5,
+                    "kordoc_input_extension": ".pdf",
+                    "kordoc_timeout_seconds": 120,
+                },
+            ):
                 job = service.process(
                     document.document_id,
                     ChunkOptions(include_context_header=False),
@@ -211,6 +224,18 @@ class ProcessingServiceTests(unittest.TestCase):
         self.assertEqual(chunks[0].metadata["parser_uncertainty_source"], "pdf")
         self.assertEqual(chunks[0].metadata["parser_uncertainty_risk_level"], "medium")
         self.assertIn("ocr_text_extracted", chunks[0].metadata["parser_uncertainty_flags"])
+        self.assertEqual(
+            chunks[0].metadata["kordoc_table_summary"],
+            {
+                "status": "parsed",
+                "table_count": 2,
+                "parser": "kordoc",
+                "elapsed_ms": 12.5,
+                "input_extension": ".pdf",
+                "timeout_seconds": 120,
+                "tables_truncated": True,
+            },
+        )
 
     def test_process_skips_existing_completed_run_with_same_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
