@@ -30,7 +30,10 @@ class PackageManifestTests(unittest.TestCase):
         self.assertIn("include CONTRIBUTING.md", text)
         self.assertIn("include SECURITY.md", text)
         self.assertIn("include THIRD_PARTY_NOTICES.md", text)
+        self.assertIn("include *.bat", text)
         self.assertIn("recursive-include tests *.py", text)
+        self.assertIn("recursive-include scripts *.ps1", text)
+        self.assertIn("recursive-include packaging *.py *.spec *.txt", text)
 
     def test_manifest_excludes_runtime_and_private_artifacts(self) -> None:
         text = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")

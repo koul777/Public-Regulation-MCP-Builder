@@ -71,7 +71,7 @@ jobs:
           else:
               release_version = (latest_version[0], latest_version[1], latest_version[2] + 1)
               next_version = ".".join(str(value) for value in release_version)
-              contents = contents[:match.start(1)] + next_version + contents[match.end(1):]
+              contents = contents[:match.start()] + f'version = "{next_version}"' + contents[match.end():]
               path.write_text(contents, encoding="utf-8")
           version_text = ".".join(str(value) for value in release_version)
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:

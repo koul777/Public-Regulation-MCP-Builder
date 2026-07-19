@@ -8,6 +8,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class GitHubWorkflowTemplatesTests(unittest.TestCase):
+    def test_auto_release_replaces_the_complete_semantic_version_line(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
+        text = path.read_text(encoding="utf-8")
+
+        self.assertIn("contents[:match.start()]", text)
+        self.assertIn("contents[match.end():]", text)
+        self.assertNotIn("match.start(1)", text)
+        self.assertNotIn("match.end(1)", text)
+
     def test_preprocessing_policy_never_executes_pull_request_code(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "preprocessing-change-policy.yml"
         text = path.read_text(encoding="utf-8")
