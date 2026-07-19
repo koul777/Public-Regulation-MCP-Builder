@@ -189,6 +189,10 @@ class ProcessingService:
                 "status": kordoc_table_inventory.get("status"),
                 "table_count": kordoc_table_inventory.get("table_count", 0),
                 "parser": kordoc_table_inventory.get("parser", "kordoc"),
+                "elapsed_ms": kordoc_table_inventory.get("kordoc_elapsed_ms"),
+                "input_extension": kordoc_table_inventory.get("kordoc_input_extension"),
+                "timeout_seconds": kordoc_table_inventory.get("kordoc_timeout_seconds"),
+                "tables_truncated": bool(kordoc_table_inventory.get("tables_truncated")),
             }
             document_metadata = {
                 key: value

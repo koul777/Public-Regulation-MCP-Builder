@@ -236,6 +236,9 @@ class KordocTableParserTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "parsed")
         self.assertEqual(argv[-3:], ["--format", "json", "--silent"])
+        self.assertEqual(result["kordoc_input_extension"], ".pdf")
+        self.assertEqual(result["kordoc_timeout_seconds"], 10)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
     def test_parse_file_copies_non_ascii_input_path_before_running_kordoc(self) -> None:
         from types import SimpleNamespace
@@ -335,6 +338,24 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(result["table_count"], 3)
         self.assertEqual(result["stored_table_count"], 2)
         self.assertTrue(result["tables_truncated"])
+        self.assertEqual(result["kordoc_input_extension"], ".pdf")
+        self.assertEqual(result["kordoc_timeout_seconds"], 10)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
+
+    def test_parse_file_reports_disabled_runtime_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(
+                data_dir=root / "data",
+                enable_kordoc_table_parser=False,
+                kordoc_table_timeout_seconds=7,
+            )
+            result = KordocTableParser(settings).parse_file(root / "sample.HWPX")
+
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["kordoc_input_extension"], ".hwpx")
+        self.assertEqual(result["kordoc_timeout_seconds"], 7)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
     def test_parse_file_runs_windows_cmd_shim_through_cmd_exe(self) -> None:
         # npm installs CLIs like `kordoc` as .cmd shims on Windows; CreateProcess
