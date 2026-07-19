@@ -9,7 +9,14 @@ from unittest.mock import patch
 
 from app.parsers.base import ParserError
 from app.parsers.factory import get_parser
-from app.parsers.hwp_parser import HWP_LEGACY_EXTRACTION_MODE, HWP_TAG_PARA_TEXT, HWPML_EXTRACTION_MODE, HwpParser
+from app.parsers.hwp_parser import (
+    HWP_LEGACY_EXTRACTION_MODE,
+    HWP_TAG_PARA_TEXT,
+    HWPML_EXTRACTION_MODE,
+    HWP_TRUNCATED_RECORD_DIAGNOSTIC,
+    HWP_UTF16_DECODE_DIAGNOSTIC,
+    HwpParser,
+)
 
 
 def hwp_record(tag_id: int, payload: bytes) -> bytes:
@@ -51,6 +58,22 @@ class HwpParserTests(unittest.TestCase):
         section = hwp_record(HWP_TAG_PARA_TEXT, payload)
 
         self.assertEqual(parser._paragraph_texts(section), ["가" * 3000])
+
+    def test_reports_malformed_utf16_payload_instead_of_silently_decoding(self) -> None:
+        parser = HwpParser()
+        section = hwp_record(HWP_TAG_PARA_TEXT, "valid".encode("utf-16le")) + hwp_record(HWP_TAG_PARA_TEXT, b"\x00")
+        diagnostics: dict[str, int] = {}
+
+        self.assertEqual(parser._paragraph_texts(section, diagnostics=diagnostics), ["valid"])
+        self.assertEqual(diagnostics[HWP_UTF16_DECODE_DIAGNOSTIC], 1)
+
+    def test_reports_truncated_record_header_or_payload(self) -> None:
+        parser = HwpParser()
+        extended_header = (HWP_TAG_PARA_TEXT | (0xFFF << 20)).to_bytes(4, byteorder="little") + b"\x01"
+        diagnostics: dict[str, int] = {}
+
+        self.assertEqual(list(parser._record_infos(extended_header, diagnostics=diagnostics)), [])
+        self.assertEqual(diagnostics[HWP_TRUNCATED_RECORD_DIAGNOSTIC], 1)
 
     def test_decompresses_raw_deflate_section(self) -> None:
         parser = HwpParser()
@@ -202,6 +225,27 @@ class HwpParserTests(unittest.TestCase):
         self.assertIn("hwpml_xml_text_only", parsed.metadata["parser_uncertainty_flags"])
         self.assertEqual(parsed.pages[0].blocks[0].metadata["hwp_extraction_mode"], HWPML_EXTRACTION_MODE)
         self.assertEqual([block.text for block in parsed.pages[0].blocks], ["Sample Regulation", "Article 1 Purpose"])
+
+    def test_rejects_hwpml_dtd_and_entity_declarations(self) -> None:
+        xml = """<?xml version=\"1.0\"?>
+<!DOCTYPE HWPML [<!ENTITY injected \"blocked\">]>
+<HWPML><BODY><P><TEXT><CHAR>&injected;</CHAR></TEXT></P></BODY></HWPML>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unsafe.hwp"
+            path.write_text(xml, encoding="utf-8")
+
+            with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
+                HwpParser().parse(path, "doc_unsafe_hwpml")
+
+    def test_rejects_hwpml_payload_past_document_limit(self) -> None:
+        xml = '<?xml version="1.0"?><HWPML><BODY><P><TEXT><CHAR>oversized</CHAR></TEXT></P></BODY></HWPML>'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized.hwp"
+            path.write_text(xml, encoding="utf-8")
+
+            with self.assertRaisesRegex(ParserError, "HWPML XML exceeds"):
+                HwpParser(max_decompressed_document_bytes=16).parse(path, "doc_oversized_hwpml")
 
 
 if __name__ == "__main__":

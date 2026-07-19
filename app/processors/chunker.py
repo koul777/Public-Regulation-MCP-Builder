@@ -642,6 +642,23 @@ class Chunker:
                 "table_like": False,
                 "table_confidence": analysis.get("table_confidence", 0.0),
             }
+            short_cell_rows = analysis.get("table_cell_rows") or []
+            if len(short_cell_rows) >= 2:
+                # Keep evidence for compact two-row forms even when the
+                # classifier cannot safely promote them to a full table.
+                metadata.update(
+                    {
+                        "table_cell_rows": short_cell_rows,
+                        "table_cell_rows_raw": [row.get("cells", []) for row in short_cell_rows],
+                        "table_column_count": max((len(row.get("cells") or []) for row in short_cell_rows), default=0),
+                        "table_structured_row_count": sum(
+                            1 for row in short_cell_rows if len(row.get("cells") or []) >= 2
+                        ),
+                        "table_short_candidate": True,
+                        "table_review_required": True,
+                        "table_review_reason": "short_structured_table",
+                    }
+                )
             if analysis.get("table_probable_false_positive"):
                 metadata.update(
                     {
@@ -1341,6 +1358,7 @@ class Chunker:
         caption_count = 0
         caption_parents: list[str] = []
         hwpx_review_flags: list[str] = []
+        xml_roles: list[str] = []
         hwpx_counts = {key: 0 for key in HWPX_SOURCE_COUNT_METADATA_KEYS}
         hwpx_lists = {key: [] for key in HWPX_SOURCE_LIST_METADATA_KEYS}
         hwp_extraction_modes: list[str] = []
@@ -1359,6 +1377,9 @@ class Chunker:
             for value in node.metadata.get("source_xml_files") or []:
                 if value not in xml_files:
                     xml_files.append(value)
+            for value in node.metadata.get("source_xml_roles") or []:
+                if value not in xml_roles:
+                    xml_roles.append(value)
             if isinstance(node.metadata.get("caption_count"), int):
                 caption_count += int(node.metadata["caption_count"])
             caption_parent = node.metadata.get("caption_parent")
@@ -1398,6 +1419,8 @@ class Chunker:
             result["source_hwpx_block_type_count"] = len(hwpx_block_types)
         if xml_files:
             result["source_xml_files"] = xml_files
+        if xml_roles:
+            result["source_xml_roles"] = xml_roles
         if caption_count:
             result["source_caption_count"] = caption_count
         if caption_parents:
@@ -1722,6 +1745,7 @@ class Chunker:
 
     def _attach_pdf_document_metadata(self, chunks: list[Chunk], parsed: ParsedDocument) -> None:
         blank_pages = parsed.metadata.get("blank_pages") or []
+        embedded_image_pages = parsed.metadata.get("pdf_embedded_image_pages") or []
         footnote_links = parsed.metadata.get("pdf_footnote_links") or []
         footnote_marker_references = parsed.metadata.get("pdf_footnote_marker_references") or []
         if not chunks:
@@ -1731,6 +1755,8 @@ class Chunker:
         for chunk in chunks:
             if blank_pages:
                 chunk.metadata["blank_pages"] = blank_pages
+            if embedded_image_pages:
+                chunk.metadata["pdf_embedded_image_pages"] = embedded_image_pages
             start = chunk.source_page_start
             end = chunk.source_page_end or start
             if footnote_links:

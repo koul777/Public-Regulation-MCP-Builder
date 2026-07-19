@@ -682,6 +682,7 @@ def warm_mcp_runtime(*, settings: Settings, auth: AuthContext) -> dict[str, Any]
     )
     if hierarchical_paths is not None:
         summary = hierarchical_index_summary(hierarchical_paths[0]) or {}
+        bm25_path = routes_rag.bm25_index_path(settings=settings, auth=auth)
         timing_ms["total_elapsed_ms"] = _elapsed_ms(started_at)
         return {
             "warmed": True,
@@ -690,12 +691,20 @@ def warm_mcp_runtime(*, settings: Settings, auth: AuthContext) -> dict[str, Any]
             "regulation_version_count": summary.get("regulation_version_count"),
             "toc_node_count": summary.get("toc_node_count"),
             "hierarchical_index_ready": True,
+            # Hierarchical runtime search is the active retrieval path. Keep
+            # BM25 readiness visible for diagnostics when the bundle also
+            # carries the optional fallback index, but do not force the
+            # concurrent benchmark to reject a valid hierarchical-only bundle.
+            "bm25_index_ready": routes_rag.path_signature(bm25_path) is not None,
+            "retrieval_index_ready": True,
+            "retrieval_index_mode": "hierarchical_sqlite",
             "warmup_mode": "hierarchical_sqlite",
             "vector_byte_count": vector_byte_count,
             "timing_ms": timing_ms,
         }
     if vector_byte_count > _MCP_HEAVY_WARMUP_MAX_VECTOR_BYTES:
         bm25_path = routes_rag.bm25_index_path(settings=settings, auth=auth)
+        bm25_index_ready = routes_rag.path_signature(bm25_path) is not None
         manifest_summary = _runtime_manifest_summary(settings.data_dir)
         timing_ms["total_elapsed_ms"] = _elapsed_ms(started_at)
         return {
@@ -710,7 +719,9 @@ def warm_mcp_runtime(*, settings: Settings, auth: AuthContext) -> dict[str, Any]
             "vector_path": str(vector_path),
             "vector_byte_count": vector_byte_count,
             "warmup_max_vector_bytes": _MCP_HEAVY_WARMUP_MAX_VECTOR_BYTES,
-            "bm25_index_ready": routes_rag.path_signature(bm25_path) is not None,
+            "bm25_index_ready": bm25_index_ready,
+            "retrieval_index_ready": bm25_index_ready,
+            "retrieval_index_mode": "bm25_json" if bm25_index_ready else None,
             "timing_ms": timing_ms,
         }
 
@@ -743,6 +754,8 @@ def warm_mcp_runtime(*, settings: Settings, auth: AuthContext) -> dict[str, Any]
         "record_count": len(records),
         "approval_snapshot_count": len(approval_snapshot),
         "bm25_index_ready": bm25_index is not None,
+        "retrieval_index_ready": bm25_index is not None,
+        "retrieval_index_mode": "bm25_json" if bm25_index is not None else None,
         "timing_ms": timing_ms,
     }
 
@@ -2747,9 +2760,12 @@ def _citation_metadata(
         "answer_profile_version": str(result.get("answer_profile_version") or ""),
         "answer_intents": result.get("answer_intents") or [],
         "source_hwpx_block_types": result.get("source_hwpx_block_types") or [],
+        "source_xml_files": result.get("source_xml_files") or [],
+        "source_xml_roles": result.get("source_xml_roles") or [],
         "source_hwpx_parser_review_flags": result.get("source_hwpx_parser_review_flags") or [],
         "source_hwp_extraction_modes": result.get("source_hwp_extraction_modes") or [],
         "source_hwp_native_table_geometry": result.get("source_hwp_native_table_geometry"),
+        "pdf_embedded_image_pages": result.get("pdf_embedded_image_pages") or [],
         "table_source": str(result.get("table_source") or ""),
         "table_geometry_source": str(result.get("table_geometry_source") or ""),
         "primary_parser_table_source": str(result.get("primary_parser_table_source") or ""),

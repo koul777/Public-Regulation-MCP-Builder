@@ -56,6 +56,7 @@ class PDFParser(BaseParser):
         raw_parts: list[str] = []
         blank_pages: list[int] = []
         missing_content_pages: list[int] = []
+        embedded_image_pages: list[int] = []
         table_regions: list[dict] = []
         footnote_links: list[dict] = []
         footnote_marker_references: list[dict] = []
@@ -66,20 +67,20 @@ class PDFParser(BaseParser):
                     blocks = self._layout_line_blocks(page, page_index)
                     if not blocks:
                         blocks = self._text_block_fallback(page)
+                    try:
+                        page_images = page.get_images(full=True)
+                    except (AttributeError, TypeError, RuntimeError):
+                        page_images = []
+                    if page_images:
+                        embedded_image_pages.append(page_index)
                     if not blocks:
                         blank_pages.append(page_index)
                         # A page with no extractable text may be an intentionally
                         # blank page, or it may be a scanned/image-only page. Keep
                         # image-only pages explicitly visible so a mixed PDF cannot
                         # be treated as a low-risk text document.
-                        try:
-                            if page.get_images(full=True):
-                                missing_content_pages.append(page_index)
-                        except (AttributeError, TypeError, RuntimeError):
-                            # Some lightweight/fake page implementations do not
-                            # expose image inspection; uncertainty below still
-                            # records the blank page for manual review.
-                            pass
+                        if page_images:
+                            missing_content_pages.append(page_index)
                     table_regions.extend(self._table_regions(page, page_index, blocks))
                     footnote_links.extend(self._footnote_links(page, page_index))
                     footnote_marker_references.extend(self._footnote_marker_references(page, page_index))
@@ -164,6 +165,17 @@ class PDFParser(BaseParser):
             recommendation = "review_ocr_text"
             risk_level = "medium"
             confidence = min(confidence, 0.72)
+        if embedded_image_pages:
+            uncertainty_flags.append("pdf_embedded_images_detected")
+            remediation_hints.append(
+                "Review embedded image region(s) for content not represented by extracted text on PDF page(s): "
+                + ", ".join(str(page_no) for page_no in embedded_image_pages)
+                + "."
+            )
+            if recommendation == "none":
+                recommendation = "review_embedded_images"
+            risk_level = "medium"
+            confidence = min(confidence, 0.78)
         uncertainty = parser_uncertainty_metadata(
             source="pdf",
             risk_level=risk_level,
@@ -185,6 +197,7 @@ class PDFParser(BaseParser):
                 "pdf_parser_version": "layout-lines-v1",
                 "blank_pages": blank_pages,
                 "missing_content_pages": missing_content_pages,
+                "pdf_embedded_image_pages": embedded_image_pages,
                 "pdf_two_column_reading_order_ambiguous_pages": ambiguous_two_column_pages,
                 "pdf_table_regions": table_regions,
                 "pdf_footnote_links": footnote_links,

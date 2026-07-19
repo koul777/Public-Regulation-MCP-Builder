@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 
 from app.parsers.base import BaseParser, ParserError, document_name_from_path, parser_uncertainty_metadata
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
+from app.parsers.xml_safety import reject_unsafe_xml_declarations
 
 try:
     import olefile
@@ -24,6 +25,8 @@ HWP_TAG_TABLE = 77
 HWP_TABLE_CONTROL_ID = b" lbt"
 HWP_LEGACY_EXTRACTION_MODE = "legacy_ole_para_text_only"
 HWPML_EXTRACTION_MODE = "hwpml_xml_text_only"
+HWP_TRUNCATED_RECORD_DIAGNOSTIC = "hwp_truncated_record_count"
+HWP_UTF16_DECODE_DIAGNOSTIC = "hwp_utf16_decode_error_count"
 DEFAULT_HWP_MAX_DECOMPRESSED_SECTION_BYTES = 256 * 1024 * 1024
 DEFAULT_HWP_MAX_DECOMPRESSED_DOCUMENT_BYTES = 512 * 1024 * 1024
 HWP_ARTIFACT_TOKENS = (
@@ -112,6 +115,7 @@ class HwpParser(BaseParser):
         raw_parts: list[str] = []
         table_records: list[dict] = []
         table_control_flags: Counter[str] = Counter()
+        parser_diagnostics: dict[str, int] = {}
         total_section_bytes = 0
         with olefile.OleFileIO(path) as ole:
             compressed = self._is_compressed(ole)
@@ -130,7 +134,7 @@ class HwpParser(BaseParser):
                 section_table_inventory = self._table_inventory_from_section(data, stream_name)
                 table_records.extend(section_table_inventory["tables"])
                 table_control_flags.update(section_table_inventory["table_control_flags"])
-                for text in self._paragraph_texts(data):
+                for text in self._paragraph_texts(data, diagnostics=parser_diagnostics):
                     clean = self._clean_text(text)
                     if clean and not self._looks_like_hwp_mojibake_block(clean):
                         blocks.append(
@@ -149,6 +153,9 @@ class HwpParser(BaseParser):
         if not blocks:
             raise ParserError("No text blocks were extracted from the HWP file.")
         document_inventory = self._document_inventory(blocks, table_records, table_control_flags)
+        diagnostic_flags = self._diagnostic_flags(parser_diagnostics)
+        diagnostic_metadata = self._diagnostic_metadata(parser_diagnostics)
+        diagnostic_present = bool(diagnostic_flags)
 
         return ParsedDocument(
             document_id=document_id,
@@ -164,13 +171,18 @@ class HwpParser(BaseParser):
                 "hwp_native_table_inventory": True,
                 "document_inventory": document_inventory,
                 "hwp_inventory": document_inventory,
+                **diagnostic_metadata,
                 **parser_uncertainty_metadata(
                     source="hwp",
-                    risk_level="medium",
-                    flags=[HWP_LEGACY_EXTRACTION_MODE, "native_table_geometry_unavailable"],
-                    confidence=0.72,
-                    recommendation="review_tables_and_appendices",
-                    remediation_hint="Legacy HWP text extraction lacks native table geometry; review tables, forms, appendices, and effective-date sections before approval.",
+                    risk_level="high" if diagnostic_present else "medium",
+                    flags=[HWP_LEGACY_EXTRACTION_MODE, "native_table_geometry_unavailable", *diagnostic_flags],
+                    confidence=0.58 if diagnostic_present else 0.72,
+                    recommendation="review_malformed_records" if diagnostic_present else "review_tables_and_appendices",
+                    remediation_hint=(
+                        "Malformed HWP records or UTF-16 payloads were detected and skipped; review the source before approval."
+                        if diagnostic_present
+                        else "Legacy HWP text extraction lacks native table geometry; review tables, forms, appendices, and effective-date sections before approval."
+                    ),
                 ),
             },
         )
@@ -181,7 +193,18 @@ class HwpParser(BaseParser):
         return prefix.startswith(b"<?xml") and b"<HWPML" in prefix
 
     def _parse_hwpml(self, path: Path, document_id: str) -> ParsedDocument:
-        raw_xml = path.read_text(encoding="utf-8-sig", errors="replace")
+        try:
+            with path.open("rb") as handle:
+                payload = handle.read(self.max_decompressed_document_bytes + 1)
+        except OSError as exc:
+            raise ParserError("Failed to read HWPML XML safely.") from exc
+        if len(payload) > self.max_decompressed_document_bytes:
+            raise ParserError(
+                "HWPML XML exceeds the configured total decompressed size limit "
+                f"({self.max_decompressed_document_bytes} bytes)."
+            )
+        reject_unsafe_xml_declarations(payload, format_name="HWPML")
+        raw_xml = payload.decode("utf-8-sig", errors="replace")
         raw_xml = raw_xml.replace("&nbsp;", "&#160;")
         try:
             root = ElementTree.fromstring(raw_xml)
@@ -318,14 +341,20 @@ class HwpParser(BaseParser):
                 f"({self.max_decompressed_document_bytes} bytes)."
             )
 
-    def _paragraph_texts(self, section_data: bytes) -> list[str]:
+    def _paragraph_texts(
+        self,
+        section_data: bytes,
+        *,
+        diagnostics: dict[str, int] | None = None,
+    ) -> list[str]:
         texts: list[str] = []
-        for tag_id, payload in self._records(section_data):
+        for tag_id, _level, payload in self._record_infos(section_data, diagnostics=diagnostics):
             if tag_id != HWP_TAG_PARA_TEXT:
                 continue
             try:
-                text = payload.decode("utf-16le", errors="ignore")
+                text = payload.decode("utf-16le", errors="strict")
             except UnicodeDecodeError:
+                self._increment_diagnostic(diagnostics, HWP_UTF16_DECODE_DIAGNOSTIC)
                 continue
             if text.strip():
                 texts.append(text)
@@ -660,7 +689,12 @@ class HwpParser(BaseParser):
         for tag_id, _level, payload in self._record_infos(section_data):
             yield tag_id, payload
 
-    def _record_infos(self, section_data: bytes) -> Iterable[tuple[int, int, bytes]]:
+    def _record_infos(
+        self,
+        section_data: bytes,
+        *,
+        diagnostics: dict[str, int] | None = None,
+    ) -> Iterable[tuple[int, int, bytes]]:
         offset = 0
         length = len(section_data)
         while offset + 4 <= length:
@@ -671,13 +705,39 @@ class HwpParser(BaseParser):
             size = (header >> 20) & 0xFFF
             if size == 0xFFF:
                 if offset + 4 > length:
+                    self._increment_diagnostic(diagnostics, HWP_TRUNCATED_RECORD_DIAGNOSTIC)
+                    offset = length
                     break
                 size = int.from_bytes(section_data[offset : offset + 4], byteorder="little", signed=False)
                 offset += 4
             if offset + size > length:
+                self._increment_diagnostic(diagnostics, HWP_TRUNCATED_RECORD_DIAGNOSTIC)
+                offset = length
                 break
             yield tag_id, level, section_data[offset : offset + size]
             offset += size
+        if offset < length:
+            self._increment_diagnostic(diagnostics, HWP_TRUNCATED_RECORD_DIAGNOSTIC)
+
+    def _increment_diagnostic(self, diagnostics: dict[str, int] | None, key: str) -> None:
+        if diagnostics is not None:
+            diagnostics[key] = diagnostics.get(key, 0) + 1
+
+    def _diagnostic_flags(self, diagnostics: dict[str, int]) -> list[str]:
+        flags: list[str] = []
+        if diagnostics.get(HWP_TRUNCATED_RECORD_DIAGNOSTIC):
+            flags.append("hwp_malformed_record")
+        if diagnostics.get(HWP_UTF16_DECODE_DIAGNOSTIC):
+            flags.append("hwp_utf16_decode_error")
+        return flags
+
+    def _diagnostic_metadata(self, diagnostics: dict[str, int]) -> dict[str, int]:
+        allowed = {HWP_TRUNCATED_RECORD_DIAGNOSTIC, HWP_UTF16_DECODE_DIAGNOSTIC}
+        return {
+            key: int(value)
+            for key, value in diagnostics.items()
+            if key in allowed and int(value) > 0
+        }
 
     def _clean_text(self, text: str) -> str:
         text = unicodedata.normalize("NFC", text).translate(HWP_PUA_TRANSLATION)
