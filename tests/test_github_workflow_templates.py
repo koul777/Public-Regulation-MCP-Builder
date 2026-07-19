@@ -12,23 +12,10 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         path = REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
         text = path.read_text(encoding="utf-8")
 
-        self.assertIn('path = Path("app/__init__.py")', text)
-        self.assertIn('^__version__ =', text)
         self.assertIn("contents[:match.start()]", text)
         self.assertIn("contents[match.end():]", text)
         self.assertNotIn("match.start(1)", text)
         self.assertNotIn("match.end(1)", text)
-
-    def test_auto_release_publishes_all_documented_artifacts(self) -> None:
-        path = REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
-        text = path.read_text(encoding="utf-8")
-
-        self.assertIn("scripts\\build_windows_portable.ps1", text)
-        self.assertIn("dist/reg_rag_preprocessor-${VERSION}-py3-none-any.whl", text)
-        self.assertIn("dist/reg_rag_preprocessor-${VERSION}.tar.gz", text)
-        self.assertIn("dist/PR-MCP-Builder-Windows-x64-${VERSION}.zip", text)
-        self.assertIn('gh release upload "$TAG" "${artifacts[@]}" --clobber', text)
-        self.assertIn('gh release create "$TAG" "${artifacts[@]}"', text)
 
     def test_preprocessing_policy_never_executes_pull_request_code(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "preprocessing-change-policy.yml"

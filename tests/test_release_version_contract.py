@@ -13,6 +13,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseVersionContractTests(unittest.TestCase):
+    def test_auto_release_reads_single_version_source_and_publishes_all_artifacts(self) -> None:
+        workflow = (REPO_ROOT / ".github" / "workflows" / "auto-release.yml").read_text(encoding="utf-8")
+
+        self.assertIn('path = Path("app/__init__.py")', workflow)
+        self.assertIn('^__version__ =', workflow)
+        self.assertIn("scripts\\build_windows_portable.ps1", workflow)
+        self.assertIn("dist/reg_rag_preprocessor-${VERSION}-py3-none-any.whl", workflow)
+        self.assertIn("dist/reg_rag_preprocessor-${VERSION}.tar.gz", workflow)
+        self.assertIn("dist/PR-MCP-Builder-Windows-x64-${VERSION}.zip", workflow)
+        self.assertIn('gh release upload "$TAG" "${artifacts[@]}" --clobber', workflow)
+        self.assertIn('gh release create "$TAG" "${artifacts[@]}"', workflow)
+
     def test_application_version_is_semantic_and_shared_with_fastapi(self) -> None:
         self.assertRegex(__version__, r"^\d+\.\d+\.\d+$")
         self.assertEqual(app.version, __version__)
