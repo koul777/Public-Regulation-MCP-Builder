@@ -83,6 +83,21 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
 
+    def test_path_checks_accept_official_chatgpt_plugin_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "bundle"
+            bundle.mkdir()
+            _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
+            plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
+            payload = json.loads(plugin_path.read_text(encoding="utf-8"))
+            payload["mcp_servers"] = payload.pop("mcpServers")
+            plugin_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
+
+        self.assertTrue(checks["passed"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["passed"])
+
     def test_path_checks_reject_chatgpt_plugin_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "bundle"

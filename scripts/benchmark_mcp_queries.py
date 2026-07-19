@@ -30,6 +30,7 @@ def benchmark_mcp_queries(
     *,
     data_dir: Path,
     tenant_id: str,
+    profile_id: str | None = None,
     queries: list[str] | None = None,
     query_specs: list[dict[str, Any]] | None = None,
     top_k: int = 5,
@@ -68,6 +69,7 @@ def benchmark_mcp_queries(
             top_k=top_k,
             iterations=max(1, int(iterations or 1)),
             security_levels=levels,
+            profile_id=profile_id,
         )
         for spec in selected_queries
     ]
@@ -86,6 +88,7 @@ def benchmark_mcp_queries(
         "repo_commit": current_repo_commit(PROJECT_ROOT),
         "data_dir": str(data_dir),
         "tenant_id": tenant_id,
+        "profile_id": profile_id,
         "tenant_storage_isolation": tenant_storage_isolation,
         "security_levels": levels,
         "top_k": top_k,
@@ -120,6 +123,7 @@ def _benchmark_query(
     top_k: int,
     iterations: int,
     security_levels: list[str],
+    profile_id: str | None,
 ) -> dict[str, Any]:
     measurements: list[dict[str, Any]] = []
     for index in range(iterations):
@@ -131,6 +135,7 @@ def _benchmark_query(
             query=query,
             top_k=top_k,
             security_levels=security_levels,
+            profile_id=profile_id,
         )
         search_elapsed_ms = _elapsed_ms(search_started_at)
         results = search.get("results") if isinstance(search.get("results"), list) else []
@@ -142,6 +147,7 @@ def _benchmark_query(
                 auth=auth,
                 result_id=str(result.get("id") or ""),
                 security_levels=security_levels,
+                profile_id=profile_id,
             )
             for result in results
             if result.get("id")
@@ -443,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark approved local MCP search/fetch/answer query performance.")
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--tenant-id", default="default")
+    parser.add_argument("--profile-id", default=None, help="Institution profile scope when a tenant has multiple profiles.")
     parser.add_argument("--query", action="append", default=[])
     parser.add_argument("--query-spec-json", default=None)
     parser.add_argument("--top-k", type=int, default=5)
@@ -475,6 +482,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
     report = benchmark_mcp_queries(
         data_dir=Path(args.data_dir),
         tenant_id=args.tenant_id,
+        profile_id=args.profile_id,
         queries=args.query or None,
         query_specs=query_specs,
         top_k=args.top_k,

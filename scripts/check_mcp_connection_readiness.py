@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Sequence, TextIO
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -437,9 +438,20 @@ def _check_public_url(public_url: str | None, findings: list[McpConnectionFindin
             )
         )
         return
-    cleaned = public_url.strip().rstrip("/")
+    cleaned = public_url.strip()
     normalized = _normalize_mcp_url(public_url)
-    if not normalized.startswith("https://"):
+    if normalized is None:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "public-url-invalid",
+                "Remote MCP URL must be a valid HTTP(S) URL with a hostname and no query or fragment.",
+                "Use an approved URL such as https://mcp.example.go.kr/mcp without credentials, query parameters, or fragments.",
+            )
+        )
+        return
+    parsed = urlsplit(cleaned)
+    if parsed.scheme.lower() != "https":
         findings.append(
             McpConnectionFinding(
                 "high",
@@ -448,7 +460,8 @@ def _check_public_url(public_url: str | None, findings: list[McpConnectionFindin
                 "Use an approved HTTPS endpoint such as https://mcp.example.go.kr/mcp.",
             )
         )
-    if not cleaned.endswith("/mcp"):
+    raw_path = parsed.path.rstrip("/")
+    if not raw_path.endswith("/mcp"):
         findings.append(
             McpConnectionFinding(
                 "medium",
@@ -1450,10 +1463,31 @@ def _check_bundle_manifest_readiness(
 def _normalize_mcp_url(public_url: str | None) -> str | None:
     if not public_url:
         return None
-    cleaned = public_url.strip().rstrip("/")
+    cleaned = public_url.strip()
     if not cleaned:
         return None
-    return cleaned if cleaned.endswith("/mcp") else f"{cleaned}/mcp"
+    try:
+        parsed = urlsplit(cleaned)
+        # Accessing ``port`` validates malformed/non-numeric ports.
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        return None
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/mcp"
+    elif not path.endswith("/mcp"):
+        path = f"{path}/mcp"
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
 
 
 def _is_placeholder_secret(value: str | None) -> bool:

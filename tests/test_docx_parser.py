@@ -61,6 +61,27 @@ class DocxParserTests(unittest.TestCase):
         self.assertEqual(table_block.text, "공통 기준\nA | B | C")
 
     @unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
+    def test_header_part_is_exposed_as_review_metadata_without_reordering_body(self) -> None:
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header.docx"
+            doc = Document()
+            doc.add_paragraph("본문")
+            doc.sections[0].header.paragraphs[0].text = "머리말"
+            doc.sections[0].footer.paragraphs[0].text = "꼬리말"
+            doc.save(path)
+
+            parsed = DocxParser().parse(path, "doc_header")
+
+        self.assertEqual([block.text for block in parsed.pages[0].blocks], ["본문"])
+        self.assertEqual(parsed.metadata["parser_uncertainty_risk_level"], "medium")
+        self.assertIn("docx_unparsed_parts", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual(parsed.metadata["parser_uncertainty_recommendation"], "review_missing_docx_parts")
+        self.assertIn("word/header1.xml", parsed.metadata["docx_unparsed_parts"])
+        self.assertIn("word/footer1.xml", parsed.metadata["docx_unparsed_parts"])
+
+    @unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
     def test_invalid_docx_raises_parser_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "invalid.docx"

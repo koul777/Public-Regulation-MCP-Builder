@@ -156,7 +156,13 @@ def _chatgpt_desktop_plugin_server(
         if raw.startswith(b"\xef\xbb\xbf"):
             raise ValueError("forbidden UTF-8 BOM EF BB BF")
         payload = json.loads(raw.decode("utf-8", errors="strict"))
-        servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+        # The generated ChatGPT Desktop plugin follows the official
+        # ``.mcp.json`` contract and stores local servers in ``mcp_servers``.
+        # Keep accepting the legacy camelCase shape so older handoff bundles
+        # remain diagnosable during migration.
+        servers = None
+        if isinstance(payload, dict):
+            servers = payload.get("mcp_servers") or payload.get("mcpServers")
         entry = servers.get(server_name) if isinstance(servers, dict) else None
         return (
             entry if isinstance(entry, dict) else {},

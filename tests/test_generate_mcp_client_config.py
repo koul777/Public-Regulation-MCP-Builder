@@ -180,6 +180,20 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertFalse(config["chatgpt_setup"]["https_endpoint_ready"])
 
+    def test_chatgpt_connector_rejects_hostless_or_query_public_url(self) -> None:
+        for public_url in ("https://", "https://?tenant=default", "https://mcp.example.go.kr/mcp?tenant=default"):
+            with self.subTest(public_url=public_url):
+                config = build_mcp_client_config(
+                    client_profile="chatgpt-remote",
+                    transport="streamable-http",
+                    public_url=public_url,
+                )
+
+                self.assertFalse(config["ready"])
+                self.assertIsNone(config["connector_url"])
+                self.assertIn("public_url_https_mcp_endpoint", config["missing"])
+                self.assertFalse(config["chatgpt_setup"]["https_endpoint_ready"])
+
     def test_builds_bundle_for_common_clients(self) -> None:
         config = build_mcp_client_config(
             server_name="aks_mcp",
