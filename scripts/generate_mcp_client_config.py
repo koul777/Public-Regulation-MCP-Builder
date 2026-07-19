@@ -74,7 +74,7 @@ STALE_BUNDLE_STATUS_REPORT_FILENAMES = (
     "mcp_transport_smoke.json",
 )
 UTF8_BOM = b"\xef\xbb\xbf"
-CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION = "chatgpt-desktop-local-plugin-v2"
+CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION = "chatgpt-desktop-local-plugin-v3"
 
 
 def _write_utf8_no_bom(path: Path, text: str) -> None:
@@ -1182,7 +1182,9 @@ def _write_chatgpt_desktop_local_plugin(
     if not isinstance(mcp_servers, dict) or not isinstance(mcp_servers.get(server_name), dict):
         raise ValueError(f"Local stdio config does not contain MCP server {server_name}.")
 
-    plugin_mcp_config = {"mcpServers": {server_name: mcp_servers[server_name]}}
+    # Codex plugin .mcp.json uses the official wrapped ``mcp_servers`` shape.
+    # Claude Desktop's separate config continues to use ``mcpServers``.
+    plugin_mcp_config = {"mcp_servers": {server_name: mcp_servers[server_name]}}
     cachebuster_source = {
         "template_revision": CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION,
         "plugin_name": plugin_name,
@@ -2694,10 +2696,21 @@ def _windows_batch_launcher_script(
     ]
     if next_steps:
         lines.extend(["echo.", "echo [다음 단계]"])
-        lines.extend(f"echo {index}. {step}" for index, step in enumerate(next_steps, start=1))
+        lines.extend(
+            f"echo {index}. {_windows_batch_echo_text(step)}"
+            for index, step in enumerate(next_steps, start=1)
+        )
         lines.append("echo 자세한 안내는 설치 후 MCP 사용 방법 보기.bat를 실행하세요.")
     lines.append("pause")
     return "\n".join(lines)
+
+
+def _windows_batch_echo_text(value: str) -> str:
+    """Escape CMD metacharacters used in generated human-readable echo lines."""
+    escaped = str(value).replace("^", "^^")
+    for character in ("&", "|", "<", ">"):
+        escaped = escaped.replace(character, f"^{character}")
+    return escaped
 
 
 def _with_connect_wizard_preferred_runtime(
@@ -3335,7 +3348,7 @@ function Register-ClaudeCode {
     return
   }
   Run-Script "claude_code_add_stdio.ps1"
-  Write-Host "Claude Code registered local stdio MCP server."
+  Write-Host "Claude Code registered user-scoped stdio MCP server."
 }
 
 function Show-Codex {
@@ -3380,6 +3393,24 @@ function Show-ChatGptDesktop {
 }
 
 function Install-ChatGptDesktopPlugin {
+  function Invoke-CodexPluginCli([string[]]$Arguments) {
+    # codex.ps1 forwards native stderr as PowerShell error records. With the
+    # bundle-wide Stop policy that would abort before we can inspect the CLI
+    # exit code (including an expected "not installed" during cleanup).
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+      $ErrorActionPreference = "Continue"
+      $CommandOutput = @(& codex @Arguments 2>&1)
+      $CommandExitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    return [pscustomobject]@{
+      ExitCode = $CommandExitCode
+      Output = $CommandOutput
+    }
+  }
+
   $MarketplaceRoot = Get-ChatGptDesktopPluginRoot
   $PluginMcpPath = Get-ChatGptDesktopPluginMcpPath
   $PluginManifestPath = Get-ChatGptDesktopPluginManifestPath
@@ -3397,7 +3428,8 @@ function Install-ChatGptDesktopPlugin {
   $Source = Read-BundleServerConfig
   $Source = Set-McpBundlePaths $Source (Get-BundleDataDir) (BundlePath "run_mcp_stdio_server.ps1")
   Write-JsonUtf8NoBom (BundlePath "claude_desktop_config.json") $Source 50
-  Write-JsonUtf8NoBom $PluginMcpPath $Source 50
+  $PluginSource = [ordered]@{ mcp_servers = $Source.mcpServers }
+  Write-JsonUtf8NoBom $PluginMcpPath $PluginSource 50
 
   $PluginManifest = Read-StrictUtf8Json $PluginManifestPath
   $PluginMcp = Read-StrictUtf8Json $PluginMcpPath
@@ -3405,7 +3437,7 @@ function Install-ChatGptDesktopPlugin {
   if ($PluginManifest.name -ne $PluginName) { throw "Plugin manifest name mismatch: $PluginManifestPath" }
   if ([string]$PluginManifest.mcpServers -ne "./.mcp.json") { throw "Plugin manifest mcpServers must point to ./.mcp.json." }
   if ([string]$PluginManifest.version -notmatch '^0\.1\.0\+codex\.[0-9a-f]{12}$') { throw "Plugin manifest is missing the required cachebuster version." }
-  if (-not $PluginMcp.mcpServers.PSObject.Properties[$ServerName]) { throw "Plugin MCP config does not contain server $ServerName." }
+  if (-not $PluginMcp.mcp_servers.PSObject.Properties[$ServerName]) { throw "Plugin MCP config does not contain official mcp_servers entry $ServerName." }
   $MarketplacePlugin = @($Marketplace.plugins | Where-Object { $_.name -eq $PluginName })
   if ($MarketplacePlugin.Count -ne 1) { throw "Marketplace manifest does not contain exactly one $PluginName plugin entry." }
   $ExpectedPluginVersion = [string]$PluginManifest.version
@@ -3417,24 +3449,57 @@ function Install-ChatGptDesktopPlugin {
   }
 
   $PluginSelector = "$PluginName@$PluginMarketplaceName"
-  & codex plugin remove $PluginSelector --json 2>$null | Out-Null
-  & codex plugin marketplace remove $PluginMarketplaceName --json 2>$null | Out-Null
-  & codex plugin marketplace add $MarketplaceRoot --json | Out-Host
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to register the current marketplace source: $MarketplaceRoot"
-  }
-  & codex plugin add $PluginSelector --json | Out-Host
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to register ChatGPT Desktop local plugin $PluginSelector."
-  }
+  $InstallMutex = New-Object System.Threading.Mutex($false, "Local\PRMCPBuilder-$PluginMarketplaceName")
+  $InstallLockAcquired = $false
+  try {
+    try {
+      $InstallLockAcquired = $InstallMutex.WaitOne([TimeSpan]::FromSeconds(30))
+    } catch [System.Threading.AbandonedMutexException] {
+      $InstallLockAcquired = $true
+    }
+    if (-not $InstallLockAcquired) {
+      throw "Another $PluginMarketplaceName plugin installation is still running. Wait for it to finish, then retry."
+    }
+
+    $null = Invoke-CodexPluginCli @("plugin", "remove", $PluginSelector, "--json")
+    $null = Invoke-CodexPluginCli @("plugin", "marketplace", "remove", $PluginMarketplaceName, "--json")
+    $MarketplaceAdd = Invoke-CodexPluginCli @("plugin", "marketplace", "add", $MarketplaceRoot, "--json")
+    $MarketplaceAdd.Output | Out-Host
+    if ($MarketplaceAdd.ExitCode -ne 0) {
+      throw "Failed to register the current marketplace source: $MarketplaceRoot"
+    }
+
+    $PluginInstallSucceeded = $false
+    $PluginInstallOutput = @()
+    for ($PluginInstallAttempt = 1; $PluginInstallAttempt -le 3; $PluginInstallAttempt++) {
+      $PluginInstall = Invoke-CodexPluginCli @("plugin", "add", $PluginSelector, "--json")
+      $PluginInstallOutput = @($PluginInstall.Output)
+      if ($PluginInstall.ExitCode -eq 0) {
+        $PluginInstallOutput | Out-Host
+        $PluginInstallSucceeded = $true
+        break
+      }
+      if ($PluginInstallAttempt -lt 3) {
+        Start-Sleep -Milliseconds (250 * $PluginInstallAttempt)
+        $MarketplaceRetry = Invoke-CodexPluginCli @("plugin", "marketplace", "add", $MarketplaceRoot, "--json")
+        if ($MarketplaceRetry.ExitCode -ne 0) {
+          break
+        }
+      }
+    }
+    if (-not $PluginInstallSucceeded) {
+      $PluginInstallOutput | Out-Host
+      throw "Failed to register ChatGPT Desktop local plugin $PluginSelector after 3 attempts."
+    }
   Update-BundleStatus @{
     launcher_ready = $true
     plugin_install_command_succeeded = $true
     plugin_discoverable = $false
     plugin_registered = $false
   }
-  $ListOutput = @(& codex plugin list --json 2>&1)
-  $ListExitCode = $LASTEXITCODE
+  $ListResult = Invoke-CodexPluginCli @("plugin", "list", "--json")
+  $ListOutput = @($ListResult.Output)
+  $ListExitCode = $ListResult.ExitCode
   if ($ListExitCode -ne 0) {
     Update-BundleStatus @{
       plugin_discoverable = $false
@@ -3497,8 +3562,14 @@ function Install-ChatGptDesktopPlugin {
     conversation_attachment_unverified = $true
     end_to_end_verified = $false
   }
-  Write-Host "Plugin registered in the unified ChatGPT/Codex plugin directory: $PluginSelector ($ExpectedPluginVersion)"
-  Write-Host "Registration is complete; attachment to the current conversation remains unverified."
+    Write-Host "Plugin registered in the unified ChatGPT/Codex plugin directory: $PluginSelector ($ExpectedPluginVersion)"
+    Write-Host "Registration is complete; attachment to the current conversation remains unverified."
+  } finally {
+    if ($InstallLockAcquired) {
+      $InstallMutex.ReleaseMutex()
+    }
+    $InstallMutex.Dispose()
+  }
 }
 
 function Show-ChatGptHttps {
@@ -3506,8 +3577,7 @@ function Show-ChatGptHttps {
   Warn-IfCoreCommandsMissing | Out-Null
   $Connector = Read-JsonFile "chatgpt_connector.json"
   if (-not $Connector.connector_url) {
-    Write-Warning "No ChatGPT remote connector_url is ready. Regenerate with --public-url https://your-host.example/mcp, or use -Target chatgpt-tunnel for Secure MCP Tunnel."
-    return
+    throw "No ChatGPT remote connector_url is ready. Regenerate with --public-url https://your-host.example/mcp, or use -Target chatgpt-tunnel for Secure MCP Tunnel."
   }
   Write-Host "ChatGPT connector URL:"
   Write-Host "  $($Connector.connector_url)"
@@ -3551,7 +3621,7 @@ function Show-ClaudeApi {
   if ($Fragment.mcp_servers -and $Fragment.mcp_servers.Count -gt 0) {
     Write-Host "  $($Fragment.mcp_servers[0].url)"
   } else {
-    Write-Warning "No HTTPS MCP URL is ready. Regenerate the bundle with --public-url https://your-host.example/mcp."
+    throw "No Claude HTTPS MCP URL is ready. Regenerate the bundle with --public-url https://your-host.example/mcp."
   }
   Write-Host "Copy mcp_servers, tools, and betas from claude_api_fragment.json into the Messages API request."
 }
@@ -3718,7 +3788,22 @@ def _bundle_quickstart(
         + _auth_issuer_args(chatgpt_remote.get("connector_url"))
     )
     chatgpt_http_args = _with_no_warm_cache(chatgpt_http_args)
-    claude_code_json = json.dumps(claude_code, ensure_ascii=False, separators=(",", ":"))
+    claude_code_command = str(claude_code.get("command") or "powershell.exe")
+    claude_code_command_args = [
+        str(value) for value in claude_code.get("args", [])
+    ] if isinstance(claude_code.get("args"), list) else []
+    claude_code_cli_args = [
+        "mcp",
+        "add",
+        "--transport",
+        "stdio",
+        "--scope",
+        "user",
+        server_name,
+        "--",
+        claude_code_command,
+        *claude_code_command_args,
+    ]
     http_doctor_args = [
         "--client-profile",
         "bundle",
@@ -3896,7 +3981,7 @@ def _bundle_quickstart(
         },
         "claude_code": {
             "command": "claude",
-            "args": ["mcp", "add-json", server_name, claude_code_json],
+            "args": claude_code_cli_args,
         },
         "chatgpt_remote": {
             "profile": "chatgpt-remote",
@@ -4366,10 +4451,10 @@ the repository, installs a bundled `reg_rag_preprocessor-*.whl` when present out
    Run `{files.get("connect", SETUP_BUNDLE_FILES["connect"])}` with `-Target claude-desktop -ValidateClaudeDesktop`
    to validate the existing Claude Desktop JSON before merging. Automatic install runs the doctor gate before writing the config.
 3. For Claude Code, double-click `{files.get("connect_claude_code_bat", SETUP_BUNDLE_FILES["connect_claude_code_bat"])}`. For manual setup, run `{files.get("claude_code_stdio", SETUP_BUNDLE_FILES["claude_code_stdio"])}` in PowerShell.
-   The script runs the doctor gate before registering the local stdio server.
-   Claude Code registers MCP servers at local project scope by default; add a user/project scope only if your
-   operating policy requires it.
+   The script runs the doctor gate, replaces legacy local/user entries, registers the local stdio server with
+   `--scope user`, and verifies it with `claude mcp get` so it remains available outside the bundle directory.
 4. For ChatGPT Desktop local execution, double-click `{files.get("connect_chatgpt_desktop_bat", SETUP_BUNDLE_FILES["connect_chatgpt_desktop_bat"])}`. It registers the generated marketplace and `{server_name}` plugin. Fully quit and restart ChatGPT Desktop, open a new conversation, then select the plugin from `+ > More` or mention `@{server_name}`. Direct local stdio availability in a ChatGPT conversation is product-surface dependent; when it is unavailable, use the separate `chatgpt-remote` HTTPS or Secure MCP Tunnel profile.
+   The plugin follows the official `.codex-plugin/plugin.json` to `./.mcp.json` layout, with an `mcp_servers` container in `.mcp.json`.
    Use `{files.get("connect_codex_bat", SETUP_BUNDLE_FILES["connect_codex_bat"])}` for direct Codex CLI compatibility. For manual Codex setup, paste `{files.get("codex_config", SETUP_BUNDLE_FILES["codex_config"])}` into `$HOME\\.codex\\config.toml`
    or replace the existing `[mcp_servers.{server_name}]` block. The snippet points `--data-dir` at this bundle's
    `data` directory and includes `--no-warm-cache` plus the generated storage-mode flag. Local stdio client
@@ -4507,14 +4592,14 @@ powershell -ExecutionPolicy Bypass -File "{files.get('connect', SETUP_BUNDLE_FIL
 
 - 사전 진단: `{files.get('doctor_bat', SETUP_BUNDLE_FILES['doctor_bat'])}`를 먼저 실행합니다. indexed record, smoke 문서 배제, append-only approval journal coverage가 통과해야 합니다.
 - Claude Desktop: `{files.get('connect_claude_desktop_bat', SETUP_BUNDLE_FILES['connect_claude_desktop_bat'])}`를 더블클릭합니다. 수동 설정이 필요할 때만 `{files.get('claude_desktop', SETUP_BUNDLE_FILES['claude_desktop'])}`의 `mcpServers`를 Claude Desktop 설정에 병합합니다. 자동 병합은 doctor gate를 통과한 뒤 `connect_mcp_client.ps1 -Target claude-desktop -InstallClaudeDesktop`로 수행합니다. JSON 파싱 오류가 났다면 먼저 `connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop`으로 기존 설정 파일을 검증합니다.
-- Claude Code: `{files.get('connect_claude_code_bat', SETUP_BUNDLE_FILES['connect_claude_code_bat'])}`를 더블클릭하면 로컬 stdio MCP가 등록됩니다. 수동 설정이 필요할 때만 `{files.get('claude_code_stdio', SETUP_BUNDLE_FILES['claude_code_stdio'])}`를 실행합니다.
+- Claude Code: `{files.get('connect_claude_code_bat', SETUP_BUNDLE_FILES['connect_claude_code_bat'])}`를 더블클릭하면 로컬 stdio MCP를 사용자 범위(`--scope user`)에 등록하고 `claude mcp get`으로 확인합니다. 따라서 생성 폴더 밖의 다른 프로젝트에서도 같은 사용자에게 보입니다. 수동 설정이 필요할 때만 `{files.get('claude_code_stdio', SETUP_BUNDLE_FILES['claude_code_stdio'])}`를 실행합니다.
 - Claude API: `{files.get('claude_api', SETUP_BUNDLE_FILES['claude_api'])}`의 `mcp_servers`, `tools`, `betas`를 Messages API 요청에 넣습니다. Ready: `{str(claude_api_ready).lower()}`.
 - 클라이언트 설정 smoke: `{files.get('client_config_smoke', SETUP_BUNDLE_FILES['client_config_smoke'])}`를 실행하면 생성된 Codex/Claude Desktop 설정 파일의 `command`/`args` 그대로 MCP를 띄우고 `list_tools`, `search`, `fetch`를 확인합니다.
 - 런타임 smoke 검증: `{files.get('validate', SETUP_BUNDLE_FILES['validate'])}`를 실행하면 `data/mcp_runtime_manifest.json`의 `recommended_smoke_query`를 읽어 실제 번들 데이터로 `search`/`fetch`를 확인합니다.
 
 ## ChatGPT Desktop 로컬 플러그인 및 Codex CLI 연결
 
-- ChatGPT Desktop 로컬 플러그인: `{files.get('connect_chatgpt_desktop_bat', SETUP_BUNDLE_FILES['connect_chatgpt_desktop_bat'])}`를 더블클릭하면 생성된 마켓플레이스와 `{server_name}` 플러그인을 자동 등록합니다. 앱을 완전히 종료하고 다시 실행한 뒤 새 대화에서 `+ > 더 보기 > {server_name}`을 선택하거나 `@{server_name}`을 멘션합니다. 플러그인 등록 완료와 현재 대화에 도구가 첨부된 상태는 별개입니다.
+- ChatGPT Desktop 로컬 플러그인: `{files.get('connect_chatgpt_desktop_bat', SETUP_BUNDLE_FILES['connect_chatgpt_desktop_bat'])}`를 더블클릭하면 생성된 마켓플레이스와 `{server_name}` 플러그인을 자동 등록합니다. 플러그인은 공식 `.codex-plugin/plugin.json` → `./.mcp.json` 구조와 `.mcp.json`의 `mcp_servers` 컨테이너를 사용합니다. 앱을 완전히 종료하고 다시 실행한 뒤 Plugins를 새로고침하고, 새 대화에서 `+ > 더 보기 > {server_name}`을 선택하거나 `@{server_name}`을 멘션합니다. 플러그인 등록 완료와 현재 대화에 도구가 첨부된 상태는 별개입니다.
 - Codex CLI 호환: `{files.get('connect_codex_bat', SETUP_BUNDLE_FILES['connect_codex_bat'])}`를 더블클릭합니다. 수동 설정이 필요할 때만 `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`의 TOML 블록을 `$HOME\\.codex\\config.toml`에 붙여 넣거나 기존 `[mcp_servers.{server_name}]` 블록과 교체합니다.
 - 이 스니펫은 `--data-dir`을 이 번들의 `data` 폴더로 고정하고 `--no-warm-cache`와 저장소 모드 플래그를 포함합니다. 그래서 예전 번들이나 다른 MCP 서버를 물고 느리게 인식하는 문제를 줄입니다.
 - 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 번들이 저장소 checkout 안에 있으면 현재 checkout의 `scripts\\run_regulation_mcp.py`를 오래된 전역 콘솔 명령보다 먼저 실행하고, 독립 배포 번들은 PATH의 `reg-rag-mcp-server`로 fallback합니다. 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다.
@@ -4732,8 +4817,8 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '}',
         'function Update-PluginBundleConfig {',
         '  $Plugin = Get-Content -LiteralPath $PluginMcpConfig -Raw -Encoding UTF8 | ConvertFrom-Json',
-        '  if (-not $Plugin.mcpServers) { throw "Generated ChatGPT Desktop plugin config is missing mcpServers." }',
-        '  $ServerProperty = $Plugin.mcpServers.PSObject.Properties[$ServerName]',
+        '  if (-not $Plugin.mcp_servers) { throw "Generated ChatGPT Desktop plugin config is missing official mcp_servers." }',
+        '  $ServerProperty = $Plugin.mcp_servers.PSObject.Properties[$ServerName]',
         '  if (-not $ServerProperty) { throw "Generated ChatGPT Desktop plugin config is missing MCP server $ServerName." }',
         '  $Server = $ServerProperty.Value',
         '  $Server.command = "powershell.exe"',
@@ -4823,22 +4908,33 @@ def _powershell_claude_code_stdio_bundle_script(
         '$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"',
         'if (-not (Test-Path -LiteralPath $StdioLauncher)) { throw "Missing generated stdio launcher: $StdioLauncher" }',
         'function Assert-Command([string]$Name) { if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { throw "$Name was not found on PATH. Install this package in the active Python environment first." } }',
+        'function Invoke-ClaudeMcpCli([string[]]$Arguments) {',
+        '  $PreviousErrorActionPreference = $ErrorActionPreference',
+        '  try {',
+        '    $ErrorActionPreference = "Continue"',
+        '    $CommandOutput = @(& claude @Arguments 2>&1)',
+        '    $CommandExitCode = $LASTEXITCODE',
+        '  } finally {',
+        '    $ErrorActionPreference = $PreviousErrorActionPreference',
+        '  }',
+        '  return [pscustomobject]@{ ExitCode = $CommandExitCode; Output = $CommandOutput }',
+        '}',
         'Assert-Command "reg-rag-mcp-doctor"',
         'Assert-Command "claude"',
         _powershell_command("reg-rag-mcp-doctor", doctor_args),
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
         "$ClaudeCodeArgs = " + _powershell_array_literal(server_args),
         '$LauncherArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $StdioLauncher) + $ClaudeCodeArgs',
-        '$ClaudeCodeConfig = [ordered]@{ type = "stdio"; command = "powershell.exe"; args = $LauncherArgs }',
-        "$ClaudeCodeJson = $ClaudeCodeConfig | ConvertTo-Json -Depth 20 -Compress",
-        f'& claude mcp get "{server_name}" *> $null',
-        '$ExistingMcp = $LASTEXITCODE -eq 0',
-        'if ($ExistingMcp) {',
-        f'  & claude mcp remove "{server_name}" --scope local',
-        '  if ($LASTEXITCODE -ne 0) { throw "Failed to remove the existing Claude Code MCP entry." }',
-        '}',
-        _powershell_command("claude", ["mcp", "add-json", "--scope", "local", server_name, "$ClaudeCodeJson"]),
-        'if ($LASTEXITCODE -ne 0) { throw "Failed to register the updated Claude Code MCP entry." }',
+        '# Remove both the legacy project-local entry and the target user entry before replacing it.',
+        f'$null = Invoke-ClaudeMcpCli @("mcp", "remove", "{server_name}", "--scope", "local")',
+        f'$null = Invoke-ClaudeMcpCli @("mcp", "remove", "{server_name}", "--scope", "user")',
+        f'$ClaudeAddArgs = @("mcp", "add", "--transport", "stdio", "--scope", "user", "{server_name}", "--", "powershell.exe") + $LauncherArgs',
+        '$ClaudeAdd = Invoke-ClaudeMcpCli $ClaudeAddArgs',
+        '$ClaudeAdd.Output | Out-Host',
+        'if ($ClaudeAdd.ExitCode -ne 0) { throw "Failed to register the updated Claude Code MCP entry." }',
+        f'$ClaudeGet = Invoke-ClaudeMcpCli @("mcp", "get", "{server_name}")',
+        '$ClaudeGet.Output | Out-Host',
+        'if ($ClaudeGet.ExitCode -ne 0) { throw "Claude Code MCP registration could not be verified after writing user scope." }',
     ]
     return "\n".join(lines)
 
