@@ -32,8 +32,9 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
             (source / "mcp_client_config_smoke.json").write_text('{"passed": true}\n', encoding="utf-8")
             bundle_zip = root / "bundle.zip"
             with zipfile.ZipFile(bundle_zip, "w") as archive:
-                for path in source.iterdir():
-                    archive.write(path, arcname=path.name)
+                for path in source.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, arcname=path.relative_to(source).as_posix())
                 archive.writestr("data/.keep", "")
 
             previous_cwd = Path.cwd()
@@ -79,6 +80,23 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertTrue(checks["passed"])
         self.assertTrue(checks["clients"]["codex"]["passed"])
         self.assertTrue(checks["clients"]["claude_desktop"]["passed"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["passed"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
+
+    def test_path_checks_reject_chatgpt_plugin_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "bundle"
+            bundle.mkdir()
+            _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
+            plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
+            plugin_path.write_bytes(b"\xef\xbb\xbf" + plugin_path.read_bytes())
+
+            checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
+
+        self.assertFalse(checks["passed"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["passed"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
+        self.assertIn("EF BB BF", checks["clients"]["chatgpt_desktop_local"]["encoding_error"])
 
     def test_path_checks_reject_stale_generated_bundle_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,6 +140,25 @@ def _write_client_configs(bundle: Path, *, launcher: Path, data_dir: Path) -> No
     ]
     (bundle / "codex_config_snippet.toml").write_text("\n".join(codex_lines) + "\n", encoding="utf-8")
     (bundle / "claude_desktop_config.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "govreg-local": {
+                        "type": "stdio",
+                        "command": "powershell.exe",
+                        "args": args,
+                    }
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
+    plugin_path.parent.mkdir(parents=True)
+    plugin_path.write_text(
         json.dumps(
             {
                 "mcpServers": {

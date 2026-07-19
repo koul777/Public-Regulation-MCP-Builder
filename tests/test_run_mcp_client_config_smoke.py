@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import asyncio
 import io
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from scripts.run_mcp_client_config_smoke import run, run_mcp_client_config_smoke
+from scripts.run_mcp_client_config_smoke import (
+    _validate_strict_jsonrpc_stdout,
+    _search_with_fallback,
+    run,
+    run_mcp_client_config_smoke,
+)
 
 
 class RunMcpClientConfigSmokeTests(unittest.TestCase):
@@ -47,6 +54,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                     "process_started": True,
                     "mcp_initialized": True,
                     "tools_discovered": True,
+                    "strict_stdio_wire_verified": True,
                     "index_status_verified": True,
                     "end_to_end_verified": True,
                     "tool_names": ["fetch", "get_index_status", "search"],
@@ -100,6 +108,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                     "process_started": True,
                     "mcp_initialized": True,
                     "tools_discovered": True,
+                    "strict_stdio_wire_verified": True,
                     "index_status_verified": True,
                     "end_to_end_verified": True,
                     "tool_names": ["fetch", "get_index_status", "search"],
@@ -144,6 +153,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                     "process_started": True,
                     "mcp_initialized": True,
                     "tools_discovered": True,
+                    "strict_stdio_wire_verified": True,
                     "index_status_verified": True,
                     "end_to_end_verified": True,
                     "tool_names": ["fetch", "get_index_status", "list_regulations", "search"],
@@ -156,6 +166,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 report = run_mcp_client_config_smoke(plugin_mcp_config=config, server_name="aksmcp")
 
         self.assertTrue(report["passed"])
+        self.assertTrue(report["direct_stdio_verified"])
         self.assertEqual("@aksmcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", report["verification_prompt"])
         answer = report["verification_answer"]
         self.assertEqual("verified", answer["status"])
@@ -163,6 +174,84 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertIn("get_index_status", answer["available_regulation_tools"])
         self.assertEqual(7, answer["index_status_summaries"][0]["indexed_records"])
         self.assertTrue(answer["conversation_attachment_unverified"])
+        self.assertFalse(answer["desktop_tool_scan_verified"])
+        self.assertFalse(answer["conversation_attachment_verified"])
+
+    def test_plugin_config_rejects_utf8_bom_before_process_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / ".mcp.json"
+            payload = {"mcpServers": {"aksmcp": {"command": "python", "args": []}}}
+            config.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
+
+            report = run_mcp_client_config_smoke(plugin_mcp_config=config, server_name="aksmcp")
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["process_started"])
+        self.assertFalse(report["results"][0]["config_encoding_verified"])
+        self.assertIn("EF BB BF", report["results"][0]["error"])
+
+    def test_claude_desktop_config_keeps_explicit_bom_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "claude_desktop_config.json"
+            payload = {"mcpServers": {"aksmcp": {"command": "python", "args": []}}}
+            config.write_text(json.dumps(payload), encoding="utf-8-sig")
+
+            async def fake_run_client_entry(*, command, args, query):
+                return {
+                    "passed": True,
+                    "process_started": True,
+                    "mcp_initialized": True,
+                    "tools_discovered": True,
+                    "strict_stdio_wire_verified": True,
+                    "index_status_verified": True,
+                    "end_to_end_verified": True,
+                }
+
+            with patch("scripts.run_mcp_client_config_smoke._run_client_entry", new=fake_run_client_entry):
+                report = run_mcp_client_config_smoke(
+                    claude_desktop_config=config,
+                    server_name="aksmcp",
+                )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["results"][0]["config_encoding_verified"])
+
+    def test_strict_stdio_wire_rejects_bom_blank_lines_and_non_json_notices(self) -> None:
+        valid = (
+            b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+            b'{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+        )
+        self.assertEqual(2, _validate_strict_jsonrpc_stdout(valid)["message_count"])
+
+        invalid_streams = {
+            "bom": b'\xef\xbb\xbf{"jsonrpc":"2.0","id":1,"result":{}}\n',
+            "blank": b'{"jsonrpc":"2.0","id":1,"result":{}}\n\n',
+            "notice": b'MCP server ready\n',
+            "invalid_utf8": b"\xff\n",
+        }
+        for label, stdout in invalid_streams.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                _validate_strict_jsonrpc_stdout(stdout)
+
+    def test_search_smoke_falls_back_when_manifest_query_returns_no_results(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            async def call_tool(self, name, arguments):
+                self.queries.append(arguments["query"])
+                results = [{"id": "result-1"}] if arguments["query"] == "규정" else []
+                return SimpleNamespace(structuredContent={"results": results})
+
+        session = FakeSession()
+        _payload, results, query_used, attempted, _elapsed = asyncio.run(
+            _search_with_fallback(session, query="제3조 다른 규정의 개정")
+        )
+
+        self.assertEqual([{"id": "result-1"}], results)
+        self.assertEqual("규정", query_used)
+        self.assertEqual(["제3조 다른 규정의 개정", "제1조", "규정"], attempted)
+        self.assertEqual(attempted, session.queries)
 
     def test_remote_rejects_http_and_does_not_report_connected(self) -> None:
         report = run_mcp_client_config_smoke(

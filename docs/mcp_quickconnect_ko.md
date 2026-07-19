@@ -18,7 +18,13 @@ PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 ChatGPT Desktop 로
 - `process_started`: MCP 프로세스 또는 원격 세션이 실제로 시작됨
 - `mcp_initialized`: MCP `initialize` 성공
 - `tools_discovered`: MCP `tools/list` 성공 및 도구 발견
-- `plugin_registered`: 로컬 플러그인 패키지 등록 성공
+- `plugin_install_command_succeeded`: 플러그인 설치 명령 종료 코드 성공
+- `plugin_manifest_validated`: companion JSON의 strict UTF-8-without-BOM 및 JSON 검증 성공
+- `plugin_discoverable`: 설치된 selector가 `codex plugin list`에서 발견됨
+- `plugin_registered`: manifest·설치 명령이 성공하고 `codex plugin list --json`의 활성 플러그인 버전과 로컬 마켓플레이스 경로가 현재 번들과 정확히 일치
+- `direct_stdio_verified`: 생성 launcher를 통한 직접 stdio 프로토콜 검증 성공
+- `desktop_tool_scan_verified`: ChatGPT Desktop 도구 scan에서 MCP 도구 노출 확인
+- `conversation_attachment_verified`: 현재 대화에서 플러그인 도구 첨부 확인
 - `conversation_attachment_unverified`: 현재 대화의 플러그인 선택/멘션은 아직 제품 UI에서 확인되지 않음
 - `end_to_end_verified`: `initialize`, `tools/list`, `get_index_status`가 모두 성공함
 
@@ -66,9 +72,11 @@ Streamlit의 MCP 설정 JSON 다운로드와 `Write MCP setup bundle now`는 app
 
 번들의 `data/` 폴더는 설정 예시가 아니라 실제 approved runtime payload입니다. 포함 대상은 approved chunks, approved vectors, BM25 index, approval/indexing journal, `mcp_runtime_manifest.json`이며, raw `*_nodes.json`, `*_issues.json`, `*_quality.json` 전처리 산출물은 handoff zip에 포함하지 않습니다.
 
+공급 ZIP은 생성 설정/플러그인, 승인 runtime data, 빌드된 wheel만 allowlist로 포함합니다. `.venv`, `venv`, `__pycache__`, 테스트·빌드 캐시와 로컬 runtime 부산물을 제외하며, 플러그인 companion JSON은 압축 직전에 strict UTF-8-without-BOM JSON으로 다시 검증합니다.
+
 승인 전 단계에서는 `Approval worklist evidence`에서 `approval_review_batch_manifest`를 불러오고, 필요하면 `Review batch ID to load`로 실제 검토한 batch를 선택합니다. 선택 batch의 `approval_request_template.chunk_ids`만 `Approve selected review batch for RAG` 범위가 되며, `review_flags_acknowledged`는 자동으로 체크되지 않습니다. batch 승인 후 `Index approved chunks` 또는 `Reindex approved chunks`를 실행해야 MCP 연결 산출물이 준비 상태가 됩니다.
 
-ChatGPT Desktop 로컬 플러그인, Codex CLI, Claude Desktop, Claude Code용 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 실행하지 않고 번들 안의 `run_mcp_stdio_server.ps1` launcher를 실행합니다. 이 launcher는 번들 `data` 폴더를 기준으로 서버를 띄우고, 저장소 checkout 안에 번들이 있으면 현재 checkout의 `scripts\run_regulation_mcp.py`를 설치된 콘솔 명령보다 먼저 실행합니다. checkout을 찾지 못할 때만 PATH의 `reg-rag-mcp-server`로 fallback하며, 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다. Windows PowerShell 5.1에서 한글·공백 경로가 깨지지 않도록 실행 스크립트는 UTF-8 BOM으로 생성합니다.
+ChatGPT Desktop 로컬 플러그인, Codex CLI, Claude Desktop, Claude Code용 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 실행하지 않고 번들 안의 `run_mcp_stdio_server.ps1` launcher를 실행합니다. 이 launcher는 번들 `data` 폴더를 기준으로 서버를 띄우고, 저장소 checkout 안에 번들이 있으면 현재 checkout의 `scripts\run_regulation_mcp.py`를 설치된 콘솔 명령보다 먼저 실행합니다. checkout을 찾지 못할 때만 PATH의 `reg-rag-mcp-server`로 fallback하며, 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다. Windows PowerShell 5.1에서 한글·공백 경로가 깨지지 않도록 `.ps1` 실행 스크립트만 UTF-8 BOM을 허용합니다. `plugin.json`, `.mcp.json`, `marketplace.json`, 상태 JSON과 TOML은 항상 BOM 없는 UTF-8이며, ChatGPT Desktop `.mcp.json`이 `EF BB BF`로 시작하면 smoke와 ZIP 추출 검증이 실패합니다.
 
 GitHub private push 또는 배포 직전에는 release harness로 실제 runtime data를 다시 번들화하고, 생성된 번들 자체의 local stdio doctor와 transport smoke까지 확인합니다. 이 검사는 GitHub에서 받은 코드와 로컬 번들이 같은 방식으로 빠르게 연결되는지 보는 최소 회귀입니다.
 
@@ -194,7 +202,7 @@ powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_m
 
 ## 3. ChatGPT Desktop 로컬 플러그인과 Codex CLI
 
-`ChatGPT Desktop에 연결하기.bat`는 생성된 로컬 마켓플레이스와 플러그인을 통합 플러그인 디렉터리에 자동 등록한 뒤, 실제 stdio MCP 프로토콜 smoke를 실행합니다. 앱을 완전히 종료하고 다시 실행한 뒤 새 대화에서 입력창의 `+` → `더 보기` → MCP 이름을 선택하거나 `@MCP이름`으로 멘션합니다. 플러그인 등록 완료와 현재 대화의 도구 첨부는 별개입니다.
+`ChatGPT Desktop에 연결하기.bat`는 같은 이름의 기존 로컬 마켓플레이스를 제거하고 현재 번들 경로로 다시 등록한 뒤 플러그인을 설치합니다. 이어서 `codex plugin list --json`에서 새 cachebuster 버전과 공급 경로가 모두 일치하는지 확인하고 실제 stdio MCP 프로토콜 smoke를 실행합니다. 예전 경로나 `0.1.0` 같은 오래된 버전이 다시 발견되면 등록 성공으로 기록하지 않습니다. 앱을 완전히 종료하고 다시 실행한 뒤 새 대화에서 입력창의 `+` → `더 보기` → MCP 이름을 선택하거나 `@MCP이름`으로 멘션합니다. 플러그인 등록 완료와 현재 대화의 도구 첨부는 별개입니다.
 
 ChatGPT 대화 화면이 로컬 stdio 플러그인을 노출하지 않는 제품 구성에서는 아래의 `chatgpt-remote` HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다. `Codex 플러그인 MCP 입력값.txt`는 Codex CLI 수동 호환 설정용이며, Codex CLI는 `Codex에 연결하기.bat`를 사용합니다.
 
