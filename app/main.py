@@ -6,6 +6,7 @@ from uuid import uuid4
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from app import __version__
 from app.api.routes_documents import router as documents_router
 from app.api.routes_institutions import router as institutions_router
 from app.api.routes_exports import router as exports_router
@@ -29,7 +30,7 @@ def _assert_protected_env_storage_posture(settings: Settings) -> None:
 
 _assert_protected_env_storage_posture(Settings())
 
-app = FastAPI(title="PR MCP Builder", version="0.1.0")
+app = FastAPI(title="PR MCP Builder", version=__version__)
 app.add_middleware(
     JsonRequestBodyLimitMiddleware,
     max_body_bytes=Settings().max_json_request_body_mb * 1024 * 1024,

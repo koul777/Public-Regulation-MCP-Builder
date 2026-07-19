@@ -1,5 +1,15 @@
 # PR MCP Builder
 
+## MCP 구축 후 사용 예시
+
+<p align="center">
+  <img src="docs/assets/public-regulation-mcp-builder-demo.gif" alt="PR MCP Builder에서 MCP를 구축한 후 AI 프로그램에서 규정 도구를 사용하는 예시" width="960" />
+</p>
+
+<p align="center"><a href="docs/assets/public-regulation-mcp-builder-demo.gif">GIF를 새 창에서 크게 보기</a></p>
+
+규정 문서를 전처리하고 승인한 뒤 MCP를 연결하면, AI 프로그램에서 승인된 규정만 검색하고 근거와 함께 답변받을 수 있습니다.
+
 ## v1.2 업데이트 내역
 
 이번 v1.2는 **MCP 첫 연결 신뢰성**과 **파싱·전처리 변경 보호**를 강화한 업데이트입니다.
@@ -36,16 +46,16 @@
 [![Kordoc](https://img.shields.io/badge/HWP%20표-Kordoc%20선택%20보강-6B7280)](https://github.com/chrisryugj/kordoc)
 [![승인 데이터만](https://img.shields.io/badge/색인-승인%20데이터만-15803D)](#처리-구조)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Release target](https://img.shields.io/badge/release-v1.2.0-7C3AED)](#릴리스-자동화와-버전)
+[![Latest release](https://img.shields.io/github/v/release/koul777/Public-Regulation-MCP-Builder?display_name=tag&sort=semver)](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)
 
 PDF, HWP, HWPX, DOCX 형식의 공공기관 규정을 **기관 → 규정 → 개정 버전 → 장·절·조문** 구조로 정리하고, 사람이 승인한 내용만 검색 색인과 MCP 응답에 포함하는 Windows용 빌더입니다.
 
 단순히 모든 문장을 같은 크기로 잘라 유사도 검색만 하지 않습니다. 규정명과 목차를 먼저 좁힌 뒤 최신 유효 개정본의 조문을 찾고, 필요한 경우 이전 개정 이력까지 추적합니다. 같은 기관의 개정판을 다시 넣으면 본문 앞부분의 제정·개정 이력과 시행일을 읽어 기존 규정 계열에 새 버전으로 연결합니다.
 
-## 20초 사용 흐름
+## MCP 빌더 화면 안내
 
 <p align="center">
-  <img src="docs/assets/pr-mcp-builder-demo.gif" alt="PR MCP Builder 기관 선택부터 MCP 연결까지의 샘플 사용 흐름" width="960" />
+  <img src="docs/assets/pr-mcp-builder-demo.gif" alt="PR MCP Builder에서 기관을 선택하고 규정 문서를 처리한 뒤 MCP를 연결하는 화면 안내" width="960" />
 </p>
 
 <p align="center"><a href="docs/assets/pr-mcp-builder-demo.gif">GIF를 새 창에서 크게 보기</a></p>
@@ -103,7 +113,7 @@ ChatGPT Desktop 새 대화의 첫 검증 문장은 다음과 같습니다.
 
 배포 ZIP을 사용하는 경우 다음 세 단계만 수행합니다.
 
-1. `PR-MCP-Builder-Windows-x64-<버전>.zip`을 일반 폴더에 완전히 압축 해제합니다.
+1. [최신 GitHub Release](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)의 **Assets**에서 `PR-MCP-Builder-Windows-x64-<버전>.zip`을 내려받아 일반 폴더에 완전히 압축 해제합니다.
 2. 폴더 안의 **`PR MCP Builder.exe`**를 더블클릭합니다.
 3. 브라우저에서 자동으로 열린 로컬 화면을 사용합니다.
 
@@ -396,23 +406,23 @@ python scripts\audit_release_hygiene.py --workflow-scope available --include-unt
 Windows portable ZIP은 다음 명령으로 만듭니다.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_windows_portable.ps1 -Version 1.2.0
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_portable.ps1
 ```
 
-결과 파일은 `dist\PR-MCP-Builder-Windows-x64-1.2.0.zip`입니다. `data/`, `reports/`, `.tmp/`, `build/`, `dist/`, 가상환경과 실제 기관 문서는 Git에 커밋하지 않습니다.
+버전은 `app\__init__.py`에서 자동으로 읽으며, 결과 파일은 `dist\PR-MCP-Builder-Windows-x64-<버전>.zip`입니다. `data/`, `reports/`, `.tmp/`, `build/`, `dist/`, 가상환경과 실제 기관 문서는 Git에 커밋하지 않습니다.
 
 ## 릴리스 자동화와 버전
 
-현재 공개 릴리스 기준은 **v1.2.0**입니다. `pyproject.toml`의 패키지 버전은 `1.2.0`으로 유지하고, GitHub 태그와 Release에는 `v1.2.0` 형식을 사용합니다.
+[최신 공개 릴리스](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)의 태그와 Assets를 기준으로 배포 상태를 확인합니다. 버전의 단일 원천은 `app\__init__.py`의 `__version__`이며, Python 패키지 메타데이터, FastAPI OpenAPI 버전, Windows portable ZIP 이름, GitHub 태그와 Release가 모두 이 값을 사용합니다.
 
 ### main 푸시 자동 릴리스
 
 `main`에 병합하거나 직접 푸시한 변경은 `.github/workflows/auto-release.yml`로 자동 릴리스됩니다. 워크플로는 Python 3.11 환경에서 전체 `unittest`를 통과한 경우에만 다음을 수행합니다.
 
-1. 아직 태그가 없는 새 버전(현재 `v1.2.0`)은 그대로 첫 GitHub Release로 발행합니다.
-2. 이후 `main` 변경은 patch 버전을 하나 올립니다. 예: `1.2.0` → `1.2.1`.
-3. source distribution과 wheel을 빌드하고, 새 태그의 GitHub Release에 첨부합니다.
+1. 아직 태그가 없는 새 버전은 `app\__init__.py`의 버전으로 GitHub Release를 발행합니다.
+2. 이후 `main` 변경은 patch 버전을 하나 올리고 같은 값을 패키지, API와 모든 배포 파일에 적용합니다.
+3. source distribution(`.tar.gz`), wheel(`.whl`), Windows portable ZIP을 모두 빌드하고 새 태그의 GitHub Release에 첨부합니다.
 
-릴리스 커밋에는 `[skip auto-release]` 표식을 넣어 자체 푸시가 다시 버전을 올리는 무한 반복을 막습니다. 동일 커밋의 워크플로 재실행은 기존 태그와 Release를 재사용합니다. 테스트나 빌드가 실패하면 버전·태그·Release를 만들지 않습니다. 리포지토리의 **Settings → Actions → General → Workflow permissions**는 `Read and write permissions`를 허용해야 하며, `main` 브랜치 보호 규칙이 GitHub Actions의 릴리스 커밋 푸시를 막지 않도록 설정해야 합니다.
+릴리스 커밋에는 `[skip auto-release]` 표식을 넣어 자체 푸시가 다시 버전을 올리는 무한 반복을 막습니다. 동일 커밋의 워크플로 재실행은 기존 태그와 Release를 재사용하고 세 Assets를 다시 검증·업로드해 불완전한 릴리스를 복구합니다. 테스트나 빌드가 실패하거나 세 산출물 중 하나라도 없으면 버전·태그·Release 발행을 완료하지 않습니다. 리포지토리의 **Settings → Actions → General → Workflow permissions**는 `Read and write permissions`를 허용해야 하며, `main` 브랜치 보호 규칙이 GitHub Actions의 릴리스 커밋 푸시를 막지 않도록 설정해야 합니다.
 
 자세한 설계와 운영 문서는 [docs](docs/)를 참고합니다. 소스 코드는 [MIT License](LICENSE)를 따르며 외부 구성요소의 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 정리되어 있습니다.

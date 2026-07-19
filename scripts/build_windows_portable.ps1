@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = "0.1.0-dev",
+    [string]$Version = "",
     [string]$BasePython = "python",
     [switch]$SkipExeBuild
 )
@@ -12,12 +12,23 @@ $BuildRoot = Join-Path $ProjectRoot "build"
 $BuildVenv = Join-Path $ProjectRoot ".build-venv"
 $BuildPython = Join-Path $BuildVenv "Scripts\python.exe"
 $BuildPip = Join-Path $BuildVenv "Scripts\pip.exe"
-$PackageName = "PR-MCP-Builder-Windows-x64-$Version"
-$StageRoot = Join-Path $BuildRoot $PackageName
-$ZipPath = Join-Path $DistRoot "$PackageName.zip"
-
 Push-Location $ProjectRoot
 try {
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        $DetectedVersion = & $BasePython -c "from app import __version__; print(__version__)"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to read the package version from app.__version__."
+        }
+        $Version = $DetectedVersion.Trim()
+    }
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+        throw "Version must be a semantic release version such as 1.2.3: $Version"
+    }
+
+    $PackageName = "PR-MCP-Builder-Windows-x64-$Version"
+    $StageRoot = Join-Path $BuildRoot $PackageName
+    $ZipPath = Join-Path $DistRoot "$PackageName.zip"
+
     if (-not $SkipExeBuild) {
         if (-not (Test-Path -LiteralPath $BuildPython)) {
             & $BasePython -m venv $BuildVenv

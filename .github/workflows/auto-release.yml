@@ -46,11 +46,11 @@ jobs:
           import re
           from pathlib import Path
 
-          path = Path("pyproject.toml")
+          path = Path("app/__init__.py")
           contents = path.read_text(encoding="utf-8")
-          match = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"$', contents)
+          match = re.search(r'(?m)^__version__ = "(\d+)\.(\d+)\.(\d+)"$', contents)
           if not match:
-              raise SystemExit("A semantic project version is required in pyproject.toml.")
+              raise SystemExit("A semantic project version is required in app/__init__.py.")
           source_version = tuple(int(value) for value in match.groups())
           tags = []
           for tag in os.popen("git tag --list").read().splitlines():
@@ -71,7 +71,7 @@ jobs:
           else:
               release_version = (latest_version[0], latest_version[1], latest_version[2] + 1)
               next_version = ".".join(str(value) for value in release_version)
-              contents = contents[:match.start()] + f'version = "{next_version}"' + contents[match.end():]
+              contents = contents[:match.start()] + f'__version__ = "{next_version}"' + contents[match.end():]
               path.write_text(contents, encoding="utf-8")
           version_text = ".".join(str(value) for value in release_version)
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
@@ -82,6 +82,10 @@ jobs:
       - name: Build release artifacts
         run: python -m build --sdist --wheel
 
+      - name: Build Windows portable ZIP
+        shell: powershell
+        run: .\scripts\build_windows_portable.ps1 -Version "${{ steps.version.outputs.version }}"
+
       - name: Commit the release version and tag it
         shell: bash
         env:
@@ -90,8 +94,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- pyproject.toml; then
-            git add pyproject.toml
+          if ! git diff --quiet -- app/__init__.py; then
+            git add app/__init__.py
             git commit -m "chore(release): ${TAG} [skip auto-release]"
             git push origin HEAD:main
           fi
@@ -105,9 +109,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          artifacts=(
+            "dist/reg_rag_preprocessor-${VERSION}-py3-none-any.whl"
+            "dist/reg_rag_preprocessor-${VERSION}.tar.gz"
+            "dist/PR-MCP-Builder-Windows-x64-${VERSION}.zip"
+          )
+          for artifact in "${artifacts[@]}"; do
+            test -f "$artifact" || { echo "Missing release artifact: $artifact"; exit 1; }
+          done
           if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "Release ${TAG} already exists."
+            gh release upload "$TAG" "${artifacts[@]}" --clobber
           else
-            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+            gh release create "$TAG" "${artifacts[@]}" --title "$TAG" --generate-notes
           fi
