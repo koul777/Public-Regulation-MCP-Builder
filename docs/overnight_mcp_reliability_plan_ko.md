@@ -19,12 +19,14 @@
 
 ## 현재 확인된 수용 기준
 
-- 전체 회귀: `python -m unittest discover -s tests -v` 2114개 통과, 14개 skip (171.8초).
+- 전체 회귀: `python -m unittest discover -s tests -q` 2119개 통과, 14개 skip (174.0초).
 - 깨끗한 승인 MCP bundle: readiness/index visibility 277/277, stdio와 bearer 인증 HTTP smoke 통과.
 - 계층형 SQLite 검색: BM25가 없어도 유효한 retrieval runtime으로 진단되며, 동시성 benchmark가 이를 오류로 오판하지 않음.
 - 파서: HWP 잘림/UTF-16 손실, HWPML/HWPX DTD·entity, PDF 텍스트+이미지 혼합 페이지, HWPX 비본문 XML, 짧은 구조화 표를 review 신호로 보존.
 - Kordoc 외부 실행: 문서 메타데이터에 입력 확장자, 실행시간, timeout, table inventory 잘림 여부를 기록해 운영 중 성능·손실 원인을 추적한다.
 - Kordoc 임시 경로 생성 실패도 일반화된 오류 코드만 반환해 절대 경로가 인증 응답·JSONL로 흘러가지 않도록 한다.
+- 외부 ChatGPT/Claude API·Secure Tunnel은 `chatgpt-data` 프로필로 제한하고, 원격 smoke는 `search`→`fetch`와 내부 metadata deny-list를 검증한다.
+- ZIP bundle smoke는 traversal/symlink/크기 제한과 `--require-console-scripts` 실행 경로 증명을 지원한다.
 
 ## 후속 개선 후보
 
@@ -34,8 +36,9 @@
 ## 이번 9시간 세션 실행 상태
 
 - 완료: 기준선·파서 보안·승인/테넌트·stdio/HTTP·계층형 retrieval·Kordoc telemetry/redaction 감사.
-- 완료: 전체 회귀 2114/14 skip, wheel/sdist, release hygiene, dependency-complete wheel console-script 5/5, client-config stdio 3/3.
+- 완료: 전체 회귀 2119/14 skip, wheel/sdist, release hygiene, dependency-complete wheel console-script 5/5, client-config stdio 3/3, focused handoff 81 tests.
 - 완료: clean bundle 277/277 readiness, cold-start 5/5, concurrent/query benchmark 무결성.
+- 완료: secure-profile bundle/ZIP extraction 및 pinned venv console-script provenance 검증.
 - 대기: GitHub protected PR의 실제 Code Owner 검토와 `preprocessing-reviewed` 라벨. 라벨은 테스트 통과를 대신하지 않으며, 근거 확인 후에만 적용한다.
 
 ## 안전 원칙
