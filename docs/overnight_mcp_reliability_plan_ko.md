@@ -31,6 +31,13 @@
 - `QualityReport.passed`의 기존 호환 의미는 유지하고, 승인 직전 전용 `approval_ready`/blocking-warning 정책을 additive하게 도입한다.
 - Kordoc은 현재 릴리스 경로의 전 포맷 증거 계약을 깨지 않도록 유지하되, 포맷별 호출 필요성은 별도 benchmark와 명시적 설정으로 검토한다.
 
+## 이번 9시간 세션 실행 상태
+
+- 완료: 기준선·파서 보안·승인/테넌트·stdio/HTTP·계층형 retrieval·Kordoc telemetry/redaction 감사.
+- 완료: 전체 회귀 2114/14 skip, wheel/sdist, release hygiene, dependency-complete wheel console-script 5/5, client-config stdio 3/3.
+- 완료: clean bundle 277/277 readiness, cold-start 5/5, concurrent/query benchmark 무결성.
+- 대기: GitHub protected PR의 실제 Code Owner 검토와 `preprocessing-reviewed` 라벨. 라벨은 테스트 통과를 대신하지 않으며, 근거 확인 후에만 적용한다.
+
 ## 안전 원칙
 
 - 원문·런타임 데이터·기관 식별자는 공개 소스와 MCP 응답에 넣지 않는다.
