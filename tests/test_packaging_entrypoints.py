@@ -135,6 +135,8 @@ class PackagingEntrypointTests(unittest.TestCase):
     def test_windows_portable_release_includes_readme_link_targets(self) -> None:
         build_script = (ROOT / "scripts" / "build_windows_portable.ps1").read_text(encoding="utf-8")
 
+        self.assertIn("from app import __version__", build_script)
+        self.assertNotIn("0.1.0-dev", build_script)
         for expected_path in (
             "SECURITY.md",
             "THIRD_PARTY_NOTICES.md",
