@@ -15,7 +15,8 @@ from app.processors.kordoc_table_parser import KordocTableParser, extract_kordoc
 
 class KordocTableParserTests(unittest.TestCase):
     def test_split_command_repairs_unquoted_windows_executable_path(self) -> None:
-        parts = split_command(r"C:\Program Files\Kordoc\kordoc.exe --format json")
+        with patch("app.processors.kordoc_table_parser._is_windows", return_value=True):
+            parts = split_command(r"C:\Program Files\Kordoc\kordoc.exe --format json")
 
         self.assertEqual(parts[0], r"C:\Program Files\Kordoc\kordoc.exe")
         self.assertEqual(parts[1:], ["--format", "json"])
@@ -354,7 +355,7 @@ class KordocTableParserTests(unittest.TestCase):
 
         shim = "\\".join(["C:", "Users", "op", "AppData", "Roaming", "npm", "kordoc.CMD"])
         with patch("app.processors.kordoc_table_parser.shutil.which", return_value=shim), patch(
-            "app.processors.kordoc_table_parser.os.name", "nt"
+            "app.processors.kordoc_table_parser._is_windows", return_value=True
         ), patch("app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run):
             result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
 
@@ -380,7 +381,7 @@ class KordocTableParserTests(unittest.TestCase):
 
         shim = "\\".join(["C:", "Users", "op", "AppData", "Roaming", "npm", "kordoc.ps1"])
         with patch("app.processors.kordoc_table_parser.shutil.which", return_value=shim), patch(
-            "app.processors.kordoc_table_parser.os.name", "nt"
+            "app.processors.kordoc_table_parser._is_windows", return_value=True
         ), patch("app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run):
             result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
 
@@ -413,7 +414,7 @@ class KordocTableParserTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout=json.dumps({"blocks": []}), stderr="")
 
             with patch("app.processors.kordoc_table_parser.shutil.which", return_value=None), patch(
-                "app.processors.kordoc_table_parser.os.name", "nt"
+                "app.processors.kordoc_table_parser._is_windows", return_value=True
             ), patch.dict("app.processors.kordoc_table_parser.os.environ", {"APPDATA": str(root)}, clear=False), patch(
                 "app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run
             ):
@@ -443,7 +444,7 @@ class KordocTableParserTests(unittest.TestCase):
 
         binary = "/usr/local/bin/kordoc"
         with patch("app.processors.kordoc_table_parser.shutil.which", return_value=binary), patch(
-            "app.processors.kordoc_table_parser.os.name", "posix"
+            "app.processors.kordoc_table_parser._is_windows", return_value=False
         ), patch("app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run):
             result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
 

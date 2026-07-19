@@ -27,6 +27,7 @@ class PublicGithubReleaseChecklistTests(unittest.TestCase):
         self.assertIn("reg-rag-release-evidence-index --profile mcp-product-readiness", text)
         self.assertIn("--probe-public-url", text)
         self.assertIn("ChatGPT HTTPS/tunnel doctor", text)
+        self.assertIn("--client-profile chatgpt-remote", text)
 
     def test_readme_keeps_authority_backed_product_release_chain(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")

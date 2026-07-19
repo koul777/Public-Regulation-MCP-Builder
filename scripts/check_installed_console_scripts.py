@@ -14,6 +14,7 @@ DEFAULT_COMMANDS = (
     "reg-rag-batch",
     "reg-rag-public-batch-pipeline",
     "reg-rag-ci-gate",
+    "reg-rag-preprocessing-change-guard",
     "reg-rag-nightly-smoke",
     "reg-rag-audit-release",
     "reg-rag-audit-public-release",

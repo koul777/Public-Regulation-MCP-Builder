@@ -28,6 +28,7 @@ dev = [
 reg-rag-batch = "scripts.batch_process_regulations:main"
 reg-rag-public-batch-pipeline = "scripts.run_public_batch_pipeline:main"
 reg-rag-ci-gate = "scripts.run_ci_regression_gate:main"
+reg-rag-preprocessing-change-guard = "scripts.check_preprocessing_change_guard:main"
 reg-rag-nightly-smoke = "scripts.run_nightly_smoke:main"
 reg-rag-audit-release = "scripts.audit_release_hygiene:main"
 reg-rag-audit-public-release = "scripts.audit_public_release_readiness:main"

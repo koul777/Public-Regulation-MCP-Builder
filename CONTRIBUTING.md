@@ -24,6 +24,7 @@ For public/source-only workflow changes, run `reg-rag-private-release-smoke --sy
 
 - Keep changes scoped to preprocessing, approval, local regulation DB, MCP tools, or documented operator workflows.
 - Add focused tests for parser changes, approval/indexing gates, tenant isolation, MCP visibility, audit evidence, and security filtering.
+- Parser/preprocessing, regression-baseline, and guard changes must complete the protected section in the PR template and receive the `preprocessing-reviewed` label after Code Owner review.
 - Do not commit private documents, uploaded files, generated runtime data, vector stores, secrets, local paths, or institution-specific reports.
 - Prefer synthetic fixtures unless a public sample is redistributable and documented.
 - Keep MCP responses citation-backed and approved-data-only.
@@ -42,3 +43,5 @@ git diff --check
 ```
 
 PRs should include a summary, test commands, affected workflows, and any security or public-release implications.
+
+See `docs/preprocessing_change_governance_ko.md` for the protected paths, required PR evidence, and the GitHub Ruleset settings that prevent direct or unreviewed changes to parsing behavior.

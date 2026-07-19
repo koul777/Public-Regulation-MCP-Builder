@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp import FastMCP
 
@@ -114,6 +116,8 @@ def create_regulation_mcp_server(
     port: int = 8000,
     http_bearer_token: str | None = None,
     auth_issuer_url: str | None = None,
+    allowed_http_hosts: list[str] | None = None,
+    allowed_http_origins: list[str] | None = None,
     tool_profile: str = "full",
     warm_cache: bool = True,
 ) -> FastMCP:
@@ -156,6 +160,13 @@ def create_regulation_mcp_server(
         port=port,
         auth=auth_settings,
         token_verifier=token_verifier,
+        transport_security=_http_transport_security_settings(
+            host=host,
+            port=port,
+            auth_issuer_url=auth_issuer_url,
+            allowed_hosts=allowed_http_hosts,
+            allowed_origins=allowed_http_origins,
+        ),
     )
     server._reg_rag_scope = {
         "protocol": "MCP",
@@ -576,6 +587,37 @@ def _default_auth_issuer_url(*, host: str, port: int) -> str:
     issuer_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     bracketed_host = f"[{issuer_host}]" if ":" in issuer_host and not issuer_host.startswith("[") else issuer_host
     return f"http://{bracketed_host}:{int(port)}"
+
+
+def _http_transport_security_settings(
+    *,
+    host: str,
+    port: int,
+    auth_issuer_url: str | None,
+    allowed_hosts: list[str] | None,
+    allowed_origins: list[str] | None,
+) -> TransportSecuritySettings:
+    hosts = {str(value).strip() for value in (allowed_hosts or []) if str(value).strip()}
+    origins = {str(value).strip().rstrip("/") for value in (allowed_origins or []) if str(value).strip()}
+    if host in {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::"}:
+        hosts.update({"127.0.0.1:*", "localhost:*", "[::1]:*"})
+        origins.update({"http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"})
+    else:
+        hosts.update({host, f"{host}:*"})
+
+    issuer = urlparse(str(auth_issuer_url or "").strip())
+    if issuer.scheme in {"http", "https"} and issuer.hostname:
+        hosts.add(issuer.netloc)
+        hosts.add(f"{issuer.hostname}:*")
+        origins.add(f"{issuer.scheme}://{issuer.netloc}")
+
+    if not hosts:
+        hosts.add(f"127.0.0.1:{int(port)}")
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=sorted(hosts),
+        allowed_origins=sorted(origins),
+    )
 
 
 def _resolve_profile_scope(requested_profile_id: str | None, default_profile_id: str | None) -> str | None:

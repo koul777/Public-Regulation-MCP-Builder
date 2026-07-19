@@ -10,6 +10,7 @@ include docs/harness_engineering_plan_ko.md
 include docs/hermes_engineering_plan_ko.md
 include docs/prd_integrated_rag_chatbot_ko.md
 include docs/public_github_release_checklist_ko.md
+include docs/preprocessing_change_governance_ko.md
 include docs/public_release_report_allowlist.json
 include docs/public_release_report_allowlist.example.json
 include docs/ui_ux_release_scope_ko.md

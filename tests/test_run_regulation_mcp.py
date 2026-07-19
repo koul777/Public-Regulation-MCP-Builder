@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from app.mcp_server.regulation_server import create_regulation_mcp_server
-from scripts.run_regulation_mcp import _resolve_http_bearer_token, _validate_http_auth_posture
+from scripts.run_regulation_mcp import _resolve_http_bearer_token, _validate_http_auth_posture, parse_args
 
 
 class RunRegulationMcpTests(unittest.TestCase):
@@ -44,6 +44,57 @@ class RunRegulationMcpTests(unittest.TestCase):
 
         self.assertIsNotNone(server.settings.auth)
         self.assertEqual(["mcp:read"], server.settings.auth.required_scopes)
+
+    def test_loopback_server_enables_dns_rebinding_protection(self) -> None:
+        server = create_regulation_mcp_server(
+            data_dir="data",
+            tenant_id="default",
+            host="127.0.0.1",
+            port=8123,
+            warm_cache=False,
+        )
+
+        security = server.settings.transport_security
+        self.assertTrue(security.enable_dns_rebinding_protection)
+        self.assertIn("127.0.0.1:*", security.allowed_hosts)
+        self.assertIn("http://127.0.0.1:*", security.allowed_origins)
+
+    def test_public_https_issuer_and_explicit_host_origin_are_allowlisted(self) -> None:
+        server = create_regulation_mcp_server(
+            data_dir="data",
+            tenant_id="default",
+            host="0.0.0.0",
+            port=8000,
+            http_bearer_token="secret-token",
+            auth_issuer_url="https://mcp.example.go.kr",
+            allowed_http_hosts=["mcp.example.go.kr"],
+            allowed_http_origins=["https://chatgpt.com/"],
+            warm_cache=False,
+        )
+
+        security = server.settings.transport_security
+        self.assertTrue(security.enable_dns_rebinding_protection)
+        self.assertIn("mcp.example.go.kr", security.allowed_hosts)
+        self.assertIn("https://mcp.example.go.kr", security.allowed_origins)
+        self.assertIn("https://chatgpt.com", security.allowed_origins)
+
+    def test_cli_accepts_repeated_http_host_and_origin_allowlists(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "run_regulation_mcp.py",
+                "--allowed-http-host",
+                "mcp.example.go.kr",
+                "--allowed-http-host",
+                "proxy.example.go.kr",
+                "--allowed-http-origin",
+                "https://chatgpt.com",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(["mcp.example.go.kr", "proxy.example.go.kr"], args.allowed_http_host)
+        self.assertEqual(["https://chatgpt.com"], args.allowed_http_origin)
 
     def test_create_server_warms_runtime_cache_by_default(self) -> None:
         with (

@@ -96,7 +96,7 @@ reg-rag-github-publish-owner-decisions --decisions-csv reports/github_publish_ow
 reg-rag-mcp-smoke --out-json reports/mcp_smoke.json --fail-on-issue
 reg-rag-private-release-smoke --synthetic-sample --out-json reports/private_release_smoke_dev.json
 reg-rag-mcp-config --client-profile bundle --server-name regulation_mcp --tenant-id default --out-dir reports/mcp_connection_bundle --zip-out reports/mcp_connection_bundle.zip --include-wheel --skip-runtime-data
-reg-rag-mcp-doctor --client-profile chatgpt --transport streamable-http --public-url https://example.invalid/mcp --skip-data-check --json
+reg-rag-mcp-doctor --client-profile chatgpt-remote --transport streamable-http --public-url https://example.invalid/mcp --skip-data-check --json
 reg-rag-mcp-doctor --client-profile bundle --transport streamable-http --host 0.0.0.0 --public-url https://example.invalid/mcp --bundle-dir reports/mcp_connection_bundle --skip-data-check --json
 git diff --check
 ```

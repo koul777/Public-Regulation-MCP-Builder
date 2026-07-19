@@ -1,0 +1,52 @@
+name: Preprocessing change policy
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  policy:
+    name: preprocessing-change-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Collect changed file names without executing PR code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[] | [.status, .filename] | @tsv' \
+            > "${RUNNER_TEMP}/preprocessing-changed-files.tsv"
+
+      - name: Enforce preprocessing PR evidence and review
+        run: |
+          python scripts/check_preprocessing_change_guard.py \
+            --changed-files-file "${RUNNER_TEMP}/preprocessing-changed-files.tsv" \
+            --github-event "${GITHUB_EVENT_PATH}" \
+            --out-json "${RUNNER_TEMP}/preprocessing-change-policy.json"
+
+      - name: Upload policy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preprocessing-change-policy
+          path: ${{ runner.temp }}/preprocessing-change-policy.json
+          if-no-files-found: ignore
+          retention-days: 14

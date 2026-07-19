@@ -47,6 +47,18 @@ def parse_args() -> argparse.Namespace:
         help="Issuer URL advertised by the MCP auth metadata when bearer auth is enabled.",
     )
     parser.add_argument(
+        "--allowed-http-host",
+        action="append",
+        default=[],
+        help="Allowed Host header for MCP HTTP DNS-rebinding protection. Repeat for multiple public hosts.",
+    )
+    parser.add_argument(
+        "--allowed-http-origin",
+        action="append",
+        default=[],
+        help="Allowed Origin header for MCP HTTP DNS-rebinding protection. Repeat when a trusted client sends Origin.",
+    )
+    parser.add_argument(
         "--allow-unauthenticated-http",
         action="store_true",
         help="Allow non-loopback HTTP/SSE startup without bearer auth. Use only behind approved network controls.",
@@ -87,6 +99,8 @@ def main() -> int:
         port=args.port,
         http_bearer_token=http_bearer_token,
         auth_issuer_url=args.auth_issuer_url,
+        allowed_http_hosts=args.allowed_http_host,
+        allowed_http_origins=args.allowed_http_origin,
         tool_profile=args.tool_profile,
         warm_cache=not args.no_warm_cache,
     )
