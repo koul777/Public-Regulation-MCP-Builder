@@ -89,6 +89,10 @@ class RegulationMcpToolsTests(unittest.TestCase):
             "kordoc_table_promotion_review_required": True,
             "kordoc_table_unmatched_source": False,
             "kordoc_table_match": {"table_id": "kordoc-1", "score": 0.9},
+            "kordoc_elapsed_ms": 12.5,
+            "kordoc_input_extension": ".hwp",
+            "kordoc_timeout_seconds": 120,
+            "kordoc_table_inventory": {"tables": [{"title": "internal"}]},
             "parser_uncertainty_remediation_hint": "review original",
         }
 
@@ -105,6 +109,11 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertNotIn("source_hwp_streams", search_result["metadata"])
         self.assertNotIn("kordoc_table_match", search_result["metadata"])
         self.assertNotIn("parser_uncertainty_remediation_hint", search_result["metadata"])
+        for metadata in (search_result["metadata"], fetch_result["metadata"]):
+            self.assertNotIn("kordoc_elapsed_ms", metadata)
+            self.assertNotIn("kordoc_input_extension", metadata)
+            self.assertNotIn("kordoc_timeout_seconds", metadata)
+            self.assertNotIn("kordoc_table_inventory", metadata)
         self.assertEqual(search_result["metadata"]["table_source"], "kordoc")
         self.assertEqual(search_result["metadata"]["table_geometry_source"], "kordoc")
         self.assertEqual(search_result["metadata"]["primary_parser_table_source"], "hwp_parser")

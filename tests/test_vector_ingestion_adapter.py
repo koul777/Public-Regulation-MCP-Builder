@@ -61,6 +61,10 @@ class VectorIngestionAdapterTests(unittest.TestCase):
                 "table_geometry_source": "kordoc",
                 "kordoc_table_parser_status": "parsed",
                 "kordoc_table_count": 3,
+                "kordoc_elapsed_ms": 12.5,
+                "kordoc_input_extension": ".hwp",
+                "kordoc_timeout_seconds": 120,
+                "kordoc_table_inventory": {"tables": [{"title": "internal"}]},
                 "kordoc_table_match": {
                     "match_label": "medium_review_match",
                     "table_index": 2,
@@ -124,6 +128,10 @@ class VectorIngestionAdapterTests(unittest.TestCase):
         self.assertEqual(record["metadata"]["table_geometry_source"], "kordoc")
         self.assertEqual(record["metadata"]["kordoc_table_parser_status"], "parsed")
         self.assertEqual(record["metadata"]["kordoc_table_count"], 3)
+        self.assertNotIn("kordoc_elapsed_ms", record["metadata"])
+        self.assertNotIn("kordoc_input_extension", record["metadata"])
+        self.assertNotIn("kordoc_timeout_seconds", record["metadata"])
+        self.assertNotIn("kordoc_table_inventory", record["metadata"])
         self.assertEqual(record["metadata"]["kordoc_table_match"]["table_index"], 2)
         self.assertTrue(record["metadata"]["kordoc_table_match_review_required"])
         self.assertTrue(record["metadata"]["kordoc_table_match_provisional"])
