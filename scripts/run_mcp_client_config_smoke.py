@@ -462,6 +462,51 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
             list_tools_elapsed_ms = _elapsed_ms(list_tools_started_at)
             tool_names = sorted(tool.name for tool in tool_result.tools)
 
+            if "get_index_status" not in tool_names and {"search", "fetch"}.issubset(set(tool_names)):
+                search_payload, results, search_query_used, search_queries_attempted, search_elapsed_ms = (
+                    await _search_with_fallback(session, query=query)
+                )
+                first_id = str((results[0] if results else {}).get("id") or "")
+                fetch_payload: dict[str, Any] = {}
+                fetch_elapsed_ms = 0.0
+                if first_id:
+                    fetch_started_at = time.perf_counter()
+                    fetch = await session.call_tool("fetch", {"id": first_id})
+                    fetch_elapsed_ms = _elapsed_ms(fetch_started_at)
+                    fetch_payload = _tool_payload(fetch)
+                metadata_candidates: list[Any] = []
+                if results and isinstance(results[0], dict):
+                    metadata_candidates.append(results[0].get("metadata") or {})
+                metadata_candidates.append(fetch_payload.get("metadata") or {})
+                metadata_violations = _external_metadata_violations(metadata_candidates)
+                verified = bool(results and fetch_payload.get("text") and not metadata_violations)
+                return {
+                    "passed": verified,
+                    "process_started": True,
+                    "mcp_initialized": True,
+                    "tools_discovered": bool(tool_names),
+                    "strict_stdio_wire_verified": True,
+                    "index_status_verified": False,
+                    "contract_verified": verified,
+                    "end_to_end_verified": verified,
+                    "verification_mode": "search_fetch",
+                    "external_metadata_violations": metadata_violations,
+                    "external_metadata_redaction_verified": not metadata_violations,
+                    "tool_names": tool_names,
+                    "index_status_summary": {},
+                    "search_result_count": len(results),
+                    "search_query_used": search_query_used,
+                    "search_queries_attempted": search_queries_attempted,
+                    "fetch_has_text": bool(fetch_payload.get("text")),
+                    "first_id": first_id,
+                    "first_result_metadata": (results[0] if results else {}).get("metadata") or {},
+                    "list_tools_elapsed_ms": list_tools_elapsed_ms,
+                    "index_status_elapsed_ms": 0.0,
+                    "search_elapsed_ms": search_elapsed_ms,
+                    "fetch_elapsed_ms": fetch_elapsed_ms,
+                    "total_elapsed_ms": _elapsed_ms(started_at),
+                }
+
             index_status_started_at = time.perf_counter()
             index_status = await session.call_tool(
                 "get_index_status",
