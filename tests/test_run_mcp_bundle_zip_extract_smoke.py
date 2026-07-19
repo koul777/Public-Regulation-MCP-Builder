@@ -207,6 +207,13 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Symlink bundle archive member"):
                 _extract_archive_safely(symlink, destination)
 
+            duplicate = root / "duplicate.zip"
+            with zipfile.ZipFile(duplicate, "w") as archive:
+                archive.writestr("same.txt", "first")
+                archive.writestr("same.txt", "second")
+            with self.assertRaisesRegex(ValueError, "Duplicate bundle archive member"):
+                _extract_archive_safely(duplicate, destination)
+
 
 def _write_client_configs(bundle: Path, *, launcher: Path, data_dir: Path) -> None:
     args = [

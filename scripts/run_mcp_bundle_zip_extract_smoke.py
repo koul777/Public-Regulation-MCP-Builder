@@ -138,6 +138,7 @@ def _extract_archive_safely(
         if len(members) > max_entries:
             raise ValueError(f"Bundle archive has too many entries: {len(members)} > {max_entries}.")
         total_bytes = 0
+        seen_targets: set[Path] = set()
         for member in members:
             posix_name = PurePosixPath(member.filename)
             windows_name = PureWindowsPath(member.filename)
@@ -164,6 +165,9 @@ def _extract_archive_safely(
             target = (destination / Path(*posix_name.parts)).resolve()
             if target != destination and destination not in target.parents:
                 raise ValueError(f"Bundle archive member escapes extraction directory: {member.filename}")
+            if target in seen_targets:
+                raise ValueError(f"Duplicate bundle archive member path: {member.filename}")
+            seen_targets.add(target)
             if member.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
