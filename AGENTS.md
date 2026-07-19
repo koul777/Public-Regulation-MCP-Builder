@@ -34,3 +34,5 @@ python scripts\audit_release_hygiene.py --workflow-scope available --include-unt
 ## Contributions
 
 Add focused tests for parser behavior, security gates, tenant isolation, vector ingestion, approval-based indexing, and public-release hygiene. See `docs/harness_engineering_plan_ko.md` and `docs/hermes_engineering_plan_ko.md` for public release-harness procedures. Include the commands and results in pull requests. Do not commit generated runtime data or institution documents.
+
+Changes to parsing/preprocessing logic, regression baselines, or their GitHub guard must also follow `docs/preprocessing_change_governance_ko.md`: complete the protected PR template fields, change a focused regression test, and obtain Code Owner review plus the `preprocessing-reviewed` label.

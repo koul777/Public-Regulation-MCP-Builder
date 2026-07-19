@@ -80,7 +80,9 @@ def kordoc_table_command_status(command: str) -> dict[str, Any]:
     if not resolved:
         return status
     status["available"] = True
-    status["resolved_name"] = Path(resolved).name
+    # Preserve a stable evidence label even when a Windows path is inspected
+    # by a non-Windows CI runner (and vice versa).
+    status["resolved_name"] = str(resolved).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     version = _command_version(resolved)
     if version:
         status["version"] = version

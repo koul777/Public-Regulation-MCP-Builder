@@ -8,6 +8,45 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class GitHubWorkflowTemplatesTests(unittest.TestCase):
+    def test_auto_release_replaces_the_complete_semantic_version_line(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
+        text = path.read_text(encoding="utf-8")
+
+        self.assertIn("contents[:match.start()]", text)
+        self.assertIn("contents[match.end():]", text)
+        self.assertNotIn("match.start(1)", text)
+        self.assertNotIn("match.end(1)", text)
+
+    def test_preprocessing_policy_never_executes_pull_request_code(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "preprocessing-change-policy.yml"
+        text = path.read_text(encoding="utf-8")
+
+        self.assertIn("pull_request_target:", text)
+        self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", text)
+        self.assertIn("persist-credentials: false", text)
+        self.assertIn("gh api --paginate", text)
+        self.assertIn("scripts/check_preprocessing_change_guard.py", text)
+        self.assertNotIn("github.event.pull_request.head.sha", text)
+
+    def test_preprocessing_regression_runs_protected_suite_and_release_checks(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "preprocessing-regression.yml"
+        text = path.read_text(encoding="utf-8")
+
+        self.assertIn("pull_request:", text)
+        self.assertIn("runs-on: windows-latest", text)
+        self.assertIn("shell: bash", text)
+        self.assertIn("tests.test_preprocessing_change_guard", text)
+        self.assertIn("tests.test_deployment_defaults", text)
+        self.assertIn("tests.test_hwpx_parser", text)
+        self.assertIn("tests.test_table_extractor", text)
+        self.assertIn("tests.test_processing_service", text)
+        self.assertIn("tests.test_generate_mcp_client_config", text)
+        self.assertIn("tests.test_run_mcp_client_config_smoke", text)
+        self.assertIn("tests.test_run_mcp_transport_smoke", text)
+        self.assertIn("tests.test_check_mcp_connection_readiness", text)
+        self.assertIn("python -m build --sdist --wheel", text)
+        self.assertIn("--include-source-path-scan", text)
+
     def test_ci_template_exercises_mcp_connection_paths(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
         if not path.exists():

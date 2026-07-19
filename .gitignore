@@ -10,9 +10,6 @@ venv/
 .venv-rehearsal/
 .env
 .codex/
-.github/workflows/*
-!.github/workflows/auto-release.yml
-
 build/
 dist/
 tmp/

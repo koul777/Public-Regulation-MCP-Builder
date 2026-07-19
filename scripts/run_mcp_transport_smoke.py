@@ -191,6 +191,10 @@ def _run_transport_smoke_with_data_dir(
             and full_profile.get("history_passed")
             and set(chatgpt_profile.get("tool_names") or []) == {"search", "fetch"}
         ),
+        "process_started": bool(full_profile.get("process_started")),
+        "mcp_initialized": bool(full_profile.get("mcp_initialized")),
+        "tools_discovered": bool(full_profile.get("tools_discovered")),
+        "end_to_end_verified": bool(full_profile.get("end_to_end_verified")),
         "preparation": {
             "passed": bool(preparation.get("passed")),
             "search_result_count": preparation.get("search_result_count"),
@@ -456,6 +460,18 @@ async def _call_profile_tools(
     tool_result = await session.list_tools()
     list_tools_elapsed_ms = _elapsed_ms(list_tools_started_at)
     tool_names = sorted(tool.name for tool in tool_result.tools)
+    index_status_payload: dict[str, Any] = {}
+    index_status_elapsed_ms = 0.0
+    index_status_verified = False
+    if "get_index_status" in tool_names:
+        index_status_started_at = time.perf_counter()
+        index_status = await session.call_tool(
+            "get_index_status",
+            {"security_levels": ["internal"]},
+        )
+        index_status_elapsed_ms = _elapsed_ms(index_status_started_at)
+        index_status_payload = _tool_payload(index_status)
+        index_status_verified = isinstance(index_status_payload.get("summary"), dict)
     search_started_at = time.perf_counter()
     search = await session.call_tool(
         "search",
@@ -534,9 +550,28 @@ async def _call_profile_tools(
         if isinstance(warm_search_payload.get("results"), list)
         else []
     )
-    expected_tools = {"search", "fetch"} if tool_profile == "chatgpt-data" else {"search", "fetch", "list_documents"}
+    expected_tools = (
+        {"search", "fetch"}
+        if tool_profile == "chatgpt-data"
+        else {"search", "fetch", "list_documents", "get_index_status"}
+    )
     return {
-        "passed": bool(expected_tools.issubset(set(tool_names)) and results and fetch_payload.get("text")),
+        "passed": bool(
+            expected_tools.issubset(set(tool_names))
+            and (tool_profile == "chatgpt-data" or index_status_verified)
+            and results
+            and fetch_payload.get("text")
+        ),
+        "process_started": True,
+        "mcp_initialized": True,
+        "tools_discovered": bool(tool_names),
+        "index_status_verified": index_status_verified,
+        "end_to_end_verified": bool(
+            expected_tools.issubset(set(tool_names))
+            and (tool_profile == "chatgpt-data" or index_status_verified)
+            and results
+            and fetch_payload.get("text")
+        ),
         "tool_profile": tool_profile,
         "tool_names": tool_names,
         "query": query,
@@ -555,6 +590,8 @@ async def _call_profile_tools(
         "first_result_metadata": first_result_metadata,
         "search_metadata": search_metadata,
         "list_tools_elapsed_ms": list_tools_elapsed_ms,
+        "index_status_elapsed_ms": index_status_elapsed_ms,
+        "index_status_summary": index_status_payload.get("summary") or {},
         "search_elapsed_ms": search_elapsed_ms,
         "fetch_elapsed_ms": fetch_elapsed_ms,
         "warm_search_elapsed_ms": warm_search_elapsed_ms,

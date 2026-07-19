@@ -23,8 +23,17 @@ from scripts.report_metadata import current_repo_commit
 from app.core.tenant_access import tenant_storage_key
 
 
-REMOTE_CLIENTS = {"chatgpt", "claude-api"}
-VALID_CLIENTS = {"bundle", "claude-desktop", "claude-code", "chatgpt", "claude-api"}
+PROFILE_ALIASES = {"chatgpt": "chatgpt-remote"}
+REMOTE_CLIENTS = {"chatgpt-remote", "claude-api"}
+VALID_CLIENTS = {
+    "bundle",
+    "claude-desktop",
+    "claude-code",
+    "chatgpt-desktop-local",
+    "chatgpt-remote",
+    "chatgpt",
+    "claude-api",
+}
 VALID_CONNECTION_MODES = {"direct", "openai-tunnel"}
 PLACEHOLDER_VALUES = {"", "<strong-token>", "<strong-internal-token>", "<strong-approved-token>", "<runtime-api-key>", "<tunnel_id>"}
 BUNDLE_REQUIRED_FILES = REQUIRED_SETUP_BUNDLE_FILES
@@ -82,9 +91,13 @@ def check_mcp_connection_readiness(
     probe_timeout_seconds: float = 5.0,
     allow_local_only_bundle: bool = False,
 ) -> dict[str, object]:
-    profile = client_profile.strip().lower()
-    if profile not in VALID_CLIENTS:
-        raise ValueError("client_profile must be bundle, claude-desktop, claude-code, chatgpt, or claude-api.")
+    requested_profile = client_profile.strip().lower()
+    if requested_profile not in VALID_CLIENTS:
+        raise ValueError(
+            "client_profile must be bundle, claude-desktop, claude-code, chatgpt-desktop-local, "
+            "chatgpt-remote, chatgpt (legacy alias), or claude-api."
+        )
+    profile = PROFILE_ALIASES.get(requested_profile, requested_profile)
     mode = connection_mode.strip().lower()
     if mode not in VALID_CONNECTION_MODES:
         raise ValueError("connection_mode must be direct or openai-tunnel.")
@@ -1416,8 +1429,12 @@ def _check_bundle_manifest_readiness(
             )
         )
         return
-    for key, label in (("chatgpt", "ChatGPT"), ("claude_api", "Claude API")):
-        if ready.get(key) is not True:
+    readiness_checks = (
+        (("chatgpt_remote", "chatgpt"), "ChatGPT remote"),
+        (("claude_api",), "Claude API"),
+    )
+    for keys, label in readiness_checks:
+        if not any(ready.get(key) is True for key in keys):
             if allow_local_only_bundle:
                 continue
             findings.append(

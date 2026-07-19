@@ -5,9 +5,15 @@
 ## 권장 구조
 
 ```text
-Claude Desktop / Claude Code / ChatGPT / Claude API
-  -> MCP client
+ChatGPT Desktop 로컬 플러그인 / Claude Desktop / Claude Code
+  -> local stdio MCP
   -> PR MCP Builder local MCP server
+
+ChatGPT 원격 앱 / Claude API
+  -> authenticated HTTPS Streamable HTTP MCP
+  -> PR MCP Builder MCP server
+
+두 경로 모두
   -> approved local regulation DB and vector index
 ```
 
@@ -40,7 +46,7 @@ reg-rag-mcp-config `
   --include-wheel
 ```
 
-`--public-url`이 없어도 통합형 ChatGPT Desktop, Codex CLI, Claude Desktop, Claude Code 로컬 stdio 설정은 생성됩니다. ChatGPT 웹/Claude API 원격 연결만 `ready=false`로 표시됩니다.
+`--public-url`이 없어도 ChatGPT Desktop 로컬 플러그인, Codex CLI, Claude Desktop, Claude Code의 stdio 설정은 생성됩니다. ChatGPT 원격 앱/Claude API 연결만 `ready=false`로 표시됩니다.
 로컬 Claude Desktop/Claude Code만 검증할 때는 doctor에 `--allow-local-only-bundle`을 붙이면 원격 프로필 not-ready를 실패로 보지 않습니다. 이 검사는 번들 내 JSON 구문과 Claude Desktop `mcpServers` 구조도 함께 확인합니다.
 Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop`를 먼저 실행합니다. 통과하면 `-InstallClaudeDesktop` 자동 병합을 사용하고, 수동 편집 시에는 생성된 JSON 전체가 아니라 `mcpServers` 항목만 병합합니다. 생성된 `claude_desktop_config.json`은 bundle 폴더의 `data` 경로를 가리키도록 만들어지지만, zip을 다른 위치에 풀었다면 자동 병합 스크립트를 다시 실행하는 편이 안전합니다.
 
@@ -78,11 +84,11 @@ Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp
 - `data/vector_db/<tenant>/approved_vectors.jsonl`
 - `data/vector_db/<tenant>/bm25_index.json`
 
-비개발자용 Windows 배포에서는 `.ps1` 실행을 안내하지 않습니다. 프로그램에서 연결 대상을 선택하면 로컬 앱은 `ChatGPT Desktop에 연결하기.bat`, `Codex에 연결하기.bat`, `Claude Desktop에 연결하기.bat`, `Claude Code에 연결하기.bat`를 만들고, 원격 연결은 `ChatGPT HTTPS에 연결하기.bat`, `ChatGPT 보안 Tunnel에 연결하기.bat`, `Claude HTTPS에 연결하기.bat` 중 선택한 방식의 버튼과 설정 파일을 만듭니다. 연결 후 새 대화에서 `입력한이름 MCP를 사용해서 등록된 규정 목록을 보여줘.`라고 호출합니다. 같은 이름으로 다시 생성하면 기존 설정을 교체하고 추가·개정 청크를 같은 MCP에 포함합니다.
+비개발자용 Windows 배포에서는 `.ps1` 실행을 안내하지 않습니다. 프로그램에서 연결 대상을 선택하면 로컬 앱은 `ChatGPT Desktop에 연결하기.bat`, `Codex에 연결하기.bat`, `Claude Desktop에 연결하기.bat`, `Claude Code에 연결하기.bat`를 만들고, 원격 연결은 `ChatGPT HTTPS에 연결하기.bat`, `ChatGPT 보안 Tunnel에 연결하기.bat`, `Claude HTTPS에 연결하기.bat` 중 선택한 방식의 버튼과 설정 파일을 만듭니다. ChatGPT Desktop 플러그인을 등록한 뒤에는 앱을 완전히 종료하고 다시 시작합니다. 새 대화에서 입력창의 `+` → `더 보기` → `aksmcp`를 선택하거나 `@aksmcp`를 멘션한 뒤 `@aksmcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.`라고 확인합니다. 플러그인 등록과 현재 대화 첨부는 별도 상태입니다. 같은 이름으로 다시 생성하면 기존 설정을 교체하고 추가·개정 청크를 같은 MCP에 포함합니다.
 
 ## stdio 방식
 
-통합형 ChatGPT Desktop, Codex CLI, 로컬 Claude Desktop/Claude Code에는 stdio가 가장 단순합니다.
+ChatGPT Desktop 로컬 플러그인, Codex CLI, 로컬 Claude Desktop/Claude Code에는 stdio가 가장 단순합니다.
 
 ```powershell
 reg-rag-mcp-server --data-dir data --tenant-id default --transport stdio
@@ -173,13 +179,13 @@ reg-rag-mcp-config `
   --public-url https://mcp.example.go.kr
 ```
 
-## ChatGPT 연결
+## ChatGPT 원격 연결
 
 ChatGPT Apps/Connectors는 HTTPS `/mcp` endpoint가 필요합니다. 공개 가능 데이터 또는 별도 승인된 데이터만 연결합니다.
 
 ```powershell
 reg-rag-mcp-config `
-  --client-profile chatgpt `
+  --client-profile chatgpt-remote `
   --server-name regulation_mcp `
   --tenant-id default `
   --transport streamable-http `
@@ -188,7 +194,7 @@ reg-rag-mcp-config `
   --public-url https://mcp.example.go.kr
 ```
 
-데이터형 연결은 `search`와 `fetch`만 노출합니다. 내부망에서 직접 공개하지 않는 방식이 필요하면 bundle의 `run_openai_secure_tunnel.ps1`을 사용합니다.
+원격 프로필은 승인된 읽기 전용 규정 도구와 `get_index_status`를 노출합니다. 실제 연결 검증은 `initialize`, `tools/list`, `get_index_status`를 모두 통과해야 완료됩니다. 내부망에서 직접 공개하지 않는 방식이 필요하면 bundle의 `run_openai_secure_tunnel.ps1`을 사용합니다.
 
 ## Claude API 연결
 

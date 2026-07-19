@@ -1,0 +1,71 @@
+name: Preprocessing regression
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: preprocessing-regression
+    # The shipped operator path and Kordoc shim/BAT regressions are Windows-specific.
+    # Git Bash keeps the readable multiline commands while Python still runs on Windows.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out pull request revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and build tooling
+        run: python -m pip install --disable-pip-version-check -e . build
+
+      - name: Run parsing and preprocessing regression suite
+        run: |
+          python -m unittest -v \
+            tests.test_preprocessing_change_guard \
+            tests.test_github_workflow_templates \
+            tests.test_deployment_defaults \
+            tests.test_docx_parser \
+            tests.test_hwp_parser \
+            tests.test_hwpx_parser \
+            tests.test_pdf_parser \
+            tests.test_office_archive_safety \
+            tests.test_normalizer \
+            tests.test_metadata_extractor \
+            tests.test_structure_detector \
+            tests.test_table_extractor \
+            tests.test_kordoc_table_matcher \
+            tests.test_kordoc_table_parser \
+            tests.test_chunker \
+            tests.test_quality_gate \
+            tests.test_pipeline \
+            tests.test_processing_service \
+            tests.test_article_validity \
+            tests.test_generate_mcp_client_config \
+            tests.test_run_mcp_client_config_smoke \
+            tests.test_run_mcp_transport_smoke \
+            tests.test_run_regulation_mcp \
+            tests.test_check_mcp_connection_readiness \
+            tests.test_streamlit_operator_mode
+
+      - name: Build source and wheel distributions
+        run: python -m build --sdist --wheel
+
+      - name: Audit public source hygiene
+        run: >-
+          python scripts/audit_release_hygiene.py
+          --workflow-scope available
+          --include-untracked
+          --include-source-path-scan

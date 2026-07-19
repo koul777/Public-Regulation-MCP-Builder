@@ -1,0 +1,22 @@
+# Parsing/preprocessing and MCP connection behavior require repository-owner review.
+/app/parsers/ @koul777
+/app/processors/ @koul777
+/app/mcp_server/ @koul777
+/app/core/pipeline.py @koul777
+/app/services/processing_service.py @koul777
+/app/schemas/chunk.py @koul777
+/app/schemas/parsed.py @koul777
+/app/schemas/quality.py @koul777
+/app/schemas/structure.py @koul777
+/frontend/streamlit_app.py @koul777
+/tests/ @koul777
+/tests/fixtures/regression/ @koul777
+/scripts/check_preprocessing_change_guard.py @koul777
+/scripts/check_mcp_connection_readiness.py @koul777
+/scripts/generate_mcp_client_config.py @koul777
+/scripts/mcp_bundle_contract.py @koul777
+/scripts/run_mcp_client_config_smoke.py @koul777
+/scripts/run_mcp_transport_smoke.py @koul777
+/scripts/run_regulation_mcp.py @koul777
+/.github/ @koul777
+/docs/preprocessing_change_governance_ko.md @koul777

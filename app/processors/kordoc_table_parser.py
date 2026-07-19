@@ -62,9 +62,9 @@ class KordocTableParser:
         argv = [resolved, *parts[1:], str(run_path), "--format", "json", "--silent"]
         # Windows npm shims need an explicit shell host when launched from
         # subprocess with argv-list form.
-        if os.name == "nt" and resolved.lower().endswith(".ps1"):
+        if _is_windows() and resolved.lower().endswith(".ps1"):
             argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
-        elif os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        elif _is_windows() and resolved.lower().endswith((".cmd", ".bat")):
             argv = ["cmd", "/c", *argv]
         try:
             completed = subprocess.run(
@@ -107,12 +107,17 @@ class KordocTableParser:
 
 def split_command(command: str) -> list[str]:
     try:
-        parts = shlex.split(command, posix=os.name != "nt")
+        parts = shlex.split(command, posix=not _is_windows())
     except ValueError:
         return [command]
-    if os.name == "nt":
+    if _is_windows():
         return _repair_windows_executable_path([part.strip("\"") for part in parts])
     return parts
+
+
+def _is_windows() -> bool:
+    """Keep platform branching mockable without mutating process-wide os.name."""
+    return os.name == "nt"
 
 
 def _requires_ascii_safe_input_path(path: Path) -> bool:
@@ -163,7 +168,7 @@ def _ascii_temp_parent_candidates(preferred_parent: Path | None = None) -> list[
     if preferred_parent is not None:
         candidates.append(preferred_parent)
     candidates.append(Path(tempfile.gettempdir()))
-    if os.name == "nt":
+    if _is_windows():
         program_data = os.environ.get("PROGRAMDATA")
         if program_data:
             candidates.append(Path(program_data) / "reg-rag" / "kordoc_tmp")
@@ -193,7 +198,7 @@ def _resolve_command_executable(command_name: str) -> str | None:
     resolved = shutil.which(command_name)
     if resolved:
         return resolved
-    if os.name != "nt" or _looks_like_path(command_name):
+    if not _is_windows() or _looks_like_path(command_name):
         return None
     for directory in _windows_npm_global_dirs():
         for candidate in _windows_command_candidates(directory, command_name):

@@ -5960,24 +5960,24 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             else mcp_connection_ready
         )
         mcp_connection_target_labels = {
-            "chatgpt-desktop": "ChatGPT Desktop (Codex 통합)",
+            "chatgpt-desktop-local": "ChatGPT Desktop 로컬 플러그인 (stdio)",
             "codex": "Codex CLI (개발자용 호환)",
             "claude-desktop": "Claude Desktop",
             "claude-code": "Claude Code",
             "all-local": "로컬 AI 앱 모두",
-            "chatgpt-https": "ChatGPT 웹 (HTTPS MCP)",
+            "chatgpt-remote": "ChatGPT 원격 MCP (Streamable HTTP/HTTPS)",
             "chatgpt-tunnel": "ChatGPT 웹 (보안 Tunnel MCP)",
             "claude-api": "Claude (HTTPS MCP)",
         }
         mcp_connection_target = st.radio(
             "연결할 AI 앱",
             [
-                "chatgpt-desktop",
+                "chatgpt-desktop-local",
                 "claude-desktop",
                 "claude-code",
                 "all-local",
                 "codex",
-                "chatgpt-https",
+                "chatgpt-remote",
                 "chatgpt-tunnel",
                 "claude-api",
             ],
@@ -5999,7 +5999,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             "tunnel"
             if mcp_connection_target == "chatgpt-tunnel"
             else "http"
-            if mcp_connection_target in {"chatgpt-https", "claude-api"}
+            if mcp_connection_target in {"chatgpt-remote", "claude-api"}
             else "local"
         )
         mcp_mode_labels = {
@@ -6014,25 +6014,30 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 "기관 서버에 배포하고 접근 가능한 HTTPS /mcp 주소를 사용해야 합니다. GitHub에는 소스와 배포 산출물을 올릴 수 있지만, "
                 "실제 답변에는 승인된 색인 데이터가 배포 서버에도 있어야 합니다."
             )
-            mcp_profile_options = ["bundle", "chatgpt", "claude-api", "claude-code"]
+            mcp_profile_options = ["bundle", "chatgpt-remote", "claude-api", "claude-code"]
             mcp_transport = "streamable-http"
         elif mcp_mode == "tunnel":
             st.info(
                 "보안 Tunnel은 공개 HTTPS 주소나 인바운드 방화벽 개방 없이 ChatGPT에 연결합니다. "
                 "생성 후 OpenAI Tunnel ID와 API 키를 한 번 설정하고 전용 연결 버튼을 실행하면 됩니다."
             )
-            mcp_profile_options = ["bundle", "chatgpt"]
+            mcp_profile_options = ["bundle", "chatgpt-remote"]
             mcp_transport = "stdio"
         else:
-            st.info("MCP 로컬은 이 PC에서 실행됩니다. GitHub 배포나 공개 HTTPS 주소가 없어도 사용할 수 있습니다.")
-            mcp_profile_options = ["bundle", "claude-desktop", "claude-code"]
+            st.info(
+                "MCP 로컬은 이 PC에서 stdio로 실행됩니다. ChatGPT Desktop용 BAT는 로컬 플러그인을 등록하지만, "
+                "플러그인 등록과 현재 대화의 도구 첨부는 서로 다른 상태입니다."
+            )
+            mcp_profile_options = ["bundle", "chatgpt-desktop-local", "claude-desktop", "claude-code"]
             mcp_transport = "stdio"
         st.caption(f"Selected MCP transport: {mcp_transport}")
         mcp_profile = "bundle"
         if mcp_connection_target in {"claude-desktop", "claude-code", "claude-api"}:
             mcp_profile = mcp_connection_target
-        elif mcp_connection_target in {"chatgpt-https", "chatgpt-tunnel"}:
-            mcp_profile = "chatgpt"
+        elif mcp_connection_target == "chatgpt-desktop-local":
+            mcp_profile = "chatgpt-desktop-local"
+        elif mcp_connection_target in {"chatgpt-remote", "chatgpt-tunnel"}:
+            mcp_profile = "chatgpt-remote"
         if mcp_profile not in mcp_profile_options:
             mcp_profile = "bundle"
         mcp_host = "127.0.0.1"
@@ -6083,7 +6088,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             mcp_http_url = ""
             st.markdown("#### 2. MCP 로컬 연결")
             st.caption(
-                "생성되는 stdio 실행 파일로 같은 PC의 ChatGPT Desktop 통합 Codex 플러그인, "
+                "생성되는 stdio 실행 파일로 같은 PC의 ChatGPT Desktop 로컬 플러그인, "
                 "Codex CLI, Claude Desktop, Claude Code에 연결합니다. HTTPS 주소는 필요하지 않습니다."
             )
 
@@ -6221,8 +6226,8 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             "claude-desktop": "connect_claude_desktop_bat",
             "claude-code": "connect_claude_code_bat",
             "all-local": "doctor_bat",
-            "chatgpt-desktop": "connect_chatgpt_desktop_bat",
-            "chatgpt-https": "connect_chatgpt_https_bat",
+            "chatgpt-desktop-local": "connect_chatgpt_desktop_bat",
+            "chatgpt-remote": "connect_chatgpt_https_bat",
             "chatgpt-tunnel": "connect_chatgpt_tunnel_bat",
             "claude-api": "connect_claude_https_bat",
         }
@@ -6409,10 +6414,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 if selected_target_file:
                     if mcp_connection_target in {
                         "codex",
-                        "chatgpt-desktop",
+                        "chatgpt-desktop-local",
                         "claude-desktop",
                         "claude-code",
-                        "chatgpt-https",
+                        "chatgpt-remote",
                         "chatgpt-tunnel",
                         "claude-api",
                     }:
@@ -6443,7 +6448,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"- 연결 마법사: `{Path(str(files.get('connect'))).name}`",
                         f"- 설치 확인 스크립트: `{Path(str(files.get('install'))).name}`",
                         f"- 설치 후 사용 안내: `{Path(str(files.get('usage_guide_bat'))).name}`",
-                        f"- 통합 Codex 플러그인 수동 입력값: `{Path(str(files.get('codex_plugin_guide'))).name}`",
+                        f"- Codex CLI 호환 수동 입력값: `{Path(str(files.get('codex_plugin_guide'))).name}`",
                         f"- 한국어 안내문: `{Path(str(files.get('readme_ko'))).name}`",
                     ]
                 )
@@ -6467,10 +6472,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             installed_target = str(bundle_state.get("connection_target") or "")
             st.markdown("#### BAT 실행 후 MCP 불러오기")
             st.markdown(f"**등록할 MCP 이름:** `{installed_server_name}`")
-            if installed_target == "chatgpt-desktop":
+            if installed_target == "chatgpt-desktop-local":
                 st.info(
-                    "ChatGPT Desktop을 완전히 종료하고 연결 BAT를 실행한 뒤 다시 시작하세요. "
-                    "설정 > 플러그인 > MCP에는 실행 명령, 인자, 작업 폴더가 자동 반영됩니다."
+                    "연결 BAT가 로컬 플러그인을 등록합니다. ChatGPT Desktop을 완전히 종료한 뒤 다시 시작하고, "
+                    f"새 대화에서 입력창의 + > 더 보기 > {installed_server_name}을 선택하거나 @{installed_server_name}을 멘션하세요. "
+                    "등록 완료만으로 현재 대화에 도구가 첨부됐다고 표시하지 않습니다."
                 )
             elif installed_target == "codex":
                 st.info("Codex CLI를 다시 시작하고 새 task에서 `/mcp`로 등록 이름을 확인하세요.")
@@ -6478,14 +6484,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 st.info("Claude Code를 다시 시작하고 대화에서 `/mcp` 또는 터미널의 `claude mcp list`로 확인하세요.")
             elif installed_target == "claude-desktop":
                 st.info("Claude Desktop을 완전히 종료한 뒤 다시 시작하고 새 대화를 여세요.")
-            elif installed_target in {"chatgpt-https", "chatgpt-tunnel"}:
+            elif installed_target in {"chatgpt-remote", "chatgpt-tunnel"}:
                 st.info(
                     "ChatGPT 웹의 Settings > Apps에서 생성한 MCP를 같은 이름으로 등록한 뒤, "
                     "새 대화에서 앱을 선택하거나 @이름으로 지정하세요."
                 )
             st.caption("새 대화 또는 새 task에 아래 문장을 그대로 입력합니다.")
             st.code(
-                f"{installed_server_name} MCP를 사용해서 등록된 규정 목록을 보여줘.",
+                f"@{installed_server_name} MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.",
                 language=None,
             )
             st.code(

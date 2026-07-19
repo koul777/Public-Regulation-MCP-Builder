@@ -62,6 +62,25 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertIn("remote-client-stdio", codes)
         self.assertIn("missing-public-url", codes)
 
+    def test_canonical_chatgpt_local_and_remote_profiles_are_distinct(self) -> None:
+        local = check_mcp_connection_readiness(
+            client_profile="chatgpt-desktop-local",
+            transport="stdio",
+            check_cli=False,
+            check_data=False,
+        )
+        remote = check_mcp_connection_readiness(
+            client_profile="chatgpt-remote",
+            transport="stdio",
+            check_cli=False,
+            check_data=False,
+        )
+
+        self.assertTrue(local["passed"])
+        self.assertNotIn("remote-client-stdio", {item["code"] for item in local["findings"]})
+        self.assertFalse(remote["passed"])
+        self.assertIn("remote-client-stdio", {item["code"] for item in remote["findings"]})
+
     def test_non_loopback_http_requires_token_env(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             report = check_mcp_connection_readiness(

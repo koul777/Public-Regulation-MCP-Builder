@@ -20,6 +20,7 @@ SETUP_BUNDLE_FILES = {
     "openai_tunnel": "run_openai_secure_tunnel.ps1",
     "validate": "validate_mcp_smoke.ps1",
     "client_config_smoke": "validate_client_config_smoke.ps1",
+    "remote_validate": "validate_chatgpt_remote_mcp.ps1",
     "doctor": "doctor_mcp_connection.ps1",
     "connect": "connect_mcp_client.ps1",
     "usage_guide": "MCP 사용 시작하기.txt",
