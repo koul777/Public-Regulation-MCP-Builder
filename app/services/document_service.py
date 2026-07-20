@@ -45,6 +45,8 @@ class DocumentService:
         repealed_at: str | None = None,
         regulation_status: str = "draft",
         supersedes_document_id: str | None = None,
+        reprocessing_source_document_id: str | None = None,
+        reprocessing_reason: str | None = None,
         tenant_id: str | None = None,
     ) -> Document:
         if regulation_status not in {"draft", "pending_approval"}:
@@ -91,6 +93,8 @@ class DocumentService:
             repealed_at=repealed_at,
             regulation_status=regulation_status,
             supersedes_document_id=supersedes_document_id or detected.supersedes_document_id,
+            reprocessing_source_document_id=reprocessing_source_document_id,
+            reprocessing_reason=reprocessing_reason,
             tenant_id=tenant_id,
             status="uploaded",
         )
@@ -120,8 +124,11 @@ class DocumentService:
         repealed_at: str | None = None,
         regulation_status: str = "draft",
         supersedes_document_id: str | None = None,
+        reprocessing_source_document_id: str | None = None,
+        reprocessing_reason: str | None = None,
         tenant_id: str | None = None,
         expected_size: int | None = None,
+        expected_sha256: str | None = None,
         progress_callback: Callable[[int, int | None], None] | None = None,
     ) -> Document:
         if regulation_status not in {"draft", "pending_approval"}:
@@ -145,6 +152,10 @@ class DocumentService:
             profile_id=profile_id,
             regulation_version=resolved_regulation_version,
         )
+        normalized_expected_hash = str(expected_sha256 or "").strip().lower()
+        if normalized_expected_hash and file_hash.lower() != normalized_expected_hash:
+            path.unlink(missing_ok=True)
+            raise ValueError("Uploaded source SHA-256 does not match the expected document hash.")
         document = Document(
             document_id=document_id,
             filename=Path(filename).name,
@@ -168,6 +179,8 @@ class DocumentService:
             repealed_at=repealed_at,
             regulation_status=regulation_status,
             supersedes_document_id=supersedes_document_id or detected.supersedes_document_id,
+            reprocessing_source_document_id=reprocessing_source_document_id,
+            reprocessing_reason=reprocessing_reason,
             tenant_id=tenant_id,
             status="uploaded",
         )
@@ -182,6 +195,68 @@ class DocumentService:
 
     def list(self) -> list[Document]:
         return self.repository.list_documents()
+
+    def clone_as_reprocessing_draft(
+        self,
+        document_id: str,
+        *,
+        progress_callback: Callable[[int, int | None], None] | None = None,
+    ) -> Document:
+        """Copy a stored source into a new draft without mutating prior results.
+
+        Reprocessing an approved document in place would replace its chunks while
+        leaving approval and index history attached to the same document ID.  A
+        recovery run therefore always starts from a fresh draft document ID and
+        records the source document as the version it is intended to replace.
+        """
+
+        source_document = self.get(document_id)
+        source_path = self.path_for(source_document)
+        if not source_path.is_file():
+            raise FileNotFoundError(
+                f"Stored source file is unavailable for reprocessing: {document_id}"
+            )
+
+        intended_supersedes_document_id = (
+            source_document.document_id
+            if source_document.regulation_status in {"approved", "superseded"}
+            else source_document.supersedes_document_id
+        )
+        with source_path.open("rb") as source:
+            draft = self.upload_stream(
+                source_document.filename,
+                source,
+                document_name=source_document.document_name,
+                institution_name=source_document.institution_name,
+                apba_id=source_document.apba_id,
+                source_system=source_document.source_system,
+                source_url=source_document.source_url,
+                source_record_id=source_document.source_record_id,
+                source_file_id=source_document.source_file_id,
+                source_disclosure_date=source_document.source_disclosure_date,
+                source_posted_date=source_document.source_posted_date,
+                profile_id=source_document.profile_id,
+                regulation_id=source_document.regulation_id,
+                regulation_version=source_document.regulation_version,
+                revision_date=source_document.revision_date,
+                effective_from=source_document.effective_from,
+                effective_to=source_document.effective_to,
+                repealed_at=source_document.repealed_at,
+                regulation_status="draft",
+                supersedes_document_id=intended_supersedes_document_id,
+                reprocessing_source_document_id=source_document.document_id,
+                reprocessing_reason="kordoc_evidence_recovery",
+                tenant_id=source_document.tenant_id,
+                expected_size=source_path.stat().st_size,
+                expected_sha256=source_document.file_hash,
+                progress_callback=progress_callback,
+            )
+        if draft.supersedes_document_id != intended_supersedes_document_id:
+            draft = draft.model_copy(
+                update={"supersedes_document_id": intended_supersedes_document_id}
+            )
+            self.repository.upsert_document(draft)
+        return draft
 
     def path_for(self, document: Document) -> Path:
         return self.file_store.upload_path(

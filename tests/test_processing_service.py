@@ -18,6 +18,7 @@ from app.schemas.quality import QualityReport
 from app.schemas.run import ProcessingRun
 from app.schemas.structure import StructureNode
 from app.services.processing_service import ProcessingService
+from app.services.regulation_metadata_service import RegulationMetadataGuess
 from app.storage.repository import JsonRepository
 
 
@@ -236,6 +237,94 @@ class ProcessingServiceTests(unittest.TestCase):
                 "tables_truncated": True,
             },
         )
+
+    def test_process_does_not_infer_supersedes_for_unapproved_reprocessing_draft(self) -> None:
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="Recovery Regulation",
+                    file_type="pdf",
+                    pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text="Article 1 Purpose")])],
+                    raw_text="Article 1 Purpose",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            source = Document(
+                document_id="doc_unapproved_source",
+                filename="recovery.pdf",
+                document_name="Recovery Regulation",
+                file_type="pdf",
+                file_hash="source-hash",
+                profile_id="profile-a",
+                regulation_id="reg-recovery",
+                regulation_version="v1",
+                regulation_status="draft",
+                tenant_id="tenant-a",
+            )
+            recovery = Document(
+                document_id="doc_recovery_draft",
+                filename="recovery.pdf",
+                document_name="Recovery Regulation",
+                file_type="pdf",
+                file_hash="source-hash",
+                profile_id="profile-a",
+                regulation_id="reg-recovery",
+                regulation_version="v1",
+                regulation_status="draft",
+                supersedes_document_id=None,
+                reprocessing_source_document_id=source.document_id,
+                reprocessing_reason="kordoc_evidence_recovery",
+                tenant_id="tenant-a",
+            )
+            repo.upsert_document(source)
+            repo.upsert_document(recovery)
+            service = ProcessingService(settings=settings, repository=repo)
+            inferred = RegulationMetadataGuess(
+                document_name="Recovery Regulation",
+                regulation_id="reg-recovery",
+                regulation_version="v1",
+                revision_date="2026-01-01",
+                effective_from="2026-01-01",
+                supersedes_document_id=source.document_id,
+                title_source="filename",
+                revision_date_source="filename",
+                effective_from_source="filename",
+                version_source="filename",
+            )
+
+            with patch("app.services.processing_service.get_parser", return_value=Parser()), patch(
+                "app.services.processing_service.infer_regulation_metadata",
+                return_value=inferred,
+            ), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={
+                    "status": "parsed",
+                    "parser": "kordoc",
+                    "table_count": 0,
+                    "tables": [],
+                },
+            ):
+                job = service.process(recovery.document_id, ChunkOptions(include_context_header=False))
+
+            stored = repo.get_document(recovery.document_id)
+            chunks = repo.get_chunks(recovery.document_id)
+
+        self.assertEqual(job.status, "completed")
+        self.assertIsNone(stored.supersedes_document_id)
+        self.assertEqual(stored.reprocessing_source_document_id, source.document_id)
+        self.assertTrue(chunks)
+        self.assertTrue(
+            all(
+                chunk.metadata["reprocessing_source_document_id"] == source.document_id
+                for chunk in chunks
+            )
+        )
+        self.assertTrue(all("supersedes_document_id" not in chunk.metadata for chunk in chunks))
 
     def test_process_skips_existing_completed_run_with_same_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

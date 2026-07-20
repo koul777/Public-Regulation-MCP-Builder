@@ -33,6 +33,8 @@ class Document(BaseModel):
     repealed_at: str | None = None
     regulation_status: Literal["draft", "pending_approval", "approved", "superseded", "repealed"] = "draft"
     supersedes_document_id: str | None = None
+    reprocessing_source_document_id: str | None = None
+    reprocessing_reason: str | None = None
     tenant_id: str | None = None
     page_count: int | None = None
     status: Literal["uploaded", "processing", "completed", "failed"] = "uploaded"

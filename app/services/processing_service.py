@@ -166,7 +166,7 @@ class ProcessingService:
                 document.effective_from = detected.effective_from
             if detected.version_source == "content":
                 document.regulation_version = detected.regulation_version
-            if not document.supersedes_document_id:
+            if not document.supersedes_document_id and not document.reprocessing_source_document_id:
                 document.supersedes_document_id = detected.supersedes_document_id
             if (
                 document.regulation_id != old_regulation_id
@@ -214,6 +214,8 @@ class ProcessingService:
                     "repealed_at": document.repealed_at,
                     "regulation_status": document.regulation_status,
                     "supersedes_document_id": document.supersedes_document_id,
+                    "reprocessing_source_document_id": document.reprocessing_source_document_id,
+                    "reprocessing_reason": document.reprocessing_reason,
                     "tenant_id": document.tenant_id,
                     "kordoc_table_summary": kordoc_summary,
                 }.items()

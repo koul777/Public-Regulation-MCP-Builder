@@ -2,42 +2,21 @@
 
 ## MCP 연결·Kordoc 오류 빠른 해결
 
-MCP 번들 생성 화면에서 다음과 같은 메시지가 나오면 Kordoc 설치 여부만의 문제가 아닙니다.
+`Missing or failed Kordoc evidence`는 설치 여부가 아니라 해당 문서가 Kordoc으로 전처리됐는지를 뜻합니다.
 
-```text
-MCP bundle creation requires Kordoc table parsing ...
-Missing or failed Kordoc evidence: <document-id>(hwp, status=not_available, parser=kordoc)
+1. MCP 화면은 Kordoc이 없으면 설치·검증을 한 번 자동 시도합니다.
+2. 설치됐지만 증거가 없으면 기존 승인본을 보존한 새 draft를 만들어 자동 재전처리합니다.
+3. `status=parsed`, `parser=kordoc` 확인 후에만 새 draft가 선택됩니다.
+4. 새 결과를 사람 검토·승인·색인한 뒤 MCP 묶음을 생성합니다.
+
+실패 시 기존 approved chunk·approval journal·vector는 바뀌지 않습니다. 저장된 원본이 없을 때만 원본을 다시 올리세요. 수동 설치가 필요하면 `INSTALL_KORDOC_KO.ps1` 또는 아래 명령을 사용합니다.
+
+```powershell
+npm install -g kordoc
+kordoc --version
 ```
 
-HWP, HWPX, PDF, DOCX 문서가 MCP 범위에 포함되면 생성기는 해당 원본의 저장된 Kordoc evidence가 `status=parsed`이고 `parser=kordoc`인지 먼저 확인합니다. Kordoc을 나중에 설치해도 이미 `not_available`로 저장된 과거 전처리 결과가 자동으로 바뀌지는 않습니다.
-
-1. Windows PowerShell에서 Kordoc을 설치하고 버전을 확인합니다.
-
-   ```powershell
-   npm install -g kordoc
-   kordoc --version
-   where.exe kordoc
-   ```
-
-   Windows portable ZIP을 사용한다면 같은 폴더의 `INSTALL_KORDOC_KO.ps1`을 관리자 권한 없이 실행해도 같은 설치·검증을 자동으로 수행합니다. Node.js/npm이 없는 PC에서는 먼저 Node.js LTS를 설치해야 합니다.
-
-   wheel 설치본에도 `INSTALL_KORDOC_KO.ps1`이 포함되며, 가상환경 전역 경로에서 앱이 자동으로 찾아 실행합니다.
-
-   MCP 화면에서 Kordoc 명령이 없으면 앱도 첫 진입 시 위 설치·검증을 한 번 자동 시도합니다. 자동 시도는 사용자 PATH를 영구 변경할 수 있으므로 실패 원인을 화면에 남기며, 재시도 버튼 또는 위 스크립트로 명시적으로 다시 실행할 수 있습니다.
-
-   `where.exe kordoc`가 아무 경로도 출력하지 않으면, 앱을 실행할 동일한 PowerShell에서 npm 전역 경로를 현재 프로세스 PATH에 넣고 다시 확인합니다.
-
-   ```powershell
-   $npmGlobal = (npm prefix -g).Trim()
-   $env:Path = "$npmGlobal;$env:Path"
-   where.exe kordoc
-   ```
-
-   이미 실행 중인 Streamlit/portable 앱은 이전 PATH를 계속 사용할 수 있으므로 위 확인 뒤 앱을 완전히 종료하고 다시 시작합니다. 화면의 명령 상태가 `available`로 바뀌어도 과거 `status=not_available` evidence가 자동으로 고쳐지는 것은 아니므로 원본 재처리·사람 승인·색인 순서는 그대로 지켜야 합니다.
-
-2. 같은 원본 파일을 `① 문서 올려서 전처리`에서 다시 처리합니다.
-3. 사람 검수·승인을 완료하고 `승인하고 색인`을 다시 실행합니다.
-4. 그 다음에만 `MCP로 쓸 파일 묶음 만들기`를 실행합니다. 승인 JSON/evidence를 손으로 수정하거나 Kordoc 게이트를 끄면 안 됩니다.
+자세한 PATH·portable·wheel 안내는 [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)를 참고하세요. 승인 JSON을 직접 수정하거나 Kordoc 게이트를 끄면 안 됩니다.
 
 독립적으로 옮긴 MCP 번들에서 `McpError: Connection closed`가 나오면 오래된 전역 콘솔 스크립트가 선택된 것일 수 있습니다. 번들에 포함된 `install_local_package.ps1`을 먼저 실행하거나, 설치된 wheel 환경을 명시한 뒤 연결 BAT를 다시 실행합니다.
 
@@ -432,6 +411,7 @@ HWP 표 추출을 보강할 때는 [Kordoc 프로젝트](https://github.com/chri
 - 연동 방식: 사용자가 별도로 설치한 Kordoc CLI를 subprocess로 호출
 - 배포 범위: PR MCP Builder 소스와 Windows ZIP에 Kordoc 소스·실행 파일을 포함하지 않음
 - 검수 원칙: Kordoc 표 매칭·승격·미매칭 결과에 검수 표시를 남기고 승인 전 원문 대조
+- 과거 증거 복구: MCP 화면에서 기존 승인본을 덮어쓰지 않고 같은 원본의 새 draft를 만든 뒤 Kordoc evidence를 검증하고, 사람 승인·색인은 다시 요구
 
 Kordoc 소스나 실행 파일이 포함되지 않음이 기본 배포 원칙입니다.
 
