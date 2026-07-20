@@ -6111,12 +6111,22 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         "1단계에서 원본 문서를 다시 전처리하고, 사람 검토·승인·인덱싱을 다시 완료해야 합니다."
                     )
                 else:
+                    auto_install_result: dict[str, Any] | None = None
+                    auto_install_key = "kordoc_auto_install_attempted"
+                    if not bool(st.session_state.get(auto_install_key)):
+                        st.session_state[auto_install_key] = True
+                        with st.spinner("Kordoc이 없어 자동 설치·검증을 시도하는 중..."):
+                            auto_install_result = _run_kordoc_installer()
+                        if auto_install_result.get("ok"):
+                            kordoc_table_command_status.cache_clear()
+                            st.success("Kordoc 자동 설치·검증이 완료됐습니다. 명령 상태를 다시 확인합니다.")
+                            st.rerun()
                     st.error(
                         f"Kordoc 명령({command_label})을 현재 실행 환경에서 찾을 수 없습니다. "
-                        "먼저 `npm install -g kordoc` 후 앱을 재시작하고 원본 문서를 다시 전처리하세요."
+                        "자동 설치가 실패했으면 Node.js LTS/npm을 확인한 뒤 다시 시도하세요."
                     )
                     if st.button(
-                        "Kordoc 설치·검증 실행",
+                        "Kordoc 설치·검증 다시 실행",
                         key=f"kordoc-install-run-{document_id}-{mcp_scope}",
                         help="Node.js/npm이 설치된 Windows PC에서 Kordoc을 설치하고 사용자 PATH를 확인합니다.",
                     ):
@@ -6136,6 +6146,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                             )
                             if install_result.get("output"):
                                 st.code(str(install_result["output"]), language="text")
+                    elif auto_install_result and auto_install_result.get("output"):
+                        st.caption("자동 설치 시도 결과")
+                        st.code(str(auto_install_result["output"]), language="text")
                 missing_ids = ", ".join(
                     str(item.get("document_id") or "") for item in kordoc_preflight["missing"][:10]
                 )
