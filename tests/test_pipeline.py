@@ -140,7 +140,7 @@ class PipelineTests(unittest.TestCase):
         options = ChunkOptions()
         kordoc_table_command_status.cache_clear()
 
-        with patch("app.core.pipeline.resolve_kordoc_command", return_value=r"C:\Users\dd\AppData\Roaming\npm\kordoc.cmd"):
+        with patch("app.core.pipeline.resolve_kordoc_command", return_value=r"C:\Npm\kordoc.cmd"):
             with patch("app.core.pipeline._command_version", return_value="4.2.3"):
                 payload = processing_options_payload(
                     options,
