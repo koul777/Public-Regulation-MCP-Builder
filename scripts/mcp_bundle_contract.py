@@ -1,5 +1,28 @@
 from __future__ import annotations
 
+import re
+
+
+CHATGPT_PLUGIN_MCP_CONTAINER = "mcpServers"
+CHATGPT_PLUGIN_MCP_PATH = "./.mcp.json"
+CHATGPT_PLUGIN_VERSION_PATTERN = re.compile(r"^0\.1\.0\+codex\.[0-9a-f]{12}$")
+
+
+def normalized_chatgpt_plugin_name(server_name: str) -> str:
+    """Return the loader-safe plugin package name for an MCP server."""
+    normalized = re.sub(r"[^a-z0-9]+", "-", server_name.strip().lower()).strip("-")
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    return (normalized or "regulation-mcp")[:64].rstrip("-")
+
+
+def chatgpt_local_marketplace_name(server_name: str) -> str:
+    """Return the loader-safe local marketplace name for an MCP server."""
+    suffix = "-local"
+    base = normalized_chatgpt_plugin_name(server_name)
+    if len(base) + len(suffix) > 64:
+        base = base[: 64 - len(suffix)].rstrip("-")
+    return base + suffix
+
 
 SETUP_BUNDLE_FILES = {
     "manifest": "manifest.json",
@@ -34,6 +57,9 @@ SETUP_BUNDLE_FILES = {
     "connect_chatgpt_tunnel_bat": "ChatGPT 보안 Tunnel에 연결하기.bat",
     "connect_claude_https_bat": "Claude HTTPS에 연결하기.bat",
     "chatgpt_desktop_local": "chatgpt_desktop_local_mcp.json",
+    "chatgpt_desktop_agent_prompt": "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+    "codex_agent_prompt": "CODEX_AGENT_CONNECT_PROMPT.md",
+    "claude_code_agent_prompt": "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md",
     "doctor_bat": "연결 상태 확인하기.bat",
     "install": "install_local_package.ps1",
 }

@@ -59,6 +59,7 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
                         "scripts.run_mcp_bundle_zip_extract_smoke.shutil.which",
                         return_value=None,
                     ),
+                    mock.patch.dict(os.environ, {"REG_RAG_PYTHON": str(root / "stale-python.exe")}),
                 ):
                     report = run_mcp_bundle_zip_extract_smoke(
                         bundle_zip="bundle.zip",
@@ -69,10 +70,13 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
                 os.chdir(previous_cwd)
 
         command = run_mock.call_args.args[0]
+        child_env = run_mock.call_args.kwargs["env"]
         self.assertTrue(Path(command[command.index("-File") + 1]).is_absolute())
         self.assertEqual(str((extracted / "validate_client_config_smoke.ps1").resolve()), command[-1])
         self.assertEqual(str(bundle_zip.resolve()), report["bundle_zip"])
         self.assertEqual(str(extracted.resolve()), report["extract_dir"])
+        self.assertEqual(str(Path(os.sys.executable).resolve().parent), child_env["PATH"].split(os.pathsep)[0])
+        self.assertEqual(str(Path(os.sys.executable).resolve()), child_env["REG_RAG_PYTHON"])
         self.assertTrue(report["passed"])
 
     def test_require_console_scripts_reports_environment_blocker(self) -> None:
@@ -141,8 +145,9 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertTrue(checks["clients"]["claude_desktop"]["passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
 
-    def test_path_checks_accept_official_chatgpt_plugin_container(self) -> None:
+    def test_path_checks_reject_snake_case_chatgpt_plugin_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "bundle"
             bundle.mkdir()
@@ -154,8 +159,11 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
 
             checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
 
-        self.assertTrue(checks["passed"])
-        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["passed"])
+        self.assertFalse(checks["passed"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["passed"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
+        self.assertIn("expected mcpServers", checks["clients"]["chatgpt_desktop_local"]["schema_error"])
 
     def test_path_checks_reject_chatgpt_plugin_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +179,25 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["passed"])
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertIn("EF BB BF", checks["clients"]["chatgpt_desktop_local"]["encoding_error"])
+
+    def test_path_checks_reject_duplicate_chatgpt_plugin_json_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "bundle"
+            bundle.mkdir()
+            _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
+            plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
+            plugin_path.write_text(
+                '{"mcpServers":{"govreg-local":{"command":"powershell.exe","command":"other","args":[]}}}',
+                encoding="utf-8",
+            )
+
+            checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
+
+        self.assertFalse(checks["passed"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["passed"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
+        self.assertIn("duplicate JSON key: command", checks["clients"]["chatgpt_desktop_local"]["schema_error"])
 
     def test_path_checks_reject_stale_generated_bundle_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
-import re
 import shutil
 import stat
 import subprocess
@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.mcp_bundle_contract import normalized_chatgpt_plugin_name
 from scripts.report_metadata import current_repo_commit
 
 
@@ -46,12 +47,24 @@ def run_mcp_bundle_zip_extract_smoke(
     target_dir.mkdir(parents=True, exist_ok=True)
     _extract_archive_safely(zip_path, target_dir)
 
+    # Running this module through ``python path\to\script.py`` does not add
+    # that interpreter's Scripts directory to PATH.  Keep the smoke child and
+    # its console-script discovery on the same Python runtime that launched
+    # this check, instead of accidentally falling back to stale global tools.
+    child_env = os.environ.copy()
+    interpreter_bin = str(Path(sys.executable).resolve().parent)
+    inherited_path = child_env.get("PATH", "")
+    child_env["PATH"] = os.pathsep.join(
+        part for part in (interpreter_bin, inherited_path) if part
+    )
+    child_env["REG_RAG_PYTHON"] = str(Path(sys.executable).resolve())
+
     required_console_scripts = (
         "reg-rag-mcp-client-config-smoke",
         "reg-rag-mcp-server",
     )
     console_script_resolution = {
-        name: shutil.which(name) for name in required_console_scripts
+        name: shutil.which(name, path=child_env["PATH"]) for name in required_console_scripts
     }
     missing_console_scripts = [
         name for name, resolved in console_script_resolution.items() if not resolved
@@ -77,6 +90,7 @@ def run_mcp_bundle_zip_extract_smoke(
         errors="replace",
         capture_output=True,
         timeout=timeout_seconds,
+        env=child_env,
     )
     client_smoke_path = target_dir / "mcp_client_config_smoke.json"
     client_smoke = _read_json(client_smoke_path)
@@ -224,32 +238,53 @@ def _chatgpt_desktop_plugin_server(
     target_dir: Path,
     server_name: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    plugin_name = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-", server_name.lower()).strip("-"))
-    plugin_name = (plugin_name or "regulation-mcp")[:64].rstrip("-")
+    plugin_name = normalized_chatgpt_plugin_name(server_name)
     path = target_dir / "chatgpt-desktop-local-plugin" / "plugins" / plugin_name / ".mcp.json"
     try:
         raw = path.read_bytes()
         if raw.startswith(b"\xef\xbb\xbf"):
             raise ValueError("forbidden UTF-8 BOM EF BB BF")
-        payload = json.loads(raw.decode("utf-8", errors="strict"))
-        # The generated ChatGPT Desktop plugin follows the official
-        # ``.mcp.json`` contract and stores local servers in ``mcp_servers``.
-        # Keep accepting the legacy camelCase shape so older handoff bundles
-        # remain diagnosable during migration.
-        servers = None
-        if isinstance(payload, dict):
-            servers = payload.get("mcp_servers") or payload.get("mcpServers")
-        entry = servers.get(server_name) if isinstance(servers, dict) else None
-        return (
-            entry if isinstance(entry, dict) else {},
-            {"plugin_config_path": str(path), "strict_utf8_without_bom": True},
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        text = raw.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         return {}, {
             "plugin_config_path": str(path),
             "strict_utf8_without_bom": False,
+            "config_schema_verified": False,
             "encoding_error": str(exc),
         }
+    try:
+        payload = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+        if not isinstance(payload, dict):
+            raise ValueError("plugin config must be a JSON object")
+        if "mcp_servers" in payload:
+            raise ValueError("unsupported mcp_servers container; expected mcpServers")
+        servers = payload.get("mcpServers")
+        if not isinstance(servers, dict) or set(servers) != {server_name}:
+            raise ValueError(f"mcpServers must contain exactly {server_name}")
+        entry = servers[server_name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"mcpServers.{server_name} must be an object")
+        return entry, {
+            "plugin_config_path": str(path),
+            "strict_utf8_without_bom": True,
+            "config_schema_verified": True,
+        }
+    except (json.JSONDecodeError, ValueError) as exc:
+        return {}, {
+            "plugin_config_path": str(path),
+            "strict_utf8_without_bom": True,
+            "config_schema_verified": False,
+            "schema_error": str(exc),
+        }
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
 
 
 def _entry_path_check(entry: dict[str, Any], *, expected_launcher: str, expected_data_dir: str) -> dict[str, Any]:
