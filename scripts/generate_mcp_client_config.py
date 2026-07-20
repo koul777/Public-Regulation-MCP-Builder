@@ -6162,7 +6162,7 @@ function Show-ChatGptHttps {
   Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'validate_chatgpt_remote_mcp.ps1'))`""
   Write-Host "Open a new ChatGPT conversation, then select + > More > $ServerName."
   Write-Host "Verification prompt: $ServerName MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 fetch 도구로 조회해 조문 원문과 출처를 보여줘."
-  Start-Process "https://chatgpt.com/"
+  Start-Process "https://chatgpt.com/plugins"
 }
 
 function Show-ChatGptTunnel {

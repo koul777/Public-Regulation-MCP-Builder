@@ -7156,7 +7156,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             elif installed_target in {"chatgpt-remote", "chatgpt-tunnel"}:
                 st.caption(
                     "같은 이름으로 번들을 다시 생성했다면 원격 서버 또는 Tunnel을 다시 준비하고, "
-                    "ChatGPT Apps 설정에서 도구를 다시 스캔하거나 앱을 다시 생성한 뒤 새 대화에서 확인하세요."
+                    "ChatGPT Plugins 설정에서 앱을 Refresh하거나 다시 생성한 뒤 새 대화의 + > More에서 선택해 확인하세요."
                 )
             elif installed_target == "claude-api":
                 st.caption(
