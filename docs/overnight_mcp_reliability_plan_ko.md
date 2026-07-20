@@ -27,6 +27,7 @@
 - Kordoc 임시 경로 생성 실패도 일반화된 오류 코드만 반환해 절대 경로가 인증 응답·JSONL로 흘러가지 않도록 한다.
 - 외부 ChatGPT/Claude API·Secure Tunnel은 `chatgpt-data` 프로필로 제한하고, 원격 smoke는 `search`→`fetch`와 내부 metadata deny-list를 검증한다.
 - ZIP bundle smoke는 traversal/symlink/크기 제한과 `--require-console-scripts` 실행 경로 증명을 지원한다.
+- 승인 snapshot sidecar는 ZIP 해제 후에도 파일 inode/mtime에 의존하지 않고 크기+SHA-256 지문으로 재사용되며, 복사 경로 회귀 테스트를 포함한다.
 
 ## 후속 개선 후보
 
@@ -37,7 +38,7 @@
 
 - 완료: 기준선·파서 보안·승인/테넌트·stdio/HTTP·계층형 retrieval·Kordoc telemetry/redaction 감사.
 - 완료: 전체 회귀 2119/14 skip, wheel/sdist, release hygiene, dependency-complete wheel console-script 5/5, client-config stdio 3/3, focused handoff 81 tests.
-- 완료: clean bundle 277/277 readiness, cold-start 5/5, concurrent/query benchmark 무결성.
+- 완료: clean bundle 277/277 readiness, cold-start 5/5, concurrent/query benchmark 무결성 및 portable sidecar 성능 재측정.
 - 완료: secure-profile bundle/ZIP extraction 및 pinned venv console-script provenance 검증.
 - 대기: GitHub protected PR의 실제 Code Owner 검토와 `preprocessing-reviewed` 라벨. 라벨은 테스트 통과를 대신하지 않으며, 근거 확인 후에만 적용한다.
 
