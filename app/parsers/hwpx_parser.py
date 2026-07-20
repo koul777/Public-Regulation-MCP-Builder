@@ -12,6 +12,7 @@ from app.parsers.archive_safety import (
     validate_office_archive_file_size,
 )
 from app.parsers.base import BaseParser, ParserError, document_name_from_path, parser_uncertainty_metadata
+from app.parsers.xml_safety import reject_unsafe_xml_declarations
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 
@@ -35,6 +36,7 @@ class HwpxParser(BaseParser):
         blocks: list[ParsedBlock] = []
         raw_parts: list[str] = []
         parse_error_sections: list[str] = []
+        xml_role_counts: dict[str, int] = {}
         try:
             with zipfile.ZipFile(path) as archive:
                 infos = validate_office_archive(
@@ -56,6 +58,8 @@ class HwpxParser(BaseParser):
                     key=lambda info: self._section_sort_key(info.filename),
                 )
                 for info in xml_infos:
+                    xml_role = self._xml_role(info.filename)
+                    xml_role_counts[xml_role] = xml_role_counts.get(xml_role, 0) + 1
                     payload = read_archive_member_bounded(
                         archive,
                         info,
@@ -63,11 +67,12 @@ class HwpxParser(BaseParser):
                         max_bytes=self.archive_limits.max_entry_uncompressed_bytes,
                     )
                     try:
+                        reject_unsafe_xml_declarations(payload, format_name="HWPX")
                         root = ElementTree.fromstring(payload)
                     except ElementTree.ParseError:
                         parse_error_sections.append(info.filename)
                         continue
-                    for block in self._blocks(root, info.filename):
+                    for block in self._blocks(root, info.filename, xml_role=xml_role):
                         if block.text:
                             blocks.append(block)
                             raw_parts.append(block.text)
@@ -81,9 +86,15 @@ class HwpxParser(BaseParser):
 
         flagged_tables = self._has_parser_review_flags(blocks)
         flags = self._document_uncertainty_flags(blocks)
+        non_body_xml = any(
+            str((block.metadata or {}).get("source_xml_role") or "unknown") != "body"
+            for block in blocks
+        )
+        if non_body_xml:
+            flags = sorted({*flags, "hwpx_non_body_xml_content"})
         if parse_error_sections:
             flags = sorted({*flags, "hwpx_section_parse_error"})
-        needs_review = flagged_tables or bool(parse_error_sections)
+        needs_review = flagged_tables or bool(parse_error_sections) or non_body_xml
         if flagged_tables:
             recommendation = "review_flagged_tables"
             remediation_hint = (
@@ -94,6 +105,12 @@ class HwpxParser(BaseParser):
             remediation_hint = (
                 "One or more HWPX sections could not be parsed and were dropped; review the source before approval: "
                 + ", ".join(parse_error_sections)
+            )
+        elif non_body_xml:
+            recommendation = "review_non_body_xml"
+            remediation_hint = (
+                "HWPX XML outside body sections was extracted with an explicit role; review metadata/header content "
+                "before approval."
             )
         else:
             recommendation = "none"
@@ -106,19 +123,31 @@ class HwpxParser(BaseParser):
             file_type="hwpx",
             pages=[ParsedPage(page_no=1, blocks=blocks)],
             raw_text="\n".join(raw_parts),
-            metadata=parser_uncertainty_metadata(
-                source="hwpx",
-                risk_level="low" if not needs_review else "medium",
-                flags=flags,
-                confidence=0.92 if not needs_review else 0.82,
-                recommendation=recommendation,
-                remediation_hint=remediation_hint,
-            ),
+            metadata={
+                **parser_uncertainty_metadata(
+                    source="hwpx",
+                    risk_level="low" if not needs_review else "medium",
+                    flags=flags,
+                    confidence=0.92 if not needs_review else 0.82,
+                    recommendation=recommendation,
+                    remediation_hint=remediation_hint,
+                ),
+                "hwpx_xml_role_counts": dict(sorted(xml_role_counts.items())),
+            },
         )
 
     def _section_sort_key(self, filename: str) -> tuple[int, str]:
         match = re.search(r"section(\d+)", filename, flags=re.IGNORECASE)
         return (int(match.group(1)) if match else 0, filename.lower())
+
+    def _xml_role(self, filename: str) -> str:
+        normalized = str(filename or "").replace("\\", "/").casefold()
+        basename = normalized.rsplit("/", 1)[-1]
+        if re.fullmatch(r"section\d+\.xml", basename) or "/bodytext/" in normalized:
+            return "body"
+        if any(token in basename for token in ("header", "manifest", "meta")):
+            return "metadata"
+        return "unknown"
 
     def _has_parser_review_flags(self, blocks: list[ParsedBlock]) -> bool:
         return any((block.metadata or {}).get("hwpx_parser_review_flags") for block in blocks)
@@ -131,7 +160,13 @@ class HwpxParser(BaseParser):
                     flags.add(f"hwpx_{str(flag).strip()}")
         return sorted(flags)
 
-    def _blocks(self, root: ElementTree.Element, xml_file: str) -> list[ParsedBlock]:
+    def _blocks(
+        self,
+        root: ElementTree.Element,
+        xml_file: str,
+        *,
+        xml_role: str = "unknown",
+    ) -> list[ParsedBlock]:
         blocks: list[ParsedBlock] = []
         for block_index, (block_type, text, metadata) in enumerate(self._iter_blocks(root), start=1):
             clean = self._clean_table_text(text) if block_type == "table" else self._clean_text(text)
@@ -140,7 +175,12 @@ class HwpxParser(BaseParser):
                     ParsedBlock(
                         type=block_type,
                         text=clean,
-                        metadata={"xml_file": xml_file, "hwpx_xml_block_index": block_index, **metadata},
+                        metadata={
+                            "xml_file": xml_file,
+                            "source_xml_role": xml_role,
+                            "hwpx_xml_block_index": block_index,
+                            **metadata,
+                        },
                     )
                 )
         return blocks
@@ -421,4 +461,3 @@ class HwpxParser(BaseParser):
             if clean:
                 lines.append(clean)
         return "\n".join(lines)
-

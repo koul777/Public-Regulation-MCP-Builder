@@ -47,6 +47,8 @@ class VectorIngestionAdapterTests(unittest.TestCase):
                 "supplementary_paragraph_label": "effective date",
                 "supplementary_boilerplate": True,
                 "source_hwpx_block_types": ["table"],
+                "source_xml_files": ["Contents/section0.xml"],
+                "source_xml_roles": ["body"],
                 "source_hwpx_parser_review_flags": ["nested_table"],
                 "source_hwpx_xml_block_indices": [312, 313, 314],
                 "source_hwpx_nested_table_text_snippets": ["Nested table evidence"],
@@ -54,10 +56,15 @@ class VectorIngestionAdapterTests(unittest.TestCase):
                 "source_hwp_streams": ["BodyText/Section0"],
                 "source_hwp_section_indices": [1],
                 "source_hwp_native_table_geometry": False,
+                "pdf_embedded_image_pages": [3, 8],
                 "table_source": "kordoc",
                 "table_geometry_source": "kordoc",
                 "kordoc_table_parser_status": "parsed",
                 "kordoc_table_count": 3,
+                "kordoc_elapsed_ms": 12.5,
+                "kordoc_input_extension": ".hwp",
+                "kordoc_timeout_seconds": 120,
+                "kordoc_table_inventory": {"tables": [{"title": "internal"}]},
                 "kordoc_table_match": {
                     "match_label": "medium_review_match",
                     "table_index": 2,
@@ -107,6 +114,8 @@ class VectorIngestionAdapterTests(unittest.TestCase):
         self.assertEqual(record["metadata"]["answer_intents"], ["duration"])
         self.assertEqual(record["metadata"]["answer_facts"][0]["value"], "3년")
         self.assertEqual(record["metadata"]["source_hwpx_block_types"], ["table"])
+        self.assertEqual(record["metadata"]["source_xml_files"], ["Contents/section0.xml"])
+        self.assertEqual(record["metadata"]["source_xml_roles"], ["body"])
         self.assertEqual(record["metadata"]["source_hwpx_parser_review_flags"], ["nested_table"])
         self.assertEqual(record["metadata"]["source_hwpx_xml_block_indices"], [312, 313, 314])
         self.assertEqual(record["metadata"]["source_hwpx_nested_table_text_snippets"], ["Nested table evidence"])
@@ -114,10 +123,15 @@ class VectorIngestionAdapterTests(unittest.TestCase):
         self.assertEqual(record["metadata"]["source_hwp_streams"], ["BodyText/Section0"])
         self.assertEqual(record["metadata"]["source_hwp_section_indices"], [1])
         self.assertFalse(record["metadata"]["source_hwp_native_table_geometry"])
+        self.assertEqual(record["metadata"]["pdf_embedded_image_pages"], [3, 8])
         self.assertEqual(record["metadata"]["table_source"], "kordoc")
         self.assertEqual(record["metadata"]["table_geometry_source"], "kordoc")
         self.assertEqual(record["metadata"]["kordoc_table_parser_status"], "parsed")
         self.assertEqual(record["metadata"]["kordoc_table_count"], 3)
+        self.assertNotIn("kordoc_elapsed_ms", record["metadata"])
+        self.assertNotIn("kordoc_input_extension", record["metadata"])
+        self.assertNotIn("kordoc_timeout_seconds", record["metadata"])
+        self.assertNotIn("kordoc_table_inventory", record["metadata"])
         self.assertEqual(record["metadata"]["kordoc_table_match"]["table_index"], 2)
         self.assertTrue(record["metadata"]["kordoc_table_match_review_required"])
         self.assertTrue(record["metadata"]["kordoc_table_match_provisional"])

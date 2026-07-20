@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -32,6 +33,7 @@ from app.api.routes_documents import (
 )
 from app.api.routes_rag import RagChatRequest, rag_chat
 from app.core.config import get_settings, set_runtime_settings_overrides
+from app.core.pipeline import kordoc_table_command_status
 from app.agents.provider_config import (
     SUPPORTED_AGENT_REVIEW_PROVIDERS,
     agent_review_configuration_reason,
@@ -71,6 +73,8 @@ from app.services.approval_governance import (
 )
 from app.storage.repository import JsonRepository
 from scripts.generate_mcp_client_config import (
+    KORDOC_TABLE_REQUIRED_FILE_TYPES,
+    _kordoc_table_parser_evidence_summary,
     build_mcp_client_config,
     write_mcp_runtime_data_bundle,
     write_mcp_setup_bundle,
@@ -2878,6 +2882,40 @@ def _mcp_bundle_state_key(document_id: str, scope: str = "document") -> str:
     if scope == "document":
         return f"{MCP_BUNDLE_STATE_PREFIX}:{document_id}"
     return f"{MCP_BUNDLE_STATE_PREFIX}:{scope}:{document_id}"
+
+
+def _mcp_kordoc_preflight(
+    target_repository: JsonRepository,
+    document_ids: list[str],
+    *,
+    command: str,
+) -> dict[str, Any]:
+    """Return the non-mutating Kordoc evidence gate used by the bundle UI.
+
+    Bundle generation can be expensive (especially for large approved runtimes),
+    so the UI must check persisted parser evidence before starting the export.
+    Installing Kordoc does not retroactively change a document that was
+    preprocessed while the command was unavailable; those documents must be
+    reprocessed and reviewed again.
+    """
+
+    normalized_ids = list(dict.fromkeys(str(value or "").strip() for value in document_ids if str(value or "").strip()))
+    summary = _kordoc_table_parser_evidence_summary(target_repository, normalized_ids)
+    missing = [
+        item
+        for item in summary.get("documents", [])
+        if item.get("required") and not (item.get("status") == "parsed" and item.get("parser") == "kordoc")
+    ]
+    command_status = kordoc_table_command_status(str(command or ""))
+    return {
+        "ready": not missing,
+        "required_document_count": int(summary.get("required_document_count") or 0),
+        "parsed_document_count": int(summary.get("parsed_document_count") or 0),
+        "missing": missing,
+        "documents": summary.get("documents") or [],
+        "required_file_types": sorted(KORDOC_TABLE_REQUIRED_FILE_TYPES),
+        "command_status": command_status,
+    }
 
 
 def _candidate_operator_paths(raw_path: object) -> list[Path]:
@@ -5963,6 +6001,69 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 for field in _missing_mcp_source_metadata(scope_document)
             }
         )
+        scope_document_ids = [
+            str(getattr(scope_document, "document_id", "") or "")
+            for scope_document in scope_documents
+        ]
+        kordoc_preflight = _mcp_kordoc_preflight(
+            repository,
+            scope_document_ids,
+            command=str(getattr(settings, "kordoc_table_command", "") or ""),
+        )
+        if kordoc_preflight["required_document_count"]:
+            st.markdown("#### Kordoc 표 파싱 사전 점검")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "document_id": item.get("document_id"),
+                            "file_type": item.get("file_type"),
+                            "required": item.get("required"),
+                            "status": item.get("status") or "missing",
+                            "parser": item.get("parser") or "missing",
+                            "table_count": item.get("table_count", 0),
+                        }
+                        for item in kordoc_preflight["documents"]
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+            if kordoc_preflight["ready"]:
+                st.success(
+                    "Kordoc 표 파싱 증거가 모두 확인되었습니다. "
+                    f"{kordoc_preflight['parsed_document_count']:,}/"
+                    f"{kordoc_preflight['required_document_count']:,} 문서"
+                )
+            else:
+                command_status = kordoc_preflight["command_status"]
+                command_label = str(command_status.get("label") or "kordoc")
+                if command_status.get("available"):
+                    version = str(command_status.get("version") or "unknown")
+                    st.error(
+                        "현재 Kordoc 명령은 사용 가능하지만, 선택한 문서의 저장된 전처리 증거가 없습니다 "
+                        f"(명령={command_label}, 버전={version}). "
+                        "1단계에서 원본 문서를 다시 전처리하고, 사람 검토·승인·인덱싱을 다시 완료해야 합니다."
+                    )
+                else:
+                    st.error(
+                        f"Kordoc 명령({command_label})을 현재 실행 환경에서 찾을 수 없습니다. "
+                        "먼저 `npm install -g kordoc` 후 앱을 재시작하고 원본 문서를 다시 전처리하세요."
+                    )
+                missing_ids = ", ".join(
+                    str(item.get("document_id") or "") for item in kordoc_preflight["missing"][:10]
+                )
+                if missing_ids:
+                    st.info(
+                        f"Kordoc 증거가 없는 문서: {missing_ids}. "
+                        "기존 approved chunk를 직접 수정하거나 게이트를 끄지 마세요."
+                    )
+                if st.button(
+                    "Kordoc 설치 후 원본 재처리 화면으로 이동",
+                    key=f"kordoc-reprocess-goto-{document_id}-{mcp_scope}",
+                ):
+                    _go(NAV_PREPROCESS)
+                    st.rerun()
         mcp_export_document_id = document_id if mcp_scope == "current_document" else None
         mcp_export_document_ids = selected_document_ids if mcp_scope == "selected_documents" else None
         selected_scope_gate = (
@@ -5975,7 +6076,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.dataframe(pd.DataFrame(selected_scope_gate["rows"]), width="stretch", hide_index=True)
             if not selected_scope_gate["ready"]:
                 st.warning("선택한 모든 규정의 검수·승인·색인을 완료해야 규정이 빠지지 않은 MCP를 만들 수 있습니다.")
-        mcp_bundle_ready = bool(scope_documents) and (
+        mcp_bundle_ready = bool(scope_documents) and bool(kordoc_preflight["ready"]) and (
             bool(selected_scope_gate and selected_scope_gate["ready"])
             if mcp_scope == "selected_documents"
             else mcp_connection_ready

@@ -50,7 +50,11 @@ class StructureDetectorTests(unittest.TestCase):
                     blocks=[
                         ParsedBlock(
                             text="제1조(목적) 본문",
-                            metadata={"hwpx_block_type": "paragraph", "xml_file": "Contents/section0.xml"},
+                            metadata={
+                                "hwpx_block_type": "paragraph",
+                                "xml_file": "Contents/section0.xml",
+                                "source_xml_role": "body",
+                            },
                         ),
                         ParsedBlock(
                             type="image",
@@ -59,6 +63,7 @@ class StructureDetectorTests(unittest.TestCase):
                                 "hwpx_block_type": "image",
                                 "caption_count": 1,
                                 "xml_file": "Contents/section0.xml",
+                                "source_xml_role": "body",
                             },
                         ),
                     ],
@@ -72,6 +77,7 @@ class StructureDetectorTests(unittest.TestCase):
 
         self.assertEqual(article.metadata["source_hwpx_block_types"], ["paragraph", "image"])
         self.assertEqual(article.metadata["source_xml_files"], ["Contents/section0.xml"])
+        self.assertEqual(article.metadata["source_xml_roles"], ["body"])
         self.assertEqual(article.metadata["caption_count"], 1)
         self.assertIn("그림 1. 처리 흐름", article.text)
 

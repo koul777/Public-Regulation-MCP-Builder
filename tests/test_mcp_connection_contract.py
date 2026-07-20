@@ -16,7 +16,7 @@ class McpConnectionContractTests(unittest.TestCase):
 
         args = config["server_start"]["args"]
         self.assertEqual(1, args.count("--tool-profile"))
-        self.assertEqual("full", args[args.index("--tool-profile") + 1])
+        self.assertEqual("chatgpt-data", args[args.index("--tool-profile") + 1])
 
 
 if __name__ == "__main__":

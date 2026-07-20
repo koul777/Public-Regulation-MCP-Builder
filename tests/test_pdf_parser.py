@@ -151,6 +151,30 @@ class PDFParserTests(unittest.TestCase):
         self.assertIn("pdf_missing_content_pages", parsed.metadata["parser_uncertainty_flags"])
         self.assertEqual("review_ocr_text", parsed.metadata["parser_uncertainty_recommendation"])
 
+    def test_text_page_with_embedded_image_emits_image_review_signal(self) -> None:
+        class _TextImagePage(_FakePdfPage):
+            def get_images(self, *, full: bool = False) -> list[tuple]:
+                return [("image-x",)]
+
+        class FakePdfDocument:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def __iter__(self):
+                return iter([_TextImagePage(width=600, height=800, lines=[[_fake_chars("text", x=40, y=100)]])])
+
+        fake_fitz = SimpleNamespace(open=lambda path: FakePdfDocument())
+        with patch.dict(sys.modules, {"fitz": fake_fitz}):
+            parsed = PDFParser().parse(Path("text-image.pdf"), "doc_text_image_pdf")
+
+        self.assertEqual([1], parsed.metadata["pdf_embedded_image_pages"])
+        self.assertIn("pdf_embedded_images_detected", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("review_embedded_images", parsed.metadata["parser_uncertainty_recommendation"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+
     def test_layout_line_blocks_split_wide_two_column_lines(self) -> None:
         page = _FakePdfPage(
             width=600,

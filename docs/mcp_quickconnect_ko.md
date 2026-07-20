@@ -8,6 +8,8 @@
 
 연결 전 게이트: MCP 클라이언트 연결 산출물은 전처리, 사람 승인, approved chunk 인덱싱까지 끝난 런타임에서만 ready로 취급합니다. 승인만 있고 `Index approved chunks` 또는 `Reindex approved chunks`가 끝나지 않은 상태는 연결 전 단계입니다.
 
+Kordoc 사전 점검: HWP/HWPX/PDF/DOCX가 선택 범위에 있으면 MCP 생성 화면이 저장된 Kordoc 증거(`status=parsed`, `parser=kordoc`)를 먼저 확인합니다. 현재 PC에 Kordoc을 설치했더라도 과거 `not_available` 전처리 결과가 자동으로 바뀌지는 않으므로, `npm install -g kordoc` 후 원본을 ① 전처리 화면에서 다시 처리하고 ② 사람 검토·승인을 다시 완료한 뒤 ③ `Index approved chunks` 또는 `Reindex approved chunks`를 실행해야 합니다. 증거가 없으면 비싼 bundle export를 시작하지 않고 재처리 화면으로 안내합니다.
+
 미검수 프리뷰는 `UNREVIEWED_PREVIEW`로 분리합니다. 이 모드는 품질과 연결 UX를 빠르게 확인하기 위한 경고 상태이며, 정식 MCP handoff, 외부 AI 연결, 기관 업무 사용, release evidence에는 사용할 수 없습니다.
 
 PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 ChatGPT Desktop 로컬 플러그인, ChatGPT 원격 MCP, Codex CLI, Claude Desktop, Claude Code, Claude API에 빠르게 연결하기 위한 최소 절차입니다.
@@ -26,7 +28,7 @@ PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 ChatGPT Desktop 로
 - `desktop_tool_scan_verified`: ChatGPT Desktop 도구 scan에서 MCP 도구 노출 확인
 - `conversation_attachment_verified`: 현재 대화에서 플러그인 도구 첨부 확인
 - `conversation_attachment_unverified`: 현재 대화의 플러그인 선택/멘션은 아직 제품 UI에서 확인되지 않음
-- `end_to_end_verified`: `initialize`, `tools/list`, `get_index_status`가 모두 성공함
+- `end_to_end_verified`: local/full은 `initialize`, `tools/list`, `get_index_status`; 외부 `chatgpt-data`는 `initialize`, `tools/list`, `search`, `fetch` 계약이 모두 성공함
 
 ## 용어 정리
 
@@ -76,7 +78,7 @@ Streamlit의 MCP 설정 JSON 다운로드와 `Write MCP setup bundle now`는 app
 
 승인 전 단계에서는 `Approval worklist evidence`에서 `approval_review_batch_manifest`를 불러오고, 필요하면 `Review batch ID to load`로 실제 검토한 batch를 선택합니다. 선택 batch의 `approval_request_template.chunk_ids`만 `Approve selected review batch for RAG` 범위가 되며, `review_flags_acknowledged`는 자동으로 체크되지 않습니다. batch 승인 후 `Index approved chunks` 또는 `Reindex approved chunks`를 실행해야 MCP 연결 산출물이 준비 상태가 됩니다.
 
-ChatGPT Desktop 로컬 플러그인, Codex CLI, Claude Desktop, Claude Code용 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 실행하지 않고 번들 안의 `run_mcp_stdio_server.ps1` launcher를 실행합니다. 이 launcher는 번들 `data` 폴더를 기준으로 서버를 띄우고, 저장소 checkout 안에 번들이 있으면 현재 checkout의 `scripts\run_regulation_mcp.py`를 설치된 콘솔 명령보다 먼저 실행합니다. checkout을 찾지 못할 때만 PATH의 `reg-rag-mcp-server`로 fallback하며, 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다. Windows PowerShell 5.1에서 한글·공백 경로가 깨지지 않도록 `.ps1` 실행 스크립트만 UTF-8 BOM을 허용합니다. `plugin.json`, `.mcp.json`, `marketplace.json`, 상태 JSON과 TOML은 항상 BOM 없는 UTF-8이며, ChatGPT Desktop `.mcp.json`이 `EF BB BF`로 시작하면 smoke와 ZIP 추출 검증이 실패합니다.
+ChatGPT Desktop 로컬 플러그인, Codex CLI, Claude Desktop, Claude Code용 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 실행하지 않고 번들 안의 `run_mcp_stdio_server.ps1` launcher를 실행합니다. 이 launcher는 번들 `data` 폴더를 기준으로 서버를 띄우고, 저장소 checkout 안에 번들이 있으면 현재 checkout의 `scripts\run_regulation_mcp.py`를 설치된 콘솔 명령보다 먼저 실행합니다. checkout을 찾지 못하면 `REG_RAG_PYTHON=<venv>\Scripts\python.exe`가 지정된 경우 설치된 wheel의 `scripts.run_regulation_mcp` 모듈을 먼저 실행하고, 그 다음에만 PATH의 `reg-rag-mcp-server`로 fallback하며, 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다. 다른 Python 환경이나 오래된 전역 console script가 PATH에 먼저 잡히면 `REG_RAG_PYTHON=<venv>\Scripts\python.exe`를 지정해 launcher가 사용할 Python을 고정해야 합니다. Windows PowerShell 5.1에서 한글·공백 경로가 깨지지 않도록 `.ps1` 실행 스크립트만 UTF-8 BOM을 허용합니다. `plugin.json`, `.mcp.json`, `marketplace.json`, 상태 JSON과 TOML은 항상 BOM 없는 UTF-8이며, ChatGPT Desktop `.mcp.json`이 `EF BB BF`로 시작하면 smoke와 ZIP 추출 검증이 실패합니다.
 
 GitHub private push 또는 배포 직전에는 release harness로 실제 runtime data를 다시 번들화하고, 생성된 번들 자체의 local stdio doctor와 transport smoke까지 확인합니다. 이 검사는 GitHub에서 받은 코드와 로컬 번들이 같은 방식으로 빠르게 연결되는지 보는 최소 회귀입니다.
 
@@ -262,13 +264,13 @@ powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/claude_co
 
 ## 6. ChatGPT 원격 HTTPS
 
-이 절차는 위의 ChatGPT Desktop 로컬 플러그인과 별개입니다. ChatGPT Apps/Connectors는 ChatGPT에서 접근 가능한 인증된 HTTPS `/mcp` endpoint가 필요하며 localhost에 직접 연결하지 않습니다. 생성된 `chatgpt-remote` 프로필은 연결 검증을 위해 `get_index_status`를 포함한 전체 읽기 전용 도구를 명시적으로 노출합니다. 외부 connector 응답에는 `source_record_id`, `source_file_id`, `approval_review_batch_manifest_path` 같은 내부 운영 metadata가 포함되면 안 됩니다.
+이 절차는 위의 ChatGPT Desktop 로컬 플러그인과 별개입니다. ChatGPT Apps/Connectors는 ChatGPT에서 접근 가능한 인증된 HTTPS `/mcp` endpoint가 필요하며 localhost에 직접 연결하지 않습니다. 생성된 `chatgpt-remote` 프로필은 외부 응답 경계를 위해 `chatgpt-data` 프로필(search/fetch)만 명시적으로 노출합니다. 외부 connector 응답에는 `source_record_id`, `source_file_id`, `approval_review_batch_manifest_path` 같은 내부 운영 metadata가 포함되면 안 됩니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/run_chatgpt_data_server.ps1
 ```
 
-ChatGPT Settings > Apps/Connectors > Create에서 앱 이름을 프로그램에서 입력한 MCP 이름으로 지정하고 `chatgpt_connector.json`의 `connector_url`을 등록합니다. `Scan tools`에서 `get_index_status`를 확인하고 `Create`를 승인합니다. ChatGPT Desktop을 완전히 재시작한 뒤 새 대화에서 해당 앱을 선택하거나 `@MCP이름`으로 호출합니다. 현재 대화에서 보이지 않으면 입력창의 `+` → `더 보기` → MCP 이름을 선택합니다.
+ChatGPT Settings > Apps/Connectors > Create에서 앱 이름을 프로그램에서 입력한 MCP 이름으로 지정하고 `chatgpt_connector.json`의 `connector_url`을 등록합니다. `Scan tools`에서 `search`와 `fetch`를 확인하고 `Create`를 승인합니다. `get_index_status` 같은 내부 진단은 로컬/full 프로필에서만 실행합니다. ChatGPT Desktop을 완전히 재시작한 뒤 새 대화에서 해당 앱을 선택하거나 `@MCP이름`으로 호출합니다. 현재 대화에서 보이지 않으면 입력창의 `+` → `더 보기` → MCP 이름을 선택합니다.
 
 배포된 HTTPS endpoint 자체는 다음 스크립트로 검증합니다. 이 스크립트가 성공해도 ChatGPT 대화 첨부와 Apps의 도구 scan 상태는 별도입니다.
 

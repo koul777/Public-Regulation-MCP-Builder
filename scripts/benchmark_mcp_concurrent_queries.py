@@ -259,8 +259,13 @@ def _findings(
                 threshold_record_count=int(min_warm_records),
             )
         )
-    if not bool(warmup.get("bm25_index_ready")):
-        findings.append(_finding("concurrent-bm25-index-not-ready", "Warm runtime BM25 index was not ready."))
+    if not bool(warmup.get("bm25_index_ready")) and not bool(warmup.get("hierarchical_index_ready")):
+        findings.append(
+            _finding(
+                "concurrent-bm25-index-not-ready",
+                "Warm runtime has neither a BM25 index nor a verified hierarchical retrieval index.",
+            )
+        )
     if max_batch_elapsed_ms is not None and batch_elapsed_ms > max_batch_elapsed_ms:
         findings.append(
             _finding(

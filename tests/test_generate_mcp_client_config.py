@@ -20,6 +20,7 @@ from app.schemas.structure import StructureNode
 from app.storage.repository import JsonRepository
 from scripts.generate_mcp_client_config import (
     _recommended_runtime_smoke_query,
+    _powershell_stdio_launcher_script,
     build_mcp_client_config,
     main,
     parse_args,
@@ -31,6 +32,15 @@ from scripts.mcp_bundle_contract import ALL_SETUP_BUNDLE_FILES, REQUIRED_SETUP_B
 
 
 class GenerateMcpClientConfigTests(unittest.TestCase):
+    def test_stdio_launcher_can_use_explicit_packaged_python_after_bundle_move(self) -> None:
+        launcher = _powershell_stdio_launcher_script(
+            ["--data-dir", "C:/bundle/data", "--transport", "stdio"],
+        )
+
+        self.assertIn("$env:REG_RAG_PYTHON", launcher)
+        self.assertIn("-m scripts.run_regulation_mcp", launcher)
+        self.assertIn("stale console script", launcher)
+
     def test_cli_accepts_explicit_wheel_dist_directory(self) -> None:
         with patch.object(
             sys,
@@ -154,10 +164,10 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertTrue(config["chatgpt_setup"]["https_endpoint_ready"])
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
-        self.assertIn("get_index_status", config["compatible_tools"])
+        self.assertEqual(["search", "fetch"], config["compatible_tools"])
         self.assertIn("--tenant-storage-isolation", config["server_start"]["args"])
         self.assertIn("--tool-profile", config["server_start"]["args"])
-        self.assertIn("full", config["server_start"]["args"])
+        self.assertIn("chatgpt-data", config["server_start"]["args"])
         self.assertIn("--allowed-http-host", config["server_start"]["args"])
         self.assertIn("--allowed-http-origin", config["server_start"]["args"])
         self.assertIn("--no-warm-cache", config["server_start"]["args"])
@@ -219,7 +229,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         claude_code_args = config["claude_code"]["args"]
         self.assertIn("--no-warm-cache", claude_desktop_args)
         self.assertIn("--no-warm-cache", claude_code_args)
-        self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["get_index_status"])
+        self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["search", "fetch"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["requires_reachable_https"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
         self.assertIn("openai_secure_tunnel", config["quickstart"]["chatgpt_remote"]["connection_options"])
@@ -227,7 +237,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertTrue(config["quickstart"]["chatgpt_desktop_local"]["conversation_attachment_unverified"])
         self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["tunnel_id_env"], "OPENAI_TUNNEL_ID")
         self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["setup_state"], "manual_setup_required")
-        self.assertNotIn("--tool-profile chatgpt-data", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
+        self.assertIn("--tool-profile chatgpt-data", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
         self.assertIn("--no-warm-cache", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
         self.assertIn("--flat-storage", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
         self.assertIn("--fail-on-warning", config["quickstart"]["openai_secure_tunnel"]["commands"]["readiness"]["args"])
@@ -240,7 +250,11 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertIn("--auth-issuer-url", config["quickstart"]["run_http_server"]["args"])
         self.assertIn("--no-warm-cache", config["quickstart"]["run_http_server"]["args"])
         self.assertIn("https://mcp.example.go.kr", config["quickstart"]["run_http_server"]["args"])
-        self.assertEqual("full", config["quickstart"]["run_chatgpt_data_server"]["tool_profile"])
+        self.assertEqual("chatgpt-data", config["quickstart"]["run_chatgpt_data_server"]["tool_profile"])
+        self.assertIn("--tool-profile", config["chatgpt_remote"]["server_start"]["args"])
+        self.assertIn("chatgpt-data", config["chatgpt_remote"]["server_start"]["args"])
+        self.assertIn("chatgpt-data", config["claude_api"]["server_start"]["args"])
+        self.assertEqual(["search", "fetch"], config["quickstart"]["chatgpt_remote"]["verification_tools"])
         self.assertIn("--no-warm-cache", config["quickstart"]["run_chatgpt_data_server"]["args"])
         self.assertIn("copy_paste", config["quickstart"])
         self.assertIn(
@@ -255,7 +269,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertIn("--audit-index-visibility", config["quickstart"]["copy_paste"]["run_http_server_ps"])
         self.assertIn('Assert-Command "reg-rag-mcp-doctor"', config["quickstart"]["copy_paste"]["run_http_server_ps"])
         self.assertIn("if ($LASTEXITCODE -ne 0)", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertNotIn("--tool-profile chatgpt-data", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
+        self.assertIn("--tool-profile chatgpt-data", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
         self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
         self.assertIn("reg-rag-mcp-doctor --client-profile chatgpt-remote", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
         self.assertIn("--audit-index-visibility", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
@@ -616,7 +630,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 (output_dir / "run_http_server.ps1").read_text(encoding="utf-8"),
             )
             self.assertIn(
-                "--tool-profile full",
+                "--tool-profile chatgpt-data",
                 (output_dir / "run_chatgpt_data_server.ps1").read_text(encoding="utf-8"),
             )
             self.assertIn(

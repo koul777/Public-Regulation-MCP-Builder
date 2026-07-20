@@ -83,6 +83,28 @@ class BenchmarkMcpConcurrentQueriesTests(unittest.TestCase):
         self.assertIn("concurrent-warm-record-count-below-minimum", codes)
         self.assertIn("concurrent-task-elapsed-too-high", codes)
 
+    def test_verified_hierarchical_runtime_does_not_require_bm25_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with _patched_runtime() as mocks:
+                mocks["warm_mcp_runtime"].return_value = {
+                    "warmed": True,
+                    "record_count": 3,
+                    "hierarchical_index_ready": True,
+                    "bm25_index_ready": False,
+                }
+                report = benchmark_mcp_concurrent_queries(
+                    data_dir=root / "data",
+                    tenant_id="tenant-demo",
+                    profile_id="profile-demo",
+                    queries=["childcare"],
+                    rounds=1,
+                    concurrency=1,
+                )
+
+        self.assertTrue(report["passed"])
+        self.assertNotIn("concurrent-bm25-index-not-ready", {item["code"] for item in report["findings"]})
+
     def test_expected_no_evidence_query_passes_when_no_results_are_returned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

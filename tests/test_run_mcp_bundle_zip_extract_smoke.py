@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ import zipfile
 
 from scripts.run_mcp_bundle_zip_extract_smoke import (
     _client_config_path_checks,
+    _extract_archive_safely,
     run_mcp_bundle_zip_extract_smoke,
 )
 
@@ -53,6 +55,10 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
                         "scripts.run_mcp_bundle_zip_extract_smoke.current_repo_commit",
                         return_value="test-commit",
                     ),
+                    mock.patch(
+                        "scripts.run_mcp_bundle_zip_extract_smoke.shutil.which",
+                        return_value=None,
+                    ),
                 ):
                     report = run_mcp_bundle_zip_extract_smoke(
                         bundle_zip="bundle.zip",
@@ -68,6 +74,59 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertEqual(str(bundle_zip.resolve()), report["bundle_zip"])
         self.assertEqual(str(extracted.resolve()), report["extract_dir"])
         self.assertTrue(report["passed"])
+
+    def test_require_console_scripts_reports_environment_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            extracted = root / "nested" / "extracted"
+            _write_client_configs(
+                source,
+                launcher=extracted / "run_mcp_stdio_server.ps1",
+                data_dir=extracted / "data",
+            )
+            (source / "validate_client_config_smoke.ps1").write_text("exit 0\n", encoding="utf-8")
+            (source / "run_mcp_stdio_server.ps1").write_text("exit 0\n", encoding="utf-8")
+            (source / "mcp_client_config_smoke.json").write_text('{"passed": true}\n', encoding="utf-8")
+            bundle_zip = root / "bundle.zip"
+            with zipfile.ZipFile(bundle_zip, "w") as archive:
+                for path in source.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, arcname=path.relative_to(source).as_posix())
+                archive.writestr("data/.keep", "")
+
+            with (
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke._powershell_command",
+                    return_value="powershell.exe",
+                ),
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ),
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke.shutil.which",
+                    return_value=None,
+                ),
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke.current_repo_commit",
+                    return_value="test-commit",
+                ),
+            ):
+                report = run_mcp_bundle_zip_extract_smoke(
+                    bundle_zip=bundle_zip,
+                    extract_dir=extracted,
+                    server_name="govreg-local",
+                    require_console_scripts=True,
+                )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["environment_checks_passed"])
+        self.assertEqual(
+            {"reg-rag-mcp-client-config-smoke", "reg-rag-mcp-server"},
+            set(report["missing_console_scripts"]),
+        )
 
     def test_path_checks_pass_when_configs_point_to_extracted_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,6 +187,32 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertFalse(checks["clients"]["codex"]["passed"])
         self.assertFalse(checks["clients"]["claude_desktop"]["passed"])
         self.assertIn("stale", checks["clients"]["codex"]["launcher"])
+
+    def test_safe_extract_rejects_traversal_and_symlink_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "nested" / "extract"
+            destination.mkdir(parents=True)
+            traversal = root / "traversal.zip"
+            with zipfile.ZipFile(traversal, "w") as archive:
+                archive.writestr("../outside.txt", "blocked")
+            with self.assertRaisesRegex(ValueError, "Unsafe bundle archive member"):
+                _extract_archive_safely(traversal, destination)
+
+            symlink = root / "symlink.zip"
+            info = zipfile.ZipInfo("linked.txt")
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            with zipfile.ZipFile(symlink, "w") as archive:
+                archive.writestr(info, "outside.txt")
+            with self.assertRaisesRegex(ValueError, "Symlink bundle archive member"):
+                _extract_archive_safely(symlink, destination)
+
+            duplicate = root / "duplicate.zip"
+            with zipfile.ZipFile(duplicate, "w") as archive:
+                archive.writestr("same.txt", "first")
+                archive.writestr("same.txt", "second")
+            with self.assertRaisesRegex(ValueError, "Duplicate bundle archive member"):
+                _extract_archive_safely(duplicate, destination)
 
 
 def _write_client_configs(bundle: Path, *, launcher: Path, data_dir: Path) -> None:

@@ -739,6 +739,12 @@ class StructureDetector:
             if xml_file not in xml_files:
                 xml_files.append(xml_file)
             node.metadata["source_xml_files"] = xml_files
+        xml_role = str(source_metadata.get("source_xml_role") or "").strip()
+        if xml_role:
+            xml_roles = list(node.metadata.get("source_xml_roles") or [])
+            if xml_role not in xml_roles:
+                xml_roles.append(xml_role)
+            node.metadata["source_xml_roles"] = xml_roles
         xml_block_index = source_metadata.get("hwpx_xml_block_index")
         if isinstance(xml_block_index, int):
             xml_block_indices = list(node.metadata.get("source_hwpx_xml_block_indices") or [])

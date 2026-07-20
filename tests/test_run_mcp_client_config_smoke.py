@@ -11,7 +11,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.run_mcp_client_config_smoke import (
+    _external_metadata_violations,
     _validate_strict_jsonrpc_stdout,
+    _exception_message,
     _search_with_fallback,
     run,
     run_mcp_client_config_smoke,
@@ -19,6 +21,13 @@ from scripts.run_mcp_client_config_smoke import (
 
 
 class RunMcpClientConfigSmokeTests(unittest.TestCase):
+    def test_exception_group_message_includes_nested_cause(self) -> None:
+        message = _exception_message(ExceptionGroup("unhandled errors in a TaskGroup", [FileNotFoundError("server")]))
+
+        self.assertIn("ExceptionGroup", message)
+        self.assertIn("FileNotFoundError", message)
+        self.assertIn("server", message)
+
     def test_codex_config_uses_bundle_recommended_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -308,6 +317,49 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["end_to_end_verified"])
         self.assertTrue(report["tool_scan_unverified"])
         self.assertEqual("verified", report["verification_answer"]["status"])
+
+    def test_remote_external_profile_accepts_search_fetch_without_index_status(self) -> None:
+        async def fake_remote_entry(*, url, token):
+            return {
+                "passed": True,
+                "process_started": True,
+                "mcp_initialized": True,
+                "tools_discovered": True,
+                "index_status_verified": False,
+                "contract_verified": True,
+                "end_to_end_verified": True,
+                "verification_mode": "search_fetch",
+                "tool_names": ["fetch", "search"],
+                "index_status_summary": {},
+                "session_id_present": True,
+            }
+
+        with patch.dict(os.environ, {"MCP_TEST_TOKEN": "secret"}, clear=False), patch(
+            "scripts.run_mcp_client_config_smoke._run_remote_entry",
+            new=fake_remote_entry,
+        ):
+            report = run_mcp_client_config_smoke(
+                remote_url="https://mcp.example.test/mcp",
+                remote_token_env="MCP_TEST_TOKEN",
+                server_name="aksmcp",
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["end_to_end_verified"])
+        self.assertFalse(report["verification_answer"]["get_index_status_verified"])
+        self.assertTrue(report["verification_answer"]["search_fetch_verified"])
+        self.assertIn("search_fetch", report["verification_answer"]["verification_modes"])
+
+    def test_external_metadata_deny_list_detects_internal_fields(self) -> None:
+        self.assertEqual(
+            ["approval_review_batch_manifest_path", "source_file_id"],
+            _external_metadata_violations(
+                [
+                    {"source_file_id": "internal-file", "source_record_id": ""},
+                    {"approval_review_batch_manifest_path": "reports/internal.json"},
+                ]
+            ),
+        )
 
     def test_cli_fails_without_any_config(self) -> None:
         stdout = io.StringIO()

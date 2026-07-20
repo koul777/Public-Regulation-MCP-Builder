@@ -89,6 +89,10 @@ class RegulationMcpToolsTests(unittest.TestCase):
             "kordoc_table_promotion_review_required": True,
             "kordoc_table_unmatched_source": False,
             "kordoc_table_match": {"table_id": "kordoc-1", "score": 0.9},
+            "kordoc_elapsed_ms": 12.5,
+            "kordoc_input_extension": ".hwp",
+            "kordoc_timeout_seconds": 120,
+            "kordoc_table_inventory": {"tables": [{"title": "internal"}]},
             "parser_uncertainty_remediation_hint": "review original",
         }
 
@@ -105,6 +109,11 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertNotIn("source_hwp_streams", search_result["metadata"])
         self.assertNotIn("kordoc_table_match", search_result["metadata"])
         self.assertNotIn("parser_uncertainty_remediation_hint", search_result["metadata"])
+        for metadata in (search_result["metadata"], fetch_result["metadata"]):
+            self.assertNotIn("kordoc_elapsed_ms", metadata)
+            self.assertNotIn("kordoc_input_extension", metadata)
+            self.assertNotIn("kordoc_timeout_seconds", metadata)
+            self.assertNotIn("kordoc_table_inventory", metadata)
         self.assertEqual(search_result["metadata"]["table_source"], "kordoc")
         self.assertEqual(search_result["metadata"]["table_geometry_source"], "kordoc")
         self.assertEqual(search_result["metadata"]["primary_parser_table_source"], "hwp_parser")
@@ -750,6 +759,8 @@ class RegulationMcpToolsTests(unittest.TestCase):
                     "article_no": "A1",
                     "article_title": "HWPX evidence",
                     "source_hwpx_block_types": ["table"],
+                    "source_xml_files": ["Contents/header.xml"],
+                    "source_xml_roles": ["metadata"],
                     "source_hwpx_parser_review_flags": ["nested_table"],
                     "source_hwpx_xml_block_indices": [312, 313, 314],
                     "source_hwpx_nested_table_text_snippets": ["Nested table evidence"],
@@ -757,6 +768,7 @@ class RegulationMcpToolsTests(unittest.TestCase):
                     "source_hwp_streams": ["BodyText/Section0"],
                     "source_hwp_section_indices": [1],
                     "source_hwp_native_table_geometry": False,
+                    "pdf_embedded_image_pages": [8],
                 },
             )
             mcp_auth = mcp_auth_context(tenant_id="tenant-a")
@@ -776,12 +788,15 @@ class RegulationMcpToolsTests(unittest.TestCase):
 
         self.assertEqual(search["results"][0]["metadata"]["source_hwpx_block_types"], ["table"])
         self.assertEqual(search["results"][0]["metadata"]["source_hwpx_parser_review_flags"], ["nested_table"])
+        self.assertEqual(search["results"][0]["metadata"]["source_xml_roles"], ["metadata"])
+        self.assertEqual(fetched["metadata"]["source_xml_files"], ["Contents/header.xml"])
         self.assertEqual(fetched["metadata"]["source_hwpx_xml_block_indices"], [312, 313, 314])
         self.assertEqual(fetched["metadata"]["source_hwpx_nested_table_text_snippets"], ["Nested table evidence"])
         self.assertEqual(fetched["metadata"]["source_hwp_extraction_modes"], ["legacy_ole_para_text_only"])
         self.assertEqual(fetched["metadata"]["source_hwp_streams"], ["BodyText/Section0"])
         self.assertEqual(fetched["metadata"]["source_hwp_section_indices"], [1])
         self.assertFalse(fetched["metadata"]["source_hwp_native_table_geometry"])
+        self.assertEqual(fetched["metadata"]["pdf_embedded_image_pages"], [8])
 
     def test_fetch_validates_only_the_requested_vector_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1343,6 +1358,26 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertTrue(status["record_count_available"])
         self.assertEqual("mcp_runtime_manifest", status["record_count_source"])
         self.assertEqual(str(manifest_path), status["manifest_path"])
+
+    def test_warm_mcp_runtime_reports_hierarchical_retrieval_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            bm25_path = settings.data_dir / "vector_db" / "tenant-a" / "bm25.json"
+            with (
+                patch.object(regulation_tools, "_verified_hierarchical_runtime_paths", return_value=(hierarchy_path, None)),
+                patch.object(regulation_tools, "hierarchical_index_summary", return_value={"record_count": 3}),
+                patch.object(regulation_tools.routes_rag, "bm25_index_path", return_value=bm25_path),
+                patch.object(regulation_tools.routes_rag, "path_signature", return_value=None),
+            ):
+                status = warm_mcp_runtime(settings=settings, auth=auth)
+
+        self.assertTrue(status["warmed"])
+        self.assertTrue(status["hierarchical_index_ready"])
+        self.assertTrue(status["retrieval_index_ready"])
+        self.assertEqual("hierarchical_sqlite", status["retrieval_index_mode"])
+        self.assertFalse(status["bm25_index_ready"])
 
     def test_get_index_status_reports_mcp_visible_vector_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

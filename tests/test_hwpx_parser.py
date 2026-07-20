@@ -8,6 +8,7 @@ from pathlib import Path
 from app.processors.chunker import Chunker
 from app.processors.structure_detector import StructureDetector
 from app.schemas.chunk import ChunkOptions
+from app.parsers.base import ParserError
 from app.parsers.factory import get_parser
 from app.parsers.hwpx_parser import HwpxParser
 
@@ -46,6 +47,8 @@ class HwpxParserTests(unittest.TestCase):
         self.assertEqual(blocks[0].text, "Article One")
         self.assertEqual(blocks[1].text, "Header A | Header B\nValue A | Value B")
         self.assertEqual(blocks[1].metadata["hwpx_block_type"], "table")
+        self.assertEqual(blocks[0].metadata["source_xml_role"], "body")
+        self.assertEqual(blocks[1].metadata["source_xml_role"], "body")
         self.assertEqual(blocks[2].text, "Article Two")
         self.assertEqual(parsed.raw_text.count("Article One"), 1)
         self.assertEqual(parsed.raw_text.count("Header A"), 1)
@@ -294,6 +297,43 @@ class HwpxParserTests(unittest.TestCase):
         self.assertEqual(parsed.metadata["parser_uncertainty_risk_level"], "medium")
         self.assertIn("hwpx_section_parse_error", parsed.metadata["parser_uncertainty_flags"])
         self.assertLess(parsed.metadata["parser_uncertainty_confidence"], 0.92)
+
+    def test_rejects_dtd_and_entity_declarations_before_xml_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unsafe.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/section0.xml",
+                    '<!DOCTYPE root [<!ENTITY injected "blocked">]>'
+                    '<root><hp:p xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    '<hp:run><hp:t>&injected;</hp:t></hp:run></hp:p></root>',
+                )
+
+            with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
+                HwpxParser().parse(path, "doc_unsafe_hwpx")
+
+    def test_marks_non_body_xml_role_for_review_instead_of_mixing_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header-role.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/header.xml",
+                    '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    "<hp:p><hp:run><hp:t>Header metadata</hp:t></hp:run></hp:p></root>",
+                )
+                archive.writestr(
+                    "Contents/section0.xml",
+                    '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    "<hp:p><hp:run><hp:t>Body text</hp:t></hp:run></hp:p></root>",
+                )
+
+            parsed = HwpxParser().parse(path, "doc_header_role")
+
+        self.assertEqual({"body": 1, "metadata": 1}, parsed.metadata["hwpx_xml_role_counts"])
+        header = next(block for block in parsed.pages[0].blocks if block.text == "Header metadata")
+        self.assertEqual("metadata", header.metadata["source_xml_role"])
+        self.assertIn("hwpx_non_body_xml_content", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("review_non_body_xml", parsed.metadata["parser_uncertainty_recommendation"])
 
     def _write_hwpx(self, path: Path, section_xml: str) -> None:
         with zipfile.ZipFile(path, "w") as archive:

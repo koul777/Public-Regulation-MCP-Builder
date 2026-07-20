@@ -29,6 +29,14 @@ def parsed_fixture() -> ParsedDocument:
 
 
 class ChunkerTests(unittest.TestCase):
+    def test_preserves_compact_two_row_table_evidence_for_review(self) -> None:
+        metadata = Chunker()._table_metadata("Item | Standard\nManager | 10", "appendix")
+
+        self.assertFalse(metadata["table_like"])
+        self.assertTrue(metadata["table_short_candidate"])
+        self.assertTrue(metadata["table_review_required"])
+        self.assertEqual([["Item", "Standard"], ["Manager", "10"]], metadata["table_cell_rows_raw"])
+
     def test_kordoc_table_records_preserve_values_under_duplicate_headers(self) -> None:
         cell_rows = [
             {"row_index": 0, "cells": ["구분", "금액", "금액"]},
@@ -299,6 +307,7 @@ class ChunkerTests(unittest.TestCase):
             document_name="Rules",
             file_type="pdf",
             metadata={
+                "pdf_embedded_image_pages": [23],
                 "pdf_footnote_links": [
                     {"source_page": 23, "marker": "ⅰ"},
                     {"source_page": 24, "marker": "ⅶ"},
@@ -337,6 +346,8 @@ class ChunkerTests(unittest.TestCase):
         self.assertEqual(15, chunks[0].metadata["footnote_marker_reference_count"])
         self.assertEqual(2, len(chunks[0].metadata["footnote_marker_references"]))
         self.assertEqual(2, len(chunks[0].metadata["footnote_links"]))
+        self.assertEqual([23], chunks[0].metadata["pdf_embedded_image_pages"])
+        self.assertEqual([23], chunks[1].metadata["pdf_embedded_image_pages"])
         self.assertNotIn("footnote_marker_reference_count", chunks[1].metadata)
         self.assertNotIn("footnote_links", chunks[1].metadata)
 
@@ -1191,11 +1202,19 @@ class ChunkerTests(unittest.TestCase):
                     blocks=[
                         ParsedBlock(
                             text="제1조(목적) 본문",
-                            metadata={"hwpx_block_type": "paragraph", "xml_file": "Contents/section0.xml"},
+                            metadata={
+                                "hwpx_block_type": "paragraph",
+                                "xml_file": "Contents/section0.xml",
+                                "source_xml_role": "body",
+                            },
                         ),
                         ParsedBlock(
                             text="각주 설명",
-                            metadata={"hwpx_block_type": "footnote", "xml_file": "Contents/section0.xml"},
+                            metadata={
+                                "hwpx_block_type": "footnote",
+                                "xml_file": "Contents/section0.xml",
+                                "source_xml_role": "metadata",
+                            },
                         ),
                         ParsedBlock(
                             type="image",
@@ -1204,6 +1223,7 @@ class ChunkerTests(unittest.TestCase):
                                 "hwpx_block_type": "image",
                                 "caption_count": 1,
                                 "xml_file": "Contents/section0.xml",
+                                "source_xml_role": "body",
                             },
                         ),
                     ],
@@ -1218,6 +1238,7 @@ class ChunkerTests(unittest.TestCase):
         self.assertEqual(chunk.metadata["source_hwpx_block_types"], ["paragraph", "footnote", "image"])
         self.assertEqual(chunk.metadata["source_hwpx_block_type_count"], 3)
         self.assertEqual(chunk.metadata["source_xml_files"], ["Contents/section0.xml"])
+        self.assertEqual(chunk.metadata["source_xml_roles"], ["body", "metadata"])
         self.assertEqual(chunk.metadata["source_caption_count"], 1)
 
     def test_chunk_metadata_keeps_hwpx_complex_table_sources(self) -> None:

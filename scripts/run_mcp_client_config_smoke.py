@@ -26,6 +26,15 @@ from scripts.report_metadata import current_repo_commit
 
 UTF8_BOM = b"\xef\xbb\xbf"
 DEFAULT_SEARCH_QUERY = "\uc81c1\uc870"
+_EXTERNAL_METADATA_DENY_KEYS = frozenset(
+    {
+        "source_record_id",
+        "source_file_id",
+        "approval_review_batch_manifest_path",
+        "approval_review_batch_manifest_sha256",
+        "approval_worklist_report_sha256",
+    }
+)
 
 
 def run_mcp_client_config_smoke(
@@ -73,7 +82,7 @@ def run_mcp_client_config_smoke(
     mcp_initialized = bool(results) and all(bool(result.get("mcp_initialized")) for result in results)
     tools_discovered = bool(results) and all(bool(result.get("tools_discovered")) for result in results)
     end_to_end_verified = bool(results) and all(
-        bool(result.get("end_to_end_verified")) and bool(result.get("index_status_verified"))
+        bool(result.get("contract_verified", result.get("end_to_end_verified")))
         for result in results
     )
     local_results = [result for result in results if result.get("label") != "chatgpt_remote"]
@@ -131,11 +140,32 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
         if isinstance(result, dict) and isinstance(result.get("index_status_summary"), dict)
     ]
     verified = bool(report.get("end_to_end_verified"))
+    verification_modes = sorted(
+        {
+            str(result.get("verification_mode") or "index_status")
+            for result in results
+            if isinstance(result, dict) and result.get("end_to_end_verified")
+        }
+    )
+    index_status_verified = any(
+        str(result.get("verification_mode") or "index_status") == "index_status"
+        and bool(result.get("index_status_verified"))
+        for result in results
+        if isinstance(result, dict)
+    )
+    search_fetch_verified = any(
+        str(result.get("verification_mode") or "") == "search_fetch"
+        and bool(result.get("contract_verified"))
+        for result in results
+        if isinstance(result, dict)
+    )
     return {
         "status": "verified" if verified else "not_verified",
         "mcp_initialized": bool(report.get("mcp_initialized")),
         "tools_discovered": bool(report.get("tools_discovered")),
-        "get_index_status_verified": verified,
+        "get_index_status_verified": index_status_verified,
+        "search_fetch_verified": search_fetch_verified,
+        "verification_modes": verification_modes,
         "direct_stdio_verified": bool(report.get("direct_stdio_verified")),
         "desktop_tool_scan_verified": bool(report.get("desktop_tool_scan_verified")),
         "conversation_attachment_verified": bool(report.get("conversation_attachment_verified")),
@@ -143,7 +173,7 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
         "index_status_summaries": index_summaries,
         "conversation_attachment_unverified": bool(report.get("conversation_attachment_unverified")),
         "message": (
-            "MCP initialize, tools/list, and get_index_status completed successfully on the direct transport; Desktop tool exposure and conversation attachment remain separate states."
+            "MCP initialize and the configured verification contract completed successfully on the direct transport; Desktop tool exposure and conversation attachment remain separate states."
             if verified
             else "MCP connection verification is incomplete; do not report this connection as connected."
         ),
@@ -200,7 +230,7 @@ def _run_single_client_config_smoke(
             "config_encoding_verified": False,
             "strict_stdio_wire_verified": False,
             "end_to_end_verified": False,
-            "error": str(exc),
+            "error": _exception_message(exc),
         }
 
 
@@ -325,7 +355,7 @@ def _run_remote_client_smoke(
             "mcp_initialized": False,
             "tools_discovered": False,
             "end_to_end_verified": False,
-            "error": str(exc),
+            "error": _exception_message(exc),
         }
 
 
@@ -337,7 +367,7 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                 await session.initialize()
                 tool_result = await session.list_tools()
                 tool_names = sorted(tool.name for tool in tool_result.tools)
-                if "get_index_status" not in tool_names:
+                if "get_index_status" not in tool_names and not {"search", "fetch"}.issubset(set(tool_names)):
                     return {
                         "passed": False,
                         "process_started": True,
@@ -347,22 +377,54 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                         "end_to_end_verified": False,
                         "tool_names": tool_names,
                         "session_id_present": bool(get_session_id()),
-                        "error": "tools/list did not expose get_index_status.",
+                        "error": "tools/list did not expose get_index_status or the external search/fetch contract.",
                     }
-                index_status = await session.call_tool(
-                    "get_index_status",
-                    {"security_levels": ["internal"]},
-                )
-                index_payload = _tool_payload(index_status)
-                index_summary = index_payload.get("summary") if isinstance(index_payload.get("summary"), dict) else {}
-                verified = bool(index_summary)
+                verification_mode = "index_status"
+                index_summary: dict[str, Any] = {}
+                verified = False
+                if "get_index_status" in tool_names:
+                    index_status = await session.call_tool(
+                        "get_index_status",
+                        {"security_levels": ["internal"]},
+                    )
+                    index_payload = _tool_payload(index_status)
+                    index_summary = index_payload.get("summary") if isinstance(index_payload.get("summary"), dict) else {}
+                    verified = bool(index_summary)
+                else:
+                    # The privacy-reduced ChatGPT profile intentionally exposes
+                    # only search/fetch. Verify that content contract without
+                    # requiring internal index diagnostics to cross the boundary.
+                    verification_mode = "search_fetch"
+                    search = await session.call_tool(
+                        "search",
+                        {"query": DEFAULT_SEARCH_QUERY, "top_k": 1},
+                    )
+                    search_payload = _tool_payload(search)
+                    results = search_payload.get("results") if isinstance(search_payload.get("results"), list) else []
+                    first_id = str((results[0] if results else {}).get("id") or "")
+                    fetch_payload: dict[str, Any] = {}
+                    if first_id:
+                        fetch = await session.call_tool("fetch", {"id": first_id})
+                        fetch_payload = _tool_payload(fetch)
+                    metadata_candidates: list[Any] = []
+                    if results and isinstance(results[0], dict):
+                        metadata_candidates.append(results[0].get("metadata") or {})
+                    metadata_candidates.append(fetch_payload.get("metadata") or {})
+                    metadata_violations = _external_metadata_violations(metadata_candidates)
+                    verified = bool(results and fetch_payload.get("text") and not metadata_violations)
                 return {
                     "passed": verified,
                     "process_started": True,
                     "mcp_initialized": True,
                     "tools_discovered": bool(tool_names),
-                    "index_status_verified": verified,
+                    "index_status_verified": bool(verification_mode == "index_status" and verified),
                     "end_to_end_verified": verified,
+                    "contract_verified": verified,
+                    "verification_mode": verification_mode,
+                    "external_metadata_violations": metadata_violations if verification_mode == "search_fetch" else [],
+                    "external_metadata_redaction_verified": bool(
+                        verification_mode != "search_fetch" or not metadata_violations
+                    ),
                     "tool_names": tool_names,
                     "index_status_summary": index_summary,
                     "session_id_present": bool(get_session_id()),
@@ -391,7 +453,16 @@ def _arg_value(args: Sequence[str], flag: str) -> str | None:
 
 async def _run_client_entry(*, command: str, args: list[str], query: str) -> dict[str, Any]:
     started_at = time.perf_counter()
-    params = StdioServerParameters(command=command, args=args)
+    # The MCP client library intentionally inherits a narrow environment and
+    # drops custom interpreter selectors. Preserve the explicit runtime
+    # selector used by generated bundle launchers so smoke tests exercise the
+    # same wheel/source fallback that operators configure.
+    runtime_python = os.getenv("REG_RAG_PYTHON", "").strip()
+    params = StdioServerParameters(
+        command=command,
+        args=args,
+        env={"REG_RAG_PYTHON": runtime_python} if runtime_python else None,
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -399,6 +470,51 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
             tool_result = await session.list_tools()
             list_tools_elapsed_ms = _elapsed_ms(list_tools_started_at)
             tool_names = sorted(tool.name for tool in tool_result.tools)
+
+            if "get_index_status" not in tool_names and {"search", "fetch"}.issubset(set(tool_names)):
+                search_payload, results, search_query_used, search_queries_attempted, search_elapsed_ms = (
+                    await _search_with_fallback(session, query=query)
+                )
+                first_id = str((results[0] if results else {}).get("id") or "")
+                fetch_payload: dict[str, Any] = {}
+                fetch_elapsed_ms = 0.0
+                if first_id:
+                    fetch_started_at = time.perf_counter()
+                    fetch = await session.call_tool("fetch", {"id": first_id})
+                    fetch_elapsed_ms = _elapsed_ms(fetch_started_at)
+                    fetch_payload = _tool_payload(fetch)
+                metadata_candidates: list[Any] = []
+                if results and isinstance(results[0], dict):
+                    metadata_candidates.append(results[0].get("metadata") or {})
+                metadata_candidates.append(fetch_payload.get("metadata") or {})
+                metadata_violations = _external_metadata_violations(metadata_candidates)
+                verified = bool(results and fetch_payload.get("text") and not metadata_violations)
+                return {
+                    "passed": verified,
+                    "process_started": True,
+                    "mcp_initialized": True,
+                    "tools_discovered": bool(tool_names),
+                    "strict_stdio_wire_verified": True,
+                    "index_status_verified": False,
+                    "contract_verified": verified,
+                    "end_to_end_verified": verified,
+                    "verification_mode": "search_fetch",
+                    "external_metadata_violations": metadata_violations,
+                    "external_metadata_redaction_verified": not metadata_violations,
+                    "tool_names": tool_names,
+                    "index_status_summary": {},
+                    "search_result_count": len(results),
+                    "search_query_used": search_query_used,
+                    "search_queries_attempted": search_queries_attempted,
+                    "fetch_has_text": bool(fetch_payload.get("text")),
+                    "first_id": first_id,
+                    "first_result_metadata": (results[0] if results else {}).get("metadata") or {},
+                    "list_tools_elapsed_ms": list_tools_elapsed_ms,
+                    "index_status_elapsed_ms": 0.0,
+                    "search_elapsed_ms": search_elapsed_ms,
+                    "fetch_elapsed_ms": fetch_elapsed_ms,
+                    "total_elapsed_ms": _elapsed_ms(started_at),
+                }
 
             index_status_started_at = time.perf_counter()
             index_status = await session.call_tool(
@@ -445,6 +561,12 @@ async def _run_client_entry(*, command: str, args: list[str], query: str) -> dic
                 "tools_discovered": bool(tool_names),
                 "strict_stdio_wire_verified": True,
                 "index_status_verified": index_status_verified,
+                "contract_verified": bool(
+                    {"search", "fetch", "get_index_status"}.issubset(set(tool_names))
+                    and index_status_verified
+                    and results
+                    and fetch_payload.get("text")
+                ),
                 "end_to_end_verified": bool(
                     {"search", "fetch", "get_index_status"}.issubset(set(tool_names))
                     and index_status_verified
@@ -499,6 +621,28 @@ async def _search_with_fallback(
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def _external_metadata_violations(metadata_candidates: Sequence[Any]) -> list[str]:
+    return sorted(
+        {
+            key
+            for metadata in metadata_candidates
+            if isinstance(metadata, dict)
+            for key in _EXTERNAL_METADATA_DENY_KEYS
+            if key in metadata and metadata.get(key) not in (None, "", [], {})
+        }
+    )
+
+
+def _exception_message(exc: BaseException) -> str:
+    """Flatten TaskGroup/ExceptionGroup errors into an actionable smoke detail."""
+    nested = getattr(exc, "exceptions", None)
+    if isinstance(nested, tuple) and nested:
+        details = [_exception_message(item) for item in nested]
+        return f"{exc.__class__.__name__}: {'; '.join(details)}"
+    message = str(exc).strip()
+    return f"{exc.__class__.__name__}: {message}" if message else exc.__class__.__name__
 
 
 def _tool_payload(result: Any) -> dict[str, Any]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -236,6 +237,9 @@ class KordocTableParserTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "parsed")
         self.assertEqual(argv[-3:], ["--format", "json", "--silent"])
+        self.assertEqual(result["kordoc_input_extension"], ".pdf")
+        self.assertEqual(result["kordoc_timeout_seconds"], 10)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
     def test_parse_file_copies_non_ascii_input_path_before_running_kordoc(self) -> None:
         from types import SimpleNamespace
@@ -335,6 +339,62 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(result["table_count"], 3)
         self.assertEqual(result["stored_table_count"], 2)
         self.assertTrue(result["tables_truncated"])
+        self.assertEqual(result["kordoc_input_extension"], ".pdf")
+        self.assertEqual(result["kordoc_timeout_seconds"], 10)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
+
+    def test_parse_file_reports_disabled_runtime_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(
+                data_dir=root / "data",
+                enable_kordoc_table_parser=False,
+                kordoc_table_timeout_seconds=7,
+            )
+            result = KordocTableParser(settings).parse_file(root / "sample.HWPX")
+
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["kordoc_input_extension"], ".hwpx")
+        self.assertEqual(result["kordoc_timeout_seconds"], 7)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
+
+    def test_parse_file_reports_timeout_runtime_telemetry(self) -> None:
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=3,
+        )
+        timeout = subprocess.TimeoutExpired(["kordoc"], timeout=3)
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run", side_effect=timeout
+        ):
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["kordoc_input_extension"], ".hwp")
+        self.assertEqual(result["kordoc_timeout_seconds"], 3)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
+
+    def test_parse_file_reports_invalid_json_runtime_telemetry(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="not-json", stderr=""),
+        ):
+            result = KordocTableParser(settings).parse_file(Path("sample.pdf"))
+
+        self.assertEqual(result["status"], "invalid_json")
+        self.assertEqual(result["kordoc_input_extension"], ".pdf")
+        self.assertEqual(result["kordoc_timeout_seconds"], 4)
+        self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
     def test_parse_file_runs_windows_cmd_shim_through_cmd_exe(self) -> None:
         # npm installs CLIs like `kordoc` as .cmd shims on Windows; CreateProcess
@@ -519,6 +579,28 @@ class KordocTableParserTests(unittest.TestCase):
         encoded = json.dumps(result, ensure_ascii=False)
         self.assertEqual(result["status"], "failed")
         self.assertNotIn(str(root), encoded)
+
+    def test_parse_file_redacts_ascii_temp_creation_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "규정.hwp"
+            source.write_bytes(b"dummy")
+            settings = Settings(
+                data_dir=root / "data",
+                enable_kordoc_table_parser=True,
+                kordoc_table_command="kordoc",
+                kordoc_table_timeout_seconds=10,
+            )
+            with patch(
+                "app.processors.kordoc_table_parser.tempfile.TemporaryDirectory",
+                side_effect=OSError(f"SECRET_PATH:{root}"),
+            ), patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"):
+                result = KordocTableParser(settings).parse_file(source)
+
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "ascii_temp_unavailable")
+        self.assertNotIn("SECRET_PATH", encoded)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,21 +24,32 @@ class KordocTableParser:
         self.settings = settings
 
     def parse_file(self, path: Path) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        input_extension = str(path.suffix or "").casefold()
+        timeout_seconds = max(1, int(self.settings.kordoc_table_timeout_seconds))
+
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            output = dict(result)
+            output.setdefault("kordoc_elapsed_ms", round((time.perf_counter() - started_at) * 1000, 3))
+            output.setdefault("kordoc_input_extension", input_extension)
+            output.setdefault("kordoc_timeout_seconds", timeout_seconds)
+            return output
+
         if not self.settings.enable_kordoc_table_parser:
-            return {"status": "disabled", "parser": "kordoc", "table_count": 0, "tables": []}
+            return finish({"status": "disabled", "parser": "kordoc", "table_count": 0, "tables": []})
         command = str(self.settings.kordoc_table_command or "").strip()
         if not command:
-            return {"status": "not_available", "parser": "kordoc", "table_count": 0, "tables": []}
+            return finish({"status": "not_available", "parser": "kordoc", "table_count": 0, "tables": []})
         parts = split_command(command)
         resolved = _resolve_command_executable(parts[0]) if parts else None
         if not parts or resolved is None:
-            return {
+            return finish({
                 "status": "not_available",
                 "parser": "kordoc",
                 "table_count": 0,
                 "tables": [],
                 "command_label": parts[0] if parts else "",
-            }
+            })
         run_path = path
         temp_dir: tempfile.TemporaryDirectory | None = None
         copied_to_ascii_path = False
@@ -49,16 +61,19 @@ class KordocTableParser:
                     preferred_parent=self.settings.data_dir / ".tmp" / "kordoc",
                 )
                 copied_to_ascii_path = True
-            except OSError as exc:
+            except OSError:
                 if temp_dir is not None:
                     temp_dir.cleanup()
-                return {
+                return finish({
                     "status": "failed",
                     "parser": "kordoc",
                     "table_count": 0,
                     "tables": [],
-                    "error": f"ascii_temp_unavailable:{exc}",
-                }
+                    # The exception may contain an absolute local path. Keep
+                    # runtime exports and authenticated document responses
+                    # free of host-specific filesystem details.
+                    "error": "ascii_temp_unavailable",
+                })
         argv = [resolved, *parts[1:], str(run_path), "--format", "json", "--silent"]
         # Windows npm shims need an explicit shell host when launched from
         # subprocess with argv-list form.
@@ -74,35 +89,35 @@ class KordocTableParser:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=max(1, int(self.settings.kordoc_table_timeout_seconds)),
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
             if temp_dir is not None:
                 temp_dir.cleanup()
-            return {"status": "timeout", "parser": "kordoc", "table_count": 0, "tables": []}
+            return finish({"status": "timeout", "parser": "kordoc", "table_count": 0, "tables": []})
         except OSError:
             if temp_dir is not None:
                 temp_dir.cleanup()
-            return {"status": "failed", "parser": "kordoc", "table_count": 0, "tables": []}
+            return finish({"status": "failed", "parser": "kordoc", "table_count": 0, "tables": []})
         if temp_dir is not None:
             temp_dir.cleanup()
         if completed.returncode != 0:
-            return {
+            return finish({
                 "status": "failed",
                 "parser": "kordoc",
                 "table_count": 0,
                 "tables": [],
                 "stderr_chars": len(completed.stderr or ""),
-            }
+            })
         try:
             payload = _load_json_payload(completed.stdout or "")
         except json.JSONDecodeError:
-            return {"status": "invalid_json", "parser": "kordoc", "table_count": 0, "tables": []}
+            return finish({"status": "invalid_json", "parser": "kordoc", "table_count": 0, "tables": []})
         max_tables = max(1, int(getattr(self.settings, "kordoc_table_max_tables", 500)))
         result = extract_kordoc_table_inventory(payload, max_tables=max_tables)
         if copied_to_ascii_path:
             result["input_path_normalized_for_kordoc"] = True
-        return result
+        return finish(result)
 
 
 def split_command(command: str) -> list[str]:

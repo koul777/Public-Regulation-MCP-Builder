@@ -3590,7 +3590,7 @@ function Show-ChatGptHttps {
   Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}"' -f (BundlePath "run_chatgpt_data_server.ps1"))
   Write-Host ""
   Write-Host "Then open ChatGPT Settings > Apps/Connectors > Create and register the connector URL."
-  Write-Host "Choose the matching authentication method, click Scan Tools, and verify get_index_status is present."
+  Write-Host "Choose the matching authentication method, click Scan Tools, and verify search/fetch are present."
   Write-Host "Set MCP_AUTH_TOKEN in the approved runtime environment before starting or validating the HTTP endpoint."
   Write-Host "Validate the deployed endpoint with:"
   Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'validate_chatgpt_remote_mcp.ps1'))`""
@@ -3781,7 +3781,11 @@ def _bundle_quickstart(
             role=role,
             department_ids=department_ids,
             tenant_storage_isolation=tenant_storage_isolation,
-            tool_profile="full",
+            # ChatGPT is an external cloud client.  Keep its tool surface and
+            # citation metadata on the explicit privacy-reduced profile; the
+            # local/full HTTP command above remains available for approved
+            # operator-only deployments.
+            tool_profile="chatgpt-data",
         )
         + ["--host", host, "--port", str(int(port))]
         + _http_auth_args(remote_auth_token_env)
@@ -3938,8 +3942,8 @@ def _bundle_quickstart(
         "check_existing_index": {
             "tool": "get_index_status",
             "note": (
-                "Run against the actual full-profile server after starting it; synthetic smoke does not validate "
-                "the real tenant DB. For the full remote profile, validate get_index_status, search, and fetch."
+                "Run against the actual local/full-profile server after starting it; synthetic smoke does not validate "
+                "the real tenant DB. External ChatGPT connectors use chatgpt-data and should validate search and fetch."
             ),
         },
         "audit_index_visibility": {
@@ -3969,7 +3973,7 @@ def _bundle_quickstart(
             "command": "reg-rag-mcp-server",
             "args": chatgpt_http_args,
             "url": chatgpt_remote["connector_url"],
-            "tool_profile": "full",
+            "tool_profile": "chatgpt-data",
             "auth": _remote_auth_summary(remote_auth_token_env),
         },
         "claude_desktop": {
@@ -3989,7 +3993,8 @@ def _bundle_quickstart(
             "connector_url": chatgpt_remote["connector_url"],
             "requires_reachable_https": chatgpt_remote["chatgpt_setup"]["requires_reachable_https"],
             "https_endpoint_ready": chatgpt_remote["chatgpt_setup"]["https_endpoint_ready"],
-            "verification_tools": ["get_index_status"],
+            "verification_tools": ["search", "fetch"],
+            "tool_profile": "chatgpt-data",
             "auth_required": True,
             "connection_options": ["https_endpoint", "openai_secure_tunnel"],
         },
@@ -4092,6 +4097,7 @@ def _chatgpt_connector_config(
                     role=role,
                     department_ids=department_ids,
                     tenant_storage_isolation=tenant_storage_isolation,
+                    tool_profile="chatgpt-data",
                 )
                 + ["--host", host, "--port", str(int(port))]
                 + _http_auth_args(remote_auth_token_env)
@@ -4113,23 +4119,13 @@ def _chatgpt_connector_config(
         "compatible_tools": [
             "search",
             "fetch",
-            "list_documents",
-            "list_regulations",
-            "get_regulation_toc",
-            "get_regulation_article",
-            "get_regulation_history",
-            "get_article",
-            "get_table",
-            "compare_versions",
-            "get_citation",
-            "get_index_status",
         ],
         "connection_steps": [
             "Run the HTTP MCP server from server_start.",
             "Set the bearer token environment variable or use an approved authenticated reverse proxy.",
             "Expose the /mcp endpoint through an approved HTTPS URL.",
             "Create a ChatGPT app/connector with connector_url.",
-            "Click Scan Tools and verify get_index_status is discovered before creating the app.",
+            "Click Scan Tools and verify search and fetch are discovered before creating the app.",
             "Ask ChatGPT to search first, then fetch returned result IDs for evidence.",
         ],
         "notes": [
@@ -4165,7 +4161,9 @@ def _openai_secure_tunnel_config(
         role=role,
         department_ids=department_ids,
         tenant_storage_isolation=tenant_storage_isolation,
-        tool_profile="full",
+        # The tunnel terminates at ChatGPT, so it must use the same external
+        # data profile as the HTTPS connector.
+        tool_profile="chatgpt-data",
     )
     stdio_args = _with_no_warm_cache(stdio_args)
     mcp_command = _powershell_command("reg-rag-mcp-server", stdio_args)
@@ -4237,7 +4235,7 @@ def _openai_secure_tunnel_config(
             "Create or select an OpenAI Secure MCP Tunnel in Platform tunnel settings.",
             "Run this script inside the network that can reach the local regulation MCP data directory.",
             "In ChatGPT connector/app settings, choose Tunnel under Connection and select the tunnel_id.",
-            "Run Scan Tools and verify the full read-only profile includes get_index_status.",
+            "Run Scan Tools and verify the privacy-reduced read-only profile includes search and fetch.",
         ],
         "copy_paste_ps": script,
         "docs": [
@@ -4304,6 +4302,7 @@ def _claude_api_connector_config(
                     role=role,
                     department_ids=department_ids,
                     tenant_storage_isolation=tenant_storage_isolation,
+                    tool_profile="chatgpt-data",
                 )
                 + ["--host", host, "--port", str(int(port))]
                 + _http_auth_args(remote_auth_token_env)
@@ -4447,7 +4446,7 @@ It is regenerated from `data/mcp_runtime_manifest.json` and shows the current ap
 `plugin_registered=true` requires strict companion JSON validation, a successful install command, and an enabled entry in
 `codex plugin list --json` whose cachebuster version and marketplace source match this bundle. It still does not mean the current conversation attached the plugin. `direct_stdio_verified` records
 the generated launcher's MCP chain, while `desktop_tool_scan_verified` and `conversation_attachment_verified` remain
-separate. `end_to_end_verified=true` is reserved for a successful MCP `initialize`, `tools/list`, and `get_index_status` chain.
+separate. `end_to_end_verified=true` means the selected profile's contract passed: local/full uses `initialize`, `tools/list`, and `get_index_status`, while external `chatgpt-data` uses `initialize`, `tools/list`, `search`, and `fetch`.
 Older `mcp_connection_readiness.json` and `mcp_transport_smoke.json` run outputs are cleared on generation so stale evidence does not
 look like the current bundle state.
 After installing or merging a client config, rerun doctor with the installed config path when a client still opens the old runtime:
@@ -4500,7 +4499,7 @@ the repository, installs a bundled `reg_rag_preprocessor-*.whl` when present out
 The `chatgpt-desktop-local` profile registers a local plugin for the unified desktop plugin directory. Registration and
 conversation attachment are separate states: fully restart the app, then use `+ > More > {server_name}` or `@{server_name}`.
 ChatGPT remote apps need a reachable HTTPS `/mcp` endpoint; ChatGPT does not directly connect to a localhost MCP endpoint.
-Use `{files.get("run_chatgpt", SETUP_BUNDLE_FILES["run_chatgpt"])}` on the server for the full read-only tool profile, then register the URL from
+Use `{files.get("run_chatgpt", SETUP_BUNDLE_FILES["run_chatgpt"])}` on the server for the external `chatgpt-data` profile, then register the URL from
 `{files.get("chatgpt", SETUP_BUNDLE_FILES["chatgpt"])}` in ChatGPT Settings > Apps/Connectors.
 
 Ready: `{str(chatgpt_ready).lower()}`. If false, regenerate with `--public-url https://your-host.example/mcp`.
@@ -4626,14 +4625,14 @@ powershell -ExecutionPolicy Bypass -File "{files.get('connect', SETUP_BUNDLE_FIL
 - ChatGPT Desktop 로컬 플러그인: `{files.get('connect_chatgpt_desktop_bat', SETUP_BUNDLE_FILES['connect_chatgpt_desktop_bat'])}`를 더블클릭하면 생성된 마켓플레이스와 `{server_name}` 플러그인을 자동 등록합니다. 플러그인은 공식 `.codex-plugin/plugin.json` → `./.mcp.json` 구조와 `.mcp.json`의 `mcp_servers` 컨테이너를 사용합니다. 앱을 완전히 종료하고 다시 실행한 뒤 Plugins를 새로고침하고, 새 대화에서 `+ > 더 보기 > {server_name}`을 선택하거나 `@{server_name}`을 멘션합니다. 플러그인 등록 완료와 현재 대화에 도구가 첨부된 상태는 별개입니다.
 - Codex CLI 호환: `{files.get('connect_codex_bat', SETUP_BUNDLE_FILES['connect_codex_bat'])}`를 더블클릭합니다. 수동 설정이 필요할 때만 `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`의 TOML 블록을 `$HOME\\.codex\\config.toml`에 붙여 넣거나 기존 `[mcp_servers.{server_name}]` 블록과 교체합니다.
 - 이 스니펫은 `--data-dir`을 이 번들의 `data` 폴더로 고정하고 `--no-warm-cache`와 저장소 모드 플래그를 포함합니다. 그래서 예전 번들이나 다른 MCP 서버를 물고 느리게 인식하는 문제를 줄입니다.
-- 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 번들이 저장소 checkout 안에 있으면 현재 checkout의 `scripts\\run_regulation_mcp.py`를 오래된 전역 콘솔 명령보다 먼저 실행하고, 독립 배포 번들은 PATH의 `reg-rag-mcp-server`로 fallback합니다. 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다.
+- 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 번들이 저장소 checkout 안에 있으면 현재 checkout의 `scripts\\run_regulation_mcp.py`를 오래된 전역 콘솔 명령보다 먼저 실행합니다. 독립 배포 번들은 `REG_RAG_PYTHON=<venv>\\Scripts\\python.exe`가 지정되면 설치된 wheel의 `scripts.run_regulation_mcp` 모듈을 먼저 실행한 뒤 PATH의 `reg-rag-mcp-server`로 fallback합니다. 그래도 찾지 못하면 `install_local_package.ps1`을 한 번 실행하라는 오류를 냅니다.
 - 붙여 넣은 뒤에는 `reg-rag-mcp-doctor --client-profile bundle --bundle-dir . --allow-local-only-bundle --codex-config $HOME\\.codex\\config.toml`로 실제 설치된 설정을 확인합니다.
 
 ## ChatGPT 연결
 
 - ChatGPT Desktop 로컬 방식: 생성 플러그인을 등록한 뒤 완전히 재시작하고 새 대화에서 선택하거나 멘션합니다. 제품 화면이 로컬 stdio 플러그인을 ChatGPT 대화에 노출하지 않으면 원격 HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다.
-- HTTPS 방식: `{files.get('run_chatgpt', SETUP_BUNDLE_FILES['run_chatgpt'])}`로 전체 읽기 전용 도구 MCP 서버를 실행하고, `{files.get('chatgpt', SETUP_BUNDLE_FILES['chatgpt'])}`의 `connector_url`을 ChatGPT Settings > Apps/Connectors에 등록합니다. ChatGPT는 localhost MCP에 직접 연결하지 않습니다. Ready: `{str(chatgpt_ready).lower()}`.
-- 상태 판정: `plugin_registered=true`는 companion JSON 검증, 설치 명령 성공, `codex plugin list --json`의 활성 플러그인 cachebuster 버전과 공급 마켓플레이스 경로가 현재 번들과 정확히 일치하는 경우에만 기록합니다. `direct_stdio_verified`, `desktop_tool_scan_verified`, `conversation_attachment_verified`는 서로 별도이며, `end_to_end_verified=true`는 실제 `initialize`, `tools/list`, `get_index_status`가 모두 성공한 경우에만 기록합니다.
+- HTTPS 방식: `{files.get('run_chatgpt', SETUP_BUNDLE_FILES['run_chatgpt'])}`로 외부 응답 경계인 `chatgpt-data` MCP 서버를 실행하고, `{files.get('chatgpt', SETUP_BUNDLE_FILES['chatgpt'])}`의 `connector_url`을 ChatGPT Settings > Apps/Connectors에 등록합니다. ChatGPT는 localhost MCP에 직접 연결하지 않습니다. Ready: `{str(chatgpt_ready).lower()}`.
+- 상태 판정: `plugin_registered=true`는 companion JSON 검증, 설치 명령 성공, `codex plugin list --json`의 활성 플러그인 cachebuster 버전과 공급 마켓플레이스 경로가 현재 번들과 정확히 일치하는 경우에만 기록합니다. `direct_stdio_verified`, `desktop_tool_scan_verified`, `conversation_attachment_verified`는 서로 별도이며, `end_to_end_verified=true`는 선택한 프로필의 MCP 계약이 성공한 경우에만 기록합니다.
 - 내부망/비공개 방식: 외부 inbound 방화벽을 열지 않아야 하면 `{files.get('openai_tunnel', SETUP_BUNDLE_FILES['openai_tunnel'])}`를 사용합니다. `CONTROL_PLANE_API_KEY`와 `OPENAI_TUNNEL_ID`는 파일에 쓰지 말고 실행 환경변수로 설정합니다.
 
 ## 사전 진단
@@ -5033,6 +5032,20 @@ def _powershell_stdio_launcher_script(
             '  if (Test-Path -LiteralPath $PreferredScript) { $ProjectRoot = $PreferredProjectRoot }',
             '}',
             'if ($ProjectRoot) { Invoke-ServerFromSource $ProjectRoot $ServerArgs }',
+            '# An extracted bundle may not contain the source checkout. When the operator points',
+            '# REG_RAG_PYTHON at the installed wheel environment, invoke its packaged module',
+            '# directly instead of relying on a stale console script from another PATH entry.',
+            '$PackagedPythonCandidates = @()',
+            'if ($env:REG_RAG_PYTHON) { $PackagedPythonCandidates += $env:REG_RAG_PYTHON }',
+            'if ($PreferredPython) { $PackagedPythonCandidates += $PreferredPython }',
+            'foreach ($Candidate in $PackagedPythonCandidates) {',
+            '  if (-not $Candidate -or -not (Test-Path -LiteralPath $Candidate)) { continue }',
+            '  & $Candidate -c "import scripts.run_regulation_mcp" 2>$null',
+            '  if ($LASTEXITCODE -eq 0) {',
+            '    & $Candidate -m scripts.run_regulation_mcp @ServerArgs',
+            '    exit $LASTEXITCODE',
+            '  }',
+            '}',
             '$ConsoleCommand = Get-Command "reg-rag-mcp-server" -ErrorAction SilentlyContinue',
             'if ($ConsoleCommand) {',
             '  & $ConsoleCommand.Source @ServerArgs',
