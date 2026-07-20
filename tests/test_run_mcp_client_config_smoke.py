@@ -12,9 +12,14 @@ from unittest.mock import patch
 
 from scripts.run_mcp_client_config_smoke import (
     _external_metadata_violations,
-    _validate_strict_jsonrpc_stdout,
     _exception_message,
+    _remote_unauthenticated_request_is_rejected,
     _search_with_fallback,
+    _successful_tool_payload,
+    _valid_fetch_payload,
+    _valid_index_status_summary,
+    _valid_search_results,
+    _validate_strict_jsonrpc_stdout,
     run,
     run_mcp_client_config_smoke,
 )
@@ -144,7 +149,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
             config.write_text(
                 json.dumps(
                     {
-                        "mcp_servers": {
+                        "mcpServers": {
                             "aksmcp": {
                                 "command": "powershell.exe",
                                 "args": ["-File", str(root / "run_mcp_stdio_server.ps1")],
@@ -176,7 +181,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
 
         self.assertTrue(report["passed"])
         self.assertTrue(report["direct_stdio_verified"])
-        self.assertEqual("@aksmcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", report["verification_prompt"])
+        self.assertEqual("aksmcp MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.", report["verification_prompt"])
         answer = report["verification_answer"]
         self.assertEqual("verified", answer["status"])
         self.assertTrue(answer["get_index_status_verified"])
@@ -189,7 +194,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
     def test_plugin_config_rejects_utf8_bom_before_process_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / ".mcp.json"
-            payload = {"mcp_servers": {"aksmcp": {"command": "python", "args": []}}}
+            payload = {"mcpServers": {"aksmcp": {"command": "python", "args": []}}}
             config.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
 
             report = run_mcp_client_config_smoke(plugin_mcp_config=config, server_name="aksmcp")
@@ -198,6 +203,32 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertFalse(report["process_started"])
         self.assertFalse(report["results"][0]["config_encoding_verified"])
         self.assertIn("EF BB BF", report["results"][0]["error"])
+
+    def test_plugin_config_rejects_snake_case_container_before_process_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / ".mcp.json"
+            payload = {"mcp_servers": {"aksmcp": {"command": "python", "args": []}}}
+            config.write_text(json.dumps(payload), encoding="utf-8")
+
+            report = run_mcp_client_config_smoke(plugin_mcp_config=config, server_name="aksmcp")
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["process_started"])
+        self.assertIn("requires mcpServers", report["results"][0]["error"])
+
+    def test_plugin_config_rejects_duplicate_json_keys_before_process_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / ".mcp.json"
+            config.write_text(
+                '{"mcpServers":{"aksmcp":{"command":"python","command":"other","args":[]}}}',
+                encoding="utf-8",
+            )
+
+            report = run_mcp_client_config_smoke(plugin_mcp_config=config, server_name="aksmcp")
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["process_started"])
+        self.assertIn("duplicate JSON key: command", report["results"][0]["error"])
 
     def test_claude_desktop_config_keeps_explicit_bom_compatibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -273,6 +304,83 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertEqual("not_verified", report["verification_answer"]["status"])
         self.assertIn("https://", report["results"][0]["error"])
 
+    def test_remote_requires_token_env_even_when_no_token_name_is_supplied(self) -> None:
+        report = run_mcp_client_config_smoke(
+            remote_url="https://mcp.example.test/mcp",
+            remote_token_env=None,
+            server_name="aksmcp",
+        )
+
+        result = report["results"][0]
+        self.assertFalse(report["passed"])
+        self.assertFalse(result["auth_wire_verified"])
+        self.assertIn("bearer-token environment variable", result["error"])
+
+    def test_remote_url_rejects_and_sanitizes_credentials_query_and_fragment(self) -> None:
+        urls = (
+            "https://user:sentinel-password@mcp.example.test/mcp",
+            "https://mcp.example.test/mcp?token=sentinel-query",
+            "https://mcp.example.test/mcp#sentinel-fragment",
+            "https://localhost/mcp",
+            "https://127.0.0.1/mcp",
+        )
+        for remote_url in urls:
+            with self.subTest(remote_url=remote_url):
+                report = run_mcp_client_config_smoke(
+                    remote_url=remote_url,
+                    remote_token_env="MCP_TEST_TOKEN",
+                    server_name="aksmcp",
+                )
+                serialized = json.dumps(report)
+                self.assertFalse(report["passed"])
+                self.assertNotIn("sentinel-password", serialized)
+                self.assertNotIn("sentinel-query", serialized)
+                self.assertNotIn("sentinel-fragment", serialized)
+
+    def test_remote_auth_probe_rejects_unauthenticated_and_random_invalid_bearer(self) -> None:
+        seen_headers: list[dict[str, str]] = []
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, *, json, headers):
+                seen_headers.append(headers)
+                return SimpleNamespace(status_code=401)
+
+        with patch("scripts.run_mcp_client_config_smoke.httpx.AsyncClient", return_value=FakeAsyncClient()):
+            rejected = asyncio.run(
+                _remote_unauthenticated_request_is_rejected(url="https://mcp.example.test/mcp")
+            )
+
+        self.assertTrue(rejected)
+        self.assertEqual(2, len(seen_headers))
+        self.assertNotIn("Authorization", seen_headers[0])
+        self.assertRegex(seen_headers[1]["Authorization"], r"^Bearer invalid-")
+
+    def test_remote_auth_probe_fails_if_invalid_bearer_is_accepted(self) -> None:
+        status_codes = iter((401, 200))
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, *, json, headers):
+                return SimpleNamespace(status_code=next(status_codes))
+
+        with patch("scripts.run_mcp_client_config_smoke.httpx.AsyncClient", return_value=FakeAsyncClient()):
+            rejected = asyncio.run(
+                _remote_unauthenticated_request_is_rejected(url="https://mcp.example.test/mcp")
+            )
+
+        self.assertFalse(rejected)
+
     def test_remote_requires_named_token_and_preserves_unverified_states(self) -> None:
         with patch.dict(os.environ, {"MCP_TEST_TOKEN": ""}, clear=False):
             report = run_mcp_client_config_smoke(
@@ -306,6 +414,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         with patch.dict(os.environ, {"MCP_TEST_TOKEN": "secret"}, clear=False), patch(
             "scripts.run_mcp_client_config_smoke._run_remote_entry",
             new=fake_remote_entry,
+        ), patch(
+            "scripts.run_mcp_client_config_smoke._remote_unauthenticated_request_is_rejected",
+            return_value=True,
         ):
             report = run_mcp_client_config_smoke(
                 remote_url="https://mcp.example.test/mcp",
@@ -337,6 +448,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         with patch.dict(os.environ, {"MCP_TEST_TOKEN": "secret"}, clear=False), patch(
             "scripts.run_mcp_client_config_smoke._run_remote_entry",
             new=fake_remote_entry,
+        ), patch(
+            "scripts.run_mcp_client_config_smoke._remote_unauthenticated_request_is_rejected",
+            return_value=True,
         ):
             report = run_mcp_client_config_smoke(
                 remote_url="https://mcp.example.test/mcp",
@@ -349,6 +463,71 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertFalse(report["verification_answer"]["get_index_status_verified"])
         self.assertTrue(report["verification_answer"]["search_fetch_verified"])
         self.assertIn("search_fetch", report["verification_answer"]["verification_modes"])
+
+    def test_remote_smoke_redacts_token_from_exception(self) -> None:
+        async def fake_remote_entry(*, url, token):
+            raise RuntimeError(f"request failed with Authorization: Bearer {token}")
+
+        with patch.dict(os.environ, {"MCP_TEST_TOKEN": "sentinel-secret"}, clear=False), patch(
+            "scripts.run_mcp_client_config_smoke._run_remote_entry",
+            new=fake_remote_entry,
+        ), patch(
+            "scripts.run_mcp_client_config_smoke._remote_unauthenticated_request_is_rejected",
+            return_value=True,
+        ):
+            report = run_mcp_client_config_smoke(
+                remote_url="https://mcp.example.test/mcp",
+                remote_token_env="MCP_TEST_TOKEN",
+                server_name="aksmcp",
+            )
+
+        serialized = json.dumps(report)
+        self.assertNotIn("sentinel-secret", serialized)
+        self.assertIn("[REDACTED]", serialized)
+
+    def test_remote_rejects_server_that_does_not_enforce_bearer_auth(self) -> None:
+        async def fake_remote_entry(*, url, token):
+            return {
+                "passed": True,
+                "process_started": True,
+                "mcp_initialized": True,
+                "tools_discovered": True,
+                "contract_verified": True,
+                "end_to_end_verified": True,
+                "tool_names": ["fetch", "search"],
+            }
+
+        with patch.dict(os.environ, {"MCP_TEST_TOKEN": "secret"}, clear=False), patch(
+            "scripts.run_mcp_client_config_smoke._run_remote_entry",
+            new=fake_remote_entry,
+        ), patch(
+            "scripts.run_mcp_client_config_smoke._remote_unauthenticated_request_is_rejected",
+            return_value=False,
+        ):
+            report = run_mcp_client_config_smoke(
+                remote_url="https://mcp.example.test/mcp",
+                remote_token_env="MCP_TEST_TOKEN",
+                server_name="aksmcp",
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["results"][0]["auth_wire_verified"])
+        self.assertTrue(report["results"][0]["protocol_contract_verified"])
+
+    def test_remote_tool_contract_rejects_is_error_and_malformed_payloads(self) -> None:
+        with self.assertRaisesRegex(ValueError, "isError=true"):
+            _successful_tool_payload(
+                SimpleNamespace(isError=True, structuredContent={"summary": {"document_count": 1}}),
+                tool_name="get_index_status",
+            )
+        self.assertFalse(_valid_index_status_summary({"unexpected": "value"}))
+        self.assertFalse(_valid_index_status_summary({"document_count": -1}))
+        self.assertTrue(_valid_index_status_summary({"document_count": 0, "status_counts": {}}))
+        self.assertFalse(_valid_search_results([{"title": "missing id"}]))
+        self.assertFalse(_valid_search_results([{"id": ""}]))
+        self.assertTrue(_valid_search_results([{"id": "result-1"}]))
+        self.assertFalse(_valid_fetch_payload({"text": "   "}))
+        self.assertTrue(_valid_fetch_payload({"text": "approved text"}))
 
     def test_external_metadata_deny_list_detects_internal_fields(self) -> None:
         self.assertEqual(

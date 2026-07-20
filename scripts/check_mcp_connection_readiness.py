@@ -3,15 +3,15 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import ipaddress
 import json
 import os
+import re
 import shutil
 import sys
 import tomllib
 from pathlib import Path
 from typing import Sequence, TextIO
-import urllib.error
-import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +19,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.audit_mcp_index_visibility import audit_mcp_index_visibility
-from scripts.mcp_bundle_contract import REQUIRED_SETUP_BUNDLE_FILES
+from scripts.mcp_bundle_contract import (
+    CHATGPT_PLUGIN_MCP_PATH,
+    CHATGPT_PLUGIN_VERSION_PATTERN,
+    REQUIRED_SETUP_BUNDLE_FILES,
+    chatgpt_local_marketplace_name,
+    normalized_chatgpt_plugin_name,
+)
 from scripts.report_metadata import current_repo_commit
 from app.core.tenant_access import tenant_storage_key
 
@@ -157,9 +163,40 @@ def check_mcp_connection_readiness(
         )
     if remote_required:
         _check_public_url(public_url, findings)
+        if normalized_transport == "sse":
+            findings.append(
+                McpConnectionFinding(
+                    "high",
+                    "remote-sse-not-supported",
+                    "The remote readiness probe supports Streamable HTTP and cannot verify a legacy SSE endpoint.",
+                    "Expose the remote MCP endpoint as Streamable HTTP and use --transport streamable-http.",
+                )
+            )
+        if not token_env:
+            findings.append(
+                McpConnectionFinding(
+                    "high",
+                    "missing-remote-auth-token-env",
+                    "A direct remote public_url requires a named bearer-token environment variable.",
+                    "Set --token-env MCP_AUTH_TOKEN and configure the same bearer token at the remote endpoint.",
+                )
+            )
         remote_probe = _build_remote_probe(public_url=public_url, performed=False, passed=None, detail="configuration_only")
-        if probe_public_url:
-            remote_probe = _probe_public_url(public_url=public_url, timeout_seconds=probe_timeout_seconds, findings=findings)
+        if probe_public_url and normalized_transport == "sse":
+            remote_probe = _build_remote_probe(
+                public_url=public_url,
+                performed=True,
+                passed=False,
+                detail="unsupported_sse_transport",
+                protocol_verified=False,
+            )
+        elif probe_public_url:
+            remote_probe = _probe_public_url(
+                public_url=public_url,
+                token_env=token_env,
+                timeout_seconds=probe_timeout_seconds,
+                findings=findings,
+            )
         if normalized_transport in {"streamable-http", "sse"} and _is_loopback_host(host):
             findings.append(
                 McpConnectionFinding(
@@ -240,7 +277,11 @@ def check_mcp_connection_readiness(
     findings = _dedupe_findings(findings)
     high_count = sum(1 for finding in findings if finding.severity == "high")
     medium_count = sum(1 for finding in findings if finding.severity == "medium")
-    deploy_ready = high_count == 0 and (not remote_required or (remote_probe["performed"] and remote_probe["passed"]))
+    deploy_ready = bool(
+        high_count == 0
+        and not uses_openai_tunnel
+        and (not remote_required or (remote_probe["performed"] and remote_probe["passed"]))
+    )
     return {
         "report_type": "mcp_connection_readiness",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -381,7 +422,7 @@ def _check_openai_tunnel(
     if check_cli and not shutil.which("tunnel-client"):
         findings.append(
             McpConnectionFinding(
-                "medium",
+                "high",
                 "tunnel-client-not-found",
                 "The tunnel-client CLI is not available on PATH.",
                 "Install tunnel-client from OpenAI Platform tunnel settings or the latest openai/tunnel-client release.",
@@ -392,7 +433,7 @@ def _check_openai_tunnel(
     if tunnel_id_env and not tunnel_id:
         findings.append(
             McpConnectionFinding(
-                "medium",
+                "high",
                 "openai-tunnel-id-env-empty",
                 f"Environment variable {tunnel_id_env} is not set in this shell.",
                 f"Set $env:{tunnel_id_env} to the OpenAI tunnel_id before running tunnel-client.",
@@ -410,7 +451,7 @@ def _check_openai_tunnel(
     if control_plane_api_key_env and not control_plane_api_key:
         findings.append(
             McpConnectionFinding(
-                "medium",
+                "high",
                 "openai-control-plane-api-key-env-empty",
                 f"Environment variable {control_plane_api_key_env} is not set in this shell.",
                 f"Set $env:{control_plane_api_key_env} to the runtime API key used by tunnel-client.",
@@ -460,6 +501,15 @@ def _check_public_url(public_url: str | None, findings: list[McpConnectionFindin
                 "Use an approved HTTPS endpoint such as https://mcp.example.go.kr/mcp.",
             )
         )
+    if _is_non_public_literal_host(parsed.hostname):
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "public-url-non-public-literal-host",
+                "Remote MCP public_url uses localhost or a loopback, private, link-local, reserved, unspecified, or multicast IP literal.",
+                "Use an approved publicly reachable HTTPS hostname; keep local/private endpoints on a local client transport.",
+            )
+        )
     raw_path = parsed.path.rstrip("/")
     if not raw_path.endswith("/mcp"):
         findings.append(
@@ -479,6 +529,8 @@ def _build_remote_probe(
     passed: bool | None,
     detail: str,
     status_code: int | None = None,
+    protocol_verified: bool | None = None,
+    tool_names: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "performed": performed,
@@ -486,12 +538,15 @@ def _build_remote_probe(
         "url": _normalize_mcp_url(public_url),
         "status_code": status_code,
         "detail": detail,
+        "protocol_verified": protocol_verified,
+        "tool_names": tool_names or [],
     }
 
 
 def _probe_public_url(
     *,
     public_url: str | None,
+    token_env: str | None,
     timeout_seconds: float,
     findings: list[McpConnectionFinding],
 ) -> dict[str, object]:
@@ -506,46 +561,70 @@ def _probe_public_url(
             )
         )
         return _build_remote_probe(public_url=public_url, performed=True, passed=False, detail="invalid_public_url")
-    request = urllib.request.Request(normalized, method="GET", headers={"User-Agent": "reg-rag-mcp-doctor/0.1"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status_code = int(getattr(response, "status", 0) or 0)
-    except urllib.error.HTTPError as exc:
-        status_code = int(exc.code)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        from scripts.run_mcp_client_config_smoke import run_mcp_client_config_smoke
+
+        smoke = run_mcp_client_config_smoke(
+            remote_url=normalized,
+            remote_token_env=token_env,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        exception_detail = _redact_probe_detail(str(exc), token_env=token_env)
         findings.append(
             McpConnectionFinding(
                 "high",
                 "public-url-probe-failed",
-                f"Could not reach remote MCP URL: {exc}",
-                "Start the HTTPS MCP endpoint or tunnel, verify DNS/proxy/TLS, then rerun with --probe-public-url.",
-            )
-        )
-        return _build_remote_probe(public_url=public_url, performed=True, passed=False, detail=str(exc))
-
-    reachable_statuses = {200, 204, 400, 401, 403, 405}
-    if status_code not in reachable_statuses:
-        findings.append(
-            McpConnectionFinding(
-                "high",
-                "public-url-probe-bad-status",
-                f"Remote MCP URL responded with HTTP {status_code}.",
-                "Verify the /mcp endpoint is routed to the MCP server and protected by the expected authentication layer.",
+                f"Could not run the remote MCP protocol probe: {exception_detail}",
+                "Install the MCP client dependencies, verify DNS/proxy/TLS and authentication, then rerun with --probe-public-url.",
             )
         )
         return _build_remote_probe(
             public_url=public_url,
             performed=True,
             passed=False,
-            detail="unexpected_status",
-            status_code=status_code,
+            detail="protocol_probe_exception",
+            protocol_verified=False,
+        )
+
+    results = smoke.get("results") if isinstance(smoke.get("results"), list) else []
+    remote_result = results[0] if results and isinstance(results[0], dict) else {}
+    tool_names = [str(name) for name in remote_result.get("tool_names", []) if str(name).strip()]
+    protocol_verified = bool(
+        smoke.get("passed")
+        and remote_result.get("mcp_initialized")
+        and remote_result.get("tools_discovered")
+        and remote_result.get("contract_verified", remote_result.get("end_to_end_verified"))
+        and remote_result.get("auth_wire_verified")
+    )
+    if not protocol_verified:
+        error_detail = _redact_probe_detail(
+            str(remote_result.get("error") or smoke.get("error") or "MCP protocol contract was not verified."),
+            token_env=token_env,
+        )
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "public-url-mcp-protocol-failed",
+                f"Remote endpoint did not pass initialize, tools/list, and a tool contract check: {error_detail}",
+                "Verify the URL routes to a Streamable HTTP MCP server, supply the expected bearer-token environment variable, and rerun the probe.",
+            )
+        )
+        return _build_remote_probe(
+            public_url=public_url,
+            performed=True,
+            passed=False,
+            detail="mcp_protocol_failed",
+            protocol_verified=False,
+            tool_names=tool_names,
         )
     return _build_remote_probe(
         public_url=public_url,
         performed=True,
         passed=True,
-        detail="reachable",
-        status_code=status_code,
+        detail="mcp_protocol_verified",
+        protocol_verified=True,
+        tool_names=tool_names,
     )
 
 
@@ -1010,10 +1089,239 @@ def _check_bundle_dir(
                     "Regenerate the bundle so operators get a clear first-run install path.",
                 )
             )
+    _check_chatgpt_desktop_plugin_bundle(bundle_dir, findings)
     _check_bundle_manifest_readiness(bundle_dir, findings, allow_local_only_bundle=allow_local_only_bundle)
     bundle_data_dir = bundle_dir / "data"
     if bundle_data_dir.is_dir():
         _check_runtime_data_document_consistency(bundle_data_dir, findings, require_manifest=True)
+
+
+def _check_chatgpt_desktop_plugin_bundle(
+    bundle_dir: Path,
+    findings: list[McpConnectionFinding],
+) -> None:
+    plugin_root = bundle_dir / "chatgpt-desktop-local-plugin"
+    marketplace_path = plugin_root / ".agents" / "plugins" / "marketplace.json"
+    if not plugin_root.is_dir():
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-root-missing",
+                f"Generated bundle is missing the ChatGPT Desktop plugin root: {plugin_root}.",
+                "Regenerate the setup bundle with the current reg-rag-mcp-config command.",
+            )
+        )
+        return
+
+    expected_server_name = ""
+    try:
+        bundle_manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
+        if isinstance(bundle_manifest, dict):
+            expected_server_name = str(bundle_manifest.get("server_name") or "").strip()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    if not expected_server_name:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-server-name-missing",
+                "manifest.json must contain the authoritative server_name used by the nested plugin.",
+                "Regenerate the complete setup bundle with the current generator.",
+            )
+        )
+        return
+    expected_plugin_name = normalized_chatgpt_plugin_name(expected_server_name)
+    expected_marketplace_name = chatgpt_local_marketplace_name(expected_server_name)
+
+    marketplace = _read_strict_plugin_json(marketplace_path, findings, kind="marketplace")
+    if not isinstance(marketplace, dict):
+        return
+    entries = marketplace.get("plugins")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-marketplace-invalid",
+                f"{marketplace_path} must contain exactly one object in its plugins array.",
+                "Regenerate the ChatGPT Desktop plugin marketplace.",
+            )
+        )
+        return
+    entry = entries[0]
+    plugin_name = str(entry.get("name") or "").strip()
+    source = entry.get("source")
+    expected_source_path = f"./plugins/{expected_plugin_name}"
+    if (
+        str(marketplace.get("name") or "") != expected_marketplace_name
+        or plugin_name != expected_plugin_name
+        or not isinstance(source, dict)
+        or source.get("source") != "local"
+        or source.get("path") != expected_source_path
+    ):
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-marketplace-contract-invalid",
+                "The marketplace name, plugin name, or local source.path does not match manifest.json server_name.",
+                f"Use marketplace {expected_marketplace_name} and source.path {expected_source_path}.",
+            )
+        )
+        return
+    try:
+        resolved_root = plugin_root.resolve(strict=True)
+        package_dir = (plugin_root / str(source["path"])).resolve(strict=True)
+        expected_package_dir = (resolved_root / "plugins" / expected_plugin_name).resolve(strict=True)
+        if not package_dir.is_relative_to(resolved_root) or package_dir != expected_package_dir:
+            raise ValueError("plugin source path escapes or targets the wrong package")
+    except (OSError, RuntimeError, ValueError) as exc:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-source-path-invalid",
+                f"The marketplace plugin source path is unsafe or unavailable: {exc}",
+                "Regenerate the plugin and do not use absolute, traversing, symlinked, or junction paths.",
+            )
+        )
+        return
+
+    manifest_path = package_dir / ".codex-plugin" / "plugin.json"
+    mcp_path = package_dir / ".mcp.json"
+    manifest = _read_strict_plugin_json(manifest_path, findings, kind="manifest")
+    mcp_config = _read_strict_plugin_json(mcp_path, findings, kind="mcp")
+    if not isinstance(manifest, dict) or not isinstance(mcp_config, dict):
+        return
+    if (
+        manifest.get("name") != expected_plugin_name
+        or manifest.get("mcpServers") != CHATGPT_PLUGIN_MCP_PATH
+        or not CHATGPT_PLUGIN_VERSION_PATTERN.fullmatch(str(manifest.get("version") or ""))
+    ):
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-manifest-contract-invalid",
+                f"{manifest_path} has the wrong name, mcpServers path, or cachebuster version.",
+                "Regenerate the plugin manifest with the official companion-file contract.",
+            )
+        )
+    if "mcp_servers" in mcp_config:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-container-unsupported",
+                f"{mcp_path} uses unsupported mcp_servers; the current plugin loader requires mcpServers.",
+                "Regenerate and reinstall the plugin with the current mcpServers companion schema.",
+            )
+        )
+        return
+    servers = mcp_config.get("mcpServers")
+    if not isinstance(servers, dict) or set(servers) != {expected_server_name}:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-container-missing",
+                f"{mcp_path} must contain exactly the mcpServers entry {expected_server_name}.",
+                "Regenerate and reinstall the ChatGPT Desktop plugin.",
+            )
+        )
+        return
+    server = servers[expected_server_name]
+    args = server.get("args") if isinstance(server, dict) else None
+    if (
+        not isinstance(server, dict)
+        or server.get("type") != "stdio"
+        or server.get("command") != "powershell.exe"
+        or not isinstance(args, list)
+        or not args
+        or any(not isinstance(value, str) or not value for value in args)
+    ):
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-stdio-entry-invalid",
+                "The plugin MCP entry must be a non-empty powershell.exe stdio command with string args.",
+                "Regenerate the plugin MCP companion file.",
+            )
+        )
+        return
+
+    def single_flag_value(flag: str) -> str | None:
+        positions = [index for index, value in enumerate(args[:-1]) if value == flag]
+        return args[positions[0] + 1] if len(positions) == 1 else None
+
+    launcher = single_flag_value("-File")
+    data_dir = single_flag_value("--data-dir")
+    storage_flags = [flag for flag in ("--flat-storage", "--tenant-storage-isolation") if args.count(flag)]
+    valid_args = (
+        launcher is not None
+        and Path(launcher).name.lower() == "run_mcp_stdio_server.ps1"
+        and data_dir is not None
+        and Path(data_dir).name.lower() == "data"
+        and single_flag_value("--tenant-id") is not None
+        and single_flag_value("--transport") == "stdio"
+        and single_flag_value("--tool-profile") == "full"
+        and len(storage_flags) == 1
+        and args.count(storage_flags[0]) == 1
+        and args.count("--no-warm-cache") == 1
+    )
+    if not valid_args:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-chatgpt-plugin-stdio-args-invalid",
+                "The plugin stdio args do not contain one correctly paired launcher, data, tenant, transport, storage, tool-profile, and cache policy.",
+                "Regenerate the plugin and do not hand-edit its stdio args.",
+            )
+        )
+
+
+def _read_strict_plugin_json(
+    path: Path,
+    findings: list[McpConnectionFinding],
+    *,
+    kind: str,
+) -> object | None:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                f"bundle-chatgpt-plugin-{kind}-missing",
+                f"Could not read required plugin file {path}: {exc}",
+                "Regenerate the complete ChatGPT Desktop plugin bundle.",
+            )
+        )
+        return None
+    if raw.startswith(b"\xef\xbb\xbf"):
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                f"bundle-chatgpt-plugin-{kind}-bom",
+                f"{path} must be strict UTF-8 without a BOM.",
+                "Regenerate the plugin JSON files as UTF-8 without BOM.",
+            )
+        )
+        return None
+    try:
+        def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            value: dict[str, object] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError(f"duplicate JSON key: {key}")
+                value[key] = item
+            return value
+
+        return json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                f"bundle-chatgpt-plugin-{kind}-invalid",
+                f"{path} is not valid strict UTF-8 JSON: {exc}",
+                "Regenerate the ChatGPT Desktop plugin JSON files.",
+            )
+        )
+        return None
 
 
 def _bundle_connection_summary(bundle_dir: Path) -> dict[str, object] | None:
@@ -1140,7 +1448,15 @@ def _check_installed_client_config(
         summary["status"] = "missing_or_invalid_server"
         return summary
     if entry.get("url"):
-        summary["status"] = "remote_url"
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "installed-client-local-contract-mismatch",
+                f"{label} server {server_name} is configured as a remote URL, but this bundle requires local stdio.",
+                "Reinstall the generated local stdio config for this bundle.",
+            )
+        )
+        summary["status"] = "invalid_contract"
         summary["url"] = entry.get("url")
         return summary
 
@@ -1159,11 +1475,30 @@ def _check_installed_client_config(
         summary["status"] = "invalid_args"
         return summary
 
+    contract_issues = _installed_stdio_contract_issues(
+        client_key=client_key,
+        entry=entry,
+        args=args,
+        server_name=server_name,
+        expected_data_dir=expected_data_dir,
+    )
+    if contract_issues:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "installed-client-local-contract-mismatch",
+                f"{label} server {server_name} does not match the generated local stdio contract: "
+                + "; ".join(contract_issues),
+                "Reinstall the generated config and do not hand-edit or duplicate its MCP arguments.",
+            )
+        )
+        summary["contract_issues"] = contract_issues
+
     transport = (_arg_value(args, "--transport") or str(entry.get("type") or "stdio")).strip().lower()
     summary["transport"] = transport
     summary["args_checked"] = True
     if transport != "stdio":
-        summary["status"] = "non_stdio_skipped"
+        summary["status"] = "invalid_contract"
         return summary
 
     _check_installed_stdio_launcher(
@@ -1227,8 +1562,100 @@ def _check_installed_client_config(
             )
         )
 
-    summary["status"] = "checked"
+    summary["status"] = "invalid_contract" if contract_issues else "checked"
     return summary
+
+
+def _installed_stdio_contract_issues(
+    *,
+    client_key: str,
+    entry: dict[str, object],
+    args: list[str],
+    server_name: str,
+    expected_data_dir: Path,
+) -> list[str]:
+    issues: list[str] = []
+    expected_entry = _expected_bundle_stdio_entry(expected_data_dir, server_name)
+    if entry.get("enabled") is False:
+        issues.append("entry is disabled")
+    entry_type = str(entry.get("type") or "stdio").strip().lower()
+    if entry_type != "stdio":
+        issues.append(f"type is {entry_type or '<empty>'}, expected stdio")
+
+    command = str(entry.get("command") or "")
+    if expected_entry is not None:
+        expected_command = str(expected_entry.get("command") or "")
+        expected_args = expected_entry.get("args")
+        if command.casefold() != expected_command.casefold():
+            issues.append(f"command is {command or '<empty>'}, expected {expected_command or '<empty>'}")
+        if not isinstance(expected_args, list) or not all(isinstance(value, str) for value in expected_args):
+            issues.append("generated bundle contract has invalid args")
+        elif not _same_mcp_argument_list(args, expected_args, expected_data_dir.parent):
+            issues.append("args differ from the generated bundle contract")
+    else:
+        if command.casefold() != "powershell.exe":
+            issues.append(f"command is {command or '<empty>'}, expected powershell.exe")
+        required_pairs = {
+            "-File": None,
+            "--data-dir": None,
+            "--tenant-id": None,
+            "--transport": "stdio",
+            "--tool-profile": "full",
+        }
+        for flag, expected_value in required_pairs.items():
+            values = _arg_values(args, flag)
+            if len(values) != 1:
+                issues.append(f"{flag} must occur exactly once")
+            elif expected_value is not None and values[0] != expected_value:
+                issues.append(f"{flag} is {values[0]}, expected {expected_value}")
+        profile_values = _arg_values(args, "--profile-id")
+        if len(profile_values) > 1:
+            issues.append("--profile-id occurs more than once")
+        storage_counts = {flag: args.count(flag) for flag in ("--flat-storage", "--tenant-storage-isolation")}
+        if sum(storage_counts.values()) != 1:
+            issues.append("exactly one storage-mode flag is required")
+        if args.count("--no-warm-cache") != 1:
+            issues.append("--no-warm-cache must occur exactly once")
+
+    if client_key == "codex":
+        cwd = str(entry.get("cwd") or "")
+        if not cwd or not _same_filesystem_path(cwd, expected_data_dir.parent):
+            issues.append(f"cwd is {cwd or '<empty>'}, expected {expected_data_dir.parent}")
+    return issues
+
+
+def _expected_bundle_stdio_entry(expected_data_dir: Path, server_name: str) -> dict[str, object] | None:
+    plugin_name = normalized_chatgpt_plugin_name(server_name)
+    path = (
+        expected_data_dir.parent
+        / "chatgpt-desktop-local-plugin"
+        / "plugins"
+        / plugin_name
+        / ".mcp.json"
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+    entry = servers.get(server_name) if isinstance(servers, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _same_mcp_argument_list(actual: Sequence[str], expected: Sequence[str], bundle_dir: Path) -> bool:
+    if len(actual) != len(expected):
+        return False
+    for index, (actual_value, expected_value) in enumerate(zip(actual, expected)):
+        previous_expected = expected[index - 1] if index else ""
+        if previous_expected in {"-File", "--data-dir"}:
+            expected_path = Path(expected_value)
+            if not expected_path.is_absolute():
+                expected_path = bundle_dir / expected_path
+            if not _same_filesystem_path(actual_value, expected_path):
+                return False
+        elif actual_value != expected_value:
+            return False
+    return True
 
 
 def _check_installed_stdio_launcher(
@@ -1340,10 +1767,12 @@ def _expected_storage_flag(data_dir: Path, tenant_storage_isolation: bool) -> st
 
 
 def _arg_value(args: Sequence[str], flag: str) -> str | None:
-    for index, value in enumerate(args):
-        if value == flag and index + 1 < len(args):
-            return args[index + 1]
-    return None
+    values = _arg_values(args, flag)
+    return values[0] if values else None
+
+
+def _arg_values(args: Sequence[str], flag: str) -> list[str]:
+    return [args[index + 1] for index, value in enumerate(args[:-1]) if value == flag]
 
 
 def _same_filesystem_path(left: str | Path, right: str | Path) -> bool:
@@ -1466,6 +1895,8 @@ def _normalize_mcp_url(public_url: str | None) -> str | None:
     cleaned = public_url.strip()
     if not cleaned:
         return None
+    if any(character.isspace() or ord(character) < 32 for character in cleaned):
+        return None
     try:
         parsed = urlsplit(cleaned)
         # Accessing ``port`` validates malformed/non-numeric ports.
@@ -1488,6 +1919,39 @@ def _normalize_mcp_url(public_url: str | None) -> str | None:
     elif not path.endswith("/mcp"):
         path = f"{path}/mcp"
     return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
+
+
+def _is_non_public_literal_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    normalized_hostname = hostname.rstrip(".").casefold()
+    if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        return False
+    return bool(
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_unspecified
+        or address.is_multicast
+    )
+
+
+def _redact_probe_detail(detail: str, *, token_env: str | None) -> str:
+    redacted = detail
+    token = os.getenv(token_env, "") if token_env else ""
+    if token:
+        redacted = redacted.replace(token, "[REDACTED]")
+    redacted = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    return redacted
 
 
 def _is_placeholder_secret(value: str | None) -> bool:
@@ -1569,7 +2033,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail index visibility audit if smoke-test-like documents are visible; auto-enables it with --tenant-id.",
     )
-    parser.add_argument("--probe-public-url", action="store_true", help="Make a live HTTPS probe to the normalized public /mcp URL.")
+    parser.add_argument(
+        "--probe-public-url",
+        action="store_true",
+        help="Run a live MCP initialize, tools/list, and tool-contract probe against the normalized HTTPS /mcp URL.",
+    )
     parser.add_argument("--probe-timeout-seconds", type=float, default=5.0)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--out-json", default=None)
