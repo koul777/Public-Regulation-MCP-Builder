@@ -1,5 +1,38 @@
 # PR MCP Builder
 
+## MCP 연결·Kordoc 오류 빠른 해결
+
+MCP 번들 생성 화면에서 다음과 같은 메시지가 나오면 Kordoc 설치 여부만의 문제가 아닙니다.
+
+```text
+MCP bundle creation requires Kordoc table parsing ...
+Missing or failed Kordoc evidence: <document-id>(hwp, status=not_available, parser=kordoc)
+```
+
+HWP, HWPX, PDF, DOCX 문서가 MCP 범위에 포함되면 생성기는 해당 원본의 저장된 Kordoc evidence가 `status=parsed`이고 `parser=kordoc`인지 먼저 확인합니다. Kordoc을 나중에 설치해도 이미 `not_available`로 저장된 과거 전처리 결과가 자동으로 바뀌지는 않습니다.
+
+1. Windows PowerShell에서 Kordoc을 설치하고 버전을 확인합니다.
+
+   ```powershell
+   npm install -g kordoc
+   kordoc --version
+   ```
+
+2. 같은 원본 파일을 `① 문서 올려서 전처리`에서 다시 처리합니다.
+3. 사람 검수·승인을 완료하고 `승인하고 색인`을 다시 실행합니다.
+4. 그 다음에만 `MCP로 쓸 파일 묶음 만들기`를 실행합니다. 승인 JSON/evidence를 손으로 수정하거나 Kordoc 게이트를 끄면 안 됩니다.
+
+독립적으로 옮긴 MCP 번들에서 `McpError: Connection closed`가 나오면 오래된 전역 콘솔 스크립트가 선택된 것일 수 있습니다. 번들에 포함된 `install_local_package.ps1`을 먼저 실행하거나, 설치된 wheel 환경을 명시한 뒤 연결 BAT를 다시 실행합니다.
+
+```powershell
+$env:REG_RAG_PYTHON = (Join-Path $env:USERPROFILE 'venvs\reg-rag\Scripts\python.exe')
+& '.\run_mcp_stdio_server.ps1'
+```
+
+생성 launcher는 source/package Python을 import probe하고 PATH의 `reg-rag-mcp-server`도 `--help` 검증 후에만 사용합니다. 검증에 실패하면 설치 또는 `REG_RAG_PYTHON` 지정 안내를 출력합니다. PowerShell에 표시되는 사용자 홈 경로 같은 호스트 경로를 MCP 설정이나 공개 응답에 복사하지 말고 생성된 번들의 `.bat`/`.ps1` 파일을 사용하세요.
+
+원본 문서가 현재 공개 소스 checkout에 없으면 해당 기관의 원본 파일이 있는 운영 환경에서 위 순서로 재처리·승인·색인을 완료한 뒤 번들을 다시 생성해야 합니다.
+
 ## MCP 구축 후 사용 예시
 
 <p align="center">
