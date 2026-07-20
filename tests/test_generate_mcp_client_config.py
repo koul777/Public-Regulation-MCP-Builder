@@ -20,6 +20,7 @@ from app.schemas.structure import StructureNode
 from app.storage.repository import JsonRepository
 from scripts.generate_mcp_client_config import (
     _recommended_runtime_smoke_query,
+    _powershell_stdio_launcher_script,
     build_mcp_client_config,
     main,
     parse_args,
@@ -31,6 +32,15 @@ from scripts.mcp_bundle_contract import ALL_SETUP_BUNDLE_FILES, REQUIRED_SETUP_B
 
 
 class GenerateMcpClientConfigTests(unittest.TestCase):
+    def test_stdio_launcher_can_use_explicit_packaged_python_after_bundle_move(self) -> None:
+        launcher = _powershell_stdio_launcher_script(
+            ["--data-dir", "C:/bundle/data", "--transport", "stdio"],
+        )
+
+        self.assertIn("$env:REG_RAG_PYTHON", launcher)
+        self.assertIn("-m scripts.run_regulation_mcp", launcher)
+        self.assertIn("stale console script", launcher)
+
     def test_cli_accepts_explicit_wheel_dist_directory(self) -> None:
         with patch.object(
             sys,

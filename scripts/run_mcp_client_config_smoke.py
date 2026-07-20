@@ -453,7 +453,16 @@ def _arg_value(args: Sequence[str], flag: str) -> str | None:
 
 async def _run_client_entry(*, command: str, args: list[str], query: str) -> dict[str, Any]:
     started_at = time.perf_counter()
-    params = StdioServerParameters(command=command, args=args)
+    # The MCP client library intentionally inherits a narrow environment and
+    # drops custom interpreter selectors. Preserve the explicit runtime
+    # selector used by generated bundle launchers so smoke tests exercise the
+    # same wheel/source fallback that operators configure.
+    runtime_python = os.getenv("REG_RAG_PYTHON", "").strip()
+    params = StdioServerParameters(
+        command=command,
+        args=args,
+        env={"REG_RAG_PYTHON": runtime_python} if runtime_python else None,
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
