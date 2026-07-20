@@ -31,7 +31,7 @@ PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 ChatGPT Desktop 로
 - `direct_stdio_verified`: 생성 launcher를 통한 직접 stdio 프로토콜 검증 성공
 - `desktop_tool_scan_verified`: ChatGPT Desktop 도구 scan에서 MCP 도구 노출 확인
 - `conversation_attachment_verified`: 현재 대화에서 플러그인 도구 첨부 확인
-- `conversation_attachment_unverified`: 현재 대화의 플러그인 선택/멘션은 아직 제품 UI에서 확인되지 않음
+- `conversation_attachment_unverified`: 제품 UI의 도구 노출 및 현재 대화의 실제 도구 호출이 아직 확인되지 않음
 - `end_to_end_verified`: 해당 smoke 보고서에서 local/full은 `initialize`, `tools/list`, `get_index_status`; 외부 `chatgpt-data`는 `initialize`, `tools/list`, `search`, `fetch` 전송 계약이 모두 성공함. Desktop 도구 scan이나 현재 대화 첨부 완료를 뜻하지 않음
 
 ## 용어 정리

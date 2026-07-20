@@ -522,6 +522,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Settings > MCP servers > Add server", source)
         self.assertIn("Settings > Plugins", source)
         self.assertIn("https://chatgpt.com/plugins", source)
+        self.assertIn("ChatGPT Plugins 설정에서 앱을 Refresh", source)
+        self.assertNotIn("ChatGPT Apps 설정에서 도구를 다시 스캔", source)
         self.assertNotIn("Settings > Apps", source)
         self.assertIn("Claude Desktop은 전용 BAT가 기본", source)
         self.assertIn("설치 검증이 끝날 때까지 실행", source)

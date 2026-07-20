@@ -305,4 +305,4 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 - 내부망 AI 플랫폼이 지원하는 MCP transport 범위
 - 기관별 보안등급과 부서 ACL을 필수로 둘지 선택 기능으로 둘지
 - 검색은 키워드 우선으로 시작할지, deterministic local embedding을 기본 포함할지
-- ChatGPT Apps 연결은 공개 규정 전용 별도 프로파일로 둘지
+- ChatGPT Plugins 연결은 공개 규정 전용 별도 프로파일로 둘지
