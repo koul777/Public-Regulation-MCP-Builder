@@ -104,6 +104,9 @@ BUNDLE_GENERATION_TRANSITIONAL_STATES = {
 RUNTIME_PYTHON_MARKER_FILENAME = "runtime_python.json"
 RUNTIME_PYTHON_MARKER_SCHEMA_VERSION = 2
 RUNTIME_IDENTITY_SCOPE = "mcp-command-modules-v1"
+AGENT_CONNECT_BUNDLE_NAME_MARKER = "<PROGRAM_BUNDLE_NAME>"
+AGENT_CONNECT_BUNDLE_DIR_MARKER = "<PROGRAM_BUNDLE_DIR>"
+AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER = "<PROGRAM_BUNDLE_DIR_PS_LITERAL>"
 RUNTIME_IDENTITY_MODULES = (
     "scripts.run_regulation_mcp",
     "scripts.check_mcp_connection_readiness",
@@ -114,6 +117,112 @@ RUNTIME_IDENTITY_MODULES = (
     "scripts.check_chatgpt_desktop_recognition",
     "scripts.audit_mcp_index_visibility",
 )
+
+
+def _agent_connect_bundle_context(
+    *,
+    prompt_file: str,
+    fallback_file: str,
+) -> str:
+    return f"""생성 프로그램이 지정한 번들 폴더 이름: `{AGENT_CONNECT_BUNDLE_NAME_MARKER}`
+생성 프로그램이 지정한 번들 절대경로: `{AGENT_CONNECT_BUNDLE_DIR_MARKER}`
+
+반드시 위 폴더 하나를 번들 루트로 사용하고 다음 핵심 구조를 먼저 확인해.
+
+```text
+{AGENT_CONNECT_BUNDLE_NAME_MARKER}\\
+├─ {prompt_file}
+├─ manifest.json
+├─ bundle_status.json
+├─ connect_mcp_client.ps1
+├─ install_local_package.ps1
+├─ run_mcp_stdio_server.ps1
+├─ {fallback_file}
+├─ data\\
+├─ reg_rag_preprocessor-*.whl  (독립 배포용 wheel을 포함한 경우)
+└─ runtime_python.json         (설치가 성공하면 생성 또는 갱신)
+```
+"""
+
+
+def render_agent_connect_prompt_for_program(
+    prompt_text: str,
+    *,
+    bundle_dir: str | Path,
+) -> str:
+    """Materialize the current local bundle path only in the operator UI copy text.
+
+    Prompt files stored in the transferable ZIP keep placeholders so they do not
+    disclose the generation host path and continue to work after relocation.
+    """
+
+    resolved_bundle_dir = str(Path(bundle_dir).resolve())
+    if "\r" in resolved_bundle_dir or "\n" in resolved_bundle_dir:
+        raise ValueError("bundle_dir must not contain line breaks.")
+    powershell_literal = "'" + resolved_bundle_dir.replace("'", "''") + "'"
+    bundle_name = Path(resolved_bundle_dir).name
+    has_program_path_markers = (
+        AGENT_CONNECT_BUNDLE_NAME_MARKER in prompt_text
+        or AGENT_CONNECT_BUNDLE_DIR_MARKER in prompt_text
+        or AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER in prompt_text
+    )
+    rendered = prompt_text.replace(
+        AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER,
+        powershell_literal,
+    ).replace(
+        AGENT_CONNECT_BUNDLE_NAME_MARKER,
+        bundle_name,
+    ).replace(
+        AGENT_CONNECT_BUNDLE_DIR_MARKER,
+        resolved_bundle_dir,
+    )
+    if has_program_path_markers:
+        return rendered
+
+    # Bundles created before the program-path markers were introduced should
+    # become immediately usable when their prompt is copied from the updated
+    # operator UI. Replace only the known first discovery step and preserve the
+    # rest of the signed-off connection procedure verbatim.
+    legacy_step = re.compile(
+        r"^1\. 현재 작업공간에서 `(?P<prompt_file>[^`]+)`[^\r\n]*$",
+        flags=re.MULTILINE,
+    )
+    match = legacy_step.search(rendered)
+    if match is None:
+        return rendered
+    prompt_file = match.group("prompt_file")
+    fallback_by_prompt = {
+        "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md": "ChatGPT Desktop에 연결하기.bat",
+        "CODEX_AGENT_CONNECT_PROMPT.md": "Codex에 연결하기.bat",
+        "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md": "Claude Code에 연결하기.bat",
+    }
+    portable_context = _agent_connect_bundle_context(
+        prompt_file=prompt_file,
+        fallback_file=fallback_by_prompt.get(prompt_file, "<대상별 연결 BAT>"),
+    )
+    materialized_context = portable_context.replace(
+        AGENT_CONNECT_BUNDLE_NAME_MARKER,
+        bundle_name,
+    ).replace(
+        AGENT_CONNECT_BUNDLE_DIR_MARKER,
+        resolved_bundle_dir,
+    )
+    first_line_end = rendered.find("\n")
+    if first_line_end >= 0:
+        rendered = rendered[: first_line_end + 1] + "\n" + materialized_context + rendered[first_line_end + 1 :]
+    else:
+        rendered = rendered + "\n\n" + materialized_context
+    match = legacy_step.search(rendered)
+    if match is None:
+        return rendered
+    replacement = (
+        "1. 생성 프로그램이 지정한 현재 번들 폴더를 사용해 "
+        f"`$BundleDir = {powershell_literal}`를 실행하고, `{prompt_file}`, `manifest.json`, "
+        "`bundle_status.json`, `connect_mcp_client.ps1`이 모두 그 폴더 바로 아래에 있는지 확인한 뒤 "
+        "`Set-Location -LiteralPath $BundleDir`을 실행해. 경로가 없거나 접근할 수 없으면 임의 경로를 "
+        "검색하거나 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해."
+    )
+    return legacy_step.sub(lambda _: replacement, rendered, count=1)
 
 
 def _runtime_identity_builder_base64() -> str:
@@ -3730,7 +3839,9 @@ def _chatgpt_desktop_agent_connect_prompt(server_name: str) -> str:
 
 이 요청은 압축을 푼 연결 번들 폴더를 로컬 프로젝트/작업공간으로 연 ChatGPT Desktop의 Codex 에이전트에서 실행해줘. 일반 ChatGPT 대화처럼 로컬 파일·터미널 권한이 없는 화면에서는 실행 성공을 주장하지 마.
 
-1. 현재 작업공간에서 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 `$BundleDir`로 삼고 `Set-Location -LiteralPath $BundleDir`을 실행해. 0개 또는 여러 개면 임의 경로를 선택하지 말고 중단해.
+{_agent_connect_bundle_context(prompt_file="CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md", fallback_file="ChatGPT Desktop에 연결하기.bat")}
+
+1. 위 경로가 실제 절대경로로 채워져 있으면 `$BundleDir = {AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER}`를 실행하고, `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`, `manifest.json`, `bundle_status.json`, `connect_mcp_client.ps1`이 모두 그 폴더 바로 아래에 있는지 확인한 뒤 `Set-Location -LiteralPath $BundleDir`을 실행해. 경로가 없거나 접근할 수 없으면 임의 경로로 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해. 위 값이 여전히 `PROGRAM_BUNDLE_DIR` 자리표시자인 원본 파일을 직접 붙여넣은 경우에만 현재 작업공간에서 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 `$BundleDir`로 삼아. 검색 결과가 0개 또는 여러 개면 중단해.
 2. `manifest.json`, `bundle_status.json`, `connect_mcp_client.ps1`을 읽고 서버 이름이 `{server_name}`인지 확인해.
 3. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target codex -InstallCodex`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, 재시작 후에도 유지되는 Python runtime 기록, doctor, ChatGPT Desktop/Codex 공용 direct 설정 백업·갱신, 실제 설치 설정 stdio 검증을 끝내고, 실행 가능한 Codex CLI가 있으면 fresh app-server inventory까지 확인해야 해.
 4. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·설정 기록·실제 설치 설정의 direct stdio 검증이 실패하면 성공으로 보고하지 마.
@@ -3748,7 +3859,9 @@ def _codex_agent_connect_prompt(server_name: str) -> str:
 
 압축을 푼 연결 번들 폴더를 로컬 작업공간으로 연 뒤 아래 작업을 수행해줘.
 
-1. 현재 작업공간에서 `CODEX_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더로 `Set-Location -LiteralPath`해. 0개 또는 여러 개면 중단해.
+{_agent_connect_bundle_context(prompt_file="CODEX_AGENT_CONNECT_PROMPT.md", fallback_file="Codex에 연결하기.bat")}
+
+1. 위 경로가 실제 절대경로로 채워져 있으면 `$BundleDir = {AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER}`를 실행하고, 필수 파일이 그 폴더 바로 아래에 있는지 확인한 뒤 `Set-Location -LiteralPath $BundleDir`을 실행해. 경로가 없거나 접근할 수 없으면 임의 경로로 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해. 위 값이 여전히 `PROGRAM_BUNDLE_DIR` 자리표시자인 원본 파일을 직접 붙여넣은 경우에만 현재 작업공간에서 `CODEX_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 사용해. 검색 결과가 0개 또는 여러 개면 중단해.
 2. `manifest.json`, `bundle_status.json`, `connect_mcp_client.ps1`을 읽고 서버 이름이 `{server_name}`인지 확인해.
 3. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target codex -InstallCodex`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, active Python Scripts 경로 보정, doctor, 현재 사용자의 Codex MCP 설정 백업·갱신, stdio 및 app-server 검증까지 모두 끝내야 해.
 4. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·등록·로더 검증 중 하나라도 실패하면 성공으로 보고하지 마.
@@ -3765,7 +3878,9 @@ def _claude_code_agent_connect_prompt(server_name: str) -> str:
 
 압축을 푼 연결 번들 폴더를 로컬 작업공간으로 연 뒤 아래 작업을 수행해줘.
 
-1. 현재 작업공간에서 `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더로 `Set-Location -LiteralPath`해. 0개 또는 여러 개면 중단해.
+{_agent_connect_bundle_context(prompt_file="CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", fallback_file="Claude Code에 연결하기.bat")}
+
+1. 위 경로가 실제 절대경로로 채워져 있으면 `$BundleDir = {AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER}`를 실행하고, 필수 파일이 그 폴더 바로 아래에 있는지 확인한 뒤 `Set-Location -LiteralPath $BundleDir`을 실행해. 경로가 없거나 접근할 수 없으면 임의 경로로 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해. 위 값이 여전히 `PROGRAM_BUNDLE_DIR` 자리표시자인 원본 파일을 직접 붙여넣은 경우에만 현재 작업공간에서 `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 사용해. 검색 결과가 0개 또는 여러 개면 중단해.
 2. `manifest.json`, `bundle_status.json`, `connect_mcp_client.ps1`을 읽고 서버 이름이 `{server_name}`인지 확인해.
 3. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target claude-code`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, active Python Scripts 경로 보정, doctor, Claude Code user scope 로컬 stdio 등록까지 끝내야 해.
 4. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·등록 검증 중 하나라도 실패하면 성공으로 보고하지 마.
