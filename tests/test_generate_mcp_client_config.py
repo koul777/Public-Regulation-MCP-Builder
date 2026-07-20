@@ -39,6 +39,8 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
 
         self.assertIn("$env:REG_RAG_PYTHON", launcher)
         self.assertIn("-m scripts.run_regulation_mcp", launcher)
+        self.assertIn('import scripts.run_regulation_mcp', launcher)
+        self.assertIn('$ConsoleProbe = Start-Process', launcher)
         self.assertIn("stale console script", launcher)
 
     def test_cli_accepts_explicit_wheel_dist_directory(self) -> None:
