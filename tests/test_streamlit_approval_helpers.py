@@ -269,6 +269,28 @@ class StreamlitApprovalHelperTests(unittest.TestCase):
         self.assertIn("[local-path-redacted]", result["output"])
         self.assertIn("-PersistUserPath", run.call_args.args[0])
 
+    def test_replace_workflow_document_id_switches_only_the_reprocessed_source(self) -> None:
+        state = {
+            streamlit_app.WORKFLOW_DOCUMENT_IDS_KEY: ["doc-old", "doc-other"],
+            streamlit_app.WORKFLOW_SELECTED_DOCUMENT_IDS_KEY: ["doc-old", "doc-other"],
+            "document_id": "doc-old",
+            streamlit_app.WORKFLOW_MCP_GATE_CACHE_KEY: {"cached": True},
+            streamlit_app.DOCUMENT_CONTEXT_CACHE_KEY: {
+                "document_id": "doc-old",
+                "revision": (),
+                "context": {},
+            },
+        }
+
+        with patch.object(streamlit_app.st, "session_state", state):
+            streamlit_app._replace_workflow_document_id("doc-old", "doc-new")
+
+        self.assertEqual(["doc-new", "doc-other"], state[streamlit_app.WORKFLOW_DOCUMENT_IDS_KEY])
+        self.assertEqual(["doc-new", "doc-other"], state[streamlit_app.WORKFLOW_SELECTED_DOCUMENT_IDS_KEY])
+        self.assertEqual("doc-new", state["document_id"])
+        self.assertNotIn(streamlit_app.WORKFLOW_MCP_GATE_CACHE_KEY, state)
+        self.assertNotIn(streamlit_app.DOCUMENT_CONTEXT_CACHE_KEY, state)
+
 
 if __name__ == "__main__":
     unittest.main()

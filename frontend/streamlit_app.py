@@ -33,7 +33,7 @@ from app.api.routes_documents import (
 )
 from app.api.routes_rag import RagChatRequest, rag_chat
 from app.core.api_audit import redact_sensitive_paths
-from app.core.config import get_settings, set_runtime_settings_overrides
+from app.core.config import Settings, get_settings, set_runtime_settings_overrides
 from app.core.pipeline import kordoc_table_command_status
 from app.agents.provider_config import (
     SUPPORTED_AGENT_REVIEW_PROVIDERS,
@@ -63,6 +63,11 @@ from app.processors.quality_gate import (
 )
 from app.schemas.chunk import ChunkOptions
 from app.services.document_service import DocumentService
+from app.services.kordoc_reprocessing_service import (
+    KordocReprocessingError,
+    KordocReprocessingResult,
+    KordocReprocessingService,
+)
 from app.services.processing_service import ProcessingService
 from app.services.regulation_catalog_service import group_documents_by_regulation, latest_active_version, read_regulation_metadata
 from app.services.regulation_metadata_service import infer_regulation_metadata, regulation_upload_sort_key
@@ -647,6 +652,8 @@ WORKFLOW_DOCUMENT_IDS_KEY = "workflow_document_ids"
 WORKFLOW_SELECTED_DOCUMENT_IDS_KEY = "workflow_selected_document_ids"
 WORKFLOW_MCP_GATE_CACHE_KEY = "workflow_mcp_gate_cache"
 DOCUMENT_CONTEXT_CACHE_KEY = "document_context_cache"
+KORDOC_REPROCESS_NOTICE_KEY = "kordoc_reprocess_notice"
+KORDOC_AUTO_REPROCESS_ATTEMPT_PREFIX = "kordoc_auto_reprocess_attempted"
 DOCUMENT_CONTEXT_NAV_PAGES = {NAV_HOME, NAV_RESULTS, NAV_APPROVAL, NAV_MCP}
 
 
@@ -2919,6 +2926,100 @@ def _mcp_kordoc_preflight(
     }
 
 
+def _safe_kordoc_reprocess_documents(
+    target_settings: Settings,
+    target_repository: JsonRepository,
+    document_ids: list[str],
+    *,
+    quality_profile: QualityProfileConfig | None = None,
+    progress_callback: Callable[[int, str, int | None, int | None], None] | None = None,
+) -> list[KordocReprocessingResult]:
+    """Reprocess source documents as isolated drafts and verify Kordoc evidence."""
+
+    normalized_ids = list(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in document_ids
+            if str(value or "").strip()
+        )
+    )
+    service = KordocReprocessingService(
+        target_settings,
+        target_repository,
+        quality_profile_config=quality_profile,
+    )
+    results: list[KordocReprocessingResult] = []
+    total = len(normalized_ids)
+    for index, source_document_id in enumerate(normalized_ids):
+        def report(
+            percent: int,
+            message: str,
+            current: int | None = None,
+            current_total: int | None = None,
+            *,
+            offset: int = index,
+        ) -> None:
+            mapped = int(((offset + max(0, min(100, int(percent))) / 100) / max(total, 1)) * 100)
+            if progress_callback is not None:
+                progress_callback(
+                    mapped,
+                    f"{offset + 1}/{total} · {message}",
+                    current,
+                    current_total,
+                )
+
+        results.append(service.recover(source_document_id, progress_callback=report))
+    return results
+
+
+def _replace_workflow_document_id(source_document_id: str, draft_document_id: str) -> None:
+    """Switch the UI to a verified draft while preserving unrelated batch entries."""
+
+    source_id = str(source_document_id or "").strip()
+    draft_id = str(draft_document_id or "").strip()
+    if not source_id or not draft_id or source_id == draft_id:
+        return
+
+    def replaced(values: object) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        output: list[str] = []
+        for value in values:
+            current = str(value or "").strip()
+            if not current:
+                continue
+            current = draft_id if current == source_id else current
+            if current not in output:
+                output.append(current)
+        return output
+
+    workflow_ids = replaced(st.session_state.get(WORKFLOW_DOCUMENT_IDS_KEY))
+    if draft_id not in workflow_ids:
+        workflow_ids.append(draft_id)
+    st.session_state[WORKFLOW_DOCUMENT_IDS_KEY] = workflow_ids
+
+    selected_ids = replaced(st.session_state.get(WORKFLOW_SELECTED_DOCUMENT_IDS_KEY))
+    if not selected_ids or source_id in {
+        str(value or "").strip()
+        for value in (st.session_state.get(WORKFLOW_SELECTED_DOCUMENT_IDS_KEY) or [])
+    }:
+        if draft_id not in selected_ids:
+            selected_ids.append(draft_id)
+    st.session_state[WORKFLOW_SELECTED_DOCUMENT_IDS_KEY] = selected_ids
+    if str(st.session_state.get("document_id") or "").strip() == source_id:
+        st.session_state["document_id"] = draft_id
+    _invalidate_document_context_cache()
+
+
+def _kordoc_auto_reprocess_attempt_key(
+    target_repository: JsonRepository,
+    document_id: str,
+) -> str:
+    document = target_repository.get_document(document_id)
+    file_hash = str(getattr(document, "file_hash", "") or "")[:16]
+    return f"{KORDOC_AUTO_REPROCESS_ATTEMPT_PREFIX}:{document_id}:{file_hash}"
+
+
 def _kordoc_installer_candidates() -> list[Path]:
     """Return source and portable locations for the explicit Kordoc setup script."""
 
@@ -4036,6 +4137,13 @@ def _page_results(ctx: dict | None) -> None:
         return
     selected_document_ids = _render_workflow_document_directory(page_key="results")
     document_id = ctx["document_id"]
+    kordoc_notice = st.session_state.get(KORDOC_REPROCESS_NOTICE_KEY)
+    if isinstance(kordoc_notice, dict) and kordoc_notice.get("document_id") == document_id:
+        st.session_state.pop(KORDOC_REPROCESS_NOTICE_KEY, None)
+        st.success(
+            f"설치된 Kordoc으로 새 초안 {int(kordoc_notice.get('count') or 1):,}개를 재전처리하고 "
+            "표 파싱 증거를 확인했습니다. 이제 결과를 검토·승인한 뒤 색인해 주세요."
+        )
     chunks = ctx["chunks"]
     issues = ctx["issues"]
     nodes = ctx["nodes"]
@@ -6077,10 +6185,15 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             str(getattr(scope_document, "document_id", "") or "")
             for scope_document in scope_documents
         ]
+        kordoc_command = str(getattr(settings, "kordoc_table_command", "") or "")
+        command_refresh_key = f"kordoc_command_status_refreshed:{kordoc_command}"
+        if not st.session_state.get(command_refresh_key):
+            kordoc_table_command_status.cache_clear()
+            st.session_state[command_refresh_key] = True
         kordoc_preflight = _mcp_kordoc_preflight(
             repository,
             scope_document_ids,
-            command=str(getattr(settings, "kordoc_table_command", "") or ""),
+            command=kordoc_command,
         )
         if kordoc_preflight["required_document_count"]:
             st.markdown("#### Kordoc 표 파싱 사전 점검")
@@ -6110,13 +6223,98 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             else:
                 command_status = kordoc_preflight["command_status"]
                 command_label = str(command_status.get("label") or "kordoc")
+                missing_document_ids = [
+                    str(item.get("document_id") or "").strip()
+                    for item in kordoc_preflight["missing"]
+                    if str(item.get("document_id") or "").strip()
+                ]
                 if command_status.get("available"):
                     version = str(command_status.get("version") or "unknown")
-                    st.error(
-                        "현재 Kordoc 명령은 사용 가능하지만, 선택한 문서의 저장된 전처리 증거가 없습니다 "
-                        f"(명령={command_label}, 버전={version}). "
-                        "1단계에서 원본 문서를 다시 전처리하고, 사람 검토·승인·인덱싱을 다시 완료해야 합니다."
+                    st.warning(
+                        "설치된 Kordoc으로 증거가 없는 원본을 새 초안에서 재전처리합니다. "
+                        f"기존 승인본·승인 기록·색인은 그대로 보존됩니다 (명령={command_label}, 버전={version})."
                     )
+                    institution_history_scope = mcp_scope == "selected_institution"
+                    automatic_single = len(missing_document_ids) == 1 and not institution_history_scope
+                    attempt_key = (
+                        _kordoc_auto_reprocess_attempt_key(repository, missing_document_ids[0])
+                        if automatic_single
+                        else ""
+                    )
+                    automatic_trigger = bool(
+                        automatic_single
+                        and attempt_key
+                        and not st.session_state.get(attempt_key)
+                    )
+                    if automatic_trigger:
+                        st.session_state[attempt_key] = True
+                    retry_trigger = False
+                    if institution_history_scope:
+                        st.info(
+                            "기관 전체 범위에는 과거 superseded 이력도 포함됩니다. "
+                            "먼저 '현재 연 규정만' 또는 '선택한 규정' 범위에서 각 규정을 안전 재전처리·승인·색인해 주세요."
+                        )
+                    else:
+                        retry_trigger = st.button(
+                            (
+                                "설치된 Kordoc으로 안전 재전처리 다시 실행"
+                                if automatic_single
+                                else f"증거 없는 규정 {len(missing_document_ids):,}개 안전 재전처리"
+                            ),
+                            key=f"kordoc-safe-reprocess-{document_id}-{mcp_scope}",
+                            type="primary",
+                            help="기존 문서를 덮어쓰지 않고 새 draft 문서 ID에서 처리합니다.",
+                        )
+                    if automatic_trigger or retry_trigger:
+                        if retry_trigger and attempt_key:
+                            st.session_state[attempt_key] = True
+                        try:
+                            with st.status("Kordoc 안전 재전처리 중…", expanded=True) as reprocess_status:
+                                reprocess_progress = st.progress(0, text="새 초안 준비 · 0%")
+                                reprocess_detail = st.empty()
+                                reprocess_results = _run_background_operation_with_progress(
+                                    lambda report: _safe_kordoc_reprocess_documents(
+                                        settings,
+                                        repository,
+                                        missing_document_ids,
+                                        quality_profile=quality_profile_config,
+                                        progress_callback=report,
+                                    ),
+                                    progress_bar=reprocess_progress,
+                                    detail_box=reprocess_detail,
+                                    start_percent=0,
+                                    end_percent=100,
+                                    label="Kordoc 재전처리·증거 검증",
+                                    estimated_seconds=max(60.0, 120.0 * len(missing_document_ids)),
+                                )
+                                reprocess_status.update(
+                                    label="Kordoc 재전처리와 증거 검증 완료",
+                                    state="complete",
+                                )
+                            for result in reprocess_results:
+                                _replace_workflow_document_id(
+                                    result.source_document_id,
+                                    result.draft_document_id,
+                                )
+                            st.session_state[KORDOC_REPROCESS_NOTICE_KEY] = {
+                                "document_id": str(st.session_state.get("document_id") or ""),
+                                "count": len(reprocess_results),
+                                "draft_document_ids": [result.draft_document_id for result in reprocess_results],
+                            }
+                            _go(NAV_RESULTS)
+                            st.rerun()
+                        except KordocReprocessingError as exc:
+                            st.error(str(exc))
+                            if exc.draft_document_id:
+                                st.caption(
+                                    f"실패한 새 초안 {exc.draft_document_id}은 승인·색인되지 않았으며 기존 문서는 변경되지 않았습니다."
+                                )
+                        except (FileNotFoundError, KeyError, ValueError) as exc:
+                            st.error(redact_sensitive_paths(str(exc)))
+                            st.info("저장된 원본이 없으면 ① 단계에서 원본 파일을 다시 올려 주세요.")
+                        except Exception as exc:
+                            st.error(redact_sensitive_paths(str(exc)))
+                            st.info("기존 승인본은 변경되지 않았습니다. 원본과 Kordoc 상태를 확인한 뒤 다시 시도해 주세요.")
                 else:
                     auto_install_result: dict[str, Any] | None = None
                     auto_install_key = "kordoc_auto_install_attempted"
@@ -6156,20 +6354,12 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     elif auto_install_result and auto_install_result.get("output"):
                         st.caption("자동 설치 시도 결과")
                         st.code(str(auto_install_result["output"]), language="text")
-                missing_ids = ", ".join(
-                    str(item.get("document_id") or "") for item in kordoc_preflight["missing"][:10]
-                )
+                missing_ids = ", ".join(missing_document_ids[:10])
                 if missing_ids:
                     st.info(
                         f"Kordoc 증거가 없는 문서: {missing_ids}. "
                         "기존 approved chunk를 직접 수정하거나 게이트를 끄지 마세요."
                     )
-                if st.button(
-                    "원본 재처리 화면으로 이동",
-                    key=f"kordoc-reprocess-goto-{document_id}-{mcp_scope}",
-                ):
-                    _go(NAV_PREPROCESS)
-                    st.rerun()
         mcp_export_document_id = document_id if mcp_scope == "current_document" else None
         mcp_export_document_ids = selected_document_ids if mcp_scope == "selected_documents" else None
         selected_scope_gate = (
