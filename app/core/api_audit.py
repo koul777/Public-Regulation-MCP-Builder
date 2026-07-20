@@ -26,8 +26,11 @@ PATH_WITH_EXTENSION_RE = re.compile(
     r"(?<![A-Za-z])(?:[A-Za-z]:[\\/]|\\\\[^\\/\r\n\"'<>`]+[\\/][^\\/\r\n\"'<>`]+[\\/]|"
     r"/(?:Users|home|var|tmp|mnt|workspace|data|app)/)"
     r"[^\"'<>`\r\n]*?\."
-    r"(?:pdf|docx|hwpx|hwp|jsonl?|csv|md|txt|log|db|sqlite|tmp|yaml|yml|py)",
+    r"(?:pdf|docx|hwpx|hwp|jsonl?|csv|md|txt|log|db|sqlite|tmp|yaml|yml|py|png|jpe?g|gif|bmp|webp)",
     re.IGNORECASE,
+)
+WINDOWS_QUOTED_PATH_RE = re.compile(
+    r"(?:&\s*)?(?P<quote>['\"])[A-Za-z]:[\\/][^'\"\r\n]+(?P=quote)"
 )
 REQUIRED_API_AUDIT_FIELDS = ("actor", "tenant_id", "auth_mode", "action", "outcome", "status_code")
 ALLOWED_OUTCOMES = {"success", "failure", "denied"}
@@ -114,7 +117,11 @@ def _redacted_provenance(value: str) -> str:
 def redact_sensitive_paths(value: str) -> str:
     if not value:
         return ""
-    redacted = PATH_WITH_EXTENSION_RE.sub("[local-path-redacted]", str(value))
+    # PowerShell commonly presents an operator-opened artifact as
+    # ``& 'C:\\Users\\...\\file.png'``.  Match the quoted command as a
+    # whole so neither the invocation operator nor a filename suffix leaks.
+    redacted = WINDOWS_QUOTED_PATH_RE.sub("[local-path-redacted]", str(value))
+    redacted = PATH_WITH_EXTENSION_RE.sub("[local-path-redacted]", redacted)
     redacted = re.sub(
         r"(?<![A-Za-z])[A-Za-z]:[\\/][^\s\"'<>`]+",
         "[local-path-redacted]",

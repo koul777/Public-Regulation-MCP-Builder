@@ -215,6 +215,14 @@ class ApiAuditTests(unittest.TestCase):
         self.assertNotIn("\\\\server\\share", redacted)
         self.assertNotIn("/home/example", redacted)
 
+    def test_redacts_quoted_powershell_image_open_command(self) -> None:
+        detail = "& 'C:\\Users\\dd\\Desktop\\7월 20일\\다운로드.png'"
+
+        redacted = redact_sensitive_paths(detail)
+
+        self.assertEqual("[local-path-redacted]", redacted)
+        self.assertNotIn("다운로드.png", redacted)
+
     def test_auth_denial_writes_denied_audit_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp), api_default_tenant_id="tenant-default")
