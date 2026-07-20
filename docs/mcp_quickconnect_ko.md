@@ -8,6 +8,8 @@
 
 연결 전 게이트: MCP 클라이언트 연결 산출물은 전처리, 사람 승인, approved chunk 인덱싱까지 끝난 런타임에서만 ready로 취급합니다. 승인만 있고 `Index approved chunks` 또는 `Reindex approved chunks`가 끝나지 않은 상태는 연결 전 단계입니다.
 
+Kordoc 사전 점검: HWP/HWPX/PDF/DOCX가 선택 범위에 있으면 MCP 생성 화면이 저장된 Kordoc 증거(`status=parsed`, `parser=kordoc`)를 먼저 확인합니다. 현재 PC에 Kordoc을 설치했더라도 과거 `not_available` 전처리 결과가 자동으로 바뀌지는 않으므로, `npm install -g kordoc` 후 원본을 ① 전처리 화면에서 다시 처리하고 ② 사람 검토·승인을 다시 완료한 뒤 ③ `Index approved chunks` 또는 `Reindex approved chunks`를 실행해야 합니다. 증거가 없으면 비싼 bundle export를 시작하지 않고 재처리 화면으로 안내합니다.
+
 미검수 프리뷰는 `UNREVIEWED_PREVIEW`로 분리합니다. 이 모드는 품질과 연결 UX를 빠르게 확인하기 위한 경고 상태이며, 정식 MCP handoff, 외부 AI 연결, 기관 업무 사용, release evidence에는 사용할 수 없습니다.
 
 PR MCP Builder에서 전처리와 승인까지 끝낸 MCP를 ChatGPT Desktop 로컬 플러그인, ChatGPT 원격 MCP, Codex CLI, Claude Desktop, Claude Code, Claude API에 빠르게 연결하기 위한 최소 절차입니다.

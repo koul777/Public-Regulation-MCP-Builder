@@ -162,6 +162,89 @@ class StreamlitApprovalHelperTests(unittest.TestCase):
         self.assertTrue(gate["ready"])
         self.assertEqual("approved_chunks_indexed", gate["reason"])
 
+    def test_mcp_kordoc_preflight_blocks_stale_missing_hwp_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp))
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_kordoc_preflight",
+                    filename="rules.hwp",
+                    document_name="Rules",
+                    file_type="hwp",
+                    file_hash="hash",
+                    tenant_id="default",
+                    status="completed",
+                )
+            )
+            repository.save_chunks(
+                "doc_kordoc_preflight",
+                [
+                    Chunk(
+                        chunk_id="chunk-kordoc-preflight",
+                        document_id="doc_kordoc_preflight",
+                        chunk_type="article",
+                        text="draft",
+                    )
+                ],
+            )
+
+            preflight = streamlit_app._mcp_kordoc_preflight(
+                repository,
+                ["doc_kordoc_preflight"],
+                command="kordoc",
+            )
+
+        self.assertFalse(preflight["ready"])
+        self.assertEqual(["doc_kordoc_preflight"], [item["document_id"] for item in preflight["missing"]])
+        self.assertEqual("hwp", preflight["missing"][0]["file_type"])
+
+    def test_mcp_kordoc_preflight_allows_parsed_hwp_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp))
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_kordoc_preflight",
+                    filename="rules.hwp",
+                    document_name="Rules",
+                    file_type="hwp",
+                    file_hash="hash",
+                    tenant_id="default",
+                    status="completed",
+                )
+            )
+            repository.save_chunks(
+                "doc_kordoc_preflight",
+                [
+                    Chunk(
+                        chunk_id="chunk-kordoc-preflight",
+                        document_id="doc_kordoc_preflight",
+                        chunk_type="table",
+                        text="parsed",
+                        metadata={
+                            "kordoc_table_parser_status": "parsed",
+                            "kordoc_table_count": 1,
+                            "kordoc_table_inventory": {
+                                "status": "parsed",
+                                "parser": "kordoc",
+                                "table_count": 1,
+                            },
+                        },
+                    )
+                ],
+            )
+
+            preflight = streamlit_app._mcp_kordoc_preflight(
+                repository,
+                ["doc_kordoc_preflight"],
+                command="kordoc",
+            )
+
+        self.assertTrue(preflight["ready"])
+        self.assertEqual(1, preflight["parsed_document_count"])
+        self.assertEqual([], preflight["missing"])
+
 
 if __name__ == "__main__":
     unittest.main()
