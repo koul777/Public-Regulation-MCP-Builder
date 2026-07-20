@@ -222,6 +222,18 @@ def _resolve_command_executable(command_name: str) -> str | None:
     return None
 
 
+def resolve_kordoc_command(command_name: str) -> str | None:
+    """Resolve the configured Kordoc command using the parser's platform fallbacks.
+
+    The Streamlit preflight and the actual parser must agree about whether a
+    globally installed Windows npm shim is usable.  Keep this small public
+    wrapper around the existing resolver so callers do not duplicate the
+    ``%APPDATA%\\npm`` fallback logic.
+    """
+
+    return _resolve_command_executable(str(command_name or "").strip())
+
+
 def _looks_like_path(value: str) -> bool:
     return "\\" in value or "/" in value or bool(re.match(r"^[A-Za-z]:", value))
 

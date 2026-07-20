@@ -120,7 +120,7 @@ class PipelineTests(unittest.TestCase):
         options = ChunkOptions()
         kordoc_table_command_status.cache_clear()
 
-        with patch("app.core.pipeline.shutil.which", return_value="C:\\Tools\\kordoc.cmd"):
+        with patch("app.core.pipeline.resolve_kordoc_command", return_value="C:/Tools/kordoc.cmd"):
             with patch("app.core.pipeline._command_version", return_value="4.0.0"):
                 payload = processing_options_payload(
                     options,
@@ -134,6 +134,26 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(payload["kordoc_table_command_available"])
         self.assertEqual(payload["kordoc_table_command_resolved_name"], "kordoc.cmd")
         self.assertEqual(payload["kordoc_table_command_version"], "4.0.0")
+        kordoc_table_command_status.cache_clear()
+
+    def test_processing_options_payload_uses_kordoc_windows_global_fallback(self) -> None:
+        options = ChunkOptions()
+        kordoc_table_command_status.cache_clear()
+
+        with patch("app.core.pipeline.resolve_kordoc_command", return_value=r"C:\Npm\kordoc.cmd"):
+            with patch("app.core.pipeline._command_version", return_value="4.2.3"):
+                payload = processing_options_payload(
+                    options,
+                    settings=Settings(
+                        data_dir=Path("data"),
+                        enable_kordoc_table_parser=True,
+                        kordoc_table_command="kordoc",
+                    ),
+                )
+
+        self.assertTrue(payload["kordoc_table_command_available"])
+        self.assertEqual(payload["kordoc_table_command_resolved_name"], "kordoc.cmd")
+        self.assertEqual(payload["kordoc_table_command_version"], "4.2.3")
         kordoc_table_command_status.cache_clear()
 
     def test_processing_options_payload_keeps_agent_review_scope_when_provider_execution_disabled(self) -> None:
