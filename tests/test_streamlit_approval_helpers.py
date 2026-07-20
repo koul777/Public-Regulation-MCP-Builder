@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.core.config import Settings
 from app.schemas.chunk import Chunk
@@ -244,6 +246,28 @@ class StreamlitApprovalHelperTests(unittest.TestCase):
         self.assertTrue(preflight["ready"])
         self.assertEqual(1, preflight["parsed_document_count"])
         self.assertEqual([], preflight["missing"])
+
+    def test_kordoc_installer_candidates_include_source_setup_script(self) -> None:
+        candidates = streamlit_app._kordoc_installer_candidates()
+
+        self.assertTrue(candidates)
+        self.assertTrue(any(candidate.name == "INSTALL_KORDOC_KO.ps1" for candidate in candidates))
+
+    def test_kordoc_installer_redacts_operator_output(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout="Kordoc 4.2.3\nsource=C:\\Users\\someone\\Desktop\\rules.hwp\n",
+            stderr="",
+        )
+        with patch.object(streamlit_app.sys, "platform", "win32"), patch.object(
+            streamlit_app, "_kordoc_installer_candidates", return_value=[Path("C:/Npm/INSTALL_KORDOC_KO.ps1")]
+        ), patch.object(streamlit_app.subprocess, "run", return_value=completed) as run:
+            result = streamlit_app._run_kordoc_installer()
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn("C:\\Users\\someone", result["output"])
+        self.assertIn("[local-path-redacted]", result["output"])
+        self.assertIn("-PersistUserPath", run.call_args.args[0])
 
 
 if __name__ == "__main__":

@@ -344,6 +344,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Kordoc 표 파싱 사전 점검", source)
         self.assertIn("현재 Kordoc 명령은 사용 가능하지만", source)
         self.assertIn("kordoc-reprocess-goto-", source)
+        self.assertIn("kordoc_auto_install_attempted", source)
+        self.assertIn("Kordoc 설치·검증 다시 실행", source)
         self.assertIn("Draft MCP server command; approve and index chunks before connecting a client.", source)
         self.assertIn("MCP server command is ready for connection.", source)
         self.assertIn("MCP로 쓸 파일 묶음 만들기", source)
