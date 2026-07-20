@@ -84,6 +84,10 @@ _RAG_APPROVAL_SNAPSHOT_CACHE: dict[
     tuple[Path, str, tuple[str, ...]],
     tuple[tuple[Any, ...], dict[tuple[str, str], dict[str, Any]]],
 ] = {}
+_RUNTIME_CONTENT_SIGNATURE_LOCK = threading.Lock()
+_RUNTIME_CONTENT_SIGNATURE_CACHE: dict[
+    Path, tuple[_FileIdentitySignature, tuple[int, str]]
+] = {}
 _RAG_RESPONSE_METADATA_PROFILES = frozenset({"full", "external", "chatgpt-data"})
 _EXTERNAL_RAG_RESPONSE_METADATA_PROFILES = frozenset({"external", "chatgpt-data"})
 _INTERNAL_RAG_RESPONSE_METADATA_KEYS = frozenset(
@@ -798,13 +802,17 @@ def _runtime_approval_snapshot_path(repository: JsonRepository) -> Path:
 
 def _runtime_approval_snapshot_file_signatures(
     repository: JsonRepository,
-) -> dict[str, tuple[int, ...] | None]:
+) -> dict[str, tuple[Any, ...] | None]:
     return {
-        "repository_manifest": _path_signature(repository.manifest_path),
+        # Runtime bundles are routinely copied or extracted from a ZIP.  File
+        # identity fields such as inode and mtime are therefore not portable
+        # across handoff environments.  Content signatures keep the approval
+        # sidecar valid after extraction while still invalidating it on edits.
+        "repository_manifest": _portable_file_signature(repository.manifest_path),
         # Legacy repositories are still readable for backward compatibility;
         # a mutation there must invalidate the runtime approval sidecar too.
-        "legacy_repository": _path_signature(repository.legacy_path),
-        "approval_journal": _path_signature(repository.root / "journals" / "approvals.jsonl"),
+        "legacy_repository": _portable_file_signature(repository.legacy_path),
+        "approval_journal": _portable_file_signature(repository.root / "journals" / "approvals.jsonl"),
         # Approval/rejection and ACL changes are persisted to per-document chunk
         # files before their audit record is appended.  Include those files in
         # the sidecar contract so a failure between the two writes cannot leave
@@ -813,15 +821,48 @@ def _runtime_approval_snapshot_file_signatures(
     }
 
 
-def _repository_chunk_files_signature(repository: JsonRepository) -> tuple[int, int]:
+def _portable_file_signature(path: Path) -> tuple[int, str] | None:
+    """Return a ZIP-portable content signature for a runtime file.
+
+    The stat signature is used only as a cheap cache key.  The value written
+    to the runtime approval sidecar is the byte length plus SHA-256 digest, so
+    extraction to a different filesystem does not force a live snapshot
+    rebuild merely because inode/timestamp values changed.
+    """
+
+    stat_signature = _path_signature(path)
+    if stat_signature is None:
+        return None
+    with _RUNTIME_CONTENT_SIGNATURE_LOCK:
+        cached = _RUNTIME_CONTENT_SIGNATURE_CACHE.get(path)
+        if cached and cached[0] == stat_signature:
+            return cached[1]
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                while block := handle.read(1024 * 1024):
+                    digest.update(block)
+        except OSError:
+            return None
+        signature = (int(stat_signature[1]), digest.hexdigest())
+        _RUNTIME_CONTENT_SIGNATURE_CACHE[path] = (stat_signature, signature)
+        return signature
+
+
+def _repository_chunk_files_signature(repository: JsonRepository) -> tuple[int, str]:
     file_signatures = [
-        (path.name, _chunk_path_identity_signature(path))
+        (path.name, _portable_file_signature(path))
         for path in sorted(repository.root.glob("*_chunks.json"), key=lambda candidate: candidate.name)
     ]
     digest = hashlib.sha256(
         json.dumps(file_signatures, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return (int(digest[:16], 16), int(digest[16:32], 16))
+    total_bytes = sum(
+        int(signature[1][0])
+        for signature in file_signatures
+        if signature[1] is not None
+    )
+    return (total_bytes, digest)
 
 
 def _chunk_path_identity_signature(path: Path) -> tuple[int, int, int, int] | None:

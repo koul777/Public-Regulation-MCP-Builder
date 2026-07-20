@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import tempfile
 import unittest
 import json
@@ -1996,6 +1997,21 @@ class RoutesRagTests(unittest.TestCase):
 
         self.assertIn(("doc", "chunk-1"), snapshot)
         self.assertEqual("approval-chunk-1", snapshot[("doc", "chunk-1")]["approval_id"])
+
+    def test_runtime_approval_snapshot_sidecar_survives_bundle_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_data = Path(tmp) / "source" / "data"
+            target_data = Path(tmp) / "target" / "data"
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="mcp_internal", role="operator")
+            record = _vector_record("doc:chunk-1", "approved text")
+            _write_runtime_approval_snapshot_sidecar_fixture(source_data, [record], tenant_id="tenant-a")
+            shutil.copytree(source_data, target_data)
+            target_repository = JsonRepository(Settings(data_dir=target_data))
+
+            with patch.object(routes_rag, "_build_approval_snapshot", side_effect=AssertionError("live rebuild")):
+                snapshot = routes_rag._load_cached_approval_snapshot(target_repository, [record], auth)
+
+        self.assertIn(("doc", "chunk-1"), snapshot)
 
     def test_runtime_approval_snapshot_sidecar_falls_back_when_journal_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
