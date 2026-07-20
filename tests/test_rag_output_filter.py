@@ -52,6 +52,12 @@ class RagOutputFilterTests(unittest.TestCase):
         self.assertNotIn("/etc/passwd", sanitized)
         self.assertNotIn("~/.ssh/id_rsa", sanitized)
 
+    def test_redacts_quoted_powershell_image_open_command(self) -> None:
+        sanitized = sanitize_rag_answer("& 'C:\\Users\\dd\\Desktop\\7월 20일\\다운로드.png'")
+
+        self.assertEqual("[local-path-redacted]", sanitized)
+        self.assertNotIn("다운로드.png", sanitized)
+
 
 if __name__ == "__main__":
     unittest.main()
