@@ -2924,9 +2924,16 @@ def _kordoc_installer_candidates() -> list[Path]:
 
     candidates: list[Path] = []
     try:
-        candidates.append(Path(sys.executable).resolve().parent / "INSTALL_KORDOC_KO.ps1")
+        executable_dir = Path(sys.executable).resolve().parent
+        candidates.append(executable_dir / "INSTALL_KORDOC_KO.ps1")
+    except OSError:
+        executable_dir = None
+    try:
+        candidates.append(Path(sys.prefix).resolve() / "INSTALL_KORDOC_KO.ps1")
     except OSError:
         pass
+    if executable_dir is not None:
+        candidates.append(executable_dir.parent / "INSTALL_KORDOC_KO.ps1")
     candidates.extend(
         (
             PROJECT_ROOT / "INSTALL_KORDOC_KO.ps1",

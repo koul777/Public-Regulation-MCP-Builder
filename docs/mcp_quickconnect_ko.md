@@ -10,7 +10,7 @@
 
 Kordoc 사전 점검: HWP/HWPX/PDF/DOCX가 선택 범위에 있으면 MCP 생성 화면이 저장된 Kordoc 증거(`status=parsed`, `parser=kordoc`)를 먼저 확인합니다. 현재 PC에 Kordoc을 설치했더라도 과거 `not_available` 전처리 결과가 자동으로 바뀌지는 않으므로, `npm install -g kordoc` 후 원본을 ① 전처리 화면에서 다시 처리하고 ② 사람 검토·승인을 다시 완료한 뒤 ③ `Index approved chunks` 또는 `Reindex approved chunks`를 실행해야 합니다. 증거가 없으면 비싼 bundle export를 시작하지 않고 재처리 화면으로 안내합니다.
 
-Kordoc 명령이 없는 Windows 환경에서는 MCP 화면이 첫 진입 시 `INSTALL_KORDOC_KO.ps1`을 한 번 자동 실행해 설치·검증을 시도합니다. Node.js/npm이 없거나 설치가 실패하면 화면의 재시도 버튼 또는 portable ZIP의 설치 스크립트를 사용하고, 설치가 끝난 뒤 원본 재처리·승인·색인을 다시 수행합니다.
+Kordoc 명령이 없는 Windows 환경에서는 MCP 화면이 첫 진입 시 `INSTALL_KORDOC_KO.ps1`을 한 번 자동 실행해 설치·검증을 시도합니다. 이 스크립트는 portable ZIP과 wheel 설치본에 포함되며, 가상환경 전역 경로도 자동 탐색합니다. Node.js/npm이 없거나 설치가 실패하면 화면의 재시도 버튼 또는 portable ZIP의 설치 스크립트를 사용하고, 설치가 끝난 뒤 원본 재처리·승인·색인을 다시 수행합니다.
 
 미검수 프리뷰는 `UNREVIEWED_PREVIEW`로 분리합니다. 이 모드는 품질과 연결 UX를 빠르게 확인하기 위한 경고 상태이며, 정식 MCP handoff, 외부 AI 연결, 기관 업무 사용, release evidence에는 사용할 수 없습니다.
 
