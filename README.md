@@ -275,7 +275,7 @@ README 촬영용 샘플에서는 외부 API 키를 넣지 않았으므로 실제
 
 `선택한 규정 N개`에서는 각 규정의 승인 청크 수와 MCP 노출 기록 수를 표로 확인합니다. 하나라도 검수·승인·색인이 끝나지 않았으면 누락된 채 생성하지 않고 MCP 생성 버튼을 잠급니다.
 
-그다음 ChatGPT Desktop 로컬 direct MCP, Codex CLI, Claude Desktop, Claude Code, ChatGPT 원격 MCP 또는 Claude HTTPS 중 실제로 사용할 대상을 선택합니다. ChatGPT Desktop, Codex, Claude Code는 압축을 푼 번들 폴더를 로컬 작업공간으로 연 뒤 생성 결과 아래의 대상별 에이전트 연결 요청문을 붙여넣는 방식을 우선 사용합니다. 에이전트가 doctor·설치·각 CLI의 `mcp get` 검증을 실행하며, 일반 채팅처럼 로컬 파일·터미널 권한이 없는 화면에서는 BAT를 보조 수단으로 사용합니다.
+그다음 ChatGPT Desktop 로컬 direct MCP, Codex CLI, Claude Desktop, Claude Code, ChatGPT 원격 MCP 또는 Claude HTTPS 중 실제로 사용할 대상을 선택합니다. ChatGPT Desktop, Codex, Claude Code는 생성 결과 아래의 대상별 에이전트 연결 요청문을 붙여넣는 방식을 우선 사용합니다. 프로그램의 복사 상자는 현재 번들의 폴더 이름·정확한 절대경로·핵심 파일 구조를 요청문에 자동으로 넣으므로, 에이전트가 엉뚱한 작업공간을 검색하지 않고 번들 루트를 먼저 검증할 수 있습니다. 에이전트가 doctor·설치·각 CLI의 `mcp get` 검증을 실행하며, 일반 채팅처럼 로컬 파일·터미널 권한이 없는 화면에서는 BAT를 보조 수단으로 사용합니다.
 
 ![기관 범위와 MCP 연결 대상을 선택하는 화면](docs/assets/readme-guide-05-mcp-next.png)
 

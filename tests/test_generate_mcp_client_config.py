@@ -24,6 +24,9 @@ from app.schemas.document import Document
 from app.schemas.structure import StructureNode
 from app.storage.repository import JsonRepository
 from scripts.generate_mcp_client_config import (
+    AGENT_CONNECT_BUNDLE_NAME_MARKER,
+    AGENT_CONNECT_BUNDLE_DIR_MARKER,
+    AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER,
     RUNTIME_IDENTITY_MODULES,
     _install_local_package_script,
     _powershell_runtime_identity_validator_lines,
@@ -34,6 +37,7 @@ from scripts.generate_mcp_client_config import (
     build_mcp_client_config,
     main,
     parse_args,
+    render_agent_connect_prompt_for_program,
     write_mcp_runtime_data_bundle,
     write_mcp_setup_bundle,
     write_mcp_setup_bundle_zip,
@@ -129,6 +133,57 @@ def _fake_client_config_smoke_source(message: str = "client-smoke-ok") -> str:
 
 
 class GenerateMcpClientConfigTests(unittest.TestCase):
+    def test_program_copy_prompt_materializes_exact_bundle_path_without_changing_portable_source(self) -> None:
+        portable_prompt = (
+            f"Bundle name: {AGENT_CONNECT_BUNDLE_NAME_MARKER}\n"
+            f"Bundle: {AGENT_CONNECT_BUNDLE_DIR_MARKER}\n"
+            f"$BundleDir = {AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER}\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "MCP's 한글 번들"
+            bundle_dir.mkdir()
+            rendered = render_agent_connect_prompt_for_program(
+                portable_prompt,
+                bundle_dir=bundle_dir,
+            )
+
+        resolved = str(bundle_dir.resolve())
+        self.assertIn(f"Bundle name: {bundle_dir.name}", rendered)
+        self.assertIn(f"Bundle: {resolved}", rendered)
+        self.assertIn("$BundleDir = '" + resolved.replace("'", "''") + "'", rendered)
+        self.assertNotIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, rendered)
+        self.assertNotIn(AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER, rendered)
+        self.assertNotIn(AGENT_CONNECT_BUNDLE_NAME_MARKER, rendered)
+        self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, portable_prompt)
+
+    def test_program_copy_prompt_upgrades_existing_workspace_search_prompt(self) -> None:
+        legacy_prompt = """# ChatGPT Desktop 에이전트 MCP 연결 요청
+
+1. 현재 작업공간에서 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 `$BundleDir`로 삼고 `Set-Location -LiteralPath $BundleDir`을 실행해. 0개 또는 여러 개면 임의 경로를 선택하지 말고 중단해.
+2. `manifest.json`을 확인해.
+"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "기존 번들"
+            bundle_dir.mkdir()
+            rendered = render_agent_connect_prompt_for_program(
+                legacy_prompt,
+                bundle_dir=bundle_dir,
+            )
+
+        self.assertIn("생성 프로그램이 지정한 현재 번들 폴더", rendered)
+        self.assertIn(f"생성 프로그램이 지정한 번들 폴더 이름: `{bundle_dir.name}`", rendered)
+        self.assertIn("├─ manifest.json", rendered)
+        self.assertIn("├─ data\\", rendered)
+        self.assertIn("reg_rag_preprocessor-*.whl  (독립 배포용 wheel을 포함한 경우)", rendered)
+        self.assertIn("runtime_python.json", rendered)
+        self.assertIn("$BundleDir = '" + str(bundle_dir.resolve()) + "'", rendered)
+        self.assertIn("CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md", rendered)
+        self.assertIn("그 정확한 폴더를 작업공간으로 열거나 추가", rendered)
+        self.assertNotIn("현재 작업공간에서 `CHATGPT_DESKTOP", rendered)
+        self.assertIn("2. `manifest.json`을 확인해.", rendered)
+
     def test_runtime_identity_payloads_are_encoded_for_powershell_native_argv(self) -> None:
         builder_source = base64.b64decode(_runtime_identity_builder_base64()).decode("utf-8")
         verifier_source = base64.b64decode(_runtime_identity_verifier_base64()).decode("utf-8")
@@ -2125,6 +2180,16 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual({"govreg-local"}, set(plugin_mcp["mcpServers"]))
             self.assertNotIn("mcp_servers", plugin_mcp)
             agent_prompt = Path(files["chatgpt_desktop_agent_prompt"]).read_text(encoding="utf-8")
+            self.assertIn(AGENT_CONNECT_BUNDLE_NAME_MARKER, agent_prompt)
+            self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, agent_prompt)
+            self.assertIn(AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER, agent_prompt)
+            self.assertNotIn(str(output_dir.resolve()), agent_prompt)
+            self.assertIn("그 정확한 폴더를 작업공간으로 열거나 추가", agent_prompt)
+            self.assertIn("원본 파일을 직접 붙여넣은 경우에만", agent_prompt)
+            self.assertIn("├─ ChatGPT Desktop에 연결하기.bat", agent_prompt)
+            self.assertIn("├─ data\\", agent_prompt)
+            self.assertIn("reg_rag_preprocessor-*.whl", agent_prompt)
+            self.assertIn("runtime_python.json", agent_prompt)
             self.assertIn("codex mcp get govreg-local --json", agent_prompt)
             self.assertIn("direct_config_loader_verified", agent_prompt)
             self.assertIn("direct_stdio_verified", agent_prompt)
@@ -2136,12 +2201,16 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             final_tool_prompt = "govreg-local MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘."
             self.assertIn(final_tool_prompt, agent_prompt)
             codex_agent_prompt = Path(files["codex_agent_prompt"]).read_text(encoding="utf-8")
+            self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, codex_agent_prompt)
+            self.assertNotIn(str(output_dir.resolve()), codex_agent_prompt)
             self.assertIn("codex mcp get govreg-local --json", codex_agent_prompt)
             self.assertIn("direct_stdio_verified", codex_agent_prompt)
             self.assertIn("desktop_app_server_loader_verified", codex_agent_prompt)
             self.assertIn(final_tool_prompt, codex_agent_prompt)
             self.assertIn("Codex를 완전히 종료하고 다시 실행", codex_agent_prompt)
             claude_agent_prompt = Path(files["claude_code_agent_prompt"]).read_text(encoding="utf-8")
+            self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, claude_agent_prompt)
+            self.assertNotIn(str(output_dir.resolve()), claude_agent_prompt)
             self.assertIn("claude mcp get govreg-local", claude_agent_prompt)
             self.assertIn(final_tool_prompt, claude_agent_prompt)
             self.assertIn("Claude Code를 완전히 종료하고 다시 실행", claude_agent_prompt)

@@ -82,6 +82,7 @@ from scripts.generate_mcp_client_config import (
     KORDOC_TABLE_REQUIRED_FILE_TYPES,
     _kordoc_table_parser_evidence_summary,
     build_mcp_client_config,
+    render_agent_connect_prompt_for_program,
     write_mcp_runtime_data_bundle,
     write_mcp_setup_bundle,
     write_mcp_setup_bundle_zip,
@@ -7023,8 +7024,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 prompt_label = Path(str(agent_prompt_path)).stem.replace("_", " ")
                 st.markdown(f"#### {prompt_label}")
                 st.caption(
-                    "먼저 압축을 푼 번들 폴더를 해당 AI의 로컬 프로젝트/작업공간으로 연 뒤, "
-                    "아래 코드 상자 오른쪽 위의 복사 아이콘으로 요청문 전체를 복사해 에이전트에 붙여넣고 "
+                    "프로그램이 현재 번들의 폴더 이름·정확한 절대경로·핵심 파일 구조를 아래 요청문에 자동으로 넣습니다. "
+                    "가능하면 그 폴더를 해당 AI의 로컬 프로젝트/작업공간으로 열고, "
+                    "코드 상자 오른쪽 위의 복사 아이콘으로 요청문 전체를 복사해 에이전트에 붙여넣고, "
+                    "경로 접근 승인이 필요하면 표시된 그 폴더만 작업공간으로 열거나 추가한 뒤 "
                     "설치 검증이 끝날 때까지 실행하세요. "
                     "그 후 해당 앱을 완전히 종료·재실행하고 새 대화 또는 task에서 `/mcp`로 확인합니다. "
                     "일반 채팅처럼 로컬 파일·터미널 권한이 없는 화면에서는 실행되지 않습니다."
@@ -7034,6 +7037,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 except OSError as exc:
                     st.warning(f"연결 요청문을 읽을 수 없습니다: {exc}")
                 else:
+                    agent_prompt_text = render_agent_connect_prompt_for_program(
+                        agent_prompt_text,
+                        bundle_dir=Path(str(agent_prompt_path)).parent,
+                    )
                     st.code(agent_prompt_text, language=None)
             if installed_target in {"chatgpt-desktop-local", "codex", "all-local"}:
                 st.markdown("#### ChatGPT/Codex Desktop 7단계 연결 진단")
