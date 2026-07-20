@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import os
 import shlex
-import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from app.agents.review_policy import AgentReviewPolicy
+from app.processors.kordoc_table_parser import resolve_kordoc_command
 from app.schemas.chunk import ChunkOptions
 
 
@@ -76,7 +76,7 @@ def kordoc_table_command_status(command: str) -> dict[str, Any]:
     }
     if not label:
         return status
-    resolved = shutil.which(label)
+    resolved = resolve_kordoc_command(label)
     if not resolved:
         return status
     status["available"] = True
