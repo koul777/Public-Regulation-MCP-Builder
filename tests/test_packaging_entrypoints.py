@@ -149,6 +149,7 @@ class PackagingEntrypointTests(unittest.TestCase):
     def test_kordoc_portable_installer_has_fail_closed_setup_checks(self) -> None:
         installer = (ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1").read_text(encoding="utf-8")
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
         self.assertIn("Get-Command npm", installer)
         self.assertIn("npm install -g kordoc", installer)
@@ -157,6 +158,10 @@ class PackagingEntrypointTests(unittest.TestCase):
         self.assertIn("kordoc --version", installer)
         self.assertIn("재처리 -> 사람 승인 -> 승인하고 색인", installer)
         self.assertIn("recursive-include packaging *.py *.spec *.txt *.ps1", manifest)
+        self.assertEqual(
+            pyproject["tool"]["setuptools"]["data-files"]["."],
+            ["packaging/INSTALL_KORDOC_KO.ps1"],
+        )
 
     def test_readme_discloses_kordoc_source_and_bundle_scope(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
