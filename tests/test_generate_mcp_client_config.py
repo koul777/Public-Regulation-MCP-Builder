@@ -2713,12 +2713,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
 
                 payload_json = json.dumps(payload, ensure_ascii=False).replace("'", "''")
                 expected_config_ps = expected_config.replace("'", "''")
+                bundle_dir_ps = str(bundle_dir).replace("'", "''")
                 harness = "\n".join(
                     [
                         '$ErrorActionPreference = "Stop"',
                         "$InstallationAttemptId = 'focused-red-attempt'",
                         "$ServerName = 'expected-report-server'",
-                        f"$BundleDir = '{str(bundle_dir).replace("'", "''")}'",
+                        f"$BundleDir = '{bundle_dir_ps}'",
                         "function BundlePath([string]$Name) { return Join-Path $BundleDir $Name }",
                         "function Read-JsonFile([string]$Name) {",
                         "  return [pscustomobject]@{ installation_attempt_id = $InstallationAttemptId; runtime_fingerprint = 'runtime-current' }",
