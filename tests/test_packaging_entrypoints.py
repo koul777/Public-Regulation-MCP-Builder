@@ -142,8 +142,21 @@ class PackagingEntrypointTests(unittest.TestCase):
             "THIRD_PARTY_NOTICES.md",
             "docs\\mcp_quickconnect_ko.md",
             "docs\\public_repository_history_policy_ko.md",
+            "packaging\\INSTALL_KORDOC_KO.ps1",
         ):
             self.assertIn(expected_path, build_script)
+
+    def test_kordoc_portable_installer_has_fail_closed_setup_checks(self) -> None:
+        installer = (ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1").read_text(encoding="utf-8")
+        manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+        self.assertIn("Get-Command npm", installer)
+        self.assertIn("npm install -g kordoc", installer)
+        self.assertIn("npm prefix -g", installer)
+        self.assertIn("where.exe kordoc", installer)
+        self.assertIn("kordoc --version", installer)
+        self.assertIn("재처리 -> 사람 승인 -> 승인하고 색인", installer)
+        self.assertIn("recursive-include packaging *.py *.spec *.txt *.ps1", manifest)
 
     def test_readme_discloses_kordoc_source_and_bundle_scope(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

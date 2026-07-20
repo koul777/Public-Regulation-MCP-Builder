@@ -17,7 +17,7 @@ include docs/public_release_report_allowlist.example.json
 include docs/ui_ux_release_scope_ko.md
 recursive-include tests *.py
 recursive-include scripts *.ps1
-recursive-include packaging *.py *.spec *.txt
+recursive-include packaging *.py *.spec *.txt *.ps1
 prune build
 prune data
 prune dist

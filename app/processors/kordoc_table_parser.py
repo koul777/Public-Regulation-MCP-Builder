@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -247,6 +248,16 @@ def _windows_npm_global_dirs() -> list[Path]:
     if userprofile:
         directories.append(Path(userprofile) / "AppData" / "Roaming" / "npm")
     directories.append(Path.home() / "AppData" / "Roaming" / "npm")
+    # npm supports custom global prefixes (for example on a new machine or
+    # managed workstation).  Desktop/portable launchers often inherit a PATH
+    # that omits that prefix, so ask npm directly after the conventional
+    # Windows locations have been checked.  This is cached by the executable
+    # path to avoid spawning npm once per source document during a batch.
+    npm_executable = shutil.which("npm")
+    if npm_executable:
+        npm_prefix = _npm_global_prefix(str(npm_executable))
+        if npm_prefix is not None:
+            directories.append(npm_prefix)
     unique: list[Path] = []
     seen: set[str] = set()
     for directory in directories:
@@ -256,6 +267,39 @@ def _windows_npm_global_dirs() -> list[Path]:
         seen.add(key)
         unique.append(directory)
     return unique
+
+
+@lru_cache(maxsize=8)
+def _npm_global_prefix(npm_executable: str) -> Path | None:
+    """Return npm's configured global prefix without exposing it as metadata."""
+
+    executable = str(npm_executable or "").strip()
+    if not executable:
+        return None
+    argv = [executable, "prefix", "-g"]
+    if _is_windows() and executable.lower().endswith((".cmd", ".bat")):
+        argv = ["cmd", "/c", *argv]
+    try:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    candidate = Path(lines[-1])
+    if not candidate.is_absolute():
+        return None
+    return candidate
 
 
 def _windows_command_candidates(directory: Path, command_name: str) -> list[Path]:

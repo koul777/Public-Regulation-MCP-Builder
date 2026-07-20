@@ -485,6 +485,51 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(Path(captured["argv"][2]), shim)
         self.assertEqual(captured["argv"][-3:], ["--format", "json", "--silent"])
 
+    def test_parse_file_finds_windows_npm_custom_prefix_when_path_and_defaults_are_stale(self) -> None:
+        """A custom npm prefix must work when a desktop launcher has a stale PATH."""
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prefix = root / "custom-npm-prefix"
+            prefix.mkdir()
+            shim = prefix / "kordoc.cmd"
+            shim.write_text("@echo off\n", encoding="utf-8")
+            npm_executable = root / "npm.cmd"
+            npm_executable.write_text("@echo off\n", encoding="utf-8")
+            settings = Settings(
+                data_dir=root / "data",
+                enable_kordoc_table_parser=True,
+                kordoc_table_command="kordoc",
+                kordoc_table_timeout_seconds=10,
+            )
+            captured: dict[str, list[str]] = {}
+
+            def fake_which(command: str):
+                return str(npm_executable) if command == "npm" else None
+
+            def fake_run(argv, **kwargs):
+                captured.setdefault("calls", []).append(argv)
+                if argv[:2] == ["cmd", "/c"] and argv[-2:] == ["prefix", "-g"]:
+                    return SimpleNamespace(returncode=0, stdout=f"{prefix}\n", stderr="")
+                captured["argv"] = argv
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"blocks": []}), stderr="")
+
+            with patch("app.processors.kordoc_table_parser.shutil.which", side_effect=fake_which), patch(
+                "app.processors.kordoc_table_parser._is_windows", return_value=True
+            ), patch.dict(
+                "app.processors.kordoc_table_parser.os.environ",
+                {"APPDATA": str(root / "missing-appdata"), "USERPROFILE": str(root / "missing-profile")},
+                clear=False,
+            ), patch("app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run):
+                result = KordocTableParser(settings).parse_file(root / "sample.hwp")
+
+        self.assertEqual(result["status"], "parsed")
+        self.assertEqual(captured["calls"][0][:2], ["cmd", "/c"])
+        self.assertEqual(captured["calls"][0][-2:], ["prefix", "-g"])
+        self.assertEqual(captured["argv"][:2], ["cmd", "/c"])
+        self.assertEqual(Path(captured["argv"][2]), shim)
+
     @unittest.skipIf(os.name == "nt", "POSIX command invocation test")
     def test_parse_file_runs_resolved_binary_directly_off_windows(self) -> None:
         # On POSIX (or when the resolved command is a real binary) no cmd.exe wrapper.

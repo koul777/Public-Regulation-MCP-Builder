@@ -32,6 +32,7 @@ from app.api.routes_documents import (
     transition_regulation_status,
 )
 from app.api.routes_rag import RagChatRequest, rag_chat
+from app.core.api_audit import redact_sensitive_paths
 from app.core.config import get_settings, set_runtime_settings_overrides
 from app.core.pipeline import kordoc_table_command_status
 from app.agents.provider_config import (
@@ -2915,6 +2916,70 @@ def _mcp_kordoc_preflight(
         "documents": summary.get("documents") or [],
         "required_file_types": sorted(KORDOC_TABLE_REQUIRED_FILE_TYPES),
         "command_status": command_status,
+    }
+
+
+def _kordoc_installer_candidates() -> list[Path]:
+    """Return source and portable locations for the explicit Kordoc setup script."""
+
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(sys.executable).resolve().parent / "INSTALL_KORDOC_KO.ps1")
+    except OSError:
+        pass
+    candidates.extend(
+        (
+            PROJECT_ROOT / "INSTALL_KORDOC_KO.ps1",
+            PROJECT_ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1",
+        )
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            unique.append(candidate)
+    return unique
+
+
+def _run_kordoc_installer() -> dict[str, Any]:
+    """Run the explicit Windows installer and return redacted operator output."""
+
+    if sys.platform != "win32":
+        return {"ok": False, "error": "windows_only", "output": ""}
+    candidates = _kordoc_installer_candidates()
+    if not candidates:
+        return {"ok": False, "error": "installer_missing", "output": ""}
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(candidates[0]),
+                "-PersistUserPath",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "installer_timeout", "output": ""}
+    except OSError:
+        return {"ok": False, "error": "installer_unavailable", "output": ""}
+    output = redact_sensitive_paths("\n".join(part for part in (completed.stdout, completed.stderr) if part))
+    return {
+        "ok": completed.returncode == 0,
+        "error": "" if completed.returncode == 0 else "installer_failed",
+        "output": output[-4000:],
     }
 
 
@@ -6050,6 +6115,27 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"Kordoc 명령({command_label})을 현재 실행 환경에서 찾을 수 없습니다. "
                         "먼저 `npm install -g kordoc` 후 앱을 재시작하고 원본 문서를 다시 전처리하세요."
                     )
+                    if st.button(
+                        "Kordoc 설치·검증 실행",
+                        key=f"kordoc-install-run-{document_id}-{mcp_scope}",
+                        help="Node.js/npm이 설치된 Windows PC에서 Kordoc을 설치하고 사용자 PATH를 확인합니다.",
+                    ):
+                        with st.spinner("Kordoc 설치·검증 중..."):
+                            install_result = _run_kordoc_installer()
+                        if install_result.get("ok"):
+                            kordoc_table_command_status.cache_clear()
+                            st.success("Kordoc 설치·검증이 완료됐습니다. 화면을 새로 고쳐 명령 상태를 다시 확인합니다.")
+                            if install_result.get("output"):
+                                st.code(str(install_result["output"]), language="text")
+                            st.rerun()
+                        else:
+                            error_code = str(install_result.get("error") or "installer_failed")
+                            st.error(
+                                f"Kordoc 설치·검증을 완료하지 못했습니다 ({error_code}). "
+                                "Node.js LTS 설치 여부와 npm 오류를 확인한 뒤 README의 수동 명령을 실행하세요."
+                            )
+                            if install_result.get("output"):
+                                st.code(str(install_result["output"]), language="text")
                 missing_ids = ", ".join(
                     str(item.get("document_id") or "") for item in kordoc_preflight["missing"][:10]
                 )
@@ -6059,7 +6145,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         "기존 approved chunk를 직접 수정하거나 게이트를 끄지 마세요."
                     )
                 if st.button(
-                    "Kordoc 설치 후 원본 재처리 화면으로 이동",
+                    "원본 재처리 화면으로 이동",
                     key=f"kordoc-reprocess-goto-{document_id}-{mcp_scope}",
                 ):
                     _go(NAV_PREPROCESS)

@@ -80,6 +80,7 @@ try {
     Copy-Item -LiteralPath "docs\public_repository_history_policy_ko.md" -Destination $StageDocs
 
     Copy-Item -LiteralPath "packaging\README_RUN_KO.txt" -Destination $StageRoot
+    Copy-Item -LiteralPath "packaging\INSTALL_KORDOC_KO.ps1" -Destination $StageRoot
 
     if (Test-Path -LiteralPath $ZipPath) {
         Remove-Item -LiteralPath $ZipPath -Force
