@@ -57,7 +57,7 @@ SETUP_BUNDLE_FILES = {
     "connect_chatgpt_tunnel_bat": "ChatGPT 보안 Tunnel에 연결하기.bat",
     "connect_claude_https_bat": "Claude HTTPS에 연결하기.bat",
     "chatgpt_desktop_local": "chatgpt_desktop_local_mcp.json",
-    "chatgpt_desktop_agent_prompt": "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+    "chatgpt_desktop_agent_prompt": "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
     "codex_agent_prompt": "CODEX_AGENT_CONNECT_PROMPT.md",
     "claude_code_agent_prompt": "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md",
     "doctor_bat": "연결 상태 확인하기.bat",

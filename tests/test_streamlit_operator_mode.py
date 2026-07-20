@@ -206,7 +206,9 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("diagnostic_from_bundle_status", source)
         self.assertIn('status_path = Path(bundle_dir) / "bundle_status.json"', source)
         self.assertIn("MCP 연결 상태 새로고침", source)
-        self.assertIn("ChatGPT/Codex Desktop 7단계 연결 진단", source)
+        self.assertIn("ChatGPT Desktop 7단계 연결 진단", source)
+        self.assertIn("Codex CLI 7단계 연결 진단", source)
+        self.assertNotIn("ChatGPT Desktop·Codex CLI 7단계 연결 진단", source)
         self.assertIn("재시작 후 최종 확인 프롬프트", source)
         self.assertIn("MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.", source)
         self.assertIn('if diagnostic_state == "connected":', source)
@@ -506,8 +508,27 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('"chatgpt-desktop-local": "chatgpt_desktop_agent_prompt"', source)
         self.assertIn('"codex": "codex_agent_prompt"', source)
         self.assertIn('"claude-code": "claude_code_agent_prompt"', source)
-        self.assertIn("ChatGPT Desktop 로컬 direct MCP", source)
-        self.assertIn("Codex CLI (개발자용 호환)", source)
+        self.assertIn('"chatgpt-desktop-local": "ChatGPT Desktop"', source)
+        self.assertIn('"codex": "Codex CLI"', source)
+        self.assertIn('"chatgpt-remote": "ChatGPT 원격 MCP (HTTPS)"', source)
+        self.assertIn('"chatgpt-tunnel": "ChatGPT 웹 (보안 Tunnel MCP)"', source)
+        self.assertNotIn('"all-local": "로컬 AI 앱 모두"', source)
+        target_order = [
+            '"claude-code"',
+            '"codex"',
+            '"claude-desktop"',
+            '"chatgpt-desktop-local"',
+            '"chatgpt-remote"',
+            '"chatgpt-tunnel"',
+            '"claude-api"',
+        ]
+        options_start = source.index("mcp_connection_target_options = [")
+        options_end = source.index("]", options_start)
+        options_source = source[options_start:options_end]
+        self.assertEqual(
+            sorted(options_source.index(target) for target in target_order),
+            [options_source.index(target) for target in target_order],
+        )
         self.assertIn("connection_target_file", source)
         self.assertIn("사용자용 연결 파일", source)
         self.assertIn("Path(str(bundle_state.get('connection_target_file'))).name", source)
@@ -515,7 +536,6 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Path(str(zip_path)).name", source)
         self.assertIn("BAT 보조 연결 방식", source)
         self.assertIn("Claude Desktop 기본 BAT 연결 방식", source)
-        self.assertIn("Claude Desktop 기본 BAT 및 기타 앱 보조 BAT", source)
         self.assertIn("로컬 프로젝트/작업공간", source)
         self.assertIn("코드 상자 오른쪽 위의 복사 아이콘", source)
         self.assertIn("현재 번들의 폴더 이름·정확한 절대경로·핵심 파일 구조", source)

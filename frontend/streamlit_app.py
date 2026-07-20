@@ -6481,34 +6481,36 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             else mcp_connection_ready
         )
         mcp_connection_target_labels = {
-            "chatgpt-desktop-local": "ChatGPT Desktop 로컬 direct MCP (stdio)",
-            "codex": "Codex CLI (개발자용 호환)",
-            "claude-desktop": "Claude Desktop",
             "claude-code": "Claude Code",
-            "all-local": "로컬 AI 앱 모두",
-            "chatgpt-remote": "ChatGPT 원격 MCP (Streamable HTTP/HTTPS)",
+            "codex": "Codex CLI",
+            "claude-desktop": "Claude Desktop",
+            "chatgpt-desktop-local": "ChatGPT Desktop",
+            "chatgpt-remote": "ChatGPT 원격 MCP (HTTPS)",
             "chatgpt-tunnel": "ChatGPT 웹 (보안 Tunnel MCP)",
             "claude-api": "Claude (HTTPS MCP)",
         }
+        mcp_connection_target_options = [
+            "claude-code",
+            "codex",
+            "claude-desktop",
+            "chatgpt-desktop-local",
+            "chatgpt-remote",
+            "chatgpt-tunnel",
+            "claude-api",
+        ]
+        mcp_connection_target_key = f"mcp-connection-target-{document_id}"
+        if st.session_state.get(mcp_connection_target_key) not in {None, *mcp_connection_target_options}:
+            del st.session_state[mcp_connection_target_key]
         mcp_connection_target = st.radio(
             "연결할 AI 앱",
-            [
-                "chatgpt-desktop-local",
-                "claude-desktop",
-                "claude-code",
-                "all-local",
-                "codex",
-                "chatgpt-remote",
-                "chatgpt-tunnel",
-                "claude-api",
-            ],
+            mcp_connection_target_options,
             format_func=lambda value: mcp_connection_target_labels.get(value, value),
-            key=f"mcp-connection-target-{document_id}",
+            key=mcp_connection_target_key,
             horizontal=True,
         )
         st.caption(
-            "ChatGPT Desktop·Codex·Claude Code에는 에이전트 연결 요청문과 보조 BAT를 만들며 요청문이 기본입니다. "
-            "Claude Desktop은 전용 BAT를 기본으로 사용합니다."
+            "ChatGPT Desktop에는 Settings > MCP servers 내장 등록 안내와 보조 BAT를 만듭니다. "
+            "Codex CLI·Claude Code에는 에이전트 연결 요청문과 보조 BAT를 만들며, Claude Desktop은 전용 BAT를 기본으로 사용합니다."
         )
         if mcp_scope == "selected_institution":
             st.info(
@@ -6548,8 +6550,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             mcp_transport = "stdio"
         else:
             st.info(
-                "MCP 로컬은 이 PC에서 stdio로 실행됩니다. Codex·Claude Code·ChatGPT Desktop은 압축을 푼 번들을 "
-                "로컬 작업공간으로 열고 대상별 연결 요청문을 실행하며, 로컬 실행 권한이 없을 때만 BAT를 사용합니다. "
+                "MCP 로컬은 이 PC에서 stdio로 실행됩니다. ChatGPT Desktop은 Settings > MCP servers에서 생성된 값을 등록하고, "
+                "Codex CLI·Claude Code는 압축을 푼 번들을 로컬 작업공간으로 열어 대상별 연결 요청문을 실행합니다. "
+                "ChatGPT Desktop 내장 등록이 어렵거나 로컬 에이전트 실행 권한이 없을 때만 대상별 BAT를 사용합니다. "
                 "Claude Desktop은 전용 BAT가 기본입니다. 등록과 현재 대화의 도구 노출은 서로 다른 상태입니다."
             )
             mcp_profile_options = ["bundle", "chatgpt-desktop-local", "claude-desktop", "claude-code"]
@@ -6749,7 +6752,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             "codex": "codex_agent_prompt",
             "claude-desktop": "connect_claude_desktop_bat",
             "claude-code": "claude_code_agent_prompt",
-            "all-local": "doctor_bat",
             "chatgpt-desktop-local": "chatgpt_desktop_agent_prompt",
             "chatgpt-remote": "connect_chatgpt_https_bat",
             "chatgpt-tunnel": "connect_chatgpt_tunnel_bat",
@@ -6944,7 +6946,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     )
                 st.success("MCP 실행 데이터와 연결 파일 묶음을 만들었습니다.")
                 if selected_target_file:
-                    if mcp_target_file_key.endswith("_agent_prompt"):
+                    if mcp_connection_target == "chatgpt-desktop-local":
+                        st.success(
+                            "ChatGPT Desktop 내장 MCP 서버 등록 안내를 만들었습니다. "
+                            "아래 Name·STDIO·Command·Arguments를 Settings > MCP servers > Add server에 입력하세요: "
+                            f"{Path(str(selected_target_file)).name}"
+                        )
+                    elif mcp_target_file_key.endswith("_agent_prompt"):
                         st.success(
                             f"{mcp_connection_target_labels.get(mcp_connection_target)} 에이전트 연결 요청문을 만들었습니다. "
                             f"아래 내용을 복사해 해당 에이전트에 붙여넣으세요: {Path(str(selected_target_file)).name}"
@@ -6961,11 +6969,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         st.success(
                             f"{mcp_connection_target_labels.get(mcp_connection_target)} 연결 준비 버튼을 만들었습니다. "
                             "파일을 실행한 뒤 아래 대상별 등록·재시작·최종 확인 절차까지 완료하세요: "
-                            f"{Path(str(selected_target_file)).name}"
-                        )
-                    elif mcp_connection_target == "all-local":
-                        st.success(
-                            "Codex/ChatGPT Desktop/Claude 연결 버튼을 모두 만들었습니다. 먼저 연결 상태 확인 버튼을 실행할 수 있습니다: "
                             f"{Path(str(selected_target_file)).name}"
                         )
                     else:
@@ -6986,7 +6989,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"- 연결 마법사: `{Path(str(files.get('connect'))).name}`",
                         f"- 설치 확인 스크립트: `{Path(str(files.get('install'))).name}`",
                         f"- 설치 후 사용 안내: `{Path(str(files.get('usage_guide_bat'))).name}`",
-                        f"- ChatGPT Desktop 에이전트 연결 요청문: `{Path(str(files.get('chatgpt_desktop_agent_prompt'))).name}`",
+                        f"- ChatGPT Desktop 내장 MCP 등록 안내: `{Path(str(files.get('chatgpt_desktop_agent_prompt'))).name}`",
                         f"- Codex 에이전트 연결 요청문: `{Path(str(files.get('codex_agent_prompt'))).name}`",
                         f"- Claude Code 에이전트 연결 요청문: `{Path(str(files.get('claude_code_agent_prompt'))).name}`",
                         f"- Codex CLI 호환 수동 입력값: `{Path(str(files.get('codex_plugin_guide'))).name}`",
@@ -7012,26 +7015,29 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             installed_server_name = str(bundle_state.get("server_name") or mcp_server_name)
             installed_target = str(bundle_state.get("connection_target") or "")
             agent_prompt_paths = []
-            if installed_target == "all-local":
-                agent_prompt_paths = [
-                    bundle_state.get("chatgpt_desktop_agent_prompt"),
-                    bundle_state.get("codex_agent_prompt"),
-                    bundle_state.get("claude_code_agent_prompt"),
-                ]
-            elif bundle_state.get("agent_connect_prompt"):
+            if bundle_state.get("agent_connect_prompt"):
                 agent_prompt_paths = [bundle_state.get("agent_connect_prompt")]
             for agent_prompt_path in [path for path in agent_prompt_paths if path]:
-                prompt_label = Path(str(agent_prompt_path)).stem.replace("_", " ")
+                prompt_path = Path(str(agent_prompt_path))
+                prompt_label = prompt_path.stem.replace("_", " ")
+                is_chatgpt_desktop_guide = prompt_path.name == "CHATGPT_DESKTOP_CONNECT_GUIDE.md"
                 st.markdown(f"#### {prompt_label}")
-                st.caption(
-                    "프로그램이 현재 번들의 폴더 이름·정확한 절대경로·핵심 파일 구조를 아래 요청문에 자동으로 넣습니다. "
-                    "가능하면 그 폴더를 해당 AI의 로컬 프로젝트/작업공간으로 열고, "
-                    "코드 상자 오른쪽 위의 복사 아이콘으로 요청문 전체를 복사해 에이전트에 붙여넣고, "
-                    "경로 접근 승인이 필요하면 표시된 그 폴더만 작업공간으로 열거나 추가한 뒤 "
-                    "설치 검증이 끝날 때까지 실행하세요. "
-                    "그 후 해당 앱을 완전히 종료·재실행하고 새 대화 또는 task에서 `/mcp`로 확인합니다. "
-                    "일반 채팅처럼 로컬 파일·터미널 권한이 없는 화면에서는 실행되지 않습니다."
-                )
+                if is_chatgpt_desktop_guide:
+                    st.caption(
+                        "ChatGPT Desktop의 Settings > MCP servers > Add server에 아래 실제 값을 입력하세요. "
+                        "프로그램이 현재 번들의 폴더 이름·절대경로·핵심 파일 구조와 전체 Arguments를 자동으로 넣었습니다. "
+                        "저장 후 Desktop을 Restart하고 새 대화에서 `/mcp`와 실제 도구 호출을 확인합니다."
+                    )
+                else:
+                    st.caption(
+                        "프로그램이 현재 번들의 폴더 이름·정확한 절대경로·핵심 파일 구조를 아래 요청문에 자동으로 넣습니다. "
+                        "가능하면 그 폴더를 해당 AI의 로컬 프로젝트/작업공간으로 열고, "
+                        "코드 상자 오른쪽 위의 복사 아이콘으로 요청문 전체를 복사해 에이전트에 붙여넣고, "
+                        "경로 접근 승인이 필요하면 표시된 그 폴더만 작업공간으로 열거나 추가한 뒤 "
+                        "설치 검증이 끝날 때까지 실행하세요. "
+                        "그 후 해당 앱을 완전히 종료·재실행하고 새 대화 또는 task에서 `/mcp`로 확인합니다. "
+                        "일반 채팅처럼 로컬 파일·터미널 권한이 없는 화면에서는 실행되지 않습니다."
+                    )
                 try:
                     agent_prompt_text = Path(str(agent_prompt_path)).read_text(encoding="utf-8")
                 except OSError as exc:
@@ -7042,8 +7048,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         bundle_dir=Path(str(agent_prompt_path)).parent,
                     )
                     st.code(agent_prompt_text, language=None)
-            if installed_target in {"chatgpt-desktop-local", "codex", "all-local"}:
-                st.markdown("#### ChatGPT/Codex Desktop 7단계 연결 진단")
+            if installed_target in {"chatgpt-desktop-local", "codex"}:
+                diagnostic_title = (
+                    "ChatGPT Desktop 7단계 연결 진단"
+                    if installed_target == "chatgpt-desktop-local"
+                    else "Codex CLI 7단계 연결 진단"
+                )
+                st.markdown(f"#### {diagnostic_title}")
                 st.caption(
                     "이 표는 화면이 다시 실행될 때마다 번들의 bundle_status.json을 새로 읽습니다. "
                     "설정·서버 검증과 실제 Desktop 연결 완료를 별도 상태로 표시하며, "
@@ -7096,8 +7107,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     language=None,
                 )
                 st.markdown("#### 재시작 후 최종 확인 프롬프트")
+                restart_target_label = (
+                    "ChatGPT Desktop"
+                    if installed_target == "chatgpt-desktop-local"
+                    else "Codex CLI"
+                )
                 st.caption(
-                    "ChatGPT/Codex Desktop을 완전히 종료·재실행한 뒤 새 대화에서 먼저 `/mcp`로 "
+                    f"{restart_target_label}를 완전히 종료·재실행한 뒤 새 대화나 task에서 먼저 `/mcp`로 "
                     f"`{installed_server_name}`을 확인하고, 아래 문장을 그대로 복사해 실행하세요."
                 )
                 st.code(
@@ -7107,8 +7123,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.markdown(
                 "#### Claude Desktop 기본 BAT 연결 방식"
                 if installed_target == "claude-desktop"
-                else "#### Claude Desktop 기본 BAT 및 기타 앱 보조 BAT"
-                if installed_target == "all-local"
                 else "#### 원격 MCP 연결 준비 및 최종 확인"
                 if installed_target in MCP_EXTERNAL_DATA_TARGETS
                 else "#### BAT 보조 연결 방식"
@@ -7116,9 +7130,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.markdown(f"**등록할 MCP 이름:** `{installed_server_name}`")
             if installed_target == "chatgpt-desktop-local":
                 st.info(
-                    "연결 프롬프트와 보조 BAT는 ChatGPT Desktop·Codex가 공유하는 config.toml에 direct MCP를 등록합니다. "
-                    "ChatGPT Desktop의 Settings > MCP servers > Add server는 수동 대안이며, 이 번들은 설치와 경로 검증까지 필요한 복사 프롬프트를 우선합니다. "
-                    "ChatGPT Desktop을 완전히 종료한 뒤 다시 시작하고, "
+                    "ChatGPT Desktop의 Settings > MCP servers > Add server가 기본 연결 방식입니다. "
+                    "위 안내에 표시된 Name·STDIO·Command·Working directory·Arguments를 입력하고 Save한 뒤 Restart하세요. "
+                    "메뉴가 없거나 수동 입력이 어려울 때만 ChatGPT Desktop 전용 BAT를 보조 수단으로 사용합니다. "
                     f"새 대화에서 먼저 `/mcp`로 {installed_server_name}을 확인하세요. `@이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다."
                 )
             elif installed_target == "codex":
@@ -7126,11 +7140,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             elif installed_target == "claude-code":
                 st.info("Claude Code를 다시 시작하고 대화에서 `/mcp` 또는 터미널의 `claude mcp list`로 확인하세요.")
             elif installed_target == "claude-desktop":
-                st.info("Claude Desktop을 완전히 종료한 뒤 다시 시작하고 새 대화를 여세요.")
-            elif installed_target == "all-local":
                 st.info(
-                    "ChatGPT Desktop·Codex·Claude Code는 각 요청문의 설치 검증 후 앱을 완전히 재시작하고 `/mcp`로 확인합니다. "
-                    "Claude Desktop은 전용 BAT를 실행한 뒤 완전히 재시작해 새 대화를 여세요."
+                    "Claude Desktop 전용 BAT는 설치된 사용자 설정으로 stdio 도구 호출까지 검증합니다. "
+                    "그 성공은 Desktop 자체 인식 완료가 아니므로 앱을 완전히 종료·재실행한 뒤 "
+                    "새 대화의 Connectors에서 서버를 확인하고 실제 get_index_status 호출을 요청하세요."
                 )
             elif installed_target in {"chatgpt-remote", "chatgpt-tunnel"}:
                 st.info(
@@ -7154,10 +7167,15 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "같은 이름으로 다시 생성하고 Claude Desktop 전용 BAT를 실행하면 기존 연결 설정을 교체합니다. "
                     "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
                 )
-            elif installed_target in {"chatgpt-desktop-local", "codex", "claude-code", "all-local"}:
+            elif installed_target == "chatgpt-desktop-local":
+                st.caption(
+                    "같은 이름으로 다시 생성하면 Settings > MCP servers의 기존 항목을 새 안내 값으로 갱신합니다. "
+                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
+                )
+            elif installed_target in {"codex", "claude-code"}:
                 st.caption(
                     "같은 이름으로 다시 생성하고 대상별 에이전트 프롬프트를 실행하면 기존 연결 설정을 교체하며, "
-                    "ChatGPT Desktop·Codex·Claude Code에서 로컬 에이전트를 사용할 수 없을 때만 보조 BAT를 실행합니다. "
+                    "Codex CLI·Claude Code에서 로컬 에이전트를 사용할 수 없을 때만 보조 BAT를 실행합니다. "
                     "Claude Desktop은 전용 BAT가 기본입니다. 현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
                 )
             elif installed_target in {"chatgpt-remote", "chatgpt-tunnel"}:

@@ -48,7 +48,7 @@ reg-rag-mcp-config `
 
 `--public-url`이 없어도 ChatGPT Desktop 로컬 direct MCP와 선택형 plugin package, Codex CLI, Claude Desktop, Claude Code의 stdio 설정은 생성됩니다. ChatGPT 원격 앱/Claude API 연결만 `ready=false`로 표시됩니다.
 로컬 Claude Desktop/Claude Code만 검증할 때는 doctor에 `--allow-local-only-bundle`을 붙이면 원격 프로필 not-ready를 실패로 보지 않습니다. 이 검사는 번들 내 JSON 구문과 Claude Desktop `mcpServers` 구조도 함께 확인합니다.
-Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop`를 먼저 실행합니다. 통과하면 `-InstallClaudeDesktop` 자동 병합을 사용하고, 수동 편집 시에는 생성된 JSON 전체가 아니라 `mcpServers` 항목만 병합합니다. 생성된 `claude_desktop_config.json`은 bundle 폴더의 `data` 경로를 가리키도록 만들어지지만, zip을 다른 위치에 풀었다면 자동 병합 스크립트를 다시 실행하는 편이 안전합니다.
+Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop`를 먼저 실행합니다. 통과하면 `-InstallClaudeDesktop` 자동 병합을 사용하고, 수동 편집 시에는 생성된 JSON 전체가 아니라 `mcpServers` 항목만 병합합니다. 자동 병합은 설치된 사용자 설정으로 `initialize`·`tools/list`·`get_index_status`까지 직접 검증하고 `bundle_status.json`을 `installed_pending_claude_desktop_verification`으로 기록합니다. 이는 Claude Desktop 자체 로더나 현재 대화 노출 성공이 아니므로, 완전 재시작 후 Connectors와 실제 도구 호출을 별도로 확인합니다. 생성된 `claude_desktop_config.json`은 bundle 폴더의 `data` 경로를 가리키도록 만들어지지만, zip을 다른 위치에 풀었다면 자동 병합 스크립트를 다시 실행하는 편이 안전합니다.
 
 번들의 `data/` 폴더는 실제 approved runtime payload입니다. approved chunks, approved vectors, BM25 index, approval/indexing journal, `mcp_runtime_manifest.json`만 handoff 대상이며 raw `*_nodes.json`, `*_issues.json`, `*_quality.json`는 포함하지 않습니다.
 
@@ -57,7 +57,7 @@ Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp
 - `README.md`, `README.ko.md`
 - `connect_mcp_client.ps1`
 - `MCP 사용 시작하기.txt`
-- `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`
+- `CHATGPT_DESKTOP_CONNECT_GUIDE.md`
 - `CODEX_AGENT_CONNECT_PROMPT.md`
 - `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`
 - `설치 후 MCP 사용 방법 보기.bat`
@@ -87,7 +87,7 @@ Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp
 - `data/vector_db/<tenant>/approved_vectors.jsonl`
 - `data/vector_db/<tenant>/bm25_index.json`
 
-프로그램에서 연결 대상을 선택하면 ChatGPT Desktop, Codex, Claude Code에는 대상별 `*_AGENT_CONNECT_PROMPT.md`를 먼저 표시하고, 로컬 파일·터미널 권한이 없는 경우를 위한 보조 BAT도 만듭니다. 압축을 푼 번들 폴더를 해당 AI의 로컬 작업공간으로 연 뒤 요청문을 붙여넣고 doctor·설치·로더 검증을 완료합니다. 그 후 해당 앱을 완전히 종료하고 다시 시작한 뒤 새 대화 또는 task에서 `/mcp`로 `aksmcp`를 확인하고 `aksmcp MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.`라고 요청합니다. ChatGPT Desktop 요청문과 보조 BAT는 Desktop·Codex가 공유하는 `config.toml`에 direct MCP를 등록하고 `codex mcp get`으로 현재 번들 경로를 검증합니다. 생성 플러그인은 Work/Codex 배포가 명시적으로 필요할 때만 쓰는 선택 산출물이며, `@aksmcp` 반복 입력은 설치나 연결 확인을 대신하지 않습니다. Claude Desktop은 전용 BAT가 기본이고 설치 검증 후 앱을 재시작하며 `/mcp` 공통 절차에서는 제외합니다. 같은 이름으로 다시 생성하면 기존 설정을 교체하고 추가·개정 청크를 같은 MCP에 포함합니다.
+프로그램에서 ChatGPT Desktop 연결 대상을 선택하면 생성 결과 화면의 `CHATGPT_DESKTOP_CONNECT_GUIDE.md` 코드 상자에 현재 번들 경로와 Name·STDIO·Command·Arguments를 표시합니다. 이 값을 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하고 Save·Restart한 뒤 새 대화에서 `/mcp`와 실제 도구 호출을 확인합니다. ZIP 안의 원본 GUIDE에 `<PROGRAM_BUNDLE_DIR>`이 보이면 그대로 복사하지 않습니다. 내장 메뉴가 없거나 수동 입력이 어려울 때만 전용 BAT를 사용합니다. Codex CLI와 Claude Code에는 대상별 `*_AGENT_CONNECT_PROMPT.md`를 표시하며, Claude Desktop은 전용 BAT가 기본입니다. `@aksmcp` 반복 입력은 설치나 연결 확인을 대신하지 않습니다. 같은 이름으로 다시 생성하면 기존 설정을 새 값으로 갱신하고 추가·개정 청크를 같은 MCP에 포함합니다.
 
 ## stdio 방식
 
