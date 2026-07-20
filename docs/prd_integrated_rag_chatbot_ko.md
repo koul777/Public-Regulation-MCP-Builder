@@ -221,7 +221,7 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 
 ### 12.3 외부 ChatGPT 연결
 
-외부 ChatGPT Apps/Connectors 연결은 MVP 기본 범위가 아니다. 필요 시 공개 가능 데이터 또는 별도 승인된 망연계 환경에서 HTTPS MCP 서버로 구성한다. 내부망 MCP 서버를 외부에 직접 노출하지 않는 구성이 필요하면 OpenAI Secure MCP Tunnel 템플릿을 선택 경로로 제공한다.
+외부 ChatGPT 개발자 모드 앱/플러그인 연결은 MVP 기본 범위가 아니다. 필요 시 공개 가능 데이터 또는 별도 승인된 망연계 환경에서 HTTPS MCP 서버로 구성한다. 내부망 MCP 서버를 외부에 직접 노출하지 않는 구성이 필요하면 OpenAI Secure MCP Tunnel 템플릿을 선택 경로로 제공한다.
 
 ## 13. 성공 지표
 
@@ -305,4 +305,4 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 - 내부망 AI 플랫폼이 지원하는 MCP transport 범위
 - 기관별 보안등급과 부서 ACL을 필수로 둘지 선택 기능으로 둘지
 - 검색은 키워드 우선으로 시작할지, deterministic local embedding을 기본 포함할지
-- ChatGPT Apps 연결은 공개 규정 전용 별도 프로파일로 둘지
+- ChatGPT Plugins 연결은 공개 규정 전용 별도 프로파일로 둘지

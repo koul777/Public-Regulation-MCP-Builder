@@ -17,6 +17,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertIn("README.ko.md", text)
         self.assertIn("connect_mcp_client.ps1", text)
         self.assertIn("MCP 사용 시작하기.txt", text)
+        self.assertIn("CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
         self.assertIn("설치 후 MCP 사용 방법 보기.bat", text)
         self.assertIn("Codex 플러그인 MCP 입력값.txt", text)
         self.assertIn("ChatGPT Desktop에 연결하기.bat", text)
@@ -24,7 +27,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertIn("Claude Desktop에 연결하기.bat", text)
         self.assertIn("Claude Code에 연결하기.bat", text)
         self.assertIn("연결 상태 확인하기.bat", text)
-        self.assertIn("@aks_mcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", text)
+        self.assertIn("먼저 /mcp로 aks_mcp가 연결됨으로 보이는지 확인", text)
         self.assertIn("같은 이름으로 번들을 다시 생성", text)
         self.assertIn("install_local_package.ps1", text)
         self.assertIn("Write MCP setup bundle now", text)
@@ -71,6 +74,10 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertIn("Approve selected review batch for RAG", text)
         self.assertIn("review_flags_acknowledged", text)
         self.assertIn("예열 후 AKS 첫 `search`는 약 143ms", text)
+        self.assertIn("Claude Desktop에는 위 `/mcp` 지시를 적용하지 않습니다", text)
+        self.assertIn("ChatGPT Desktop은 direct config가 기본", text)
+        self.assertNotIn("ChatGPT Desktop 로컬 플러그인, Codex CLI", text)
+        self.assertNotIn("Codex CLI는 `Codex에 연결하기.bat`를 사용합니다", text)
 
     def test_client_config_doc_explains_warm_cache_and_latency_fields(self) -> None:
         text = (REPO_ROOT / "docs" / "mcp_client_config_examples_ko.md").read_text(encoding="utf-8")
@@ -84,7 +91,13 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertIn("Claude Desktop에 연결하기.bat", text)
         self.assertIn("Claude Code에 연결하기.bat", text)
         self.assertIn("연결 상태 확인하기.bat", text)
-        self.assertIn("@aksmcp MCP 연결 상태와 사용 가능한 규정 도구를 보여줘.", text)
+        self.assertIn("aksmcp MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.", text)
+        self.assertIn("*_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("Claude Desktop은 전용 BAT가 기본", text)
+        self.assertIn("플러그인은 Work/Codex 배포가 명시적으로 필요할 때만", text)
         self.assertIn("--client-profile chatgpt-remote", text)
         self.assertIn("추가·개정 청크", text)
         self.assertIn("--codex-config", text)
@@ -101,6 +114,10 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("docs/mcp_quickconnect_ko.md", text)
+        self.assertIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
+        self.assertIn("Claude Desktop에는 위 `/mcp` 단계를 적용하지 않습니다", text)
+        self.assertNotIn("기존과 동일하게 생성된 `.bat` 파일을 더블클릭해 연결", text)
 
 
 if __name__ == "__main__":

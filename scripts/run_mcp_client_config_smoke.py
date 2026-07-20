@@ -3,13 +3,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime, timezone
+import ipaddress
 import os
 import json
 from pathlib import Path
+import re
+import secrets
 import sys
 import time
 import tomllib
 from typing import Any, Sequence, TextIO
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
@@ -90,7 +94,7 @@ def run_mcp_client_config_smoke(
         bool(result.get("end_to_end_verified")) and bool(result.get("strict_stdio_wire_verified"))
         for result in local_results
     )
-    verification_prompt = f"@{server_name} MCP 연결 상태와 사용 가능한 규정 도구를 보여줘."
+    verification_prompt = f"{server_name} MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘."
     report = {
         "report_type": "mcp_client_config_smoke",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -243,7 +247,11 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     elif client_key == "chatgpt_desktop_local":
         payload = _read_strict_utf8_json(config_path)
-        servers = payload.get("mcp_servers") if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and "mcp_servers" in payload:
+            raise ValueError(
+                f"{config_path} uses unsupported mcp_servers; Codex plugin .mcp.json requires mcpServers."
+            )
+        servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     else:
         raise ValueError(f"Unsupported client key: {client_key}")
     if not isinstance(servers, dict):
@@ -267,9 +275,18 @@ def _read_strict_utf8_json(path: Path) -> Any:
     except UnicodeDecodeError as exc:
         raise ValueError(f"{path} must contain strict UTF-8 JSON: {exc}") from exc
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"{path} must contain valid strict UTF-8 JSON: {exc}") from exc
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
 
 
 def _validate_strict_jsonrpc_stdout(stdout: bytes) -> dict[str, Any]:
@@ -310,53 +327,113 @@ def _run_remote_client_smoke(
     remote_token_env: str | None,
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    url = remote_url.strip()
-    if not url.lower().startswith("https://"):
+    url = _normalize_remote_mcp_url(remote_url)
+    report_url = _sanitize_remote_url_for_report(remote_url)
+    if url is None:
         return {
             "label": "chatgpt_remote",
-            "remote_url": url,
+            "remote_url": report_url,
             "passed": False,
             "launcher_ready": False,
             "process_started": False,
             "mcp_initialized": False,
             "tools_discovered": False,
             "end_to_end_verified": False,
-            "error": "Remote ChatGPT MCP verification requires an https:// endpoint.",
+            "auth_wire_verified": False,
+            "error": (
+                "Remote MCP verification requires a valid public https:// URL without "
+                "credentials, query parameters, fragments, whitespace, or a non-public IP literal."
+            ),
         }
-    token = os.getenv(remote_token_env, "").strip() if remote_token_env else ""
-    if remote_token_env and not token:
+    if not remote_token_env:
         return {
             "label": "chatgpt_remote",
-            "remote_url": url,
+            "remote_url": report_url,
             "passed": False,
             "launcher_ready": False,
             "process_started": False,
             "mcp_initialized": False,
             "tools_discovered": False,
             "end_to_end_verified": False,
+            "auth_wire_verified": False,
+            "error": "A named bearer-token environment variable is required for a direct remote MCP URL.",
+        }
+    token = os.getenv(remote_token_env, "").strip()
+    if not token:
+        return {
+            "label": "chatgpt_remote",
+            "remote_url": report_url,
+            "passed": False,
+            "launcher_ready": False,
+            "process_started": False,
+            "mcp_initialized": False,
+            "tools_discovered": False,
+            "end_to_end_verified": False,
+            "auth_wire_verified": False,
             "error": f"Environment variable is not set or empty: {remote_token_env}",
         }
     try:
         result = asyncio.run(
             asyncio.wait_for(
-                _run_remote_entry(url=url, token=token or None),
+                _run_remote_entry_with_auth_verification(url=url, token=token or None),
                 timeout=timeout_seconds,
             )
         )
-        result.update({"label": "chatgpt_remote", "remote_url": url, "launcher_ready": True})
+        result.update({"label": "chatgpt_remote", "remote_url": report_url, "launcher_ready": True})
         return result
     except Exception as exc:
         return {
             "label": "chatgpt_remote",
-            "remote_url": url,
+            "remote_url": report_url,
             "passed": False,
             "launcher_ready": True,
             "process_started": False,
             "mcp_initialized": False,
             "tools_discovered": False,
             "end_to_end_verified": False,
-            "error": _exception_message(exc),
+            "auth_wire_verified": False,
+            "error": _redact_remote_exception(exc, token=token, remote_url=remote_url),
         }
+
+
+async def _run_remote_entry_with_auth_verification(*, url: str, token: str | None) -> dict[str, Any]:
+    auth_challenge_observed = await _remote_unauthenticated_request_is_rejected(url=url) if token else False
+    result = await _run_remote_entry(url=url, token=token)
+    result["auth_challenge_observed"] = auth_challenge_observed
+    result["auth_wire_verified"] = bool(auth_challenge_observed)
+    if not token or not auth_challenge_observed:
+        protocol_contract_verified = bool(result.get("contract_verified", result.get("end_to_end_verified")))
+        result["protocol_contract_verified"] = protocol_contract_verified
+        result["passed"] = False
+        result["contract_verified"] = False
+        result["end_to_end_verified"] = False
+        result["error"] = (
+            "The endpoint did not reject both unauthenticated and invalid-bearer MCP initialize requests with 401/403; "
+            "bearer authentication is not fail-closed."
+        )
+    return result
+
+
+async def _remote_unauthenticated_request_is_rejected(*, url: str) -> bool:
+    initialize_request = {
+        "jsonrpc": "2.0",
+        "id": "auth-wire-probe",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "reg-rag-mcp-auth-probe", "version": "0.1"},
+        },
+    }
+    headers = {"Accept": "application/json, text/event-stream"}
+    invalid_headers = {
+        **headers,
+        "Authorization": f"Bearer invalid-{secrets.token_urlsafe(32)}",
+    }
+    async with httpx.AsyncClient(follow_redirects=False) as http_client:
+        unauthenticated = await http_client.post(url, json=initialize_request, headers=headers)
+        invalid_bearer = await http_client.post(url, json=initialize_request, headers=invalid_headers)
+    return all(response.status_code in {401, 403} for response in (unauthenticated, invalid_bearer))
 
 
 async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
@@ -387,9 +464,9 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                         "get_index_status",
                         {"security_levels": ["internal"]},
                     )
-                    index_payload = _tool_payload(index_status)
+                    index_payload = _successful_tool_payload(index_status, tool_name="get_index_status")
                     index_summary = index_payload.get("summary") if isinstance(index_payload.get("summary"), dict) else {}
-                    verified = bool(index_summary)
+                    verified = _valid_index_status_summary(index_summary)
                 else:
                     # The privacy-reduced ChatGPT profile intentionally exposes
                     # only search/fetch. Verify that content contract without
@@ -399,19 +476,23 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                         "search",
                         {"query": DEFAULT_SEARCH_QUERY, "top_k": 1},
                     )
-                    search_payload = _tool_payload(search)
+                    search_payload = _successful_tool_payload(search, tool_name="search")
                     results = search_payload.get("results") if isinstance(search_payload.get("results"), list) else []
-                    first_id = str((results[0] if results else {}).get("id") or "")
+                    first_id = _first_search_result_id(results)
                     fetch_payload: dict[str, Any] = {}
                     if first_id:
                         fetch = await session.call_tool("fetch", {"id": first_id})
-                        fetch_payload = _tool_payload(fetch)
+                        fetch_payload = _successful_tool_payload(fetch, tool_name="fetch")
                     metadata_candidates: list[Any] = []
                     if results and isinstance(results[0], dict):
                         metadata_candidates.append(results[0].get("metadata") or {})
                     metadata_candidates.append(fetch_payload.get("metadata") or {})
                     metadata_violations = _external_metadata_violations(metadata_candidates)
-                    verified = bool(results and fetch_payload.get("text") and not metadata_violations)
+                    verified = bool(
+                        _valid_search_results(results)
+                        and _valid_fetch_payload(fetch_payload)
+                        and not metadata_violations
+                    )
                 return {
                     "passed": verified,
                     "process_started": True,
@@ -635,6 +716,101 @@ def _external_metadata_violations(metadata_candidates: Sequence[Any]) -> list[st
     )
 
 
+def _normalize_remote_mcp_url(remote_url: str | None) -> str | None:
+    cleaned = str(remote_url or "").strip()
+    if not cleaned or any(character.isspace() or ord(character) < 32 for character in cleaned):
+        return None
+    try:
+        parsed = urlsplit(cleaned)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+        or _is_non_public_ip_literal(parsed.hostname)
+    ):
+        return None
+    return urlunsplit(("https", parsed.netloc, parsed.path or "/mcp", "", ""))
+
+
+def _sanitize_remote_url_for_report(remote_url: str | None) -> str | None:
+    cleaned = str(remote_url or "").strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = urlsplit(cleaned)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        return None
+    report_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        report_host = f"{report_host}:{port}"
+    return urlunsplit((parsed.scheme.lower(), report_host, parsed.path or "/mcp", "", ""))
+
+
+def _is_non_public_ip_literal(hostname: str) -> bool:
+    normalized_hostname = hostname.rstrip(".").casefold()
+    if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        return False
+    return bool(not address.is_global or address.is_multicast)
+
+
+def _successful_tool_payload(result: Any, *, tool_name: str) -> dict[str, Any]:
+    if bool(getattr(result, "isError", False)):
+        raise ValueError(f"MCP tool {tool_name} returned isError=true.")
+    payload = _tool_payload(result)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"MCP tool {tool_name} did not return a non-empty object payload.")
+    return payload
+
+
+def _valid_index_status_summary(summary: dict[str, Any]) -> bool:
+    if not summary:
+        return False
+    count_keys = ("document_count", "record_count", "indexed_records", "regulation_count")
+    has_valid_count = any(
+        isinstance(summary.get(key), int) and not isinstance(summary.get(key), bool) and summary[key] >= 0
+        for key in count_keys
+    )
+    status_counts = summary.get("status_counts")
+    has_valid_status_counts = isinstance(status_counts, dict) and bool(status_counts) and all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in status_counts.values()
+    )
+    return bool(has_valid_count or has_valid_status_counts)
+
+
+def _valid_search_results(results: list[Any]) -> bool:
+    return bool(results) and all(
+        isinstance(result, dict) and isinstance(result.get("id"), str) and bool(result["id"].strip())
+        for result in results
+    )
+
+
+def _first_search_result_id(results: list[Any]) -> str:
+    if not _valid_search_results(results):
+        return ""
+    return str(results[0]["id"]).strip()
+
+
+def _valid_fetch_payload(payload: dict[str, Any]) -> bool:
+    text = payload.get("text")
+    return isinstance(text, str) and bool(text.strip())
+
+
 def _exception_message(exc: BaseException) -> str:
     """Flatten TaskGroup/ExceptionGroup errors into an actionable smoke detail."""
     nested = getattr(exc, "exceptions", None)
@@ -643,6 +819,31 @@ def _exception_message(exc: BaseException) -> str:
         return f"{exc.__class__.__name__}: {'; '.join(details)}"
     message = str(exc).strip()
     return f"{exc.__class__.__name__}: {message}" if message else exc.__class__.__name__
+
+
+def _redact_values(text: str, values: Sequence[str]) -> str:
+    """Remove runtime-only secret values from diagnostics before serialization."""
+    redacted = text
+    for value in sorted({item for item in values if item}, key=len, reverse=True):
+        redacted = redacted.replace(value, "[REDACTED]")
+    return redacted
+
+
+def _redact_remote_exception(exc: BaseException, *, token: str, remote_url: str) -> str:
+    detail = _redact_values(_exception_message(exc), [token])
+    safe_url = _sanitize_remote_url_for_report(remote_url) or "[REDACTED_REMOTE_URL]"
+    if remote_url:
+        detail = detail.replace(remote_url, safe_url)
+    detail = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+",
+        r"\1[REDACTED]",
+        detail,
+    )
+
+    def sanitize_url(match: re.Match[str]) -> str:
+        return _sanitize_remote_url_for_report(match.group(0)) or "[REDACTED_REMOTE_URL]"
+
+    return re.sub(r"https?://[^\s]+", sanitize_url, detail, flags=re.IGNORECASE)
 
 
 def _tool_payload(result: Any) -> dict[str, Any]:
