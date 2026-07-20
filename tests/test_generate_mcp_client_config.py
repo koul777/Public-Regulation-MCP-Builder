@@ -41,6 +41,22 @@ from scripts.generate_mcp_client_config import (
 from scripts.mcp_bundle_contract import ALL_SETUP_BUNDLE_FILES, REQUIRED_SETUP_BUNDLE_FILES
 
 
+def _assert_same_existing_path(
+    test_case: unittest.TestCase,
+    expected: str | Path,
+    actual: str | Path,
+) -> None:
+    """Compare file identity so Windows 8.3 and long paths are equivalent."""
+    expected_path = Path(expected)
+    actual_path = Path(actual)
+    test_case.assertTrue(expected_path.exists(), f"Expected path does not exist: {expected_path}")
+    test_case.assertTrue(actual_path.exists(), f"Actual path does not exist: {actual_path}")
+    test_case.assertTrue(
+        os.path.samefile(expected_path, actual_path),
+        f"Paths do not identify the same filesystem entry: {expected_path!s} != {actual_path!s}",
+    )
+
+
 def _test_runtime_marker_payload(python_executable: str | Path) -> dict[str, object]:
     module_sha256 = {
         module_name: "sha256:" + hashlib.sha256(module_name.encode("utf-8")).hexdigest()
@@ -391,7 +407,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertIn("installed and visible on PATH", completed.stdout)
             marker = json.loads((bundle_dir / "runtime_python.json").read_text(encoding="utf-8"))
             self.assertEqual(2, marker["schema_version"])
-            self.assertEqual(str(fake_python.resolve()), marker["python_executable"])
+            _assert_same_existing_path(self, fake_python, marker["python_executable"])
             self.assertEqual("scripts.run_regulation_mcp", marker["package_import"])
             self.assertEqual(set(RUNTIME_IDENTITY_MODULES), set(marker["module_sha256"]))
 
@@ -472,7 +488,10 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
 
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             pip_invocation = pip_log.read_text(encoding="utf-8")
-            self.assertIn(str(bundled_wheel), pip_invocation)
+            invoked_wheels = re.findall(r'"([^"\r\n]+\.whl)"', pip_invocation)
+            self.assertTrue(invoked_wheels, pip_invocation)
+            for invoked_wheel in invoked_wheels:
+                _assert_same_existing_path(self, bundled_wheel, invoked_wheel)
             self.assertNotIn(" pip install -e ", pip_invocation)
             self.assertIn(
                 "pip install --force-reinstall --no-deps",
@@ -629,10 +648,12 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             launcher_source = base64.b64decode(encoded_launcher).decode("utf-16-le")
             self.assertIn("$env:PRMCPBUILDER_TUNNEL_DATA_DIR", launcher_source)
             self.assertIn("'--tool-profile', 'chatgpt-data'", launcher_source)
-            self.assertEqual(f"DATA={data_dir}", inherited_data_dir)
+            self.assertTrue(inherited_data_dir.startswith("DATA="), inherited_data_dir)
+            _assert_same_existing_path(self, data_dir, inherited_data_dir.removeprefix("DATA="))
             server_args = server_args_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual("ARG1=--data-dir", server_args[0])
-            self.assertEqual(f"ARG2={data_dir}", server_args[1])
+            self.assertTrue(server_args[1].startswith("ARG2="), server_args[1])
+            _assert_same_existing_path(self, data_dir, server_args[1].removeprefix("ARG2="))
             self.assertEqual("ARG3=--tenant-id", server_args[2])
             self.assertEqual("ARG4=tenant-a", server_args[3])
             self.assertEqual("ARG7=--flat-storage", server_args[4])
@@ -794,7 +815,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
 
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             marker = json.loads((bundle_dir / "runtime_python.json").read_text(encoding="utf-8"))
-            self.assertEqual(str(fake_python.resolve()), marker["python_executable"])
+            _assert_same_existing_path(self, fake_python, marker["python_executable"])
             self.assertEqual(set(RUNTIME_IDENTITY_MODULES), set(marker["module_sha256"]))
 
     @unittest.skipUnless(os.name == "nt", "PowerShell native-output decoding is Windows-specific.")
@@ -963,7 +984,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             marker = json.loads((bundle_dir / "runtime_python.json").read_text(encoding="utf-8"))
-            self.assertEqual(str(selected_python.resolve()), marker["python_executable"])
+            _assert_same_existing_path(self, selected_python, marker["python_executable"])
 
     @unittest.skipUnless(os.name == "nt", "Windows py launcher behavior is Windows-specific.")
     def test_install_script_uses_py_311_when_python_command_is_absent(self) -> None:
@@ -1049,7 +1070,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
 
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             marker = json.loads((bundle_dir / "runtime_python.json").read_text(encoding="utf-8"))
-            self.assertEqual(str(fake_python.resolve()), marker["python_executable"])
+            _assert_same_existing_path(self, fake_python, marker["python_executable"])
 
     @unittest.skipUnless(os.name == "nt", "PowerShell launcher behavior is Windows-specific.")
     def test_stdio_launcher_uses_path_python_when_console_scripts_are_missing(self) -> None:
@@ -3050,7 +3071,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(legacy_plugin_marker.exists())
             self.assertEqual(3, status["desktop_app_server_tool_count"])
             self.assertEqual(["fetch", "get_index_status", "search"], status["desktop_app_server_tool_names"])
-            self.assertEqual(str(codex_config), status["direct_config_path"])
+            _assert_same_existing_path(self, codex_config, status["direct_config_path"])
 
     @unittest.skipUnless(os.name == "nt", "Codex fresh app-server evidence is Windows-specific.")
     def test_codex_installer_rejects_stale_app_server_report_when_checker_writes_nothing(self) -> None:
