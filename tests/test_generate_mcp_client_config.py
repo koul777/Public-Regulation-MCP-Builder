@@ -4909,6 +4909,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["USERPROFILE"] = str(claude_user_profile)
             env["CLAUDE_FAKE_PYTHON"] = str(Path(sys.executable).resolve())
             env["CLAUDE_FAKE_SCRIPT"] = str(fake_cli.resolve())
+            env["PYTHONIOENCODING"] = "utf-8"
             env["CLAUDE_FAKE_GET_STATUS"] = "Connected"
             env["CLAUDE_EXPECTED_LAUNCHER"] = str((bundle_dir / "run_mcp_stdio_server.ps1").resolve())
             env["CLAUDE_EXPECTED_DATA"] = str((bundle_dir / "data").resolve())
@@ -5080,8 +5081,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 )
             )
             self.assertTrue(smoke_report["passed"])
-            self.assertEqual(
-                str(claude_config.resolve()),
+            _assert_same_existing_path(
+                self,
+                claude_config,
                 smoke_report["results"][0]["config_path"],
             )
             status = json.loads(Path(files["bundle_status"]).read_text(encoding="utf-8"))
