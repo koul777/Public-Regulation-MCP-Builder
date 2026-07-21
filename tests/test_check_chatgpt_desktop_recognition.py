@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -11,8 +12,11 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.check_chatgpt_desktop_recognition import (
+    _discover_appx_desktop_package_families,
     RegistrationObservation,
     build_support_summary,
+    discover_desktop_log_roots,
+    discover_desktop_process_start_times,
     evaluate_recognition_observation,
     load_registration_observation,
     parse_desktop_log_text,
@@ -105,6 +109,26 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
         self.assertFalse(report["recognition_observation_ready"])
         self.assertEqual("mcp_status_list_success_not_observed", report["observation_status"])
 
+    def test_mixed_success_and_error_status_window_is_not_error_free(self) -> None:
+        session = parse_desktop_log_text(
+            "2026-07-20T14:10:00Z info desktop_started\n"
+            "2026-07-20T14:10:04Z info response_routed errorCode=null method=mcpServerStatus/list\n"
+            "2026-07-20T14:10:05Z error response_routed "
+            "errorCode=mcp_start_failed method=mcpServerStatus/list\n"
+        )
+        report = evaluate_recognition_observation(
+            registration=RegistrationObservation(parse_timestamp("2026-07-20T14:00:00Z"), "explicit"),
+            process_start_times=["2026-07-20T14:09:59Z"],
+            log_sessions=[session],
+        )
+
+        self.assertFalse(report["recognition_observation_ready"])
+        self.assertFalse(report["desktop_logs"]["mcp_status_list_observed_without_error"])
+        self.assertEqual(1, report["desktop_logs"]["mcp_status_list_success_count"])
+        self.assertEqual(1, report["desktop_logs"]["mcp_status_list_error_count"])
+        self.assertEqual("mcp_status_list_error_observed", report["observation_status"])
+        self.assertTrue(report["support_summary"]["mcp_status_list_error_observed"])
+
     def test_not_running_is_distinct_from_restart_required(self) -> None:
         report = evaluate_recognition_observation(
             registration=RegistrationObservation(parse_timestamp("2026-07-20T14:00:00Z"), "explicit"),
@@ -115,6 +139,122 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
         self.assertFalse(report["desktop_process"]["detected"])
         self.assertFalse(report["desktop_process"]["restart_required"])
         self.assertEqual("desktop_not_running", report["observation_status"])
+
+    def test_process_discovery_queries_chatgpt_only_and_never_codex_cli(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='["2026-07-20T14:10:00.0000000Z"]\n',
+            stderr="",
+        )
+        with mock.patch("scripts.check_chatgpt_desktop_recognition.os.name", "nt"), mock.patch(
+            "scripts.check_chatgpt_desktop_recognition.subprocess.run",
+            return_value=completed,
+        ) as run_process:
+            discovered = discover_desktop_process_start_times()
+
+        command = run_process.call_args.args[0]
+        script = command[-1]
+        self.assertEqual([parse_timestamp("2026-07-20T14:10:00Z")], discovered)
+        self.assertIn("Get-Process -Name ChatGPT", script)
+        self.assertNotIn("Get-Process -Name Codex", script)
+
+    def test_dynamic_log_roots_accept_only_safe_chatgpt_package_families(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local_app_data = Path(tmp)
+            roots = discover_desktop_log_roots(
+                local_app_data=local_app_data,
+                package_family_names=[
+                    "OpenAI.ChatGPT_testpublisher",
+                    "OpenAI.Codex_testpublisher",
+                    "..\\escape",
+                    "Other.Codex_testpublisher",
+                ],
+            )
+
+        rendered = [str(path) for path in roots]
+        self.assertTrue(any("OpenAI.ChatGPT_testpublisher" in path for path in rendered))
+        self.assertTrue(any("OpenAI.Codex_testpublisher" in path for path in rendered))
+        self.assertFalse(any("escape" in path for path in rendered))
+        self.assertFalse(any("Other.Codex" in path for path in rendered))
+        self.assertTrue(all("Packages" in path for path in rendered))
+
+    def test_appx_identity_discovery_requires_chatgpt_executable_and_filters_output(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    "OpenAI.Codex_testpublisher",
+                    "OpenAI.ChatGPT_testpublisher",
+                    "Other.Codex_testpublisher",
+                    "..\\escape",
+                ]
+            ),
+            stderr="",
+        )
+        with mock.patch("scripts.check_chatgpt_desktop_recognition.os.name", "nt"), mock.patch(
+            "scripts.check_chatgpt_desktop_recognition.subprocess.run",
+            return_value=completed,
+        ) as run_process:
+            families = _discover_appx_desktop_package_families()
+
+        script = run_process.call_args.args[0][-1]
+        self.assertEqual(
+            ["OpenAI.ChatGPT_testpublisher", "OpenAI.Codex_testpublisher"],
+            families,
+        )
+        self.assertIn("app\\ChatGPT.exe", script)
+        self.assertNotIn("app\\Codex.exe", script)
+
+    def test_cli_distinguishes_missing_log_root_without_exposing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_root = Path(tmp) / "private-user-alice" / "missing-logs"
+            stdout = io.StringIO()
+            exit_code = run(
+                [
+                    "--registration-time",
+                    "2026-07-20T14:00:00Z",
+                    "--process-start-time",
+                    "2026-07-20T14:10:00Z",
+                    "--log-root",
+                    str(missing_root),
+                ],
+                stdout=stdout,
+            )
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("desktop_log_root_not_found", payload["observation_status"])
+        self.assertEqual("log_root_missing", payload["desktop_logs"]["discovery_status"])
+        self.assertEqual("log_root_missing", payload["support_summary"]["desktop_log_discovery_status"])
+        self.assertNotIn(str(missing_root), stdout.getvalue())
+        self.assertNotIn("private-user-alice", stdout.getvalue())
+
+    def test_cli_distinguishes_empty_log_root_without_exposing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_root = Path(tmp) / "private-user-alice" / "empty-logs"
+            empty_root.mkdir(parents=True)
+            stdout = io.StringIO()
+            exit_code = run(
+                [
+                    "--registration-time",
+                    "2026-07-20T14:00:00Z",
+                    "--process-start-time",
+                    "2026-07-20T14:10:00Z",
+                    "--log-root",
+                    str(empty_root),
+                ],
+                stdout=stdout,
+            )
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("desktop_log_files_not_found", payload["observation_status"])
+        self.assertEqual("logs_not_found", payload["desktop_logs"]["discovery_status"])
+        self.assertEqual("logs_not_found", payload["support_summary"]["desktop_log_discovery_status"])
+        self.assertNotIn(str(empty_root), stdout.getvalue())
+        self.assertNotIn("private-user-alice", stdout.getvalue())
 
     def test_registration_prefers_explicit_then_bundle_status_then_config_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,6 +297,21 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
         self.assertNotIn("secret.log", serialized)
         self.assertNotIn("C:\\Users", serialized)
         self.assertIn("local-path-redacted", serialized)
+
+    def test_support_summary_tolerates_malformed_discovery_counts(self) -> None:
+        summary = build_support_summary(
+            {
+                "desktop_logs": {
+                    "existing_root_count": "not-a-count",
+                    "log_file_count": object(),
+                    "mcp_status_list_error_count": "unknown",
+                }
+            }
+        )
+
+        self.assertFalse(summary["desktop_log_root_found"])
+        self.assertFalse(summary["desktop_log_files_found"])
+        self.assertFalse(summary["mcp_status_list_error_observed"])
 
     def test_cli_explicit_evidence_writes_path_free_report_and_fail_gate_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

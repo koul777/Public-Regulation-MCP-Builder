@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.mcp_connection_diagnostic import diagnostic_from_bundle_status
+from scripts.mcp_client_status import begin_attempt, commit_success, create_bundle_status
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +66,64 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertEqual("second", calls[1][0]["marker"])
         self.assertEqual("attempt-1", calls[1][1]["attempt_id"])
         self.assertIsNone(calls[1][1]["config_fingerprint"])
+
+    def test_mcp_connection_diagnostic_reader_does_not_mix_v5_client_identities(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_read_mcp_connection_diagnostic"
+        )
+        namespace = {
+            "Any": Any,
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "diagnostic_from_bundle_status": diagnostic_from_bundle_status,
+        }
+        exec(
+            compile(ast.Module(body=[reader_node], type_ignores=[]), "<mcp-diagnostic-reader>", "exec"),
+            namespace,
+        )
+        read_diagnostic = namespace["_read_mcp_connection_diagnostic"]
+        status = begin_attempt(
+            create_bundle_status("final", generated_at="2026-07-21T00:00:00Z"),
+            "codex",
+            "attempt-codex",
+            started_at="2026-07-21T00:01:00Z",
+        )
+        status = commit_success(
+            status,
+            "codex",
+            "attempt-codex",
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-current",
+            bundle_location_fingerprint="bundle-current",
+            verified_at="2026-07-21T00:02:00Z",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "bundle_status.json").write_text(
+                json.dumps(status),
+                encoding="utf-8",
+            )
+            for target in (
+                "claude-code",
+                "claude-desktop",
+                "chatgpt-desktop-local",
+                "chatgpt-remote",
+                "chatgpt-tunnel",
+                "claude-api",
+            ):
+                with self.subTest(target=target):
+                    report, read_error = read_diagnostic(tmp, target)
+                    self.assertIsNone(read_error)
+                    self.assertEqual("client_connections", report.get("status_source"))
+                    self.assertIsNone(report["attempt_id"])
+                    self.assertIsNone(report["config_fingerprint"])
+                    self.assertFalse(report["configured"])
 
     def test_mcp_connection_diagnostic_reader_requires_real_installed_config_fingerprint(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -200,14 +260,117 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             )
         )
 
+    def test_mcp_connection_diagnostic_reader_uses_claude_desktop_config(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_read_mcp_connection_diagnostic"
+        )
+        namespace = {
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "diagnostic_from_bundle_status": diagnostic_from_bundle_status,
+        }
+        exec(
+            compile(ast.Module(body=[reader_node], type_ignores=[]), "<mcp-diagnostic-reader>", "exec"),
+            namespace,
+        )
+        read_diagnostic = namespace["_read_mcp_connection_diagnostic"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "claude_desktop_config.json"
+            config_path.write_text(
+                json.dumps({"mcpServers": {"regulation_mcp": {"command": "powershell.exe"}}}),
+                encoding="utf-8",
+            )
+            actual_fingerprint = "sha256:" + hashlib.sha256(config_path.read_bytes()).hexdigest()
+            runtime_fingerprint = "sha256:runtime-current"
+            (bundle_dir / "bundle_status.json").write_text(
+                json.dumps(
+                    {
+                        "installation_attempt_id": "attempt-claude",
+                        "claude_desktop_config_path": str(config_path),
+                        "claude_desktop_config_fingerprint": actual_fingerprint,
+                        "claude_desktop_config_registered": True,
+                        "claude_desktop_config_transport_verified": True,
+                        "claude_desktop_config_transport_runtime_fingerprint": runtime_fingerprint,
+                        "runtime_fingerprint": runtime_fingerprint,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report, read_error = read_diagnostic(bundle_dir, "claude-desktop")
+
+        self.assertIsNone(read_error)
+        self.assertEqual("claude-desktop", report["connection_target"])
+        self.assertEqual(actual_fingerprint, report["config_fingerprint"])
+        self.assertTrue(report["configured"])
+        self.assertEqual("not_applicable", report["stages"]["fresh_app_server"]["state"])
+
+    def test_desktop_refresh_runs_observer_without_claiming_connection(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_refresh_mcp_connection_observation"
+        )
+        calls: list[list[str]] = []
+
+        def fake_refresh(argv, *, stdout):
+            calls.append(list(argv))
+            stdout.write(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status_updated": True,
+                        "connection_verified": False,
+                    }
+                )
+            )
+            return 0
+
+        namespace = {
+            "Path": Path,
+            "io": io,
+            "json": json,
+            "refresh_mcp_client_connection": fake_refresh,
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-refresh>", "exec"),
+            namespace,
+        )
+
+        refreshed, reason = namespace["_refresh_mcp_connection_observation"](
+            "fixture-bundle",
+            "chatgpt-desktop-local",
+            "regulation_mcp",
+        )
+
+        self.assertTrue(refreshed)
+        self.assertEqual("observation_recorded_pending", reason)
+        self.assertEqual("chatgpt-desktop-local", calls[0][1])
+        self.assertIn("--bundle-status", calls[0])
+        self.assertIn("--bundle-dir", calls[0])
+        self.assertIn("--adopt-manual-registration", calls[0])
+        self.assertNotIn("--fail-on-issue", calls[0])
+
     def test_streamlit_distinguishes_configured_from_desktop_connected(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
         self.assertIn("diagnostic_from_bundle_status", source)
         self.assertIn('status_path = Path(bundle_dir) / "bundle_status.json"', source)
         self.assertIn("MCP 연결 상태 새로고침", source)
-        self.assertIn("ChatGPT Desktop 7단계 연결 진단", source)
-        self.assertIn("Codex CLI 7단계 연결 진단", source)
+        self.assertIn("ChatGPT Desktop 연결 진단", source)
+        self.assertIn("Codex CLI 연결 진단", source)
+        self.assertIn("Claude Code 연결 진단", source)
+        self.assertIn("Claude Desktop 연결 진단", source)
         self.assertNotIn("ChatGPT Desktop·Codex CLI 7단계 연결 진단", source)
         self.assertIn("재시작 후 최종 확인 프롬프트", source)
         self.assertIn("MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.", source)
@@ -219,6 +382,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("support_summary:", source)
         self.assertIn("next_action:", source)
         self.assertIn("st.code(agent_prompt_text, language=None)", source)
+        self.assertIn("_refresh_mcp_connection_observation(", source)
+        self.assertIn("이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다.", source)
 
     def test_mcp_http_url_builder_normalizes_local_and_public_urls(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -546,8 +711,9 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Settings > Plugins", source)
         self.assertIn("https://chatgpt.com/plugins", source)
         self.assertIn("ChatGPT Plugins 설정에서 앱을 Refresh", source)
-        self.assertNotIn("ChatGPT Apps 설정에서 도구를 다시 스캔", source)
-        self.assertNotIn("Settings > Apps", source)
+        self.assertIn("Settings > Apps > Advanced Settings", source)
+        self.assertIn("Settings > Apps > Create", source)
+        self.assertIn("Settings > Apps의 custom app을 갱신", source)
         self.assertIn("Claude Desktop은 전용 BAT가 기본", source)
         self.assertIn("설치 검증이 끝날 때까지 실행", source)
         self.assertIn("MCP의 list_regulations 도구를 사용해서 등록된 규정 목록을 보여줘", source)
