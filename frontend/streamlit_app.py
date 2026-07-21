@@ -2917,6 +2917,15 @@ def _mcp_bundle_state_key(document_id: str, scope: str = "document") -> str:
     return f"{MCP_BUNDLE_STATE_PREFIX}:{scope}:{document_id}"
 
 
+def _mcp_agent_prompt_display_kind(prompt_path: str | Path) -> str:
+    prompt_name = Path(prompt_path).name.casefold()
+    if prompt_name == "chatgpt_desktop_agent_connect_prompt.md".casefold():
+        return "legacy_chatgpt_desktop"
+    if prompt_name == "chatgpt_desktop_connect_guide.md".casefold():
+        return "chatgpt_desktop"
+    return "agent"
+
+
 def _mcp_final_verification_prompts(connection_target: str, server_name: str) -> list[str]:
     """Return only prompts supported by the selected client's MCP tool profile."""
 
@@ -6308,7 +6317,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
 
     with mcp_tab:
         st.markdown("### MCP client connection")
-        st.caption("승인·인덱싱 후 Claude Desktop, Claude Code, ChatGPT, Claude API에 붙일 설정을 생성합니다.")
+        st.caption(
+            "승인·인덱싱 후 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, "
+            "ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS)에 붙일 설정을 생성합니다."
+        )
         with st.expander("MCP/AI connection guide", expanded=False):
             st.markdown(
                 """
@@ -6370,7 +6382,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         status_cols[1].metric("MCP 노출 기록", int(mcp_connection_gate.get("mcp_visible_count") or 0))
         status_cols[2].metric("색인 상태", str(mcp_connection_gate.get("indexing_status") or "-"))
         status_cols[3].metric("오래된 기록", int(mcp_connection_gate.get("stale_count") or 0))
-        st.caption("아래 버튼을 누르면 Claude Desktop/Claude Code/ChatGPT/Claude API 연결에 필요한 파일 묶음이 생성됩니다.")
+        st.caption(
+            "아래 버튼을 누르면 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, "
+            "ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 연결 파일 묶음이 생성됩니다."
+        )
         mcp_scope = st.radio(
             "MCP 데이터 범위",
             ["selected_documents", "current_document", "selected_institution"],
@@ -6628,7 +6643,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             horizontal=True,
         )
         st.caption(
-            "ChatGPT Desktop에는 Settings > MCP servers 내장 등록 안내와 보조 BAT를 만듭니다. "
+            "ChatGPT Desktop에는 Settings > MCP servers 내장 등록 안내와 공유 config.toml용 보조 BAT를 만듭니다. "
             "Codex CLI·Claude Code에는 에이전트 연결 요청문과 보조 BAT를 만들며, Claude Desktop은 전용 BAT를 기본으로 사용합니다."
         )
         if mcp_scope == "selected_institution":
@@ -6671,7 +6686,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.info(
                 "MCP 로컬은 이 PC에서 stdio로 실행됩니다. ChatGPT Desktop은 Settings > MCP servers에서 생성된 값을 등록하고, "
                 "Codex CLI·Claude Code는 압축을 푼 번들을 로컬 작업공간으로 열어 대상별 연결 요청문을 실행합니다. "
-                "ChatGPT Desktop 내장 등록이 어렵거나 로컬 에이전트 실행 권한이 없을 때만 대상별 BAT를 사용합니다. "
+                "ChatGPT Desktop 수동 입력이 어렵거나 로컬 에이전트 실행 권한이 없을 때만 대상별 BAT를 사용합니다. "
                 "Claude Desktop은 전용 BAT가 기본입니다. 등록과 현재 대화의 도구 노출은 서로 다른 상태입니다."
             )
             mcp_profile_options = ["bundle", "chatgpt-desktop-local", "claude-desktop", "claude-code"]
@@ -7139,12 +7154,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             for agent_prompt_path in [path for path in agent_prompt_paths if path]:
                 prompt_path = Path(str(agent_prompt_path))
                 prompt_label = prompt_path.stem.replace("_", " ")
-                is_legacy_chatgpt_desktop_prompt = (
-                    prompt_path.name == "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md"
-                )
-                is_chatgpt_desktop_guide = prompt_path.name in {
-                    "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
-                    "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+                prompt_display_kind = _mcp_agent_prompt_display_kind(prompt_path)
+                is_legacy_chatgpt_desktop_prompt = prompt_display_kind == "legacy_chatgpt_desktop"
+                is_chatgpt_desktop_guide = prompt_display_kind in {
+                    "legacy_chatgpt_desktop",
+                    "chatgpt_desktop",
                 }
                 st.markdown(f"#### {prompt_label}")
                 if is_chatgpt_desktop_guide:
@@ -7178,6 +7192,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     agent_prompt_text = render_agent_connect_prompt_for_program(
                         agent_prompt_text,
                         bundle_dir=Path(str(agent_prompt_path)).parent,
+                        source_name=prompt_path.name,
                     )
                     st.code(agent_prompt_text, language=None)
             if installed_target in {
@@ -7324,7 +7339,8 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 st.info(
                     "ChatGPT Desktop의 Settings > MCP servers > Add server가 기본 연결 방식입니다. "
                     "위 안내에 표시된 Name·STDIO·Command·Working directory·Arguments를 입력하고 Save한 뒤 Restart하세요. "
-                    "메뉴가 없거나 수동 입력이 어려울 때만 ChatGPT Desktop 전용 BAT를 보조 수단으로 사용합니다. "
+                    "수동 입력이 어렵거나 고급 설정 파일 경로가 필요할 때만 ChatGPT Desktop 전용 BAT를 보조 수단으로 사용합니다. "
+                    "BAT는 공유 ~/.codex/config.toml을 기록·검증하지만 Desktop에 없는 MCP 메뉴나 기능을 활성화하지는 않습니다. "
                     f"새 대화에서 먼저 `/mcp`로 {installed_server_name}을 확인하세요. `@이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다."
                 )
             elif installed_target == "codex":

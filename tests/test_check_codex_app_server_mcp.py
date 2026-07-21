@@ -5,12 +5,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.check_codex_app_server_mcp import check_codex_app_server_mcp, run
+from scripts.check_codex_app_server_mcp import _executable_version, check_codex_app_server_mcp, run
 
 
 FAKE_APP_SERVER = r'''
@@ -49,7 +50,13 @@ class CodexAppServerMcpTests(unittest.TestCase):
         self.assertEqual("fresh_codex_app_server_process", report["probe_scope"])
         self.assertTrue(report["probe_id"])
         self.assertTrue(report["generated_at"])
-        self.assertEqual(str(Path(sys.executable).resolve()), report["provenance"]["executable_path"])
+        expected_executable = str(Path(sys.executable).resolve())
+        self.assertNotIn("executable_path", report["provenance"])
+        self.assertEqual(Path(sys.executable).name, report["provenance"]["executable_file_name"])
+        self.assertEqual(
+            hashlib.sha256(os.path.normcase(expected_executable).encode("utf-8")).hexdigest(),
+            report["provenance"]["executable_path_sha256"],
+        )
         self.assertIn("Python", report["provenance"]["executable_version"])
         self.assertIsInstance(report["provenance"]["process_id"], int)
         self.assertEqual(1, report["page_count"])
@@ -69,6 +76,53 @@ class CodexAppServerMcpTests(unittest.TestCase):
         self.assertTrue(report["server_found"])
         self.assertEqual(["missing_tool"], report["missing_tools"])
 
+    def test_json_rpc_error_does_not_copy_local_paths_into_report(self) -> None:
+        secret_path = r"C:\Users\private-user\Desktop\secret-mcp\config.toml"
+        fake_app_server = f'''
+import json
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("id") == 1:
+        print({secret_path!r}, file=sys.stderr, flush=True)
+        print(json.dumps({{"id": 1, "error": {{"code": -32000, "message": {secret_path!r}, "data": {{"path": {secret_path!r}}}}}}}), flush=True)
+        break
+'''
+        report = check_codex_app_server_mcp(
+            server_name="aksmcp2",
+            codex_command=[sys.executable, "-c", fake_app_server],
+            timeout_seconds=5,
+        )
+
+        rendered = json.dumps(report, ensure_ascii=False)
+        self.assertFalse(report["passed"])
+        self.assertEqual("app_server_initialize_failed", report["reason_code"])
+        self.assertIn("Codex app-server initialize returned a JSON-RPC error.", report["error"])
+        self.assertNotIn(secret_path, rendered)
+
+    def test_executable_version_accepts_only_a_safe_product_and_version_token(self) -> None:
+        secret_path = r"C:\Users\private-user\Desktop\secret-mcp"
+        safe_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"codex-cli 0.145.0-alpha.18\nloaded from {secret_path}\n",
+            stderr="",
+        )
+        unsafe_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"loaded from {secret_path}\n",
+            stderr="",
+        )
+        with patch("scripts.check_codex_app_server_mcp.subprocess.run", return_value=safe_result):
+            safe_version = _executable_version(sys.executable)
+        with patch("scripts.check_codex_app_server_mcp.subprocess.run", return_value=unsafe_result):
+            unsafe_version = _executable_version(sys.executable)
+
+        self.assertEqual("codex-cli 0.145.0-alpha.18", safe_version)
+        self.assertIsNone(unsafe_version)
+        self.assertNotIn(secret_path, safe_version or "")
+
     def test_cli_fails_when_codex_is_unavailable(self) -> None:
         stdout = io.StringIO()
 
@@ -79,7 +133,9 @@ class CodexAppServerMcpTests(unittest.TestCase):
         report = json.loads(stdout.getvalue())
         self.assertFalse(report["passed"])
         self.assertEqual("codex_cli_unavailable", report["reason_code"])
-        self.assertIsNone(report["provenance"]["executable_path"])
+        self.assertNotIn("executable_path", report["provenance"])
+        self.assertIsNone(report["provenance"]["executable_path_sha256"])
+        self.assertIsNone(report["provenance"]["executable_file_name"])
         self.assertIsNone(report["provenance"]["process_id"])
 
     def test_cli_can_probe_an_explicit_codex_executable(self) -> None:
@@ -98,7 +154,13 @@ class CodexAppServerMcpTests(unittest.TestCase):
 
         self.assertEqual(2, exit_code)
         report = json.loads(stdout.getvalue())
-        self.assertEqual(str(Path(sys.executable).resolve()), report["provenance"]["executable_path"])
+        expected_executable = str(Path(sys.executable).resolve())
+        self.assertNotIn("executable_path", report["provenance"])
+        self.assertEqual(Path(sys.executable).name, report["provenance"]["executable_file_name"])
+        self.assertEqual(
+            hashlib.sha256(os.path.normcase(expected_executable).encode("utf-8")).hexdigest(),
+            report["provenance"]["executable_path_sha256"],
+        )
         self.assertNotEqual("codex_cli_unavailable", report["reason_code"])
 
     def test_inventory_follows_next_cursor_until_target_is_found(self) -> None:

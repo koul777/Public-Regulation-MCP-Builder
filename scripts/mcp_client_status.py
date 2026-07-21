@@ -309,6 +309,15 @@ def commit_success(
         "rollback_complete": None,
     }
     _refresh_readiness(record)
+    if "registration" in seen:
+        _invalidate_replaced_shared_config_siblings(
+            answer,
+            target=target,
+            config_entry_fingerprint=normalized_config,
+            bundle_location_fingerprint=normalized_location,
+            runtime_fingerprint=normalized_runtime,
+            checked_at=timestamp,
+        )
     answer["active_target"] = target
     answer["updated_at"] = timestamp
     if normalized_runtime:
@@ -717,6 +726,80 @@ def _stale_matching_stages(
     if changed:
         record["effective"]["state"] = "stale"
         _refresh_readiness(record)
+
+
+def _invalidate_replaced_shared_config_siblings(
+    status: dict[str, Any],
+    *,
+    target: str,
+    config_entry_fingerprint: str | None,
+    bundle_location_fingerprint: str | None,
+    runtime_fingerprint: str | None,
+    checked_at: str,
+) -> None:
+    """Stale sibling evidence when one shared client config is replaced.
+
+    Codex and ChatGPT Desktop currently share the Codex-host user config. A
+    successful write for one target can therefore replace the other target's
+    effective server entry even though their loader, surface, and conversation
+    evidence remain product-specific. Identical entry/location contracts keep
+    each sibling's own evidence; no stage is copied between products. A runtime
+    change still stales only runtime-bound sibling stages and preserves its
+    independently verified registration.
+    """
+
+    source = _client_record(status, target)
+    resource_id = str(source.get("config_resource_id") or "")
+    if not resource_id:
+        return
+    for sibling_target, sibling in status["client_connections"].items():
+        if (
+            sibling_target == target
+            or sibling.get("config_resource_id") != resource_id
+        ):
+            continue
+        verified_stages = [
+            stage
+            for stage in sibling["stages"].values()
+            if stage.get("state") == "verified"
+        ]
+        if not verified_stages:
+            continue
+        sibling_effective = sibling["effective"]
+        same_entry = (
+            config_entry_fingerprint is not None
+            and sibling_effective.get("config_entry_fingerprint")
+            == config_entry_fingerprint
+        )
+        same_location = (
+            bundle_location_fingerprint is not None
+            and sibling_effective.get("bundle_location_fingerprint")
+            == bundle_location_fingerprint
+        )
+        if not (same_entry and same_location):
+            sibling["observed_config_entry_fingerprint"] = config_entry_fingerprint
+            sibling["observed_bundle_location_fingerprint"] = (
+                bundle_location_fingerprint
+            )
+            _stale_matching_stages(
+                sibling,
+                reason_code="shared_config_replaced",
+                checked_at=checked_at,
+                predicate=lambda stage: stage.get("state") == "verified",
+            )
+            continue
+        if runtime_fingerprint is None:
+            continue
+        _stale_matching_stages(
+            sibling,
+            reason_code="shared_runtime_replaced",
+            checked_at=checked_at,
+            predicate=lambda stage: (
+                stage.get("state") == "verified"
+                and stage.get("runtime_fingerprint") is not None
+                and stage.get("runtime_fingerprint") != runtime_fingerprint
+            ),
+        )
 
 
 def _derived_effective_state(record: Mapping[str, Any]) -> str:

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from scripts import mcp_client_status
+from scripts.mcp_connection_diagnostic import diagnostic_from_bundle_status
 from scripts import refresh_mcp_client_connection as refresh
 
 
@@ -513,6 +515,180 @@ class RefreshMcpClientConnectionTests(unittest.TestCase):
             self.assertNotIn(str(root), rendered)
             self.assertNotIn("must-not-be-reported", rendered)
             self.assertNotIn(config_fingerprint, rendered)
+
+    def test_v5_manual_registration_updates_selected_client_registration_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            status_path, config_path = self._write_manual_registration_files(root)
+            initial = mcp_client_status.create_bundle_status(
+                "sample_mcp",
+                runtime_fingerprint="runtime-current",
+                bundle_fingerprint="bundle-current",
+                generated_at="2026-07-21T00:00:00Z",
+            )
+            initial = mcp_client_status.begin_attempt(
+                initial,
+                "codex",
+                "prior-codex-attempt",
+                started_at="2026-07-21T00:00:01Z",
+            )
+            initial = mcp_client_status.commit_success(
+                initial,
+                "codex",
+                "prior-codex-attempt",
+                verified_stages=(
+                    "registration",
+                    "loader",
+                    "transport",
+                    "fresh_app_server",
+                ),
+                config_entry_fingerprint="prior-codex-config",
+                runtime_fingerprint=initial["runtime_fingerprint"],
+                bundle_fingerprint=initial["bundle_fingerprint"],
+                bundle_location_fingerprint="prior-codex-location",
+                verified_at="2026-07-21T00:00:02Z",
+            )
+            self._write_status(root, initial)
+            exit_code = refresh.run(
+                [
+                    "--target",
+                    "chatgpt-desktop-local",
+                    "--server",
+                    "sample_mcp",
+                    "--bundle-status",
+                    str(status_path),
+                    "--bundle-dir",
+                    str(root),
+                    "--codex-config",
+                    str(config_path),
+                    "--adopt-manual-registration",
+                ],
+                stdout=io.StringIO(),
+                probe=lambda *_args: _chatgpt_report(ready=False),
+                attempt_id_factory=lambda: "manual-v5-attempt",
+                clock=lambda: datetime(2026, 7, 21, 1, 2, 3, tzinfo=timezone.utc),
+            )
+
+            self.assertEqual(0, exit_code)
+            updated = json.loads(status_path.read_text(encoding="utf-8"))
+            record = updated["client_connections"]["chatgpt-desktop-local"]
+            codex_record = updated["client_connections"]["codex"]
+            self.assertEqual("stale", codex_record["effective"]["state"])
+            self.assertEqual(
+                "shared_config_replaced",
+                codex_record["stages"]["registration"]["reason_code"],
+            )
+            self.assertEqual("completed", record["last_attempt"]["state"])
+            self.assertEqual("manual-v5-attempt", record["last_attempt"]["id"])
+            self.assertEqual("partially_verified", record["effective"]["state"])
+            self.assertEqual(
+                "sha256:" + hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                record["effective"]["config_entry_fingerprint"],
+            )
+            self.assertEqual("verified", record["stages"]["registration"]["state"])
+            for stage_name in (
+                "loader",
+                "transport",
+                "fresh_app_server",
+                "client_reload",
+                "client_surface",
+                "conversation",
+            ):
+                with self.subTest(stage_name=stage_name):
+                    self.assertEqual(
+                        "not_checked",
+                        record["stages"][stage_name]["state"],
+                    )
+            self.assertTrue(updated["direct_config_registered"])
+            self.assertFalse(updated["direct_config_loader_verified"])
+            self.assertFalse(updated["desktop_tool_scan_verified"])
+            self.assertFalse(updated["conversation_attachment_verified"])
+            self.assertFalse(updated["end_to_end_verified"])
+            diagnostic = diagnostic_from_bundle_status(
+                updated,
+                connection_target="chatgpt-desktop-local",
+            )
+            self.assertEqual("client_connections", diagnostic["status_source"])
+            self.assertEqual("completed", diagnostic["last_attempt_state"])
+            self.assertEqual("verified", diagnostic["stages"]["registration"]["state"])
+            self.assertEqual("pending", diagnostic["overall_state"])
+            self.assertFalse(diagnostic["configured"])
+            self.assertFalse(diagnostic["connected"])
+
+    def test_v5_later_transport_observation_stays_within_registration_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            status_path, config_path = self._write_manual_registration_files(root)
+            initial = mcp_client_status.create_bundle_status(
+                "sample_mcp",
+                runtime_fingerprint="runtime-current",
+                bundle_fingerprint="bundle-current",
+                generated_at="2026-07-21T00:00:00Z",
+            )
+            self._write_status(root, initial)
+            common_args = [
+                "--target",
+                "chatgpt-desktop-local",
+                "--server",
+                "sample_mcp",
+                "--bundle-status",
+                str(status_path),
+                "--bundle-dir",
+                str(root),
+                "--codex-config",
+                str(config_path),
+                "--adopt-manual-registration",
+            ]
+            first_exit = refresh.run(
+                common_args,
+                stdout=io.StringIO(),
+                probe=lambda *_args: _chatgpt_report(ready=False),
+                attempt_id_factory=lambda: "manual-v5-later-transport",
+                clock=lambda: datetime(2026, 7, 21, 1, 2, 3, tzinfo=timezone.utc),
+            )
+            second_exit = refresh.run(
+                common_args,
+                stdout=io.StringIO(),
+                probe=lambda *_args: _chatgpt_report(ready=True),
+            )
+
+            self.assertEqual(0, first_exit)
+            self.assertEqual(0, second_exit)
+            updated = json.loads(status_path.read_text(encoding="utf-8"))
+            record = updated["client_connections"]["chatgpt-desktop-local"]
+            self.assertEqual("manual-v5-later-transport", record["last_attempt"]["id"])
+            self.assertEqual("completed", record["last_attempt"]["state"])
+            self.assertEqual("partially_verified", record["effective"]["state"])
+            self.assertEqual("verified", record["stages"]["registration"]["state"])
+            self.assertEqual("verified", record["stages"]["transport"]["state"])
+            self.assertEqual(
+                updated["runtime_fingerprint"],
+                record["stages"]["transport"]["runtime_fingerprint"],
+            )
+            for stage_name in (
+                "loader",
+                "fresh_app_server",
+                "client_reload",
+                "client_surface",
+                "conversation",
+            ):
+                with self.subTest(stage_name=stage_name):
+                    self.assertEqual(
+                        "not_checked",
+                        record["stages"][stage_name]["state"],
+                    )
+            self.assertFalse(updated["desktop_tool_scan_verified"])
+            self.assertFalse(updated["conversation_attachment_verified"])
+            self.assertFalse(updated["end_to_end_verified"])
+            diagnostic = diagnostic_from_bundle_status(
+                updated,
+                connection_target="chatgpt-desktop-local",
+            )
+            self.assertEqual("verified", diagnostic["stages"]["registration"]["state"])
+            self.assertEqual("verified", diagnostic["stages"]["transport"]["state"])
+            self.assertEqual("pending", diagnostic["overall_state"])
+            self.assertFalse(diagnostic["configured"])
+            self.assertFalse(diagnostic["connected"])
 
     def test_manual_registration_mismatch_fails_closed_without_status_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

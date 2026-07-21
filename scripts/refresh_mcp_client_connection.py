@@ -21,9 +21,11 @@ if __package__ in {None, ""}:  # Keep a third-party ``scripts`` package from sha
 try:
     from scripts import check_chatgpt_desktop_recognition as chatgpt_observer
     from scripts import inspect_claude_desktop_connection as claude_observer
+    from scripts import mcp_client_status
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - local fallback
     import check_chatgpt_desktop_recognition as chatgpt_observer
     import inspect_claude_desktop_connection as claude_observer
+    import mcp_client_status
 
 
 SCHEMA_VERSION = "mcp-client-connection-refresh-v1"
@@ -104,16 +106,40 @@ def _read_status(path: Path) -> tuple[dict[str, Any], str]:
     return payload, hashlib.sha256(raw).hexdigest()
 
 
-def _existing_attempt_id(status: Mapping[str, Any]) -> str:
+def _v5_client_record(
+    status: Mapping[str, Any], target: str
+) -> Mapping[str, Any] | None:
+    if status.get("schema_version") != mcp_client_status.SCHEMA_VERSION:
+        return None
+    if status.get("status_model") != mcp_client_status.STATUS_MODEL:
+        raise RefreshError("bundle_status_v5_model_invalid")
+    connections = status.get("client_connections")
+    if not isinstance(connections, Mapping):
+        raise RefreshError("bundle_status_v5_connections_invalid")
+    record = connections.get(target)
+    if not isinstance(record, Mapping) or record.get("target") != target:
+        raise RefreshError("bundle_status_v5_client_record_invalid")
+    return record
+
+
+def _optional_attempt_id(status: Mapping[str, Any], target: str) -> str | None:
+    record = _v5_client_record(status, target)
+    if record is not None:
+        last_attempt = _mapping(record.get("last_attempt"))
+        effective = _mapping(record.get("effective"))
+        attempt_id = str(
+            last_attempt.get("id") or effective.get("attempt_id") or ""
+        ).strip()
+        return attempt_id or None
     attempt_id = str(status.get("installation_attempt_id") or "").strip()
+    return attempt_id or None
+
+
+def _existing_attempt_id(status: Mapping[str, Any], target: str) -> str:
+    attempt_id = _optional_attempt_id(status, target)
     if not attempt_id:
         raise RefreshError("installation_attempt_id_missing")
     return attempt_id
-
-
-def _optional_attempt_id(status: Mapping[str, Any]) -> str | None:
-    attempt_id = str(status.get("installation_attempt_id") or "").strip()
-    return attempt_id or None
 
 
 def _validate_server_identity(status: Mapping[str, Any], supplied: str) -> None:
@@ -578,6 +604,130 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
                 pass
 
 
+def _commit_v5_manual_registration(
+    status: Mapping[str, Any],
+    *,
+    evidence: ManualRegistrationEvidence,
+    attempt_id: str,
+    registered_at: str,
+) -> dict[str, Any]:
+    """Record only the exact Settings registration in the v5 client model."""
+
+    target = "chatgpt-desktop-local"
+    started = mcp_client_status.begin_attempt(
+        status,
+        target,
+        attempt_id,
+        started_at=registered_at,
+    )
+    return mcp_client_status.commit_success(
+        started,
+        target,
+        attempt_id,
+        verified_stages={
+            "registration": {
+                "manual_settings_registration_adopted": True,
+                "exact_entry_match_verified": True,
+            }
+        },
+        config_entry_fingerprint=evidence.config_fingerprint,
+        config_container_fingerprint=evidence.config_fingerprint,
+        bundle_fingerprint=status.get("bundle_fingerprint"),
+        bundle_location_fingerprint=str(evidence.snippet_path.parent),
+        verified_at=registered_at,
+    )
+
+
+def _v5_transport_observation_transition(
+    status: Mapping[str, Any],
+    *,
+    target: str,
+    attempt_id: str,
+    observation: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Upgrade an exact registration-only v5 scope through transport, and no further."""
+
+    if target != "chatgpt-desktop-local":
+        return None
+    record = _v5_client_record(status, target)
+    if record is None:
+        return None
+    transport_observed = bool(
+        observation.get("recognition_observation_ready")
+        and observation.get("registration_observed")
+        and observation.get("post_registration_log_session_observed")
+        and observation.get("mcp_status_list_observed_without_error")
+    )
+    if not transport_observed:
+        return None
+
+    last_attempt = _mapping(record.get("last_attempt"))
+    effective = _mapping(record.get("effective"))
+    stages = _mapping(record.get("stages"))
+    registration = _mapping(stages.get("registration"))
+    transport = _mapping(stages.get("transport"))
+    if (
+        last_attempt.get("id") != attempt_id
+        or last_attempt.get("state") != "completed"
+        or effective.get("attempt_id") != attempt_id
+        or registration.get("state") != "verified"
+        or registration.get("attempt_id") != attempt_id
+        or transport.get("state") == "verified"
+    ):
+        return None
+    # This observer may extend only an isolated registration-only scope. It
+    # must never rewrite loader, app inventory, client surface, or conversation
+    # evidence produced by another setup path.
+    for stage_name in (
+        "loader",
+        "fresh_app_server",
+        "client_reload",
+        "client_surface",
+        "conversation",
+    ):
+        if _mapping(stages.get(stage_name)).get("state") != "not_checked":
+            return None
+    if transport.get("state") != "not_checked":
+        return None
+
+    config_fingerprint = effective.get("config_entry_fingerprint")
+    location_fingerprint = effective.get("bundle_location_fingerprint")
+    runtime_fingerprint = status.get("runtime_fingerprint")
+    if not config_fingerprint or not location_fingerprint or not runtime_fingerprint:
+        return None
+    observed_at = str(observation.get("observed_at") or "").strip() or None
+    started_at = str(last_attempt.get("started_at") or "").strip() or observed_at
+    started = mcp_client_status.begin_attempt(
+        status,
+        target,
+        attempt_id,
+        started_at=started_at,
+    )
+    return mcp_client_status.commit_success(
+        started,
+        target,
+        attempt_id,
+        verified_stages={
+            "registration": {
+                "registration_scope_preserved": True,
+                "exact_entry_match_verified": True,
+            },
+            "transport": {
+                "desktop_transport_observed": True,
+                "post_registration_session_observed": True,
+                "mcp_status_list_observed_without_error": True,
+            },
+        },
+        config_entry_fingerprint=config_fingerprint,
+        config_container_fingerprint=effective.get("config_container_fingerprint"),
+        runtime_fingerprint=runtime_fingerprint,
+        bundle_fingerprint=effective.get("bundle_fingerprint")
+        or status.get("bundle_fingerprint"),
+        bundle_location_fingerprint=location_fingerprint,
+        verified_at=observed_at,
+    )
+
+
 def _commit_manual_registration_adoption(
     path: Path,
     *,
@@ -591,7 +741,7 @@ def _commit_manual_registration_adoption(
     if current_digest != expected_status_digest:
         raise RefreshError("bundle_status_changed_during_manual_adoption")
     _validate_server_identity(current, expected_server_name)
-    if _optional_attempt_id(current) is not None:
+    if _optional_attempt_id(current, "chatgpt-desktop-local") is not None:
         raise RefreshError("installation_attempt_created_during_manual_adoption")
     if (
         _source_digest(
@@ -607,40 +757,67 @@ def _commit_manual_registration_adoption(
     ):
         raise RefreshError("manual_registration_source_changed")
 
-    current.update(
-        {
-            "installation_attempt_id": attempt_id,
-            "installation_state": "installed_pending_desktop_verification",
-            "connection_state": "pending_desktop_verification",
-            "direct_config_registered": True,
-            "direct_config_path": str(evidence.config_path),
-            "installed_config_fingerprint": evidence.config_fingerprint,
-            "desktop_mcp_registration_updated_at": registered_at,
-            "direct_config_loader_verified": False,
-            "loader_verification_state": "not_checked",
-            "loader_verification_reason": "manual_registration_pending_verification",
-            "installed_config_transport_verified": False,
-            "installed_config_transport_runtime_fingerprint": None,
-            "direct_stdio_verified": False,
-            "transport_end_to_end_verified": False,
-            "fresh_codex_app_server_inventory_verified": False,
-            "fresh_codex_app_server_runtime_fingerprint": None,
-            "desktop_app_server_loader_verified": False,
-            "desktop_app_server_tool_count": 0,
-            "desktop_app_server_tool_names": [],
-            "desktop_app_server_server_info": None,
-            "desktop_app_server_error": None,
-            "desktop_recognition_observation_status": "not_checked",
-            "desktop_restarted_after_registration": False,
-            "desktop_post_registration_log_session_observed": False,
-            "desktop_status_scan_request_observed": False,
-            "desktop_tool_scan_verified": False,
-            "conversation_attachment_verified": False,
-            "conversation_attachment_unverified": True,
-            "tool_scan_unverified": True,
-            "end_to_end_verified": False,
-        }
-    )
+    is_v5 = _v5_client_record(current, "chatgpt-desktop-local") is not None
+    if is_v5:
+        current = _commit_v5_manual_registration(
+            current,
+            evidence=evidence,
+            attempt_id=attempt_id,
+            registered_at=registered_at,
+        )
+    legacy_updates = {
+        "installation_attempt_id": attempt_id,
+        "installation_state": "installed_pending_desktop_verification",
+        "connection_state": "pending_desktop_verification",
+        "direct_config_registered": True,
+        "direct_config_path": str(evidence.config_path),
+        "installed_config_fingerprint": evidence.config_fingerprint,
+        "desktop_mcp_registration_updated_at": registered_at,
+        "direct_config_loader_verified": False,
+        "loader_verification_state": "not_checked",
+        "loader_verification_reason": "manual_registration_pending_verification",
+        "installed_config_transport_verified": False,
+        "installed_config_transport_runtime_fingerprint": None,
+        "direct_stdio_verified": False,
+        "transport_end_to_end_verified": False,
+        "fresh_codex_app_server_inventory_verified": False,
+        "fresh_codex_app_server_runtime_fingerprint": None,
+        "desktop_app_server_loader_verified": False,
+        "desktop_app_server_tool_count": 0,
+        "desktop_app_server_tool_names": [],
+        "desktop_app_server_server_info": None,
+        "desktop_app_server_error": None,
+        "desktop_recognition_observation_status": "not_checked",
+        "desktop_restarted_after_registration": False,
+        "desktop_post_registration_log_session_observed": False,
+        "desktop_status_scan_request_observed": False,
+        "desktop_tool_scan_verified": False,
+        "conversation_attachment_verified": False,
+        "conversation_attachment_unverified": True,
+        "tool_scan_unverified": True,
+        "end_to_end_verified": False,
+    }
+    if is_v5:
+        # Keep the v5 transition's legacy projection authoritative. Only add
+        # compatibility metadata that the projection model does not own.
+        for projected_key in (
+            "installation_attempt_id",
+            "installation_state",
+            "connection_state",
+            "installed_config_fingerprint",
+            "direct_config_registered",
+            "direct_config_loader_verified",
+            "installed_config_transport_verified",
+            "direct_stdio_verified",
+            "fresh_codex_app_server_inventory_verified",
+            "desktop_app_server_loader_verified",
+            "desktop_tool_scan_verified",
+            "conversation_attachment_verified",
+            "transport_end_to_end_verified",
+            "end_to_end_verified",
+        ):
+            legacy_updates.pop(projected_key, None)
+    current.update(legacy_updates)
     _atomic_write_json(path, current)
 
 
@@ -658,7 +835,8 @@ def _commit_observation(
     if current_digest != expected_digest:
         raise RefreshError("bundle_status_changed_during_observation")
     if not hmac.compare_digest(
-        _existing_attempt_id(current).encode("utf-8"), expected_attempt_id.encode("utf-8")
+        _existing_attempt_id(current, target).encode("utf-8"),
+        expected_attempt_id.encode("utf-8"),
     ):
         raise RefreshError("installation_attempt_changed_during_observation")
     _validate_server_identity(current, expected_server_name)
@@ -675,8 +853,16 @@ def _commit_observation(
         != manual_evidence.snippet_source_digest
     ):
         raise RefreshError("manual_registration_source_changed_during_observation")
+    transitioned = _v5_transport_observation_transition(
+        current,
+        target=target,
+        attempt_id=expected_attempt_id,
+        observation=observation,
+    )
+    if transitioned is not None:
+        current = transitioned
     _merge_observation_fields(current, target, observation)
-    if str(current.get("installation_attempt_id") or "") != expected_attempt_id:
+    if _existing_attempt_id(current, target) != expected_attempt_id:
         raise RefreshError("installation_attempt_preservation_failed")
     _atomic_write_json(path, current)
 
@@ -756,7 +942,7 @@ def run(
                 raise RefreshError("output_path_validation_failed") from exc
         status, digest = _read_status(args.bundle_status)
         _validate_server_identity(status, args.server_name)
-        attempt_id = _optional_attempt_id(status)
+        attempt_id = _optional_attempt_id(status, args.target)
         if attempt_id is None:
             if not args.adopt_manual_registration:
                 raise RefreshError("installation_attempt_id_missing")
@@ -785,7 +971,8 @@ def run(
             manual_registration_adopted = True
             status, digest = _read_status(args.bundle_status)
             if not hmac.compare_digest(
-                _existing_attempt_id(status).encode("utf-8"), attempt_id.encode("utf-8")
+                _existing_attempt_id(status, args.target).encode("utf-8"),
+                attempt_id.encode("utf-8"),
             ):
                 raise RefreshError("manual_registration_attempt_commit_failed")
         config_path = _config_path_from_status(status, args.target)

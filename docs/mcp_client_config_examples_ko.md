@@ -87,7 +87,7 @@ Claude Desktop 설정 파일 자체가 깨졌는지 확인하려면 `connect_mcp
 - `data/vector_db/<tenant>/approved_vectors.jsonl`
 - `data/vector_db/<tenant>/bm25_index.json`
 
-대상 안내 순서는 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS)입니다. Claude Code와 Codex CLI에는 대상별 `*_AGENT_CONNECT_PROMPT.md`를 표시하고 Claude Desktop은 전용 BAT가 기본입니다. ChatGPT Desktop은 `CHATGPT_DESKTOP_CONNECT_GUIDE.md`의 값을 `Settings > MCP servers > Add server`에 입력하는 방식이 기본이며 Codex CLI를 실행하는 방식이 아닙니다. 다만 현재 로컬 direct 설정은 Codex CLI와 `~/.codex/config.toml`을 공유합니다. 내장 메뉴가 없거나 수동 입력이 어려울 때만 전용 BAT를 보조 수단으로 사용합니다. Save·Restart 뒤 새 대화에서 `/mcp`와 실제 도구 호출을 확인하며, `@aksmcp` 반복 입력은 설치나 연결 확인을 대신하지 않습니다.
+대상 안내 순서는 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS)입니다. Claude Code와 Codex CLI에는 대상별 `*_AGENT_CONNECT_PROMPT.md`를 표시하고 Claude Desktop은 전용 BAT가 기본입니다. ChatGPT Desktop은 `CHATGPT_DESKTOP_CONNECT_GUIDE.md`의 값을 `Settings > MCP servers > Add server`에 입력하는 방식이 기본이며 Codex CLI를 실행하는 방식이 아닙니다. 다만 현재 로컬 direct 설정은 Codex CLI와 `~/.codex/config.toml`을 공유합니다. 수동 입력이 어렵거나 고급 설정 파일 경로가 필요할 때만 전용 BAT를 보조 수단으로 사용합니다. BAT가 공유 설정을 기록해도 Desktop에 없는 MCP 기능을 활성화하지는 않으므로, 메뉴와 `/mcp`가 계속 보이지 않으면 앱 버전·계정 정책을 확인하고 원격 HTTPS 또는 Secure MCP Tunnel로 전환합니다. Save·Restart 뒤 새 대화에서 `/mcp`와 실제 도구 호출을 확인하며, `@aksmcp` 반복 입력은 설치나 연결 확인을 대신하지 않습니다.
 
 같은 이름으로 번들을 다시 생성하고 대상별 연결 절차를 다시 실행하면 추가·개정 청크가 같은 MCP 이름에 반영됩니다.
 

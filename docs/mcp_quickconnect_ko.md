@@ -84,6 +84,8 @@ Streamlit의 MCP 설정 JSON 다운로드와 `Write MCP setup bundle now`는 app
 
 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop용 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 실행하지 않고 번들 안의 `run_mcp_stdio_server.ps1` launcher를 실행합니다. `install_local_package.ps1`을 한 번 실행하면 선택한 Python과 MCP 명령 모듈 11개의 SHA-256 build identity가 `runtime_python.json` schema 2에 기록됩니다. 이후 launcher·doctor·연결 wizard는 이 marker를 PATH, `REG_RAG_PYTHON`, 저장소 checkout보다 먼저 사용하고, `PYTHONPATH`를 격리한 상태에서 현재 모듈 hash를 다시 확인합니다. 같은 Python 경로라도 wheel이나 소스가 바뀌었거나 marker가 손상되면 다른 runtime으로 조용히 fallback하지 않고 재설치를 요구합니다. marker가 아직 없는 설치 전 단계에서만 생성 당시 checkout, 명시적 `REG_RAG_PYTHON`, 마지막 호환 PATH 순서로 탐색합니다. 설치 프로세스 안에서는 선택한 Python의 `Scripts` 폴더를 PATH 맨 앞으로 재배치하고 각 console command의 출처도 확인합니다. Windows PowerShell 5.1에서 한글·공백 경로가 깨지지 않도록 `.ps1` 실행 스크립트만 UTF-8 BOM을 허용합니다. `plugin.json`, `.mcp.json`, `marketplace.json`, 상태 JSON과 TOML은 항상 BOM 없는 UTF-8이며, 선택형 ChatGPT Desktop 플러그인의 `.mcp.json`이 `EF BB BF`로 시작하면 smoke와 ZIP 추출 검증이 실패합니다.
 
+서버 이름은 `/mcp` 또는 로더 목록에 보이는데 도구 수가 0이거나 `Connection closed`가 나오면 등록 성공으로 끝내지 마세요. 등록 경로는 살아 있어도 이동·재빌드 뒤의 `runtime_python.json`이 현재 wheel/모듈 identity와 달라 launcher가 시작 직후 종료된 상태일 수 있습니다. 최신 번들 폴더의 대상별 연결 BAT 또는 연결 요청문을 다시 실행해 `-InstallPackage` 단계에서 runtime marker를 갱신하고, doctor·direct stdio·fresh loader inventory를 다시 통과시킵니다. 예전 번들의 launcher만 계속 재실행하거나 `@이름`을 반복 입력하는 것으로는 복구되지 않습니다.
+
 GitHub private push 또는 배포 직전에는 release harness로 실제 runtime data를 다시 번들화하고, 생성된 번들 자체의 local stdio doctor와 transport smoke까지 확인합니다. 이 검사는 GitHub에서 받은 코드와 로컬 번들이 같은 방식으로 빠르게 연결되는지 보는 최소 회귀입니다.
 
 ```powershell
@@ -217,7 +219,7 @@ powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/connect_m
 
 로컬 stdio 연결은 `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`를 사용해 공식 CLI의 사용자 범위(`--scope user`)에 등록합니다. 보조 스크립트는 예전 생성기가 만든 같은 이름의 local 항목과 기존 user 항목을 정리하고 다시 등록한 뒤 `claude mcp get`으로 확인합니다. 따라서 생성 폴더 밖에서 Claude Code를 시작해도 같은 사용자에게 보입니다.
 
-주의: [Anthropic의 Claude Code MCP 공식 한국어 문서](https://code.claude.com/docs/ko/mcp)에 따라 프로젝트 루트의 `.mcp.json`은 `project` scope이고, `~/.claude/settings.json`은 MCP 사용자 등록 파일을 대신하지 않습니다. `enabledMcpjsonServers` 같은 프로젝트 승인 설정과 서버 등록 자체를 혼동하지 마세요. 사용자 전체 연결은 설정 파일 경로를 추측해 직접 편집하는 대신 `claude mcp add --scope user ...`로 등록하고, `claude mcp get <이름>`의 User scope·`Status: Connected`·정확한 launcher/data 경로와 실제 stdio protocol smoke를 모두 검증합니다.
+주의: [Anthropic의 Claude Code MCP 공식 한국어 문서](https://code.claude.com/docs/ko/mcp)에 따라 프로젝트 루트의 `.mcp.json`은 `project` scope이고, `~/.claude/settings.json`은 MCP 사용자 등록 파일을 대신하지 않습니다. 공식 `user` scope 서버는 `~/.claude.json`에 저장됩니다. `enabledMcpjsonServers` 같은 프로젝트 승인 설정과 user-scope 서버 등록 자체를 혼동하지 마세요. 사용자 전체 연결은 설정 파일 경로를 추측해 직접 편집하는 대신 `claude mcp add --scope user ...`로 등록하고, `claude mcp get <이름>`의 User scope·`Status: Connected`·정확한 launcher/data 경로와 실제 stdio protocol smoke를 모두 검증합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File reports/mcp_connection_bundle/claude_code_add_stdio.ps1
@@ -281,7 +283,7 @@ python scripts\run_mcp_client_config_smoke.py `
 
 프로그램 생성 결과 화면의 `CHATGPT_DESKTOP_CONNECT_GUIDE.md` 코드 상자에 표시된 Name·STDIO·Command·Working directory·Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하고 Save한 뒤 Restart합니다. ZIP 원본의 `<PROGRAM_BUNDLE_DIR>` 자리표시자는 입력값이 아닙니다. 이 화면이 기본 사용자 경로이며 Codex CLI를 실행하라는 뜻이 아닙니다. 다만 현재 로컬 direct 설정의 저장소는 Codex CLI와 같은 `~/.codex/config.toml`입니다.
 
-새 대화에서 `/mcp`로 서버 이름을 확인하고 실제 `get_index_status`를 호출합니다. 내장 메뉴가 없거나 수동 입력이 어려울 때만 보조 수단인 `ChatGPT Desktop에 연결하기.bat`를 사용합니다. `@MCP이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다. ChatGPT 대화 화면이 로컬 direct MCP를 노출하지 않는 제품 구성에서는 아래의 원격 HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다.
+새 대화에서 `/mcp`로 서버 이름을 확인하고 실제 `get_index_status`를 호출합니다. 수동 입력이 어렵거나 고급 설정 파일 경로를 사용할 때만 보조 수단인 `ChatGPT Desktop에 연결하기.bat`를 사용합니다. 이 BAT는 ChatGPT Desktop과 Codex CLI가 공유하는 `~/.codex/config.toml`을 백업·기록하고 설치된 항목의 stdio를 검증하지만, Desktop에 없는 MCP 메뉴나 기능을 새로 활성화하지는 않습니다. 메뉴가 보이지 않으면 먼저 최신 ChatGPT Desktop인지와 현재 계정·워크스페이스에서 MCP가 제공되는지 확인합니다. 재시작한 새 대화에서도 `/mcp`가 보이지 않으면 연결 완료로 판단하지 말고 아래 원격 HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다. `@MCP이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다.
 
 Work/Codex 플러그인 배포를 명시적으로 선택한 경우에만 direct 설정과 겹치지 않는 격리 환경에서 `-InstallPackage -Target chatgpt-desktop-local -InstallChatGptDesktopPlugin`을 사용합니다. 일반 ChatGPT Desktop 연결에는 위의 내장 등록을 사용합니다.
 

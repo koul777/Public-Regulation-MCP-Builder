@@ -125,6 +125,77 @@ class StreamlitOperatorModeTests(unittest.TestCase):
                     self.assertIsNone(report["config_fingerprint"])
                     self.assertFalse(report["configured"])
 
+    def test_mcp_connection_diagnostic_reader_shows_v5_manual_registration(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_read_mcp_connection_diagnostic"
+        )
+        namespace = {
+            "Any": Any,
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "diagnostic_from_bundle_status": diagnostic_from_bundle_status,
+        }
+        exec(
+            compile(ast.Module(body=[reader_node], type_ignores=[]), "<mcp-diagnostic-reader>", "exec"),
+            namespace,
+        )
+        read_diagnostic = namespace["_read_mcp_connection_diagnostic"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.toml"
+            config_path.write_text(
+                '[mcp_servers.final]\ncommand = "powershell.exe"\n',
+                encoding="utf-8",
+            )
+            config_fingerprint = "sha256:" + hashlib.sha256(
+                config_path.read_bytes()
+            ).hexdigest()
+            status = begin_attempt(
+                create_bundle_status(
+                    "final",
+                    runtime_fingerprint="runtime-current",
+                    generated_at="2026-07-21T00:00:00Z",
+                ),
+                "chatgpt-desktop-local",
+                "manual-settings-attempt",
+                started_at="2026-07-21T00:01:00Z",
+            )
+            status = commit_success(
+                status,
+                "chatgpt-desktop-local",
+                "manual-settings-attempt",
+                verified_stages=("registration",),
+                config_entry_fingerprint=config_fingerprint,
+                bundle_location_fingerprint=str(bundle_dir),
+                verified_at="2026-07-21T00:02:00Z",
+            )
+            status["direct_config_path"] = str(config_path)
+            (bundle_dir / "bundle_status.json").write_text(
+                json.dumps(status),
+                encoding="utf-8",
+            )
+
+            report, read_error = read_diagnostic(
+                bundle_dir,
+                "chatgpt-desktop-local",
+            )
+
+        self.assertIsNone(read_error)
+        self.assertEqual("client_connections", report["status_source"])
+        self.assertEqual("manual-settings-attempt", report["attempt_id"])
+        self.assertEqual("completed", report["last_attempt_state"])
+        self.assertEqual("verified", report["stages"]["registration"]["state"])
+        self.assertEqual("not_checked", report["stages"]["transport"]["state"])
+        self.assertEqual("pending", report["overall_state"])
+        self.assertFalse(report["configured"])
+        self.assertFalse(report["connected"])
+
     def test_mcp_connection_diagnostic_reader_requires_real_installed_config_fingerprint(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
@@ -385,10 +456,34 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("support_summary:", source)
         self.assertIn("next_action:", source)
         self.assertIn("st.code(agent_prompt_text, language=None)", source)
-        self.assertIn('prompt_path.name == "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md"', source)
+        self.assertIn("_mcp_agent_prompt_display_kind(prompt_path)", source)
         self.assertIn("구형 ChatGPT Desktop 에이전트 프롬프트를 감지했습니다", source)
+        self.assertIn("source_name=prompt_path.name", source)
         self.assertIn("_refresh_mcp_connection_observation(", source)
         self.assertIn("이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다.", source)
+
+    def test_legacy_chatgpt_prompt_ui_kind_is_case_insensitive_and_never_agent_mode(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_mcp_agent_prompt_display_kind"
+        )
+        namespace = {"Path": Path}
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-prompt-kind>", "exec"),
+            namespace,
+        )
+        classify = namespace["_mcp_agent_prompt_display_kind"]
+
+        self.assertEqual(
+            "legacy_chatgpt_desktop",
+            classify(r"C:\moved\chatgpt_desktop_agent_connect_prompt.MD"),
+        )
+        self.assertEqual("chatgpt_desktop", classify("CHATGPT_DESKTOP_CONNECT_GUIDE.md"))
+        self.assertEqual("agent", classify("CODEX_AGENT_CONNECT_PROMPT.md"))
 
     def test_mcp_http_url_builder_normalizes_local_and_public_urls(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -787,7 +882,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("OPENAI_API_KEY", source)
         self.assertIn("Codex can connect as an MCP client", source)
         self.assertIn("not a replacement API key for this product runtime", source)
-        self.assertIn("아래 버튼을 누르면 Claude Desktop/Claude Code/ChatGPT/Claude API 연결에 필요한 파일 묶음이 생성됩니다.", source)
+        self.assertIn(
+            "아래 버튼을 누르면 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop,",
+            source,
+        )
+        self.assertIn("ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 연결 파일 묶음", source)
+        self.assertNotIn("Claude Desktop/Claude Code/ChatGPT/Claude API", source)
         self.assertIn("AI review API and cost guard", source)
         self.assertIn("cached_candidate_count", source)
         self.assertIn("cost_estimate_status", source)

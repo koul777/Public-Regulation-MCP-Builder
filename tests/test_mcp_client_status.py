@@ -187,6 +187,191 @@ class McpClientStatusTests(unittest.TestCase):
                         f"{target} success changed {other}",
                     )
 
+    def test_chatgpt_replacement_stales_prior_codex_shared_config_evidence(self) -> None:
+        status = self._commit_shared_target(
+            create_bundle_status("final", generated_at=T0),
+            "codex",
+            attempt_id="attempt-codex-a",
+            config_fingerprint="config-a",
+            location_fingerprint="location-a",
+        )
+
+        replaced = self._commit_shared_target(
+            status,
+            "chatgpt-desktop-local",
+            attempt_id="attempt-chatgpt-b",
+            config_fingerprint="config-b",
+            location_fingerprint="location-b",
+        )
+
+        codex = replaced["client_connections"]["codex"]
+        self.assertEqual("stale", codex["effective"]["state"])
+        for stage_name in ("registration", "loader", "transport", "fresh_app_server"):
+            self.assertEqual("stale", codex["stages"][stage_name]["state"])
+            self.assertEqual(
+                "shared_config_replaced",
+                codex["stages"][stage_name]["reason_code"],
+            )
+        self.assertEqual(
+            "configured",
+            replaced["client_connections"]["chatgpt-desktop-local"]["effective"]["state"],
+        )
+
+    def test_codex_replacement_stales_prior_chatgpt_shared_config_evidence(self) -> None:
+        status = self._commit_shared_target(
+            create_bundle_status("final", generated_at=T0),
+            "chatgpt-desktop-local",
+            attempt_id="attempt-chatgpt-a",
+            config_fingerprint="config-a",
+            location_fingerprint="location-a",
+        )
+
+        replaced = self._commit_shared_target(
+            status,
+            "codex",
+            attempt_id="attempt-codex-b",
+            config_fingerprint="config-b",
+            location_fingerprint="location-b",
+        )
+
+        chatgpt = replaced["client_connections"]["chatgpt-desktop-local"]
+        self.assertEqual("stale", chatgpt["effective"]["state"])
+        for stage_name in ("registration", "loader", "transport", "fresh_app_server"):
+            self.assertEqual("stale", chatgpt["stages"][stage_name]["state"])
+            self.assertEqual(
+                "shared_config_replaced",
+                chatgpt["stages"][stage_name]["reason_code"],
+            )
+        self.assertEqual(
+            "configured",
+            replaced["client_connections"]["codex"]["effective"]["state"],
+        )
+
+    def test_shared_config_same_entry_at_moved_location_stales_prior_target(self) -> None:
+        status = self._commit_shared_target(
+            create_bundle_status("final", generated_at=T0),
+            "codex",
+            attempt_id="attempt-codex-before-move",
+            config_fingerprint="same-entry",
+            location_fingerprint="location-before-move",
+        )
+
+        moved = self._commit_shared_target(
+            status,
+            "chatgpt-desktop-local",
+            attempt_id="attempt-chatgpt-after-move",
+            config_fingerprint="same-entry",
+            location_fingerprint="location-after-move",
+        )
+
+        codex = moved["client_connections"]["codex"]
+        self.assertEqual("stale", codex["effective"]["state"])
+        self.assertEqual(
+            "shared_config_replaced",
+            codex["stages"]["registration"]["reason_code"],
+        )
+
+    def test_shared_config_replacement_does_not_change_independent_resource(self) -> None:
+        status = begin_attempt(
+            create_bundle_status("final", generated_at=T0),
+            "claude-desktop",
+            "attempt-claude",
+            started_at=T1,
+        )
+        status = commit_success(
+            status,
+            "claude-desktop",
+            "attempt-claude",
+            verified_stages=("registration", "transport"),
+            config_entry_fingerprint="claude-config",
+            runtime_fingerprint="runtime-v1",
+            bundle_location_fingerprint="claude-location",
+            verified_at=T2,
+        )
+        status = self._commit_shared_target(
+            status,
+            "codex",
+            attempt_id="attempt-codex-a",
+            config_fingerprint="config-a",
+            location_fingerprint="location-a",
+        )
+        claude_before = copy.deepcopy(
+            status["client_connections"]["claude-desktop"]
+        )
+
+        replaced = self._commit_shared_target(
+            status,
+            "chatgpt-desktop-local",
+            attempt_id="attempt-chatgpt-b",
+            config_fingerprint="config-b",
+            location_fingerprint="location-b",
+        )
+
+        self.assertEqual(
+            claude_before,
+            replaced["client_connections"]["claude-desktop"],
+        )
+
+    def test_identical_shared_contract_keeps_product_evidence_isolated(self) -> None:
+        status = self._commit_shared_target(
+            create_bundle_status("final", generated_at=T0),
+            "codex",
+            attempt_id="attempt-codex-connected",
+            config_fingerprint="shared-config",
+            location_fingerprint="shared-location",
+            include_conversation=True,
+        )
+        codex_before = copy.deepcopy(status["client_connections"]["codex"])
+
+        committed = self._commit_shared_target(
+            status,
+            "chatgpt-desktop-local",
+            attempt_id="attempt-chatgpt-same-contract",
+            config_fingerprint="shared-config",
+            location_fingerprint="shared-location",
+        )
+
+        self.assertEqual(codex_before, committed["client_connections"]["codex"])
+        self.assertEqual(
+            "verified",
+            committed["client_connections"]["codex"]["stages"]["conversation"]["state"],
+        )
+        self.assertEqual(
+            "not_checked",
+            committed["client_connections"]["chatgpt-desktop-local"]["stages"]["conversation"]["state"],
+        )
+
+    def test_identical_shared_entry_with_new_runtime_stales_only_runtime_bound_evidence(
+        self,
+    ) -> None:
+        status = self._commit_shared_target(
+            create_bundle_status("final", generated_at=T0),
+            "codex",
+            attempt_id="attempt-codex-runtime-a",
+            config_fingerprint="shared-config",
+            location_fingerprint="shared-location",
+            runtime_fingerprint="runtime-a",
+        )
+
+        committed = self._commit_shared_target(
+            status,
+            "chatgpt-desktop-local",
+            attempt_id="attempt-chatgpt-runtime-b",
+            config_fingerprint="shared-config",
+            location_fingerprint="shared-location",
+            runtime_fingerprint="runtime-b",
+        )
+
+        codex = committed["client_connections"]["codex"]
+        self.assertEqual("verified", codex["stages"]["registration"]["state"])
+        for stage_name in ("loader", "transport", "fresh_app_server"):
+            self.assertEqual("stale", codex["stages"][stage_name]["state"])
+            self.assertEqual(
+                "shared_runtime_replaced",
+                codex["stages"][stage_name]["reason_code"],
+            )
+        self.assertEqual("stale", codex["effective"]["state"])
+
     def test_new_success_attempt_cannot_reuse_stages_from_prior_attempt(self) -> None:
         configured = self._configured_codex_status()
         retrying = begin_attempt(
@@ -326,7 +511,11 @@ class McpClientStatusTests(unittest.TestCase):
                 target,
                 attempt_id,
                 verified_stages=stages,
-                config_entry_fingerprint=f"config-{target}",
+                config_entry_fingerprint=(
+                    "config-codex-host"
+                    if target in {"codex", "chatgpt-desktop-local"}
+                    else f"config-{target}"
+                ),
                 runtime_fingerprint="runtime-v1",
                 bundle_location_fingerprint=(
                     "bundle-location-v1" if target in local_targets else None
@@ -885,6 +1074,53 @@ class McpClientStatusTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = mcp_client_status.main(list(args))
         return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def _commit_shared_target(
+        self,
+        status: dict,
+        target: str,
+        *,
+        attempt_id: str,
+        config_fingerprint: str,
+        location_fingerprint: str,
+        runtime_fingerprint: str = "runtime-v1",
+        include_conversation: bool = False,
+    ) -> dict:
+        started = begin_attempt(status, target, attempt_id, started_at=T1)
+        verified_stages: tuple[str, ...] | dict[str, dict[str, object]]
+        if include_conversation:
+            verified_stages = {
+                "registration": {},
+                "loader": {},
+                "transport": {},
+                "fresh_app_server": {},
+                "client_reload": {},
+                "client_surface": {},
+                "conversation": {
+                    "tool_call_verified": True,
+                    "server_name": "final",
+                    "tool_name": "get_index_status",
+                    "conversation_id": f"conversation-{target}",
+                    "result_nonce_hash": "sha256:" + "7" * 64,
+                },
+            }
+        else:
+            verified_stages = (
+                "registration",
+                "loader",
+                "transport",
+                "fresh_app_server",
+            )
+        return commit_success(
+            started,
+            target,
+            attempt_id,
+            verified_stages=verified_stages,
+            config_entry_fingerprint=config_fingerprint,
+            runtime_fingerprint=runtime_fingerprint,
+            bundle_location_fingerprint=location_fingerprint,
+            verified_at=T2,
+        )
 
     def _configured_codex_status(self) -> dict:
         status = begin_attempt(
