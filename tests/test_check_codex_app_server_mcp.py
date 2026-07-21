@@ -77,7 +77,7 @@ class CodexAppServerMcpTests(unittest.TestCase):
         self.assertEqual(["missing_tool"], report["missing_tools"])
 
     def test_json_rpc_error_does_not_copy_local_paths_into_report(self) -> None:
-        secret_path = r"C:\Users\private-user\Desktop\secret-mcp\config.toml"
+        secret_path = r"C:\fixture\secret-mcp\config.toml"
         fake_app_server = f'''
 import json
 import sys
@@ -101,7 +101,7 @@ for line in sys.stdin:
         self.assertNotIn(secret_path, rendered)
 
     def test_executable_version_accepts_only_a_safe_product_and_version_token(self) -> None:
-        secret_path = r"C:\Users\private-user\Desktop\secret-mcp"
+        secret_path = r"C:\fixture\secret-mcp"
         safe_result = subprocess.CompletedProcess(
             args=[],
             returncode=0,
