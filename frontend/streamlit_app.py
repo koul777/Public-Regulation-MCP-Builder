@@ -7179,10 +7179,16 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "claude-code": "Claude Code 연결 진단",
                     "claude-desktop": "Claude Desktop 연결 진단",
                 }[installed_target]
+                diagnostic_client_label = {
+                    "chatgpt-desktop-local": "ChatGPT Desktop",
+                    "codex": "Codex CLI",
+                    "claude-code": "Claude Code",
+                    "claude-desktop": "Claude Desktop",
+                }[installed_target]
                 st.markdown(f"#### {diagnostic_title}")
                 st.caption(
                     "이 표는 화면이 다시 실행될 때마다 번들의 bundle_status.json을 새로 읽습니다. "
-                    "설정·서버 검증과 실제 Desktop 연결 완료를 별도 상태로 표시하며, "
+                    "설정·서버 검증과 선택한 클라이언트의 실제 연결 완료를 별도 상태로 표시하며, "
                     "이전 실행에서 남은 성공 값만으로 연결 완료라고 표시하지 않습니다. "
                     "이 프로그램은 다른 앱의 현재 대화 결과를 자동으로 읽을 수 없으므로, "
                     "아래 최종 도구 호출 성공은 해당 대화에서 직접 확인해야 합니다."
@@ -7231,12 +7237,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 diagnostic_state = str(connection_diagnostic.get("overall_state") or "pending")
                 if diagnostic_state == "connected":
                     st.success(
-                        "Desktop 연결 완료 — 현재 시도의 Desktop 도구 노출과 대화 도구 호출 증명까지 확인했습니다."
+                        f"{diagnostic_client_label} 연결 완료 — 현재 시도의 등록·실행 및 "
+                        "새 대화 또는 task 실제 도구 호출 증명까지 확인했습니다."
                     )
                 elif diagnostic_state == "configured":
                     st.info(
-                        "MCP 구성 확인 완료 · Desktop 연결 확인 대기 — 서버 실행 준비는 확인됐지만 "
-                        "Desktop 도구 노출과 현재 대화 호출은 아직 별도 확인이 필요합니다."
+                        f"MCP 구성 확인 완료 · {diagnostic_client_label} 최종 확인 대기 — "
+                        "서버 실행 준비는 확인됐지만 새 대화 또는 task의 실제 도구 호출은 "
+                        "아직 별도 확인이 필요합니다."
                     )
                 else:
                     st.warning(
