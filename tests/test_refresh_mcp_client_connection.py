@@ -13,6 +13,15 @@ from scripts import refresh_mcp_client_connection as refresh
 
 
 OBSERVED_AT = "2026-07-21T00:00:03Z"
+_FAKE_WINDOWS_HOME = Path("C:/") / "Users" / "private-user"
+_FAKE_CODEX_CONFIG = _FAKE_WINDOWS_HOME / ".codex" / "config.toml"
+_FAKE_CLAUDE_CONFIG = (
+    _FAKE_WINDOWS_HOME
+    / "AppData"
+    / "Roaming"
+    / "Claude"
+    / "claude_desktop_config.json"
+)
 
 
 def _status(*, server_name: str = "sample_mcp") -> dict[str, object]:
@@ -22,10 +31,8 @@ def _status(*, server_name: str = "sample_mcp") -> dict[str, object]:
         "installation_attempt_id": "attempt-existing-001",
         "installation_state": "installed_loader_verified",
         "connection_state": "configured_pending_conversation_verification",
-        "direct_config_path": r"C:\Users\private-user\.codex\config.toml",
-        "claude_desktop_config_path": (
-            r"C:\Users\private-user\AppData\Roaming\Claude\claude_desktop_config.json"
-        ),
+        "direct_config_path": str(_FAKE_CODEX_CONFIG),
+        "claude_desktop_config_path": str(_FAKE_CLAUDE_CONFIG),
         "desktop_tool_scan_verified": True,
         "conversation_attachment_verified": True,
         "end_to_end_verified": True,
@@ -195,7 +202,7 @@ class RefreshMcpClientConnectionTests(unittest.TestCase):
             self.assertEqual(observed["target"], "chatgpt-desktop-local")
             self.assertEqual(observed["bundle"], status_path)
             self.assertEqual(
-                observed["config"], Path(r"C:\Users\private-user\.codex\config.toml")
+                observed["config"], _FAKE_CODEX_CONFIG
             )
             self.assertEqual(observed["server"], "sample_mcp")
 
@@ -419,7 +426,7 @@ class RefreshMcpClientConnectionTests(unittest.TestCase):
 
     def test_sanitizer_rejects_free_form_status_and_invalid_timestamp(self) -> None:
         report = _chatgpt_report()
-        report["observation_status"] = r"C:\Users\private-user\secret.log"
+        report["observation_status"] = str(_FAKE_WINDOWS_HOME / "secret.log")
         report["generated_at"] = "bearer private-token"
         observation = refresh.sanitize_observation("chatgpt-desktop-local", report)
         self.assertEqual(observation["observation_status"], "unknown")
