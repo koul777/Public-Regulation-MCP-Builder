@@ -3073,7 +3073,8 @@ def _refresh_mcp_connection_observation(
         stdout=output,
     )
     try:
-        result = json.loads(output.getvalue())
+        output.seek(0)
+        result = json.loads(output.read())
     except (TypeError, json.JSONDecodeError):
         return False, "refresh_report_invalid"
     if not isinstance(result, dict) or result.get("status_updated") is not True:
