@@ -55,6 +55,9 @@ def _mark_bundle_status_connected(status_path: Path) -> None:
             "installed_config_transport_verified": True,
             "direct_stdio_verified": True,
             "transport_end_to_end_verified": True,
+            "claude_desktop_config_transport_verified": True,
+            "claude_desktop_loader_verified": True,
+            "claude_desktop_conversation_verified": True,
             "fresh_codex_app_server_inventory_verified": True,
             "desktop_app_server_loader_verified": True,
             "desktop_tool_scan_verified": True,
@@ -184,6 +187,43 @@ class McpStatusTransactionTests(unittest.TestCase):
             write_mcp_setup_bundle(config, bundle_dir, server_name="status-transaction-mcp")
 
             self.assertFalse(marker.exists())
+
+    def test_setup_refresh_invalidates_claude_evidence_before_bundle_replacement(self) -> None:
+        config = build_mcp_client_config(
+            server_name="status-transaction-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            write_mcp_setup_bundle(config, bundle_dir, server_name="status-transaction-mcp")
+            status_path = bundle_dir / "bundle_status.json"
+            _mark_bundle_status_connected(status_path)
+            observed_status: dict[str, Any] = {}
+
+            def inspect_transition_then_fail(*args: Any, **kwargs: Any) -> dict[str, str]:
+                del args, kwargs
+                observed_status.update(json.loads(status_path.read_text(encoding="utf-8")))
+                raise RuntimeError("stop-after-setup-transition")
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._write_mcp_setup_bundle_untransactional",
+                    side_effect=inspect_transition_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "stop-after-setup-transition"),
+            ):
+                write_mcp_setup_bundle(config, bundle_dir, server_name="status-transaction-mcp")
+
+        self.assertEqual("setup_refresh_in_progress", observed_status["installation_state"])
+        for field in (
+            "claude_desktop_config_transport_verified",
+            "claude_desktop_loader_verified",
+            "claude_desktop_conversation_verified",
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(observed_status[field])
 
     def test_failed_setup_backup_preserves_unbacked_original_bytes(self) -> None:
         config = build_mcp_client_config(
@@ -449,6 +489,164 @@ class McpStatusTransactionTests(unittest.TestCase):
             refreshed_status["desktop_app_server_error"],
         )
 
+    def test_runtime_refresh_invalidates_claude_evidence_before_data_swap(self) -> None:
+        config = build_mcp_client_config(
+            server_name="status-transaction-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        refreshed_runtime = {
+            "tenant_id": "tenant-a",
+            "document_id": "document-b",
+            "record_count": 2,
+            "chunk_count": 4,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle_dir = root / "bundle"
+            source_data_dir = root / "source-data"
+            source_data_dir.mkdir()
+            write_mcp_setup_bundle(config, bundle_dir, server_name="status-transaction-mcp")
+            status_path = bundle_dir / "bundle_status.json"
+            _mark_bundle_status_connected(status_path)
+            observed_status: dict[str, Any] = {}
+
+            def stage_runtime(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                del args
+                staging_dir = Path(kwargs["_runtime_data_dir"])
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                (staging_dir / "mcp_runtime_manifest.json").write_text(
+                    json.dumps(refreshed_runtime, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                return refreshed_runtime
+
+            def inspect_transition(_output_dir: Path) -> list[str]:
+                observed_status.update(json.loads(status_path.read_text(encoding="utf-8")))
+                return []
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._write_mcp_runtime_data_bundle_uncommitted",
+                    side_effect=stage_runtime,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config._clear_stale_bundle_status_reports",
+                    side_effect=inspect_transition,
+                ),
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=source_data_dir,
+                    out_dir=bundle_dir,
+                    tenant_id="tenant-a",
+                    document_id="document-b",
+                )
+
+        self.assertEqual("runtime_refresh_in_progress", observed_status["installation_state"])
+        for field in (
+            "claude_desktop_config_transport_verified",
+            "claude_desktop_loader_verified",
+            "claude_desktop_conversation_verified",
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(observed_status[field])
+
+    def test_runtime_refresh_invalidates_claude_desktop_verification_evidence(self) -> None:
+        config = build_mcp_client_config(
+            server_name="claude-status-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        original_runtime = {
+            "tenant_id": "tenant-a",
+            "document_id": "document-a",
+            "record_count": 1,
+            "chunk_count": 2,
+        }
+        refreshed_runtime = {
+            "tenant_id": "tenant-a",
+            "document_id": "document-b",
+            "record_count": 2,
+            "chunk_count": 4,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="claude-status-mcp",
+            )
+            status_path = bundle_dir / "bundle_status.json"
+            _write_bundle_status(
+                bundle_dir,
+                config=config,
+                runtime_manifest=original_runtime,
+            )
+
+            completed_status = json.loads(status_path.read_text(encoding="utf-8"))
+            completed_status.update(
+                {
+                    "installation_attempt_id": "claude-completed-attempt",
+                    "installation_state": "installed_pending_claude_desktop_verification",
+                    "connection_state": "pending_claude_desktop_restart",
+                    "claude_desktop_config_registered": True,
+                    "claude_desktop_config_path": "C:/fixture/AppData/Roaming/Claude/claude_desktop_config.json",
+                    "claude_desktop_config_fingerprint": "sha256:" + ("c" * 64),
+                    "claude_desktop_config_transport_verified": True,
+                    "claude_desktop_loader_verified": True,
+                    "claude_desktop_conversation_verified": True,
+                    "direct_stdio_verified": True,
+                    "transport_end_to_end_verified": True,
+                    "end_to_end_verified": True,
+                }
+            )
+            status_path.write_text(
+                json.dumps(completed_status, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            _write_bundle_status(
+                bundle_dir,
+                config=config,
+                runtime_manifest=refreshed_runtime,
+            )
+
+            refreshed_status = json.loads(status_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            "claude-completed-attempt",
+            refreshed_status["installation_attempt_id"],
+        )
+        self.assertTrue(refreshed_status["claude_desktop_config_registered"])
+        self.assertEqual(
+            "C:/fixture/AppData/Roaming/Claude/claude_desktop_config.json",
+            refreshed_status["claude_desktop_config_path"],
+        )
+        self.assertEqual(
+            "sha256:" + ("c" * 64),
+            refreshed_status["claude_desktop_config_fingerprint"],
+        )
+        self.assertEqual(
+            "installed_pending_claude_desktop_verification_runtime_changed",
+            refreshed_status["installation_state"],
+        )
+        self.assertEqual(
+            "pending_runtime_revalidation",
+            refreshed_status["connection_state"],
+        )
+        for field in (
+            "claude_desktop_config_transport_verified",
+            "claude_desktop_loader_verified",
+            "claude_desktop_conversation_verified",
+            "direct_stdio_verified",
+            "transport_end_to_end_verified",
+            "end_to_end_verified",
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(refreshed_status[field])
+
     def test_runtime_refresh_rejects_every_active_installation_state(self) -> None:
         config = build_mcp_client_config(
             server_name="active-status-mcp",
@@ -470,6 +668,7 @@ class McpStatusTransactionTests(unittest.TestCase):
         active_states = (
             "preflight_direct",
             "preflight_plugin",
+            "preflight_claude_desktop",
             "installing",
             "installing_plugin",
             "plugin_installed_pending_loader_verification",

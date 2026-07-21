@@ -2438,7 +2438,7 @@ def _write_hermes_bundle_zip(path: Path) -> None:
         "manifest.json",
         "mcp_config.bundle.json",
         "connect_mcp_client.ps1",
-        "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+        "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
         "CODEX_AGENT_CONNECT_PROMPT.md",
         "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md",
         "MCP 사용 시작하기.txt",
