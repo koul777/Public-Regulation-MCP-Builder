@@ -2586,8 +2586,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, codex_agent_prompt)
             self.assertNotIn(str(output_dir.resolve()), codex_agent_prompt)
             self.assertIn("codex mcp get govreg-local --json", codex_agent_prompt)
-            self.assertIn("direct_stdio_verified", codex_agent_prompt)
-            self.assertIn("desktop_app_server_loader_verified", codex_agent_prompt)
+            self.assertIn("client_connections.codex", codex_agent_prompt)
+            self.assertIn("fresh_app_server", codex_agent_prompt)
+            self.assertIn("같은 현재 attempt", codex_agent_prompt)
+            self.assertIn("다른 클라이언트의 성공 상태", codex_agent_prompt)
             self.assertIn(final_tool_prompt, codex_agent_prompt)
             self.assertIn("Codex를 완전히 종료하고 다시 실행", codex_agent_prompt)
             claude_agent_prompt = Path(files["claude_code_agent_prompt"]).read_text(encoding="utf-8")
@@ -2738,6 +2740,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("validate_client_config_smoke.ps1", readme)
             self.assertIn("recommended_smoke_query", readme)
             self.assertIn(
+                f"identities for {len(RUNTIME_IDENTITY_MODULES)} MCP command modules",
+                readme,
+            )
+            self.assertIn(
                 "uses it before any source checkout, environment override, or PATH",
                 readme,
             )
@@ -2782,6 +2788,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("validate_client_config_smoke.ps1", readme_ko)
             self.assertIn("`list_tools`, `get_index_status`, `search`, `fetch`", readme_ko)
             self.assertIn("recommended_smoke_query", readme_ko)
+            self.assertIn(f"MCP 명령 모듈 {len(RUNTIME_IDENTITY_MODULES)}개", readme_ko)
             self.assertIn(
                 "저장소 checkout, `REG_RAG_PYTHON`, PATH보다 먼저 사용",
                 readme_ko,

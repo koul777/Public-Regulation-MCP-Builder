@@ -4113,7 +4113,7 @@ def _codex_agent_connect_prompt(server_name: str) -> str:
 3. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target codex -InstallCodex`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, active Python Scripts 경로 보정, doctor, 현재 사용자의 Codex MCP 설정 백업·갱신, stdio 및 app-server 검증까지 모두 끝내야 해.
 4. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·등록·로더 검증 중 하나라도 실패하면 성공으로 보고하지 마.
 5. 설치 후 `codex mcp get {server_name} --json`을 실행하고 `powershell.exe`, `-File`, `--data-dir`가 이 번들의 현재 절대 경로를 가리키는지 확인해. 이름이 같아도 다른 경로를 가리키면 성공으로 보고하지 마.
-6. `bundle_status.json`의 `direct_config_registered`, `direct_config_loader_verified`, `direct_stdio_verified`, `desktop_app_server_loader_verified`가 모두 true인지 확인해. 하나라도 false면 성공으로 보고하지 마.
+6. `bundle_status.json`의 `client_connections.codex`에서 `last_attempt.state=completed`, `effective.state=configured`, registration·loader·transport·fresh_app_server stage가 모두 같은 현재 attempt에서 verified인지 확인해. 호환용 최상위 direct 필드나 다른 클라이언트의 성공 상태를 Codex 성공으로 대신 사용하지 마.
 7. 설치와 로더 검증이 모두 끝난 뒤 Codex를 완전히 종료하고 다시 실행해야 한다고 알려줘. 재시작한 새 task에서 `/mcp`로 `{server_name}`을 확인한 뒤 정확히 `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출까지 확인하도록 안내해.
 
 현재 화면에서 로컬 파일 또는 터미널 실행 권한이 없다면 성공했다고 말하지 말고, `manifest.json`의 `files.connect_codex_bat`가 가리키는 BAT를 사용자가 실행하도록 안내해.
@@ -7983,7 +7983,7 @@ the repository, installs a bundled `reg_rag_preprocessor-*.whl` when present out
    `data` directory and includes `--no-warm-cache` plus the generated storage-mode flag. Local stdio client
    configs launch `{files.get("stdio_launcher", SETUP_BUNDLE_FILES["stdio_launcher"])}` through PowerShell instead
    of calling `reg-rag-mcp-server` directly. A successful package install writes `runtime_python.json` schema 2
-   with the selected Python and SHA-256 identities for eight MCP command modules. The launcher validates that
+   with the selected Python and SHA-256 identities for {len(RUNTIME_IDENTITY_MODULES)} MCP command modules. The launcher validates that
    identity with `PYTHONPATH` isolated and uses it before any source checkout, environment override, or PATH
    command. A damaged or drifted marker fails closed and asks for reinstall; fallback discovery is only used
    before a marker exists.
@@ -8152,7 +8152,7 @@ powershell -ExecutionPolicy Bypass -File "{files.get('connect', SETUP_BUNDLE_FIL
 - ChatGPT Desktop 로컬 direct MCP: `{files.get('chatgpt_desktop_agent_prompt', SETUP_BUNDLE_FILES['chatgpt_desktop_agent_prompt'])}`에 표시된 Name, STDIO, Command, Working directory, Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하는 방식이 기본입니다. Save 후 Restart하고 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 실제 `get_index_status`를 호출합니다. 메뉴가 없거나 수동 입력이 어려울 때만 보조 BAT `{files.get('connect_chatgpt_desktop_bat', SETUP_BUNDLE_FILES['connect_chatgpt_desktop_bat'])}`를 사용합니다. `@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않습니다.
 - Codex CLI 호환: `{files.get('codex_agent_prompt', SETUP_BUNDLE_FILES['codex_agent_prompt'])}`를 Codex 에이전트에 붙여넣는 방식을 우선 사용합니다. 실행 권한이 없으면 `{files.get('connect_codex_bat', SETUP_BUNDLE_FILES['connect_codex_bat'])}`를 사용합니다. 수동 설정이 필요하면 먼저 `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`의 모든 `<BUNDLE_DIR>`을 `C:/MCP/aksmcp2`처럼 슬래시(`/`)를 쓴 현재 압축 해제 폴더의 절대 경로로 바꿉니다(역슬래시를 쓰려면 TOML 규칙에 맞게 각각 이스케이프). 그 뒤 TOML 블록을 `$HOME\\.codex\\config.toml`에 붙여 넣거나 기존 `[mcp_servers.{server_name}]` 블록과 교체합니다.
 - 이 스니펫은 `--data-dir`을 이 번들의 `data` 폴더로 고정하고 `--no-warm-cache`와 저장소 모드 플래그를 포함합니다. 그래서 예전 번들이나 다른 MCP 서버를 물고 느리게 인식하는 문제를 줄입니다.
-- 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 설치가 성공하면 선택한 Python과 MCP 명령 모듈 8개의 SHA-256 build identity를 `runtime_python.json` schema 2에 기록합니다. launcher는 `PYTHONPATH`를 격리해 이 identity를 다시 확인한 뒤 저장소 checkout, `REG_RAG_PYTHON`, PATH보다 먼저 사용합니다. marker가 손상되거나 같은 Python의 모듈이 바뀌면 다른 runtime으로 조용히 fallback하지 않고 재설치를 요구합니다. marker가 아직 없는 설치 전 단계에서만 생성 당시 checkout과 명시적 runtime 탐색을 허용합니다.
+- 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 설치가 성공하면 선택한 Python과 MCP 명령 모듈 {len(RUNTIME_IDENTITY_MODULES)}개의 SHA-256 build identity를 `runtime_python.json` schema 2에 기록합니다. launcher는 `PYTHONPATH`를 격리해 이 identity를 다시 확인한 뒤 저장소 checkout, `REG_RAG_PYTHON`, PATH보다 먼저 사용합니다. marker가 손상되거나 같은 Python의 모듈이 바뀌면 다른 runtime으로 조용히 fallback하지 않고 재설치를 요구합니다. marker가 아직 없는 설치 전 단계에서만 생성 당시 checkout과 명시적 runtime 탐색을 허용합니다.
 - Codex CLI 설정을 붙여 넣은 뒤에는 `reg-rag-mcp-doctor --client-profile bundle --bundle-dir . --allow-local-only-bundle --codex-config $HOME\\.codex\\config.toml`로 실제 설치된 설정을 확인합니다.
 
 ## ChatGPT 연결
