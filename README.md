@@ -339,6 +339,8 @@ README 촬영용 샘플에서는 외부 API 키를 넣지 않았으므로 실제
 
 같은 MCP 이름으로 다시 생성하면 Claude Code와 Codex CLI는 대상별 에이전트 프롬프트를 다시 실행하고, Claude Desktop은 전용 BAT를 다시 실행합니다. ChatGPT Desktop은 새 안내 값을 기존 `Settings > MCP servers` 항목에 반영합니다. 생성할 때 현재 승인된 전체 청크를 다시 묶으므로 추가 규정과 개정판 청크도 같은 MCP 이름으로 조회됩니다. 폴더를 옮겼다면 모든 로컬 대상에서 새 폴더 기준으로 등록을 갱신해야 합니다.
 
+업데이트 전 번들의 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`는 ChatGPT Desktop에 Codex CLI 설치를 요청하던 구형 형식일 수 있습니다. 프로그램은 이 파일을 감지하면 구형 지시를 그대로 표시하지 않고, 검증 가능한 stdio 입력값이 있으면 현행 Desktop Settings 안내로 변환합니다. 복구할 수 없으면 재생성을 요구하며 구형 ChatGPT Desktop BAT도 실행하지 않도록 안내합니다.
+
 생성 폴더의 `설치 후 MCP 사용 방법 보기.bat`는 클라이언트별 확인 명령과 실제 MCP 이름이 들어간 첫 호출 문장을 보여줍니다. `Codex 플러그인 MCP 입력값.txt`는 Codex CLI 수동 호환 설정용입니다.
 
 생성 파일의 의미, 수동 점검 명령과 장애 해결 절차는 [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)에 정리되어 있습니다.

@@ -7139,9 +7139,22 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             for agent_prompt_path in [path for path in agent_prompt_paths if path]:
                 prompt_path = Path(str(agent_prompt_path))
                 prompt_label = prompt_path.stem.replace("_", " ")
-                is_chatgpt_desktop_guide = prompt_path.name == "CHATGPT_DESKTOP_CONNECT_GUIDE.md"
+                is_legacy_chatgpt_desktop_prompt = (
+                    prompt_path.name == "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md"
+                )
+                is_chatgpt_desktop_guide = prompt_path.name in {
+                    "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
+                    "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+                }
                 st.markdown(f"#### {prompt_label}")
                 if is_chatgpt_desktop_guide:
+                    if is_legacy_chatgpt_desktop_prompt:
+                        st.warning(
+                            "구형 ChatGPT Desktop 에이전트 프롬프트를 감지했습니다. "
+                            "Codex 설치 지시는 실행하지 않으며, 복구 가능한 경우 아래 내용을 "
+                            "현재 Desktop Settings 입력 안내로 안전하게 변환합니다. 복구할 수 없으면 "
+                            "현재 프로그램에서 파일 묶음을 다시 생성하세요."
+                        )
                     st.caption(
                         "ChatGPT Desktop의 Settings > MCP servers > Add server에 아래 실제 값을 입력하세요. "
                         "프로그램이 현재 번들의 폴더 이름·절대경로·핵심 파일 구조와 전체 Arguments를 자동으로 넣었습니다. "

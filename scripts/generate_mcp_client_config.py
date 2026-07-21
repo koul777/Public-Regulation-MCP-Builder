@@ -179,6 +179,8 @@ def render_agent_connect_prompt_for_program(
         or AGENT_CONNECT_BUNDLE_DIR_MARKER in prompt_text
         or AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER in prompt_text
     )
+    if "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md" in prompt_text:
+        return _render_legacy_chatgpt_desktop_guide(bundle_dir=Path(resolved_bundle_dir))
     rendered = prompt_text.replace(
         AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER,
         powershell_literal,
@@ -237,6 +239,76 @@ def render_agent_connect_prompt_for_program(
         "검색하거나 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해."
     )
     return legacy_step.sub(lambda _: replacement, rendered, count=1)
+
+
+def _render_legacy_chatgpt_desktop_guide(*, bundle_dir: Path) -> str:
+    """Replace obsolete Desktop agent instructions with the current settings guide.
+
+    Older bundles told a ChatGPT Desktop conversation to execute the Codex CLI
+    installer.  Reusing that text after only materializing its path would keep
+    the unsafe product mismatch alive.  Recover only the local stdio launch
+    contract, relocate its path-bearing arguments, and otherwise fail closed
+    with a regeneration notice.
+    """
+
+    config_path = bundle_dir / SETUP_BUNDLE_FILES["chatgpt_desktop_local"]
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+
+    ui_fields = payload.get("ui_fields")
+    server_name = str(payload.get("server_name") or "").strip()
+    if not isinstance(ui_fields, dict):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+    if not server_name:
+        server_name = str(ui_fields.get("name") or "").strip()
+    if not SAFE_MCP_SERVER_NAME.fullmatch(server_name):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+    if str(ui_fields.get("command") or "").strip().lower() != "powershell.exe":
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+    raw_args = ui_fields.get("args")
+    if not isinstance(raw_args, list) or not all(isinstance(arg, str) for arg in raw_args):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+
+    relocated_args = list(raw_args)
+    required_paths = {
+        "-File": str((bundle_dir / SETUP_BUNDLE_FILES["stdio_launcher"]).resolve()),
+        "--data-dir": str((bundle_dir / "data").resolve()),
+    }
+    for flag, current_path in required_paths.items():
+        positions = [index for index, value in enumerate(relocated_args) if value == flag]
+        if len(positions) != 1 or positions[0] + 1 >= len(relocated_args):
+            return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+        relocated_args[positions[0] + 1] = current_path
+
+    current_payload = copy.deepcopy(payload)
+    current_payload["ui_fields"] = {
+        **ui_fields,
+        "name": server_name,
+        "cwd": str(bundle_dir.resolve()),
+        "args": relocated_args,
+    }
+    portable_guide = _chatgpt_desktop_setup_guide(
+        server_name,
+        config=current_payload,
+        bundle_dir=bundle_dir,
+        allow_bat_fallback=False,
+    )
+    return render_agent_connect_prompt_for_program(portable_guide, bundle_dir=bundle_dir)
+
+
+def _legacy_chatgpt_desktop_regeneration_notice(bundle_dir: Path) -> str:
+    return f"""# ChatGPT Desktop MCP 연결 안내 갱신 필요
+
+현재 폴더: `{bundle_dir.resolve()}`
+
+이 폴더의 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`는 ChatGPT Desktop에 Codex CLI 설치를 요청하던 구형 형식이며 실행하면 안 됩니다. 구형 `ChatGPT Desktop에 연결하기.bat`도 실행하지 마세요.
+
+현재 프로그램에서 MCP 파일 묶음을 다시 생성한 뒤 새 `CHATGPT_DESKTOP_CONNECT_GUIDE.md`의 Name·Command·Working directory·Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하세요.
+"""
 
 
 def _runtime_identity_builder_base64() -> str:
@@ -4049,6 +4121,7 @@ def _chatgpt_desktop_setup_guide(
     *,
     config: dict[str, Any],
     bundle_dir: str | Path,
+    allow_bat_fallback: bool = True,
 ) -> str:
     ui_fields = config.get("ui_fields") if isinstance(config, dict) else None
     if not isinstance(ui_fields, dict):
@@ -4065,18 +4138,34 @@ def _chatgpt_desktop_setup_guide(
     env = ui_fields.get("env") if isinstance(ui_fields.get("env"), dict) else {}
     argument_lines = "\n".join(f"{index}. {arg}" for index, arg in enumerate(args, start=1)) or "없음"
     environment_note = "비워 둠" if not env else "비밀값을 복사하지 말고 승인된 로컬 환경변수만 설정"
+    fallback_note = (
+        f"`@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않는다. "
+        "`Settings > MCP servers` 메뉴가 없거나 수동 입력이 어려울 때만 이 번들 폴더의 "
+        "`ChatGPT Desktop에 연결하기.bat`를 Windows 탐색기에서 실행한다. BAT 실행 후에도 "
+        "ChatGPT Desktop을 완전히 재시작하고 새 대화에서 `/mcp`와 실제 `get_index_status` 호출을 확인해야 한다."
+        if allow_bat_fallback
+        else f"`@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않는다. 이 안내는 구형 연결 프롬프트에서 안전하게 변환됐으므로 구형 BAT를 실행하지 말고 위 Settings 입력값만 사용한다."
+    )
+    portable_source_note = (
+        "아래 경로에 `PROGRAM_BUNDLE_DIR` 자리표시자가 그대로 보이면 ZIP 이식용 원본 파일이다. "
+        "그 값을 ChatGPT Desktop에 복사하지 말고 프로그램 생성 결과 화면에서 실제 절대경로가 "
+        "채워진 코드 상자를 사용하거나, 마지막의 보조 BAT를 실행한다."
+        if allow_bat_fallback
+        else "아래 입력값은 구형 프롬프트에서 안전하게 복구해 현재 번들 절대경로로 다시 계산했다. "
+        "구형 BAT는 실행하지 말고 이 Settings 입력값만 사용한다."
+    )
     return f"""# ChatGPT Desktop MCP 연결 안내
 
 이 안내는 **ChatGPT Desktop 전용**이다. 다른 제품의 에이전트 실행 요청이 아니며, 일반 대화창에 설치 프롬프트로 붙여넣지 않는다.
 
-아래 경로에 `PROGRAM_BUNDLE_DIR` 자리표시자가 그대로 보이면 ZIP 이식용 원본 파일이다. 그 값을 ChatGPT Desktop에 복사하지 말고 프로그램 생성 결과 화면에서 실제 절대경로가 채워진 코드 상자를 사용하거나, 마지막의 보조 BAT를 실행한다.
+{portable_source_note}
 
 {_agent_connect_bundle_context(prompt_file="CHATGPT_DESKTOP_CONNECT_GUIDE.md", fallback_file="ChatGPT Desktop에 연결하기.bat")}
 
 ## ChatGPT Desktop에서 등록
 
-1. ChatGPT Desktop의 `Settings`를 연다.
-2. `MCP servers` → `Add server`를 선택한다.
+1. ChatGPT Desktop의 `Settings > MCP servers > Add server`를 연다.
+2. 새 STDIO 서버 입력 화면이 표시되는지 확인한다.
 3. 아래 값을 그대로 입력한다.
 
 ```text
@@ -4097,7 +4186,7 @@ Arguments — 아래 항목을 표시된 순서대로 하나씩 추가한다.
 5. 재시작 후 새 대화에서 `/mcp`를 입력해 `{server_name}`이 보이는지 확인한다.
 6. `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출을 확인한다.
 
-`@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않는다. `Settings > MCP servers` 메뉴가 없거나 수동 입력이 어려울 때만 이 번들 폴더의 `ChatGPT Desktop에 연결하기.bat`를 Windows 탐색기에서 실행한다. BAT 실행 후에도 ChatGPT Desktop을 완전히 재시작하고 새 대화에서 `/mcp`와 실제 `get_index_status` 호출을 확인해야 한다.
+{fallback_note}
 """
 
 
@@ -8523,6 +8612,7 @@ def _powershell_claude_code_stdio_bundle_script(
         '$ClaudeUserConfig = Get-ClaudeUserConfigPath',
         '$ClaudeConfigExisted = $false',
         '$ClaudeConfigBackup = $null',
+        '$ClaudeSmokeConfig = $null',
         '$ClaudeConfigMutex = New-Object System.Threading.Mutex($false, "Local\\PRMCPBuilder-ClaudeCodeConfig")',
         '$ClaudeConfigLockAcquired = $false',
         '$ClaudeMutationStarted = $false',
@@ -8549,13 +8639,24 @@ def _powershell_claude_code_stdio_bundle_script(
         '$ClaudeCommandVerified = $ClaudeGetText.IndexOf("powershell.exe", [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
         '$ClaudeLauncherVerified = $ClaudeGetText.IndexOf($StdioLauncher, [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
         '$ClaudeDataVerified = $ClaudeGetText.IndexOf($BundleDataDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
-        'if (-not ($ClaudeScopeVerified -and $ClaudeStatusConnected -and $ClaudeCommandVerified -and $ClaudeLauncherVerified -and $ClaudeDataVerified)) { throw "Claude Code mcp get returned a disconnected, stale, wrong-scope, or wrong-path entry." }',
-        '$SmokeArgs = @("--server-name", "' + server_name + '", "--claude-desktop-config", (Join-Path $BundleDir "claude_desktop_config.json"), "--out-json", $ClaudeSmokeReport, "--fail-on-issue")',
+        '$ClaudeArgumentsVerified = $true',
+        'foreach ($ExpectedArgument in $LauncherArgs) { if ($ClaudeGetText.IndexOf([string]$ExpectedArgument, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { $ClaudeArgumentsVerified = $false; break } }',
+        'if (-not ($ClaudeScopeVerified -and $ClaudeStatusConnected -and $ClaudeCommandVerified -and $ClaudeLauncherVerified -and $ClaudeDataVerified -and $ClaudeArgumentsVerified)) { throw "Claude Code mcp get returned a disconnected, stale, wrong-scope, wrong-path, or incomplete argument contract." }',
+        '$ClaudeSmokeConfig = Join-Path $BundleDir (".claude-code-stdio-smoke.{0}.json" -f [Guid]::NewGuid().ToString("N"))',
+        '$ClaudeSmokePayload = [ordered]@{ mcpServers = [ordered]@{ "' + server_name + '" = [ordered]@{ type = "stdio"; command = "powershell.exe"; args = $LauncherArgs } } }',
+        '$ClaudeSmokeJson = ($ClaudeSmokePayload | ConvertTo-Json -Depth 20) + [Environment]::NewLine',
+        '$ClaudeSmokeUtf8 = New-Object System.Text.UTF8Encoding($false)',
+        '[System.IO.File]::WriteAllText($ClaudeSmokeConfig, $ClaudeSmokeJson, $ClaudeSmokeUtf8)',
+        '$SmokeArgs = @("--server-name", "' + server_name + '", "--claude-code-config", $ClaudeSmokeConfig, "--out-json", $ClaudeSmokeReport, "--fail-on-issue")',
         '$McpPython = Resolve-BundleModulePython "scripts.run_mcp_client_config_smoke"',
         '$SmokeExitCode = Invoke-BundlePythonModule $McpPython "scripts.run_mcp_client_config_smoke" $SmokeArgs',
         '$SmokeResult = $null',
         'if (Test-Path -LiteralPath $ClaudeSmokeReport) { try { $SmokeResult = Get-Content -LiteralPath $ClaudeSmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $SmokeResult = $null } }',
-        '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and @($SmokeResult.results).Count -eq 1',
+        '$SmokeResults = @($(if ($SmokeResult) { $SmokeResult.results } else { @() }))',
+        '$SmokeEntry = $(if ($SmokeResults.Count -eq 1) { $SmokeResults[0] } else { $null })',
+        '$SmokeConfigPathMatches = $false',
+        'if ($SmokeEntry) { try { $SmokeConfigPathMatches = Test-SamePath ([string]$SmokeEntry.config_path) $ClaudeSmokeConfig } catch { $SmokeConfigPathMatches = $false } }',
+        '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and $SmokeResults.Count -eq 1 -and [string]$SmokeEntry.label -eq "claude_code" -and $SmokeConfigPathMatches -and [string]$SmokeEntry.command -eq "powershell.exe" -and (Test-SameMcpArguments @($SmokeEntry.args) $LauncherArgs)',
         'if (-not $SmokeVerified) { throw "Claude Code launch contract did not complete initialize, tools/list, and get_index_status." }',
         '$ContractCanonical = (@("user", "stdio", "powershell.exe") + $LauncherArgs) -join [char]0',
         '$ContractBytes = [Text.Encoding]::UTF8.GetBytes($ContractCanonical)',
@@ -8578,6 +8679,7 @@ def _powershell_claude_code_stdio_bundle_script(
         '  throw $ClaudeInstallError',
         '} finally {',
         '  if ($ClaudeConfigBackup -and (Test-Path -LiteralPath $ClaudeConfigBackup)) { Remove-Item -LiteralPath $ClaudeConfigBackup -Force }',
+        '  if ($ClaudeSmokeConfig -and (Test-Path -LiteralPath $ClaudeSmokeConfig)) { Remove-Item -LiteralPath $ClaudeSmokeConfig -Force }',
         '  if ($ClaudeConfigLockAcquired) { $ClaudeConfigMutex.ReleaseMutex() }',
         '  $ClaudeConfigMutex.Dispose()',
         '}',

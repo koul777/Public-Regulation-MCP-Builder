@@ -45,6 +45,7 @@ def run_mcp_client_config_smoke(
     *,
     server_name: str = "regulation_mcp",
     codex_config: str | Path | None = None,
+    claude_code_config: str | Path | None = None,
     claude_desktop_config: str | Path | None = None,
     plugin_mcp_config: str | Path | None = None,
     remote_url: str | None = None,
@@ -56,6 +57,8 @@ def run_mcp_client_config_smoke(
     targets: list[tuple[str, Path]] = []
     if codex_config is not None:
         targets.append(("codex", Path(codex_config)))
+    if claude_code_config is not None:
+        targets.append(("claude_code", Path(claude_code_config)))
     if claude_desktop_config is not None:
         targets.append(("claude_desktop", Path(claude_desktop_config)))
     if plugin_mcp_config is not None:
@@ -194,6 +197,7 @@ def _run_single_client_config_smoke(
 ) -> dict[str, Any]:
     label = {
         "codex": "Codex",
+        "claude_code": "Claude Code",
         "claude_desktop": "Claude Desktop",
         "chatgpt_desktop_local": "ChatGPT Desktop local plugin",
     }.get(client_key, client_key)
@@ -242,7 +246,7 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
     if client_key == "codex":
         payload = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
         servers = payload.get("mcp_servers") if isinstance(payload, dict) else None
-    elif client_key == "claude_desktop":
+    elif client_key in {"claude_code", "claude_desktop"}:
         payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     elif client_key == "chatgpt_desktop_local":
@@ -864,6 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run MCP stdio smoke through generated client config files.")
     parser.add_argument("--server-name", default="regulation_mcp")
     parser.add_argument("--codex-config", default=None)
+    parser.add_argument("--claude-code-config", default=None)
     parser.add_argument("--claude-desktop-config", default=None)
     parser.add_argument("--plugin-mcp-config", default=None)
     parser.add_argument("--remote-url", default=None)
@@ -883,6 +888,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
     report = run_mcp_client_config_smoke(
         server_name=args.server_name,
         codex_config=args.codex_config,
+        claude_code_config=args.claude_code_config,
         claude_desktop_config=args.claude_desktop_config,
         plugin_mcp_config=args.plugin_mcp_config,
         remote_url=args.remote_url,

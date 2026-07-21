@@ -142,6 +142,48 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertEqual("claude_desktop", report["results"][0]["label"])
         self.assertEqual("임원", report["results"][0]["query"])
 
+    def test_claude_code_config_smoke_keeps_client_identity_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "claude_code_stdio_smoke.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "govreg-local": {
+                                "type": "stdio",
+                                "command": "powershell.exe",
+                                "args": ["-File", str(root / "run_mcp_stdio_server.ps1")],
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            async def fake_run_client_entry(*, command, args, query):
+                return {
+                    "passed": True,
+                    "process_started": True,
+                    "mcp_initialized": True,
+                    "tools_discovered": True,
+                    "strict_stdio_wire_verified": True,
+                    "index_status_verified": True,
+                    "end_to_end_verified": True,
+                }
+
+            with patch("scripts.run_mcp_client_config_smoke._run_client_entry", new=fake_run_client_entry):
+                report = run_mcp_client_config_smoke(
+                    claude_code_config=config,
+                    server_name="govreg-local",
+                )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual("claude_code", report["results"][0]["label"])
+        self.assertEqual("powershell.exe", report["results"][0]["command"])
+        self.assertEqual(["-File", str(root / "run_mcp_stdio_server.ps1")], report["results"][0]["args"])
+
     def test_plugin_config_generates_verified_prompt_answer_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

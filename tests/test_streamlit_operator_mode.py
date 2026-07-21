@@ -385,6 +385,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("support_summary:", source)
         self.assertIn("next_action:", source)
         self.assertIn("st.code(agent_prompt_text, language=None)", source)
+        self.assertIn('prompt_path.name == "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md"', source)
+        self.assertIn("구형 ChatGPT Desktop 에이전트 프롬프트를 감지했습니다", source)
         self.assertIn("_refresh_mcp_connection_observation(", source)
         self.assertIn("이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다.", source)
 
