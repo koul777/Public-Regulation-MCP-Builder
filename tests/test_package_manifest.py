@@ -17,6 +17,11 @@ class PackageManifestTests(unittest.TestCase):
             {"file": "README.md", "content-type": "text/markdown"},
         )
 
+    def test_mcp_sdk_stays_on_the_stable_v1_line(self) -> None:
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+        self.assertIn("mcp>=1.26,<2", pyproject["project"]["dependencies"])
+
     def test_manifest_includes_public_docs_needed_by_tests(self) -> None:
         text = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
 

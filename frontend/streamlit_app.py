@@ -219,6 +219,9 @@ MCP_CONNECTION_STATE_LABELS = {
     "stale": "이전 증거",
 }
 MCP_EXTERNAL_DATA_TARGETS = frozenset({"chatgpt-remote", "chatgpt-tunnel", "claude-api"})
+MCP_SEARCH_FETCH_TARGETS = MCP_EXTERNAL_DATA_TARGETS | frozenset(
+    {"chatgpt-desktop-local", "codex"}
+)
 
 NAV_HOME = "🏠 시작하기"
 NAV_PREPROCESS = "① 문서 올려서 전처리"
@@ -2929,7 +2932,7 @@ def _mcp_agent_prompt_display_kind(prompt_path: str | Path) -> str:
 def _mcp_final_verification_prompts(connection_target: str, server_name: str) -> list[str]:
     """Return only prompts supported by the selected client's MCP tool profile."""
 
-    if connection_target in MCP_EXTERNAL_DATA_TARGETS:
+    if connection_target in MCP_SEARCH_FETCH_TARGETS:
         return [
             f"{server_name} MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 "
             "fetch 도구로 조회해 조문 원문과 출처를 보여줘."
@@ -6644,7 +6647,8 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         )
         st.caption(
             "ChatGPT Desktop에는 Settings > MCP servers 내장 등록 안내와 공유 config.toml용 보조 BAT를 만듭니다. "
-            "Codex CLI·Claude Code에는 에이전트 연결 요청문과 보조 BAT를 만들며, Claude Desktop은 전용 BAT를 기본으로 사용합니다."
+            "Codex CLI는 직접 설정/BAT를 기본으로 사용하고, Claude Code만 선택적 에이전트 연결 요청문을 제공합니다. "
+            "Claude Desktop은 전용 BAT를 기본으로 사용합니다. 연결 설정이나 비밀값을 대화 프롬프트에 넣지 마세요."
         )
         if mcp_scope == "selected_institution":
             st.info(
@@ -6883,7 +6887,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             visibility_precheck_args.append("--tenant-storage-isolation")
         connect_script_path = mcp_bundle_output_dir / "connect_mcp_client.ps1"
         mcp_target_file_keys = {
-            "codex": "codex_agent_prompt",
+            "codex": "connect_codex_bat",
             "claude-desktop": "connect_claude_desktop_bat",
             "claude-code": "claude_code_agent_prompt",
             "chatgpt-desktop-local": "chatgpt_desktop_agent_prompt",
@@ -7124,7 +7128,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"- 설치 확인 스크립트: `{Path(str(files.get('install'))).name}`",
                         f"- 설치 후 사용 안내: `{Path(str(files.get('usage_guide_bat'))).name}`",
                         f"- ChatGPT Desktop 내장 MCP 등록 안내: `{Path(str(files.get('chatgpt_desktop_agent_prompt'))).name}`",
-                        f"- Codex 에이전트 연결 요청문: `{Path(str(files.get('codex_agent_prompt'))).name}`",
+                        f"- Codex 선택적 로컬 자동화 요청문: `{Path(str(files.get('codex_agent_prompt'))).name}`",
                         f"- Claude Code 에이전트 연결 요청문: `{Path(str(files.get('claude_code_agent_prompt'))).name}`",
                         f"- Codex CLI 호환 수동 입력값: `{Path(str(files.get('codex_plugin_guide'))).name}`",
                         f"- 한국어 안내문: `{Path(str(files.get('readme_ko'))).name}`",
@@ -7323,10 +7327,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"{restart_target_label}를 완전히 종료·재실행한 뒤 새 대화나 task에서 먼저 `/mcp`로 "
                         f"`{installed_server_name}`을 확인하고, 아래 문장을 그대로 복사해 실행하세요."
                     )
-                st.code(
-                    f"{installed_server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.",
-                    language=None,
-                )
+                for verification_prompt in _mcp_final_verification_prompts(
+                    installed_target,
+                    installed_server_name,
+                ):
+                    st.code(verification_prompt, language=None)
             st.markdown(
                 "#### Claude Desktop 기본 BAT 연결 방식"
                 if installed_target == "claude-desktop"
@@ -7344,7 +7349,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     f"새 대화에서 먼저 `/mcp`로 {installed_server_name}을 확인하세요. `@이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다."
                 )
             elif installed_target == "codex":
-                st.info("Codex CLI를 다시 시작하고 새 task에서 `/mcp`로 등록 이름을 확인하세요.")
+                st.info(
+                    "Codex에 연결하기.bat가 사용자 MCP 설정을 직접 등록·검증합니다. "
+                    "또는 생성된 TOML 스니펫을 직접 설정한 뒤 Codex를 다시 시작하고 새 task에서 `/mcp`를 확인하세요. "
+                    "연결 설정·로컬 경로·토큰·API 키는 프롬프트에 붙여넣지 않습니다."
+                )
             elif installed_target == "claude-code":
                 st.info("Claude Code를 다시 시작하고 대화에서 `/mcp` 또는 터미널의 `claude mcp list`로 확인하세요.")
             elif installed_target == "claude-desktop":
@@ -7355,9 +7364,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 )
             elif installed_target == "chatgpt-remote":
                 st.info(
-                    "ChatGPT 웹의 Settings > Apps > Advanced Settings에서 Developer mode를 켠 뒤 "
-                    "Settings > Apps > Create에서 공개 HTTPS MCP 앱을 같은 이름으로 등록하고, "
-                    "새 대화의 tools 메뉴에서 앱을 선택해 아래 실제 search/fetch 도구 호출로 확인하세요."
+                    "공개 endpoint의 MCP OAuth 2.1 검증을 완료하고 --chatgpt-oauth-ready로 번들을 생성해야 합니다. "
+                    "정적 MCP_AUTH_TOKEN은 ChatGPT에 입력할 수 없으므로 OAuth 준비가 없으면 보안 Tunnel을 사용하세요. "
+                    "ChatGPT 웹의 Settings > Security and login에서 Developer mode를 켠 뒤 "
+                    "Settings > Plugins 또는 https://chatgpt.com/plugins 의 +에서 공개 HTTPS MCP 앱을 같은 이름으로 등록하고, "
+                    "새 대화의 + > More에서 앱을 선택해 아래 실제 search/fetch 도구 호출로 확인하세요."
                 )
             elif installed_target == "chatgpt-tunnel":
                 st.info(
@@ -7386,16 +7397,20 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "같은 이름으로 다시 생성하면 Settings > MCP servers의 기존 항목을 새 안내 값으로 갱신합니다. "
                     "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
                 )
-            elif installed_target in {"codex", "claude-code"}:
+            elif installed_target == "codex":
                 st.caption(
-                    "같은 이름으로 다시 생성하고 대상별 에이전트 프롬프트를 실행하면 기존 연결 설정을 교체하며, "
-                    "Codex CLI·Claude Code에서 로컬 에이전트를 사용할 수 없을 때만 보조 BAT를 실행합니다. "
+                    "같은 이름으로 다시 생성하고 Codex 전용 BAT를 실행하거나 TOML 설정을 직접 교체하면 기존 연결을 갱신합니다. "
+                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
+                )
+            elif installed_target == "claude-code":
+                st.caption(
+                    "같은 이름으로 다시 생성하고 Claude Code 에이전트 요청문 또는 보조 BAT를 실행하면 기존 연결 설정을 교체합니다. "
                     "Claude Desktop은 전용 BAT가 기본입니다. 현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
                 )
             elif installed_target == "chatgpt-remote":
                 st.caption(
                     "같은 이름으로 번들을 다시 생성했다면 원격 서버를 다시 준비하고, "
-                    "Settings > Apps의 custom app을 갱신하거나 다시 만든 뒤 새 대화의 tools 메뉴에서 선택해 확인하세요."
+                    "Settings > Plugins의 개발자 앱을 Refresh하거나 다시 만든 뒤 새 대화의 + > More에서 선택해 확인하세요."
                 )
             elif installed_target == "chatgpt-tunnel":
                 st.caption(

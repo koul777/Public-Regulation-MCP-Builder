@@ -14,7 +14,7 @@ dependencies = [
   "pymupdf>=1.24",
   "python-docx>=1.1",
   "olefile>=0.47",
-  "mcp>=1.26",
+  "mcp>=1.26,<2",
   "kiwipiepy>=0.21",
 ]
 

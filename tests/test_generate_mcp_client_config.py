@@ -660,7 +660,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                                 "legacy-profile",
                                 "--flat-storage",
                                 "--tool-profile",
-                                "full",
+                                "chatgpt-data",
                                 "--no-warm-cache",
                             ],
                             "env": {},
@@ -2747,15 +2747,16 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             public_url="https://mcp.example.go.kr/govreg",
             tenant_id="tenant-a",
             tenant_storage_isolation=True,
+            chatgpt_oauth_ready=True,
         )
 
         self.assertEqual(config["connector_url"], "https://mcp.example.go.kr/govreg/mcp")
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertTrue(config["chatgpt_setup"]["https_endpoint_ready"])
-        self.assertIn("Settings > Apps > Advanced Settings", config["chatgpt_setup"]["location"])
-        self.assertIn("Settings > Apps > Create", config["chatgpt_setup"]["location"])
+        self.assertIn("Settings > Security and login", config["chatgpt_setup"]["location"])
+        self.assertIn("Settings > Plugins", config["chatgpt_setup"]["location"])
         self.assertIn("Developer mode", " ".join(config["connection_steps"]))
-        self.assertIn("tools menu", " ".join(config["connection_steps"]))
+        self.assertIn("+ > More", " ".join(config["connection_steps"]))
         direct_setup = json.dumps(
             {
                 "chatgpt_setup": config["chatgpt_setup"],
@@ -2763,9 +2764,11 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             },
             ensure_ascii=False,
         )
-        self.assertNotIn("Settings > Security and login", direct_setup)
-        self.assertNotIn("Settings > Plugins", direct_setup)
-        self.assertNotIn("https://chatgpt.com/plugins", direct_setup)
+        self.assertIn("Settings > Security and login", direct_setup)
+        self.assertIn("Settings > Plugins", direct_setup)
+        self.assertIn("https://chatgpt.com/plugins", direct_setup)
+        self.assertNotIn("Settings > Apps > Advanced Settings", direct_setup)
+        self.assertNotIn("Settings > Apps > Create", direct_setup)
         self.assertIn(
             "Settings > Security and login",
             " ".join(config["openai_secure_tunnel"]["chatgpt_setup"]),
@@ -2774,6 +2777,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
         self.assertEqual(["search", "fetch"], config["compatible_tools"])
+        self.assertIn("search(query)", " ".join(config["notes"]))
+        self.assertIn("fetch(id)", " ".join(config["notes"]))
+        self.assertIn("user-openable HTTP(S)", " ".join(config["notes"]))
         self.assertIn("--tenant-storage-isolation", config["server_start"]["args"])
         self.assertIn("--tool-profile", config["server_start"]["args"])
         self.assertIn("chatgpt-data", config["server_start"]["args"])
@@ -2783,7 +2789,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("--http-bearer-token-env", config["server_start"]["args"])
         self.assertIn("--auth-issuer-url", config["server_start"]["args"])
         self.assertIn("https://mcp.example.go.kr/govreg", config["server_start"]["args"])
-        self.assertEqual(config["server_auth"]["token_env"], "MCP_AUTH_TOKEN")
+        self.assertEqual(config["server_auth"]["backend_token_env"], "MCP_AUTH_TOKEN")
+        self.assertEqual(config["server_auth"]["mode"], "mcp-oauth-2.1")
+        self.assertTrue(config["server_auth"]["oauth_ready"])
+        self.assertFalse(config["server_auth"]["custom_static_bearer_supported_by_chatgpt"])
         self.assertNotIn("$BundleDataDir", config["openai_secure_tunnel"]["copy_paste_ps"])
 
     def test_chatgpt_connector_requires_https_public_url(self) -> None:
@@ -2798,6 +2807,20 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("public_url_must_use_https", config["missing"])
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertFalse(config["chatgpt_setup"]["https_endpoint_ready"])
+
+    def test_chatgpt_connector_does_not_treat_static_bearer_as_chatgpt_auth(self) -> None:
+        config = build_mcp_client_config(
+            client_profile="chatgpt-remote",
+            transport="streamable-http",
+            public_url="https://mcp.example.go.kr/mcp",
+            remote_auth_token_env="MCP_AUTH_TOKEN",
+        )
+
+        self.assertFalse(config["ready"])
+        self.assertIn("chatgpt_mcp_oauth_2_1_not_attested", config["missing"])
+        self.assertFalse(config["chatgpt_setup"]["oauth_ready"])
+        self.assertIn("cannot present a custom API key", config["chatgpt_setup"]["authentication_note"])
+        self.assertIn("static MCP_AUTH_TOKEN alone cannot authenticate", " ".join(config["notes"]))
 
     def test_chatgpt_connector_rejects_hostless_or_query_public_url(self) -> None:
         for public_url in ("https://", "https://?tenant=default", "https://mcp.example.go.kr/mcp?tenant=default"):
@@ -2836,13 +2859,36 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         claude_desktop_args = config["claude_desktop"]["mcpServers"]["aks_mcp"]["args"]
         claude_code_args = config["claude_code"]["args"]
+        chatgpt_desktop_args = config["chatgpt_desktop_local"]["mcpServers"]["aks_mcp"]["args"]
         self.assertIn("--no-warm-cache", claude_desktop_args)
         self.assertIn("--no-warm-cache", claude_code_args)
+        self.assertEqual(
+            "full",
+            claude_desktop_args[claude_desktop_args.index("--tool-profile") + 1],
+        )
+        self.assertEqual(
+            "full",
+            claude_code_args[claude_code_args.index("--tool-profile") + 1],
+        )
+        self.assertEqual(
+            "chatgpt-data",
+            chatgpt_desktop_args[chatgpt_desktop_args.index("--tool-profile") + 1],
+        )
         self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["search", "fetch"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["requires_reachable_https"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
         self.assertIn("openai_secure_tunnel", config["quickstart"]["chatgpt_remote"]["connection_options"])
         self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["profile"], "chatgpt-desktop-local")
+        self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["tool_profile"], "chatgpt-data")
+        self.assertEqual(
+            config["quickstart"]["chatgpt_desktop_local"]["verification_tools"],
+            ["search", "fetch"],
+        )
+        self.assertEqual(
+            config["quickstart"]["chatgpt_desktop_local"]["connection_configuration_method"],
+            "direct_config",
+        )
+        self.assertFalse(config["quickstart"]["chatgpt_desktop_local"]["connection_prompt_required"])
         self.assertTrue(config["quickstart"]["chatgpt_desktop_local"]["conversation_attachment_unverified"])
         self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["tunnel_id_env"], "OPENAI_TUNNEL_ID")
         self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["setup_state"], "manual_setup_required")
@@ -3094,6 +3140,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual("./.mcp.json", plugin_manifest["mcpServers"])
             self.assertEqual({"govreg-local"}, set(plugin_mcp["mcpServers"]))
             self.assertNotIn("mcp_servers", plugin_mcp)
+            plugin_args = plugin_mcp["mcpServers"]["govreg-local"]["args"]
+            self.assertEqual(
+                "chatgpt-data",
+                plugin_args[plugin_args.index("--tool-profile") + 1],
+            )
+            self.assertNotIn("get_index_status", " ".join(plugin_manifest["interface"]["defaultPrompt"]))
             agent_prompt = Path(files["chatgpt_desktop_agent_prompt"]).read_text(encoding="utf-8")
             self.assertIn(AGENT_CONNECT_BUNDLE_NAME_MARKER, agent_prompt)
             self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, agent_prompt)
@@ -3118,8 +3170,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertNotIn("-Target codex", agent_prompt)
             self.assertNotIn("Codex", agent_prompt)
             self.assertIn("/mcp", agent_prompt)
-            final_tool_prompt = "govreg-local MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘."
-            self.assertIn(final_tool_prompt, agent_prompt)
+            privacy_tool_prompt = (
+                "govreg-local MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 "
+                "fetch로 조회해 원문과 출처를 보여줘."
+            )
+            full_tool_prompt = "govreg-local MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘."
+            self.assertIn(privacy_tool_prompt, agent_prompt)
+            self.assertIn("일반 대화창에 설치 프롬프트로 붙여넣지 않는다", agent_prompt)
             rendered_desktop_guide = render_agent_connect_prompt_for_program(
                 agent_prompt,
                 bundle_dir=output_dir,
@@ -3140,7 +3197,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("fresh_app_server", codex_agent_prompt)
             self.assertIn("같은 현재 attempt", codex_agent_prompt)
             self.assertIn("다른 클라이언트의 성공 상태", codex_agent_prompt)
-            self.assertIn(final_tool_prompt, codex_agent_prompt)
+            self.assertIn(privacy_tool_prompt, codex_agent_prompt)
+            self.assertIn("선택적 자동화 자료", codex_agent_prompt)
+            self.assertIn("토큰, API 키, tunnel ID", codex_agent_prompt)
             self.assertIn("Codex를 완전히 종료하고 다시 실행", codex_agent_prompt)
             claude_agent_prompt = Path(files["claude_code_agent_prompt"]).read_text(encoding="utf-8")
             self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, claude_agent_prompt)
@@ -3151,7 +3210,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("enabledMcpjsonServers", claude_agent_prompt)
             self.assertIn("~/.mcp.json", claude_agent_prompt)
             self.assertIn("~/.claude.json", claude_agent_prompt)
-            self.assertIn(final_tool_prompt, claude_agent_prompt)
+            self.assertIn(full_tool_prompt, claude_agent_prompt)
             self.assertIn("Claude Code를 완전히 종료하고 다시 실행", claude_agent_prompt)
             readme = (output_dir / "README.md").read_text(encoding="utf-8")
             readme_ko = (output_dir / "README.ko.md").read_text(encoding="utf-8")
@@ -3170,6 +3229,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("stdio", codex_args)
             self.assertIn("--no-warm-cache", codex_args)
             self.assertIn("--flat-storage", codex_args)
+            self.assertEqual(
+                "chatgpt-data",
+                codex_args[codex_args.index("--tool-profile") + 1],
+            )
             stdio_launcher = (output_dir / "run_mcp_stdio_server.ps1").read_text(encoding="utf-8")
             self.assertIn('Get-Command "reg-rag-mcp-server"', stdio_launcher)
             self.assertIn("scripts\\run_regulation_mcp.py", stdio_launcher)
@@ -3258,8 +3321,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn('"connect_chatgpt_tunnel_bat": "ChatGPT 보안 Tunnel에 연결하기.bat"', manifest)
             self.assertIn('"connect_claude_https_bat": "Claude HTTPS에 연결하기.bat"', manifest)
             self.assertIn('"doctor_bat": "연결 상태 확인하기.bat"', manifest)
-            self.assertIn('"primary_file": "CODEX_AGENT_CONNECT_PROMPT.md"', manifest)
-            self.assertIn('"fallback_file": "Codex에 연결하기.bat"', manifest)
+            self.assertIn('"primary_file": "Codex에 연결하기.bat"', manifest)
+            self.assertIn('"fallback_file": "codex_config_snippet.toml"', manifest)
+            self.assertIn('"optional_agent_prompt": "CODEX_AGENT_CONNECT_PROMPT.md"', manifest)
             self.assertIn('"primary_file": "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md"', manifest)
             self.assertIn('"fallback_file": "Claude Code에 연결하기.bat"', manifest)
             self.assertIn('"config_file": "codex_config_snippet.toml"', manifest)
@@ -3272,18 +3336,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn('"config_file": "claude_desktop_config.json"', manifest)
             self.assertIn('"install": "install_local_package.ps1"', manifest)
             self.assertIn("Run `connect_mcp_client.ps1`", readme)
-            self.assertIn("For direct Codex CLI compatibility, paste `CODEX_AGENT_CONNECT_PROMPT.md`", readme)
+            self.assertIn("For direct Codex CLI compatibility, run `Codex에 연결하기.bat`", readme)
+            self.assertIn("Never paste connection configuration", readme)
             self.assertIn("double-click `Claude Desktop에 연결하기.bat`", readme)
-            self.assertIn("run `/mcp` and verify", readme)
+            self.assertIn("verify `/mcp`", readme)
             self.assertIn("Do not apply the `/mcp` step above to Claude Desktop", readme)
-            self.assertLess(
-                readme.index("Open this extracted bundle as that app's local workspace"),
-                readme.index("Only after verification completes, fully quit and restart that client"),
-            )
-            self.assertLess(
-                readme.index("Only after verification completes, fully quit and restart that client"),
-                readme.index("run `/mcp` and verify"),
-            )
+            self.assertIn("it is not a required installation prompt", readme)
             self.assertIn("get_index_status", readme)
             self.assertIn("bundle_status.json", readme)
             self.assertIn("codex_config_snippet.toml", readme)
@@ -3309,10 +3367,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("bundled `reg_rag_preprocessor-*.whl`", readme)
             self.assertIn("--include-wheel", readme)
             self.assertIn("https://help.openai.com/en/articles/20001256-plugins-in-codex", readme)
-            self.assertIn("Settings > Apps > Advanced Settings", readme)
-            self.assertIn("Settings > Apps > Create", readme)
+            self.assertIn("Settings > Security and login", readme)
+            self.assertIn("Settings > Plugins", readme)
+            self.assertNotIn("Settings > Apps > Advanced Settings", readme)
+            self.assertNotIn("Settings > Apps > Create", readme)
             self.assertIn("ChatGPT web does not read local Codex `config.toml`", readme)
-            self.assertIn("Work-mode Plugins are a separate distribution path", readme)
+            self.assertIn("Reviewed marketplace distribution remains separate", readme)
             self.assertIn("Customize > Connectors", readme)
             self.assertIn("Do not paste the API request fragment into the Claude connector UI", readme)
             self.assertIn("Settings > Security and login", readme)
@@ -3356,7 +3416,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("Claude HTTPS에 연결하기.bat", readme_ko)
             self.assertIn("연결 상태 확인하기.bat", readme_ko)
             self.assertIn("Settings > MCP servers > Add server", readme_ko)
-            self.assertIn("Codex CLI와 Claude Code", readme_ko)
+            self.assertIn("Codex CLI는 `Codex에 연결하기.bat`", readme_ko)
+            self.assertIn("연결 설정·로컬 경로·토큰·API 키·tunnel ID", readme_ko)
             self.assertNotIn("For ChatGPT Desktop, Codex, and Claude Code", readme)
             self.assertNotIn("ChatGPT Desktop, Codex, Claude Code는 다음 순서", readme_ko)
             self.assertNotIn("local Work/Codex workspace", readme)
@@ -3373,7 +3434,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta", readme_ko)
             self.assertIn("https://docs.anthropic.com/en/docs/agents-and-tools/mcp-connector", readme_ko)
             self.assertIn("ChatGPT", readme_ko)
-            self.assertIn("| Codex CLI | local_stdio | true | `CODEX_AGENT_CONNECT_PROMPT.md` |", readme)
+            self.assertIn("| Codex CLI | local_stdio | true | `Codex에 연결하기.bat` |", readme)
             self.assertIn("| Claude Desktop | local_stdio | true | `Claude Desktop에 연결하기.bat` |", readme)
             self.assertIn("| Claude Code | local_stdio | true | `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md` |", readme)
             self.assertIn("| ChatGPT 웹 | secure_mcp_tunnel | manual_setup_required | `ChatGPT 보안 Tunnel에 연결하기.bat` |", readme)
@@ -3384,6 +3445,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertTrue(chatgpt_desktop_local["chatgpt_direct_local_mcp_supported"])
             self.assertEqual("chatgpt_desktop_settings_mcp_servers", chatgpt_desktop_local["primary_registration"])
             self.assertEqual("chatgpt_desktop_mcp_settings", chatgpt_desktop_local["surface"])
+            self.assertEqual("chatgpt-data", chatgpt_desktop_local["tool_profile"])
+            self.assertEqual(["search", "fetch"], chatgpt_desktop_local["verification_tools"])
+            self.assertEqual("direct_config", chatgpt_desktop_local["connection_configuration_method"])
+            self.assertFalse(chatgpt_desktop_local["connection_prompt_required"])
             self.assertTrue(chatgpt_desktop_local["conversation_attachment_unverified"])
             self.assertFalse(chatgpt_desktop_local["plugin_install_command_succeeded"])
             self.assertFalse(chatgpt_desktop_local["plugin_manifest_validated"])
@@ -3405,15 +3470,15 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertNotIn("-InstallChatGptDesktopPlugin", chatgpt_desktop_bat)
             self.assertIn("/mcp를 입력해 govreg-local이 연결됨으로 보이는지", chatgpt_desktop_bat)
             self.assertIn("[다음 단계]", chatgpt_desktop_bat)
-            self.assertIn("govreg-local MCP의 get_index_status를 실행하고", chatgpt_desktop_bat)
-            self.assertIn("govreg-local MCP의 get_index_status를 실행하고", codex_bat)
+            self.assertIn("govreg-local MCP의 search 도구로 인사규정을 찾고", chatgpt_desktop_bat)
+            self.assertIn("govreg-local MCP의 search 도구로 인사규정을 찾고", codex_bat)
             self.assertIn("govreg-local MCP의 get_index_status를 실행하고", claude_code_bat)
             usage_guide = (output_dir / "MCP 사용 시작하기.txt").read_text(encoding="utf-8")
             self.assertIn("등록된 MCP 이름: govreg-local", usage_guide)
             self.assertIn("ChatGPT Desktop은 GUIDE 값을", usage_guide)
-            self.assertIn("Claude Code와 Codex CLI는", usage_guide)
-            self.assertIn("로컬 full 프로필의 설치 후 도구 확인", usage_guide)
-            self.assertIn("원격 ChatGPT/보안 Tunnel/Claude API의 chatgpt-data 프로필 확인", usage_guide)
+            self.assertIn("Codex CLI는 `Codex에 연결하기.bat`", usage_guide)
+            self.assertIn("Claude Desktop·Claude Code 로컬 full 프로필의 설치 후 도구 확인", usage_guide)
+            self.assertIn("ChatGPT Desktop·Codex·원격 ChatGPT/보안 Tunnel", usage_guide)
             self.assertIn("search 도구로 인사규정을 찾고", usage_guide)
             self.assertIn("`@` 멘션은 연결 확인 수단이 아닙니다", usage_guide)
             self.assertIn("Claude Desktop에는 위 에이전트 프롬프트 및 /mcp 공통 절차를 적용하지 않음", usage_guide)
@@ -3513,10 +3578,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 wizard,
             )
             self.assertIn("function Show-ChatGptDesktop", wizard)
-            self.assertIn("Open a new ChatGPT conversation, then select $ServerName from the tools menu.", wizard)
+            self.assertIn("Open a new ChatGPT conversation, then select $ServerName from + > More.", wizard)
             self.assertIn('Start-Process "https://chatgpt.com"', wizard)
-            self.assertIn("Settings > Apps > Advanced Settings", wizard)
-            self.assertIn("Settings > Apps > Create", wizard)
+            self.assertIn("Settings > Security and login", wizard)
+            self.assertIn("Settings > Plugins", wizard)
+            self.assertNotIn("Settings > Apps > Advanced Settings", wizard)
+            self.assertNotIn("Settings > Apps > Create", wizard)
             self.assertIn("Settings > Security and login", wizard)
             self.assertIn("https://chatgpt.com/plugins", wizard)
             self.assertIn("choose Tunnel under Connection", wizard)
@@ -4163,7 +4230,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["CODEX_EXPECTED_DATA_JSON"] = json.dumps(str((moved_bundle_dir / "data").resolve()))[1:-1]
             env["CODEX_EXPECTED_CWD_JSON"] = json.dumps(str(moved_bundle_dir.resolve()))[1:-1]
             env["CODEX_EXPECTED_ENABLED"] = "false"
-            env["CODEX_EXPECTED_TOOL_PROFILE"] = "full"
+            env["CODEX_EXPECTED_TOOL_PROFILE"] = "chatgpt-data"
             env["CODEX_PLUGIN_MARKER"] = str(legacy_plugin_marker)
             env["CODEX_HOME"] = str(codex_config.parent)
 
@@ -4239,7 +4306,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertTrue(legacy_plugin_marker.exists())
             self.assertEqual(original_codex_config, codex_config.read_text(encoding="utf-8"))
 
-            env["CODEX_EXPECTED_TOOL_PROFILE"] = "full"
+            env["CODEX_EXPECTED_TOOL_PROFILE"] = "chatgpt-data"
 
             completed = subprocess.run(
                 [
@@ -4374,7 +4441,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
 
             generated_entry = json.loads(
-                (bundle_dir / "claude_desktop_config.json").read_text(encoding="utf-8")
+                (
+                    bundle_dir
+                    / "chatgpt-desktop-local-plugin"
+                    / "plugins"
+                    / "aksmcp"
+                    / ".mcp.json"
+                ).read_text(encoding="utf-8")
             )["mcpServers"]["aksmcp"]
             loader_payload = {
                 "name": "aksmcp",

@@ -10,7 +10,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import HTTPException
 
@@ -27,6 +27,11 @@ from app.core.security import AuthContext, API_ROLE_ADMIN, API_ROLE_OPERATOR
 from app.core.tenant_access import settings_for_tenant, tenant_storage_key
 from app.processors.answer_profile import clean_answer_profile_text
 from app.processors.exporter import Exporter
+from app.schemas.mcp import (
+    ChatGPTDataFetchOutput,
+    ChatGPTDataSearchOutput,
+    ChatGPTDataSearchResult,
+)
 from app.services.regulation_catalog_service import (
     filter_to_latest_active_versions,
     latest_history_version,
@@ -79,6 +84,26 @@ _INTERNAL_CITATION_METADATA_KEYS = frozenset(
         "approval_review_batch_chunk_fingerprint",
         "approval_review_strategy",
     }
+)
+_CHATGPT_DATA_FETCH_METADATA_KEYS = (
+    "document_name",
+    "institution_name",
+    "source_system",
+    "source_url",
+    "regulation_version",
+    "regulation_status",
+    "revision_date",
+    "effective_from",
+    "effective_to",
+    "repealed_at",
+    "chunk_type",
+    "regulation_title",
+    "article_no",
+    "article_title",
+    "source_page_start",
+    "source_page_end",
+    "approval_status",
+    "approved_content_hash",
 )
 
 
@@ -2649,7 +2674,7 @@ def _mcp_search_result(result: dict[str, Any], *, metadata_profile: str = "full"
     return {
         "id": result_id,
         "title": title,
-        "url": _mcp_url(document_id=str(result.get("document_id") or ""), chunk_id=str(result.get("chunk_id") or "")),
+        "url": _mcp_result_url(result, metadata_profile=metadata_profile),
         "text": verbatim_text[:600],
         "verbatim_text": verbatim_text,
         "verbatim": _mcp_verbatim_block(result),
@@ -2668,9 +2693,54 @@ def _mcp_fetch_result(result: dict[str, Any], *, metadata_profile: str = "full")
         "text": verbatim_text,
         "verbatim_text": verbatim_text,
         "verbatim": _mcp_verbatim_block(result),
-        "url": _mcp_url(document_id=str(result.get("document_id") or ""), chunk_id=str(result.get("chunk_id") or "")),
+        "url": _mcp_result_url(result, metadata_profile=metadata_profile),
         "metadata": _citation_metadata(result, metadata_profile=metadata_profile),
     }
+
+
+def chatgpt_data_search_output(response: dict[str, Any]) -> ChatGPTDataSearchOutput:
+    """Reduce a rich internal search response to OpenAI's data-source contract."""
+    results = response.get("results") if isinstance(response.get("results"), list) else []
+    return ChatGPTDataSearchOutput(
+        results=[
+            ChatGPTDataSearchResult(
+                id=str(result.get("id") or ""),
+                title=str(result.get("title") or ""),
+                url=_user_openable_http_url(result.get("url")),
+            )
+            for result in results
+            if isinstance(result, dict)
+        ]
+    )
+
+
+def chatgpt_data_fetch_output(response: dict[str, Any]) -> ChatGPTDataFetchOutput:
+    """Reduce a rich internal fetch response to OpenAI's data-source contract."""
+    raw_metadata = response.get("metadata") if isinstance(response.get("metadata"), dict) else {}
+    metadata: dict[str, str] = {}
+    for key in _CHATGPT_DATA_FETCH_METADATA_KEYS:
+        normalized = (
+            _user_openable_http_url(response.get("url"))
+            if key == "source_url"
+            else _chatgpt_data_metadata_text(raw_metadata.get(key))
+        )
+        if normalized:
+            metadata[key] = normalized
+    return ChatGPTDataFetchOutput(
+        id=str(response.get("id") or ""),
+        title=str(response.get("title") or ""),
+        text=str(response.get("text") or ""),
+        url=_user_openable_http_url(response.get("url")),
+        metadata=metadata,
+    )
+
+
+def _chatgpt_data_metadata_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).strip()
 
 
 def _mcp_verbatim_block(result: dict[str, Any]) -> dict[str, Any]:
@@ -2891,6 +2961,31 @@ def _decode_result_id(result_id: str) -> dict[str, Any]:
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def _mcp_result_url(result: dict[str, Any], *, metadata_profile: str) -> str:
+    if _is_external_metadata_profile(metadata_profile):
+        return _user_openable_http_url(result.get("source_url"))
+    return _mcp_url(
+        document_id=str(result.get("document_id") or ""),
+        chunk_id=str(result.get("chunk_id") or ""),
+    )
+
+
+def _user_openable_http_url(value: Any) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned or any(character.isspace() or ord(character) < 32 for character in cleaned):
+        return ""
+    try:
+        parsed = urlsplit(cleaned)
+        hostname = parsed.hostname
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        return ""
+    if parsed.username is not None or parsed.password is not None:
+        return ""
+    return cleaned
 
 
 def _mcp_url(*, document_id: str, chunk_id: str | None = None) -> str:

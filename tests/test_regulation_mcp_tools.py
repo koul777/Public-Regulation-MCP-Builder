@@ -17,6 +17,8 @@ from app.mcp_server.regulation_server import create_regulation_mcp_server
 from app.mcp_server.regulation_tools import (
     _FETCH_CHUNK_INDEX_CACHE,
     _mcp_relevance_guard,
+    chatgpt_data_fetch_output,
+    chatgpt_data_search_output,
     compare_versions,
     fetch_regulation,
     get_article,
@@ -380,6 +382,14 @@ class RegulationMcpToolsTests(unittest.TestCase):
             "approval_review_strategy",
         }
         self.assertNotIn("tenant_id", search["metadata"])
+        self.assertEqual(
+            "https://example.test/public_portal/doc_mcp",
+            search["results"][0]["url"],
+        )
+        self.assertEqual(
+            "https://example.test/public_portal/doc_mcp",
+            fetched["url"],
+        )
         for metadata in (search["results"][0]["metadata"], fetched["metadata"]):
             for key in internal_keys:
                 self.assertNotIn(key, metadata)
@@ -1198,6 +1208,85 @@ class RegulationMcpToolsTests(unittest.TestCase):
         tool_manager = getattr(server, "_tool_manager")
 
         self.assertEqual({"search", "fetch"}, set(tool_manager._tools))
+
+    def test_chatgpt_data_tool_profile_uses_exact_openai_data_source_schemas(self) -> None:
+        server = create_regulation_mcp_server(
+            data_dir="data",
+            tenant_id="tenant-a",
+            tool_profile="chatgpt-data",
+            warm_cache=False,
+        )
+        tools = server._tool_manager._tools
+
+        self.assertEqual({"query"}, set(tools["search"].parameters["properties"]))
+        self.assertEqual(["query"], tools["search"].parameters["required"])
+        self.assertEqual({"id"}, set(tools["fetch"].parameters["properties"]))
+        self.assertEqual(["id"], tools["fetch"].parameters["required"])
+
+        search_output_schema = tools["search"].output_schema
+        self.assertFalse(search_output_schema["additionalProperties"])
+        self.assertEqual({"results"}, set(search_output_schema["properties"]))
+        search_result_schema = next(iter(search_output_schema["$defs"].values()))
+        self.assertFalse(search_result_schema["additionalProperties"])
+        self.assertEqual({"id", "title", "url"}, set(search_result_schema["properties"]))
+
+        fetch_output_schema = tools["fetch"].output_schema
+        self.assertFalse(fetch_output_schema["additionalProperties"])
+        self.assertEqual(
+            {"id", "title", "text", "url", "metadata"},
+            set(fetch_output_schema["properties"]),
+        )
+        self.assertEqual(
+            {"type": "string"},
+            fetch_output_schema["properties"]["metadata"]["additionalProperties"],
+        )
+
+    def test_chatgpt_data_outputs_are_narrow_and_use_openable_http_citations(self) -> None:
+        rich_result = {
+            "id": "opaque-result-id",
+            "title": "Approved regulation",
+            "url": "https://example.test/regulations/1",
+            "text": "approved evidence",
+            "verbatim_text": "approved evidence",
+            "metadata": {
+                "document_id": "internal-document-id",
+                "profile_id": "internal-profile-id",
+                "approval_id": "internal-approval-id",
+                "document_name": "Approved regulation",
+                "article_no": "Article 1",
+                "source_page_start": 3,
+                "source_url": "https://example.test/regulations/1",
+            },
+        }
+
+        search_output = chatgpt_data_search_output(
+            {"results": [rich_result], "metadata": {"trace_id": "internal-trace"}}
+        ).model_dump()
+        fetch_output = chatgpt_data_fetch_output(rich_result).model_dump()
+
+        self.assertEqual(
+            {
+                "results": [
+                    {
+                        "id": "opaque-result-id",
+                        "title": "Approved regulation",
+                        "url": "https://example.test/regulations/1",
+                    }
+                ]
+            },
+            search_output,
+        )
+        self.assertEqual(
+            {"id", "title", "text", "url", "metadata"},
+            set(fetch_output),
+        )
+        self.assertEqual("3", fetch_output["metadata"]["source_page_start"])
+        self.assertNotIn("document_id", fetch_output["metadata"])
+        self.assertNotIn("profile_id", fetch_output["metadata"])
+        self.assertNotIn("approval_id", fetch_output["metadata"])
+
+        invalid_url = dict(rich_result, url="govreg://documents/internal")
+        self.assertEqual("", chatgpt_data_fetch_output(invalid_url).url)
 
     def test_historical_lookup_contract_rejects_invalid_as_of_date_for_all_content_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

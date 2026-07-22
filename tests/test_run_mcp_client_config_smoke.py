@@ -223,7 +223,11 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
 
         self.assertTrue(report["passed"])
         self.assertTrue(report["direct_stdio_verified"])
-        self.assertEqual("aksmcp MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.", report["verification_prompt"])
+        self.assertEqual(
+            "aksmcp MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 "
+            "fetch 도구로 조회해 조문 원문과 출처를 보여줘.",
+            report["verification_prompt"],
+        )
         answer = report["verification_answer"]
         self.assertEqual("verified", answer["status"])
         self.assertTrue(answer["get_index_status_verified"])

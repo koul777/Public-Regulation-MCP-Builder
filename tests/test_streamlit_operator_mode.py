@@ -759,7 +759,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("연결할 AI 앱", source)
         self.assertIn("mcp_connection_target_labels", source)
         self.assertIn("mcp-connection-target", source)
-        self.assertIn("에이전트 연결 요청문과 보조 BAT", source)
+        self.assertIn("Codex CLI는 직접 설정/BAT를 기본으로 사용", source)
+        self.assertIn("연결 설정이나 비밀값을 대화 프롬프트에 넣지 마세요", source)
         self.assertIn("mcp_target_file_keys", source)
         self.assertIn("codex_agent_prompt", source)
         self.assertIn("connect_claude_desktop_bat", source)
@@ -771,7 +772,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("chatgpt-remote", source)
         self.assertIn("chatgpt-tunnel", source)
         self.assertIn('"chatgpt-desktop-local": "chatgpt_desktop_agent_prompt"', source)
-        self.assertIn('"codex": "codex_agent_prompt"', source)
+        self.assertIn('"codex": "connect_codex_bat"', source)
         self.assertIn('"claude-code": "claude_code_agent_prompt"', source)
         self.assertIn('"chatgpt-desktop-local": "ChatGPT Desktop"', source)
         self.assertIn('"codex": "Codex CLI"', source)
@@ -811,9 +812,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Settings > Plugins", source)
         self.assertIn("https://chatgpt.com/plugins", source)
         self.assertIn("ChatGPT Plugins 설정에서 앱을 Refresh", source)
-        self.assertIn("Settings > Apps > Advanced Settings", source)
-        self.assertIn("Settings > Apps > Create", source)
-        self.assertIn("Settings > Apps의 custom app을 갱신", source)
+        self.assertIn("Settings > Security and login", source)
+        self.assertIn("+ > More", source)
+        self.assertIn("MCP OAuth 2.1", source)
+        self.assertIn("--chatgpt-oauth-ready", source)
+        self.assertNotIn("Settings > Apps > Advanced Settings", source)
+        self.assertNotIn("Settings > Apps > Create", source)
         self.assertIn("Claude Desktop은 전용 BAT가 기본", source)
         self.assertIn("설치 검증이 끝날 때까지 실행", source)
         self.assertIn("MCP의 list_regulations 도구를 사용해서 등록된 규정 목록을 보여줘", source)
@@ -935,7 +939,16 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         namespace = {
             "MCP_EXTERNAL_DATA_TARGETS": frozenset(
                 {"chatgpt-remote", "chatgpt-tunnel", "claude-api"}
-            )
+            ),
+            "MCP_SEARCH_FETCH_TARGETS": frozenset(
+                {
+                    "chatgpt-desktop-local",
+                    "codex",
+                    "chatgpt-remote",
+                    "chatgpt-tunnel",
+                    "claude-api",
+                }
+            ),
         }
         exec(
             compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-verification-prompts>", "exec"),
@@ -952,10 +965,19 @@ class StreamlitOperatorModeTests(unittest.TestCase):
                 self.assertNotIn("get_index_status", remote_prompts[0])
                 self.assertNotIn("list_regulations", remote_prompts[0])
 
-        local_prompts = prompts_for("chatgpt-desktop-local", "govreg-local")
-        self.assertEqual(2, len(local_prompts))
-        self.assertIn("get_index_status", local_prompts[0])
-        self.assertIn("list_regulations", local_prompts[1])
+        for target in ("chatgpt-desktop-local", "codex"):
+            with self.subTest(target=target):
+                local_prompts = prompts_for(target, "govreg-local")
+                self.assertEqual(1, len(local_prompts))
+                self.assertIn("search 도구", local_prompts[0])
+                self.assertIn("fetch 도구", local_prompts[0])
+                self.assertNotIn("get_index_status", local_prompts[0])
+                self.assertNotIn("list_regulations", local_prompts[0])
+
+        claude_prompts = prompts_for("claude-desktop", "govreg-local")
+        self.assertEqual(2, len(claude_prompts))
+        self.assertIn("get_index_status", claude_prompts[0])
+        self.assertIn("list_regulations", claude_prompts[1])
 
     def test_streamlit_exposes_parsing_goldset_review_gate(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
