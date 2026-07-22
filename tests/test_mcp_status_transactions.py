@@ -595,6 +595,10 @@ class McpStatusTransactionTests(unittest.TestCase):
                     "claude_desktop_config_path": "C:/fixture/AppData/Roaming/Claude/claude_desktop_config.json",
                     "claude_desktop_config_fingerprint": "sha256:" + ("c" * 64),
                     "claude_desktop_config_transport_verified": True,
+                    "claude_desktop_config_transport_runtime_fingerprint": completed_status[
+                        "runtime_fingerprint"
+                    ],
+                    "claude_desktop_loader_observed": True,
                     "claude_desktop_loader_verified": True,
                     "claude_desktop_conversation_verified": True,
                     "direct_stdio_verified": True,
@@ -638,6 +642,7 @@ class McpStatusTransactionTests(unittest.TestCase):
         )
         for field in (
             "claude_desktop_config_transport_verified",
+            "claude_desktop_loader_observed",
             "claude_desktop_loader_verified",
             "claude_desktop_conversation_verified",
             "direct_stdio_verified",
@@ -646,6 +651,12 @@ class McpStatusTransactionTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertFalse(refreshed_status[field])
+        self.assertIsNone(
+            refreshed_status["claude_desktop_config_transport_runtime_fingerprint"]
+        )
+        for target, record in refreshed_status["client_connections"].items():
+            with self.subTest(target=target):
+                self.assertTrue(record["readiness"]["runtime_ready"])
 
     def test_runtime_refresh_rejects_every_active_installation_state(self) -> None:
         config = build_mcp_client_config(

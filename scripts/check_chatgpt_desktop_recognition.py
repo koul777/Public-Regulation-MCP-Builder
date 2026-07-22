@@ -20,6 +20,13 @@ _MCP_STATUS_METHOD = "mcpServerStatus/list"
 _ERROR_CODE = re.compile(r"\berrorCode=(?P<value>[^\s]+)", re.IGNORECASE)
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)(?:[a-z]:\\|\\\\)[^\r\n\t]*")
 _USER_PATH = re.compile(r"(?i)\b(?:users|home)[\\/][^\\/\s]+")
+_DESKTOP_PROCESS_NAME = "ChatGPT"
+_KNOWN_DESKTOP_PACKAGE_FAMILIES = ("OpenAI.Codex_2p2nqsd0c76g0",)
+_DESKTOP_LOG_RELATIVE_PATHS = (
+    Path("LocalCache") / "Local" / "Codex" / "Logs",
+    Path("LocalCache") / "Local" / "ChatGPT" / "Logs",
+)
+_SAFE_PACKAGE_FAMILY = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 
 
 @dataclass(frozen=True)
@@ -113,6 +120,10 @@ def evaluate_recognition_observation(
     process_start_times: Iterable[str | datetime],
     log_sessions: Iterable[dict[str, Any]],
     generated_at: str | datetime | None = None,
+    log_discovery_status: str | None = None,
+    log_root_candidate_count: int = 0,
+    log_root_existing_count: int = 0,
+    log_file_count: int | None = None,
 ) -> dict[str, Any]:
     """Evaluate registration, restart, and status-list evidence without overclaiming."""
 
@@ -163,7 +174,13 @@ def evaluate_recognition_observation(
             post_registration_errors += int(bool(event.get("error_observed")))
 
     new_session_observed = bool(post_registration_sessions)
-    status_list_observed_without_error = post_registration_successes > 0
+    status_list_observed_without_error = (
+        post_registration_successes > 0 and post_registration_errors == 0
+    )
+    normalized_log_discovery_status = str(log_discovery_status or "").strip() or (
+        "logs_loaded" if sessions else "not_checked"
+    )
+    observed_log_file_count = len(sessions) if log_file_count is None else max(0, int(log_file_count))
     observation_ready = bool(
         registration_at is not None
         and post_registration_processes
@@ -177,8 +194,16 @@ def evaluate_recognition_observation(
         observation_status = "restart_required"
     elif not processes:
         observation_status = "desktop_not_running"
+    elif normalized_log_discovery_status == "log_root_missing":
+        observation_status = "desktop_log_root_not_found"
+    elif normalized_log_discovery_status == "logs_not_found":
+        observation_status = "desktop_log_files_not_found"
+    elif normalized_log_discovery_status == "logs_unreadable":
+        observation_status = "desktop_log_files_unreadable"
     elif not new_session_observed:
         observation_status = "post_registration_log_session_not_observed"
+    elif post_registration_errors > 0:
+        observation_status = "mcp_status_list_error_observed"
     elif not status_list_observed_without_error:
         observation_status = "mcp_status_list_success_not_observed"
     else:
@@ -205,6 +230,10 @@ def evaluate_recognition_observation(
             "restart_status": restart_status,
         },
         "desktop_logs": {
+            "discovery_status": normalized_log_discovery_status,
+            "root_candidate_count": max(0, int(log_root_candidate_count)),
+            "existing_root_count": max(0, int(log_root_existing_count)),
+            "log_file_count": observed_log_file_count,
             "session_count": len(sessions),
             "post_registration_session_count": len(post_registration_sessions),
             "post_registration_session_observed": new_session_observed,
@@ -237,11 +266,24 @@ def build_support_summary(report: dict[str, Any]) -> dict[str, Any]:
         "desktop_process_detected": bool(process.get("detected")),
         "desktop_restart_required": process.get("restart_required"),
         "post_registration_log_session_observed": bool(logs.get("post_registration_session_observed")),
+        "desktop_log_discovery_status": str(logs.get("discovery_status") or "not_checked"),
+        "desktop_log_root_found": _safe_nonnegative_count(logs.get("existing_root_count")) > 0,
+        "desktop_log_files_found": _safe_nonnegative_count(logs.get("log_file_count")) > 0,
         "mcp_status_list_observed_without_error": bool(logs.get("mcp_status_list_observed_without_error")),
+        "mcp_status_list_error_observed": (
+            _safe_nonnegative_count(logs.get("mcp_status_list_error_count")) > 0
+        ),
         "tool_exposure_not_verified": True,
         "conversation_attachment_not_verified": True,
     }
     return _redact_support_value(summary)
+
+
+def _safe_nonnegative_count(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _redact_support_value(value: Any) -> Any:
@@ -290,7 +332,7 @@ def discover_desktop_process_start_times() -> list[datetime]:
     if os.name != "nt":
         return []
     script = (
-        "$items=@(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue | ForEach-Object {"
+        f"$items=@(Get-Process -Name {_DESKTOP_PROCESS_NAME} -ErrorAction SilentlyContinue | ForEach-Object {{"
         "try { $_.StartTime.ToUniversalTime().ToString('o') } catch {} });"
         "$items | ConvertTo-Json -Compress"
     )
@@ -329,6 +371,96 @@ def default_desktop_log_root() -> Path | None:
         / "Codex"
         / "Logs"
     )
+
+
+def _is_desktop_package_family(value: object) -> bool:
+    family = str(value or "").strip()
+    if not family or not _SAFE_PACKAGE_FAMILY.fullmatch(family):
+        return False
+    normalized = family.casefold()
+    return normalized.startswith("openai.") and (
+        "codex" in normalized or "chatgpt" in normalized
+    )
+
+
+def _discover_appx_desktop_package_families() -> list[str]:
+    """Return safe package-family identities for installed ChatGPT.exe apps."""
+
+    if os.name != "nt":
+        return []
+    script = (
+        "$items=@(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {"
+        "$_.InstallLocation -and "
+        "(Test-Path -LiteralPath (Join-Path $_.InstallLocation 'app\\ChatGPT.exe') -PathType Leaf)"
+        "} | ForEach-Object { [string]$_.PackageFamilyName });"
+        "$items | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return []
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    values = payload if isinstance(payload, list) else [payload]
+    return sorted({str(value).strip() for value in values if _is_desktop_package_family(value)})
+
+
+def discover_desktop_log_roots(
+    *,
+    local_app_data: str | Path | None = None,
+    package_family_names: Iterable[str] | None = None,
+) -> list[Path]:
+    """Build safe log-root candidates without exposing them in reports."""
+
+    local_root_text = str(local_app_data or os.getenv("LOCALAPPDATA") or "").strip()
+    if not local_root_text:
+        return []
+    local_root = Path(local_root_text)
+    packages_root = local_root / "Packages"
+    families: set[str] = set(_KNOWN_DESKTOP_PACKAGE_FAMILIES)
+    if package_family_names is None:
+        families.update(_discover_appx_desktop_package_families())
+        if packages_root.is_dir():
+            try:
+                families.update(
+                    path.name
+                    for path in packages_root.iterdir()
+                    if path.is_dir() and _is_desktop_package_family(path.name)
+                )
+            except OSError:
+                pass
+    else:
+        families.update(
+            str(value).strip()
+            for value in package_family_names
+            if _is_desktop_package_family(value)
+        )
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for family in sorted(families):
+        if not _is_desktop_package_family(family):
+            continue
+        package_root = packages_root / family
+        for relative_path in _DESKTOP_LOG_RELATIVE_PATHS:
+            candidate = package_root / relative_path
+            key = os.path.normcase(str(candidate))
+            if key not in seen:
+                seen.add(key)
+                roots.append(candidate)
+    return roots
 
 
 def discover_log_files(log_root: Path | None) -> list[Path]:
@@ -383,12 +515,41 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         if args.process_start_time
         else discover_desktop_process_start_times()
     )
-    log_paths = list(args.log_file) if args.log_file else discover_log_files(args.log_root or default_desktop_log_root())
+    if args.log_file:
+        candidate_log_roots: list[Path] = []
+        existing_log_roots: list[Path] = []
+        log_paths = list(args.log_file)
+        log_discovery_status = "explicit_log_files"
+    else:
+        candidate_log_roots = [args.log_root] if args.log_root is not None else discover_desktop_log_roots()
+        existing_log_roots = [path for path in candidate_log_roots if path.is_dir()]
+        log_paths = []
+        seen_log_paths: set[str] = set()
+        for root in existing_log_roots:
+            for path in discover_log_files(root):
+                key = os.path.normcase(str(path))
+                if key not in seen_log_paths:
+                    seen_log_paths.add(key)
+                    log_paths.append(path)
+        if not existing_log_roots:
+            log_discovery_status = "log_root_missing"
+        elif not log_paths:
+            log_discovery_status = "logs_not_found"
+        else:
+            log_discovery_status = "logs_discovered"
     sessions = [session for path in log_paths if (session := load_log_session(path)) is not None]
+    if log_paths and not sessions:
+        log_discovery_status = "logs_unreadable"
+    elif sessions:
+        log_discovery_status = "logs_loaded"
     report = evaluate_recognition_observation(
         registration=registration,
         process_start_times=process_times,
         log_sessions=sessions,
+        log_discovery_status=log_discovery_status,
+        log_root_candidate_count=len(candidate_log_roots),
+        log_root_existing_count=len(existing_log_roots),
+        log_file_count=len(log_paths),
     )
     config_exists = bool(args.config_path is not None and args.config_path.is_file())
     config_sha256 = None

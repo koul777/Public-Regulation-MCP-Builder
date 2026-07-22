@@ -18,7 +18,79 @@ STAGE_ORDER = (
     "conversation",
 )
 CORE_CONFIGURATION_STAGES = STAGE_ORDER[:4]
-STAGE_STATES = frozenset({"not_checked", "pending", "verified", "failed", "stale"})
+STAGE_STATES = frozenset(
+    {"not_applicable", "not_checked", "pending", "verified", "failed", "stale"}
+)
+
+# Stage requirements differ by client.  A Codex CLI task must not wait for a
+# ChatGPT Desktop restart, while Claude Desktop has no Codex app-server
+# inventory stage.  The default keeps the v1 all-stage behavior for callers
+# that have not selected a concrete client yet.
+CONNECTION_TARGET_STAGE_PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
+    "chatgpt-desktop-local": {
+        "stage_order": STAGE_ORDER,
+        "configuration_stages": CORE_CONFIGURATION_STAGES,
+    },
+    "codex": {
+        "stage_order": (
+            "registration",
+            "loader",
+            "transport",
+            "fresh_app_server",
+            "conversation",
+        ),
+        "configuration_stages": CORE_CONFIGURATION_STAGES,
+    },
+    "claude-code": {
+        "stage_order": (
+            "registration",
+            "loader",
+            "transport",
+            "conversation",
+        ),
+        "configuration_stages": ("registration", "loader", "transport"),
+    },
+    "claude-desktop": {
+        "stage_order": (
+            "registration",
+            "transport",
+            "desktop_reload",
+            "loader",
+            "desktop_surface",
+            "conversation",
+        ),
+        "configuration_stages": ("registration", "transport"),
+    },
+    "chatgpt-remote": {
+        "stage_order": (
+            "transport",
+            "registration",
+            "loader",
+            "desktop_surface",
+            "conversation",
+        ),
+        "configuration_stages": ("transport", "registration", "loader"),
+    },
+    "chatgpt-tunnel": {
+        "stage_order": (
+            "transport",
+            "registration",
+            "loader",
+            "desktop_surface",
+            "conversation",
+        ),
+        "configuration_stages": ("transport", "registration", "loader"),
+    },
+    "claude-api": {
+        "stage_order": (
+            "transport",
+            "registration",
+            "loader",
+            "conversation",
+        ),
+        "configuration_stages": ("transport", "registration"),
+    },
+}
 
 _STATE_ALIASES = {
     "complete": "verified",
@@ -65,6 +137,7 @@ def build_connection_diagnostic(
     attempt_id: str | None,
     config_fingerprint: str | None,
     checked_at: str | datetime | None = None,
+    connection_target: str | None = None,
 ) -> dict[str, Any]:
     """Normalize current-attempt MCP evidence without performing I/O.
 
@@ -77,6 +150,16 @@ def build_connection_diagnostic(
     current_attempt = _safe_identifier_value(attempt_id)
     current_fingerprint = _safe_identifier_value(config_fingerprint)
     normalized_checked_at = _normalize_checked_at(checked_at)
+    normalized_target = _normalize_connection_target(connection_target)
+    stage_profile = CONNECTION_TARGET_STAGE_PROFILES.get(normalized_target or "")
+    required_stage_order = tuple(
+        stage_profile.get("stage_order", STAGE_ORDER) if stage_profile else STAGE_ORDER
+    )
+    configuration_stages = tuple(
+        stage_profile.get("configuration_stages", CORE_CONFIGURATION_STAGES)
+        if stage_profile
+        else CORE_CONFIGURATION_STAGES
+    )
     raw_stages = _coerce_stage_mapping(stages)
 
     normalized_stages: dict[str, dict[str, Any]] = {}
@@ -88,38 +171,57 @@ def build_connection_diagnostic(
             current_fingerprint=current_fingerprint,
             default_checked_at=normalized_checked_at,
         )
+        if stage_name not in required_stage_order:
+            normalized_stages[stage_name] = {
+                "state": "not_applicable",
+                "attempt_id": current_attempt,
+                "checked_at": normalized_checked_at,
+                "reason_code": "not_required_for_client",
+                "evidence": {"connection_target": normalized_target},
+            }
 
     configured = all(
-        normalized_stages[name]["state"] == "verified" for name in CORE_CONFIGURATION_STAGES
+        normalized_stages[name]["state"] == "verified" for name in configuration_stages
     )
-    all_verified = all(stage["state"] == "verified" for stage in normalized_stages.values())
+    all_verified = all(
+        normalized_stages[name]["state"] == "verified" for name in required_stage_order
+    )
     conversation_proved = _normalized_conversation_has_proof(normalized_stages["conversation"])
     connected = all_verified and conversation_proved
     overall_state = "connected" if connected else "configured" if configured else "pending"
     first_blocking_stage = next(
-        (name for name in STAGE_ORDER if normalized_stages[name]["state"] != "verified"),
+        (
+            name
+            for name in required_stage_order
+            if normalized_stages[name]["state"] != "verified"
+        ),
         None,
     )
     support_summary, next_action = _support_guidance(
         overall_state=overall_state,
         first_blocking_stage=first_blocking_stage,
         stages=normalized_stages,
+        connection_target=normalized_target,
     )
 
     return {
         "schema_version": SCHEMA_VERSION,
         "attempt_id": current_attempt,
         "config_fingerprint": current_fingerprint,
+        "connection_target": normalized_target,
         "checked_at": normalized_checked_at,
-        "stage_order": list(STAGE_ORDER),
+        "stage_order": list(required_stage_order),
+        "configuration_stages": list(configuration_stages),
         "stages": normalized_stages,
         "overall_state": overall_state,
         "configured": configured,
         "pending": not connected,
         "connected": connected,
-        "has_failures": any(stage["state"] == "failed" for stage in normalized_stages.values()),
+        "has_failures": any(
+            normalized_stages[name]["state"] == "failed" for name in required_stage_order
+        ),
         "stale_stages": [
-            name for name, stage in normalized_stages.items() if stage["state"] == "stale"
+            name for name in required_stage_order if normalized_stages[name]["state"] == "stale"
         ],
         "first_blocking_stage": first_blocking_stage,
         "support_summary": support_summary,
@@ -133,8 +235,9 @@ def diagnostic_from_bundle_status(
     attempt_id: str | None = None,
     config_fingerprint: str | None = None,
     checked_at: str | datetime | None = None,
+    connection_target: str | None = None,
 ) -> dict[str, Any]:
-    """Convert legacy ``bundle_status.json`` fields conservatively.
+    """Convert authoritative v5 client evidence or legacy fields conservatively.
 
     Legacy Desktop surface and end-to-end booleans have no per-attempt
     conversation proof. They are retained as sanitized evidence but never
@@ -142,12 +245,34 @@ def diagnostic_from_bundle_status(
     """
 
     status = dict(bundle_status or {})
+    normalized_target = _normalize_connection_target(connection_target)
+    client_connections = status.get("client_connections")
+    if (
+        status.get("schema_version") == "mcp-bundle-status-v5"
+        and isinstance(client_connections, Mapping)
+        and normalized_target in CONNECTION_TARGET_STAGE_PROFILES
+        and isinstance(client_connections.get(normalized_target), Mapping)
+    ):
+        return _diagnostic_from_v5_client_record(
+            client_connections[normalized_target],
+            attempt_id=attempt_id,
+            config_fingerprint=config_fingerprint,
+            runtime_fingerprint=status.get("runtime_fingerprint"),
+            checked_at=checked_at or status.get("updated_at") or status.get("generated_at"),
+            connection_target=normalized_target,
+        )
     source_attempt = _safe_identifier_value(
         status.get("installation_attempt_id") or status.get("attempt_id")
     )
-    source_fingerprint = _safe_identifier_value(
-        status.get("installed_config_fingerprint") or status.get("config_fingerprint")
-    )
+    if normalized_target == "claude-desktop":
+        source_config_fingerprint = status.get("claude_desktop_config_fingerprint")
+    elif normalized_target == "claude-code":
+        source_config_fingerprint = status.get("claude_code_config_fingerprint")
+    else:
+        source_config_fingerprint = status.get("installed_config_fingerprint") or status.get(
+            "config_fingerprint"
+        )
+    source_fingerprint = _safe_identifier_value(source_config_fingerprint)
     current_attempt = _safe_identifier_value(attempt_id) if attempt_id is not None else source_attempt
     current_fingerprint = (
         _safe_identifier_value(config_fingerprint)
@@ -207,6 +332,27 @@ def diagnostic_from_bundle_status(
             config_fingerprint=evidence_fingerprint,
             checked_at=_first_checked_at(stage_checked_at, generic_checked_at),
             evidence=evidence,
+        )
+
+    if normalized_target == "claude-desktop":
+        return _diagnostic_from_claude_desktop_status(
+            status,
+            legacy_stage=legacy_stage,
+            evidence_attempt=evidence_attempt,
+            evidence_fingerprint=evidence_fingerprint,
+            current_attempt=current_attempt,
+            current_fingerprint=current_fingerprint,
+            generic_checked_at=generic_checked_at,
+        )
+    if normalized_target == "claude-code":
+        return _diagnostic_from_claude_code_status(
+            status,
+            legacy_stage=legacy_stage,
+            evidence_attempt=evidence_attempt,
+            evidence_fingerprint=evidence_fingerprint,
+            current_attempt=current_attempt,
+            current_fingerprint=current_fingerprint,
+            generic_checked_at=generic_checked_at,
         )
 
     direct_registered = bool(status.get("direct_config_registered"))
@@ -341,10 +487,20 @@ def diagnostic_from_bundle_status(
 
     restart_required = status.get("desktop_restart_required")
     restart_status = str(status.get("desktop_restart_status") or "").strip().casefold()
-    reload_verified = restart_required is False and restart_status == "up_to_date"
+    restarted_after_registration = bool(status.get("desktop_restarted_after_registration"))
+    reload_verified = bool(
+        restart_required is False
+        and (
+            restart_status == "up_to_date"
+            or (
+                restarted_after_registration
+                and restart_status == "running_process_started_after_registration"
+            )
+        )
+    )
     if restart_required is True:
         reload_reason = "desktop_restart_required"
-    elif restart_status == "not_running":
+    elif restart_status in {"not_running", "desktop_not_running"}:
         reload_reason = "desktop_not_running"
     else:
         reload_reason = "desktop_reload_not_verified"
@@ -404,6 +560,285 @@ def diagnostic_from_bundle_status(
         attempt_id=current_attempt,
         config_fingerprint=current_fingerprint,
         checked_at=generic_checked_at,
+        connection_target=normalized_target,
+    )
+
+
+def _diagnostic_from_v5_client_record(
+    record: Mapping[str, Any],
+    *,
+    attempt_id: str | None,
+    config_fingerprint: str | None,
+    runtime_fingerprint: Any,
+    checked_at: str | datetime | None,
+    connection_target: str,
+) -> dict[str, Any]:
+    """Build one diagnostic strictly from the selected v5 client record."""
+
+    effective = record.get("effective") if isinstance(record.get("effective"), Mapping) else {}
+    last_attempt = (
+        record.get("last_attempt") if isinstance(record.get("last_attempt"), Mapping) else {}
+    )
+    current_attempt = _safe_identifier_value(
+        attempt_id
+        if attempt_id is not None
+        else effective.get("attempt_id") or last_attempt.get("id")
+    )
+    current_fingerprint = _safe_identifier_value(
+        config_fingerprint
+        if config_fingerprint is not None
+        else effective.get("config_entry_fingerprint")
+    )
+    current_runtime_fingerprint = _safe_identifier_value(
+        runtime_fingerprint
+        if runtime_fingerprint is not None
+        else effective.get("runtime_fingerprint")
+    )
+    source_stages = record.get("stages") if isinstance(record.get("stages"), Mapping) else {}
+    stage_aliases = {
+        "client_reload": "desktop_reload",
+        "client_surface": "desktop_surface",
+    }
+    diagnostic_stages: dict[str, dict[str, Any]] = {}
+    for source_name, raw_stage in source_stages.items():
+        diagnostic_name = stage_aliases.get(str(source_name), str(source_name))
+        if diagnostic_name not in STAGE_ORDER or not isinstance(raw_stage, Mapping):
+            continue
+        stage = dict(raw_stage)
+        stage["config_fingerprint"] = stage.get("config_entry_fingerprint")
+        stage_runtime_fingerprint = _safe_identifier_value(
+            stage.get("runtime_fingerprint")
+        )
+        if stage.get("state") == "verified" and str(source_name) != "registration":
+            if stage_runtime_fingerprint is None:
+                stage["state"] = "stale"
+                stage["reason_code"] = "evidence_runtime_fingerprint_missing"
+            elif stage_runtime_fingerprint != current_runtime_fingerprint:
+                stage["state"] = "stale"
+                stage["reason_code"] = "stale_runtime_fingerprint"
+        diagnostic_stages[diagnostic_name] = stage
+
+    report = build_connection_diagnostic(
+        diagnostic_stages,
+        attempt_id=current_attempt,
+        config_fingerprint=current_fingerprint,
+        checked_at=checked_at,
+        connection_target=connection_target,
+    )
+    report["status_source"] = "client_connections"
+    report["last_attempt_state"] = _normalize_reason(last_attempt.get("state"))
+    report["effective_state"] = _normalize_reason(effective.get("state"))
+    return report
+
+
+def _diagnostic_from_claude_desktop_status(
+    status: Mapping[str, Any],
+    *,
+    legacy_stage: Any,
+    evidence_attempt: str | None,
+    evidence_fingerprint: str | None,
+    current_attempt: str | None,
+    current_fingerprint: str | None,
+    generic_checked_at: str | None,
+) -> dict[str, Any]:
+    """Map Claude Desktop evidence without borrowing Codex-only stages."""
+
+    registered = bool(status.get("claude_desktop_config_registered"))
+    runtime_fingerprint = _safe_identifier_value(status.get("runtime_fingerprint"))
+    transport_claimed = bool(status.get("claude_desktop_config_transport_verified"))
+    transport_runtime_fingerprint = _safe_identifier_value(
+        status.get("claude_desktop_config_transport_runtime_fingerprint")
+    )
+    transport_runtime_bound = bool(
+        runtime_fingerprint
+        and transport_runtime_fingerprint
+        and runtime_fingerprint == transport_runtime_fingerprint
+    )
+    transport_verified = bool(transport_claimed and transport_runtime_bound)
+    loader_claimed = bool(status.get("claude_desktop_loader_verified"))
+
+    restart_required = status.get("claude_desktop_restart_required")
+    restart_status = str(status.get("claude_desktop_restart_status") or "").strip().casefold()
+    restarted_after_registration = bool(
+        status.get("claude_desktop_restarted_after_registration")
+    )
+    reload_verified = bool(
+        restart_required is False
+        and restarted_after_registration
+        and restart_status
+        in {
+            "up_to_date",
+            "restarted_after_registration",
+            "running_process_started_after_registration",
+        }
+    )
+    if restart_required is True:
+        reload_reason = "claude_desktop_restart_required"
+    elif restart_status in {"not_running", "desktop_not_running"}:
+        reload_reason = "claude_desktop_not_running"
+    else:
+        reload_reason = "claude_desktop_reload_not_verified"
+
+    stages: dict[str, dict[str, Any]] = {
+        "registration": legacy_stage(
+            registered,
+            false_reason="claude_desktop_registration_not_verified",
+            stage_checked_at=status.get("claude_desktop_registration_updated_at"),
+            evidence={
+                "legacy_source": True,
+                "claude_desktop_config_registered": registered,
+            },
+        ),
+        "transport": legacy_stage(
+            transport_verified,
+            false_reason=(
+                "claude_desktop_transport_runtime_fingerprint_mismatch"
+                if transport_claimed and not transport_runtime_bound
+                else "claude_desktop_transport_not_verified"
+            ),
+            evidence={
+                "legacy_source": True,
+                "claude_desktop_config_transport_verified": transport_claimed,
+                "runtime_fingerprint_bound": transport_runtime_bound,
+            },
+        ),
+        "desktop_reload": legacy_stage(
+            reload_verified,
+            false_reason=reload_reason,
+            stage_checked_at=status.get("claude_desktop_restart_checked_at"),
+            evidence={
+                "legacy_source": True,
+                "claude_desktop_process_detected": bool(
+                    status.get("claude_desktop_process_detected")
+                ),
+                "claude_desktop_restart_required": restart_required,
+                "claude_desktop_restart_status": restart_status or None,
+                "claude_desktop_restarted_after_registration": restarted_after_registration,
+            },
+        ),
+        "loader": legacy_stage(
+            loader_claimed,
+            false_reason="claude_desktop_loader_not_verified",
+            evidence={
+                "legacy_source": True,
+                "claude_desktop_loader_verified": loader_claimed,
+            },
+        ),
+    }
+
+    surface_claimed = bool(status.get("claude_desktop_tool_scan_verified"))
+    stages["desktop_surface"] = _legacy_stage_payload(
+        state="pending",
+        reason_code=(
+            "legacy_surface_proof_not_current"
+            if surface_claimed
+            else "claude_desktop_surface_not_verified"
+        ),
+        attempt_id=evidence_attempt,
+        config_fingerprint=evidence_fingerprint,
+        checked_at=generic_checked_at,
+        evidence={
+            "legacy_source": True,
+            "legacy_claimed_verified": surface_claimed,
+        },
+    )
+    conversation_claimed = bool(status.get("claude_desktop_conversation_verified"))
+    stages["conversation"] = _legacy_stage_payload(
+        state="pending",
+        reason_code=(
+            "legacy_conversation_proof_not_current"
+            if conversation_claimed
+            else "conversation_proof_required"
+        ),
+        attempt_id=evidence_attempt,
+        config_fingerprint=evidence_fingerprint,
+        checked_at=generic_checked_at,
+        evidence={
+            "legacy_source": True,
+            "legacy_claimed_attachment_verified": conversation_claimed,
+        },
+    )
+    return build_connection_diagnostic(
+        stages,
+        attempt_id=current_attempt,
+        config_fingerprint=current_fingerprint,
+        checked_at=generic_checked_at,
+        connection_target="claude-desktop",
+    )
+
+
+def _diagnostic_from_claude_code_status(
+    status: Mapping[str, Any],
+    *,
+    legacy_stage: Any,
+    evidence_attempt: str | None,
+    evidence_fingerprint: str | None,
+    current_attempt: str | None,
+    current_fingerprint: str | None,
+    generic_checked_at: str | None,
+) -> dict[str, Any]:
+    """Map Claude Code evidence without borrowing Desktop-only observations."""
+
+    registered = bool(status.get("claude_code_registered"))
+    loader_verified = bool(status.get("claude_code_loader_verified"))
+    runtime_fingerprint = _safe_identifier_value(status.get("runtime_fingerprint"))
+    transport_claimed = bool(status.get("claude_code_transport_verified"))
+    transport_runtime_fingerprint = _safe_identifier_value(
+        status.get("claude_code_transport_runtime_fingerprint")
+    )
+    runtime_bound = bool(
+        runtime_fingerprint
+        and transport_runtime_fingerprint
+        and runtime_fingerprint == transport_runtime_fingerprint
+    )
+    stages = {
+        "registration": legacy_stage(
+            registered,
+            false_reason="claude_code_registration_not_verified",
+            stage_checked_at=status.get("claude_code_registration_updated_at"),
+            evidence={"legacy_source": True, "claude_code_registered": registered},
+        ),
+        "loader": legacy_stage(
+            loader_verified,
+            false_reason="claude_code_loader_not_verified",
+            evidence={
+                "legacy_source": True,
+                "claude_code_loader_verified": loader_verified,
+            },
+        ),
+        "transport": legacy_stage(
+            bool(transport_claimed and runtime_bound),
+            false_reason=(
+                "claude_code_transport_runtime_fingerprint_mismatch"
+                if transport_claimed and not runtime_bound
+                else "claude_code_transport_not_verified"
+            ),
+            evidence={
+                "legacy_source": True,
+                "claude_code_transport_verified": transport_claimed,
+                "runtime_fingerprint_bound": runtime_bound,
+            },
+        ),
+        "conversation": _legacy_stage_payload(
+            state="pending",
+            reason_code="conversation_proof_required",
+            attempt_id=evidence_attempt,
+            config_fingerprint=evidence_fingerprint,
+            checked_at=generic_checked_at,
+            evidence={
+                "legacy_source": True,
+                "legacy_claimed_attachment_verified": bool(
+                    status.get("claude_code_conversation_verified")
+                ),
+            },
+        ),
+    }
+    return build_connection_diagnostic(
+        stages,
+        attempt_id=current_attempt,
+        config_fingerprint=current_fingerprint,
+        checked_at=generic_checked_at,
+        connection_target="claude-code",
     )
 
 
@@ -413,6 +848,7 @@ def normalize_connection_diagnostic(
     attempt_id: str | None,
     config_fingerprint: str | None,
     checked_at: str | datetime | None = None,
+    connection_target: str | None = None,
 ) -> dict[str, Any]:
     """Alias with a name suited to callers that already hold stage evidence."""
 
@@ -421,6 +857,7 @@ def normalize_connection_diagnostic(
         attempt_id=attempt_id,
         config_fingerprint=config_fingerprint,
         checked_at=checked_at,
+        connection_target=connection_target,
     )
 
 
@@ -430,6 +867,7 @@ def convert_bundle_status(
     attempt_id: str | None = None,
     config_fingerprint: str | None = None,
     checked_at: str | datetime | None = None,
+    connection_target: str | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible alias for :func:`diagnostic_from_bundle_status`."""
 
@@ -438,6 +876,7 @@ def convert_bundle_status(
         attempt_id=attempt_id,
         config_fingerprint=config_fingerprint,
         checked_at=checked_at,
+        connection_target=connection_target,
     )
 
 
@@ -568,6 +1007,18 @@ def _safe_identifier_value(value: Any) -> str | None:
     return f"sha256:{digest}"
 
 
+def _normalize_connection_target(value: Any) -> str | None:
+    normalized = str(value or "").strip().casefold().replace("_", "-")
+    aliases = {
+        "chatgpt": "chatgpt-desktop-local",
+        "chatgpt-desktop": "chatgpt-desktop-local",
+        "codex-cli": "codex",
+        "claude": "claude-desktop",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return _safe_identifier_value(normalized)
+
+
 def _normalize_checked_at(value: str | datetime | None) -> str | None:
     if value is None:
         return None
@@ -651,6 +1102,7 @@ def _support_guidance(
     overall_state: str,
     first_blocking_stage: str | None,
     stages: Mapping[str, Mapping[str, Any]],
+    connection_target: str | None,
 ) -> tuple[str, str]:
     if overall_state == "connected":
         return (
@@ -675,20 +1127,33 @@ def _support_guidance(
     elif first_blocking_stage == "registration":
         action = "Install and verify the MCP registration for the current configuration."
     elif first_blocking_stage == "loader":
-        action = "Run a fresh loader inventory check for the registered MCP server."
+        action = (
+            "Restart Claude Desktop and confirm that its loader observed the registered MCP server."
+            if connection_target == "claude-desktop"
+            else "Run a fresh loader inventory check for the registered MCP server."
+        )
     elif first_blocking_stage == "transport":
         action = "Run the direct MCP protocol smoke check with the registered launch contract."
     elif first_blocking_stage == "fresh_app_server":
         action = "Start a fresh app-server process and verify the expected MCP tools."
     elif first_blocking_stage == "desktop_reload":
-        action = "Fully quit and restart Desktop, then run the post-restart check."
+        client_label = (
+            "Claude Desktop"
+            if connection_target == "claude-desktop"
+            else "ChatGPT Desktop"
+        )
+        action = f"Fully quit and restart {client_label}, then run the post-restart check."
     elif first_blocking_stage == "desktop_surface":
-        action = "Open a new Desktop conversation and confirm the server in the MCP picker."
+        action = (
+            "Open a new Claude Desktop conversation and confirm the server in Connectors."
+            if connection_target == "claude-desktop"
+            else "Open a new ChatGPT Desktop conversation and confirm the server with /mcp."
+        )
     else:
         action = "Run the generated conversation verification prompt and confirm its proof."
 
     if overall_state == "configured":
-        summary = "MCP configuration is current; Desktop or conversation verification is still pending."
+        summary = "MCP configuration is current; selected-client or conversation verification is still pending."
     else:
         label = first_blocking_stage.replace("_", " ")
         summary = f"MCP connection verification is incomplete at the {label} stage."
@@ -697,6 +1162,7 @@ def _support_guidance(
 
 __all__ = [
     "SCHEMA_VERSION",
+    "CONNECTION_TARGET_STAGE_PROFILES",
     "CORE_CONFIGURATION_STAGES",
     "STAGE_ORDER",
     "STAGE_STATES",

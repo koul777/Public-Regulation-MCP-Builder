@@ -13,6 +13,7 @@ from scripts.run_mcp_windows_execution_matrix import (
     CLAUDE_CODE_BAT,
     CLAUDE_DESKTOP_BAT,
     INSTALL_SCRIPT,
+    RUNTIME_IDENTITY_MODULES,
     RUNTIME_MARKER,
     STDIO_LAUNCHER,
     CommandResult,
@@ -62,19 +63,9 @@ class SimulatedRunner:
         if spec.scenario_id in {"py_only_install", "scripts_path_absent"}:
             marker = spec.artifacts["marker"]
             expected_python = spec.artifacts["expected_python"]
-            module_names = (
-                "scripts.run_regulation_mcp",
-                "scripts.check_mcp_connection_readiness",
-                "scripts.run_mcp_smoke",
-                "scripts.run_mcp_transport_smoke",
-                "scripts.run_mcp_client_config_smoke",
-                "scripts.check_codex_app_server_mcp",
-                "scripts.check_chatgpt_desktop_recognition",
-                "scripts.audit_mcp_index_visibility",
-            )
             module_sha256 = {
                 name: "sha256:" + hashlib.sha256(name.encode("utf-8")).hexdigest()
-                for name in module_names
+                for name in RUNTIME_IDENTITY_MODULES
             }
             canonical = json.dumps(
                 module_sha256,

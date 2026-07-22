@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.mcp_connection_diagnostic import diagnostic_from_bundle_status
+from scripts.mcp_client_status import begin_attempt, commit_success, create_bundle_status
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +66,135 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertEqual("second", calls[1][0]["marker"])
         self.assertEqual("attempt-1", calls[1][1]["attempt_id"])
         self.assertIsNone(calls[1][1]["config_fingerprint"])
+
+    def test_mcp_connection_diagnostic_reader_does_not_mix_v5_client_identities(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_read_mcp_connection_diagnostic"
+        )
+        namespace = {
+            "Any": Any,
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "diagnostic_from_bundle_status": diagnostic_from_bundle_status,
+        }
+        exec(
+            compile(ast.Module(body=[reader_node], type_ignores=[]), "<mcp-diagnostic-reader>", "exec"),
+            namespace,
+        )
+        read_diagnostic = namespace["_read_mcp_connection_diagnostic"]
+        status = begin_attempt(
+            create_bundle_status("final", generated_at="2026-07-21T00:00:00Z"),
+            "codex",
+            "attempt-codex",
+            started_at="2026-07-21T00:01:00Z",
+        )
+        status = commit_success(
+            status,
+            "codex",
+            "attempt-codex",
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-current",
+            bundle_location_fingerprint="bundle-current",
+            verified_at="2026-07-21T00:02:00Z",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "bundle_status.json").write_text(
+                json.dumps(status),
+                encoding="utf-8",
+            )
+            for target in (
+                "claude-code",
+                "claude-desktop",
+                "chatgpt-desktop-local",
+                "chatgpt-remote",
+                "chatgpt-tunnel",
+                "claude-api",
+            ):
+                with self.subTest(target=target):
+                    report, read_error = read_diagnostic(tmp, target)
+                    self.assertIsNone(read_error)
+                    self.assertEqual("client_connections", report.get("status_source"))
+                    self.assertIsNone(report["attempt_id"])
+                    self.assertIsNone(report["config_fingerprint"])
+                    self.assertFalse(report["configured"])
+
+    def test_mcp_connection_diagnostic_reader_shows_v5_manual_registration(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_read_mcp_connection_diagnostic"
+        )
+        namespace = {
+            "Any": Any,
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "diagnostic_from_bundle_status": diagnostic_from_bundle_status,
+        }
+        exec(
+            compile(ast.Module(body=[reader_node], type_ignores=[]), "<mcp-diagnostic-reader>", "exec"),
+            namespace,
+        )
+        read_diagnostic = namespace["_read_mcp_connection_diagnostic"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.toml"
+            config_path.write_text(
+                '[mcp_servers.final]\ncommand = "powershell.exe"\n',
+                encoding="utf-8",
+            )
+            config_fingerprint = "sha256:" + hashlib.sha256(
+                config_path.read_bytes()
+            ).hexdigest()
+            status = begin_attempt(
+                create_bundle_status(
+                    "final",
+                    runtime_fingerprint="runtime-current",
+                    generated_at="2026-07-21T00:00:00Z",
+                ),
+                "chatgpt-desktop-local",
+                "manual-settings-attempt",
+                started_at="2026-07-21T00:01:00Z",
+            )
+            status = commit_success(
+                status,
+                "chatgpt-desktop-local",
+                "manual-settings-attempt",
+                verified_stages=("registration",),
+                config_entry_fingerprint=config_fingerprint,
+                bundle_location_fingerprint=str(bundle_dir),
+                verified_at="2026-07-21T00:02:00Z",
+            )
+            status["direct_config_path"] = str(config_path)
+            (bundle_dir / "bundle_status.json").write_text(
+                json.dumps(status),
+                encoding="utf-8",
+            )
+
+            report, read_error = read_diagnostic(
+                bundle_dir,
+                "chatgpt-desktop-local",
+            )
+
+        self.assertIsNone(read_error)
+        self.assertEqual("client_connections", report["status_source"])
+        self.assertEqual("manual-settings-attempt", report["attempt_id"])
+        self.assertEqual("completed", report["last_attempt_state"])
+        self.assertEqual("verified", report["stages"]["registration"]["state"])
+        self.assertEqual("not_checked", report["stages"]["transport"]["state"])
+        self.assertEqual("pending", report["overall_state"])
+        self.assertFalse(report["configured"])
+        self.assertFalse(report["connected"])
 
     def test_mcp_connection_diagnostic_reader_requires_real_installed_config_fingerprint(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -200,25 +331,159 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             )
         )
 
+    def test_mcp_connection_diagnostic_reader_uses_claude_desktop_config(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_read_mcp_connection_diagnostic"
+        )
+        namespace = {
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+            "diagnostic_from_bundle_status": diagnostic_from_bundle_status,
+        }
+        exec(
+            compile(ast.Module(body=[reader_node], type_ignores=[]), "<mcp-diagnostic-reader>", "exec"),
+            namespace,
+        )
+        read_diagnostic = namespace["_read_mcp_connection_diagnostic"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "claude_desktop_config.json"
+            config_path.write_text(
+                json.dumps({"mcpServers": {"regulation_mcp": {"command": "powershell.exe"}}}),
+                encoding="utf-8",
+            )
+            actual_fingerprint = "sha256:" + hashlib.sha256(config_path.read_bytes()).hexdigest()
+            runtime_fingerprint = "sha256:runtime-current"
+            (bundle_dir / "bundle_status.json").write_text(
+                json.dumps(
+                    {
+                        "installation_attempt_id": "attempt-claude",
+                        "claude_desktop_config_path": str(config_path),
+                        "claude_desktop_config_fingerprint": actual_fingerprint,
+                        "claude_desktop_config_registered": True,
+                        "claude_desktop_config_transport_verified": True,
+                        "claude_desktop_config_transport_runtime_fingerprint": runtime_fingerprint,
+                        "runtime_fingerprint": runtime_fingerprint,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report, read_error = read_diagnostic(bundle_dir, "claude-desktop")
+
+        self.assertIsNone(read_error)
+        self.assertEqual("claude-desktop", report["connection_target"])
+        self.assertEqual(actual_fingerprint, report["config_fingerprint"])
+        self.assertTrue(report["configured"])
+        self.assertEqual("not_applicable", report["stages"]["fresh_app_server"]["state"])
+
+    def test_desktop_refresh_runs_observer_without_claiming_connection(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_refresh_mcp_connection_observation"
+        )
+        calls: list[list[str]] = []
+
+        def fake_refresh(argv, *, stdout):
+            calls.append(list(argv))
+            stdout.write(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status_updated": True,
+                        "connection_verified": False,
+                    }
+                )
+            )
+            return 0
+
+        namespace = {
+            "Path": Path,
+            "io": io,
+            "json": json,
+            "refresh_mcp_client_connection": fake_refresh,
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-refresh>", "exec"),
+            namespace,
+        )
+
+        refreshed, reason = namespace["_refresh_mcp_connection_observation"](
+            "fixture-bundle",
+            "chatgpt-desktop-local",
+            "regulation_mcp",
+        )
+
+        self.assertTrue(refreshed)
+        self.assertEqual("observation_recorded_pending", reason)
+        self.assertEqual("chatgpt-desktop-local", calls[0][1])
+        self.assertIn("--bundle-status", calls[0])
+        self.assertIn("--bundle-dir", calls[0])
+        self.assertIn("--adopt-manual-registration", calls[0])
+        self.assertNotIn("--fail-on-issue", calls[0])
+
     def test_streamlit_distinguishes_configured_from_desktop_connected(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
         self.assertIn("diagnostic_from_bundle_status", source)
         self.assertIn('status_path = Path(bundle_dir) / "bundle_status.json"', source)
         self.assertIn("MCP 연결 상태 새로고침", source)
-        self.assertIn("ChatGPT Desktop 7단계 연결 진단", source)
-        self.assertIn("Codex CLI 7단계 연결 진단", source)
+        self.assertIn("ChatGPT Desktop 연결 진단", source)
+        self.assertIn("Codex CLI 연결 진단", source)
+        self.assertIn("Claude Code 연결 진단", source)
+        self.assertIn("Claude Desktop 연결 진단", source)
         self.assertNotIn("ChatGPT Desktop·Codex CLI 7단계 연결 진단", source)
         self.assertIn("재시작 후 최종 확인 프롬프트", source)
         self.assertIn("MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.", source)
         self.assertIn('if diagnostic_state == "connected":', source)
-        self.assertIn("Desktop 연결 완료 — 현재 시도의 Desktop 도구 노출과 대화 도구 호출 증명", source)
-        self.assertIn("MCP 구성 확인 완료 · Desktop 연결 확인 대기", source)
+        self.assertIn('"codex": "Codex CLI",', source)
+        self.assertIn('"claude-code": "Claude Code",', source)
+        self.assertIn('f"{diagnostic_client_label} 연결 완료', source)
+        self.assertIn('f"MCP 구성 확인 완료 · {diagnostic_client_label} 최종 확인 대기', source)
+        self.assertNotIn("MCP 구성 확인 완료 · Desktop 연결 확인 대기", source)
         self.assertIn("다른 앱의 현재 대화 결과를 자동으로 읽을 수 없으므로", source)
         self.assertIn("아래 최종 도구 호출 성공은 해당 대화에서 직접 확인", source)
         self.assertIn("support_summary:", source)
         self.assertIn("next_action:", source)
         self.assertIn("st.code(agent_prompt_text, language=None)", source)
+        self.assertIn("_mcp_agent_prompt_display_kind(prompt_path)", source)
+        self.assertIn("구형 ChatGPT Desktop 에이전트 프롬프트를 감지했습니다", source)
+        self.assertIn("source_name=prompt_path.name", source)
+        self.assertIn("_refresh_mcp_connection_observation(", source)
+        self.assertIn("이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다.", source)
+
+    def test_legacy_chatgpt_prompt_ui_kind_is_case_insensitive_and_never_agent_mode(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_mcp_agent_prompt_display_kind"
+        )
+        namespace = {"Path": Path}
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-prompt-kind>", "exec"),
+            namespace,
+        )
+        classify = namespace["_mcp_agent_prompt_display_kind"]
+
+        self.assertEqual(
+            "legacy_chatgpt_desktop",
+            classify(r"C:\moved\chatgpt_desktop_agent_connect_prompt.MD"),
+        )
+        self.assertEqual("chatgpt_desktop", classify("CHATGPT_DESKTOP_CONNECT_GUIDE.md"))
+        self.assertEqual("agent", classify("CODEX_AGENT_CONNECT_PROMPT.md"))
 
     def test_mcp_http_url_builder_normalizes_local_and_public_urls(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -494,7 +759,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("연결할 AI 앱", source)
         self.assertIn("mcp_connection_target_labels", source)
         self.assertIn("mcp-connection-target", source)
-        self.assertIn("에이전트 연결 요청문과 보조 BAT", source)
+        self.assertIn("Codex CLI는 직접 설정/BAT를 기본으로 사용", source)
+        self.assertIn("연결 설정이나 비밀값을 대화 프롬프트에 넣지 마세요", source)
         self.assertIn("mcp_target_file_keys", source)
         self.assertIn("codex_agent_prompt", source)
         self.assertIn("connect_claude_desktop_bat", source)
@@ -506,7 +772,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("chatgpt-remote", source)
         self.assertIn("chatgpt-tunnel", source)
         self.assertIn('"chatgpt-desktop-local": "chatgpt_desktop_agent_prompt"', source)
-        self.assertIn('"codex": "codex_agent_prompt"', source)
+        self.assertIn('"codex": "connect_codex_bat"', source)
         self.assertIn('"claude-code": "claude_code_agent_prompt"', source)
         self.assertIn('"chatgpt-desktop-local": "ChatGPT Desktop"', source)
         self.assertIn('"codex": "Codex CLI"', source)
@@ -546,8 +812,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Settings > Plugins", source)
         self.assertIn("https://chatgpt.com/plugins", source)
         self.assertIn("ChatGPT Plugins 설정에서 앱을 Refresh", source)
-        self.assertNotIn("ChatGPT Apps 설정에서 도구를 다시 스캔", source)
-        self.assertNotIn("Settings > Apps", source)
+        self.assertIn("Settings > Security and login", source)
+        self.assertIn("+ > More", source)
+        self.assertIn("MCP OAuth 2.1", source)
+        self.assertIn("--chatgpt-oauth-ready", source)
+        self.assertNotIn("Settings > Apps > Advanced Settings", source)
+        self.assertNotIn("Settings > Apps > Create", source)
         self.assertIn("Claude Desktop은 전용 BAT가 기본", source)
         self.assertIn("설치 검증이 끝날 때까지 실행", source)
         self.assertIn("MCP의 list_regulations 도구를 사용해서 등록된 규정 목록을 보여줘", source)
@@ -616,7 +886,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("OPENAI_API_KEY", source)
         self.assertIn("Codex can connect as an MCP client", source)
         self.assertIn("not a replacement API key for this product runtime", source)
-        self.assertIn("아래 버튼을 누르면 Claude Desktop/Claude Code/ChatGPT/Claude API 연결에 필요한 파일 묶음이 생성됩니다.", source)
+        self.assertIn(
+            "아래 버튼을 누르면 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop,",
+            source,
+        )
+        self.assertIn("ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 연결 파일 묶음", source)
+        self.assertNotIn("Claude Desktop/Claude Code/ChatGPT/Claude API", source)
         self.assertIn("AI review API and cost guard", source)
         self.assertIn("cached_candidate_count", source)
         self.assertIn("cost_estimate_status", source)
@@ -664,7 +939,16 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         namespace = {
             "MCP_EXTERNAL_DATA_TARGETS": frozenset(
                 {"chatgpt-remote", "chatgpt-tunnel", "claude-api"}
-            )
+            ),
+            "MCP_SEARCH_FETCH_TARGETS": frozenset(
+                {
+                    "chatgpt-desktop-local",
+                    "codex",
+                    "chatgpt-remote",
+                    "chatgpt-tunnel",
+                    "claude-api",
+                }
+            ),
         }
         exec(
             compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-verification-prompts>", "exec"),
@@ -681,10 +965,19 @@ class StreamlitOperatorModeTests(unittest.TestCase):
                 self.assertNotIn("get_index_status", remote_prompts[0])
                 self.assertNotIn("list_regulations", remote_prompts[0])
 
-        local_prompts = prompts_for("chatgpt-desktop-local", "govreg-local")
-        self.assertEqual(2, len(local_prompts))
-        self.assertIn("get_index_status", local_prompts[0])
-        self.assertIn("list_regulations", local_prompts[1])
+        for target in ("chatgpt-desktop-local", "codex"):
+            with self.subTest(target=target):
+                local_prompts = prompts_for(target, "govreg-local")
+                self.assertEqual(1, len(local_prompts))
+                self.assertIn("search 도구", local_prompts[0])
+                self.assertIn("fetch 도구", local_prompts[0])
+                self.assertNotIn("get_index_status", local_prompts[0])
+                self.assertNotIn("list_regulations", local_prompts[0])
+
+        claude_prompts = prompts_for("claude-desktop", "govreg-local")
+        self.assertEqual(2, len(claude_prompts))
+        self.assertIn("get_index_status", claude_prompts[0])
+        self.assertIn("list_regulations", claude_prompts[1])
 
     def test_streamlit_exposes_parsing_goldset_review_gate(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")

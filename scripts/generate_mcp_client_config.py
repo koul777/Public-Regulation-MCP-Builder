@@ -30,6 +30,10 @@ from scripts.mcp_bundle_contract import (
     chatgpt_local_marketplace_name as _chatgpt_local_marketplace_name,
     normalized_chatgpt_plugin_name as _normalized_plugin_name,
 )
+from scripts.mcp_client_status import (
+    create_bundle_status as create_client_connection_status,
+    invalidate_runtime as invalidate_client_connection_runtime,
+)
 from app.api import routes_rag
 from app.core.tenant_access import tenant_storage_key
 from app.ingestion.vector_adapter import stable_content_hash
@@ -89,11 +93,15 @@ STALE_BUNDLE_STATUS_REPORT_FILENAMES = (
     "claude_desktop_installed_mcp_config_smoke.json",
 )
 UTF8_BOM = b"\xef\xbb\xbf"
-CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION = "chatgpt-desktop-local-plugin-v4"
+CHATGPT_DESKTOP_PLUGIN_TEMPLATE_REVISION = "chatgpt-desktop-local-plugin-v5"
 SAFE_MCP_SERVER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+CLAUDE_CODE_RESERVED_MCP_SERVER_NAMES = frozenset(
+    {"workspace", "claude-in-chrome", "computer-use", "claude-preview", "claude-browser"}
+)
 ACTIVE_LOCAL_INSTALLATION_STATES = {
     "preflight_direct",
     "preflight_plugin",
+    "preflight_claude_code",
     "preflight_claude_desktop",
     "installing",
     "installing_plugin",
@@ -117,6 +125,9 @@ RUNTIME_IDENTITY_MODULES = (
     "scripts.run_mcp_client_config_smoke",
     "scripts.check_codex_app_server_mcp",
     "scripts.check_chatgpt_desktop_recognition",
+    "scripts.inspect_claude_desktop_connection",
+    "scripts.refresh_mcp_client_connection",
+    "scripts.mcp_client_status",
     "scripts.audit_mcp_index_visibility",
 )
 
@@ -151,6 +162,7 @@ def render_agent_connect_prompt_for_program(
     prompt_text: str,
     *,
     bundle_dir: str | Path,
+    source_name: str | Path | None = None,
 ) -> str:
     """Materialize the current local bundle path only in the operator UI copy text.
 
@@ -163,11 +175,20 @@ def render_agent_connect_prompt_for_program(
         raise ValueError("bundle_dir must not contain line breaks.")
     powershell_literal = "'" + resolved_bundle_dir.replace("'", "''") + "'"
     bundle_name = Path(resolved_bundle_dir).name
+    source_leaf = (
+        str(source_name or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].casefold()
+    )
+    legacy_chatgpt_prompt_name = "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md"
     has_program_path_markers = (
         AGENT_CONNECT_BUNDLE_NAME_MARKER in prompt_text
         or AGENT_CONNECT_BUNDLE_DIR_MARKER in prompt_text
         or AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER in prompt_text
     )
+    if (
+        source_leaf == legacy_chatgpt_prompt_name.casefold()
+        or legacy_chatgpt_prompt_name.casefold() in prompt_text.casefold()
+    ):
+        return _render_legacy_chatgpt_desktop_guide(bundle_dir=Path(resolved_bundle_dir))
     rendered = prompt_text.replace(
         AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER,
         powershell_literal,
@@ -226,6 +247,182 @@ def render_agent_connect_prompt_for_program(
         "검색하거나 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해."
     )
     return legacy_step.sub(lambda _: replacement, rendered, count=1)
+
+
+def _render_legacy_chatgpt_desktop_guide(*, bundle_dir: Path) -> str:
+    """Replace obsolete Desktop agent instructions with the current settings guide.
+
+    Older bundles told a ChatGPT Desktop conversation to execute the Codex CLI
+    installer.  Reusing that text after only materializing its path would keep
+    the unsafe product mismatch alive.  Recover only the local stdio launch
+    contract, relocate its path-bearing arguments, and otherwise fail closed
+    with a regeneration notice.
+    """
+
+    config_path = bundle_dir / SETUP_BUNDLE_FILES["chatgpt_desktop_local"]
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+
+    ui_fields = payload.get("ui_fields")
+    server_name = str(payload.get("server_name") or "").strip()
+    if not isinstance(ui_fields, dict):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+    if not server_name:
+        server_name = str(ui_fields.get("name") or "").strip()
+    if not SAFE_MCP_SERVER_NAME.fullmatch(server_name):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+    if str(ui_fields.get("command") or "").strip().lower() != "powershell.exe":
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+    raw_args = ui_fields.get("args")
+    if not isinstance(raw_args, list) or not all(isinstance(arg, str) for arg in raw_args):
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+
+    relocated_args = _validated_legacy_chatgpt_desktop_args(raw_args, bundle_dir=bundle_dir)
+    if relocated_args is None:
+        return _legacy_chatgpt_desktop_regeneration_notice(bundle_dir)
+
+    current_payload = copy.deepcopy(payload)
+    current_payload["ui_fields"] = {
+        **ui_fields,
+        "name": server_name,
+        "cwd": str(bundle_dir.resolve()),
+        "args": relocated_args,
+    }
+    portable_guide = _chatgpt_desktop_setup_guide(
+        server_name,
+        config=current_payload,
+        bundle_dir=bundle_dir,
+        allow_bat_fallback=False,
+    )
+    return render_agent_connect_prompt_for_program(portable_guide, bundle_dir=bundle_dir)
+
+
+def _validated_legacy_chatgpt_desktop_args(
+    raw_args: list[str],
+    *,
+    bundle_dir: Path,
+) -> list[str] | None:
+    """Validate and relocate only the generated local-stdio launcher grammar."""
+
+    launcher_path = (bundle_dir / SETUP_BUNDLE_FILES["stdio_launcher"]).resolve()
+    data_dir = (bundle_dir / "data").resolve()
+    if not launcher_path.is_file() or not data_dir.is_dir():
+        return None
+    if len(raw_args) < 12 or any("\x00" in value or "\r" in value or "\n" in value for value in raw_args):
+        return None
+    if [value.casefold() for value in raw_args[:4]] != [
+        "-noprofile",
+        "-executionpolicy",
+        "bypass",
+        "-file",
+    ]:
+        return None
+    if _path_leaf(raw_args[4]) != SETUP_BUNDLE_FILES["stdio_launcher"].casefold():
+        return None
+
+    server_args = raw_args[5:]
+    value_flags = {
+        "--data-dir",
+        "--tenant-id",
+        "--transport",
+        "--profile-id",
+        "--actor",
+        "--role",
+        "--department-id",
+        "--tool-profile",
+    }
+    repeatable_value_flags = {"--department-id"}
+    storage_flags = {"--flat-storage", "--tenant-storage-isolation"}
+    switch_flags = {"--no-warm-cache"}
+    forbidden_tokens = ("codex", "connect_mcp_client", "installcodex", "installpackage")
+    values: dict[str, list[str]] = {}
+    storage_flag: str | None = None
+    seen_switches: set[str] = set()
+    index = 0
+    while index < len(server_args):
+        flag = server_args[index]
+        normalized_flag = flag.casefold()
+        if any(token in normalized_flag for token in forbidden_tokens):
+            return None
+        if normalized_flag in value_flags:
+            if index + 1 >= len(server_args):
+                return None
+            value = server_args[index + 1]
+            normalized_value = value.casefold()
+            if not value or value.startswith("-") or any(
+                token in normalized_value for token in forbidden_tokens
+            ):
+                return None
+            if normalized_flag not in repeatable_value_flags and normalized_flag in values:
+                return None
+            values.setdefault(normalized_flag, []).append(value)
+            index += 2
+            continue
+        if normalized_flag in storage_flags:
+            if storage_flag is not None:
+                return None
+            storage_flag = normalized_flag
+            index += 1
+            continue
+        if normalized_flag in switch_flags:
+            if normalized_flag in seen_switches:
+                return None
+            seen_switches.add(normalized_flag)
+            index += 1
+            continue
+        # This rejects unexpected single-dash PowerShell parameters as well as
+        # unknown or malformed server flags.
+        return None
+
+    required_value_flags = {"--data-dir", "--tenant-id", "--transport", "--tool-profile"}
+    if not required_value_flags.issubset(values):
+        return None
+    if storage_flag is None or "--no-warm-cache" not in seen_switches:
+        return None
+    if values["--transport"] != ["stdio"] or values["--tool-profile"] != ["chatgpt-data"]:
+        return None
+
+    canonical_server_args = [
+        "--data-dir",
+        values["--data-dir"][0],
+        "--tenant-id",
+        values["--tenant-id"][0],
+        "--transport",
+        "stdio",
+    ]
+    for flag in ("--profile-id", "--actor", "--role"):
+        if flag in values:
+            canonical_server_args.extend([flag, values[flag][0]])
+    for department_id in values.get("--department-id", []):
+        canonical_server_args.extend(["--department-id", department_id])
+    canonical_server_args.extend([storage_flag, "--tool-profile", "chatgpt-data", "--no-warm-cache"])
+    if [value.casefold() for value in server_args] != [
+        value.casefold() for value in canonical_server_args
+    ]:
+        return None
+
+    relocated_args = list(raw_args)
+    relocated_args[4] = str(launcher_path)
+    data_index = next(
+        index for index, value in enumerate(relocated_args) if value.casefold() == "--data-dir"
+    )
+    relocated_args[data_index + 1] = str(data_dir)
+    return relocated_args
+
+
+def _legacy_chatgpt_desktop_regeneration_notice(bundle_dir: Path) -> str:
+    return f"""# ChatGPT Desktop MCP 연결 안내 갱신 필요
+
+현재 폴더: `{bundle_dir.resolve()}`
+
+이 폴더의 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`는 ChatGPT Desktop에 Codex CLI 설치를 요청하던 구형 형식이며 실행하면 안 됩니다. 구형 `ChatGPT Desktop에 연결하기.bat`도 실행하지 마세요.
+
+현재 프로그램에서 MCP 파일 묶음을 다시 생성한 뒤 새 `CHATGPT_DESKTOP_CONNECT_GUIDE.md`의 Name·Command·Working directory·Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하세요.
+"""
 
 
 def _runtime_identity_builder_base64() -> str:
@@ -434,6 +631,10 @@ def _validate_mcp_server_name(server_name: str) -> str:
         raise ValueError(
             "server_name must be 1-64 lowercase ASCII letters, numbers, hyphens, or underscores."
         )
+    if normalized in CLAUDE_CODE_RESERVED_MCP_SERVER_NAMES:
+        raise ValueError(
+            "server_name is reserved by Claude Code; choose a distinct MCP server name."
+        )
     return normalized
 
 
@@ -453,6 +654,7 @@ def build_mcp_client_config(
     client_profile: str = "generic",
     public_url: str | None = None,
     remote_auth_token_env: str | None = "MCP_AUTH_TOKEN",
+    chatgpt_oauth_ready: bool = False,
     min_visible_records: int = 1,
 ) -> dict[str, Any]:
     server_name = _validate_mcp_server_name(server_name)
@@ -542,6 +744,7 @@ def build_mcp_client_config(
             client_profile="chatgpt-remote",
             public_url=public_url,
             remote_auth_token_env=remote_auth_token_env,
+            chatgpt_oauth_ready=chatgpt_oauth_ready,
             min_visible_records=min_visible_records,
         )
         claude_api = build_mcp_client_config(
@@ -603,6 +806,7 @@ def build_mcp_client_config(
             tenant_storage_isolation=tenant_storage_isolation,
             public_url=public_url,
             remote_auth_token_env=remote_auth_token_env,
+            chatgpt_oauth_ready=chatgpt_oauth_ready,
             min_visible_records=min_visible_records,
         )
     if normalized_profile == "claude-api":
@@ -645,6 +849,11 @@ def build_mcp_client_config(
             role=role,
             department_ids=department_ids,
             tenant_storage_isolation=tenant_storage_isolation,
+            tool_profile=(
+                "chatgpt-data"
+                if normalized_profile == "chatgpt-desktop-local"
+                else "full"
+            ),
         )
         return {
             "mcpServers": {
@@ -913,7 +1122,7 @@ def _write_mcp_setup_bundle_untransactional(
             next_steps=[
                 "Codex를 완전히 종료한 뒤 다시 실행합니다.",
                 "새 task에서 /mcp를 입력해 등록 이름을 확인합니다.",
-                f"{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘. 라고 입력합니다.",
+                f"{server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘. 라고 입력합니다.",
             ],
         ),
     )
@@ -926,8 +1135,8 @@ def _write_mcp_setup_bundle_untransactional(
                 "ChatGPT Desktop을 완전히 종료한 뒤 다시 실행합니다.",
                 "ChatGPT Desktop에서 새 대화를 엽니다.",
                 f"/mcp를 입력해 {server_name}이 연결됨으로 보이는지 먼저 확인합니다.",
-                f"{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘. 라고 입력합니다.",
-                "이 BAT는 ChatGPT Desktop이 읽는 로컬 MCP 설정을 설치하는 보조 수단입니다.",
+                f"{server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘. 라고 입력합니다.",
+                "이 BAT는 ChatGPT Desktop이 읽는 공유 로컬 MCP 설정 항목을 기록·검증하는 보조 수단입니다.",
             ],
         ),
     )
@@ -960,9 +1169,10 @@ def _write_mcp_setup_bundle_untransactional(
             SETUP_BUNDLE_FILES["connect"],
             "-Target chatgpt-remote",
             next_steps=[
-                "ChatGPT Settings > Security and login에서 Developer mode를 켠 뒤 Settings > Plugins를 엽니다.",
+                "공개 endpoint의 MCP OAuth 2.1 검증을 마친 뒤 --chatgpt-oauth-ready로 번들을 생성합니다. 정적 MCP_AUTH_TOKEN은 ChatGPT에 입력할 수 없습니다.",
+                "ChatGPT Settings > Security and login에서 Developer mode를 켠 뒤 Settings > Plugins 또는 https://chatgpt.com/plugins 의 +를 엽니다.",
                 f"복사된 HTTPS 주소로 앱 이름을 {server_name} 으로 만들고 발견된 도구 목록의 search와 fetch를 확인합니다.",
-                f"새 대화에서 앱을 선택한 뒤 {server_name}의 search로 인사규정을 찾고 fetch로 첫 결과 원문과 출처를 확인해줘 라고 입력합니다.",
+                f"새 대화의 tools 메뉴에서 앱을 선택한 뒤 {server_name}의 search로 인사규정을 찾고 fetch로 첫 결과 원문과 출처를 확인해줘 라고 입력합니다.",
             ],
         ),
     )
@@ -972,9 +1182,9 @@ def _write_mcp_setup_bundle_untransactional(
             SETUP_BUNDLE_FILES["connect"],
             "-Target chatgpt-tunnel",
             next_steps=[
-                "ChatGPT 웹의 Settings > Plugins에서 보안 터널 MCP 앱을 만듭니다.",
-                f"앱 이름은 {server_name} 으로 등록합니다.",
-                f"새 대화에서 앱을 선택한 뒤 {server_name}의 search로 인사규정을 찾고 fetch로 첫 결과 원문과 출처를 확인해줘 라고 입력합니다.",
+                "ChatGPT 웹의 Settings > Security and login에서 Developer mode를 켠 뒤 Settings > Plugins 또는 https://chatgpt.com/plugins 를 엽니다.",
+                f"+로 {server_name} 앱을 만들 때 Connection을 Tunnel로 선택하고 승인된 tunnel_id를 지정합니다.",
+                f"새 대화의 + > More에서 앱을 선택한 뒤 {server_name}의 search로 인사규정을 찾고 fetch로 첫 결과 원문과 출처를 확인해줘 라고 입력합니다.",
             ],
         ),
     )
@@ -985,7 +1195,9 @@ def _write_mcp_setup_bundle_untransactional(
             "-Target claude-api",
             next_steps=[
                 f"생성된 HTTPS 설정에서 MCP 이름 {server_name} 과 URL을 확인합니다.",
-                f"Claude 요청에서 {server_name} MCP를 활성화한 뒤 search로 인사규정을 찾고 fetch로 첫 결과 원문과 출처를 확인합니다.",
+                "이 BAT는 Claude Messages API용 JSON 조각을 표시하며 Claude 앱의 connector 설정을 자동 변경하지 않습니다.",
+                f"Messages API에서는 {server_name} MCP를 활성화한 뒤 search로 인사규정을 찾고 fetch로 첫 결과 원문과 출처를 확인합니다.",
+                "Claude 앱에서 쓸 때는 JSON 조각이 아니라 같은 HTTPS MCP URL만 Customize > Connectors에 등록합니다.",
             ],
         ),
     )
@@ -1094,10 +1306,15 @@ def write_mcp_setup_bundle(
                     "tools_discovered": False,
                     "installed_config_transport_verified": False,
                     "generated_client_configs_transport_verified": False,
+                    "claude_code_transport_verified": False,
+                    "claude_code_transport_runtime_fingerprint": None,
+                    "claude_code_conversation_verified": False,
                     "plugin_stdio_verified": False,
                     "direct_stdio_verified": False,
                     "transport_end_to_end_verified": False,
                     "claude_desktop_config_transport_verified": False,
+                    "claude_desktop_config_transport_runtime_fingerprint": None,
+                    "claude_desktop_loader_observed": False,
                     "claude_desktop_loader_verified": False,
                     "claude_desktop_conversation_verified": False,
                     "fresh_codex_app_server_inventory_verified": False,
@@ -1244,10 +1461,28 @@ def _bundle_status_payload(
         "installed_config_transport_verified": False,
         "installed_config_transport_runtime_fingerprint": None,
         "generated_client_configs_transport_verified": False,
+        "claude_code_registered": False,
+        "claude_code_config_fingerprint": None,
+        "claude_code_loader_verified": False,
+        "claude_code_transport_verified": False,
+        "claude_code_transport_runtime_fingerprint": None,
+        "claude_code_registration_updated_at": None,
+        "claude_code_conversation_verified": False,
         "claude_desktop_config_registered": False,
         "claude_desktop_config_path": None,
         "claude_desktop_config_fingerprint": None,
         "claude_desktop_config_transport_verified": False,
+        "claude_desktop_config_transport_runtime_fingerprint": None,
+        "claude_desktop_registration_updated_at": None,
+        "claude_desktop_process_detected": False,
+        "claude_desktop_process_started_at": None,
+        "claude_desktop_restart_checked_at": None,
+        "claude_desktop_restart_required": None,
+        "claude_desktop_restart_status": "not_checked",
+        "claude_desktop_restarted_after_registration": False,
+        "claude_desktop_post_registration_log_session_observed": False,
+        "claude_desktop_server_name_observed": False,
+        "claude_desktop_loader_observed": False,
         "claude_desktop_loader_verified": False,
         "claude_desktop_conversation_verified": False,
         "plugin_stdio_verified": False,
@@ -1313,11 +1548,26 @@ def _bundle_status_payload(
             "installed_config_transport_verified": (
                 "The exact installed config entry passed initialize, tools/list, and get_index_status over stdio."
             ),
+            "claude_code_registered": (
+                "Claude Code contains the exact user-scoped server entry for this bundle."
+            ),
+            "claude_code_loader_verified": (
+                "claude mcp get resolved the user-scoped entry with this bundle's exact launcher and data paths."
+            ),
+            "claude_code_transport_verified": (
+                "The current bundle runtime passed the generated initialize, tools/list, search, and fetch smoke."
+            ),
             "claude_desktop_config_registered": (
                 "The Claude Desktop user configuration contains this bundle's exact server entry and paths."
             ),
             "claude_desktop_config_transport_verified": (
                 "The exact installed Claude Desktop configuration passed initialize, tools/list, and get_index_status over stdio."
+            ),
+            "claude_desktop_config_transport_runtime_fingerprint": (
+                "The runtime fingerprint bound to the latest successful installed Claude Desktop config smoke."
+            ),
+            "claude_desktop_loader_observed": (
+                "A restarted Claude Desktop process and post-registration server-name log event were observed; this is not tool inventory proof."
             ),
             "claude_desktop_loader_verified": (
                 "Claude Desktop itself loaded the server after restart; direct stdio smoke alone does not set this."
@@ -1342,7 +1592,7 @@ def _bundle_status_payload(
                 "A restarted Desktop log routed mcpServerStatus/list without an error; this does not prove tool exposure."
             ),
             "direct_stdio_verified": (
-                "The generated launcher passed initialize, tools/list, and get_index_status directly over stdio."
+                "The generated launcher passed initialize, tools/list, search, and fetch directly over stdio."
             ),
             "desktop_tool_scan_verified": (
                 "A ChatGPT Desktop tool scan exposed the expected MCP tools; direct stdio smoke does not set this."
@@ -1361,7 +1611,11 @@ def _bundle_status_payload(
             ),
         },
         "profiles": {
-            "chatgpt-desktop-local": {"transport": "stdio", "surface": "chatgpt_desktop_mcp_settings"},
+            "chatgpt-desktop-local": {
+                "transport": "stdio",
+                "surface": "chatgpt_desktop_mcp_settings",
+                "tool_profile": "chatgpt-data",
+            },
             "chatgpt-remote": {"transport": "streamable-http", "surface": "remote_mcp_app"},
             "claude-desktop": {"transport": "stdio"},
             "claude-code": {"transport": "stdio"},
@@ -1398,6 +1652,32 @@ def _bundle_status_payload(
     else:
         payload["recommended_smoke_query"] = None
         payload["record_count"] = 0
+    server_name = str(payload.get("server_name") or "").strip()
+    if server_name:
+        setup_fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                setup_manifest or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        client_status = create_client_connection_status(
+            server_name,
+            runtime_fingerprint=runtime_fingerprint,
+            bundle_fingerprint=setup_fingerprint,
+            generated_at=payload["generated_at"],
+        )
+        for key in (
+            "schema_version",
+            "status_model",
+            "active_target",
+            "legacy_projection_target",
+            "legacy_projection_updated_at",
+            "legacy_migration_state",
+            "client_connections",
+        ):
+            payload[key] = client_status[key]
     return payload
 
 
@@ -1484,13 +1764,35 @@ def _write_bundle_status(
         prior_fingerprint = str(existing.get("runtime_fingerprint") or "")
         next_fingerprint = str(refreshed.get("runtime_fingerprint") or "")
         if existing and prior_fingerprint != next_fingerprint:
+            if isinstance(merged.get("client_connections"), dict):
+                if prior_fingerprint:
+                    try:
+                        client_invalidated = invalidate_client_connection_runtime(
+                            merged,
+                            prior_fingerprint,
+                            next_runtime_fingerprint=next_fingerprint or None,
+                        )
+                        merged["client_connections"] = client_invalidated[
+                            "client_connections"
+                        ]
+                    except (TypeError, ValueError):
+                        pass
+                for client_record in merged["client_connections"].values():
+                    if not isinstance(client_record, dict):
+                        continue
+                    readiness = client_record.get("readiness")
+                    if isinstance(readiness, dict):
+                        readiness["runtime_ready"] = bool(next_fingerprint)
             for key in (
                 "process_started",
                 "mcp_initialized",
                 "tools_discovered",
                 "installed_config_transport_verified",
                 "generated_client_configs_transport_verified",
+                "claude_code_transport_verified",
+                "claude_code_conversation_verified",
                 "claude_desktop_config_transport_verified",
+                "claude_desktop_loader_observed",
                 "claude_desktop_loader_verified",
                 "claude_desktop_conversation_verified",
                 "plugin_stdio_verified",
@@ -1504,6 +1806,8 @@ def _write_bundle_status(
             ):
                 merged[key] = False
             merged["installed_config_transport_runtime_fingerprint"] = None
+            merged["claude_code_transport_runtime_fingerprint"] = None
+            merged["claude_desktop_config_transport_runtime_fingerprint"] = None
             merged["plugin_stdio_runtime_fingerprint"] = None
             merged["fresh_codex_app_server_runtime_fingerprint"] = None
             merged["conversation_attachment_unverified"] = True
@@ -1784,9 +2088,10 @@ def _codex_plugin_manual_guide(
     lines = [
         "Codex MCP 수동 호환 입력값",
         "",
-        "권장 방법: 압축을 푼 번들을 Codex 작업공간으로 열고 CODEX_AGENT_CONNECT_PROMPT.md를 실행합니다.",
-        "에이전트가 로컬 파일이나 터미널을 실행할 수 없을 때만 Codex에 연결하기.bat를 사용합니다.",
-        "아래 값은 두 자동 경로를 사용할 수 없을 때만 쓰는 수동 호환 정보입니다.",
+        "권장 방법: Codex에 연결하기.bat를 실행해 사용자 MCP 설정을 직접 등록·검증합니다.",
+        "BAT를 사용할 수 없으면 아래 값을 ~/.codex/config.toml에 직접 반영합니다.",
+        "연결 설정, 로컬 경로, 토큰, API 키 또는 tunnel ID를 대화 프롬프트에 붙여넣지 않습니다.",
+        "CODEX_AGENT_CONNECT_PROMPT.md는 로컬 파일·터미널 권한이 있는 에이전트용 선택적 자동화 자료이며 필수 입력이 아닙니다.",
         "<BUNDLE_DIR>은 이 TXT가 들어 있는 압축 해제 폴더의 현재 절대경로로 바꿉니다.",
         "",
         f"MCP 이름: {server_name}",
@@ -1808,7 +2113,7 @@ def _codex_plugin_manual_guide(
             "",
             "저장 후 Codex 앱을 완전히 종료하고 다시 실행합니다.",
             f"새 task에서 /mcp를 입력해 {server_name} 이름이 보이는지 확인합니다.",
-            f"확인 요청: {server_name} MCP를 사용해서 등록된 규정 목록을 보여줘.",
+            f"확인 요청: {server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘.",
         ]
     )
     return "\n".join(lines)
@@ -1845,6 +2150,11 @@ def _chatgpt_desktop_local_config(
         "client": "ChatGPT Desktop",
         "surface": "chatgpt_desktop_mcp_settings",
         "mode": "local_stdio",
+        "tool_profile": "chatgpt-data",
+        "verification_tools": ["search", "fetch"],
+        "connection_configuration_method": "direct_config",
+        "connection_prompt_required": False,
+        "secret_input_policy": "environment_or_oauth_only",
         "chatgpt_direct_local_mcp_supported": True,
         "primary_registration": "chatgpt_desktop_settings_mcp_servers",
         "supported_runtime_note": (
@@ -1916,10 +2226,11 @@ def _chatgpt_desktop_local_config(
         "operator_steps": [
             "Open ChatGPT Desktop Settings > MCP servers > Add server.",
             "Copy the generated name, STDIO command, working directory, and arguments from CHATGPT_DESKTOP_CONNECT_GUIDE.md.",
+            "Never paste this connection configuration, local paths, tokens, API keys, or tunnel IDs into a chat prompt.",
             "Save the server and select Restart in ChatGPT Desktop.",
-            "If built-in registration is unavailable or manual entry is impractical, double-click the generated ChatGPT Desktop connection BAT as fallback.",
+            "If manual entry is impractical or you need the advanced shared config path, double-click the generated ChatGPT Desktop connection BAT as fallback. The BAT writes config.toml but cannot enable a Desktop feature that the installed build or workspace does not expose.",
             f"Run /mcp first and verify that {server_name} is connected.",
-            f"Verification prompt: {server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.",
+            f"Verification prompt: {server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘.",
         ],
         "status_semantics": {
             "plugin_install_command_succeeded": "The plugin install command returned success; this is not discoverability proof.",
@@ -1936,7 +2247,7 @@ def _chatgpt_desktop_local_config(
             "fresh_codex_app_server_inventory_verified": "A separate Codex app-server process returned the required tools with recorded provenance.",
             "installed_config_transport_verified": "The exact installed config entry passed the direct MCP protocol contract.",
             "desktop_status_scan_request_observed": "A restarted Desktop routed mcpServerStatus/list without error; this does not prove tool exposure.",
-            "direct_stdio_verified": "Direct initialize, tools/list, and get_index_status succeeded over stdio.",
+            "direct_stdio_verified": "Direct initialize, tools/list, search, and fetch succeeded over stdio.",
             "desktop_tool_scan_verified": "ChatGPT Desktop exposed the expected tools after its own tool scan.",
             "conversation_attachment_verified": "The registered MCP tools were observed in the current conversation.",
             "conversation_attachment_unverified": "A restarted Desktop and new conversation must still confirm the registered MCP with /mcp and an actual tool call.",
@@ -2008,21 +2319,21 @@ def _write_chatgpt_desktop_local_plugin(
     plugin_manifest = {
         "name": plugin_name,
         "version": f"0.1.0+codex.{cachebuster}",
-        "description": "Korean public-institution regulation search and index-status tools over local MCP.",
+        "description": "Privacy-reduced Korean public-institution regulation search and fetch tools over local MCP.",
         "author": {"name": "Public Regulation MCP Builder contributors"},
         "mcpServers": "./.mcp.json",
         "interface": {
             "displayName": server_name,
             "shortDescription": "Search approved local regulation data.",
             "longDescription": (
-                "Runs the approved regulation MCP locally through stdio and exposes read-only regulation tools."
+                "Runs the approved regulation MCP locally through stdio and exposes only read-only search and fetch."
             ),
             "developerName": "Public Regulation MCP Builder contributors",
             "category": "Productivity",
             "capabilities": ["Read"],
             "defaultPrompt": [
-                f"{server_name} MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.",
-                f"{server_name} MCP의 등록된 규정 목록을 보여줘.",
+                f"{server_name} MCP의 search 도구로 인사규정을 찾아줘.",
+                f"search 결과의 첫 번째 id를 {server_name} MCP의 fetch 도구로 조회해 원문과 출처를 보여줘.",
             ],
         },
     }
@@ -2471,11 +2782,16 @@ def write_mcp_runtime_data_bundle(
                     "installed_config_transport_verified": False,
                     "installed_config_transport_runtime_fingerprint": None,
                     "generated_client_configs_transport_verified": False,
+                    "claude_code_transport_verified": False,
+                    "claude_code_transport_runtime_fingerprint": None,
+                    "claude_code_conversation_verified": False,
                     "plugin_stdio_verified": False,
                     "plugin_stdio_runtime_fingerprint": None,
                     "direct_stdio_verified": False,
                     "transport_end_to_end_verified": False,
                     "claude_desktop_config_transport_verified": False,
+                    "claude_desktop_config_transport_runtime_fingerprint": None,
+                    "claude_desktop_loader_observed": False,
                     "claude_desktop_loader_verified": False,
                     "claude_desktop_conversation_verified": False,
                     "fresh_codex_app_server_inventory_verified": False,
@@ -3571,6 +3887,7 @@ def _setup_bundle_connections(config: dict[str, Any]) -> list[dict[str, Any]]:
         {
             "client": "ChatGPT Desktop",
             "profile": "chatgpt-desktop-local",
+            "tool_profile": "chatgpt-data",
             "mode": "local_stdio",
             "ready": True,
             "registration_required": True,
@@ -3586,12 +3903,17 @@ def _setup_bundle_connections(config: dict[str, Any]) -> list[dict[str, Any]]:
         {
             "client": "Codex CLI",
             "profile": "codex-compatibility",
+            "tool_profile": "chatgpt-data",
             "mode": "local_stdio",
             "ready": True,
-            "primary_file": SETUP_BUNDLE_FILES["codex_agent_prompt"],
-            "fallback_file": SETUP_BUNDLE_FILES["connect_codex_bat"],
+            "primary_file": SETUP_BUNDLE_FILES["connect_codex_bat"],
+            "fallback_file": SETUP_BUNDLE_FILES["codex_config"],
+            "optional_agent_prompt": SETUP_BUNDLE_FILES["codex_agent_prompt"],
             "config_file": SETUP_BUNDLE_FILES["codex_config"],
-            "operator_action": "Paste the agent request into Codex; use the compatibility BAT only as fallback.",
+            "operator_action": (
+                "Run the Codex BAT or apply the generated config directly. "
+                "Do not paste connection configuration or secrets into a chat prompt."
+            ),
         },
         {
             "client": "ChatGPT 원격 MCP",
@@ -3621,7 +3943,7 @@ def _setup_bundle_connections(config: dict[str, Any]) -> list[dict[str, Any]]:
             "primary_file": SETUP_BUNDLE_FILES["connect_claude_https_bat"],
             "config_file": SETUP_BUNDLE_FILES["claude_api"],
             "server_file": SETUP_BUNDLE_FILES["run_http"],
-            "operator_action": "Double-click the Claude HTTPS connection button, then use the generated API fragment.",
+            "operator_action": "Double-click the Claude HTTPS button; register only the URL in Claude app Connectors, or use the generated fragment in a Messages API request.",
         },
     ]
     connection_order = {
@@ -3817,6 +4139,7 @@ function Write-RuntimePythonMarker {
   $PreviousPythonPath = $env:PYTHONPATH
   $HadSafePath = Test-Path Env:PYTHONSAFEPATH
   $PreviousSafePath = $env:PYTHONSAFEPATH
+  $PreviousErrorActionPreference = $ErrorActionPreference
   try {
     Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
     $env:PYTHONSAFEPATH = "1"
@@ -3938,6 +4261,7 @@ def _chatgpt_desktop_setup_guide(
     *,
     config: dict[str, Any],
     bundle_dir: str | Path,
+    allow_bat_fallback: bool = True,
 ) -> str:
     ui_fields = config.get("ui_fields") if isinstance(config, dict) else None
     if not isinstance(ui_fields, dict):
@@ -3954,18 +4278,40 @@ def _chatgpt_desktop_setup_guide(
     env = ui_fields.get("env") if isinstance(ui_fields.get("env"), dict) else {}
     argument_lines = "\n".join(f"{index}. {arg}" for index, arg in enumerate(args, start=1)) or "없음"
     environment_note = "비워 둠" if not env else "비밀값을 복사하지 말고 승인된 로컬 환경변수만 설정"
+    fallback_note = (
+        f"`@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않는다. "
+        "수동 입력이 어렵거나 고급 설정 파일 경로를 사용할 때만 이 번들 폴더의 "
+        "`ChatGPT Desktop에 연결하기.bat`를 Windows 탐색기에서 실행한다. 이 BAT는 ChatGPT Desktop이 "
+        "사용하는 사용자 `~/.codex/config.toml`에 같은 STDIO 항목을 백업·기록하고 검증하는 "
+        "보조 수단이지, Desktop에 없는 MCP 기능이나 메뉴를 새로 활성화하는 설치 프로그램은 아니다. "
+        "메뉴가 보이지 않으면 먼저 ChatGPT Desktop을 최신 버전으로 갱신하고 현재 계정·워크스페이스에서 "
+        "MCP가 제공되는지 확인한다. BAT 실행 후에도 ChatGPT Desktop을 완전히 재시작하고 새 대화에서 `/mcp`와 "
+        "실제 `search`와 `fetch` 호출을 확인해야 하며, 둘 다 노출되지 않으면 연결 완료로 판단하지 말고 "
+        "원격 HTTPS MCP 또는 Secure MCP Tunnel을 사용한다."
+        if allow_bat_fallback
+        else f"`@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않는다. 이 안내는 구형 연결 프롬프트에서 안전하게 변환됐으므로 구형 BAT를 실행하지 말고 위 Settings 입력값만 사용한다."
+    )
+    portable_source_note = (
+        "아래 경로에 `PROGRAM_BUNDLE_DIR` 자리표시자가 그대로 보이면 ZIP 이식용 원본 파일이다. "
+        "그 값을 ChatGPT Desktop에 복사하지 말고 프로그램 생성 결과 화면에서 실제 절대경로가 "
+        "채워진 코드 상자를 사용하거나, 마지막의 보조 BAT를 실행한다."
+        if allow_bat_fallback
+        else "아래 입력값은 구형 프롬프트에서 안전하게 복구해 현재 번들 절대경로로 다시 계산했다. "
+        "구형 BAT는 실행하지 말고 이 Settings 입력값만 사용한다."
+    )
     return f"""# ChatGPT Desktop MCP 연결 안내
 
 이 안내는 **ChatGPT Desktop 전용**이다. 다른 제품의 에이전트 실행 요청이 아니며, 일반 대화창에 설치 프롬프트로 붙여넣지 않는다.
+연결 설정·로컬 경로·토큰·API 키·tunnel ID는 대화 프롬프트에 넣지 않고 Settings 또는 승인된 환경변수에만 입력한다.
 
-아래 경로에 `PROGRAM_BUNDLE_DIR` 자리표시자가 그대로 보이면 ZIP 이식용 원본 파일이다. 그 값을 ChatGPT Desktop에 복사하지 말고 프로그램 생성 결과 화면에서 실제 절대경로가 채워진 코드 상자를 사용하거나, 마지막의 보조 BAT를 실행한다.
+{portable_source_note}
 
 {_agent_connect_bundle_context(prompt_file="CHATGPT_DESKTOP_CONNECT_GUIDE.md", fallback_file="ChatGPT Desktop에 연결하기.bat")}
 
 ## ChatGPT Desktop에서 등록
 
-1. ChatGPT Desktop의 `Settings`를 연다.
-2. `MCP servers` → `Add server`를 선택한다.
+1. ChatGPT Desktop의 `Settings > MCP servers > Add server`를 연다.
+2. 새 STDIO 서버 입력 화면이 표시되는지 확인한다.
 3. 아래 값을 그대로 입력한다.
 
 ```text
@@ -3984,16 +4330,18 @@ Arguments — 아래 항목을 표시된 순서대로 하나씩 추가한다.
 
 4. `Save`를 선택한 뒤 ChatGPT Desktop의 `Restart`를 실행한다.
 5. 재시작 후 새 대화에서 `/mcp`를 입력해 `{server_name}`이 보이는지 확인한다.
-6. `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출을 확인한다.
+6. `{server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘.`라고 입력해 실제 도구 호출을 확인한다.
 
-`@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않는다. `Settings > MCP servers` 메뉴가 없거나 수동 입력이 어려울 때만 이 번들 폴더의 `ChatGPT Desktop에 연결하기.bat`를 Windows 탐색기에서 실행한다. BAT 실행 후에도 ChatGPT Desktop을 완전히 재시작하고 새 대화에서 `/mcp`와 실제 `get_index_status` 호출을 확인해야 한다.
+{fallback_note}
 """
 
 
 def _codex_agent_connect_prompt(server_name: str) -> str:
-    return f"""# Codex 에이전트 MCP 연결 요청
+    return f"""# Codex MCP 선택적 로컬 자동화 요청
 
-압축을 푼 연결 번들 폴더를 로컬 작업공간으로 연 뒤 아래 작업을 수행해줘.
+기본 연결 방법은 `Codex에 연결하기.bat` 실행 또는 `codex_config_snippet.toml`의 직접 설정이다. 이 요청문은 로컬 파일·터미널 권한이 있는 Codex 에이전트에서만 쓰는 선택적 자동화 자료이며 연결에 필수적이지 않다. 원격·일반 채팅에 붙여넣지 말고 토큰, API 키, tunnel ID 또는 별도 비밀값을 추가하지 않는다.
+
+압축을 푼 연결 번들 폴더를 로컬 작업공간으로 연 경우에만 아래 작업을 수행해줘.
 
 {_agent_connect_bundle_context(prompt_file="CODEX_AGENT_CONNECT_PROMPT.md", fallback_file="Codex에 연결하기.bat")}
 
@@ -4002,8 +4350,8 @@ def _codex_agent_connect_prompt(server_name: str) -> str:
 3. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target codex -InstallCodex`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, active Python Scripts 경로 보정, doctor, 현재 사용자의 Codex MCP 설정 백업·갱신, stdio 및 app-server 검증까지 모두 끝내야 해.
 4. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·등록·로더 검증 중 하나라도 실패하면 성공으로 보고하지 마.
 5. 설치 후 `codex mcp get {server_name} --json`을 실행하고 `powershell.exe`, `-File`, `--data-dir`가 이 번들의 현재 절대 경로를 가리키는지 확인해. 이름이 같아도 다른 경로를 가리키면 성공으로 보고하지 마.
-6. `bundle_status.json`의 `direct_config_registered`, `direct_config_loader_verified`, `direct_stdio_verified`, `desktop_app_server_loader_verified`가 모두 true인지 확인해. 하나라도 false면 성공으로 보고하지 마.
-7. 설치와 로더 검증이 모두 끝난 뒤 Codex를 완전히 종료하고 다시 실행해야 한다고 알려줘. 재시작한 새 task에서 `/mcp`로 `{server_name}`을 확인한 뒤 정확히 `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출까지 확인하도록 안내해.
+6. `bundle_status.json`의 `client_connections.codex`에서 `last_attempt.state=completed`, `effective.state=configured`, registration·loader·transport·fresh_app_server stage가 모두 같은 현재 attempt에서 verified인지 확인해. 호환용 최상위 direct 필드나 다른 클라이언트의 성공 상태를 Codex 성공으로 대신 사용하지 마.
+7. 설치와 로더 검증이 모두 끝난 뒤 Codex를 완전히 종료하고 다시 실행해야 한다고 알려줘. 재시작한 새 task에서 `/mcp`로 `{server_name}`을 확인한 뒤 정확히 `{server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘.`라고 입력해 실제 도구 호출까지 확인하도록 안내해.
 
 현재 화면에서 로컬 파일 또는 터미널 실행 권한이 없다면 성공했다고 말하지 말고, `manifest.json`의 `files.connect_codex_bat`가 가리키는 BAT를 사용자가 실행하도록 안내해.
 """
@@ -4018,10 +4366,12 @@ def _claude_code_agent_connect_prompt(server_name: str) -> str:
 
 1. 위 경로가 실제 절대경로로 채워져 있으면 `$BundleDir = {AGENT_CONNECT_BUNDLE_DIR_PS_LITERAL_MARKER}`를 실행하고, 필수 파일이 그 폴더 바로 아래에 있는지 확인한 뒤 `Set-Location -LiteralPath $BundleDir`을 실행해. 경로가 없거나 접근할 수 없으면 임의 경로로 설치하지 말고 그 정확한 폴더를 작업공간으로 열거나 추가해 달라고 요청해. 위 값이 여전히 `PROGRAM_BUNDLE_DIR` 자리표시자인 원본 파일을 직접 붙여넣은 경우에만 현재 작업공간에서 `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 사용해. 검색 결과가 0개 또는 여러 개면 중단해.
 2. `manifest.json`, `bundle_status.json`, `connect_mcp_client.ps1`을 읽고 서버 이름이 `{server_name}`인지 확인해.
-3. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target claude-code`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, active Python Scripts 경로 보정, doctor, Claude Code user scope 로컬 stdio 등록까지 끝내야 해.
-4. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·등록 검증 중 하나라도 실패하면 성공으로 보고하지 마.
-5. 설치 후 `claude mcp get {server_name}`을 실행하고 Scope가 User이며 `powershell.exe`, `-File`, `--data-dir`가 이 번들의 현재 절대 경로를 가리키는지 확인해. 다른 프로젝트에서도 보이는 user scope 등록을 요구해.
-6. 설치와 로더 검증이 모두 끝난 뒤 Claude Code를 완전히 종료하고 다시 실행해야 한다고 알려줘. 재시작한 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 정확히 `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출까지 확인하도록 안내해.
+3. `~/.claude/settings.json`의 `enabledMcpjsonServers`에 이름만 추가하거나 사용자 홈의 `~/.mcp.json`을 user scope 저장소처럼 직접 편집하지 마. 프로젝트 루트 `.mcp.json`은 project scope이고, 공식 user scope 저장소는 `~/.claude.json`이다. 이 요청은 저장 파일을 추측해 편집하지 않고 공식 CLI의 user scope를 사용해야 해.
+4. 비밀값을 출력하거나 설정 파일에 저장하지 말고 `powershell -NoProfile -ExecutionPolicy Bypass -File .\\connect_mcp_client.ps1 -InstallPackage -Target claude-code`를 한 번 실행해. 이 단일 프로세스 안에서 번들 wheel 설치, active Python Scripts 경로 보정, doctor, `claude mcp add --transport stdio --scope user`, 등록 readback, 실제 stdio protocol smoke를 끝내야 해.
+5. 위 명령이 0이 아닌 종료 코드로 끝나거나 doctor·user scope 등록·`Status: Connected`·실제 stdio 검증 중 하나라도 실패하면 성공으로 보고하지 마.
+6. 설치 후 `claude mcp get {server_name}`을 실행하고 Scope가 User이고 Status가 Connected이며 `powershell.exe`, `-File`, `--data-dir`가 이 번들의 현재 절대 경로를 가리키는지 확인해. 이름이 같아도 다른 scope나 경로이면 성공으로 보고하지 마.
+7. `bundle_status.json`의 `client_connections.claude-code`에서 `last_attempt.state=completed`, `effective.state=configured`, registration·loader·transport stage가 모두 현재 attempt에서 verified인지 확인해. 다른 클라이언트의 성공 필드를 Claude Code 성공으로 대신 사용하지 마.
+8. 설치와 로더 검증이 모두 끝난 뒤 Claude Code를 완전히 종료하고 다시 실행해야 한다고 알려줘. 재시작한 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 정확히 `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출까지 확인하도록 안내해. 이 실제 새 대화 호출 전에는 연결 완료가 아니라 설정 완료로만 보고해.
 
 현재 화면에서 로컬 파일 또는 터미널 실행 권한이 없다면 성공했다고 말하지 말고, `manifest.json`의 `files.connect_claude_code_bat`가 가리키는 BAT를 사용자가 실행하도록 안내해.
 """
@@ -4034,41 +4384,44 @@ def _mcp_first_use_guide(server_name: str) -> str:
 
 핵심 사용 순서
 1. 아래 대상별 목록에서 사용할 프로그램 하나를 선택합니다.
-2. Claude Code와 Codex CLI는 압축을 푼 번들 폴더를 로컬 작업공간으로 열고 대상별 AGENT_CONNECT_PROMPT.md를 실행합니다.
-3. Claude Desktop은 전용 BAT를 실행하고, ChatGPT Desktop은 GUIDE 값을 Settings > MCP servers > Add server에 등록합니다.
+2. Codex CLI는 `Codex에 연결하기.bat` 또는 직접 설정을 사용하고, Claude Code만 로컬 에이전트 요청문을 사용할 수 있습니다.
+3. Claude Desktop은 전용 BAT를 실행하고, ChatGPT Desktop은 GUIDE 값을 Settings > MCP servers > Add server에 직접 등록합니다.
 4. 원격 대상은 승인된 HTTPS 주소 또는 Secure MCP Tunnel을 먼저 준비합니다.
-5. 등록 후 해당 앱을 완전히 종료·재실행하고, 지원하는 로컬 클라이언트에서는 /mcp로 이름을 확인합니다. `@` 멘션은 연결 확인 수단이 아닙니다.
-6. `{server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.`라고 입력해 실제 도구 호출까지 확인합니다. 원격 chatgpt-data 프로필은 search/fetch로 확인합니다.
+5. 로컬 클라이언트는 등록 후 완전히 종료·재실행하고, 지원하는 대상에서는 /mcp로 이름을 확인합니다. 원격 ChatGPT/Claude 연결은 새 대화에서 앱 또는 Connector를 첨부합니다. `@` 멘션은 연결 확인 수단이 아닙니다.
+6. ChatGPT Desktop·Codex·원격 ChatGPT는 `search`와 `fetch`로 확인합니다. Claude 로컬 운영자 프로필은 `get_index_status`도 사용할 수 있습니다.
+7. 연결 설정·로컬 경로·토큰·API 키·tunnel ID를 일반 대화 프롬프트에 붙여넣지 않습니다. 비밀값은 승인된 환경변수 또는 OAuth에만 둡니다.
 
-대상별 연결 안내와 에이전트 요청문
+대상별 연결 안내
 - Claude Code: CLAUDE_CODE_AGENT_CONNECT_PROMPT.md
-- Codex CLI: CODEX_AGENT_CONNECT_PROMPT.md
+- Codex CLI: Codex에 연결하기.bat 또는 codex_config_snippet.toml 직접 설정
 - Claude Desktop: Claude Desktop에 연결하기.bat
 - ChatGPT Desktop: CHATGPT_DESKTOP_CONNECT_GUIDE.md
 - ChatGPT 원격 MCP: ChatGPT HTTPS에 연결하기.bat
 - ChatGPT 웹: ChatGPT 보안 Tunnel에 연결하기.bat
 - Claude (HTTPS MCP): Claude HTTPS에 연결하기.bat
 
-로컬 full 프로필의 설치 후 도구 확인
+Claude Desktop·Claude Code 로컬 full 프로필의 설치 후 도구 확인
 {server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.
 
 도구를 명시해서 확인하려면 아래 문장을 입력합니다.
 
 {server_name} MCP의 list_regulations 도구를 사용해서 등록된 규정 목록을 보여줘.
 
-원격 ChatGPT/보안 Tunnel/Claude API의 chatgpt-data 프로필 확인
+ChatGPT Desktop·Codex·원격 ChatGPT/보안 Tunnel의 chatgpt-data 프로필 확인
 {server_name} MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 fetch 도구로 조회해 조문 원문과 출처를 보여줘.
 
 ChatGPT Desktop 로컬 direct MCP
 - 기본: CHATGPT_DESKTOP_CONNECT_GUIDE.md의 Name, STDIO, Command, Working directory, Arguments를 Settings > MCP servers > Add server에 입력
-- 보조 설치: 내장 등록이 어렵거나 메뉴가 없을 때만 ChatGPT Desktop에 연결하기.bat
-- 확인: Save 후 Restart하고 새 대화에서 /mcp 및 실제 get_index_status 호출
+- 보조 설치: 수동 입력이 어렵거나 고급 공유 설정 파일 경로가 필요할 때만 ChatGPT Desktop에 연결하기.bat. BAT는 Desktop 제품 기능을 활성화하지 않음
+- 확인: Save 후 Restart하고 새 대화에서 /mcp 및 실제 search/fetch 호출
 - 주의: @{server_name} 반복 입력은 연결 확인이나 설치를 대신하지 않음
 
 Codex CLI 호환
-- 권장: CODEX_AGENT_CONNECT_PROMPT.md를 Codex 에이전트에 붙여넣어 doctor, 설정 설치, `codex mcp get` 검증을 맡김
-- 설치: Codex에 연결하기.bat
-- 확인: 새 task에서 /mcp
+- 권장 설치: Codex에 연결하기.bat
+- 직접 설정: codex_config_snippet.toml을 ~/.codex/config.toml에 반영
+- 선택적 자동화: 로컬 파일·터미널 권한이 있는 경우에만 CODEX_AGENT_CONNECT_PROMPT.md 사용
+- 보안: 연결 설정과 비밀값을 프롬프트에 넣지 않음
+- 확인: 새 task에서 /mcp와 실제 search/fetch 호출
 - 터미널 확인: codex mcp list
 
 Claude Desktop
@@ -4082,19 +4435,29 @@ Claude Code
 - 확인: 대화에서 /mcp
 - 터미널 확인: claude mcp list
 
-ChatGPT 웹
+ChatGPT 원격 HTTPS custom app
 - ChatGPT 대화는 localhost MCP에 직접 연결하지 않습니다.
-- ChatGPT HTTPS 또는 보안 Tunnel BAT로 원격 MCP를 준비합니다.
-- ChatGPT 웹의 Settings > Security and login에서 Developer mode를 켠 뒤 Settings > Plugins 또는 https://chatgpt.com/plugins 에서 앱 이름을 {server_name}으로 등록합니다.
-- 새 대화에서 + > More를 열고 {server_name} 앱을 선택한 뒤 실제 search/fetch 요청으로 확인합니다.
+- ChatGPT HTTPS BAT로 승인된 공개 HTTPS MCP를 준비합니다.
+- ChatGPT 웹의 Settings > Security and login에서 Developer mode를 켠 뒤 Settings > Plugins 또는 https://chatgpt.com/plugins 의 +에서 앱 이름을 {server_name}으로 등록합니다.
+- 새 대화의 tools 메뉴에서 {server_name} 앱을 선택한 뒤 실제 search/fetch 요청으로 확인합니다.
+
+ChatGPT 웹 Secure MCP Tunnel
+- ChatGPT 보안 Tunnel BAT로 승인된 tunnel_id와 로컬 MCP 실행을 준비합니다.
+- Secure MCP Tunnel 전용 가이드에 따라 Settings > Security and login에서 Developer mode를 켜고 Settings > Plugins 또는 https://chatgpt.com/plugins 에서 +를 누릅니다.
+- 앱의 Connection을 Tunnel로 선택해 tunnel_id를 지정하고, 새 대화의 + > More에서 {server_name} 앱을 선택한 뒤 실제 search/fetch 요청으로 확인합니다.
+- 이 Plugins 화면의 개발자 모드 tunnel 앱 생성과 Work mode marketplace 플러그인 설치는 목적이 다릅니다. ChatGPT 웹이 로컬 config.toml이나 로컬 stdio 플러그인을 읽는다고 안내하지 않습니다.
+
+Claude (HTTPS MCP)
+- Claude 앱의 custom connector는 HTTPS MCP URL을 Customize > Connectors에 등록하고 대화의 + > Connectors에서 활성화합니다. Team/Enterprise 조직 등록은 Owner가 Organization settings > Connectors에서 수행합니다.
+- Claude Messages API는 claude_api_fragment.json의 mcp_servers, tools, betas를 API 요청에 사용합니다. 이 JSON 조각을 Claude 앱의 Connectors 화면에 붙여 넣지 않습니다.
 
 실제 규정 조회 예시
 {server_name} MCP에서 인사규정을 찾고 관련 조문 원문과 출처를 보여줘. search 결과는 fetch로 확인해.
 
 같은 MCP 업데이트
-- 같은 이름으로 다시 생성하면 ChatGPT Desktop은 새 안내 값을 기존 Settings > MCP servers 항목에 반영하고, Codex CLI와 Claude Code는 대상별 에이전트 프롬프트를 다시 실행해 기존 설정을 교체합니다. 로컬 에이전트를 쓸 수 없을 때만 같은 클라이언트 BAT를 실행합니다.
+- 같은 이름으로 다시 생성하면 ChatGPT Desktop은 새 안내 값을 기존 Settings > MCP servers 항목에 반영하고, Codex CLI는 BAT 또는 직접 설정으로 교체합니다. Claude Code는 대상별 에이전트 요청문 또는 BAT로 교체합니다.
 - 새 번들은 현재 승인된 전체 청크를 다시 포함하므로 추가·개정 청크가 같은 MCP에 반영됩니다.
-- 저장 폴더를 옮겼다면 ChatGPT Desktop은 새 폴더 기준 안내 값으로 Settings 항목을 갱신하고, 나머지 대상은 새 폴더를 작업공간으로 열어 대상 프롬프트 또는 BAT로 경로를 갱신합니다.
+- 저장 폴더를 옮겼다면 ChatGPT Desktop은 새 폴더 기준 안내 값으로 Settings 항목을 갱신하고, Codex는 새 위치에서 BAT를 다시 실행하거나 직접 설정 경로를 갱신합니다.
 - ChatGPT 앱의 도구 정의 snapshot이 오래되면 Plugins 설정에서 Refresh를 실행하거나 앱을 다시 생성합니다.
 
 문제가 있으면 연결 상태 확인하기.bat를 실행한 뒤 연결 BAT를 다시 실행합니다.
@@ -4272,6 +4635,9 @@ $PreferredPython = ""
 $PreferredProjectRoot = ""
 $InstallationAttemptId = [Guid]::NewGuid().ToString("N")
 $script:CodexLoaderVerified = $false
+$script:CodexCliResolutionAttempted = $false
+$script:ResolvedCodexCliExecutable = $null
+$script:ConnectionTarget = $Target
 $McpCommandScripts = @{
   "reg-rag-mcp-server" = "scripts\run_regulation_mcp.py"
   "reg-rag-mcp-doctor" = "scripts\check_mcp_connection_readiness.py"
@@ -4468,6 +4834,7 @@ function Update-BundleStatus([hashtable]$Values) {
 }
 
 function Start-LocalInstallationAttempt([string]$InstallationState) {
+  Initialize-ClientConnectionAttempt
   Update-BundleStatus @{
     installation_attempt_id = $InstallationAttemptId
     installation_state = $InstallationState
@@ -4499,10 +4866,28 @@ function Start-LocalInstallationAttempt([string]$InstallationState) {
     installed_config_transport_verified = $false
     installed_config_transport_runtime_fingerprint = $null
     generated_client_configs_transport_verified = $false
+    claude_code_registered = $false
+    claude_code_config_fingerprint = $null
+    claude_code_loader_verified = $false
+    claude_code_transport_verified = $false
+    claude_code_transport_runtime_fingerprint = $null
+    claude_code_registration_updated_at = $null
+    claude_code_conversation_verified = $false
     claude_desktop_config_registered = $false
     claude_desktop_config_path = $null
     claude_desktop_config_fingerprint = $null
     claude_desktop_config_transport_verified = $false
+    claude_desktop_config_transport_runtime_fingerprint = $null
+    claude_desktop_registration_updated_at = $null
+    claude_desktop_process_detected = $false
+    claude_desktop_process_started_at = $null
+    claude_desktop_restart_checked_at = $null
+    claude_desktop_restart_required = $null
+    claude_desktop_restart_status = "not_checked"
+    claude_desktop_restarted_after_registration = $false
+    claude_desktop_post_registration_log_session_observed = $false
+    claude_desktop_server_name_observed = $false
+    claude_desktop_loader_observed = $false
     claude_desktop_loader_verified = $false
     claude_desktop_conversation_verified = $false
     plugin_stdio_verified = $false
@@ -4538,12 +4923,172 @@ function Start-LocalInstallationAttempt([string]$InstallationState) {
   }
 }
 
+function Get-ClientConnectionStatusTarget {
+  # Use the immutable script-parameter snapshot. PowerShell uses dynamic
+  # scoping, so a child installer variable named $Target must never redirect
+  # another client's v5 status transition.
+  switch ($script:ConnectionTarget) {
+    "claude-code" { return "claude-code" }
+    "claude-desktop" { return "claude-desktop" }
+    "codex" { return "codex" }
+    "chatgpt-desktop-direct" { return "chatgpt-desktop-local" }
+    "chatgpt-desktop-local" { return "chatgpt-desktop-local" }
+    "chatgpt-desktop" { return "chatgpt-desktop-local" }
+    default { return $null }
+  }
+}
+
+function Invoke-ClientConnectionStatusCli([object[]]$Arguments) {
+  $StatusPython = $null
+  $StatusProjectRoot = $null
+  $RuntimeMarkerPath = BundlePath "runtime_python.json"
+  if (Test-Path -LiteralPath $RuntimeMarkerPath -PathType Leaf) {
+    try {
+      $RuntimeMarker = Get-Content -LiteralPath $RuntimeMarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+      $RuntimeCandidate = [string]$RuntimeMarker.python_executable
+      $RuntimeLeaf = [System.IO.Path]::GetFileNameWithoutExtension($RuntimeCandidate)
+      if ([System.IO.Path]::IsPathRooted($RuntimeCandidate) -and
+          $RuntimeLeaf -match "^python(?:\d+(?:\.\d+)*)?$" -and
+          (Test-Path -LiteralPath $RuntimeCandidate -PathType Leaf)) {
+        $StatusPython = (Resolve-Path -LiteralPath $RuntimeCandidate).Path
+      }
+    } catch {
+      $StatusPython = $null
+    }
+  }
+  if (-not $StatusPython) {
+    $StatusProjectRoot = $PreferredProjectRoot
+    $SourceStatusModule = if ($StatusProjectRoot) { Join-Path $StatusProjectRoot "scripts\mcp_client_status.py" } else { $null }
+    if ($PreferredPython -and $SourceStatusModule -and
+        (Test-Path -LiteralPath $PreferredPython -PathType Leaf) -and
+        (Test-Path -LiteralPath $SourceStatusModule -PathType Leaf)) {
+      $StatusPython = (Resolve-Path -LiteralPath $PreferredPython).Path
+    }
+  }
+  if (-not $StatusPython) {
+    $StatusRequiresClientTracking = $false
+    try {
+      $CurrentStatus = Read-JsonFile "bundle_status.json"
+      $StatusRequiresClientTracking = [bool]$CurrentStatus.PSObject.Properties["client_connections"]
+    } catch {
+      $StatusRequiresClientTracking = $false
+    }
+    if ($StatusRequiresClientTracking) {
+      throw "Client-specific MCP status tracking is required for this bundle, but its recorded Python runtime or scripts.mcp_client_status module is unavailable. Run the generated connection BAT with -InstallPackage, then retry."
+    }
+    Write-Warning "Client-specific status tracking is unavailable only because this is a pre-v5 legacy/source-only bundle; legacy verification will continue."
+    return $false
+  }
+  $HadPythonPath = Test-Path Env:PYTHONPATH
+  $PreviousPythonPath = $env:PYTHONPATH
+  $HadSafePath = Test-Path Env:PYTHONSAFEPATH
+  $PreviousSafePath = $env:PYTHONSAFEPATH
+  $PreviousErrorActionPreference = $ErrorActionPreference
+  $ExitCode = 1
+  try {
+    if ($StatusProjectRoot) { $env:PYTHONPATH = $StatusProjectRoot } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
+    $env:PYTHONSAFEPATH = "1"
+    $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = 1
+    $CliOutput = @(& $StatusPython -m scripts.mcp_client_status @Arguments 2>&1)
+    $ExitCode = [int]$global:LASTEXITCODE
+    $CliOutput | Out-Host
+  } finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+    if ($HadPythonPath) { $env:PYTHONPATH = $PreviousPythonPath } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
+    if ($HadSafePath) { $env:PYTHONSAFEPATH = $PreviousSafePath } else { Remove-Item Env:PYTHONSAFEPATH -ErrorAction SilentlyContinue }
+  }
+  if ($ExitCode -ne 0) {
+    throw "Client-specific MCP status transition failed."
+  }
+  return $true
+}
+
+function Initialize-ClientConnectionAttempt {
+  $ClientTarget = Get-ClientConnectionStatusTarget
+  if (-not $ClientTarget) { return }
+  $ClientStatusPath = BundlePath "bundle_status.json"
+  if (-not (Invoke-ClientConnectionStatusCli @("init", "--status-file", $ClientStatusPath, "--server-name", $ServerName))) {
+    return
+  }
+  $Status = Read-JsonFile "bundle_status.json"
+  $ClientRecordProperty = $Status.client_connections.PSObject.Properties[$ClientTarget]
+  $AlreadyStarted = $false
+  if ($ClientRecordProperty) {
+    $LastAttempt = $ClientRecordProperty.Value.last_attempt
+    $AlreadyStarted = [string]$LastAttempt.id -eq $InstallationAttemptId -and [string]$LastAttempt.state -eq "in_progress"
+  }
+  if (-not $AlreadyStarted) {
+    $null = Invoke-ClientConnectionStatusCli @(
+      "begin", "--status-file", $ClientStatusPath,
+      "--target", $ClientTarget,
+      "--attempt-id", $InstallationAttemptId
+    )
+  }
+}
+
+function Complete-ClientConnectionAttempt(
+  [string[]]$VerifiedStages,
+  [string]$ConfigEntryFingerprint,
+  [string]$RuntimeFingerprint
+) {
+  $ClientTarget = Get-ClientConnectionStatusTarget
+  if (-not $ClientTarget) { return }
+  $ClientStatusPath = BundlePath "bundle_status.json"
+  $Arguments = @(
+    "commit", "--status-file", $ClientStatusPath,
+    "--target", $ClientTarget,
+    "--attempt-id", $InstallationAttemptId,
+    "--config-entry-fingerprint", $ConfigEntryFingerprint,
+    "--bundle-location-fingerprint", $BundleDir,
+    "--preserve-legacy-projection"
+  )
+  if (-not [string]::IsNullOrWhiteSpace($RuntimeFingerprint)) {
+    $Arguments += @("--runtime-fingerprint", $RuntimeFingerprint)
+  }
+  foreach ($Stage in $VerifiedStages) {
+    $Arguments += @("--verified-stage", $Stage)
+  }
+  $null = Invoke-ClientConnectionStatusCli $Arguments
+}
+
+function Fail-ClientConnectionAttempt(
+  [string]$ReasonCode,
+  [switch]$RolledBack
+) {
+  $ClientTarget = Get-ClientConnectionStatusTarget
+  if (-not $ClientTarget) { return $false }
+  $ClientStatusPath = BundlePath "bundle_status.json"
+  try {
+    $Status = Read-JsonFile "bundle_status.json"
+    $ClientRecordProperty = $Status.client_connections.PSObject.Properties[$ClientTarget]
+    if (-not $ClientRecordProperty) { return $false }
+    $LastAttempt = $ClientRecordProperty.Value.last_attempt
+    if ([string]$LastAttempt.id -ne $InstallationAttemptId -or [string]$LastAttempt.state -ne "in_progress") {
+      return $false
+    }
+    $FailureAction = if ($RolledBack) { "fail-rolled-back" } else { "fail-unverified" }
+    $null = Invoke-ClientConnectionStatusCli @(
+      $FailureAction, "--status-file", $ClientStatusPath,
+      "--target", $ClientTarget,
+      "--attempt-id", $InstallationAttemptId,
+      "--reason-code", $ReasonCode,
+      "--preserve-legacy-projection"
+    )
+    return $true
+  } catch {
+    Write-Warning "Could not finalize the client-specific failure status; the original connection error will be preserved."
+    return $false
+  }
+}
+
 function Mark-CurrentAttemptFailedIfUnresolved([string]$ReasonCode) {
   $Status = Read-JsonFile "bundle_status.json"
   if ([string]$Status.installation_attempt_id -ne $InstallationAttemptId) {
-    throw "Cannot record the failure because bundle_status.json belongs to another installation attempt."
+    Write-Warning "The client-specific attempt did not start, so no top-level failure projection was written; the original connection error will be preserved."
+    return $false
   }
-  $UnresolvedStates = @("preflight_direct", "preflight_plugin", "preflight_claude_desktop", "installing", "installing_plugin", "plugin_installed_pending_loader_verification")
+  $UnresolvedStates = @("preflight_direct", "preflight_plugin", "preflight_claude_code", "preflight_claude_desktop", "installing", "installing_plugin", "plugin_installed_pending_loader_verification")
   if ($UnresolvedStates -contains [string]$Status.installation_state) {
     Update-BundleStatus @{
       installation_attempt_id = $InstallationAttemptId
@@ -4559,10 +5104,28 @@ function Mark-CurrentAttemptFailedIfUnresolved([string]$ReasonCode) {
       direct_stdio_verified = $false
       plugin_stdio_verified = $false
       generated_client_configs_transport_verified = $false
+      claude_code_registered = $false
+      claude_code_config_fingerprint = $null
+      claude_code_loader_verified = $false
+      claude_code_transport_verified = $false
+      claude_code_transport_runtime_fingerprint = $null
+      claude_code_registration_updated_at = $null
+      claude_code_conversation_verified = $false
       claude_desktop_config_registered = $false
       claude_desktop_config_path = $null
       claude_desktop_config_fingerprint = $null
       claude_desktop_config_transport_verified = $false
+      claude_desktop_config_transport_runtime_fingerprint = $null
+      claude_desktop_registration_updated_at = $null
+      claude_desktop_process_detected = $false
+      claude_desktop_process_started_at = $null
+      claude_desktop_restart_checked_at = $null
+      claude_desktop_restart_required = $null
+      claude_desktop_restart_status = "not_checked"
+      claude_desktop_restarted_after_registration = $false
+      claude_desktop_post_registration_log_session_observed = $false
+      claude_desktop_server_name_observed = $false
+      claude_desktop_loader_observed = $false
       claude_desktop_loader_verified = $false
       claude_desktop_conversation_verified = $false
       transport_end_to_end_verified = $false
@@ -4571,6 +5134,8 @@ function Mark-CurrentAttemptFailedIfUnresolved([string]$ReasonCode) {
       end_to_end_verified = $false
     }
   }
+  $null = Fail-ClientConnectionAttempt $ReasonCode
+  return $true
 }
 
 function Get-ChatGptDesktopRestartState {
@@ -4759,7 +5324,7 @@ function Get-McpCommandInvocation([string]$Name) {
   return @()
 }
 
-function Invoke-McpCommand([string]$Name, [object[]]$Arguments) {
+function Invoke-McpCommand([string]$Name, [object[]]$Arguments, [switch]$SuppressOutput) {
   $Invocation = @(Get-McpCommandInvocation $Name)
   if ($Invocation.Count -eq 0) {
     throw "$Name was not found on PATH and no generated project runtime fallback is available."
@@ -4782,7 +5347,11 @@ function Invoke-McpCommand([string]$Name, [object[]]$Arguments) {
     } elseif ($PreferredSourceInvocation) {
       $env:PYTHONPATH = if ($PreviousPythonPath) { "$PreferredProjectRoot;$PreviousPythonPath" } else { $PreferredProjectRoot }
     }
-    & $Executable @PrefixArgs @Arguments | Out-Host
+    if ($SuppressOutput) {
+      $null = @(& $Executable @PrefixArgs @Arguments 2>&1)
+    } else {
+      & $Executable @PrefixArgs @Arguments | Out-Host
+    }
     $CommandExitCode = $LASTEXITCODE
   } finally {
     if ($HadPythonPath) { $env:PYTHONPATH = $PreviousPythonPath } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
@@ -4970,6 +5539,7 @@ function Run-InstalledClaudeDesktopConfigSmoke([string]$ConfigPath) {
   Update-BundleStatus @{
     installation_attempt_id = $InstallationAttemptId
     claude_desktop_config_transport_verified = [bool]$Verified
+    claude_desktop_config_transport_runtime_fingerprint = $(if ($Verified -and -not [string]::IsNullOrWhiteSpace($SmokeRuntimeFingerprint)) { $SmokeRuntimeFingerprint } else { $null })
     direct_stdio_verified = [bool]$Verified
     transport_end_to_end_verified = [bool]$Verified
     claude_desktop_loader_verified = $false
@@ -5061,17 +5631,21 @@ function Run-CodexAppServerMcpCheck {
   $InstalledConfigFingerprint = [string]$StatusBeforeProbe.installed_config_fingerprint
   $ReportPath = BundlePath "codex_app_server_mcp_status.json"
   if (Test-Path -LiteralPath $ReportPath) { Remove-Item -LiteralPath $ReportPath -Force }
+  $CodexExecutable = Resolve-CodexCliExecutable
+  if ([string]::IsNullOrWhiteSpace($CodexExecutable)) {
+    throw "A trusted executable Codex host CLI is unavailable for the fresh app-server probe."
+  }
   $ProbeStartedAtUtc = [DateTimeOffset]::UtcNow
   $CheckArgs = @(
     "--server-name", $ServerName,
-    "--require-tool", "get_index_status",
     "--require-tool", "search",
     "--require-tool", "fetch",
     "--timeout-seconds", "75",
+    "--codex-executable", $CodexExecutable,
     "--out-json", $ReportPath,
     "--fail-on-issue"
   )
-  $ExitCode = Invoke-McpCommand "reg-rag-mcp-codex-app-server-check" $CheckArgs
+  $ExitCode = Invoke-McpCommand "reg-rag-mcp-codex-app-server-check" $CheckArgs -SuppressOutput
   $Report = $null
   if (Test-Path -LiteralPath $ReportPath) {
     try {
@@ -5080,7 +5654,7 @@ function Run-CodexAppServerMcpCheck {
       $Report = $null
     }
   }
-  $RequiredTools = @("get_index_status", "search", "fetch")
+  $RequiredTools = @("search", "fetch")
   $ToolNames = if ($Report -and $Report.tool_names) { @($Report.tool_names | ForEach-Object { [string]$_ }) } else { @() }
   $RequiredToolsFound = @($RequiredTools | Where-Object { $ToolNames -notcontains $_ }).Count -eq 0
   $GeneratedAtUtc = $null
@@ -5098,6 +5672,18 @@ function Run-CodexAppServerMcpCheck {
   }
   $Provenance = if ($Report -and $Report.provenance) { $Report.provenance } else { $null }
   $ConfigScope = if ($Provenance -and $Provenance.config_scope) { $Provenance.config_scope } else { $null }
+  $ExpectedExecutablePath = [System.IO.Path]::GetFullPath($CodexExecutable).ToLowerInvariant()
+  $ExpectedExecutableBytes = [Text.Encoding]::UTF8.GetBytes($ExpectedExecutablePath)
+  $ExecutableSha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $ExpectedExecutableFingerprint = -join ($ExecutableSha256.ComputeHash($ExpectedExecutableBytes) | ForEach-Object { $_.ToString("x2") })
+  } finally {
+    $ExecutableSha256.Dispose()
+  }
+  $ExecutablePathVerified = $Provenance -and
+    -not $Provenance.PSObject.Properties["executable_path"] -and
+    [string]$Provenance.executable_path_sha256 -eq $ExpectedExecutableFingerprint -and
+    [string]$Provenance.executable_file_name -eq [System.IO.Path]::GetFileName($CodexExecutable)
   $ConfigContentVerified = -not $DirectConfigProbe -or (
     $ConfigScope -and
     $ConfigScope.config_content_stable_during_probe -eq $true -and
@@ -5110,7 +5696,7 @@ function Run-CodexAppServerMcpCheck {
     [string]$Report.probe_scope -eq "fresh_codex_app_server_process" -and
     -not [string]::IsNullOrWhiteSpace([string]$Report.probe_id) -and
     $GeneratedAtUtc -and $GeneratedAtUtc -ge $ProbeStartedAtUtc.AddSeconds(-2) -and
-    $Provenance -and -not [string]::IsNullOrWhiteSpace([string]$Provenance.executable_path) -and
+    $ExecutablePathVerified -and
     [int]$Provenance.process_id -gt 0 -and
     $ConfigScope -and $ConfigScope.config_exists -eq $true -and
     [string]$ConfigScope.config_path_sha256 -eq $ExpectedConfigFingerprint -and
@@ -5133,6 +5719,19 @@ function Run-CodexAppServerMcpCheck {
     $NextInstallationState = "plugin_installed_loader_verified_pending_fresh_inventory"
   }
   $NextConnectionState = if ($Verified) { [string]$CurrentStatus.connection_state } else { "pending_fresh_loader_inventory" }
+  if (-not $Verified) {
+    # Registration, loader lookup, and stdio transport were already verified.
+    # Close the v5 attempt first; the legacy pending-fresh projection written
+    # below must remain authoritative after that partial commit.
+    Complete-ClientConnectionAttempt @("registration", "loader", "transport") ([string]$CurrentStatus.installed_config_fingerprint) ([string]$CurrentStatus.runtime_fingerprint)
+  }
+  $SafeAppServerError = if ($Verified) {
+    $null
+  } elseif ($Report -and -not [string]::IsNullOrWhiteSpace([string]$Report.reason_code)) {
+    [string]$Report.reason_code
+  } else {
+    "fresh_app_server_report_missing_or_invalid"
+  }
   Update-BundleStatus @{
     installation_attempt_id = $InstallationAttemptId
     fresh_codex_app_server_inventory_verified = [bool]$Verified
@@ -5141,7 +5740,7 @@ function Run-CodexAppServerMcpCheck {
     desktop_app_server_tool_count = $(if ($Report) { [int]$Report.tool_count } else { 0 })
     desktop_app_server_tool_names = $ToolNames
     desktop_app_server_server_info = $(if ($Report) { $Report.server_info } else { $null })
-    desktop_app_server_error = $(if ($Report) { $Report.error } else { "No Codex app-server MCP status report was produced." })
+    desktop_app_server_error = $SafeAppServerError
     installation_state = $NextInstallationState
     connection_state = $NextConnectionState
   }
@@ -5332,17 +5931,23 @@ function Build-CodexConfigSnippet {
   return ($Lines -join [Environment]::NewLine)
 }
 
-function Invoke-CodexCli([string[]]$Arguments) {
+function Invoke-CodexCommandCapture([string]$Command, [string[]]$Arguments) {
   $PreviousErrorActionPreference = $ErrorActionPreference
   $PreviousConsoleOutputEncoding = [Console]::OutputEncoding
   $PreviousPowerShellOutputEncoding = $OutputEncoding
   $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  $CommandOutput = @()
+  $CommandExitCode = 1
   try {
     $ErrorActionPreference = "Continue"
     [Console]::OutputEncoding = $Utf8NoBom
     $OutputEncoding = $Utf8NoBom
-    $CommandOutput = @(& codex @Arguments 2>&1)
-    $CommandExitCode = $LASTEXITCODE
+    $global:LASTEXITCODE = 1
+    $CommandOutput = @(& $Command @Arguments 2>&1)
+    $CommandExitCode = [int]$global:LASTEXITCODE
+  } catch {
+    $CommandOutput = @($_)
+    $CommandExitCode = 1
   } finally {
     $OutputEncoding = $PreviousPowerShellOutputEncoding
     [Console]::OutputEncoding = $PreviousConsoleOutputEncoding
@@ -5354,10 +5959,171 @@ function Invoke-CodexCli([string[]]$Arguments) {
   }
 }
 
-function Test-CodexCliExecutable {
-  if (-not (Get-Command codex -ErrorAction SilentlyContinue)) { return $false }
-  $Probe = Invoke-CodexCli @("--version")
+function Test-CodexCommandVersion([string]$Command) {
+  if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+  $Probe = Invoke-CodexCommandCapture $Command @("--version")
   return $Probe.ExitCode -eq 0
+}
+
+function Test-IsWindowsAppsCodexCommand([string]$Candidate) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or -not [System.IO.Path]::IsPathRooted($Candidate)) {
+    return $false
+  }
+  try { $CandidateFullPath = [System.IO.Path]::GetFullPath($Candidate) }
+  catch { return $false }
+  $BlockedRoots = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    $BlockedRoots += Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+  }
+  foreach ($ProgramFilesRoot in @($env:ProgramFiles, $env:ProgramW6432)) {
+    if (-not [string]::IsNullOrWhiteSpace($ProgramFilesRoot)) {
+      $BlockedRoots += Join-Path $ProgramFilesRoot "WindowsApps"
+    }
+  }
+  foreach ($BlockedRoot in $BlockedRoots) {
+    try { $BlockedFullPath = [System.IO.Path]::GetFullPath($BlockedRoot).TrimEnd([char[]]"\/") }
+    catch { continue }
+    if ([string]::Equals($CandidateFullPath, $BlockedFullPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CandidateFullPath.StartsWith($BlockedFullPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Get-CodexPathCommandCandidate {
+  $CommandInfos = @(Get-Command codex -All -ErrorAction SilentlyContinue)
+  foreach ($CommandInfo in $CommandInfos) {
+    $Candidate = if (-not [string]::IsNullOrWhiteSpace([string]$CommandInfo.Path)) {
+      [string]$CommandInfo.Path
+    } else {
+      [string]$CommandInfo.Name
+    }
+    if (Test-IsWindowsAppsCodexCommand $Candidate) { continue }
+
+    # npm's PowerShell/cmd shim is compatible with the interactive CLI, but a
+    # fresh app-server subprocess needs the native executable. Prefer the native
+    # binary belonging to that same PATH installation when it is present.
+    if (-not [string]::IsNullOrWhiteSpace([string]$CommandInfo.Path) -and
+        @(".cmd", ".ps1") -contains [System.IO.Path]::GetExtension([string]$CommandInfo.Path).ToLowerInvariant()) {
+      $PackageRoot = Join-Path (Split-Path -Parent ([string]$CommandInfo.Path)) "node_modules\@openai\codex"
+      if (Test-Path -LiteralPath $PackageRoot -PathType Container) {
+        $NativeCandidates = @(
+          Get-ChildItem -LiteralPath (Join-Path $PackageRoot "node_modules\@openai") -Directory -Filter "codex-win32-*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem -LiteralPath (Join-Path $_.FullName "vendor") -Recurse -File -Filter "codex.exe" -ErrorAction SilentlyContinue } |
+            Sort-Object FullName
+        )
+        foreach ($NativeCandidate in $NativeCandidates) {
+          if (Test-CodexCommandVersion $NativeCandidate.FullName) { return $NativeCandidate.FullName }
+        }
+      }
+    }
+    if (Test-CodexCommandVersion $Candidate) { return $Candidate }
+  }
+  return $null
+}
+
+function Test-CodexAppCacheCandidate([string]$CandidatePath, [string]$CanonicalRoot) {
+  try {
+    $RootItem = Get-Item -LiteralPath $CanonicalRoot -Force -ErrorAction Stop
+    $CandidateItem = Get-Item -LiteralPath $CandidatePath -Force -ErrorAction Stop
+    if (-not ($RootItem -is [System.IO.DirectoryInfo]) -or -not ($CandidateItem -is [System.IO.FileInfo])) {
+      return $false
+    }
+    $RootFullPath = [System.IO.Path]::GetFullPath($RootItem.FullName).TrimEnd([char[]]"\/")
+    $CandidateFullPath = [System.IO.Path]::GetFullPath($CandidateItem.FullName)
+    $RootPrefix = $RootFullPath + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $CandidateFullPath.StartsWith($RootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $false
+    }
+    $RelativeParts = @($CandidateFullPath.Substring($RootPrefix.Length).Split([char[]]"\/", [System.StringSplitOptions]::RemoveEmptyEntries))
+    if ($RelativeParts.Count -ne 2 -or
+        -not [string]::Equals($RelativeParts[1], "codex.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $false
+    }
+
+    # Do not trust a junction or symlink that only appears to live below the
+    # canonical app cache root.
+    $ReachedRoot = $false
+    $Cursor = $CandidateItem
+    while ($Cursor) {
+      if (($Cursor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+      $CursorFullPath = [System.IO.Path]::GetFullPath($Cursor.FullName).TrimEnd([char[]]"\/")
+      if ([string]::Equals($CursorFullPath, $RootFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $ReachedRoot = $true
+        break
+      }
+      $Cursor = if ($Cursor -is [System.IO.DirectoryInfo]) {
+        $Cursor.Parent
+      } elseif ($Cursor -is [System.IO.FileInfo]) {
+        $Cursor.Directory
+      } else {
+        $null
+      }
+    }
+    if (-not $ReachedRoot) { return $false }
+
+    $Signature = Get-AuthenticodeSignature -LiteralPath $CandidateFullPath -ErrorAction Stop
+    $SignerSubject = if ($Signature.SignerCertificate) { [string]$Signature.SignerCertificate.Subject } else { "" }
+    if ([string]$Signature.Status -ne "Valid" -or
+        $SignerSubject.IndexOf("OpenAI", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+      return $false
+    }
+    return Test-CodexCommandVersion $CandidateFullPath
+  } catch {
+    return $false
+  }
+}
+
+function Get-CodexAppCacheCandidate {
+  if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+      [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    return $null
+  }
+  $AppCacheRoot = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\bin"
+  if (-not (Test-Path -LiteralPath $AppCacheRoot -PathType Container)) { return $null }
+  try {
+    $CanonicalRoot = (Get-Item -LiteralPath $AppCacheRoot -Force -ErrorAction Stop).FullName
+    $VersionDirectories = @(Get-ChildItem -LiteralPath $CanonicalRoot -Directory -Force -ErrorAction Stop | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($VersionDirectory in $VersionDirectories) {
+      $Candidate = Join-Path $VersionDirectory.FullName "codex.exe"
+      if (Test-CodexAppCacheCandidate $Candidate $CanonicalRoot) {
+        return [System.IO.Path]::GetFullPath($Candidate)
+      }
+    }
+  } catch {
+    return $null
+  }
+  return $null
+}
+
+function Resolve-CodexCliExecutable {
+  if ($script:CodexCliResolutionAttempted) { return $script:ResolvedCodexCliExecutable }
+  $script:CodexCliResolutionAttempted = $true
+  $PathCandidate = Get-CodexPathCommandCandidate
+  if (-not [string]::IsNullOrWhiteSpace($PathCandidate)) {
+    $script:ResolvedCodexCliExecutable = $PathCandidate
+    return $script:ResolvedCodexCliExecutable
+  }
+  $AppCacheCandidate = Get-CodexAppCacheCandidate
+  if (-not [string]::IsNullOrWhiteSpace($AppCacheCandidate)) {
+    $script:ResolvedCodexCliExecutable = $AppCacheCandidate
+    return $script:ResolvedCodexCliExecutable
+  }
+  $script:ResolvedCodexCliExecutable = $null
+  return $null
+}
+
+function Invoke-CodexCli([string[]]$Arguments) {
+  $Command = Resolve-CodexCliExecutable
+  if ([string]::IsNullOrWhiteSpace($Command)) {
+    return [pscustomobject]@{ ExitCode = 127; Output = @() }
+  }
+  return Invoke-CodexCommandCapture $Command $Arguments
+}
+
+function Test-CodexCliExecutable {
+  return -not [string]::IsNullOrWhiteSpace((Resolve-CodexCliExecutable))
 }
 
 function Remove-GeneratedPluginConflictForDirectConfig {
@@ -5550,7 +6316,16 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
     installed_config_fingerprint = $InstalledConfigFingerprint
   }
   if (-not (Run-InstalledCodexConfigSmoke $TargetPath)) {
-    throw "The installed $ConsumerName MCP config could not complete the initialize/tools/get_index_status transport contract."
+    throw "The installed $ConsumerName MCP config could not complete its initialize/tools/search/fetch transport contract."
+  }
+  $PostSmokeConfigFingerprint = if (Test-Path -LiteralPath $TargetPath -PathType Leaf) {
+    "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  } else {
+    $null
+  }
+  if ([string]::IsNullOrWhiteSpace($PostSmokeConfigFingerprint) -or
+      -not [string]::Equals($PostSmokeConfigFingerprint, $InstalledConfigFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "$ConsumerName MCP config changed during installed-config stdio verification; the prior state will be restored."
   }
   if (-not $CodexCliAvailable) {
     $DesktopRestartState = Get-ChatGptDesktopRestartState -RegistrationUpdatedAtUtc $DirectRegistrationUpdatedAtUtc
@@ -5588,7 +6363,7 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
       Write-Host "Fully quit ChatGPT Desktop, start it again, open a new conversation, run /mcp, and select the exact server name $ServerName."
       Write-Host "Do not report this state as connected until the Desktop surface and an actual MCP tool call are verified."
     } else {
-      Write-Warning "An externally executable Codex CLI was not found, so loader verification remains pending. The valid config was preserved instead of rolled back."
+      Write-Warning "A trusted executable Codex host CLI was not found, so loader verification remains pending. The valid config was preserved instead of rolled back."
       Write-Host "Restart Codex CLI and verify $ServerName with /mcp in a new task."
     }
     return
@@ -5723,6 +6498,7 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
     if (-not $RollbackComplete) {
       throw "Direct MCP installation failed and prior state could not be restored completely. Config rollback error='$RollbackFailureMessage'; plugin_restore_failed=$PluginRestoreFailed. Original error: $($InstallError.Exception.Message)"
     }
+    Fail-ClientConnectionAttempt "direct_install_failed_prior_state_restored" -RolledBack
     throw $InstallError
   }
 }
@@ -5757,6 +6533,46 @@ function Test-ClaudeDesktopConfig {
   return $true
 }
 
+function Assert-ClaudeDesktopInstalledContract(
+  [string]$TargetPath,
+  [object]$GeneratedServer,
+  [string]$ExpectedFingerprint = ""
+) {
+  if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+    throw "Claude Desktop config contract verification could not find the installed config: $TargetPath"
+  }
+  try {
+    $InstalledConfig = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "Claude Desktop config contract verification could not parse the installed config: $TargetPath. $($_.Exception.Message)"
+  }
+  if (-not $InstalledConfig.PSObject.Properties["mcpServers"]) {
+    throw "Claude Desktop config contract verification found no mcpServers object: $TargetPath"
+  }
+  $InstalledProperty = $InstalledConfig.mcpServers.PSObject.Properties[$ServerName]
+  if (-not $InstalledProperty) {
+    throw "Claude Desktop config contract verification found no server ${ServerName}: $TargetPath"
+  }
+  $InstalledServer = $InstalledProperty.Value
+  $ExpectedType = [string]$GeneratedServer.type
+  $InstalledType = [string]$InstalledServer.type
+  if (-not [string]::Equals($InstalledType, $ExpectedType, [System.StringComparison]::Ordinal)) {
+    throw "Claude Desktop config contract verification found a mismatched transport type for ${ServerName}."
+  }
+  if (-not [string]::Equals([string]$InstalledServer.command, [string]$GeneratedServer.command, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Claude Desktop config contract verification found a mismatched command for ${ServerName}."
+  }
+  if (-not (Test-SameMcpArguments @($InstalledServer.args) @($GeneratedServer.args))) {
+    throw "Claude Desktop config contract verification found incomplete, reordered, or mismatched arguments for ${ServerName}."
+  }
+  $ActualFingerprint = "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if (-not [string]::IsNullOrWhiteSpace($ExpectedFingerprint) -and
+      -not [string]::Equals($ActualFingerprint, $ExpectedFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Claude Desktop config changed after its installed launch contract was verified."
+  }
+  return $ActualFingerprint
+}
+
 function Install-ClaudeDesktopConfig {
   $Source = Read-ClaudeDesktopBundleServerConfig
   $Source = Set-McpBundlePaths $Source (Get-BundleDataDir) (BundlePath "run_mcp_stdio_server.ps1")
@@ -5773,22 +6589,28 @@ function Install-ClaudeDesktopConfig {
 
   $HadExistingConfig = Test-Path -LiteralPath $TargetPath
   $BackupPath = $null
+  $BackupConfigFingerprint = $null
   if ($HadExistingConfig) {
     $BackupPath = "$TargetPath.bak-$(Get-Date -Format yyyyMMddHHmmssfff)"
+    $OriginalConfigFingerprint = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
     Copy-Item -LiteralPath $TargetPath -Destination $BackupPath
+    $BackupConfigFingerprint = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash
+    if (-not [string]::Equals($OriginalConfigFingerprint, $BackupConfigFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Claude Desktop config backup hash mismatch; installation was not attempted."
+    }
     try {
-      $Target = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $TargetConfig = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
       throw "Existing Claude Desktop config is not valid JSON: $TargetPath. Backup created at $BackupPath. Fix the JSON first, or move the invalid file aside and rerun this installer. Common cause: pasting the whole generated JSON as a second top-level object instead of merging mcpServers. Original parser error: $($_.Exception.Message)"
     }
     Write-Host "Backup created: $BackupPath"
   } else {
-    $Target = [pscustomobject]@{}
+    $TargetConfig = [pscustomobject]@{}
   }
 
   try {
-  if (-not $Target.PSObject.Properties["mcpServers"]) {
-    Add-Member -InputObject $Target -MemberType NoteProperty -Name "mcpServers" -Value ([pscustomobject]@{})
+  if (-not $TargetConfig.PSObject.Properties["mcpServers"]) {
+    Add-Member -InputObject $TargetConfig -MemberType NoteProperty -Name "mcpServers" -Value ([pscustomobject]@{})
   }
 
   $SourceServerProperty = $Source.mcpServers.PSObject.Properties[$ServerName]
@@ -5807,12 +6629,12 @@ function Install-ClaudeDesktopConfig {
   $BundleDataDir = Get-BundleDataDir
   $RemovedNames = [System.Collections.Generic.List[string]]::new()
   $ExistingNames = @(
-    $Target.mcpServers.PSObject.Properties |
+    $TargetConfig.mcpServers.PSObject.Properties |
       ForEach-Object { $_.Name } |
       Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
   )
   foreach ($ExistingName in $ExistingNames) {
-    $ExistingServer = $Target.mcpServers.PSObject.Properties[$ExistingName].Value
+    $ExistingServer = $TargetConfig.mcpServers.PSObject.Properties[$ExistingName].Value
     $ExistingArgs = @($ExistingServer.args)
     $SameName = $ExistingName -eq $ServerName
     $SameBundle = $ExistingArgs -contains $LauncherPath -or $ExistingArgs -contains $BundleDataDir
@@ -5821,38 +6643,43 @@ function Install-ClaudeDesktopConfig {
       $GeneratedProfileId -and
       $ExistingArgs -contains $GeneratedProfileId
     if ($SameName -or $SameBundle -or $LegacyDefaultForSameProfile) {
-      $Target.mcpServers.PSObject.Properties.Remove($ExistingName)
+      $TargetConfig.mcpServers.PSObject.Properties.Remove($ExistingName)
       $RemovedNames.Add($ExistingName)
     }
   }
 
   foreach ($Server in $Source.mcpServers.PSObject.Properties) {
-    Add-Member -InputObject $Target.mcpServers -MemberType NoteProperty -Name $Server.Name -Value $Server.Value
+    Add-Member -InputObject $TargetConfig.mcpServers -MemberType NoteProperty -Name $Server.Name -Value $Server.Value
   }
 
-  Write-JsonUtf8NoBom $TargetPath $Target 50
-  $WrittenTarget = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8 | ConvertFrom-Json
-  $InstalledProperty = $WrittenTarget.mcpServers.PSObject.Properties[$ServerName]
-  if (-not $InstalledProperty) {
-    throw "Claude Desktop config verification failed after writing server ${ServerName}: $TargetPath"
-  }
-  $InstalledArgs = @($InstalledProperty.Value.args)
-  if ($InstalledArgs -notcontains $LauncherPath -or $InstalledArgs -notcontains $BundleDataDir) {
-    throw "Claude Desktop config verification failed after writing bundle paths: $TargetPath"
-  }
-  $InstalledConfigFingerprint = "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  $TargetJson = ($TargetConfig | ConvertTo-Json -Depth 50) + [Environment]::NewLine
+  Write-AtomicUtf8NoBom $TargetPath $TargetJson
+  $InstalledConfigFingerprint = Assert-ClaudeDesktopInstalledContract $TargetPath $GeneratedServer
+  $ClaudeRegistrationUpdatedAt = [DateTimeOffset]::UtcNow.ToString("o")
   Update-BundleStatus @{
     installation_attempt_id = $InstallationAttemptId
     claude_desktop_config_registered = $true
     claude_desktop_config_path = $TargetPath
     claude_desktop_config_fingerprint = $InstalledConfigFingerprint
     claude_desktop_config_transport_verified = $false
+    claude_desktop_config_transport_runtime_fingerprint = $null
+    claude_desktop_registration_updated_at = $ClaudeRegistrationUpdatedAt
+    claude_desktop_process_detected = $false
+    claude_desktop_process_started_at = $null
+    claude_desktop_restart_checked_at = $null
+    claude_desktop_restart_required = $null
+    claude_desktop_restart_status = "not_checked"
+    claude_desktop_restarted_after_registration = $false
+    claude_desktop_post_registration_log_session_observed = $false
+    claude_desktop_server_name_observed = $false
+    claude_desktop_loader_observed = $false
     claude_desktop_loader_verified = $false
     claude_desktop_conversation_verified = $false
   }
   if (-not (Run-InstalledClaudeDesktopConfigSmoke $TargetPath)) {
     throw "The installed Claude Desktop MCP config could not complete initialize, tools/list, and get_index_status."
   }
+  $null = Assert-ClaudeDesktopInstalledContract $TargetPath $GeneratedServer $InstalledConfigFingerprint
   Update-BundleStatus @{
     installation_attempt_id = $InstallationAttemptId
     installation_state = "installed_pending_claude_desktop_verification"
@@ -5862,6 +6689,8 @@ function Install-ClaudeDesktopConfig {
     claude_desktop_loader_verified = $false
     claude_desktop_conversation_verified = $false
   }
+  $ClaudeVerifiedStatus = Read-JsonFile "bundle_status.json"
+  Complete-ClientConnectionAttempt @("registration", "transport") $InstalledConfigFingerprint ([string]$ClaudeVerifiedStatus.runtime_fingerprint)
   $RemovedDuplicates = @($RemovedNames | Where-Object { $_ -and $_ -ne $ServerName } | Select-Object -Unique)
   if ($RemovedDuplicates.Count -gt 0) {
     Write-Host "Removed duplicate Claude Desktop entries for this bundle: $($RemovedDuplicates -join ', ')"
@@ -5875,7 +6704,11 @@ function Install-ClaudeDesktopConfig {
     $RollbackComplete = $false
     try {
       if ($HadExistingConfig -and $BackupPath -and (Test-Path -LiteralPath $BackupPath)) {
-        Copy-Item -LiteralPath $BackupPath -Destination $TargetPath -Force
+        Restore-FileAtomically $BackupPath $TargetPath
+        $RestoredConfigFingerprint = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
+        if (-not [string]::Equals($RestoredConfigFingerprint, $BackupConfigFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+          throw "Restored Claude Desktop config hash does not match the pre-install backup."
+        }
         $RollbackComplete = $true
         Write-Warning "Claude Desktop config installation failed; the previous config was restored."
       } elseif ((-not $HadExistingConfig) -and (Test-Path -LiteralPath $TargetPath)) {
@@ -5888,6 +6721,11 @@ function Install-ClaudeDesktopConfig {
     } catch {
       Write-Warning "Claude Desktop config installation failed and automatic rollback also failed: $($_.Exception.Message)"
     }
+    if ($RollbackComplete) {
+      $null = Fail-ClientConnectionAttempt "claude_desktop_install_failed_prior_state_restored" -RolledBack
+    } else {
+      $null = Fail-ClientConnectionAttempt "claude_desktop_install_failed_rollback_incomplete"
+    }
     Update-BundleStatus @{
       installation_attempt_id = $InstallationAttemptId
       installation_state = $(if ($RollbackComplete) { "failed_rolled_back" } else { "failed_rollback_incomplete" })
@@ -5896,6 +6734,17 @@ function Install-ClaudeDesktopConfig {
       claude_desktop_config_path = $null
       claude_desktop_config_fingerprint = $null
       claude_desktop_config_transport_verified = $false
+      claude_desktop_config_transport_runtime_fingerprint = $null
+      claude_desktop_registration_updated_at = $null
+      claude_desktop_process_detected = $false
+      claude_desktop_process_started_at = $null
+      claude_desktop_restart_checked_at = $null
+      claude_desktop_restart_required = $null
+      claude_desktop_restart_status = "not_checked"
+      claude_desktop_restarted_after_registration = $false
+      claude_desktop_post_registration_log_session_observed = $false
+      claude_desktop_server_name_observed = $false
+      claude_desktop_loader_observed = $false
       claude_desktop_loader_verified = $false
       claude_desktop_conversation_verified = $false
       direct_stdio_verified = $false
@@ -5945,17 +6794,62 @@ function Show-ClaudeDesktop {
 
 function Register-ClaudeCode {
   Show-Header
-  if (-not (Run-LocalStdioDoctor)) {
-    throw "Local MCP doctor failed; Claude Code registration was not attempted."
+  Start-LocalInstallationAttempt "preflight_claude_code"
+  try {
+    if (-not (Run-LocalStdioDoctor)) {
+      throw "Local MCP doctor failed; Claude Code registration was not attempted."
+    }
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+      Write-Warning "Claude Code CLI was not found on PATH."
+      Write-Host "After installing Claude Code, run:"
+      Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}"' -f (BundlePath 'claude_code_add_stdio.ps1'))
+      throw "Claude Code CLI is required to register and verify this MCP server."
+    }
+    Run-Script "claude_code_add_stdio.ps1"
+    $ClaudeEvidencePath = BundlePath "claude_code_registration_evidence.json"
+    if (-not (Test-Path -LiteralPath $ClaudeEvidencePath -PathType Leaf)) {
+      throw "Claude Code registration did not produce current verification evidence."
+    }
+    try { $ClaudeEvidence = Get-Content -LiteralPath $ClaudeEvidencePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Claude Code registration evidence is invalid." }
+    if ([string]$ClaudeEvidence.schema_version -ne "claude-code-registration-evidence-v1" -or
+        [string]$ClaudeEvidence.server_name -ne $ServerName -or
+        [string]$ClaudeEvidence.scope -ne "user" -or
+        $ClaudeEvidence.status_connected -ne $true -or
+        $ClaudeEvidence.registration_verified -ne $true -or
+        $ClaudeEvidence.transport_verified -ne $true -or
+        [string]$ClaudeEvidence.config_entry_fingerprint -notmatch "^sha256:[0-9a-f]{64}$") {
+      throw "Claude Code registration evidence did not verify the connected user-scoped launch contract."
+    }
+    $ClaudeCodeStatus = Read-JsonFile "bundle_status.json"
+    if ([string]$ClaudeCodeStatus.installation_attempt_id -ne $InstallationAttemptId) {
+      throw "Claude Code verification does not belong to the current installation attempt."
+    }
+    $ClaudeCodeRuntimeFingerprint = [string]$ClaudeCodeStatus.runtime_fingerprint
+    $ClaudeCodeConfigFingerprint = [string]$ClaudeEvidence.config_entry_fingerprint
+    Update-BundleStatus @{
+      installation_attempt_id = $InstallationAttemptId
+      installation_state = "installed_claude_code_configured"
+      connection_state = "configured_pending_claude_code_conversation"
+      claude_code_registered = $true
+      claude_code_config_fingerprint = $ClaudeCodeConfigFingerprint
+      claude_code_loader_verified = $true
+      claude_code_transport_verified = $true
+      claude_code_transport_runtime_fingerprint = $(if (-not [string]::IsNullOrWhiteSpace($ClaudeCodeRuntimeFingerprint)) { $ClaudeCodeRuntimeFingerprint } else { $null })
+      claude_code_registration_updated_at = [DateTimeOffset]::UtcNow.ToString("o")
+      claude_code_conversation_verified = $false
+      conversation_attachment_verified = $false
+      end_to_end_verified = $false
+    }
+    Complete-ClientConnectionAttempt @("registration", "loader", "transport") $ClaudeCodeConfigFingerprint $ClaudeCodeRuntimeFingerprint
+    Write-Host "Claude Code registered user-scoped stdio MCP server."
+    Write-Host "Runtime initialize/tools/get_index_status smoke passed."
+    Write-Host "Open a fresh Claude Code task and invoke get_index_status before reporting conversation connection."
+  } catch {
+    $ClaudeCodeError = $_
+    Mark-CurrentAttemptFailedIfUnresolved "claude_code_preflight_or_registration_failed"
+    throw $ClaudeCodeError
   }
-  if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-    Write-Warning "Claude Code CLI was not found on PATH."
-    Write-Host "After installing Claude Code, run:"
-    Write-Host ('  powershell -ExecutionPolicy Bypass -File "{0}"' -f (BundlePath 'claude_code_add_stdio.ps1'))
-    throw "Claude Code CLI is required to register and verify this MCP server."
-  }
-  Run-Script "claude_code_add_stdio.ps1"
-  Write-Host "Claude Code registered user-scoped stdio MCP server."
 }
 
 function Show-Codex {
@@ -5983,7 +6877,7 @@ function Show-Codex {
         throw "bundle_status.json does not belong to the current installation attempt."
       }
       if ($DirectSmokeStatus.direct_stdio_verified -ne $true) {
-        throw "Direct MCP protocol smoke did not verify initialize, tools/list, and get_index_status."
+        throw "Direct MCP protocol smoke did not verify initialize, tools/list, search, and fetch."
       }
       Write-Host "Direct MCP protocol initialize/tools smoke passed."
       if ($script:CodexLoaderVerified) {
@@ -6002,12 +6896,15 @@ function Show-Codex {
             [string]$PostProbeStatus.installed_config_fingerprint -ne $CurrentConfigFingerprint) {
           throw "$ConsumerName MCP config changed during or immediately after fresh loader verification; revalidation is required."
         }
+        Complete-ClientConnectionAttempt @("registration", "loader", "transport", "fresh_app_server") $CurrentConfigFingerprint ([string]$PostProbeStatus.runtime_fingerprint)
       } else {
         if ($ForChatGptDesktop) {
           Write-Warning "[DESKTOP VERIFICATION PENDING] The local MCP config and direct transport passed, but automatic Desktop loader verification was unavailable."
         } else {
           Write-Warning "[LOADER VERIFICATION PENDING] The config and direct transport passed, but a fresh Codex CLI loader inventory was not available."
         }
+        $PendingDirectStatus = Read-JsonFile "bundle_status.json"
+        Complete-ClientConnectionAttempt @("registration", "transport") ([string]$PendingDirectStatus.installed_config_fingerprint) ([string]$PendingDirectStatus.runtime_fingerprint)
       }
       return
     } catch {
@@ -6047,13 +6944,15 @@ function Show-ChatGptDesktop {
       Install-ChatGptDesktopPlugin
       Run-Script "validate_client_config_smoke.ps1"
       Run-CodexAppServerMcpCheck
+      $PluginVerifiedStatus = Read-JsonFile "bundle_status.json"
+      Complete-ClientConnectionAttempt @("registration", "loader", "transport", "fresh_app_server") ([string]$PluginVerifiedStatus.installed_config_fingerprint) ([string]$PluginVerifiedStatus.runtime_fingerprint)
       Write-Host ""
       Write-Host "Plugin registration and MCP protocol validation completed."
       Write-Host "This still does not prove that the plugin is attached to the current conversation."
       Write-Host "Fully quit ChatGPT Desktop, start it again, and open a new conversation."
       Write-Host "First run /mcp and verify that $ServerName is connected."
       Write-Host "On a Work/Codex surface that exposes local plugins, select + > More > $ServerName."
-      Write-Host "Verification prompt: $ServerName MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘."
+      Write-Host "Verification prompt: $ServerName MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 fetch로 조회해 원문과 출처를 보여줘."
       return
     } catch {
       $PluginShowError = $_
@@ -6101,7 +7000,7 @@ function Install-ChatGptDesktopPlugin {
     throw "Generated plugin MCP config is missing: $PluginMcpPath"
   }
   if (-not (Test-CodexCliExecutable)) {
-    throw "Codex CLI was not found on PATH. Install/update ChatGPT Desktop with Codex support, then rerun this button."
+    throw "A trusted executable Codex host CLI was not found. Install/update ChatGPT Desktop with Codex support, then rerun this button."
   }
 
   $ExistingPluginMcp = Read-StrictUtf8Json $PluginMcpPath
@@ -6394,7 +7293,7 @@ function Install-ChatGptDesktopPlugin {
     throw "Codex MCP loader resolved $ServerName, but its command or full MCP argument contract does not match the current plugin."
   }
   if (-not (Run-InstalledPluginConfigSmoke $InstalledCacheMcpPath)) {
-    throw "The installed plugin cache could not complete the MCP initialize/tools/get_index_status transport contract."
+    throw "The installed plugin cache could not complete the MCP initialize/tools/search/fetch transport contract."
   }
   $InstalledPluginFingerprint = "sha256:" + (Get-FileHash -LiteralPath $InstalledCacheMcpPath -Algorithm SHA256).Hash.ToLowerInvariant()
   $DesktopRestartState = Get-ChatGptDesktopRestartState -RegistrationUpdatedAtUtc $PluginRegistrationUpdatedAtUtc
@@ -6541,6 +7440,11 @@ function Install-ChatGptDesktopPlugin {
     if ($ExternalPluginStateMutated -and -not $RollbackComplete) {
       throw "Plugin installation failed and the prior plugin state could not be restored completely. Original error: $($PluginInstallError.Exception.Message)"
     }
+    if ($ExternalPluginStateMutated -and $RollbackComplete) {
+      Fail-ClientConnectionAttempt "plugin_install_failed_prior_state_restored" -RolledBack
+    } else {
+      Fail-ClientConnectionAttempt "plugin_install_failed_prior_state_preserved"
+    }
     throw $PluginInstallError
   } finally {
     if ($InstallLockAcquired) {
@@ -6557,6 +7461,9 @@ function Show-ChatGptHttps {
   if (-not $Connector.connector_url) {
     throw "No ChatGPT remote connector_url is ready. Regenerate with --public-url https://your-host.example/mcp, or use -Target chatgpt-tunnel for Secure MCP Tunnel."
   }
+  if (-not $Connector.ready) {
+    throw "Direct ChatGPT HTTPS is not app-ready. Configure and test MCP OAuth 2.1, regenerate with --chatgpt-oauth-ready, or use -Target chatgpt-tunnel. A static MCP_AUTH_TOKEN cannot be entered into ChatGPT."
+  }
   Write-Host "ChatGPT connector URL:"
   Write-Host "  $($Connector.connector_url)"
   if (Get-Command Set-Clipboard -ErrorAction SilentlyContinue) {
@@ -6569,12 +7476,12 @@ function Show-ChatGptHttps {
   Write-Host ""
   Write-Host "Then enable Developer mode in ChatGPT Settings > Security and login, and open Settings > Plugins or https://chatgpt.com/plugins."
   Write-Host "Create or refresh the developer-mode app with the connector URL and verify the discovered tools include search/fetch."
-  Write-Host "Set MCP_AUTH_TOKEN in the approved runtime environment before starting or validating the HTTP endpoint."
+  Write-Host "MCP OAuth 2.1 must be available at the public endpoint. MCP_AUTH_TOKEN is only a gateway-to-origin secret and is never entered into ChatGPT."
   Write-Host "Validate the deployed endpoint with:"
   Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'validate_chatgpt_remote_mcp.ps1'))`""
-  Write-Host "Open a new ChatGPT conversation, then select + > More > $ServerName."
+  Write-Host "Open a new ChatGPT conversation, then select $ServerName from + > More."
   Write-Host "Verification prompt: $ServerName MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 fetch 도구로 조회해 조문 원문과 출처를 보여줘."
-  Start-Process "https://chatgpt.com/plugins"
+  Start-Process "https://chatgpt.com"
 }
 
 function Show-ChatGptTunnel {
@@ -6588,6 +7495,9 @@ function Show-ChatGptTunnel {
   Write-Host "Set CONTROL_PLANE_API_KEY and OPENAI_TUNNEL_ID in the approved runtime environment before running it."
   Write-Host "Running tunnel script..."
   Run-Script "run_openai_secure_tunnel.ps1"
+  Write-Host "Enable Developer mode in ChatGPT Settings > Security and login, then open Settings > Plugins or https://chatgpt.com/plugins."
+  Write-Host "Create the app with +, choose Tunnel under Connection, and select the approved tunnel_id."
+  Write-Host "In a new conversation, select the app from + > More and verify search/fetch."
 }
 
 function Show-ClaudeApi {
@@ -6600,6 +7510,8 @@ function Show-ClaudeApi {
   } else {
     throw "No Claude HTTPS MCP URL is ready. Regenerate the bundle with --public-url https://your-host.example/mcp."
   }
+  Write-Host "For the Claude app, register only this URL under Customize > Connectors, then enable it from + > Connectors in a conversation."
+  Write-Host "This command does not modify the Claude app connector settings."
   Write-Host "Copy mcp_servers, tools, and betas from claude_api_fragment.json into the Messages API request."
 }
 
@@ -6613,7 +7525,7 @@ function Show-Menu {
   Write-Host "  4. ChatGPT Desktop local MCP (Settings-compatible stdio)"
   Write-Host "  5. ChatGPT remote MCP (HTTPS)"
   Write-Host "  6. ChatGPT web (ChatGPT Secure MCP Tunnel)"
-  Write-Host "  7. Claude HTTPS MCP connector"
+  Write-Host "  7. Claude HTTPS (app connector URL / Messages API fragment)"
   Write-Host "  8. Doctor/readiness check"
   $Choice = Read-Host "Target"
   switch ($Choice) {
@@ -7006,12 +7918,20 @@ def _bundle_quickstart(
         },
         "chatgpt_desktop_local": {
             "profile": "chatgpt-desktop-local",
+            "tool_profile": "chatgpt-data",
             "transport": "stdio",
             "primary_registration": "chatgpt_desktop_settings_mcp_servers",
+            "connection_configuration_method": "direct_config",
+            "connection_prompt_required": False,
+            "secret_input_policy": "environment_or_oauth_only",
             "optional_plugin_distribution": "generated_local_marketplace",
             "server": chatgpt_desktop_local,
             "conversation_attachment_unverified": True,
-            "verification_prompt": f"{server_name} MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.",
+            "verification_tools": ["search", "fetch"],
+            "verification_prompt": (
+                f"{server_name} MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 "
+                "fetch로 조회해 원문과 출처를 보여줘."
+            ),
         },
         "run_http_server": {
             "command": "reg-rag-mcp-server",
@@ -7024,7 +7944,7 @@ def _bundle_quickstart(
             "args": chatgpt_http_args,
             "url": chatgpt_remote["connector_url"],
             "tool_profile": "chatgpt-data",
-            "auth": _remote_auth_summary(remote_auth_token_env),
+            "auth": chatgpt_remote["server_auth"],
         },
         "claude_desktop": {
             "paste_json_section": "claude_desktop.mcpServers",
@@ -7043,9 +7963,12 @@ def _bundle_quickstart(
             "connector_url": chatgpt_remote["connector_url"],
             "requires_reachable_https": chatgpt_remote["chatgpt_setup"]["requires_reachable_https"],
             "https_endpoint_ready": chatgpt_remote["chatgpt_setup"]["https_endpoint_ready"],
+            "oauth_ready": chatgpt_remote["chatgpt_setup"]["oauth_ready"],
+            "configuration_ready": chatgpt_remote["configuration_ready"],
             "verification_tools": ["search", "fetch"],
             "tool_profile": "chatgpt-data",
             "auth_required": True,
+            "custom_static_bearer_supported": False,
             "connection_options": ["https_endpoint", "openai_secure_tunnel"],
         },
         "openai_secure_tunnel": openai_tunnel,
@@ -7103,37 +8026,47 @@ def _chatgpt_connector_config(
     tenant_storage_isolation: bool,
     public_url: str | None,
     remote_auth_token_env: str | None,
+    chatgpt_oauth_ready: bool,
     min_visible_records: int = 1,
 ) -> dict[str, Any]:
     connector_url = _remote_connector_url(public_url=public_url)
     https_endpoint_ready = bool(connector_url and connector_url.startswith("https://"))
+    oauth_ready = bool(chatgpt_oauth_ready)
     missing = []
     if not connector_url:
         missing.append("public_url_https_mcp_endpoint")
     elif not https_endpoint_ready:
         missing.append("public_url_must_use_https")
+    if not oauth_ready:
+        missing.append("chatgpt_mcp_oauth_2_1_not_attested")
     return {
         "profile": "chatgpt-remote",
         "transport": "streamable-http",
         "connector_name": server_name,
         "connector_url": connector_url,
-        "ready": https_endpoint_ready,
-        "configuration_ready": https_endpoint_ready,
+        "ready": bool(https_endpoint_ready and oauth_ready),
+        "configuration_ready": bool(https_endpoint_ready and oauth_ready),
         "remote_endpoint_verified": False,
         "tool_scan_unverified": True,
         "conversation_attachment_unverified": True,
         "end_to_end_verified": False,
         "missing": missing,
         "chatgpt_setup": {
-            "location": "ChatGPT Settings > Plugins (Developer mode) or https://chatgpt.com/plugins",
+            "location": "ChatGPT Settings > Security and login (Developer mode), then Settings > Plugins or https://chatgpt.com/plugins",
             "connector_url": connector_url,
             "requires_reachable_https": True,
             "https_endpoint_ready": https_endpoint_ready,
+            "authentication_mode": "mcp-oauth-2.1",
+            "oauth_ready": oauth_ready,
             "recommended_description": (
                 "Search and fetch approved local regulation evidence from the institution's MCP server."
             ),
             "authentication_required": True,
-            "authentication_note": "Protect the HTTPS /mcp endpoint with an approved reverse proxy, OAuth flow, or bearer-token gateway.",
+            "authentication_note": (
+                "ChatGPT cannot present a custom API key or operator-provided static bearer token. "
+                "The public endpoint must implement MCP OAuth 2.1, or use Secure MCP Tunnel instead. "
+                "A backend bearer token may protect the origin behind an OAuth-aware gateway."
+            ),
         },
         "server_start": {
             "command": "reg-rag-mcp-server",
@@ -7165,7 +8098,17 @@ def _chatgpt_connector_config(
             tenant_storage_isolation=tenant_storage_isolation,
             min_visible_records=min_visible_records,
         ),
-        "server_auth": _remote_auth_summary(remote_auth_token_env),
+        "server_auth": {
+            "required": True,
+            "mode": "mcp-oauth-2.1",
+            "oauth_ready": oauth_ready,
+            "backend_token_env": remote_auth_token_env,
+            "custom_static_bearer_supported_by_chatgpt": False,
+            "note": (
+                "Use MCP OAuth 2.1 at the public endpoint. The backend token is only for an "
+                "OAuth-aware gateway-to-origin hop and is not entered into ChatGPT."
+            ),
+        },
         "compatible_tools": [
             "search",
             "fetch",
@@ -7174,14 +8117,17 @@ def _chatgpt_connector_config(
             "Run the HTTP MCP server from server_start.",
             "Set the bearer token environment variable or use an approved authenticated reverse proxy.",
             "Expose the /mcp endpoint through an approved HTTPS URL.",
+            "Complete MCP OAuth 2.1 discovery, PKCE, audience, scope, and callback validation before attesting --chatgpt-oauth-ready.",
             "Enable Developer mode in ChatGPT Settings > Security and login.",
-            "Create a developer-mode app in Settings > Plugins or https://chatgpt.com/plugins with connector_url.",
+            "Create a developer-mode app from Settings > Plugins and enter connector_url as the MCP server URL.",
             "Verify the discovered tool list includes search and fetch before using the app.",
-            "Ask ChatGPT to search first, then fetch returned result IDs for evidence.",
+            "Select the app from + > More in a new chat, then ask ChatGPT to search first and fetch returned result IDs for evidence.",
         ],
         "notes": [
             "ChatGPT cannot connect directly to a local MCP server; use reachable HTTPS or Secure MCP Tunnel.",
-            "Search and fetch are no longer mandatory for custom MCP apps, but remain available for evidence workflows.",
+            "ChatGPT does not support custom API keys; a static MCP_AUTH_TOKEN alone cannot authenticate a ChatGPT developer-mode app.",
+            "The chatgpt-data profile uses the exact search(query) and fetch(id) input signatures required for data-source compatibility.",
+            "Citation URLs are absolute user-openable HTTP(S) source URLs or empty when no such source exists.",
             "Do not expose streamable-http or SSE MCP without authentication or approved network controls.",
             "Use only public or separately approved data when routing MCP responses to an external cloud AI.",
         ],
@@ -7309,8 +8255,9 @@ def _openai_secure_tunnel_config(
         "chatgpt_setup": [
             "Create or select an OpenAI Secure MCP Tunnel in Platform tunnel settings.",
             "Run this script inside the network that can reach the local regulation MCP data directory.",
-            "In ChatGPT connector/app settings, choose Tunnel under Connection and select the tunnel_id.",
-            "Create or refresh the ChatGPT plugin and verify the discovered privacy-reduced read-only tools include search and fetch.",
+            "Enable Developer mode in ChatGPT Settings > Security and login.",
+            "Open Settings > Plugins or https://chatgpt.com/plugins, select +, choose Tunnel under Connection, and select the tunnel_id.",
+            "Create or refresh the developer-mode tunnel app and verify the discovered privacy-reduced read-only tools include search and fetch.",
         ],
         "copy_paste_ps": script,
         "docs": [
@@ -7504,17 +8451,13 @@ This folder contains generated setup files for the `{server_name}` MCP server.
 
 ## Fast Path
 
-For ChatGPT Desktop, use the program's generated-result code box for `{files.get("chatgpt_desktop_agent_prompt", SETUP_BUNDLE_FILES["chatgpt_desktop_agent_prompt"])}` and enter its materialized Name, STDIO command, working directory, and arguments in `Settings > MCP servers > Add server`. Do not copy a literal `<PROGRAM_BUNDLE_DIR>` from the portable file stored in the ZIP. Save, restart ChatGPT Desktop, run `/mcp` in a new conversation, and ask `{server_name}` to run `get_index_status`. Use the ChatGPT Desktop BAT only if the built-in menu is unavailable or manual entry is impractical. Repeated `@` mentions do not install or verify an MCP server.
+For ChatGPT Desktop, use the program's generated-result code box for `{files.get("chatgpt_desktop_agent_prompt", SETUP_BUNDLE_FILES["chatgpt_desktop_agent_prompt"])}` and enter its materialized Name, STDIO command, working directory, and arguments in `Settings > MCP servers > Add server`. Do not copy a literal `<PROGRAM_BUNDLE_DIR>` from the portable file stored in the ZIP. Save, restart ChatGPT Desktop, run `/mcp` in a new conversation, then verify `search` followed by `fetch`. Use the ChatGPT Desktop BAT only when manual entry is impractical or the advanced shared `~/.codex/config.toml` path is required. The BAT cannot enable MCP in a Desktop build or workspace that does not expose the feature. Repeated `@` mentions do not install or verify an MCP server.
 
-For Codex CLI and Claude Code:
+For Codex CLI, run `{files.get("connect_codex_bat", SETUP_BUNDLE_FILES["connect_codex_bat"])}` or apply `{files.get("codex_config", SETUP_BUNDLE_FILES["codex_config"])}` directly to `~/.codex/config.toml`, restart Codex, verify `/mcp`, then call `search` and `fetch`. `{files.get("codex_agent_prompt", SETUP_BUNDLE_FILES["codex_agent_prompt"])}` is optional local automation only; it is not a required installation prompt.
 
-1. Open this extracted bundle as that app's local workspace.
-2. Paste the matching agent prompt and let it finish the doctor, installation, and loader verification:
-   - Codex CLI: `{files.get("codex_agent_prompt", SETUP_BUNDLE_FILES["codex_agent_prompt"])}`
-   - Claude Code: `{files.get("claude_code_agent_prompt", SETUP_BUNDLE_FILES["claude_code_agent_prompt"])}`
-3. Only after verification completes, fully quit and restart that client.
-4. In a new conversation or task, run `/mcp` and verify `{server_name}`, then ask it to run `get_index_status`.
-5. Use the matching BAT only when the agent cannot access local files or a terminal.
+For Claude Code, open this bundle as its local workspace and use `{files.get("claude_code_agent_prompt", SETUP_BUNDLE_FILES["claude_code_agent_prompt"])}` or its BAT, then restart and verify `/mcp` plus `get_index_status`.
+
+Never paste connection configuration, local paths, tokens, API keys, or tunnel IDs into a chat prompt. Keep secrets in approved environment variables or OAuth only.
 
 Claude Desktop follows a separate path: double-click `{files.get("connect_claude_desktop_bat", SETUP_BUNDLE_FILES["connect_claude_desktop_bat"])}`. The BAT backs up and merges the user config, then verifies initialize, tools/list, and get_index_status from that exact installed config. This does not prove Desktop loader or conversation exposure. Fully quit and restart Claude Desktop, confirm the server in Connectors, and invoke get_index_status in a new conversation. Do not apply the `/mcp` step above to Claude Desktop.
 
@@ -7569,14 +8512,14 @@ the repository, installs a bundled `reg_rag_preprocessor-*.whl` when present out
 2. For Claude Code, open this bundle as its workspace and paste `{files.get("claude_code_agent_prompt", SETUP_BUNDLE_FILES["claude_code_agent_prompt"])}` into the agent. If it cannot execute locally, double-click `{files.get("connect_claude_code_bat", SETUP_BUNDLE_FILES["connect_claude_code_bat"])}`. For manual setup, run `{files.get("claude_code_stdio", SETUP_BUNDLE_FILES["claude_code_stdio"])}` in PowerShell.
    The script runs the doctor gate, replaces legacy local/user entries, registers the local stdio server with
    `--scope user`, and verifies it with `claude mcp get` so it remains available outside the bundle directory.
-3. For ChatGPT Desktop, use the program's generated-result code box for `{files.get("chatgpt_desktop_agent_prompt", SETUP_BUNDLE_FILES["chatgpt_desktop_agent_prompt"])}` and enter its materialized fields in `Settings > MCP servers > Add server`. A literal `<PROGRAM_BUNDLE_DIR>` in the ZIP copy is not an input value. Save, fully quit and restart ChatGPT Desktop, open a new conversation, and run `/mcp`. Use `{files.get("connect_chatgpt_desktop_bat", SETUP_BUNDLE_FILES["connect_chatgpt_desktop_bat"])}` only as fallback when the built-in menu is unavailable or manual entry is impractical.
+3. For ChatGPT Desktop, use the program's generated-result code box for `{files.get("chatgpt_desktop_agent_prompt", SETUP_BUNDLE_FILES["chatgpt_desktop_agent_prompt"])}` and enter its materialized fields in `Settings > MCP servers > Add server`. A literal `<PROGRAM_BUNDLE_DIR>` in the ZIP copy is not an input value. Save, fully quit and restart ChatGPT Desktop, open a new conversation, and run `/mcp`. Use `{files.get("connect_chatgpt_desktop_bat", SETUP_BUNDLE_FILES["connect_chatgpt_desktop_bat"])}` only when manual entry is impractical or the advanced shared `~/.codex/config.toml` path is required. A successful config write does not enable a missing Desktop feature or prove tool exposure.
    The generated plugin package follows the official `.codex-plugin/plugin.json` to `./.mcp.json` layout, but is optional and is not installed by the ChatGPT Desktop button.
-   For direct Codex CLI compatibility, paste `{files.get("codex_agent_prompt", SETUP_BUNDLE_FILES["codex_agent_prompt"])}` into a Codex agent, or use `{files.get("connect_codex_bat", SETUP_BUNDLE_FILES["connect_codex_bat"])}` as fallback. For manual Codex setup, first materialize every `<BUNDLE_DIR>` marker to a forward-slash absolute path such as `C:/MCP/aksmcp2` (or escape every backslash for valid TOML), then paste `{files.get("codex_config", SETUP_BUNDLE_FILES["codex_config"])}` into `$HOME\\.codex\\config.toml`
+   For direct Codex CLI compatibility, run `{files.get("connect_codex_bat", SETUP_BUNDLE_FILES["connect_codex_bat"])}`. For manual Codex setup, first materialize every `<BUNDLE_DIR>` marker to a forward-slash absolute path such as `C:/MCP/aksmcp2` (or escape every backslash for valid TOML), then add `{files.get("codex_config", SETUP_BUNDLE_FILES["codex_config"])}` to `$HOME\\.codex\\config.toml`
    or replace the existing `[mcp_servers.{server_name}]` block. The snippet points `--data-dir` at this bundle's
    `data` directory and includes `--no-warm-cache` plus the generated storage-mode flag. Local stdio client
    configs launch `{files.get("stdio_launcher", SETUP_BUNDLE_FILES["stdio_launcher"])}` through PowerShell instead
    of calling `reg-rag-mcp-server` directly. A successful package install writes `runtime_python.json` schema 2
-   with the selected Python and SHA-256 identities for eight MCP command modules. The launcher validates that
+   with the selected Python and SHA-256 identities for {len(RUNTIME_IDENTITY_MODULES)} MCP command modules. The launcher validates that
    identity with `PYTHONPATH` isolated and uses it before any source checkout, environment override, or PATH
    command. A damaged or drifted marker fails closed and asks for reinstall; fallback discovery is only used
    before a marker exists.
@@ -7595,16 +8538,24 @@ the repository, installs a bundled `reg_rag_preprocessor-*.whl` when present out
 The `chatgpt-desktop-local` profile provides the exact local STDIO fields for ChatGPT Desktop's built-in MCP server settings.
 Fully restart the app and run `/mcp` in a new conversation; `@{server_name}` is not a connection check.
 ChatGPT remote apps need a reachable HTTPS `/mcp` endpoint; ChatGPT does not directly connect to a localhost MCP endpoint.
+Direct authenticated apps require MCP OAuth 2.1. ChatGPT cannot present a custom API key or a static
+`MCP_AUTH_TOKEN`; that token is only suitable for an OAuth-aware gateway-to-origin hop. Generate a direct
+profile with `--chatgpt-oauth-ready` only after discovery, PKCE, audience, scopes, and callback validation pass.
 Use `{files.get("run_chatgpt", SETUP_BUNDLE_FILES["run_chatgpt"])}` on the server for the external `chatgpt-data` profile, then register the URL from
-`{files.get("chatgpt", SETUP_BUNDLE_FILES["chatgpt"])}` after enabling Developer mode in ChatGPT Settings > Security and login, then open Settings > Plugins or https://chatgpt.com/plugins.
+`{files.get("chatgpt", SETUP_BUNDLE_FILES["chatgpt"])}` after enabling Developer mode in ChatGPT Settings > Security and login, then create the developer-mode app from Settings > Plugins or https://chatgpt.com/plugins. ChatGPT web does not read local Codex `config.toml`; select the draft app from `+ > More` in a new chat. Reviewed marketplace distribution remains separate from a developer-mode draft app.
 
-HTTPS configuration artifact ready: `{str(chatgpt_ready).lower()}`. This does not verify endpoint reachability, the ChatGPT tool scan, or conversation attachment. If false, regenerate with `--public-url https://your-host.example/mcp`.
+HTTPS configuration artifact ready: `{str(chatgpt_ready).lower()}`. This does not verify endpoint reachability, the ChatGPT tool scan, or conversation attachment. If false, finish OAuth and regenerate with `--public-url https://your-host.example/mcp --chatgpt-oauth-ready`, or use Secure MCP Tunnel.
 
 For private or internal servers, use `{files.get("openai_tunnel", SETUP_BUNDLE_FILES["openai_tunnel"])}` as the
 OpenAI Secure MCP Tunnel template. It keeps the MCP server inside the local network and lets ChatGPT select the
-tunnel in connector/app settings.
+tunnel after enabling Developer mode in Settings > Security and login and creating the developer-mode app with
+`+` under Settings > Plugins (or https://chatgpt.com/plugins).
+Choose Tunnel under Connection and select the approved tunnel ID. This dedicated tunnel path is separate from
+the public-HTTPS URL path in the same developer-app screen and from reviewed marketplace plugin installation.
 
-## Claude API
+## Claude HTTPS and Claude API
+
+For the Claude app, register the reachable HTTPS MCP URL as a custom connector under Customize > Connectors, then enable it for a conversation from + > Connectors. Team and Enterprise organization registration is performed by an Owner under Organization settings > Connectors. Do not paste the API request fragment into the Claude connector UI.
 
 Claude API needs an HTTPS URL MCP server definition. Copy `{files.get("claude_api", SETUP_BUNDLE_FILES["claude_api"])}` into
 the Messages API request fields `mcp_servers`, `tools`, and `betas`.
@@ -7622,8 +8573,9 @@ this display symptom because approval journals and vector IDs are keyed by those
 ## Security
 
 Do not expose HTTP MCP without authentication or approved network controls. Generated HTTP and tunnel scripts do
-not store secrets. Set `MCP_AUTH_TOKEN`, `CONTROL_PLANE_API_KEY`, or `OPENAI_TUNNEL_ID` in the approved runtime
-environment before launch. Generated HTTP commands run `reg-rag-mcp-doctor --fail-on-warning` before starting the server.
+not store secrets. `MCP_AUTH_TOKEN` protects only a backend/origin hop and is not ChatGPT-facing authentication;
+direct ChatGPT apps require OAuth 2.1. Set tunnel credentials only in the approved runtime environment. Generated
+HTTP commands run `reg-rag-mcp-doctor --fail-on-warning` before starting the server.
 
 ## Warnings
 
@@ -7631,10 +8583,14 @@ environment before launch. Generated HTTP commands run `reg-rag-mcp-doctor --fai
 
 ## Official References
 
+- ChatGPT Desktop/Codex MCP: https://learn.chatgpt.com/docs/extend/mcp
 - ChatGPT and Codex Plugins: https://help.openai.com/en/articles/20001256-plugins-in-codex
 - ChatGPT developer mode and MCP apps: https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta
+- ChatGPT MCP app authentication: https://developers.openai.com/apps-sdk/build/auth
+- OpenAI Secure MCP Tunnel: https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
 - MCP Streamable HTTP transport: https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
 - Claude API MCP connector: https://docs.anthropic.com/en/docs/agents-and-tools/mcp-connector
+- Claude custom connectors: https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp
 - Claude Code MCP: https://docs.anthropic.com/en/docs/claude-code/mcp
 """
 
@@ -7662,23 +8618,19 @@ def _setup_bundle_readme_ko(*, config: dict[str, Any], files: dict[str, str], se
 
 ## 가장 빠른 경로
 
-ChatGPT Desktop은 프로그램 생성 결과 화면의 `{files.get('chatgpt_desktop_agent_prompt', SETUP_BUNDLE_FILES['chatgpt_desktop_agent_prompt'])}` 코드 상자에 표시된 Name·STDIO·Command·Working directory·Arguments를 `Settings > MCP servers > Add server`에 입력합니다. ZIP 원본에 `<PROGRAM_BUNDLE_DIR>`이 보이면 그대로 입력하지 않습니다. Save 후 앱을 완전히 재시작하고 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 `get_index_status` 실행을 요청합니다. 내장 메뉴가 없거나 수동 입력이 어려울 때만 Desktop 전용 BAT를 사용합니다.
+ChatGPT Desktop은 프로그램 생성 결과 화면의 `{files.get('chatgpt_desktop_agent_prompt', SETUP_BUNDLE_FILES['chatgpt_desktop_agent_prompt'])}` 코드 상자에 표시된 Name·STDIO·Command·Working directory·Arguments를 `Settings > MCP servers > Add server`에 입력합니다. ZIP 원본에 `<PROGRAM_BUNDLE_DIR>`이 보이면 그대로 입력하지 않습니다. Save 후 앱을 완전히 재시작하고 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 `search`와 `fetch`를 차례로 호출합니다. 수동 입력이 어렵거나 고급 설정 파일 경로를 사용할 때만 Desktop 전용 BAT를 사용합니다. 이 BAT는 공유 `~/.codex/config.toml`을 백업·기록·검증하지만 Desktop에 없는 MCP 기능이나 메뉴를 활성화하지는 않습니다.
 
-Codex CLI와 Claude Code는 다음 순서로 연결합니다.
+Codex CLI는 `{files.get('connect_codex_bat', SETUP_BUNDLE_FILES['connect_codex_bat'])}`를 실행하거나 `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`을 `~/.codex/config.toml`에 직접 반영합니다. Codex를 재시작한 뒤 `/mcp`와 실제 `search`·`fetch` 호출로 확인합니다. `{files.get('codex_agent_prompt', SETUP_BUNDLE_FILES['codex_agent_prompt'])}`는 로컬 파일·터미널 권한이 있는 에이전트용 선택적 자동화 자료이며 필수 설치 프롬프트가 아닙니다.
 
-1. 압축을 푼 이 번들을 해당 앱의 로컬 작업공간으로 엽니다.
-2. 대상별 에이전트 요청문을 붙여넣고 doctor, 설치, 실제 로더 검증이 모두 끝날 때까지 실행합니다.
-   - Codex CLI: `{files.get('codex_agent_prompt', SETUP_BUNDLE_FILES['codex_agent_prompt'])}`
-   - Claude Code: `{files.get('claude_code_agent_prompt', SETUP_BUNDLE_FILES['claude_code_agent_prompt'])}`
-3. 검증 완료 후 해당 앱을 완전히 종료하고 다시 실행합니다.
-4. 재시작한 새 대화 또는 task에서 `/mcp`로 `{server_name}`을 확인한 뒤 `get_index_status` 실행을 요청합니다.
-5. 해당 에이전트에 로컬 파일·터미널 실행 권한이 없을 때만 대상별 BAT를 보조 수단으로 사용합니다.
+Claude Code는 압축을 푼 번들을 로컬 작업공간으로 열고 `{files.get('claude_code_agent_prompt', SETUP_BUNDLE_FILES['claude_code_agent_prompt'])}` 또는 전용 BAT로 등록한 뒤 `/mcp`와 `get_index_status`를 확인합니다.
+
+연결 설정·로컬 경로·토큰·API 키·tunnel ID는 대화 프롬프트에 붙여넣지 않습니다. 비밀값은 승인된 환경변수 또는 OAuth에만 둡니다.
 
 Claude Desktop은 별도 경로입니다. `{files.get('connect_claude_desktop_bat', SETUP_BUNDLE_FILES['connect_claude_desktop_bat'])}`를 더블클릭하면 사용자 설정을 백업·병합하고 그 설치 설정으로 initialize·tools/list·get_index_status까지 검증합니다. 이 성공은 Desktop 로더나 현재 대화 노출 성공이 아니므로 앱을 완전히 종료·재실행한 뒤 Connectors와 실제 도구 호출을 확인합니다. Claude Desktop에는 위 `/mcp` 공통 절차를 적용하지 않습니다.
 
 번들·설정 사전 진단만 실행할 때는 `{files.get('doctor_bat', SETUP_BUNDLE_FILES['doctor_bat'])}`를 더블클릭합니다. 이 진단은 클라이언트 등록·로더 인식·현재 대화 도구 호출 성공을 뜻하지 않습니다.
 클라이언트별 확인 명령과 이름 기반 호출 예시는 `{files.get('usage_guide_bat', SETUP_BUNDLE_FILES['usage_guide_bat'])}`를 실행해 확인합니다.
-ChatGPT Desktop BAT는 내장 메뉴가 없거나 수동 입력이 어려울 때만 쓰는 보조 등록 수단입니다. 생성된 로컬 플러그인 마켓플레이스는 별도 플러그인 배포가 필요할 때만 쓰는 선택 산출물입니다.
+ChatGPT Desktop BAT는 수동 입력이 어렵거나 고급 설정 파일 경로가 필요할 때만 쓰는 보조 등록 수단입니다. 공유 `~/.codex/config.toml` 기록 성공은 Desktop 메뉴·도구 노출 성공과 다릅니다. 메뉴와 `/mcp`가 계속 보이지 않으면 앱 업데이트와 계정·워크스페이스 제공 여부를 확인한 뒤 원격 HTTPS MCP 또는 Secure MCP Tunnel을 사용합니다. 생성된 로컬 플러그인 마켓플레이스는 별도 플러그인 배포가 필요할 때만 쓰는 선택 산출물입니다.
 이 `.bat` 파일들은 내부에서 생성된 PowerShell 스크립트를 대신 실행하는 안전한 연결 버튼입니다.
 이 폴더를 이동하거나 이름을 바꿨다면 새 위치에서 연결 버튼을 다시 실행합니다. 그러면 AI 앱 설정의 실행 파일과 `data` 경로가 새 폴더 기준으로 교체됩니다.
 같은 MCP 이름으로 다시 생성하고 연결 버튼을 실행하면 기존 설정을 중복 추가하지 않고 교체합니다. 새 번들은 현재 승인된 전체 corpus를 다시 만들기 때문에 추가·개정 청크가 같은 MCP 이름에 반영됩니다.
@@ -7726,26 +8678,27 @@ powershell -ExecutionPolicy Bypass -File "{files.get('connect', SETUP_BUNDLE_FIL
 
 - 사전 진단: `{files.get('doctor_bat', SETUP_BUNDLE_FILES['doctor_bat'])}`를 먼저 실행합니다. indexed record, smoke 문서 배제, append-only approval journal coverage가 통과해야 합니다.
 - Claude Desktop: `{files.get('connect_claude_desktop_bat', SETUP_BUNDLE_FILES['connect_claude_desktop_bat'])}`를 더블클릭합니다. 배포 ZIP 안의 JSON/TOML은 `<BUNDLE_DIR>` 템플릿이므로 수동 설정 전에 모든 표시를 현재 압축 해제 폴더의 절대 경로로 바꿔야 합니다(JSON에서는 역슬래시를 이스케이프). 그 뒤에만 `{files.get('claude_desktop', SETUP_BUNDLE_FILES['claude_desktop'])}`의 `mcpServers`를 Claude Desktop 설정에 병합합니다. 자동 병합은 doctor gate를 통과한 뒤 `connect_mcp_client.ps1 -InstallPackage -Target claude-desktop -InstallClaudeDesktop`로 수행하며, 설치된 사용자 설정으로 initialize·tools/list·get_index_status를 검증합니다. 이 상태는 Desktop 로더·대화 노출 확인 대기입니다. JSON 파싱 오류가 났다면 먼저 `connect_mcp_client.ps1 -Target claude-desktop -ValidateClaudeDesktop`으로 기존 설정 파일을 검증합니다.
-- Claude Code: `{files.get('claude_code_agent_prompt', SETUP_BUNDLE_FILES['claude_code_agent_prompt'])}`를 에이전트에 붙여넣는 방식을 우선 사용합니다. 보조 BAT `{files.get('connect_claude_code_bat', SETUP_BUNDLE_FILES['connect_claude_code_bat'])}`도 로컬 stdio MCP를 사용자 범위(`--scope user`)에 등록하고 `claude mcp get`으로 확인합니다. 따라서 생성 폴더 밖의 다른 프로젝트에서도 같은 사용자에게 보입니다.
+- Claude Code: `{files.get('claude_code_agent_prompt', SETUP_BUNDLE_FILES['claude_code_agent_prompt'])}`를 에이전트에 붙여넣는 방식을 우선 사용합니다. 보조 BAT `{files.get('connect_claude_code_bat', SETUP_BUNDLE_FILES['connect_claude_code_bat'])}`도 로컬 stdio MCP를 공식 사용자 범위(`--scope user`, 저장소 `~/.claude.json`)에 등록하고 `claude mcp get`으로 확인합니다. `~/.claude/settings.json`의 `enabledMcpjsonServers`는 이 user-scope 등록 목록이 아닙니다. 따라서 생성 폴더 밖의 다른 프로젝트에서도 같은 사용자에게 보입니다.
+- Claude 앱 custom connector: 승인된 HTTPS MCP URL만 `Customize > Connectors`에 등록하고 대화의 `+` > `Connectors`에서 활성화합니다. Team/Enterprise 조직 등록은 Owner가 `Organization settings > Connectors`에서 수행합니다. 아래 API JSON 조각을 앱 화면에 붙여 넣지 않습니다.
 - Claude API: `{files.get('claude_api', SETUP_BUNDLE_FILES['claude_api'])}`의 `mcp_servers`, `tools`, `betas`를 Messages API 요청에 넣습니다. `server_auth.token_env`가 있으면 요청 직전에 해당 환경변수 값을 `authorization_token`으로 주입하며, 토큰이나 비공식 `authorization_token_env` 필드를 JSON에 저장하지 않습니다. 요청 fragment 준비: `{str(claude_api_ready).lower()}`이며 실제 endpoint 또는 도구 호출 검증은 별도입니다.
 - 클라이언트 설정 smoke: `{files.get('client_config_smoke', SETUP_BUNDLE_FILES['client_config_smoke'])}`를 실행하면 생성된 Codex/Claude Desktop 설정 파일의 `command`/`args` 그대로 MCP를 띄우고 `list_tools`, `get_index_status`, `search`, `fetch`를 확인합니다.
 - 런타임 smoke 검증: `{files.get('validate', SETUP_BUNDLE_FILES['validate'])}`를 실행하면 `data/mcp_runtime_manifest.json`의 `recommended_smoke_query`를 읽어 실제 번들 데이터로 `search`/`fetch`를 확인합니다.
 
 ## ChatGPT Desktop 로컬 direct MCP 및 Codex CLI 연결
 
-- ChatGPT Desktop 로컬 direct MCP: `{files.get('chatgpt_desktop_agent_prompt', SETUP_BUNDLE_FILES['chatgpt_desktop_agent_prompt'])}`에 표시된 Name, STDIO, Command, Working directory, Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하는 방식이 기본입니다. Save 후 Restart하고 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 실제 `get_index_status`를 호출합니다. 메뉴가 없거나 수동 입력이 어려울 때만 보조 BAT `{files.get('connect_chatgpt_desktop_bat', SETUP_BUNDLE_FILES['connect_chatgpt_desktop_bat'])}`를 사용합니다. `@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않습니다.
-- Codex CLI 호환: `{files.get('codex_agent_prompt', SETUP_BUNDLE_FILES['codex_agent_prompt'])}`를 Codex 에이전트에 붙여넣는 방식을 우선 사용합니다. 실행 권한이 없으면 `{files.get('connect_codex_bat', SETUP_BUNDLE_FILES['connect_codex_bat'])}`를 사용합니다. 수동 설정이 필요하면 먼저 `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`의 모든 `<BUNDLE_DIR>`을 `C:/MCP/aksmcp2`처럼 슬래시(`/`)를 쓴 현재 압축 해제 폴더의 절대 경로로 바꿉니다(역슬래시를 쓰려면 TOML 규칙에 맞게 각각 이스케이프). 그 뒤 TOML 블록을 `$HOME\\.codex\\config.toml`에 붙여 넣거나 기존 `[mcp_servers.{server_name}]` 블록과 교체합니다.
+- ChatGPT Desktop 로컬 direct MCP: `{files.get('chatgpt_desktop_agent_prompt', SETUP_BUNDLE_FILES['chatgpt_desktop_agent_prompt'])}`에 표시된 Name, STDIO, Command, Working directory, Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 입력하는 방식이 기본입니다. Save 후 Restart하고 새 대화에서 `/mcp`로 `{server_name}`을 확인한 뒤 실제 `search`와 `fetch`를 호출합니다. 수동 입력이 어렵거나 고급 설정 파일 경로를 사용할 때만 보조 BAT `{files.get('connect_chatgpt_desktop_bat', SETUP_BUNDLE_FILES['connect_chatgpt_desktop_bat'])}`를 사용합니다. BAT는 공유 `~/.codex/config.toml`을 기록·검증하지만 제품 기능을 활성화하지는 않습니다. `@{server_name}` 반복 입력은 설치나 연결 확인을 대신하지 않습니다.
+- Codex CLI 호환: `{files.get('connect_codex_bat', SETUP_BUNDLE_FILES['connect_codex_bat'])}`를 기본 연결 버튼으로 사용합니다. 수동 설정이 필요하면 먼저 `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`의 모든 `<BUNDLE_DIR>`을 `C:/MCP/aksmcp2`처럼 슬래시(`/`)를 쓴 현재 압축 해제 폴더의 절대 경로로 바꿉니다(역슬래시를 쓰려면 TOML 규칙에 맞게 각각 이스케이프). 그 뒤 TOML 블록을 `$HOME\\.codex\\config.toml`에 넣거나 기존 `[mcp_servers.{server_name}]` 블록과 교체합니다. 선택적 에이전트 요청문에는 비밀값이나 별도 설정 블록을 추가하지 않습니다.
 - 이 스니펫은 `--data-dir`을 이 번들의 `data` 폴더로 고정하고 `--no-warm-cache`와 저장소 모드 플래그를 포함합니다. 그래서 예전 번들이나 다른 MCP 서버를 물고 느리게 인식하는 문제를 줄입니다.
-- 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 설치가 성공하면 선택한 Python과 MCP 명령 모듈 8개의 SHA-256 build identity를 `runtime_python.json` schema 2에 기록합니다. launcher는 `PYTHONPATH`를 격리해 이 identity를 다시 확인한 뒤 저장소 checkout, `REG_RAG_PYTHON`, PATH보다 먼저 사용합니다. marker가 손상되거나 같은 Python의 모듈이 바뀌면 다른 runtime으로 조용히 fallback하지 않고 재설치를 요구합니다. marker가 아직 없는 설치 전 단계에서만 생성 당시 checkout과 명시적 runtime 탐색을 허용합니다.
+- 로컬 stdio 설정은 `reg-rag-mcp-server`를 직접 부르지 않고 `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`를 PowerShell로 실행합니다. 설치가 성공하면 선택한 Python과 MCP 명령 모듈 {len(RUNTIME_IDENTITY_MODULES)}개의 SHA-256 build identity를 `runtime_python.json` schema 2에 기록합니다. launcher는 `PYTHONPATH`를 격리해 이 identity를 다시 확인한 뒤 저장소 checkout, `REG_RAG_PYTHON`, PATH보다 먼저 사용합니다. marker가 손상되거나 같은 Python의 모듈이 바뀌면 다른 runtime으로 조용히 fallback하지 않고 재설치를 요구합니다. marker가 아직 없는 설치 전 단계에서만 생성 당시 checkout과 명시적 runtime 탐색을 허용합니다.
 - Codex CLI 설정을 붙여 넣은 뒤에는 `reg-rag-mcp-doctor --client-profile bundle --bundle-dir . --allow-local-only-bundle --codex-config $HOME\\.codex\\config.toml`로 실제 설치된 설정을 확인합니다.
 
 ## ChatGPT 연결
 
-- ChatGPT Desktop 로컬 방식: `Settings > MCP servers > Add server` 내장 등록이 기본입니다. 생성 안내의 실제 입력값을 등록하고 Save 후 Restart한 뒤 새 대화에서 `/mcp`와 `get_index_status`를 확인합니다. 생성 플러그인은 별도 플러그인 배포가 명시적으로 필요할 때만 쓰는 선택 산출물입니다. 현재 제품 화면이 로컬 direct MCP를 노출하지 않으면 원격 HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다.
-- ChatGPT Desktop 전용 BAT는 내장 메뉴가 없거나 수동 입력이 어려울 때만 사용하는 보조 경로입니다. ChatGPT Desktop 연결 안내에는 Codex 에이전트 실행 명령을 표시하지 않습니다.
-- HTTPS 방식: `{files.get('run_chatgpt', SETUP_BUNDLE_FILES['run_chatgpt'])}`로 외부 응답 경계인 `chatgpt-data` MCP 서버를 실행합니다. ChatGPT Settings > Security and login에서 Developer mode를 켠 뒤 Settings > Plugins 또는 `https://chatgpt.com/plugins`에서 `{files.get('chatgpt', SETUP_BUNDLE_FILES['chatgpt'])}`의 `connector_url`로 개발자 모드 앱을 만듭니다. ChatGPT는 localhost MCP에 직접 연결하지 않습니다. HTTPS 설정 산출물 준비: `{str(chatgpt_ready).lower()}`이며 실제 endpoint 도달·도구 목록 발견·대화 첨부 검증은 별도입니다.
+- ChatGPT Desktop 로컬 방식: `Settings > MCP servers > Add server` 내장 등록이 기본입니다. 생성 안내의 실제 입력값을 등록하고 Save 후 Restart한 뒤 새 대화에서 `/mcp`와 `search`·`fetch`를 확인합니다. 생성 플러그인은 별도 플러그인 배포가 명시적으로 필요할 때만 쓰는 선택 산출물입니다. 현재 제품 화면이 로컬 direct MCP를 노출하지 않으면 원격 HTTPS 또는 Secure MCP Tunnel 방식을 사용합니다.
+- ChatGPT Desktop 전용 BAT는 수동 입력이 어렵거나 고급 설정 파일 경로가 필요할 때만 사용하는 보조 경로입니다. `~/.codex/config.toml` 기록 성공을 Desktop 연결 완료로 과장하지 않으며, 메뉴와 `/mcp`가 현재 제품에 노출되지 않으면 앱 업데이트·계정 정책 확인 후 원격 HTTPS 또는 Secure MCP Tunnel로 전환합니다. ChatGPT Desktop 연결 안내에는 Codex 에이전트 실행 명령을 표시하지 않습니다.
+- HTTPS 방식: `{files.get('run_chatgpt', SETUP_BUNDLE_FILES['run_chatgpt'])}`로 외부 응답 경계인 `chatgpt-data` MCP 서버를 실행합니다. 직접 인증 endpoint는 MCP OAuth 2.1을 구현해야 하며 정적 `MCP_AUTH_TOKEN`을 ChatGPT에 입력할 수 없습니다. discovery·PKCE·audience·scope·callback 검증 후 `--chatgpt-oauth-ready`로 생성한 경우에만 ChatGPT Settings > Security and login에서 Developer mode를 켜고 Settings > Plugins 또는 https://chatgpt.com/plugins 의 +에서 `{files.get('chatgpt', SETUP_BUNDLE_FILES['chatgpt'])}`의 `connector_url`을 MCP server URL로 등록합니다. ChatGPT는 localhost MCP나 로컬 Codex `config.toml`을 웹 대화에서 직접 읽지 않습니다. 새 대화의 + > More에서 앱을 선택합니다. 검토·배포된 marketplace 플러그인은 개발자 모드 초안 앱과 별도 상태입니다. HTTPS 설정 산출물 준비: `{str(chatgpt_ready).lower()}`이며 실제 endpoint 도달·도구 목록 발견·대화 첨부 검증은 별도입니다.
 - 상태 판정: `plugin_registered=true`는 companion JSON, 설치된 플러그인 캐시, `codex plugin list --json`의 exact version/source, `codex mcp get --json`의 현재 번들 경로가 모두 일치할 때만 기록합니다. `direct_stdio_verified`와 `transport_end_to_end_verified`는 직접 전송 검증이며, `desktop_tool_scan_verified`, `conversation_attachment_verified`, Desktop `end_to_end_verified`는 제품 화면에서 실제 확인하기 전까지 false입니다.
-- 내부망/비공개 방식: 외부 inbound 방화벽을 열지 않아야 하면 `{files.get('openai_tunnel', SETUP_BUNDLE_FILES['openai_tunnel'])}`를 사용합니다. `CONTROL_PLANE_API_KEY`와 `OPENAI_TUNNEL_ID`는 파일에 쓰지 말고 실행 환경변수로 설정합니다.
+- 내부망/비공개 방식: 외부 inbound 방화벽을 열지 않아야 하면 `{files.get('openai_tunnel', SETUP_BUNDLE_FILES['openai_tunnel'])}`를 사용합니다. `CONTROL_PLANE_API_KEY`와 `OPENAI_TUNNEL_ID`는 파일에 쓰지 말고 실행 환경변수로 설정합니다. Settings > Security and login에서 Developer mode를 켜고 Settings > Plugins 또는 https://chatgpt.com/plugins 에서 +로 앱을 만든 뒤 Connection을 Tunnel로 선택합니다. 공개 HTTPS 방식은 같은 화면에서 MCP server URL을 입력하며, 검토·배포된 marketplace 플러그인 설치는 별도 단계입니다.
 
 ## 사전 진단
 
@@ -7762,7 +8715,7 @@ powershell -ExecutionPolicy Bypass -File "{files.get('doctor', SETUP_BUNDLE_FILE
 ## 보안 주의
 
 - 토큰, API 키, 터널 ID 같은 승인값을 파일에 저장하지 마십시오.
-- 원격 HTTP/Tunnel 실행 전에 `MCP_AUTH_TOKEN`, `CONTROL_PLANE_API_KEY`, `OPENAI_TUNNEL_ID`를 승인된 환경변수로 설정하십시오.
+- `MCP_AUTH_TOKEN`은 OAuth gateway 뒤의 origin 보호용이며 ChatGPT에 입력하는 인증값이 아닙니다. 직접 HTTPS 앱은 MCP OAuth 2.1이 필요하고, 비공개 서버는 `CONTROL_PLANE_API_KEY`와 `OPENAI_TUNNEL_ID`를 승인된 실행 환경에만 설정해 Secure MCP Tunnel을 사용하십시오.
 - 생성된 HTTP 실행 스크립트는 서버 시작 전에 `reg-rag-mcp-doctor --fail-on-warning`을 실행합니다.
 - ChatGPT 또는 Claude 원격 MCP로 반환되는 데이터는 외부 AI 서비스에 전달될 수 있습니다. 공개 가능 데이터 또는 별도 승인된 데이터만 사용하십시오.
 - 비공개 규정 데이터는 로컬 stdio 또는 승인된 내부망 MCP 연결을 우선 사용하십시오.
@@ -7780,10 +8733,14 @@ chunk_id를 바꾸면 승인 저널과 벡터 ID가 함께 바뀌므로 하지 �
 
 ## 공식 참고
 
+- ChatGPT Desktop/Codex MCP: https://learn.chatgpt.com/docs/extend/mcp
 - ChatGPT와 Codex 플러그인: https://help.openai.com/en/articles/20001256-plugins-in-codex
 - ChatGPT 개발자 모드와 MCP 앱: https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta
+- ChatGPT MCP 앱 인증: https://developers.openai.com/apps-sdk/build/auth
+- OpenAI Secure MCP Tunnel: https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
 - MCP Streamable HTTP 전송 규격: https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
 - Claude API MCP connector: https://docs.anthropic.com/en/docs/agents-and-tools/mcp-connector
+- Claude custom connectors: https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp
 - Claude Code MCP: https://docs.anthropic.com/en/docs/claude-code/mcp
 """
 
@@ -8050,7 +9007,12 @@ def _powershell_claude_code_stdio_bundle_script(
     lines: list[str] = [
         '$ErrorActionPreference = "Stop"',
         *_powershell_bundle_data_dir_lines(),
+        *_powershell_bundle_runtime_module_resolver_lines(),
         '$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"',
+        '$ClaudeEvidencePath = Join-Path $BundleDir "claude_code_registration_evidence.json"',
+        '$ClaudeSmokeReport = Join-Path $BundleDir "mcp_claude_code_registration_smoke.json"',
+        'if (Test-Path -LiteralPath $ClaudeEvidencePath) { Remove-Item -LiteralPath $ClaudeEvidencePath -Force }',
+        'if (Test-Path -LiteralPath $ClaudeSmokeReport) { Remove-Item -LiteralPath $ClaudeSmokeReport -Force }',
         'if (-not (Test-Path -LiteralPath $StdioLauncher)) { throw "Missing generated stdio launcher: $StdioLauncher" }',
         'function Assert-Command([string]$Name) { if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { throw "$Name was not found on PATH. Install this package in the active Python environment first." } }',
         'function Invoke-ClaudeMcpCli([string[]]$Arguments) {',
@@ -8062,8 +9024,9 @@ def _powershell_claude_code_stdio_bundle_script(
         '    $ErrorActionPreference = "Continue"',
         '    [Console]::OutputEncoding = $Utf8NoBom',
         '    $OutputEncoding = $Utf8NoBom',
+        '    $global:LASTEXITCODE = 1',
         '    $CommandOutput = @(& claude @Arguments 2>&1)',
-        '    $CommandExitCode = $LASTEXITCODE',
+        '    $CommandExitCode = [int]$global:LASTEXITCODE',
         '  } finally {',
         '    $OutputEncoding = $PreviousPowerShellOutputEncoding',
         '    [Console]::OutputEncoding = $PreviousConsoleOutputEncoding',
@@ -8074,6 +9037,28 @@ def _powershell_claude_code_stdio_bundle_script(
         'function Get-ClaudeUserConfigPath {',
         '  if ($env:USERPROFILE) { return Join-Path $env:USERPROFILE ".claude.json" }',
         '  throw "Cannot determine the Claude Code user config path."',
+        '}',
+        'function Test-ExactClaudeMcpArguments([object[]]$Actual, [object[]]$Expected) {',
+        '  $ActualValues = @($Actual | ForEach-Object { [string]$_ })',
+        '  $ExpectedValues = @($Expected | ForEach-Object { [string]$_ })',
+        '  if ($ActualValues.Count -ne $ExpectedValues.Count) { return $false }',
+        '  for ($Index = 0; $Index -lt $ExpectedValues.Count; $Index++) {',
+        '    if (-not [string]::Equals($ActualValues[$Index], $ExpectedValues[$Index], [System.StringComparison]::Ordinal)) { return $false }',
+        '  }',
+        '  return $true',
+        '}',
+        'function Assert-ClaudeUserConfigContract([string]$ConfigPath, [object[]]$ExpectedArgs) {',
+        '  if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { throw "Claude Code user-scope config was not written." }',
+        '  try { $InstalledConfig = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }',
+        '  catch { throw "Claude Code user-scope config is not valid JSON." }',
+        '  if (-not $InstalledConfig.PSObject.Properties["mcpServers"]) { throw "Claude Code user-scope config has no mcpServers object." }',
+        '  $InstalledProperty = $InstalledConfig.mcpServers.PSObject.Properties["' + server_name + '"]',
+        '  if (-not $InstalledProperty) { throw "Claude Code user-scope config has no exact server entry for ' + server_name + '." }',
+        '  $InstalledServer = $InstalledProperty.Value',
+        '  if (-not [string]::Equals([string]$InstalledServer.type, "stdio", [System.StringComparison]::Ordinal)) { throw "Claude Code user-scope entry has the wrong transport type." }',
+        '  if (-not [string]::Equals([string]$InstalledServer.command, "powershell.exe", [System.StringComparison]::OrdinalIgnoreCase)) { throw "Claude Code user-scope entry has the wrong command." }',
+        '  if (-not (Test-ExactClaudeMcpArguments @($InstalledServer.args) $ExpectedArgs)) { throw "Claude Code user-scope entry has incomplete, duplicated, reordered, or mismatched arguments." }',
+        '  return "sha256:" + (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()',
         '}',
         'function Restore-ClaudeConfigAtomically([string]$BackupPath, [string]$TargetPath) {',
         '  $Parent = Split-Path -Parent $TargetPath',
@@ -8098,6 +9083,7 @@ def _powershell_claude_code_stdio_bundle_script(
         '$ClaudeUserConfig = Get-ClaudeUserConfigPath',
         '$ClaudeConfigExisted = $false',
         '$ClaudeConfigBackup = $null',
+        '$ClaudeConfigBackupFingerprint = $null',
         '$ClaudeConfigMutex = New-Object System.Threading.Mutex($false, "Local\\PRMCPBuilder-ClaudeCodeConfig")',
         '$ClaudeConfigLockAcquired = $false',
         '$ClaudeMutationStarted = $false',
@@ -8106,7 +9092,12 @@ def _powershell_claude_code_stdio_bundle_script(
         '  if (-not $ClaudeConfigLockAcquired) { throw "Another Claude Code MCP registration is running. Wait for it to finish, then retry." }',
         '  $ClaudeConfigExisted = Test-Path -LiteralPath $ClaudeUserConfig -PathType Leaf',
         '  if ($ClaudeConfigExisted) { $ClaudeConfigBackup = Join-Path (Split-Path -Parent $ClaudeUserConfig) (".claude.{0}.{1}.transaction-bak" -f $PID, [Guid]::NewGuid().ToString("N")) }',
-        '  if ($ClaudeConfigExisted) { Copy-Item -LiteralPath $ClaudeUserConfig -Destination $ClaudeConfigBackup -Force }',
+        '  if ($ClaudeConfigExisted) {',
+        '    $ClaudeOriginalConfigFingerprint = (Get-FileHash -LiteralPath $ClaudeUserConfig -Algorithm SHA256).Hash',
+        '    Copy-Item -LiteralPath $ClaudeUserConfig -Destination $ClaudeConfigBackup -Force',
+        '    $ClaudeConfigBackupFingerprint = (Get-FileHash -LiteralPath $ClaudeConfigBackup -Algorithm SHA256).Hash',
+        '    if (-not [string]::Equals($ClaudeOriginalConfigFingerprint, $ClaudeConfigBackupFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Claude Code user config backup hash mismatch; registration was not attempted." }',
+        '  }',
         '  $ClaudeMutationStarted = $true',
         '# Remove both the legacy project-local entry and the target user entry before replacing it.',
         f'$null = Invoke-ClaudeMcpCli @("mcp", "remove", "{server_name}", "--scope", "local")',
@@ -8120,10 +9111,30 @@ def _powershell_claude_code_stdio_bundle_script(
         'if ($ClaudeGet.ExitCode -ne 0) { throw "Claude Code MCP registration could not be verified after writing user scope." }',
         '$ClaudeGetText = $ClaudeGet.Output -join [Environment]::NewLine',
         '$ClaudeScopeVerified = $ClaudeGetText -match "(?im)(Scope:\\s*User|user scope)"',
-        '$ClaudeCommandVerified = $ClaudeGetText.IndexOf("powershell.exe", [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
-        '$ClaudeLauncherVerified = $ClaudeGetText.IndexOf($StdioLauncher, [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
-        '$ClaudeDataVerified = $ClaudeGetText.IndexOf($BundleDataDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
-        'if (-not ($ClaudeScopeVerified -and $ClaudeCommandVerified -and $ClaudeLauncherVerified -and $ClaudeDataVerified)) { throw "Claude Code mcp get returned a stale, wrong-scope, or wrong-path entry." }',
+        '$ClaudeStatusConnected = $ClaudeGetText -match "(?im)^\\s*Status:\\s*(?:[^\\r\\n]*\\s)?Connected\\s*$"',
+        'if (-not ($ClaudeScopeVerified -and $ClaudeStatusConnected)) { throw "Claude Code mcp get returned a disconnected or wrong-scope user registration." }',
+        '$InstalledConfigFingerprint = Assert-ClaudeUserConfigContract $ClaudeUserConfig $LauncherArgs',
+        '$SmokeArgs = @("--server-name", "' + server_name + '", "--claude-code-config", $ClaudeUserConfig, "--out-json", $ClaudeSmokeReport, "--fail-on-issue")',
+        '$McpPython = Resolve-BundleModulePython "scripts.run_mcp_client_config_smoke"',
+        '$SmokeExitCode = Invoke-BundlePythonModule $McpPython "scripts.run_mcp_client_config_smoke" $SmokeArgs',
+        '$SmokeResult = $null',
+        'if (Test-Path -LiteralPath $ClaudeSmokeReport) { try { $SmokeResult = Get-Content -LiteralPath $ClaudeSmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $SmokeResult = $null } }',
+        '$SmokeResults = @($(if ($SmokeResult) { $SmokeResult.results } else { @() }))',
+        '$SmokeEntry = $(if ($SmokeResults.Count -eq 1) { $SmokeResults[0] } else { $null })',
+        '$SmokeConfigPathMatches = $false',
+        'if ($SmokeEntry) { try { $SmokeConfigPathMatches = [string]::Equals([System.IO.Path]::GetFullPath([string]$SmokeEntry.config_path), [System.IO.Path]::GetFullPath($ClaudeUserConfig), [System.StringComparison]::OrdinalIgnoreCase) } catch { $SmokeConfigPathMatches = $false } }',
+        '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and $SmokeResults.Count -eq 1 -and [string]$SmokeEntry.label -eq "claude_code" -and $SmokeConfigPathMatches -and [string]$SmokeEntry.command -eq "powershell.exe" -and (Test-ExactClaudeMcpArguments @($SmokeEntry.args) $LauncherArgs)',
+        'if (-not $SmokeVerified) { throw "Claude Code launch contract did not complete initialize, tools/list, and get_index_status." }',
+        '$PostSmokeConfigFingerprint = Assert-ClaudeUserConfigContract $ClaudeUserConfig $LauncherArgs',
+        'if (-not [string]::Equals($PostSmokeConfigFingerprint, $InstalledConfigFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Claude Code user-scope config changed during installed-entry smoke verification." }',
+        '$ContractCanonical = (@("user", "stdio", "powershell.exe") + $LauncherArgs) -join [char]0',
+        '$ContractBytes = [Text.Encoding]::UTF8.GetBytes($ContractCanonical)',
+        '$Sha256 = [Security.Cryptography.SHA256]::Create()',
+        'try { $ContractFingerprint = "sha256:" + ([BitConverter]::ToString($Sha256.ComputeHash($ContractBytes)).Replace("-", "").ToLowerInvariant()) } finally { $Sha256.Dispose() }',
+        '$Evidence = [ordered]@{ schema_version = "claude-code-registration-evidence-v1"; server_name = "' + server_name + '"; scope = "user"; status_connected = $true; registration_verified = $true; transport_verified = $true; config_entry_fingerprint = $ContractFingerprint }',
+        '$EvidenceJson = ($Evidence | ConvertTo-Json -Depth 10) + [Environment]::NewLine',
+        '$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)',
+        '[System.IO.File]::WriteAllText($ClaudeEvidencePath, $EvidenceJson, $Utf8NoBom)',
         '} catch {',
         '  $ClaudeInstallError = $_',
         '  $ClaudeRollbackComplete = $false',
@@ -8596,7 +9607,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--remote-auth-token-env",
         default="MCP_AUTH_TOKEN",
-        help="Environment variable used by generated remote HTTP server commands for bearer auth.",
+        help=(
+            "Environment variable used by generated remote HTTP origin commands for bearer auth. "
+            "ChatGPT cannot accept this as a custom API key; direct ChatGPT apps still require MCP OAuth 2.1."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-oauth-ready",
+        action="store_true",
+        help=(
+            "Attest that the public ChatGPT /mcp endpoint implements and has been tested with MCP OAuth 2.1. "
+            "Without this attestation the direct ChatGPT profile remains not ready; use Secure MCP Tunnel instead."
+        ),
     )
     parser.add_argument(
         "--min-visible-records",
@@ -8655,6 +9677,7 @@ def main() -> int:
         client_profile=args.client_profile,
         public_url=args.public_url,
         remote_auth_token_env=args.remote_auth_token_env,
+        chatgpt_oauth_ready=args.chatgpt_oauth_ready,
         min_visible_records=args.min_visible_records,
     )
     output_config = config

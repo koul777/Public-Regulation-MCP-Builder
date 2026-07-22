@@ -42,7 +42,11 @@ from scripts.generate_mcp_client_config import (
     write_mcp_setup_bundle,
     write_mcp_setup_bundle_zip,
 )
-from scripts.mcp_bundle_contract import ALL_SETUP_BUNDLE_FILES, REQUIRED_SETUP_BUNDLE_FILES
+from scripts.mcp_bundle_contract import (
+    ALL_SETUP_BUNDLE_FILES,
+    REQUIRED_SETUP_BUNDLE_FILES,
+    SETUP_BUNDLE_FILES,
+)
 
 
 def _assert_same_existing_path(
@@ -115,7 +119,33 @@ def _actual_runtime_marker_payload(python_executable: str | Path) -> dict[str, o
     return payload
 
 
-def _fake_client_config_smoke_source(message: str = "client-smoke-ok") -> str:
+def _install_v5_client_status_fixture(
+    fake_project_root: Path,
+    bundle_dir: Path,
+) -> None:
+    scripts_dir = fake_project_root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+        scripts_dir / "mcp_client_status.py",
+    )
+    status_path = bundle_dir / "bundle_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["runtime_fingerprint"] = "sha256:" + hashlib.sha256(
+        b"runtime-current"
+    ).hexdigest()
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _fake_client_config_smoke_source(
+    message: str = "client-smoke-ok",
+    *,
+    claude_code_label: str = "claude_code",
+) -> str:
     return (
         "import json, sys\n"
         "from datetime import datetime, timezone\n"
@@ -124,11 +154,233 @@ def _fake_client_config_smoke_source(message: str = "client-smoke-ok") -> str:
         "out = Path(args[args.index('--out-json') + 1])\n"
         "server_name = args[args.index('--server-name') + 1]\n"
         "targets = []\n"
-        "for flag, label in (('--codex-config', 'codex'), ('--claude-desktop-config', 'claude_desktop'), ('--plugin-mcp-config', 'chatgpt_desktop_local')):\n"
-        "    if flag in args: targets.append({'label': label, 'config_path': str(Path(args[args.index(flag) + 1])), 'passed': True, 'contract_verified': True})\n"
+        f"for flag, label in (('--codex-config', 'codex'), ('--claude-code-config', {claude_code_label!r}), ('--claude-desktop-config', 'claude_desktop'), ('--plugin-mcp-config', 'chatgpt_desktop_local')):\n"
+        "    if flag in args:\n"
+        "        config_path = Path(args[args.index(flag) + 1])\n"
+        "        target = {'label': label, 'config_path': str(config_path), 'passed': True, 'contract_verified': True}\n"
+        "        if label == 'claude_code':\n"
+        "            entry = json.loads(config_path.read_text(encoding='utf-8'))['mcpServers'][server_name]\n"
+        "            target.update({'command': entry['command'], 'args': entry['args']})\n"
+        "        targets.append(target)\n"
         "payload = {'report_type': 'mcp_client_config_smoke', 'generated_at': datetime.now(timezone.utc).isoformat(), 'server_name': server_name, 'passed': bool(targets), 'launcher_ready': bool(targets), 'process_started': bool(targets), 'mcp_initialized': bool(targets), 'tools_discovered': bool(targets), 'end_to_end_verified': bool(targets), 'results': targets}\n"
         "out.write_text(json.dumps(payload), encoding='utf-8')\n"
         f"print({message!r})\n"
+    )
+
+
+def _failing_client_config_smoke_source(message: str = "forced-client-smoke-failure") -> str:
+    return (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "out = Path(args[args.index('--out-json') + 1])\n"
+        "server_name = args[args.index('--server-name') + 1]\n"
+        "payload = {'report_type': 'mcp_client_config_smoke', 'server_name': server_name, 'passed': False, 'launcher_ready': True, 'process_started': True, 'mcp_initialized': False, 'tools_discovered': False, 'end_to_end_verified': False, 'results': [{'label': 'claude_desktop', 'passed': False, 'contract_verified': False}]}\n"
+        "out.write_text(json.dumps(payload), encoding='utf-8')\n"
+        f"print({message!r})\n"
+        "raise SystemExit(7)\n"
+    )
+
+
+def _mutating_claude_desktop_smoke_source() -> str:
+    return (
+        "import json, sys\n"
+        "from datetime import datetime, timezone\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "out = Path(args[args.index('--out-json') + 1])\n"
+        "server_name = args[args.index('--server-name') + 1]\n"
+        "config_path = Path(args[args.index('--claude-desktop-config') + 1])\n"
+        "config = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "config['smoke_mutation'] = True\n"
+        "config_path.write_text(json.dumps(config), encoding='utf-8')\n"
+        "target = {'label': 'claude_desktop', 'config_path': str(config_path), 'passed': True, 'contract_verified': True}\n"
+        "payload = {'report_type': 'mcp_client_config_smoke', 'generated_at': datetime.now(timezone.utc).isoformat(), 'server_name': server_name, 'passed': True, 'launcher_ready': True, 'process_started': True, 'mcp_initialized': True, 'tools_discovered': True, 'end_to_end_verified': True, 'results': [target]}\n"
+        "out.write_text(json.dumps(payload), encoding='utf-8')\n"
+        "print('mutated-claude-desktop-config-after-smoke')\n"
+    )
+
+
+def _mutating_claude_code_smoke_source() -> str:
+    return (
+        "import json, sys\n"
+        "from datetime import datetime, timezone\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "out = Path(args[args.index('--out-json') + 1])\n"
+        "server_name = args[args.index('--server-name') + 1]\n"
+        "config_path = Path(args[args.index('--claude-code-config') + 1])\n"
+        "config = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "entry = config['mcpServers'][server_name]\n"
+        "config['smoke_mutation'] = True\n"
+        "config_path.write_text(json.dumps(config), encoding='utf-8')\n"
+        "target = {'label': 'claude_code', 'config_path': str(config_path), 'passed': True, 'contract_verified': True, 'command': entry['command'], 'args': entry['args']}\n"
+        "payload = {'report_type': 'mcp_client_config_smoke', 'generated_at': datetime.now(timezone.utc).isoformat(), 'server_name': server_name, 'passed': True, 'launcher_ready': True, 'process_started': True, 'mcp_initialized': True, 'tools_discovered': True, 'end_to_end_verified': True, 'results': [target]}\n"
+        "out.write_text(json.dumps(payload), encoding='utf-8')\n"
+        "print('mutated-claude-user-config-during-smoke')\n"
+    )
+
+
+def _fake_claude_transaction_cli_source() -> str:
+    return (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "profile = Path(os.environ['USERPROFILE'])\n"
+        "config_path = profile / '.claude.json'\n"
+        "log_path = Path(os.environ['CLAUDE_TEST_LOG'])\n"
+        "with log_path.open('a', encoding='utf-8') as handle:\n"
+        "    handle.write(' '.join(args) + '\\n')\n"
+        "if args[:2] == ['mcp', 'remove']:\n"
+        "    scope = args[args.index('--scope') + 1]\n"
+        "    server_name = args[2]\n"
+        "    if scope == 'user' and config_path.exists():\n"
+        "        config = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "        servers = config.get('mcpServers')\n"
+        "        if isinstance(servers, dict) and server_name in servers:\n"
+        "            del servers[server_name]\n"
+        "            config_path.write_text(json.dumps(config), encoding='utf-8')\n"
+        "            print('Removed prior MCP entry')\n"
+        "            raise SystemExit(0)\n"
+        "    print('No MCP server in requested scope')\n"
+        "    raise SystemExit(1)\n"
+        "if args[:2] == ['mcp', 'add']:\n"
+        "    separator = args.index('--')\n"
+        "    server_name = args[6]\n"
+        "    command = args[separator + 1]\n"
+        "    registered_args = args[separator + 2:]\n"
+        "    mutation = os.environ.get('CLAUDE_FAKE_INSTALLED_MUTATION', '')\n"
+        "    if mutation == 'reorder':\n"
+        "        registered_args[0], registered_args[1] = registered_args[1], registered_args[0]\n"
+        "    elif mutation == 'duplicate':\n"
+        "        registered_args.append('--no-warm-cache')\n"
+        "    elif mutation == 'missing':\n"
+        "        registered_args.remove('--tool-profile')\n"
+        "    elif mutation == 'wrong-command':\n"
+        "        command = 'cmd.exe'\n"
+        "    config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.exists() else {}\n"
+        "    config.setdefault('mcpServers', {})[server_name] = {'type': 'stdio', 'command': command, 'args': registered_args}\n"
+        "    config_path.write_text(json.dumps(config), encoding='utf-8')\n"
+        "    print('Added MCP server aksmcp with user scope')\n"
+        "    raise SystemExit(0)\n"
+        "if args[:2] == ['mcp', 'get']:\n"
+        "    registered = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', os.environ['CLAUDE_EXPECTED_LAUNCHER'], '--data-dir', os.environ['CLAUDE_EXPECTED_DATA'], '--tenant-id', 'tenant-a', '--transport', 'stdio', '--flat-storage', '--tool-profile', 'full', '--no-warm-cache']\n"
+        "    print('aksmcp: Scope: User Command: powershell.exe ' + ' '.join(registered))\n"
+        "    print(f\"Status: {os.environ['CLAUDE_FAKE_GET_STATUS']}\")\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(2)\n"
+    )
+
+
+def _run_claude_code_transaction_failure(
+    root: Path,
+    *,
+    get_status: str,
+    smoke_source: str,
+    installed_mutation: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str], Path, bytes, Path, bytes, Path, bytes]:
+    config = build_mcp_client_config(
+        server_name="aksmcp",
+        client_profile="bundle",
+        data_dir="data",
+        tenant_id="tenant-a",
+    )
+    fake_project_root = root / "source-project"
+    scripts_dir = fake_project_root / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "__init__.py").write_text("", encoding="utf-8")
+    (scripts_dir / "check_mcp_connection_readiness.py").write_text(
+        'print("claude-transaction-doctor-ok")\n',
+        encoding="utf-8",
+    )
+    (scripts_dir / "run_mcp_client_config_smoke.py").write_text(
+        smoke_source,
+        encoding="utf-8",
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+        scripts_dir / "mcp_client_status.py",
+    )
+
+    bundle_dir = root / "bundle"
+    files = write_mcp_setup_bundle(
+        config,
+        bundle_dir,
+        server_name="aksmcp",
+        preferred_python=sys.executable,
+        preferred_project_root=fake_project_root,
+    )
+    (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+    status_path = bundle_dir / "bundle_status.json"
+    seeded_status = json.loads(status_path.read_text(encoding="utf-8"))
+    seeded_status["runtime_fingerprint"] = "runtime-current"
+    status_path.write_text(
+        json.dumps(seeded_status, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    user_profile = root / "claude-user"
+    claude_dir = user_profile / ".claude"
+    claude_dir.mkdir(parents=True)
+    claude_config = user_profile / ".claude.json"
+    claude_config_bytes = b'{\r\n  "sentinel": "original-claude-user-config"\r\n}\r\n'
+    claude_config.write_bytes(claude_config_bytes)
+    claude_settings = claude_dir / "settings.json"
+    claude_settings_bytes = b'{\r\n  "sentinel": "settings-must-not-change"\r\n}\r\n'
+    claude_settings.write_bytes(claude_settings_bytes)
+    home_mcp = user_profile / ".mcp.json"
+    home_mcp_bytes = b'{\r\n  "sentinel": "home-mcp-must-not-change"\r\n}\r\n'
+    home_mcp.write_bytes(home_mcp_bytes)
+
+    fake_bin = root / "fake-bin"
+    fake_bin.mkdir()
+    fake_cli = root / "fake_claude_cli.py"
+    fake_cli.write_text(_fake_claude_transaction_cli_source(), encoding="utf-8")
+    (fake_bin / "claude.cmd").write_text(
+        '@echo off\r\n"%CLAUDE_FAKE_PYTHON%" "%CLAUDE_FAKE_SCRIPT%" %*\r\nexit /b %ERRORLEVEL%\r\n',
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+    powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+    env["PATH"] = os.pathsep.join(
+        [str(fake_bin), str(windows_dir / "System32"), str(powershell_dir)]
+    )
+    env["USERPROFILE"] = str(user_profile)
+    env["CLAUDE_FAKE_PYTHON"] = str(Path(sys.executable).resolve())
+    env["CLAUDE_FAKE_SCRIPT"] = str(fake_cli.resolve())
+    env["CLAUDE_FAKE_GET_STATUS"] = get_status
+    if installed_mutation:
+        env["CLAUDE_FAKE_INSTALLED_MUTATION"] = installed_mutation
+    env["CLAUDE_TEST_LOG"] = str(root / "claude-calls.jsonl")
+    env["CLAUDE_EXPECTED_LAUNCHER"] = str((bundle_dir / "run_mcp_stdio_server.ps1").resolve())
+    env["CLAUDE_EXPECTED_DATA"] = str((bundle_dir / "data").resolve())
+    completed = subprocess.run(
+        [
+            str(windows_dir / "System32" / "cmd.exe"),
+            "/d",
+            "/c",
+            files["connect_claude_code_bat"],
+        ],
+        cwd=root,
+        env=env,
+        input="\n",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    return (
+        completed,
+        files,
+        claude_config,
+        claude_config_bytes,
+        claude_settings,
+        claude_settings_bytes,
+        home_mcp,
+        home_mcp_bytes,
     )
 
 
@@ -346,11 +598,11 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertNotIn(AGENT_CONNECT_BUNDLE_NAME_MARKER, rendered)
         self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, portable_prompt)
 
-    def test_program_copy_prompt_upgrades_existing_workspace_search_prompt(self) -> None:
+    def test_program_copy_prompt_blocks_unrecoverable_legacy_chatgpt_desktop_agent_prompt(self) -> None:
         legacy_prompt = """# ChatGPT Desktop 에이전트 MCP 연결 요청
 
 1. 현재 작업공간에서 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 `$BundleDir`로 삼고 `Set-Location -LiteralPath $BundleDir`을 실행해. 0개 또는 여러 개면 임의 경로를 선택하지 말고 중단해.
-2. `manifest.json`을 확인해.
+2. `connect_mcp_client.ps1 -Target codex -InstallCodex`를 실행해.
 """
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -361,17 +613,231 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 bundle_dir=bundle_dir,
             )
 
-        self.assertIn("생성 프로그램이 지정한 현재 번들 폴더", rendered)
-        self.assertIn(f"생성 프로그램이 지정한 번들 폴더 이름: `{bundle_dir.name}`", rendered)
-        self.assertIn("├─ manifest.json", rendered)
-        self.assertIn("├─ data\\", rendered)
-        self.assertIn("reg_rag_preprocessor-*.whl  (독립 배포용 wheel을 포함한 경우)", rendered)
-        self.assertIn("runtime_python.json", rendered)
-        self.assertIn("$BundleDir = '" + str(bundle_dir.resolve()) + "'", rendered)
-        self.assertIn("CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md", rendered)
-        self.assertIn("그 정확한 폴더를 작업공간으로 열거나 추가", rendered)
-        self.assertNotIn("현재 작업공간에서 `CHATGPT_DESKTOP", rendered)
-        self.assertIn("2. `manifest.json`을 확인해.", rendered)
+        self.assertIn(str(bundle_dir.resolve()), rendered)
+        self.assertIn("구형 형식이며 실행하면 안 됩니다", rendered)
+        self.assertIn("구형 `ChatGPT Desktop에 연결하기.bat`도 실행하지 마세요", rendered)
+        self.assertIn("Settings > MCP servers > Add server", rendered)
+        self.assertNotIn("-Target codex", rendered)
+        self.assertNotIn("-InstallCodex", rendered)
+
+    def test_program_copy_prompt_recovers_legacy_chatgpt_desktop_as_current_settings_guide(self) -> None:
+        legacy_prompt = """# ChatGPT Desktop 에이전트 MCP 연결 요청
+
+1. 현재 작업공간에서 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`를 정확히 하나 찾아 그 부모 폴더를 `$BundleDir`로 삼아.
+2. `connect_mcp_client.ps1 -Target codex -InstallCodex`를 실행해.
+"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "옮긴 MCP 번들"
+            bundle_dir.mkdir()
+            (bundle_dir / "data").mkdir()
+            (bundle_dir / SETUP_BUNDLE_FILES["stdio_launcher"]).write_text(
+                "# safe generated launcher fixture\n",
+                encoding="utf-8",
+            )
+            stale_root = Path(tmp) / "이전 생성 경로"
+            (bundle_dir / SETUP_BUNDLE_FILES["chatgpt_desktop_local"]).write_text(
+                json.dumps(
+                    {
+                        "server_name": "legacy-mcp",
+                        "ui_fields": {
+                            "name": "legacy-mcp",
+                            "command": "powershell.exe",
+                            "cwd": str(stale_root),
+                            "args": [
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-File",
+                                str(stale_root / "run_mcp_stdio_server.ps1"),
+                                "--data-dir",
+                                str(stale_root / "data"),
+                                "--tenant-id",
+                                "tenant-a",
+                                "--transport",
+                                "stdio",
+                                "--profile-id",
+                                "legacy-profile",
+                                "--flat-storage",
+                                "--tool-profile",
+                                "chatgpt-data",
+                                "--no-warm-cache",
+                            ],
+                            "env": {},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            rendered = render_agent_connect_prompt_for_program(legacy_prompt, bundle_dir=bundle_dir)
+
+        self.assertIn("# ChatGPT Desktop MCP 연결 안내", rendered)
+        self.assertIn("Settings > MCP servers > Add server", rendered)
+        self.assertIn("Name: legacy-mcp", rendered)
+        self.assertIn(f"Working directory: {bundle_dir.resolve()}", rendered)
+        self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), rendered)
+        self.assertIn(str((bundle_dir / "data").resolve()), rendered)
+        self.assertNotIn(str(stale_root), rendered)
+        self.assertNotIn("-Target codex", rendered)
+        self.assertNotIn("-InstallCodex", rendered)
+        self.assertIn("구형 BAT를 실행하지 말고", rendered)
+        self.assertNotIn("마지막의 보조 BAT를 실행", rendered)
+
+    def test_program_copy_prompt_blocks_marker_based_legacy_chatgpt_desktop_prompt(self) -> None:
+        legacy_prompt = (
+            "# ChatGPT Desktop 에이전트 MCP 연결 요청\n"
+            "파일: CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md\n"
+            f"번들: {AGENT_CONNECT_BUNDLE_DIR_MARKER}\n"
+            "powershell -File connect_mcp_client.ps1 -Target codex -InstallCodex\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "legacy-marker-bundle"
+            bundle_dir.mkdir()
+            rendered = render_agent_connect_prompt_for_program(legacy_prompt, bundle_dir=bundle_dir)
+
+        self.assertIn("연결 안내 갱신 필요", rendered)
+        self.assertIn("Settings > MCP servers > Add server", rendered)
+        self.assertNotIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, rendered)
+        self.assertNotIn("-Target codex", rendered)
+        self.assertNotIn("-InstallCodex", rendered)
+
+    def test_program_copy_prompt_uses_legacy_source_name_when_body_identity_is_missing(self) -> None:
+        bodies = {
+            "without_marker": "# truncated legacy prompt\nrun -Target codex -InstallCodex\n",
+            "with_marker": (
+                "# truncated legacy prompt\n"
+                f"bundle={AGENT_CONNECT_BUNDLE_DIR_MARKER}\n"
+                "run -Target codex -InstallCodex\n"
+            ),
+        }
+        for label, legacy_prompt in bodies.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                bundle_dir = Path(tmp) / "legacy bundle"
+                bundle_dir.mkdir()
+                rendered = render_agent_connect_prompt_for_program(
+                    legacy_prompt,
+                    bundle_dir=bundle_dir,
+                    source_name=Path(tmp) / "chatgpt_desktop_agent_connect_prompt.MD",
+                )
+
+            self.assertIn("연결 안내 갱신 필요", rendered)
+            self.assertIn("Settings > MCP servers > Add server", rendered)
+            self.assertNotIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, rendered)
+            self.assertNotIn("-Target codex", rendered)
+            self.assertNotIn("-InstallCodex", rendered)
+
+    def test_program_copy_prompt_rejects_semantically_corrupted_legacy_desktop_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "legacy bundle"
+            bundle_dir.mkdir()
+            (bundle_dir / "data").mkdir()
+            (bundle_dir / SETUP_BUNDLE_FILES["stdio_launcher"]).write_text(
+                "# safe generated launcher fixture\n",
+                encoding="utf-8",
+            )
+            stale_root = Path(tmp) / "old bundle"
+            base_args = [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(stale_root / "run_mcp_stdio_server.ps1"),
+                "--data-dir",
+                str(stale_root / "data"),
+                "--tenant-id",
+                "tenant-a",
+                "--transport",
+                "stdio",
+                "--profile-id",
+                "legacy-profile",
+                "--flat-storage",
+                "--tool-profile",
+                "full",
+                "--no-warm-cache",
+            ]
+            variants = {
+                "forbidden_codex_tokens": base_args + ["-Target", "codex", "-InstallCodex"],
+                "forbidden_connect_script": base_args + ["connect_mcp_client.ps1"],
+                "duplicate_data_dir": base_args + ["--data-dir", str(stale_root / "other-data")],
+                "unexpected_single_dash": base_args + ["-Command", "whoami"],
+                "forbidden_value": [
+                    "codex" if value == "legacy-profile" else value for value in base_args
+                ],
+            }
+            config_path = bundle_dir / SETUP_BUNDLE_FILES["chatgpt_desktop_local"]
+            for label, args in variants.items():
+                with self.subTest(label=label):
+                    config_path.write_text(
+                        json.dumps(
+                            {
+                                "server_name": "legacy-mcp",
+                                "ui_fields": {
+                                    "name": "legacy-mcp",
+                                    "command": "powershell.exe",
+                                    "cwd": str(stale_root),
+                                    "args": args,
+                                    "env": {},
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    rendered = render_agent_connect_prompt_for_program(
+                        "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+                        bundle_dir=bundle_dir,
+                    )
+                    self.assertIn("연결 안내 갱신 필요", rendered)
+                    self.assertNotIn("-Target", rendered)
+                    self.assertNotIn("-InstallCodex", rendered)
+                    self.assertNotIn("connect_mcp_client.ps1", rendered)
+
+    def test_program_copy_prompt_rejects_legacy_config_without_runtime_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "incomplete moved bundle"
+            bundle_dir.mkdir()
+            stale_root = Path(tmp) / "old bundle"
+            (bundle_dir / SETUP_BUNDLE_FILES["chatgpt_desktop_local"]).write_text(
+                json.dumps(
+                    {
+                        "server_name": "legacy-mcp",
+                        "ui_fields": {
+                            "name": "legacy-mcp",
+                            "command": "powershell.exe",
+                            "args": [
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-File",
+                                str(stale_root / "run_mcp_stdio_server.ps1"),
+                                "--data-dir",
+                                str(stale_root / "data"),
+                                "--tenant-id",
+                                "tenant-a",
+                                "--transport",
+                                "stdio",
+                                "--flat-storage",
+                                "--tool-profile",
+                                "full",
+                                "--no-warm-cache",
+                            ],
+                            "env": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rendered = render_agent_connect_prompt_for_program(
+                "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+                bundle_dir=bundle_dir,
+            )
+
+        self.assertIn("연결 안내 갱신 필요", rendered)
+        self.assertIn("파일 묶음을 다시 생성", rendered)
+        self.assertNotIn("Arguments —", rendered)
 
     def test_runtime_identity_payloads_are_encoded_for_powershell_native_argv(self) -> None:
         builder_source = base64.b64decode(_runtime_identity_builder_base64()).decode("utf-8")
@@ -1074,8 +1540,8 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             tenant_id="tenant-a",
         )
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
-        codex_start = wizard.index("function Invoke-CodexCli")
-        codex_end = wizard.index("\nfunction Test-CodexCliExecutable", codex_start)
+        codex_start = wizard.index("function Invoke-CodexCommandCapture")
+        codex_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", codex_start)
         codex_function = wizard[codex_start:codex_end]
         claude_script = config["quickstart"]["copy_paste"]["claude_code_stdio_ps"]
         claude_start = claude_script.index("function Invoke-ClaudeMcpCli")
@@ -1087,7 +1553,8 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertIn('$LoaderResult = Invoke-CodexCli @("mcp", "get", $ServerName, "--json")', wizard)
         self.assertIn("return Invoke-CodexCli -Arguments $Arguments", wizard)
         self.assertNotIn("$LoaderOutput = @(& codex", wizard)
-        self.assertEqual(1, wizard.count("$CommandOutput = @(& codex @Arguments 2>&1)"))
+        self.assertNotIn("$CommandOutput = @(& codex @Arguments 2>&1)", wizard)
+        self.assertEqual(1, wizard.count("$CommandOutput = @(& $Command @Arguments 2>&1)"))
         self.assertEqual(1, claude_script.count("$CommandOutput = @(& claude @Arguments 2>&1)"))
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1151,6 +1618,238 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                     self.assertEqual(949, result["after_console"])
                     self.assertEqual(20127, result["before_powershell"])
                     self.assertEqual(20127, result["after_powershell"])
+
+    def test_generated_codex_resolver_uses_one_trusted_executable_for_loader_and_fresh_probe(self) -> None:
+        config = build_mcp_client_config(
+            server_name="resolver-contract-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
+        app_cache_start = wizard.index("function Get-CodexAppCacheCandidate")
+        app_cache_end = wizard.index("\nfunction Resolve-CodexCliExecutable", app_cache_start)
+        app_cache_function = wizard[app_cache_start:app_cache_end]
+
+        self.assertLess(
+            wizard.index("$PathCandidate = Get-CodexPathCommandCandidate"),
+            wizard.index("$AppCacheCandidate = Get-CodexAppCacheCandidate"),
+        )
+        self.assertIn('Join-Path $env:LOCALAPPDATA "OpenAI\\Codex\\bin"', wizard)
+        self.assertIn("Get-AuthenticodeSignature -LiteralPath $CandidateFullPath", wizard)
+        self.assertIn('[string]$Signature.Status -ne "Valid"', wizard)
+        self.assertIn('$SignerSubject.IndexOf("OpenAI"', wizard)
+        self.assertIn("[System.IO.FileAttributes]::ReparsePoint", wizard)
+        self.assertNotIn("-Recurse", app_cache_function)
+        self.assertIn("Test-IsWindowsAppsCodexCommand $Candidate", wizard)
+        self.assertIn('$Command = Resolve-CodexCliExecutable', wizard)
+        self.assertIn('$CodexExecutable = Resolve-CodexCliExecutable', wizard)
+        self.assertIn('"--codex-executable", $CodexExecutable', wizard)
+        self.assertIn("executable_path_sha256", wizard)
+        self.assertNotIn("$Provenance.executable_path =", wizard)
+        self.assertIn("desktop_app_server_error = $SafeAppServerError", wizard)
+        self.assertNotIn("desktop_app_server_error = $(if ($Report) { $Report.error", wizard)
+
+    @unittest.skipUnless(os.name == "nt", "Codex PATH precedence is Windows-specific.")
+    def test_generated_codex_resolver_prefers_working_path_command_over_app_cache(self) -> None:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is not available.")
+        config = build_mcp_client_config(
+            server_name="resolver-path-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
+        resolver_start = wizard.index("function Invoke-CodexCommandCapture")
+        resolver_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", resolver_start)
+        resolver_source = wizard[resolver_start:resolver_end]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "path-bin"
+            fake_bin.mkdir()
+            (fake_bin / "codex.cmd").write_text(
+                "@echo off\r\n"
+                'if "%1"=="--version" echo codex-cli path-fixture&& exit /b 0\r\n'
+                'echo {"source":"path"}\r\n'
+                "exit /b 0\r\n",
+                encoding="utf-8",
+            )
+            local_app_data = root / "local-app-data"
+            unsigned_candidate = local_app_data / "OpenAI" / "Codex" / "bin" / "999" / "codex.exe"
+            unsigned_candidate.parent.mkdir(parents=True)
+            unsigned_candidate.write_bytes(b"unsigned-app-cache-fixture")
+            probe_path = root / "resolver-path-probe.ps1"
+            probe_path.write_text(
+                resolver_source
+                + "\n$Result = Invoke-CodexCli @(\"probe\")\n"
+                + "[pscustomobject]@{ exit_code = $Result.ExitCode; output = ($Result.Output | Out-String).Trim() } | ConvertTo-Json -Compress\n",
+                encoding="utf-8-sig",
+            )
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            env["PATH"] = os.pathsep.join(
+                [str(fake_bin), str(windows_dir / "System32"), str(powershell_dir)]
+            )
+            env["LOCALAPPDATA"] = str(local_app_data)
+            completed = subprocess.run(
+                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", probe_path],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(0, result["exit_code"])
+        self.assertEqual('{"source":"path"}', result["output"])
+
+    @unittest.skipUnless(os.name == "nt", "Codex app-cache fallback is Windows-specific.")
+    def test_generated_codex_resolver_accepts_valid_openai_signed_app_cache_candidate(self) -> None:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is not available.")
+        config = build_mcp_client_config(
+            server_name="resolver-app-cache-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
+        resolver_start = wizard.index("function Invoke-CodexCommandCapture")
+        resolver_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", resolver_start)
+        resolver_source = wizard[resolver_start:resolver_end]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_app_data = root / "local-app-data"
+            candidate = local_app_data / "OpenAI" / "Codex" / "bin" / "fixture-version" / "codex.exe"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"signed-executable-fixture")
+            probe_path = root / "resolver-app-cache-probe.ps1"
+            probe_path.write_text(
+                resolver_source
+                + "\nfunction Get-AuthenticodeSignature { [CmdletBinding()] param([string]$LiteralPath)\n"
+                + "  [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=OpenAI OpCo, LLC' } }\n"
+                + "}\n"
+                + "function Test-CodexCommandVersion([string]$Command) { return Test-Path -LiteralPath $Command -PathType Leaf }\n"
+                + "$Resolved = Resolve-CodexCliExecutable\n"
+                + "[pscustomobject]@{ found = -not [string]::IsNullOrWhiteSpace($Resolved); file_name = [System.IO.Path]::GetFileName($Resolved) } | ConvertTo-Json -Compress\n",
+                encoding="utf-8-sig",
+            )
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            env["PATH"] = os.pathsep.join(
+                [str(windows_dir / "System32"), str(powershell_dir)]
+            )
+            env["LOCALAPPDATA"] = str(local_app_data)
+            completed = subprocess.run(
+                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", probe_path],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["found"])
+        self.assertEqual("codex.exe", result["file_name"])
+        self.assertNotIn(str(candidate), completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Codex PATH fallback is Windows-specific.")
+    def test_generated_codex_resolver_skips_windowsapps_and_broken_path_candidates(self) -> None:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is not available.")
+        config = build_mcp_client_config(
+            server_name="resolver-fallback-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
+        resolver_start = wizard.index("function Invoke-CodexCommandCapture")
+        resolver_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", resolver_start)
+        resolver_source = wizard[resolver_start:resolver_end]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_base = dict(os.environ)
+            windows_dir = Path(env_base.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            for label in ("windows_apps", "broken"):
+                with self.subTest(label=label):
+                    case_root = root / label
+                    local_app_data = case_root / "local-app-data"
+                    first_bin = (
+                        local_app_data / "Microsoft" / "WindowsApps"
+                        if label == "windows_apps"
+                        else case_root / "broken-bin"
+                    )
+                    working_bin = case_root / "working-bin"
+                    first_bin.mkdir(parents=True)
+                    working_bin.mkdir(parents=True)
+                    blocked_marker = case_root / "blocked-invoked.txt"
+                    if label == "windows_apps":
+                        (first_bin / "codex.cmd").write_text(
+                            "@echo off\r\n"
+                            f'echo invoked>"{blocked_marker}"\r\n'
+                            'if "%1"=="--version" echo codex-cli 9.9.9&& exit /b 0\r\n'
+                            'echo {"source":"windowsapps"}\r\n',
+                            encoding="utf-8",
+                        )
+                    else:
+                        (first_bin / "codex.cmd").write_text(
+                            "@echo off\r\n"
+                            'if "%1"=="--version" exit /b 9\r\n'
+                            'echo {"source":"broken"}\r\n'
+                            "exit /b 0\r\n",
+                            encoding="utf-8",
+                        )
+                    (working_bin / "codex.cmd").write_text(
+                        "@echo off\r\n"
+                        'if "%1"=="--version" echo codex-cli 1.2.3&& exit /b 0\r\n'
+                        'echo {"source":"working"}\r\n'
+                        "exit /b 0\r\n",
+                        encoding="utf-8",
+                    )
+                    probe_path = case_root / "resolver-fallback-probe.ps1"
+                    probe_path.write_text(
+                        resolver_source
+                        + "\n$Result = Invoke-CodexCli @(\"probe\")\n"
+                        + "[pscustomobject]@{ exit_code = $Result.ExitCode; output = ($Result.Output | Out-String).Trim() } | ConvertTo-Json -Compress\n",
+                        encoding="utf-8-sig",
+                    )
+                    env = dict(env_base)
+                    env["PATH"] = os.pathsep.join(
+                        [str(first_bin), str(working_bin), str(windows_dir / "System32"), str(powershell_dir)]
+                    )
+                    env["LOCALAPPDATA"] = str(local_app_data)
+                    completed = subprocess.run(
+                        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", probe_path],
+                        cwd=case_root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=30,
+                    )
+
+                    self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+                    result = json.loads(completed.stdout)
+                    self.assertEqual(0, result["exit_code"])
+                    self.assertEqual('{"source":"working"}', result["output"])
+                    if label == "windows_apps":
+                        self.assertFalse(blocked_marker.exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows console-script precedence is Windows-specific.")
     def test_install_script_moves_selected_python_scripts_ahead_of_stale_path_commands(self) -> None:
@@ -2048,19 +2747,39 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             public_url="https://mcp.example.go.kr/govreg",
             tenant_id="tenant-a",
             tenant_storage_isolation=True,
+            chatgpt_oauth_ready=True,
         )
 
         self.assertEqual(config["connector_url"], "https://mcp.example.go.kr/govreg/mcp")
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertTrue(config["chatgpt_setup"]["https_endpoint_ready"])
+        self.assertIn("Settings > Security and login", config["chatgpt_setup"]["location"])
         self.assertIn("Settings > Plugins", config["chatgpt_setup"]["location"])
-        self.assertIn("https://chatgpt.com/plugins", config["chatgpt_setup"]["location"])
         self.assertIn("Developer mode", " ".join(config["connection_steps"]))
-        self.assertNotIn("Apps/Connectors", json.dumps(config, ensure_ascii=False))
+        self.assertIn("+ > More", " ".join(config["connection_steps"]))
+        direct_setup = json.dumps(
+            {
+                "chatgpt_setup": config["chatgpt_setup"],
+                "connection_steps": config["connection_steps"],
+            },
+            ensure_ascii=False,
+        )
+        self.assertIn("Settings > Security and login", direct_setup)
+        self.assertIn("Settings > Plugins", direct_setup)
+        self.assertIn("https://chatgpt.com/plugins", direct_setup)
+        self.assertNotIn("Settings > Apps > Advanced Settings", direct_setup)
+        self.assertNotIn("Settings > Apps > Create", direct_setup)
+        self.assertIn(
+            "Settings > Security and login",
+            " ".join(config["openai_secure_tunnel"]["chatgpt_setup"]),
+        )
         self.assertNotIn("@", json.dumps(config, ensure_ascii=False))
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
         self.assertEqual(["search", "fetch"], config["compatible_tools"])
+        self.assertIn("search(query)", " ".join(config["notes"]))
+        self.assertIn("fetch(id)", " ".join(config["notes"]))
+        self.assertIn("user-openable HTTP(S)", " ".join(config["notes"]))
         self.assertIn("--tenant-storage-isolation", config["server_start"]["args"])
         self.assertIn("--tool-profile", config["server_start"]["args"])
         self.assertIn("chatgpt-data", config["server_start"]["args"])
@@ -2070,7 +2789,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("--http-bearer-token-env", config["server_start"]["args"])
         self.assertIn("--auth-issuer-url", config["server_start"]["args"])
         self.assertIn("https://mcp.example.go.kr/govreg", config["server_start"]["args"])
-        self.assertEqual(config["server_auth"]["token_env"], "MCP_AUTH_TOKEN")
+        self.assertEqual(config["server_auth"]["backend_token_env"], "MCP_AUTH_TOKEN")
+        self.assertEqual(config["server_auth"]["mode"], "mcp-oauth-2.1")
+        self.assertTrue(config["server_auth"]["oauth_ready"])
+        self.assertFalse(config["server_auth"]["custom_static_bearer_supported_by_chatgpt"])
         self.assertNotIn("$BundleDataDir", config["openai_secure_tunnel"]["copy_paste_ps"])
 
     def test_chatgpt_connector_requires_https_public_url(self) -> None:
@@ -2085,6 +2807,20 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("public_url_must_use_https", config["missing"])
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertFalse(config["chatgpt_setup"]["https_endpoint_ready"])
+
+    def test_chatgpt_connector_does_not_treat_static_bearer_as_chatgpt_auth(self) -> None:
+        config = build_mcp_client_config(
+            client_profile="chatgpt-remote",
+            transport="streamable-http",
+            public_url="https://mcp.example.go.kr/mcp",
+            remote_auth_token_env="MCP_AUTH_TOKEN",
+        )
+
+        self.assertFalse(config["ready"])
+        self.assertIn("chatgpt_mcp_oauth_2_1_not_attested", config["missing"])
+        self.assertFalse(config["chatgpt_setup"]["oauth_ready"])
+        self.assertIn("cannot present a custom API key", config["chatgpt_setup"]["authentication_note"])
+        self.assertIn("static MCP_AUTH_TOKEN alone cannot authenticate", " ".join(config["notes"]))
 
     def test_chatgpt_connector_rejects_hostless_or_query_public_url(self) -> None:
         for public_url in ("https://", "https://?tenant=default", "https://mcp.example.go.kr/mcp?tenant=default"):
@@ -2123,13 +2859,36 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         claude_desktop_args = config["claude_desktop"]["mcpServers"]["aks_mcp"]["args"]
         claude_code_args = config["claude_code"]["args"]
+        chatgpt_desktop_args = config["chatgpt_desktop_local"]["mcpServers"]["aks_mcp"]["args"]
         self.assertIn("--no-warm-cache", claude_desktop_args)
         self.assertIn("--no-warm-cache", claude_code_args)
+        self.assertEqual(
+            "full",
+            claude_desktop_args[claude_desktop_args.index("--tool-profile") + 1],
+        )
+        self.assertEqual(
+            "full",
+            claude_code_args[claude_code_args.index("--tool-profile") + 1],
+        )
+        self.assertEqual(
+            "chatgpt-data",
+            chatgpt_desktop_args[chatgpt_desktop_args.index("--tool-profile") + 1],
+        )
         self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["search", "fetch"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["requires_reachable_https"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
         self.assertIn("openai_secure_tunnel", config["quickstart"]["chatgpt_remote"]["connection_options"])
         self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["profile"], "chatgpt-desktop-local")
+        self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["tool_profile"], "chatgpt-data")
+        self.assertEqual(
+            config["quickstart"]["chatgpt_desktop_local"]["verification_tools"],
+            ["search", "fetch"],
+        )
+        self.assertEqual(
+            config["quickstart"]["chatgpt_desktop_local"]["connection_configuration_method"],
+            "direct_config",
+        )
+        self.assertFalse(config["quickstart"]["chatgpt_desktop_local"]["connection_prompt_required"])
         self.assertTrue(config["quickstart"]["chatgpt_desktop_local"]["conversation_attachment_unverified"])
         self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["tunnel_id_env"], "OPENAI_TUNNEL_ID")
         self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["setup_state"], "manual_setup_required")
@@ -2381,6 +3140,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual("./.mcp.json", plugin_manifest["mcpServers"])
             self.assertEqual({"govreg-local"}, set(plugin_mcp["mcpServers"]))
             self.assertNotIn("mcp_servers", plugin_mcp)
+            plugin_args = plugin_mcp["mcpServers"]["govreg-local"]["args"]
+            self.assertEqual(
+                "chatgpt-data",
+                plugin_args[plugin_args.index("--tool-profile") + 1],
+            )
+            self.assertNotIn("get_index_status", " ".join(plugin_manifest["interface"]["defaultPrompt"]))
             agent_prompt = Path(files["chatgpt_desktop_agent_prompt"]).read_text(encoding="utf-8")
             self.assertIn(AGENT_CONNECT_BUNDLE_NAME_MARKER, agent_prompt)
             self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, agent_prompt)
@@ -2405,8 +3170,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertNotIn("-Target codex", agent_prompt)
             self.assertNotIn("Codex", agent_prompt)
             self.assertIn("/mcp", agent_prompt)
-            final_tool_prompt = "govreg-local MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘."
-            self.assertIn(final_tool_prompt, agent_prompt)
+            privacy_tool_prompt = (
+                "govreg-local MCP의 search 도구로 인사규정을 찾고 첫 번째 id를 "
+                "fetch로 조회해 원문과 출처를 보여줘."
+            )
+            full_tool_prompt = "govreg-local MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘."
+            self.assertIn(privacy_tool_prompt, agent_prompt)
+            self.assertIn("일반 대화창에 설치 프롬프트로 붙여넣지 않는다", agent_prompt)
             rendered_desktop_guide = render_agent_connect_prompt_for_program(
                 agent_prompt,
                 bundle_dir=output_dir,
@@ -2423,15 +3193,24 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, codex_agent_prompt)
             self.assertNotIn(str(output_dir.resolve()), codex_agent_prompt)
             self.assertIn("codex mcp get govreg-local --json", codex_agent_prompt)
-            self.assertIn("direct_stdio_verified", codex_agent_prompt)
-            self.assertIn("desktop_app_server_loader_verified", codex_agent_prompt)
-            self.assertIn(final_tool_prompt, codex_agent_prompt)
+            self.assertIn("client_connections.codex", codex_agent_prompt)
+            self.assertIn("fresh_app_server", codex_agent_prompt)
+            self.assertIn("같은 현재 attempt", codex_agent_prompt)
+            self.assertIn("다른 클라이언트의 성공 상태", codex_agent_prompt)
+            self.assertIn(privacy_tool_prompt, codex_agent_prompt)
+            self.assertIn("선택적 자동화 자료", codex_agent_prompt)
+            self.assertIn("토큰, API 키, tunnel ID", codex_agent_prompt)
             self.assertIn("Codex를 완전히 종료하고 다시 실행", codex_agent_prompt)
             claude_agent_prompt = Path(files["claude_code_agent_prompt"]).read_text(encoding="utf-8")
             self.assertIn(AGENT_CONNECT_BUNDLE_DIR_MARKER, claude_agent_prompt)
             self.assertNotIn(str(output_dir.resolve()), claude_agent_prompt)
             self.assertIn("claude mcp get govreg-local", claude_agent_prompt)
-            self.assertIn(final_tool_prompt, claude_agent_prompt)
+            self.assertIn("claude mcp add --transport stdio --scope user", claude_agent_prompt)
+            self.assertIn("~/.claude/settings.json", claude_agent_prompt)
+            self.assertIn("enabledMcpjsonServers", claude_agent_prompt)
+            self.assertIn("~/.mcp.json", claude_agent_prompt)
+            self.assertIn("~/.claude.json", claude_agent_prompt)
+            self.assertIn(full_tool_prompt, claude_agent_prompt)
             self.assertIn("Claude Code를 완전히 종료하고 다시 실행", claude_agent_prompt)
             readme = (output_dir / "README.md").read_text(encoding="utf-8")
             readme_ko = (output_dir / "README.ko.md").read_text(encoding="utf-8")
@@ -2450,6 +3229,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("stdio", codex_args)
             self.assertIn("--no-warm-cache", codex_args)
             self.assertIn("--flat-storage", codex_args)
+            self.assertEqual(
+                "chatgpt-data",
+                codex_args[codex_args.index("--tool-profile") + 1],
+            )
             stdio_launcher = (output_dir / "run_mcp_stdio_server.ps1").read_text(encoding="utf-8")
             self.assertIn('Get-Command "reg-rag-mcp-server"', stdio_launcher)
             self.assertIn("scripts\\run_regulation_mcp.py", stdio_launcher)
@@ -2538,8 +3321,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn('"connect_chatgpt_tunnel_bat": "ChatGPT 보안 Tunnel에 연결하기.bat"', manifest)
             self.assertIn('"connect_claude_https_bat": "Claude HTTPS에 연결하기.bat"', manifest)
             self.assertIn('"doctor_bat": "연결 상태 확인하기.bat"', manifest)
-            self.assertIn('"primary_file": "CODEX_AGENT_CONNECT_PROMPT.md"', manifest)
-            self.assertIn('"fallback_file": "Codex에 연결하기.bat"', manifest)
+            self.assertIn('"primary_file": "Codex에 연결하기.bat"', manifest)
+            self.assertIn('"fallback_file": "codex_config_snippet.toml"', manifest)
+            self.assertIn('"optional_agent_prompt": "CODEX_AGENT_CONNECT_PROMPT.md"', manifest)
             self.assertIn('"primary_file": "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md"', manifest)
             self.assertIn('"fallback_file": "Claude Code에 연결하기.bat"', manifest)
             self.assertIn('"config_file": "codex_config_snippet.toml"', manifest)
@@ -2552,24 +3336,22 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn('"config_file": "claude_desktop_config.json"', manifest)
             self.assertIn('"install": "install_local_package.ps1"', manifest)
             self.assertIn("Run `connect_mcp_client.ps1`", readme)
-            self.assertIn("For direct Codex CLI compatibility, paste `CODEX_AGENT_CONNECT_PROMPT.md`", readme)
+            self.assertIn("For direct Codex CLI compatibility, run `Codex에 연결하기.bat`", readme)
+            self.assertIn("Never paste connection configuration", readme)
             self.assertIn("double-click `Claude Desktop에 연결하기.bat`", readme)
-            self.assertIn("run `/mcp` and verify", readme)
+            self.assertIn("verify `/mcp`", readme)
             self.assertIn("Do not apply the `/mcp` step above to Claude Desktop", readme)
-            self.assertLess(
-                readme.index("Open this extracted bundle as that app's local workspace"),
-                readme.index("Only after verification completes, fully quit and restart that client"),
-            )
-            self.assertLess(
-                readme.index("Only after verification completes, fully quit and restart that client"),
-                readme.index("run `/mcp` and verify"),
-            )
+            self.assertIn("it is not a required installation prompt", readme)
             self.assertIn("get_index_status", readme)
             self.assertIn("bundle_status.json", readme)
             self.assertIn("codex_config_snippet.toml", readme)
             self.assertIn("ChatGPT Desktop에 연결하기.bat", readme)
             self.assertIn("validate_client_config_smoke.ps1", readme)
             self.assertIn("recommended_smoke_query", readme)
+            self.assertIn(
+                f"identities for {len(RUNTIME_IDENTITY_MODULES)} MCP command modules",
+                readme,
+            )
             self.assertIn(
                 "uses it before any source checkout, environment override, or PATH",
                 readme,
@@ -2585,8 +3367,17 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("bundled `reg_rag_preprocessor-*.whl`", readme)
             self.assertIn("--include-wheel", readme)
             self.assertIn("https://help.openai.com/en/articles/20001256-plugins-in-codex", readme)
+            self.assertIn("Settings > Security and login", readme)
             self.assertIn("Settings > Plugins", readme)
+            self.assertNotIn("Settings > Apps > Advanced Settings", readme)
+            self.assertNotIn("Settings > Apps > Create", readme)
+            self.assertIn("ChatGPT web does not read local Codex `config.toml`", readme)
+            self.assertIn("Reviewed marketplace distribution remains separate", readme)
+            self.assertIn("Customize > Connectors", readme)
+            self.assertIn("Do not paste the API request fragment into the Claude connector UI", readme)
+            self.assertIn("Settings > Security and login", readme)
             self.assertIn("https://chatgpt.com/plugins", readme)
+            self.assertIn("Choose Tunnel under Connection", readme)
             self.assertIn("Settings > MCP servers > Add server", readme_ko)
             self.assertNotIn("Apps/Connectors", readme)
             self.assertNotIn("Apps/Connectors", readme_ko)
@@ -2608,6 +3399,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("validate_client_config_smoke.ps1", readme_ko)
             self.assertIn("`list_tools`, `get_index_status`, `search`, `fetch`", readme_ko)
             self.assertIn("recommended_smoke_query", readme_ko)
+            self.assertIn(f"MCP 명령 모듈 {len(RUNTIME_IDENTITY_MODULES)}개", readme_ko)
             self.assertIn(
                 "저장소 checkout, `REG_RAG_PYTHON`, PATH보다 먼저 사용",
                 readme_ko,
@@ -2624,7 +3416,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("Claude HTTPS에 연결하기.bat", readme_ko)
             self.assertIn("연결 상태 확인하기.bat", readme_ko)
             self.assertIn("Settings > MCP servers > Add server", readme_ko)
-            self.assertIn("Codex CLI와 Claude Code", readme_ko)
+            self.assertIn("Codex CLI는 `Codex에 연결하기.bat`", readme_ko)
+            self.assertIn("연결 설정·로컬 경로·토큰·API 키·tunnel ID", readme_ko)
             self.assertNotIn("For ChatGPT Desktop, Codex, and Claude Code", readme)
             self.assertNotIn("ChatGPT Desktop, Codex, Claude Code는 다음 순서", readme_ko)
             self.assertNotIn("local Work/Codex workspace", readme)
@@ -2641,7 +3434,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta", readme_ko)
             self.assertIn("https://docs.anthropic.com/en/docs/agents-and-tools/mcp-connector", readme_ko)
             self.assertIn("ChatGPT", readme_ko)
-            self.assertIn("| Codex CLI | local_stdio | true | `CODEX_AGENT_CONNECT_PROMPT.md` |", readme)
+            self.assertIn("| Codex CLI | local_stdio | true | `Codex에 연결하기.bat` |", readme)
             self.assertIn("| Claude Desktop | local_stdio | true | `Claude Desktop에 연결하기.bat` |", readme)
             self.assertIn("| Claude Code | local_stdio | true | `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md` |", readme)
             self.assertIn("| ChatGPT 웹 | secure_mcp_tunnel | manual_setup_required | `ChatGPT 보안 Tunnel에 연결하기.bat` |", readme)
@@ -2652,6 +3445,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertTrue(chatgpt_desktop_local["chatgpt_direct_local_mcp_supported"])
             self.assertEqual("chatgpt_desktop_settings_mcp_servers", chatgpt_desktop_local["primary_registration"])
             self.assertEqual("chatgpt_desktop_mcp_settings", chatgpt_desktop_local["surface"])
+            self.assertEqual("chatgpt-data", chatgpt_desktop_local["tool_profile"])
+            self.assertEqual(["search", "fetch"], chatgpt_desktop_local["verification_tools"])
+            self.assertEqual("direct_config", chatgpt_desktop_local["connection_configuration_method"])
+            self.assertFalse(chatgpt_desktop_local["connection_prompt_required"])
             self.assertTrue(chatgpt_desktop_local["conversation_attachment_unverified"])
             self.assertFalse(chatgpt_desktop_local["plugin_install_command_succeeded"])
             self.assertFalse(chatgpt_desktop_local["plugin_manifest_validated"])
@@ -2673,15 +3470,15 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertNotIn("-InstallChatGptDesktopPlugin", chatgpt_desktop_bat)
             self.assertIn("/mcp를 입력해 govreg-local이 연결됨으로 보이는지", chatgpt_desktop_bat)
             self.assertIn("[다음 단계]", chatgpt_desktop_bat)
-            self.assertIn("govreg-local MCP의 get_index_status를 실행하고", chatgpt_desktop_bat)
-            self.assertIn("govreg-local MCP의 get_index_status를 실행하고", codex_bat)
+            self.assertIn("govreg-local MCP의 search 도구로 인사규정을 찾고", chatgpt_desktop_bat)
+            self.assertIn("govreg-local MCP의 search 도구로 인사규정을 찾고", codex_bat)
             self.assertIn("govreg-local MCP의 get_index_status를 실행하고", claude_code_bat)
             usage_guide = (output_dir / "MCP 사용 시작하기.txt").read_text(encoding="utf-8")
             self.assertIn("등록된 MCP 이름: govreg-local", usage_guide)
             self.assertIn("ChatGPT Desktop은 GUIDE 값을", usage_guide)
-            self.assertIn("Claude Code와 Codex CLI는", usage_guide)
-            self.assertIn("로컬 full 프로필의 설치 후 도구 확인", usage_guide)
-            self.assertIn("원격 ChatGPT/보안 Tunnel/Claude API의 chatgpt-data 프로필 확인", usage_guide)
+            self.assertIn("Codex CLI는 `Codex에 연결하기.bat`", usage_guide)
+            self.assertIn("Claude Desktop·Claude Code 로컬 full 프로필의 설치 후 도구 확인", usage_guide)
+            self.assertIn("ChatGPT Desktop·Codex·원격 ChatGPT/보안 Tunnel", usage_guide)
             self.assertIn("search 도구로 인사규정을 찾고", usage_guide)
             self.assertIn("`@` 멘션은 연결 확인 수단이 아닙니다", usage_guide)
             self.assertIn("Claude Desktop에는 위 에이전트 프롬프트 및 /mcp 공통 절차를 적용하지 않음", usage_guide)
@@ -2781,8 +3578,15 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 wizard,
             )
             self.assertIn("function Show-ChatGptDesktop", wizard)
-            self.assertIn("Open a new ChatGPT conversation, then select + > More > $ServerName.", wizard)
-            self.assertIn('Start-Process "https://chatgpt.com/plugins"', wizard)
+            self.assertIn("Open a new ChatGPT conversation, then select $ServerName from + > More.", wizard)
+            self.assertIn('Start-Process "https://chatgpt.com"', wizard)
+            self.assertIn("Settings > Security and login", wizard)
+            self.assertIn("Settings > Plugins", wizard)
+            self.assertNotIn("Settings > Apps > Advanced Settings", wizard)
+            self.assertNotIn("Settings > Apps > Create", wizard)
+            self.assertIn("Settings > Security and login", wizard)
+            self.assertIn("https://chatgpt.com/plugins", wizard)
+            self.assertIn("choose Tunnel under Connection", wizard)
             self.assertNotIn("After creating the app, fully restart ChatGPT Desktop", wizard)
             self.assertNotIn("or mention @$ServerName", wizard)
             self.assertIn("function Write-Utf8NoBom", wizard)
@@ -2877,6 +3681,20 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn('$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"', claude_code_stdio)
             self.assertIn('"--", "powershell.exe") + $LauncherArgs', claude_code_stdio)
             self.assertIn('$ClaudeAdd = Invoke-ClaudeMcpCli $ClaudeAddArgs', claude_code_stdio)
+            self.assertIn("$ClaudeStatusConnected", claude_code_stdio)
+            self.assertIn("Status:\\s*", claude_code_stdio)
+            self.assertIn("Assert-ClaudeUserConfigContract", claude_code_stdio)
+            self.assertIn("Test-ExactClaudeMcpArguments", claude_code_stdio)
+            self.assertIn("incomplete, duplicated, reordered, or mismatched arguments", claude_code_stdio)
+            self.assertIn("claude_code_registration_evidence.json", claude_code_stdio)
+            self.assertIn("mcp_claude_code_registration_smoke.json", claude_code_stdio)
+            self.assertIn('"--claude-code-config", $ClaudeUserConfig', claude_code_stdio)
+            self.assertNotIn('"--claude-desktop-config"', claude_code_stdio)
+            self.assertIn('[string]$SmokeEntry.label -eq "claude_code"', claude_code_stdio)
+            self.assertIn("Test-ExactClaudeMcpArguments @($SmokeEntry.args) $LauncherArgs", claude_code_stdio)
+            self.assertIn("changed during installed-entry smoke verification", claude_code_stdio)
+            self.assertNotIn("$ClaudeSmokePayload", claude_code_stdio)
+            self.assertNotIn("$ClaudeSmokeConfig", claude_code_stdio)
             self.assertIn("--no-warm-cache", claude_code_stdio)
             self.assertIn(
                 "--no-warm-cache",
@@ -2920,12 +3738,31 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
             self.assertIn("-Encoding UTF8 | ConvertFrom-Json", wizard)
             self.assertEqual("mcp_bundle_status", bundle_status["report_type"])
+            self.assertEqual("mcp-bundle-status-v5", bundle_status["schema_version"])
+            self.assertEqual("client-connections-v1", bundle_status["status_model"])
+            self.assertEqual(
+                {
+                    "claude-code",
+                    "codex",
+                    "claude-desktop",
+                    "chatgpt-desktop-local",
+                    "chatgpt-remote",
+                    "chatgpt-tunnel",
+                    "claude-api",
+                },
+                set(bundle_status["client_connections"]),
+            )
             self.assertFalse(bundle_status["runtime_data_ready"])
             self.assertEqual(0, bundle_status["record_count"])
             self.assertEqual("validate_client_config_smoke.ps1", bundle_status["first_use"]["client_config_smoke_script"])
             self.assertIn("mcp_connection_readiness.json", bundle_status["stale_status_reports_cleared_on_generation"])
             self.assertFalse(bundle_status["claude_desktop_config_registered"])
             self.assertFalse(bundle_status["claude_desktop_config_transport_verified"])
+            self.assertIsNone(
+                bundle_status["claude_desktop_config_transport_runtime_fingerprint"]
+            )
+            self.assertIsNone(bundle_status["claude_desktop_registration_updated_at"])
+            self.assertFalse(bundle_status["claude_desktop_loader_observed"])
             self.assertFalse(bundle_status["claude_desktop_loader_verified"])
             self.assertFalse(bundle_status["claude_desktop_conversation_verified"])
 
@@ -2937,6 +3774,11 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             'bad\"; Write-Output injected; #',
             "line\nbreak",
             "a" * 65,
+            "workspace",
+            "claude-in-chrome",
+            "computer-use",
+            "claude-preview",
+            "claude-browser",
         ]
         for server_name in invalid_names:
             with self.subTest(server_name=server_name):
@@ -2974,6 +3816,117 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             function_name="Run-InstalledClaudeDesktopConfigSmoke",
             expected_label="claude_desktop",
         )
+
+    def test_claude_desktop_installer_uses_atomic_full_contract_and_rollback_state(self) -> None:
+        config = build_mcp_client_config(
+            server_name="desktop-contract",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            files = write_mcp_setup_bundle(
+                config,
+                tmp,
+                server_name="desktop-contract",
+            )
+            wizard = Path(files["connect"]).read_text(encoding="utf-8-sig")
+
+        self.assertIn("Write-AtomicUtf8NoBom $TargetPath $TargetJson", wizard)
+        self.assertIn("$PostSmokeConfigFingerprint", wizard)
+        self.assertIn("config changed during installed-config stdio verification", wizard)
+        self.assertIn("Restore-FileAtomically $BackupPath $TargetPath", wizard)
+        self.assertIn("Claude Desktop config backup hash mismatch", wizard)
+        self.assertIn("Assert-ClaudeDesktopInstalledContract $TargetPath $GeneratedServer", wizard)
+        self.assertIn(
+            "Assert-ClaudeDesktopInstalledContract $TargetPath $GeneratedServer $InstalledConfigFingerprint",
+            wizard,
+        )
+        self.assertIn(
+            "Test-SameMcpArguments @($InstalledServer.args) @($GeneratedServer.args)",
+            wizard,
+        )
+        initial_contract = wizard.index(
+            "$InstalledConfigFingerprint = Assert-ClaudeDesktopInstalledContract"
+        )
+        smoke = wizard.index("Run-InstalledClaudeDesktopConfigSmoke $TargetPath")
+        post_smoke_contract = wizard.index(
+            "$null = Assert-ClaudeDesktopInstalledContract $TargetPath $GeneratedServer $InstalledConfigFingerprint"
+        )
+        self.assertLess(initial_contract, smoke)
+        self.assertLess(smoke, post_smoke_contract)
+        self.assertIn("$TargetConfig = Get-Content", wizard)
+        self.assertIn("$script:ConnectionTarget = $Target", wizard)
+        self.assertIn("switch ($script:ConnectionTarget)", wizard)
+        self.assertIn('$FailureAction = if ($RolledBack) { "fail-rolled-back" }', wizard)
+        self.assertIn(
+            'Fail-ClientConnectionAttempt "claude_desktop_install_failed_prior_state_restored" -RolledBack',
+            wizard,
+        )
+        self.assertNotIn("EvidenceTarget", wizard)
+
+    @unittest.skipUnless(os.name == "nt", "v5 status fail-closed behavior is Windows-specific")
+    def test_current_bundle_refuses_install_when_client_status_runtime_is_missing(self) -> None:
+        config = build_mcp_client_config(
+            server_name="status-required-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+            data_dir="data",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_project_root = root / "source-without-status-module"
+            scripts_dir = fake_project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / "__init__.py").write_text("", encoding="utf-8")
+            (scripts_dir / "check_mcp_connection_readiness.py").write_text(
+                'print("doctor-must-not-run")\n',
+                encoding="utf-8",
+            )
+            bundle_dir = root / "bundle"
+            files = write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="status-required-mcp",
+                preferred_python=sys.executable,
+                preferred_project_root=fake_project_root,
+            )
+            (bundle_dir / "data").mkdir()
+            codex_config = root / ".codex" / "config.toml"
+            codex_config.parent.mkdir(parents=True)
+            original_bytes = b'[mcp_servers.other]\ncommand = "other"\n'
+            codex_config.write_bytes(original_bytes)
+
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            env["PATH"] = os.pathsep.join([str(windows_dir / "System32"), str(powershell_dir)])
+            completed = subprocess.run(
+                [
+                    str(powershell_dir / "powershell.exe"),
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    files["connect"],
+                    "-Target",
+                    "chatgpt-desktop-direct",
+                    "-CodexConfigPath",
+                    str(codex_config),
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(0, completed.returncode, output)
+            self.assertIn("Client-specific MCP status tracking is required", output)
+            self.assertNotIn("doctor-must-not-run", output)
+            self.assertEqual(original_bytes, codex_config.read_bytes())
 
     def _assert_installed_smoke_report_guards(
         self,
@@ -3130,11 +4083,16 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             fake_project_root = root / "project"
             fake_doctor = fake_project_root / "scripts" / "check_mcp_connection_readiness.py"
             fake_doctor.parent.mkdir(parents=True)
+            (fake_project_root / "scripts" / "__init__.py").write_text("", encoding="utf-8")
             fake_doctor.write_text('print("doctor-output-ok")\nraise SystemExit(0)\n', encoding="utf-8")
             fake_client_smoke = fake_project_root / "scripts" / "run_mcp_client_config_smoke.py"
             fake_client_smoke.write_text(
                 _fake_client_config_smoke_source(),
                 encoding="utf-8",
+            )
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+                fake_project_root / "scripts" / "mcp_client_status.py",
             )
             fake_app_server_check = fake_project_root / "scripts" / "check_codex_app_server_mcp.py"
             fake_app_server_check.write_text(
@@ -3145,6 +4103,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                         "from pathlib import Path",
                         "args = sys.argv[1:]",
                         "out = Path(args[args.index('--out-json') + 1])",
+                        "codex_path = str(Path(args[args.index('--codex-executable') + 1]).resolve())",
+                        "codex_path_fingerprint = hashlib.sha256(os.path.normcase(codex_path).encode('utf-8')).hexdigest()",
                         "config_path = str((Path(os.environ['CODEX_HOME']) / 'config.toml').resolve())",
                         "config_fingerprint = hashlib.sha256(os.path.normcase(config_path).encode('utf-8')).hexdigest()",
                         "config_content_fingerprint = 'sha256:' + hashlib.sha256(Path(config_path).read_bytes()).hexdigest()",
@@ -3154,7 +4114,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                         "    'probe_id': 'fixture-fresh-probe',",
                         "    'generated_at': datetime.now(timezone.utc).isoformat(),",
                         "    'provenance': {",
-                        "        'executable_path': sys.executable,",
+                        "        'executable_file_name': Path(codex_path).name,",
+                        "        'executable_path_sha256': codex_path_fingerprint,",
                         "        'process_id': os.getpid(),",
                         "        'config_scope': {",
                         "            'config_exists': True,",
@@ -3187,6 +4148,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            seeded_status_path = bundle_dir / "bundle_status.json"
+            seeded_status = json.loads(seeded_status_path.read_text(encoding="utf-8"))
+            seeded_status["runtime_fingerprint"] = "runtime-current"
+            seeded_status_path.write_text(
+                json.dumps(seeded_status, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             moved_bundle_dir = root / "다른 위치" / "Renamed Bundle"
             moved_bundle_dir.parent.mkdir(parents=True)
             bundle_dir.rename(moved_bundle_dir)
@@ -3262,7 +4230,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["CODEX_EXPECTED_DATA_JSON"] = json.dumps(str((moved_bundle_dir / "data").resolve()))[1:-1]
             env["CODEX_EXPECTED_CWD_JSON"] = json.dumps(str(moved_bundle_dir.resolve()))[1:-1]
             env["CODEX_EXPECTED_ENABLED"] = "false"
-            env["CODEX_EXPECTED_TOOL_PROFILE"] = "full"
+            env["CODEX_EXPECTED_TOOL_PROFILE"] = "chatgpt-data"
             env["CODEX_PLUGIN_MARKER"] = str(legacy_plugin_marker)
             env["CODEX_HOME"] = str(codex_config.parent)
 
@@ -3293,6 +4261,11 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(disabled_status["direct_config_loader_verified"])
             self.assertFalse(disabled_status["direct_stdio_verified"])
             self.assertTrue(disabled_status["direct_config_rollback_performed"])
+            self.assertEqual(
+                "failed_rolled_back",
+                disabled_status["client_connections"]["chatgpt-desktop-local"]["last_attempt"]["state"],
+                disabled.stdout + disabled.stderr,
+            )
             self.assertTrue(
                 disabled_status["legacy_plugin_restored_after_direct_failure"],
                 disabled.stdout + disabled.stderr,
@@ -3333,7 +4306,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertTrue(legacy_plugin_marker.exists())
             self.assertEqual(original_codex_config, codex_config.read_text(encoding="utf-8"))
 
-            env["CODEX_EXPECTED_TOOL_PROFILE"] = "full"
+            env["CODEX_EXPECTED_TOOL_PROFILE"] = "chatgpt-data"
 
             completed = subprocess.run(
                 [
@@ -3389,6 +4362,19 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual(3, status["desktop_app_server_tool_count"])
             self.assertEqual(["fetch", "get_index_status", "search"], status["desktop_app_server_tool_names"])
             _assert_same_existing_path(self, codex_config, status["direct_config_path"])
+            app_server_report = json.loads(
+                (moved_bundle_dir / "codex_app_server_mcp_status.json").read_text(encoding="utf-8")
+            )
+            provenance = app_server_report["provenance"]
+            expected_codex_path = str((fake_bin / "codex.cmd").resolve())
+            self.assertNotIn("executable_path", provenance)
+            self.assertEqual("codex.cmd", provenance["executable_file_name"])
+            self.assertEqual(
+                hashlib.sha256(os.path.normcase(expected_codex_path).encode("utf-8")).hexdigest(),
+                provenance["executable_path_sha256"],
+            )
+            self.assertNotIn(expected_codex_path, completed.stdout + completed.stderr)
+            self.assertNotIn(expected_codex_path, json.dumps(status, ensure_ascii=False))
 
     @unittest.skipUnless(os.name == "nt", "Codex fresh app-server evidence is Windows-specific.")
     def test_codex_installer_rejects_stale_app_server_report_when_checker_writes_nothing(self) -> None:
@@ -3425,6 +4411,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             stale_report_path = bundle_dir / "codex_app_server_mcp_status.json"
             stale_report_path.write_text(
                 json.dumps(
@@ -3454,7 +4441,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
 
             generated_entry = json.loads(
-                (bundle_dir / "claude_desktop_config.json").read_text(encoding="utf-8")
+                (
+                    bundle_dir
+                    / "chatgpt-desktop-local-plugin"
+                    / "plugins"
+                    / "aksmcp"
+                    / ".mcp.json"
+                ).read_text(encoding="utf-8")
             )["mcpServers"]["aksmcp"]
             loader_payload = {
                 "name": "aksmcp",
@@ -3526,6 +4519,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(status["fresh_codex_app_server_inventory_verified"])
             self.assertFalse(status["desktop_app_server_loader_verified"])
             self.assertEqual("installed_loader_verified_pending_fresh_inventory", status["installation_state"])
+            codex_record = status["client_connections"]["codex"]
+            self.assertEqual("completed", codex_record["last_attempt"]["state"])
+            self.assertEqual("partially_verified", codex_record["effective"]["state"])
+            self.assertEqual("verified", codex_record["stages"]["registration"]["state"])
+            self.assertEqual("verified", codex_record["stages"]["loader"]["state"])
+            self.assertEqual("verified", codex_record["stages"]["transport"]["state"])
+            self.assertEqual("not_checked", codex_record["stages"]["fresh_app_server"]["state"])
 
     @unittest.skipUnless(os.name == "nt", "Desktop-only Codex config behavior is Windows-specific.")
     def test_chatgpt_desktop_keeps_verified_config_pending_when_codex_cli_is_absent(self) -> None:
@@ -3541,6 +4541,11 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             fake_project_root = root / "project"
             scripts_dir = fake_project_root / "scripts"
             scripts_dir.mkdir(parents=True)
+            (scripts_dir / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+                scripts_dir / "mcp_client_status.py",
+            )
             (scripts_dir / "check_mcp_connection_readiness.py").write_text(
                 'print("doctor-ok")\n',
                 encoding="utf-8",
@@ -3558,6 +4563,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir()
+            status_path = bundle_dir / "bundle_status.json"
+            seeded_status = json.loads(status_path.read_text(encoding="utf-8"))
+            seeded_status["runtime_fingerprint"] = "runtime-current"
+            status_path.write_text(
+                json.dumps(seeded_status, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             plugin_config_path = (
                 bundle_dir
                 / "chatgpt-desktop-local-plugin"
@@ -3591,6 +4603,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["PATH"] = os.pathsep.join(
                 [str(windows_dir / "System32"), str(powershell_dir)]
             )
+            local_app_data = root / "isolated-local-app-data"
+            unsigned_candidate = (
+                local_app_data / "OpenAI" / "Codex" / "bin" / "unsigned" / "codex.exe"
+            )
+            unsigned_candidate.parent.mkdir(parents=True)
+            unsigned_candidate.write_bytes(b"unsigned-codex-app-cache-fixture")
+            env["LOCALAPPDATA"] = str(local_app_data)
             completed = subprocess.run(
                 [
                     str(powershell_dir / "powershell.exe"),
@@ -3600,8 +4619,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                     "-File",
                     files["connect"],
                     "-Target",
-                    "codex",
-                    "-InstallCodex",
+                    "chatgpt-desktop-direct",
                     "-CodexConfigPath",
                     str(codex_config),
                 ],
@@ -3629,9 +4647,17 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(status["direct_config_loader_verified"])
             self.assertEqual("blocked", status["loader_verification_state"])
             self.assertEqual("codex_cli_unavailable", status["loader_verification_reason"])
+            self.assertNotIn(str(unsigned_candidate), completed.stdout + completed.stderr)
+            self.assertNotIn(str(unsigned_candidate), json.dumps(status, ensure_ascii=False))
             self.assertFalse(status["desktop_tool_scan_verified"])
             self.assertFalse(status["conversation_attachment_verified"])
             self.assertFalse(status["end_to_end_verified"])
+            desktop_record = status["client_connections"]["chatgpt-desktop-local"]
+            self.assertEqual("completed", desktop_record["last_attempt"]["state"])
+            self.assertEqual("partially_verified", desktop_record["effective"]["state"])
+            self.assertEqual("verified", desktop_record["stages"]["registration"]["state"])
+            self.assertEqual("verified", desktop_record["stages"]["transport"]["state"])
+            self.assertEqual("not_checked", desktop_record["stages"]["loader"]["state"])
 
     @unittest.skipUnless(os.name == "nt", "Claude Desktop Windows installer script test")
     def test_claude_desktop_installer_replaces_legacy_profile_and_verifies_paths(self) -> None:
@@ -3663,6 +4689,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             claude_bundle_config_path = bundle_dir / "claude_desktop_config.json"
             claude_bundle_config = json.loads(claude_bundle_config_path.read_text(encoding="utf-8"))
             claude_bundle_config["mcpServers"]["aks_mcp"]["args"].append("--claude-source-marker")
@@ -3730,6 +4757,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             installed = json.loads(claude_config.read_text(encoding="utf-8-sig"))
             self.assertEqual("dark", installed["theme"])
             self.assertEqual({"aks_mcp", "other"}, set(installed["mcpServers"]))
+            self.assertEqual(
+                claude_bundle_config["mcpServers"]["aks_mcp"],
+                installed["mcpServers"]["aks_mcp"],
+            )
             aks_args = installed["mcpServers"]["aks_mcp"]["args"]
             self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), aks_args)
             self.assertIn(str((bundle_dir / "data").resolve()), aks_args)
@@ -3749,8 +4780,143 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual("pending_claude_desktop_restart", status["connection_state"])
             self.assertTrue(status["claude_desktop_config_registered"])
             self.assertTrue(status["claude_desktop_config_transport_verified"])
+            self.assertEqual(
+                status["runtime_fingerprint"],
+                status["claude_desktop_config_transport_runtime_fingerprint"] or None,
+            )
+            self.assertTrue(status["claude_desktop_registration_updated_at"])
+            self.assertFalse(status["claude_desktop_loader_observed"])
             self.assertFalse(status["claude_desktop_loader_verified"])
             self.assertFalse(status["claude_desktop_conversation_verified"])
+
+    @unittest.skipUnless(os.name == "nt", "Claude Desktop rollback integrity test")
+    def test_claude_desktop_post_smoke_contract_drift_restores_exact_bytes_and_v5_state(
+        self,
+    ) -> None:
+        config = build_mcp_client_config(
+            server_name="rollback_mcp",
+            client_profile="bundle",
+            data_dir="data",
+            tenant_id="tenant-a",
+            profile_id="institution-test",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_project_root = root / "source-project"
+            scripts_dir = fake_project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / "__init__.py").write_text("", encoding="utf-8")
+            (scripts_dir / "check_mcp_connection_readiness.py").write_text(
+                'print("claude-rollback-doctor-ok")\n',
+                encoding="utf-8",
+            )
+            (scripts_dir / "run_mcp_client_config_smoke.py").write_text(
+                _mutating_claude_desktop_smoke_source(),
+                encoding="utf-8",
+            )
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+                scripts_dir / "mcp_client_status.py",
+            )
+
+            bundle_dir = root / "rollback-bundle"
+            files = write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="rollback_mcp",
+                preferred_python=sys.executable,
+                preferred_project_root=fake_project_root,
+            )
+            (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            status_path = bundle_dir / "bundle_status.json"
+            initial_status = json.loads(status_path.read_text(encoding="utf-8"))
+            untouched_client_records = {
+                target: json.loads(json.dumps(record))
+                for target, record in initial_status["client_connections"].items()
+                if target != "claude-desktop"
+            }
+
+            appdata_dir = root / "AppData" / "Roaming"
+            claude_config = appdata_dir / "Claude" / "claude_desktop_config.json"
+            claude_config.parent.mkdir(parents=True)
+            original_bytes = (
+                b'{\r\n  "theme": "original",\r\n  "mcpServers": {'
+                b'"other": {"command": "other", "args": []}}\r\n}\r\n'
+            )
+            claude_config.write_bytes(original_bytes)
+            original_hash = hashlib.sha256(original_bytes).hexdigest()
+
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            powershell_exe = powershell_dir / "powershell.exe"
+            env["APPDATA"] = str(appdata_dir)
+            env["PATH"] = os.pathsep.join(
+                [str(windows_dir / "System32"), str(powershell_dir)]
+            )
+
+            completed = subprocess.run(
+                [
+                    str(powershell_exe),
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    files["connect"],
+                    "-Target",
+                    "claude-desktop",
+                    "-InstallClaudeDesktop",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(0, completed.returncode, output)
+            self.assertIn("mutated-claude-desktop-config-after-smoke", output)
+            self.assertIn("changed after its installed launch contract was verified", output)
+            self.assertEqual(original_bytes, claude_config.read_bytes())
+            self.assertEqual(
+                original_hash,
+                hashlib.sha256(claude_config.read_bytes()).hexdigest(),
+            )
+            backups = list(claude_config.parent.glob("claude_desktop_config.json.bak-*"))
+            self.assertEqual(1, len(backups), output)
+            self.assertEqual(original_bytes, backups[0].read_bytes())
+            self.assertEqual(original_hash, hashlib.sha256(backups[0].read_bytes()).hexdigest())
+            internal_artifacts = [
+                path.name
+                for path in claude_config.parent.iterdir()
+                if path.name.startswith(".claude_desktop_config.json.")
+                and path.name.endswith((".tmp", ".replace-bak", ".restore-tmp", ".restore-bak"))
+            ]
+            self.assertEqual([], internal_artifacts)
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual("failed_rolled_back", status["installation_state"])
+            self.assertFalse(status["claude_desktop_config_registered"])
+            self.assertFalse(status["claude_desktop_config_transport_verified"])
+            self.assertFalse(status["direct_stdio_verified"])
+            desktop_record = status["client_connections"]["claude-desktop"]
+            self.assertEqual(
+                "failed_rolled_back",
+                desktop_record["last_attempt"]["state"],
+                output + "\n" + json.dumps(desktop_record["last_attempt"], ensure_ascii=False),
+            )
+            self.assertTrue(desktop_record["last_attempt"]["rollback_complete"])
+            self.assertEqual("not_configured", desktop_record["effective"]["state"])
+            for target, expected_record in untouched_client_records.items():
+                self.assertEqual(
+                    expected_record,
+                    status["client_connections"][target],
+                    f"Claude Desktop rollback unexpectedly changed {target}",
+                )
 
     @unittest.skipUnless(os.name == "nt", "Claude Code BAT automation test")
     def test_claude_code_bat_ignores_missing_legacy_entries_and_verifies_user_scope(self) -> None:
@@ -3766,7 +4932,16 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             fake_project_root = root / "가짜 프로젝트"
             fake_doctor = fake_project_root / "scripts" / "check_mcp_connection_readiness.py"
             fake_doctor.parent.mkdir(parents=True)
+            (fake_project_root / "scripts" / "__init__.py").write_text("", encoding="utf-8")
             fake_doctor.write_text('print("claude-code-doctor-ok")\n', encoding="utf-8")
+            (fake_project_root / "scripts" / "run_mcp_client_config_smoke.py").write_text(
+                _fake_client_config_smoke_source("claude-code-client-smoke-ok"),
+                encoding="utf-8",
+            )
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+                fake_project_root / "scripts" / "mcp_client_status.py",
+            )
             bundle_dir = root / "한글 경로" / "Claude Code 번들"
             files = write_mcp_setup_bundle(
                 config,
@@ -3776,26 +4951,23 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            status_path = bundle_dir / "bundle_status.json"
+            seeded_status = json.loads(status_path.read_text(encoding="utf-8"))
+            seeded_status["runtime_fingerprint"] = "runtime-current"
+            status_path.write_text(
+                json.dumps(seeded_status, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
             fake_bin = root / "fake-bin"
             fake_bin.mkdir()
             claude_log = root / "claude-calls.txt"
+            fake_cli = root / "fake_claude_cli.py"
+            fake_cli.write_text(_fake_claude_transaction_cli_source(), encoding="utf-8")
             (fake_bin / "claude.cmd").write_text(
                 "@echo off\r\n"
-                "echo %*>>\"%CLAUDE_TEST_LOG%\"\r\n"
-                "if \"%1 %2\"==\"mcp remove\" (\r\n"
-                "  echo No MCP server named aksmcp in requested scope 1>&2\r\n"
-                "  exit /b 1\r\n"
-                ")\r\n"
-                "if \"%1 %2\"==\"mcp add\" (\r\n"
-                "  echo Added MCP server aksmcp with user scope\r\n"
-                "  exit /b 0\r\n"
-                ")\r\n"
-                "if \"%1 %2\"==\"mcp get\" (\r\n"
-                "  echo aksmcp: Scope: User Command: powershell.exe -File %CLAUDE_EXPECTED_LAUNCHER% --data-dir %CLAUDE_EXPECTED_DATA%\r\n"
-                "  exit /b 0\r\n"
-                ")\r\n"
-                "exit /b 2\r\n",
+                '"%CLAUDE_FAKE_PYTHON%" "%CLAUDE_FAKE_SCRIPT%" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n",
                 encoding="utf-8",
             )
             env = dict(os.environ)
@@ -3808,6 +4980,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             claude_user_profile = root / "claude-user"
             claude_user_profile.mkdir()
             env["USERPROFILE"] = str(claude_user_profile)
+            env["CLAUDE_FAKE_PYTHON"] = str(Path(sys.executable).resolve())
+            env["CLAUDE_FAKE_SCRIPT"] = str(fake_cli.resolve())
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["CLAUDE_FAKE_GET_STATUS"] = "Connected"
             env["CLAUDE_EXPECTED_LAUNCHER"] = str((bundle_dir / "run_mcp_stdio_server.ps1").resolve())
             env["CLAUDE_EXPECTED_DATA"] = str((bundle_dir / "data").resolve())
             completed = subprocess.run(
@@ -3829,7 +5005,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
 
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             self.assertIn("claude-code-doctor-ok", completed.stdout)
-            self.assertIn("wrong-scope, or wrong-path", Path(files["claude_code_stdio"]).read_text(encoding="utf-8-sig"))
+            self.assertIn(
+                "incomplete, duplicated, reordered, or mismatched arguments",
+                Path(files["claude_code_stdio"]).read_text(encoding="utf-8-sig"),
+            )
             self.assertIn("Added MCP server aksmcp with user scope", completed.stdout)
             self.assertIn("aksmcp: Scope: User Command: powershell.exe", completed.stdout)
             calls = claude_log.read_text(encoding="utf-8").splitlines()
@@ -3839,6 +5018,229 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 any("mcp add --transport stdio --scope user aksmcp -- powershell.exe" in call for call in calls)
             )
             self.assertTrue(any("mcp get aksmcp" in call for call in calls))
+            status = json.loads((bundle_dir / "bundle_status.json").read_text(encoding="utf-8"))
+            self.assertEqual("installed_claude_code_configured", status["installation_state"])
+            self.assertTrue(status["claude_code_registered"])
+            self.assertTrue(status["claude_code_config_fingerprint"].startswith("sha256:"))
+            self.assertTrue(status["claude_code_loader_verified"])
+            self.assertTrue(status["claude_code_transport_verified"])
+            self.assertFalse(status["claude_code_conversation_verified"])
+            claude_code_record = status["client_connections"]["claude-code"]
+            self.assertEqual(
+                "completed",
+                claude_code_record["last_attempt"]["state"],
+                completed.stdout + completed.stderr,
+            )
+            self.assertEqual("configured", claude_code_record["effective"]["state"])
+            self.assertEqual(
+                "not_started",
+                status["client_connections"]["codex"]["last_attempt"]["state"],
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Claude Code failed-status rollback test")
+    def test_claude_code_failed_status_restores_user_config_without_touching_other_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                completed,
+                files,
+                claude_config,
+                claude_config_bytes,
+                claude_settings,
+                claude_settings_bytes,
+                home_mcp,
+                home_mcp_bytes,
+            ) = _run_claude_code_transaction_failure(
+                root,
+                get_status="Failed",
+                smoke_source=_fake_client_config_smoke_source("unexpected-smoke-run"),
+            )
+
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(0, completed.returncode, output)
+            self.assertIn("Status: Failed", output)
+            self.assertIn("disconnected or wrong-scope user registration", output)
+            self.assertEqual(claude_config_bytes, claude_config.read_bytes())
+            self.assertEqual(claude_settings_bytes, claude_settings.read_bytes())
+            self.assertEqual(home_mcp_bytes, home_mcp.read_bytes())
+            self.assertFalse((root / "bundle" / "claude_code_registration_evidence.json").exists())
+            self.assertFalse((root / "bundle" / "mcp_claude_code_registration_smoke.json").exists())
+            status = json.loads(Path(files["bundle_status"]).read_text(encoding="utf-8"))
+            self.assertFalse(status["claude_code_registered"])
+            self.assertFalse(status["claude_code_loader_verified"])
+            self.assertFalse(status["claude_code_transport_verified"])
+
+    @unittest.skipUnless(os.name == "nt", "Claude Code installed-entry contract rollback test")
+    def test_claude_code_rejects_mutated_user_scope_entry_before_smoke_and_rolls_back(self) -> None:
+        mutations = {
+            "reorder": "incomplete, duplicated, reordered, or mismatched arguments",
+            "duplicate": "incomplete, duplicated, reordered, or mismatched arguments",
+            "missing": "incomplete, duplicated, reordered, or mismatched arguments",
+            "wrong-command": "user-scope entry has the wrong command",
+        }
+        for mutation, expected_error in mutations.items():
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (
+                    completed,
+                    files,
+                    claude_config,
+                    claude_config_bytes,
+                    claude_settings,
+                    claude_settings_bytes,
+                    home_mcp,
+                    home_mcp_bytes,
+                ) = _run_claude_code_transaction_failure(
+                    root,
+                    get_status="Connected",
+                    smoke_source=_fake_client_config_smoke_source("unexpected-smoke-run"),
+                    installed_mutation=mutation,
+                )
+
+                output = completed.stdout + completed.stderr
+                self.assertNotEqual(0, completed.returncode, output)
+                self.assertIn("Status: Connected", output)
+                self.assertIn("--tool-profile full --no-warm-cache", output)
+                self.assertIn(expected_error, output)
+                self.assertNotIn("unexpected-smoke-run", output)
+                self.assertEqual(claude_config_bytes, claude_config.read_bytes())
+                self.assertEqual(claude_settings_bytes, claude_settings.read_bytes())
+                self.assertEqual(home_mcp_bytes, home_mcp.read_bytes())
+                self.assertFalse((root / "bundle" / "claude_code_registration_evidence.json").exists())
+                self.assertFalse((root / "bundle" / "mcp_claude_code_registration_smoke.json").exists())
+                self.assertEqual(
+                    [],
+                    [
+                        path.name
+                        for path in claude_config.parent.glob(".claude.*")
+                        if ".transaction-bak" in path.name or ".restore-" in path.name
+                    ],
+                )
+                status = json.loads(Path(files["bundle_status"]).read_text(encoding="utf-8"))
+                self.assertFalse(status["claude_code_registered"])
+                self.assertFalse(status["claude_code_loader_verified"])
+                self.assertFalse(status["claude_code_transport_verified"])
+
+    @unittest.skipUnless(os.name == "nt", "Claude Code installed-entry smoke provenance test")
+    def test_claude_code_smokes_actual_user_config_and_rejects_post_smoke_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                completed,
+                files,
+                claude_config,
+                claude_config_bytes,
+                claude_settings,
+                claude_settings_bytes,
+                home_mcp,
+                home_mcp_bytes,
+            ) = _run_claude_code_transaction_failure(
+                root,
+                get_status="Connected",
+                smoke_source=_mutating_claude_code_smoke_source(),
+            )
+
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(0, completed.returncode, output)
+            self.assertIn("mutated-claude-user-config-during-smoke", output)
+            self.assertIn("changed during installed-entry smoke verification", output)
+            self.assertEqual(claude_config_bytes, claude_config.read_bytes())
+            self.assertEqual(claude_settings_bytes, claude_settings.read_bytes())
+            self.assertEqual(home_mcp_bytes, home_mcp.read_bytes())
+            self.assertFalse((root / "bundle" / "claude_code_registration_evidence.json").exists())
+            smoke_report = json.loads(
+                (root / "bundle" / "mcp_claude_code_registration_smoke.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(smoke_report["passed"])
+            _assert_same_existing_path(
+                self,
+                claude_config,
+                smoke_report["results"][0]["config_path"],
+            )
+            status = json.loads(Path(files["bundle_status"]).read_text(encoding="utf-8"))
+            self.assertFalse(status["claude_code_registered"])
+            self.assertFalse(status["claude_code_loader_verified"])
+            self.assertFalse(status["claude_code_transport_verified"])
+
+    @unittest.skipUnless(os.name == "nt", "Claude Code stdio-smoke rollback test")
+    def test_claude_code_smoke_failure_restores_user_config_and_does_not_publish_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                completed,
+                files,
+                claude_config,
+                claude_config_bytes,
+                claude_settings,
+                claude_settings_bytes,
+                home_mcp,
+                home_mcp_bytes,
+            ) = _run_claude_code_transaction_failure(
+                root,
+                get_status="Connected",
+                smoke_source=_failing_client_config_smoke_source(),
+            )
+
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(0, completed.returncode, output)
+            self.assertIn("Status: Connected", output)
+            self.assertIn("forced-client-smoke-failure", output)
+            self.assertIn("did not complete initialize, tools/list, and get_index_status", output)
+            self.assertEqual(claude_config_bytes, claude_config.read_bytes())
+            self.assertEqual(claude_settings_bytes, claude_settings.read_bytes())
+            self.assertEqual(home_mcp_bytes, home_mcp.read_bytes())
+            evidence_path = root / "bundle" / "claude_code_registration_evidence.json"
+            self.assertFalse(evidence_path.exists())
+            smoke_report_path = root / "bundle" / "mcp_claude_code_registration_smoke.json"
+            self.assertTrue(smoke_report_path.is_file())
+            smoke_report = json.loads(smoke_report_path.read_text(encoding="utf-8"))
+            self.assertFalse(smoke_report["passed"])
+            status = json.loads(Path(files["bundle_status"]).read_text(encoding="utf-8"))
+            self.assertFalse(status["claude_code_registered"])
+            self.assertFalse(status["claude_code_loader_verified"])
+            self.assertFalse(status["claude_code_transport_verified"])
+
+    @unittest.skipUnless(os.name == "nt", "Claude Code wrong-client smoke rollback test")
+    def test_claude_code_rejects_desktop_labeled_smoke_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                completed,
+                files,
+                claude_config,
+                claude_config_bytes,
+                claude_settings,
+                claude_settings_bytes,
+                home_mcp,
+                home_mcp_bytes,
+            ) = _run_claude_code_transaction_failure(
+                root,
+                get_status="Connected",
+                smoke_source=_fake_client_config_smoke_source(
+                    "wrong-client-label-smoke",
+                    claude_code_label="claude_desktop",
+                ),
+            )
+
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(0, completed.returncode, output)
+            self.assertIn("wrong-client-label-smoke", output)
+            self.assertIn("did not complete initialize, tools/list, and get_index_status", output)
+            self.assertEqual(claude_config_bytes, claude_config.read_bytes())
+            self.assertEqual(claude_settings_bytes, claude_settings.read_bytes())
+            self.assertEqual(home_mcp_bytes, home_mcp.read_bytes())
+            self.assertFalse((root / "bundle" / "claude_code_registration_evidence.json").exists())
+            smoke_report = json.loads(
+                (root / "bundle" / "mcp_claude_code_registration_smoke.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(smoke_report["passed"])
+            self.assertEqual("claude_desktop", smoke_report["results"][0]["label"])
+            status = json.loads(Path(files["bundle_status"]).read_text(encoding="utf-8"))
+            self.assertFalse(status["claude_code_registered"])
+            self.assertFalse(status["claude_code_loader_verified"])
+            self.assertFalse(status["claude_code_transport_verified"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop BAT automation test")
     def test_chatgpt_desktop_bat_registers_plugin_idempotently_from_korean_space_path(self) -> None:
@@ -3871,6 +5273,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                         "from pathlib import Path",
                         "args = sys.argv[1:]",
                         "out = Path(args[args.index('--out-json') + 1])",
+                        "codex_path = str(Path(args[args.index('--codex-executable') + 1]).resolve())",
+                        "codex_path_fingerprint = hashlib.sha256(os.path.normcase(codex_path).encode('utf-8')).hexdigest()",
                         "config_path = str((Path(os.environ['CODEX_HOME']) / 'config.toml').resolve())",
                         "config_fingerprint = hashlib.sha256(os.path.normcase(config_path).encode('utf-8')).hexdigest()",
                         "payload = {",
@@ -3879,7 +5283,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                         "    'probe_id': 'fixture-plugin-fresh-probe',",
                         "    'generated_at': datetime.now(timezone.utc).isoformat(),",
                         "    'provenance': {",
-                        "        'executable_path': sys.executable,",
+                        "        'executable_file_name': Path(codex_path).name,",
+                        "        'executable_path_sha256': codex_path_fingerprint,",
                         "        'process_id': os.getpid(),",
                         "        'config_scope': {",
                         "            'config_exists': True,",
@@ -3911,6 +5316,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             marketplace_root = bundle_dir / "chatgpt-desktop-local-plugin"
             plugin_root = marketplace_root / "plugins" / "aksmcp"
             plugin_manifest = json.loads(
@@ -4104,6 +5510,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             stale_report = bundle_dir / "codex_app_server_mcp_status.json"
             stale_report.write_text(
                 json.dumps(
@@ -4225,6 +5632,13 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(status["desktop_tool_scan_verified"])
             self.assertFalse(status["conversation_attachment_verified"])
             self.assertFalse(status["end_to_end_verified"])
+            desktop_record = status["client_connections"]["chatgpt-desktop-local"]
+            self.assertEqual("completed", desktop_record["last_attempt"]["state"])
+            self.assertEqual("partially_verified", desktop_record["effective"]["state"])
+            self.assertEqual("verified", desktop_record["stages"]["registration"]["state"])
+            self.assertEqual("verified", desktop_record["stages"]["loader"]["state"])
+            self.assertEqual("verified", desktop_record["stages"]["transport"]["state"])
+            self.assertEqual("not_checked", desktop_record["stages"]["fresh_app_server"]["state"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop MCP name-conflict test")
     def test_chatgpt_desktop_installer_rejects_existing_direct_mcp_with_same_name(self) -> None:
@@ -4249,6 +5663,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             fake_bin = root / "fake-bin"
             fake_bin.mkdir()
             codex_log = root / "conflict-codex-calls.txt"
@@ -4364,7 +5779,12 @@ $Result | ConvertTo-Json -Depth 6
             fake_project_root = root / "project"
             fake_doctor = fake_project_root / "scripts" / "check_mcp_connection_readiness.py"
             fake_doctor.parent.mkdir(parents=True)
+            (fake_project_root / "scripts" / "__init__.py").write_text("", encoding="utf-8")
             fake_doctor.write_text('print("doctor-before-stale-discovery")\n', encoding="utf-8")
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+                fake_project_root / "scripts" / "mcp_client_status.py",
+            )
             bundle_dir = root / "stale-plugin-bundle"
             files = write_mcp_setup_bundle(
                 config,
@@ -4439,6 +5859,10 @@ $Result | ConvertTo-Json -Depth 6
             self.assertEqual("failed_rolled_back", status["installation_state"])
             self.assertTrue(status["plugin_rollback_performed"])
             self.assertTrue(status["plugin_rollback_complete"])
+            self.assertEqual(
+                "failed_rolled_back",
+                status["client_connections"]["chatgpt-desktop-local"]["last_attempt"]["state"],
+            )
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop MCP loader verification test")
     def test_chatgpt_desktop_installer_rejects_plugin_missing_from_mcp_loader(self) -> None:
@@ -4464,6 +5888,7 @@ $Result | ConvertTo-Json -Depth 6
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             marketplace_root = bundle_dir / "chatgpt-desktop-local-plugin"
             plugin_manifest = json.loads(
                 (
@@ -4560,6 +5985,7 @@ $Result | ConvertTo-Json -Depth 6
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             status_path = bundle_dir / "bundle_status.json"
             previous_status = json.loads(status_path.read_text(encoding="utf-8"))
             previous_status.update(
@@ -4660,6 +6086,7 @@ $Result | ConvertTo-Json -Depth 6
                 preferred_project_root=fake_project_root,
             )
             (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+            _install_v5_client_status_fixture(fake_project_root, bundle_dir)
             (bundle_dir / "claude_desktop_config.json").write_text(
                 r'{"mcpServers":{"aksmcp":{"command":"powershell.exe","args":["C:\bad\data"]}}}',
                 encoding="utf-8",

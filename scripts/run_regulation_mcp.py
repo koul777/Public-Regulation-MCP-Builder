@@ -67,7 +67,10 @@ def parse_args() -> argparse.Namespace:
         "--transport",
         choices=["stdio", "streamable-http", "sse"],
         default="stdio",
-        help="MCP transport. Use stdio for local desktop clients and streamable-http for internal HTTP clients.",
+        help=(
+            "MCP transport. Use stdio for local clients and streamable-http /mcp for Codex or ChatGPT. "
+            "SSE is compatibility-only for clients that explicitly require it."
+        ),
     )
     parser.add_argument(
         "--no-warm-cache",

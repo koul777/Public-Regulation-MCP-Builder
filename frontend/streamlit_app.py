@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import html
+import io
 import json
 import queue
 import shutil
@@ -91,6 +92,7 @@ from scripts.mcp_connection_diagnostic import (
     STAGE_ORDER as MCP_CONNECTION_STAGE_ORDER,
     diagnostic_from_bundle_status,
 )
+from scripts.refresh_mcp_client_connection import run as refresh_mcp_client_connection
 from scripts.analyze_regulation_corpus import (
     GOLDSET_COMPLETE_LABEL_STATUSES,
     GOLDSET_SCORE_SPECS,
@@ -209,6 +211,7 @@ MCP_CONNECTION_STAGE_LABELS = {
     "conversation": "7. 현재 대화 호출",
 }
 MCP_CONNECTION_STATE_LABELS = {
+    "not_applicable": "해당 없음",
     "not_checked": "미확인",
     "pending": "확인 대기",
     "verified": "확인됨",
@@ -216,6 +219,9 @@ MCP_CONNECTION_STATE_LABELS = {
     "stale": "이전 증거",
 }
 MCP_EXTERNAL_DATA_TARGETS = frozenset({"chatgpt-remote", "chatgpt-tunnel", "claude-api"})
+MCP_SEARCH_FETCH_TARGETS = MCP_EXTERNAL_DATA_TARGETS | frozenset(
+    {"chatgpt-desktop-local", "codex"}
+)
 
 NAV_HOME = "🏠 시작하기"
 NAV_PREPROCESS = "① 문서 올려서 전처리"
@@ -2914,10 +2920,19 @@ def _mcp_bundle_state_key(document_id: str, scope: str = "document") -> str:
     return f"{MCP_BUNDLE_STATE_PREFIX}:{scope}:{document_id}"
 
 
+def _mcp_agent_prompt_display_kind(prompt_path: str | Path) -> str:
+    prompt_name = Path(prompt_path).name.casefold()
+    if prompt_name == "chatgpt_desktop_agent_connect_prompt.md".casefold():
+        return "legacy_chatgpt_desktop"
+    if prompt_name == "chatgpt_desktop_connect_guide.md".casefold():
+        return "chatgpt_desktop"
+    return "agent"
+
+
 def _mcp_final_verification_prompts(connection_target: str, server_name: str) -> list[str]:
     """Return only prompts supported by the selected client's MCP tool profile."""
 
-    if connection_target in MCP_EXTERNAL_DATA_TARGETS:
+    if connection_target in MCP_SEARCH_FETCH_TARGETS:
         return [
             f"{server_name} MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 "
             "fetch 도구로 조회해 조문 원문과 출처를 보여줘."
@@ -2928,30 +2943,103 @@ def _mcp_final_verification_prompts(connection_target: str, server_name: str) ->
     ]
 
 
-def _read_mcp_connection_diagnostic(bundle_dir: str | Path) -> tuple[dict[str, Any], str | None]:
+def _read_mcp_connection_diagnostic(
+    bundle_dir: str | Path,
+    connection_target: str | None = None,
+) -> tuple[dict[str, Any], str | None]:
     """Read bundle_status on every call and return a conservative diagnostic."""
 
     status_path = Path(bundle_dir) / "bundle_status.json"
     try:
         payload = json.loads(status_path.read_text(encoding="utf-8"))
     except OSError:
-        return diagnostic_from_bundle_status({}), "bundle_status_unavailable"
+        return (
+            diagnostic_from_bundle_status({}, connection_target=connection_target),
+            "bundle_status_unavailable",
+        )
     except (UnicodeError, json.JSONDecodeError):
-        return diagnostic_from_bundle_status({}), "bundle_status_invalid"
+        return (
+            diagnostic_from_bundle_status({}, connection_target=connection_target),
+            "bundle_status_invalid",
+        )
     if not isinstance(payload, dict):
-        return diagnostic_from_bundle_status({}), "bundle_status_invalid"
+        return (
+            diagnostic_from_bundle_status({}, connection_target=connection_target),
+            "bundle_status_invalid",
+        )
 
-    attempt_id = str(
-        payload.get("installation_attempt_id") or payload.get("attempt_id") or ""
-    ).strip() or None
-    config_fingerprint = str(
-        payload.get("installed_config_fingerprint") or payload.get("config_fingerprint") or ""
-    ).strip() or None
-    if payload.get("direct_config_registered") is True:
-        direct_config_path = str(payload.get("direct_config_path") or "").strip()
+    v5_connections = (
+        payload.get("client_connections")
+        if payload.get("schema_version") == "mcp-bundle-status-v5"
+        and isinstance(payload.get("client_connections"), dict)
+        else None
+    )
+    selected_record = (
+        v5_connections.get(connection_target)
+        if isinstance(v5_connections, dict)
+        and isinstance(v5_connections.get(connection_target), dict)
+        else None
+    )
+    selected_effective = (
+        selected_record.get("effective")
+        if isinstance(selected_record, dict)
+        and isinstance(selected_record.get("effective"), dict)
+        else {}
+    )
+    selected_last_attempt = (
+        selected_record.get("last_attempt")
+        if isinstance(selected_record, dict)
+        and isinstance(selected_record.get("last_attempt"), dict)
+        else {}
+    )
+    if selected_record is not None:
+        attempt_id = str(
+            selected_effective.get("attempt_id")
+            or selected_last_attempt.get("id")
+            or ""
+        ).strip() or None
+    else:
+        attempt_id = str(
+            payload.get("installation_attempt_id")
+            or payload.get("attempt_id")
+            or ""
+        ).strip() or None
+    is_claude_desktop = connection_target == "claude-desktop"
+    is_claude_code = connection_target == "claude-code"
+    if is_claude_desktop:
+        fingerprint_field = "claude_desktop_config_fingerprint"
+        path_field: str | None = "claude_desktop_config_path"
+        registration_field = "claude_desktop_config_registered"
+    elif is_claude_code:
+        fingerprint_field = "claude_code_config_fingerprint"
+        path_field = None
+        registration_field = "claude_code_registered"
+    else:
+        fingerprint_field = "installed_config_fingerprint"
+        path_field = "direct_config_path"
+        registration_field = "direct_config_registered"
+    if selected_record is not None:
+        config_fingerprint = str(
+            selected_effective.get("config_entry_fingerprint") or ""
+        ).strip() or None
+    else:
+        config_fingerprint = str(
+            payload.get(fingerprint_field)
+            or payload.get("config_fingerprint")
+            or ""
+        ).strip() or None
+    legacy_projection_matches_target = (
+        selected_record is None or payload.get("legacy_projection_target") == connection_target
+    )
+    if (
+        path_field
+        and legacy_projection_matches_target
+        and payload.get(registration_field) is True
+    ):
+        installed_config_path = str(payload.get(path_field) or "").strip()
         try:
-            current_config_path = Path(direct_config_path)
-            if not direct_config_path or not current_config_path.is_file():
+            current_config_path = Path(installed_config_path)
+            if not installed_config_path or not current_config_path.is_file():
                 config_fingerprint = None
             else:
                 config_fingerprint = "sha256:" + hashlib.sha256(
@@ -2964,8 +3052,48 @@ def _read_mcp_connection_diagnostic(bundle_dir: str | Path) -> tuple[dict[str, A
         attempt_id=attempt_id,
         config_fingerprint=config_fingerprint,
         checked_at=payload.get("updated_at") or payload.get("generated_at"),
+        connection_target=connection_target,
     )
     return diagnostic, None
+
+
+def _refresh_mcp_connection_observation(
+    bundle_dir: str | Path,
+    connection_target: str,
+    server_name: str,
+) -> tuple[bool, str]:
+    """Run a path-free, read-only Desktop observation and refresh its status fields."""
+
+    if connection_target not in {"chatgpt-desktop-local", "claude-desktop"}:
+        return False, "target_not_observable"
+    status_path = Path(bundle_dir) / "bundle_status.json"
+    output = io.StringIO()
+    refresh_args = [
+            "--target",
+            connection_target,
+            "--server-name",
+            server_name,
+            "--bundle-status",
+            str(status_path),
+            "--bundle-dir",
+            str(Path(bundle_dir)),
+        ]
+    if connection_target == "chatgpt-desktop-local":
+        refresh_args.append("--adopt-manual-registration")
+    exit_code = refresh_mcp_client_connection(
+        refresh_args,
+        stdout=output,
+    )
+    try:
+        output.seek(0)
+        result = json.loads(output.read())
+    except (TypeError, json.JSONDecodeError):
+        return False, "refresh_report_invalid"
+    if not isinstance(result, dict) or result.get("status_updated") is not True:
+        return False, str(result.get("error_code") or "refresh_failed")
+    if exit_code == 0 and result.get("ok") is True:
+        return True, "observation_ready"
+    return True, "observation_recorded_pending"
 
 
 def _mcp_connection_diagnostic_rows(diagnostic: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2973,7 +3101,10 @@ def _mcp_connection_diagnostic_rows(diagnostic: dict[str, Any]) -> list[dict[str
 
     stages = diagnostic.get("stages") if isinstance(diagnostic.get("stages"), dict) else {}
     rows: list[dict[str, Any]] = []
-    for stage_name in MCP_CONNECTION_STAGE_ORDER:
+    stage_order = diagnostic.get("stage_order")
+    if not isinstance(stage_order, list):
+        stage_order = list(MCP_CONNECTION_STAGE_ORDER)
+    for stage_name in stage_order:
         stage = stages.get(stage_name) if isinstance(stages.get(stage_name), dict) else {}
         evidence = stage.get("evidence") if isinstance(stage.get("evidence"), dict) else {}
         safe_evidence_keys = sorted(
@@ -6189,7 +6320,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
 
     with mcp_tab:
         st.markdown("### MCP client connection")
-        st.caption("승인·인덱싱 후 Claude Desktop, Claude Code, ChatGPT, Claude API에 붙일 설정을 생성합니다.")
+        st.caption(
+            "승인·인덱싱 후 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, "
+            "ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS)에 붙일 설정을 생성합니다."
+        )
         with st.expander("MCP/AI connection guide", expanded=False):
             st.markdown(
                 """
@@ -6251,7 +6385,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         status_cols[1].metric("MCP 노출 기록", int(mcp_connection_gate.get("mcp_visible_count") or 0))
         status_cols[2].metric("색인 상태", str(mcp_connection_gate.get("indexing_status") or "-"))
         status_cols[3].metric("오래된 기록", int(mcp_connection_gate.get("stale_count") or 0))
-        st.caption("아래 버튼을 누르면 Claude Desktop/Claude Code/ChatGPT/Claude API 연결에 필요한 파일 묶음이 생성됩니다.")
+        st.caption(
+            "아래 버튼을 누르면 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, "
+            "ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 연결 파일 묶음이 생성됩니다."
+        )
         mcp_scope = st.radio(
             "MCP 데이터 범위",
             ["selected_documents", "current_document", "selected_institution"],
@@ -6509,8 +6646,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             horizontal=True,
         )
         st.caption(
-            "ChatGPT Desktop에는 Settings > MCP servers 내장 등록 안내와 보조 BAT를 만듭니다. "
-            "Codex CLI·Claude Code에는 에이전트 연결 요청문과 보조 BAT를 만들며, Claude Desktop은 전용 BAT를 기본으로 사용합니다."
+            "ChatGPT Desktop에는 Settings > MCP servers 내장 등록 안내와 공유 config.toml용 보조 BAT를 만듭니다. "
+            "Codex CLI는 직접 설정/BAT를 기본으로 사용하고, Claude Code만 선택적 에이전트 연결 요청문을 제공합니다. "
+            "Claude Desktop은 전용 BAT를 기본으로 사용합니다. 연결 설정이나 비밀값을 대화 프롬프트에 넣지 마세요."
         )
         if mcp_scope == "selected_institution":
             st.info(
@@ -6552,7 +6690,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.info(
                 "MCP 로컬은 이 PC에서 stdio로 실행됩니다. ChatGPT Desktop은 Settings > MCP servers에서 생성된 값을 등록하고, "
                 "Codex CLI·Claude Code는 압축을 푼 번들을 로컬 작업공간으로 열어 대상별 연결 요청문을 실행합니다. "
-                "ChatGPT Desktop 내장 등록이 어렵거나 로컬 에이전트 실행 권한이 없을 때만 대상별 BAT를 사용합니다. "
+                "ChatGPT Desktop 수동 입력이 어렵거나 로컬 에이전트 실행 권한이 없을 때만 대상별 BAT를 사용합니다. "
                 "Claude Desktop은 전용 BAT가 기본입니다. 등록과 현재 대화의 도구 노출은 서로 다른 상태입니다."
             )
             mcp_profile_options = ["bundle", "chatgpt-desktop-local", "claude-desktop", "claude-code"]
@@ -6749,7 +6887,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             visibility_precheck_args.append("--tenant-storage-isolation")
         connect_script_path = mcp_bundle_output_dir / "connect_mcp_client.ps1"
         mcp_target_file_keys = {
-            "codex": "codex_agent_prompt",
+            "codex": "connect_codex_bat",
             "claude-desktop": "connect_claude_desktop_bat",
             "claude-code": "claude_code_agent_prompt",
             "chatgpt-desktop-local": "chatgpt_desktop_agent_prompt",
@@ -6990,7 +7128,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"- 설치 확인 스크립트: `{Path(str(files.get('install'))).name}`",
                         f"- 설치 후 사용 안내: `{Path(str(files.get('usage_guide_bat'))).name}`",
                         f"- ChatGPT Desktop 내장 MCP 등록 안내: `{Path(str(files.get('chatgpt_desktop_agent_prompt'))).name}`",
-                        f"- Codex 에이전트 연결 요청문: `{Path(str(files.get('codex_agent_prompt'))).name}`",
+                        f"- Codex 선택적 로컬 자동화 요청문: `{Path(str(files.get('codex_agent_prompt'))).name}`",
                         f"- Claude Code 에이전트 연결 요청문: `{Path(str(files.get('claude_code_agent_prompt'))).name}`",
                         f"- Codex CLI 호환 수동 입력값: `{Path(str(files.get('codex_plugin_guide'))).name}`",
                         f"- 한국어 안내문: `{Path(str(files.get('readme_ko'))).name}`",
@@ -7020,9 +7158,21 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             for agent_prompt_path in [path for path in agent_prompt_paths if path]:
                 prompt_path = Path(str(agent_prompt_path))
                 prompt_label = prompt_path.stem.replace("_", " ")
-                is_chatgpt_desktop_guide = prompt_path.name == "CHATGPT_DESKTOP_CONNECT_GUIDE.md"
+                prompt_display_kind = _mcp_agent_prompt_display_kind(prompt_path)
+                is_legacy_chatgpt_desktop_prompt = prompt_display_kind == "legacy_chatgpt_desktop"
+                is_chatgpt_desktop_guide = prompt_display_kind in {
+                    "legacy_chatgpt_desktop",
+                    "chatgpt_desktop",
+                }
                 st.markdown(f"#### {prompt_label}")
                 if is_chatgpt_desktop_guide:
+                    if is_legacy_chatgpt_desktop_prompt:
+                        st.warning(
+                            "구형 ChatGPT Desktop 에이전트 프롬프트를 감지했습니다. "
+                            "Codex 설치 지시는 실행하지 않으며, 복구 가능한 경우 아래 내용을 "
+                            "현재 Desktop Settings 입력 안내로 안전하게 변환합니다. 복구할 수 없으면 "
+                            "현재 프로그램에서 파일 묶음을 다시 생성하세요."
+                        )
                     st.caption(
                         "ChatGPT Desktop의 Settings > MCP servers > Add server에 아래 실제 값을 입력하세요. "
                         "프로그램이 현재 번들의 폴더 이름·절대경로·핵심 파일 구조와 전체 Arguments를 자동으로 넣었습니다. "
@@ -7046,18 +7196,31 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     agent_prompt_text = render_agent_connect_prompt_for_program(
                         agent_prompt_text,
                         bundle_dir=Path(str(agent_prompt_path)).parent,
+                        source_name=prompt_path.name,
                     )
                     st.code(agent_prompt_text, language=None)
-            if installed_target in {"chatgpt-desktop-local", "codex"}:
-                diagnostic_title = (
-                    "ChatGPT Desktop 7단계 연결 진단"
-                    if installed_target == "chatgpt-desktop-local"
-                    else "Codex CLI 7단계 연결 진단"
-                )
+            if installed_target in {
+                "chatgpt-desktop-local",
+                "codex",
+                "claude-code",
+                "claude-desktop",
+            }:
+                diagnostic_title = {
+                    "chatgpt-desktop-local": "ChatGPT Desktop 연결 진단",
+                    "codex": "Codex CLI 연결 진단",
+                    "claude-code": "Claude Code 연결 진단",
+                    "claude-desktop": "Claude Desktop 연결 진단",
+                }[installed_target]
+                diagnostic_client_label = {
+                    "chatgpt-desktop-local": "ChatGPT Desktop",
+                    "codex": "Codex CLI",
+                    "claude-code": "Claude Code",
+                    "claude-desktop": "Claude Desktop",
+                }[installed_target]
                 st.markdown(f"#### {diagnostic_title}")
                 st.caption(
                     "이 표는 화면이 다시 실행될 때마다 번들의 bundle_status.json을 새로 읽습니다. "
-                    "설정·서버 검증과 실제 Desktop 연결 완료를 별도 상태로 표시하며, "
+                    "설정·서버 검증과 선택한 클라이언트의 실제 연결 완료를 별도 상태로 표시하며, "
                     "이전 실행에서 남은 성공 값만으로 연결 완료라고 표시하지 않습니다. "
                     "이 프로그램은 다른 앱의 현재 대화 결과를 자동으로 읽을 수 없으므로, "
                     "아래 최종 도구 호출 성공은 해당 대화에서 직접 확인해야 합니다."
@@ -7066,21 +7229,54 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "MCP 연결 상태 새로고침",
                     key=f"refresh-mcp-connection-diagnostic-{document_id}-{mcp_scope}",
                 )
+                refresh_succeeded = False
+                refresh_message = ""
+                if diagnostic_refreshed and installed_target in {
+                    "chatgpt-desktop-local",
+                    "claude-desktop",
+                }:
+                    refresh_succeeded, refresh_message = _refresh_mcp_connection_observation(
+                        str(bundle_state.get("bundle_dir") or ""),
+                        installed_target,
+                        installed_server_name,
+                    )
                 connection_diagnostic, diagnostic_read_error = _read_mcp_connection_diagnostic(
-                    str(bundle_state.get("bundle_dir") or "")
+                    str(bundle_state.get("bundle_dir") or ""),
+                    installed_target,
                 )
                 if diagnostic_refreshed:
-                    st.caption("bundle_status.json을 다시 읽어 연결 진단을 갱신했습니다.")
+                    if installed_target in {"codex", "claude-code"}:
+                        client_label = (
+                            "Claude Code" if installed_target == "claude-code" else "Codex CLI"
+                        )
+                        st.caption(
+                            f"bundle_status.json을 다시 읽어 {client_label} 진단을 갱신했습니다."
+                        )
+                    elif refresh_succeeded and refresh_message == "observation_ready":
+                        st.caption(
+                            "앱 프로세스·재시작 이후 로그를 읽기 전용으로 다시 관찰했습니다. "
+                            "이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다."
+                        )
+                    elif refresh_succeeded:
+                        st.caption(
+                            "현재 관찰 결과를 기록했습니다. 앱 재시작 또는 제품 화면 확인이 아직 필요합니다."
+                        )
+                    else:
+                        st.warning(
+                            f"연결 관찰을 갱신하지 못했습니다: {refresh_message or 'refresh_failed'}"
+                        )
 
                 diagnostic_state = str(connection_diagnostic.get("overall_state") or "pending")
                 if diagnostic_state == "connected":
                     st.success(
-                        "Desktop 연결 완료 — 현재 시도의 Desktop 도구 노출과 대화 도구 호출 증명까지 확인했습니다."
+                        f"{diagnostic_client_label} 연결 완료 — 현재 시도의 등록·실행 및 "
+                        "새 대화 또는 task 실제 도구 호출 증명까지 확인했습니다."
                     )
                 elif diagnostic_state == "configured":
                     st.info(
-                        "MCP 구성 확인 완료 · Desktop 연결 확인 대기 — 서버 실행 준비는 확인됐지만 "
-                        "Desktop 도구 노출과 현재 대화 호출은 아직 별도 확인이 필요합니다."
+                        f"MCP 구성 확인 완료 · {diagnostic_client_label} 최종 확인 대기 — "
+                        "서버 실행 준비는 확인됐지만 새 대화 또는 task의 실제 도구 호출은 "
+                        "아직 별도 확인이 필요합니다."
                     )
                 else:
                     st.warning(
@@ -7110,16 +7306,32 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 restart_target_label = (
                     "ChatGPT Desktop"
                     if installed_target == "chatgpt-desktop-local"
+                    else "Claude Desktop"
+                    if installed_target == "claude-desktop"
+                    else "Claude Code"
+                    if installed_target == "claude-code"
                     else "Codex CLI"
                 )
-                st.caption(
-                    f"{restart_target_label}를 완전히 종료·재실행한 뒤 새 대화나 task에서 먼저 `/mcp`로 "
-                    f"`{installed_server_name}`을 확인하고, 아래 문장을 그대로 복사해 실행하세요."
-                )
-                st.code(
-                    f"{installed_server_name} MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.",
-                    language=None,
-                )
+                if installed_target == "claude-desktop":
+                    st.caption(
+                        f"{restart_target_label}를 완전히 종료·재실행한 뒤 새 대화의 Connectors에서 "
+                        f"`{installed_server_name}`을 확인하고, 아래 문장을 그대로 복사해 실행하세요."
+                    )
+                elif installed_target == "claude-code":
+                    st.caption(
+                        f"새 Claude Code task를 연 뒤 `claude mcp get {installed_server_name}`으로 "
+                        "user scope와 현재 번들 경로를 확인하고, 아래 문장을 그대로 실행하세요."
+                    )
+                else:
+                    st.caption(
+                        f"{restart_target_label}를 완전히 종료·재실행한 뒤 새 대화나 task에서 먼저 `/mcp`로 "
+                        f"`{installed_server_name}`을 확인하고, 아래 문장을 그대로 복사해 실행하세요."
+                    )
+                for verification_prompt in _mcp_final_verification_prompts(
+                    installed_target,
+                    installed_server_name,
+                ):
+                    st.code(verification_prompt, language=None)
             st.markdown(
                 "#### Claude Desktop 기본 BAT 연결 방식"
                 if installed_target == "claude-desktop"
@@ -7132,11 +7344,16 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 st.info(
                     "ChatGPT Desktop의 Settings > MCP servers > Add server가 기본 연결 방식입니다. "
                     "위 안내에 표시된 Name·STDIO·Command·Working directory·Arguments를 입력하고 Save한 뒤 Restart하세요. "
-                    "메뉴가 없거나 수동 입력이 어려울 때만 ChatGPT Desktop 전용 BAT를 보조 수단으로 사용합니다. "
+                    "수동 입력이 어렵거나 고급 설정 파일 경로가 필요할 때만 ChatGPT Desktop 전용 BAT를 보조 수단으로 사용합니다. "
+                    "BAT는 공유 ~/.codex/config.toml을 기록·검증하지만 Desktop에 없는 MCP 메뉴나 기능을 활성화하지는 않습니다. "
                     f"새 대화에서 먼저 `/mcp`로 {installed_server_name}을 확인하세요. `@이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다."
                 )
             elif installed_target == "codex":
-                st.info("Codex CLI를 다시 시작하고 새 task에서 `/mcp`로 등록 이름을 확인하세요.")
+                st.info(
+                    "Codex에 연결하기.bat가 사용자 MCP 설정을 직접 등록·검증합니다. "
+                    "또는 생성된 TOML 스니펫을 직접 설정한 뒤 Codex를 다시 시작하고 새 task에서 `/mcp`를 확인하세요. "
+                    "연결 설정·로컬 경로·토큰·API 키는 프롬프트에 붙여넣지 않습니다."
+                )
             elif installed_target == "claude-code":
                 st.info("Claude Code를 다시 시작하고 대화에서 `/mcp` 또는 터미널의 `claude mcp list`로 확인하세요.")
             elif installed_target == "claude-desktop":
@@ -7145,7 +7362,15 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "그 성공은 Desktop 자체 인식 완료가 아니므로 앱을 완전히 종료·재실행한 뒤 "
                     "새 대화의 Connectors에서 서버를 확인하고 실제 get_index_status 호출을 요청하세요."
                 )
-            elif installed_target in {"chatgpt-remote", "chatgpt-tunnel"}:
+            elif installed_target == "chatgpt-remote":
+                st.info(
+                    "공개 endpoint의 MCP OAuth 2.1 검증을 완료하고 --chatgpt-oauth-ready로 번들을 생성해야 합니다. "
+                    "정적 MCP_AUTH_TOKEN은 ChatGPT에 입력할 수 없으므로 OAuth 준비가 없으면 보안 Tunnel을 사용하세요. "
+                    "ChatGPT 웹의 Settings > Security and login에서 Developer mode를 켠 뒤 "
+                    "Settings > Plugins 또는 https://chatgpt.com/plugins 의 +에서 공개 HTTPS MCP 앱을 같은 이름으로 등록하고, "
+                    "새 대화의 + > More에서 앱을 선택해 아래 실제 search/fetch 도구 호출로 확인하세요."
+                )
+            elif installed_target == "chatgpt-tunnel":
                 st.info(
                     "ChatGPT 웹의 Settings > Security and login에서 Developer mode를 켠 뒤 "
                     "Settings > Plugins 또는 https://chatgpt.com/plugins 에서 MCP 앱을 같은 이름으로 등록하고, "
@@ -7172,13 +7397,22 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "같은 이름으로 다시 생성하면 Settings > MCP servers의 기존 항목을 새 안내 값으로 갱신합니다. "
                     "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
                 )
-            elif installed_target in {"codex", "claude-code"}:
+            elif installed_target == "codex":
                 st.caption(
-                    "같은 이름으로 다시 생성하고 대상별 에이전트 프롬프트를 실행하면 기존 연결 설정을 교체하며, "
-                    "Codex CLI·Claude Code에서 로컬 에이전트를 사용할 수 없을 때만 보조 BAT를 실행합니다. "
+                    "같은 이름으로 다시 생성하고 Codex 전용 BAT를 실행하거나 TOML 설정을 직접 교체하면 기존 연결을 갱신합니다. "
+                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
+                )
+            elif installed_target == "claude-code":
+                st.caption(
+                    "같은 이름으로 다시 생성하고 Claude Code 에이전트 요청문 또는 보조 BAT를 실행하면 기존 연결 설정을 교체합니다. "
                     "Claude Desktop은 전용 BAT가 기본입니다. 현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
                 )
-            elif installed_target in {"chatgpt-remote", "chatgpt-tunnel"}:
+            elif installed_target == "chatgpt-remote":
+                st.caption(
+                    "같은 이름으로 번들을 다시 생성했다면 원격 서버를 다시 준비하고, "
+                    "Settings > Plugins의 개발자 앱을 Refresh하거나 다시 만든 뒤 새 대화의 + > More에서 선택해 확인하세요."
+                )
+            elif installed_target == "chatgpt-tunnel":
                 st.caption(
                     "같은 이름으로 번들을 다시 생성했다면 원격 서버 또는 Tunnel을 다시 준비하고, "
                     "ChatGPT Plugins 설정에서 앱을 Refresh하거나 다시 생성한 뒤 새 대화의 + > More에서 선택해 확인하세요."

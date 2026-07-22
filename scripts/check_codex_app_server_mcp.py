@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -124,7 +125,9 @@ def check_codex_app_server_mcp(
                     return _failed_report(
                         server_name=normalized_name,
                         required_tools=required,
-                        error=f"Codex app-server initialize failed: {_safe_json(payload.get('error'))}",
+                        error=_diagnostic_summary(
+                            "Codex app-server initialize returned a JSON-RPC error.", stderr_tail
+                        ),
                         probe_id=probe_id,
                         generated_at=generated_at,
                         provenance=provenance,
@@ -153,7 +156,9 @@ def check_codex_app_server_mcp(
                     required_tools=required,
                     initialized=initialized,
                     status_received=True,
-                    error=f"Codex app-server MCP inventory failed: {_safe_json(payload.get('error'))}",
+                    error=_diagnostic_summary(
+                        "Codex app-server MCP inventory returned a JSON-RPC error.", stderr_tail
+                    ),
                     probe_id=probe_id,
                     generated_at=generated_at,
                     provenance=provenance,
@@ -384,7 +389,8 @@ def _probe_provenance(command: Sequence[str]) -> dict[str, Any]:
     config_path = _normalized_path(Path(codex_home) / "config.toml") if codex_home else None
     config_content_before = _file_content_fingerprint(config_path)
     return {
-        "executable_path": executable,
+        "executable_file_name": Path(executable).name if executable else None,
+        "executable_path_sha256": _path_fingerprint(executable),
         "executable_version": _executable_version(executable),
         "process_id": None,
         "config_scope": {
@@ -452,8 +458,17 @@ def _executable_version(executable: str | None) -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part.strip())
-    return output[:200] or None
+    if completed.returncode != 0:
+        return None
+    for stream_text in (completed.stdout, completed.stderr):
+        for line in stream_text.splitlines():
+            candidate = line.strip()
+            if re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_. -]{0,31} v?\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?",
+                candidate,
+            ):
+                return candidate
+    return None
 
 
 def _read_lines(stream: TextIO, source: str, messages: queue.Queue[tuple[str, str]]) -> None:
@@ -487,8 +502,11 @@ def _send_status_list_request(
     )
 
 
-def _safe_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))[:1000]
+def _diagnostic_summary(message: str, stderr_lines: Sequence[str]) -> str:
+    count = len(stderr_lines)
+    if count:
+        return f"{message} app-server wrote {count} diagnostic line(s) to stderr."
+    return message
 
 
 def _failed_report(

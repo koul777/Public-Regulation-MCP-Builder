@@ -19,21 +19,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.generate_mcp_client_config import (
+    RUNTIME_IDENTITY_MODULES as GENERATED_RUNTIME_IDENTITY_MODULES,
+)
+
 INSTALL_SCRIPT = "install_local_package.ps1"
 STDIO_LAUNCHER = "run_mcp_stdio_server.ps1"
 CLAUDE_DESKTOP_BAT = "Claude Desktop에 연결하기.bat"
 CLAUDE_CODE_BAT = "Claude Code에 연결하기.bat"
 RUNTIME_MARKER = "runtime_python.json"
-RUNTIME_IDENTITY_MODULES = (
-    "scripts.run_regulation_mcp",
-    "scripts.check_mcp_connection_readiness",
-    "scripts.run_mcp_smoke",
-    "scripts.run_mcp_transport_smoke",
-    "scripts.run_mcp_client_config_smoke",
-    "scripts.check_codex_app_server_mcp",
-    "scripts.check_chatgpt_desktop_recognition",
-    "scripts.audit_mcp_index_visibility",
-)
+RUNTIME_IDENTITY_MODULES = tuple(GENERATED_RUNTIME_IDENTITY_MODULES)
 MCP_COMMANDS = (
     "reg-rag-mcp-server",
     "reg-rag-mcp-config",

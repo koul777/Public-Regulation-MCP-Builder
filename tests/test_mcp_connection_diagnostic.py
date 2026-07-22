@@ -7,6 +7,7 @@ from scripts.mcp_connection_diagnostic import (
     build_connection_diagnostic,
     diagnostic_from_bundle_status,
 )
+from scripts.mcp_client_status import begin_attempt, commit_success, create_bundle_status
 
 
 ATTEMPT = "attempt-20260720"
@@ -430,6 +431,364 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
         self.assertEqual("stale", report["stages"]["registration"]["state"])
         self.assertEqual("stale_attempt", report["stages"]["registration"]["reason_code"])
         self.assertFalse(report["connected"])
+
+    def test_claude_desktop_uses_its_own_configuration_and_runtime_evidence(self) -> None:
+        report = diagnostic_from_bundle_status(
+            {
+                "installation_attempt_id": ATTEMPT,
+                "claude_desktop_config_fingerprint": FINGERPRINT,
+                "runtime_fingerprint": "sha256:runtime-current",
+                "claude_desktop_config_transport_runtime_fingerprint": (
+                    "sha256:runtime-current"
+                ),
+                "claude_desktop_config_registered": True,
+                "claude_desktop_config_transport_verified": True,
+                "claude_desktop_restart_required": True,
+                # These Codex-host values must not satisfy Claude Desktop stages.
+                "direct_config_registered": True,
+                "direct_config_loader_verified": True,
+                "fresh_codex_app_server_inventory_verified": True,
+            },
+            connection_target="claude-desktop",
+        )
+
+        self.assertEqual("claude-desktop", report["connection_target"])
+        self.assertEqual(
+            [
+                "registration",
+                "transport",
+                "desktop_reload",
+                "loader",
+                "desktop_surface",
+                "conversation",
+            ],
+            report["stage_order"],
+        )
+        self.assertTrue(report["configured"])
+        self.assertEqual("configured", report["overall_state"])
+        self.assertEqual("desktop_reload", report["first_blocking_stage"])
+        self.assertEqual("verified", report["stages"]["registration"]["state"])
+        self.assertEqual("verified", report["stages"]["transport"]["state"])
+        self.assertEqual("pending", report["stages"]["loader"]["state"])
+        self.assertEqual("not_applicable", report["stages"]["fresh_app_server"]["state"])
+
+    def test_claude_desktop_does_not_borrow_direct_registration(self) -> None:
+        report = diagnostic_from_bundle_status(
+            {
+                "installation_attempt_id": ATTEMPT,
+                "installed_config_fingerprint": FINGERPRINT,
+                "direct_config_registered": True,
+                "direct_config_loader_verified": True,
+                "direct_stdio_verified": True,
+            },
+            connection_target="claude-desktop",
+        )
+
+        self.assertEqual("pending", report["overall_state"])
+        self.assertFalse(report["configured"])
+        self.assertEqual("registration", report["first_blocking_stage"])
+
+    def test_codex_profile_does_not_wait_for_chatgpt_desktop_surface(self) -> None:
+        runtime_fingerprint = "sha256:runtime-current"
+        report = diagnostic_from_bundle_status(
+            {
+                "installation_attempt_id": ATTEMPT,
+                "installed_config_fingerprint": FINGERPRINT,
+                "runtime_fingerprint": runtime_fingerprint,
+                "installed_config_transport_runtime_fingerprint": runtime_fingerprint,
+                "fresh_codex_app_server_runtime_fingerprint": runtime_fingerprint,
+                "direct_config_registered": True,
+                "direct_config_loader_verified": True,
+                "direct_stdio_verified": True,
+                "installed_config_transport_verified": True,
+                "transport_end_to_end_verified": True,
+                "desktop_app_server_loader_verified": True,
+                "fresh_codex_app_server_inventory_verified": True,
+            },
+            connection_target="codex",
+        )
+
+        self.assertEqual(
+            [
+                "registration",
+                "loader",
+                "transport",
+                "fresh_app_server",
+                "conversation",
+            ],
+            report["stage_order"],
+        )
+        self.assertTrue(report["configured"])
+        self.assertFalse(report["connected"])
+        self.assertEqual("conversation", report["first_blocking_stage"])
+        self.assertEqual("not_applicable", report["stages"]["desktop_reload"]["state"])
+        self.assertEqual("not_applicable", report["stages"]["desktop_surface"]["state"])
+
+    def test_post_restart_observer_status_satisfies_chatgpt_reload_only(self) -> None:
+        runtime_fingerprint = "sha256:runtime-current"
+        report = diagnostic_from_bundle_status(
+            {
+                "installation_attempt_id": ATTEMPT,
+                "installed_config_fingerprint": FINGERPRINT,
+                "runtime_fingerprint": runtime_fingerprint,
+                "installed_config_transport_runtime_fingerprint": runtime_fingerprint,
+                "fresh_codex_app_server_runtime_fingerprint": runtime_fingerprint,
+                "direct_config_registered": True,
+                "direct_config_loader_verified": True,
+                "installed_config_transport_verified": True,
+                "transport_end_to_end_verified": True,
+                "desktop_app_server_loader_verified": True,
+                "fresh_codex_app_server_inventory_verified": True,
+                "desktop_restart_required": False,
+                "desktop_restart_status": "running_process_started_after_registration",
+                "desktop_restarted_after_registration": True,
+            },
+            connection_target="chatgpt-desktop-local",
+        )
+
+        self.assertEqual("verified", report["stages"]["desktop_reload"]["state"])
+        self.assertEqual("pending", report["stages"]["desktop_surface"]["state"])
+        self.assertFalse(report["connected"])
+
+    def test_post_restart_observer_status_satisfies_claude_reload_only(self) -> None:
+        runtime_fingerprint = "sha256:runtime-current"
+        report = diagnostic_from_bundle_status(
+            {
+                "installation_attempt_id": ATTEMPT,
+                "claude_desktop_config_fingerprint": FINGERPRINT,
+                "runtime_fingerprint": runtime_fingerprint,
+                "claude_desktop_config_transport_runtime_fingerprint": runtime_fingerprint,
+                "claude_desktop_config_registered": True,
+                "claude_desktop_config_transport_verified": True,
+                "claude_desktop_restart_required": False,
+                "claude_desktop_restart_status": (
+                    "running_process_started_after_registration"
+                ),
+                "claude_desktop_restarted_after_registration": True,
+                "claude_desktop_loader_observed": True,
+            },
+            connection_target="claude-desktop",
+        )
+
+        self.assertEqual("verified", report["stages"]["desktop_reload"]["state"])
+        self.assertEqual("pending", report["stages"]["loader"]["state"])
+        self.assertFalse(report["connected"])
+
+    def test_claude_code_profile_uses_user_scope_loader_and_runtime_evidence(self) -> None:
+        runtime_fingerprint = "sha256:runtime-current"
+        report = diagnostic_from_bundle_status(
+            {
+                "installation_attempt_id": ATTEMPT,
+                "claude_code_config_fingerprint": FINGERPRINT,
+                "runtime_fingerprint": runtime_fingerprint,
+                "claude_code_transport_runtime_fingerprint": runtime_fingerprint,
+                "claude_code_registered": True,
+                "claude_code_loader_verified": True,
+                "claude_code_transport_verified": True,
+                "claude_code_conversation_verified": False,
+                # Desktop values must not become Claude Code requirements.
+                "desktop_restart_required": True,
+                "desktop_tool_scan_verified": False,
+            },
+            connection_target="claude-code",
+        )
+
+        self.assertEqual(
+            ["registration", "loader", "transport", "conversation"],
+            report["stage_order"],
+        )
+        self.assertTrue(report["configured"])
+        self.assertEqual("conversation", report["first_blocking_stage"])
+        self.assertEqual("not_applicable", report["stages"]["desktop_reload"]["state"])
+        self.assertFalse(report["connected"])
+
+    def test_v5_diagnostic_never_leaks_codex_success_into_chatgpt_desktop(self) -> None:
+        status = begin_attempt(
+            create_bundle_status("final", generated_at=CHECKED_AT),
+            "codex",
+            ATTEMPT,
+            started_at=CHECKED_AT,
+        )
+        status = commit_success(
+            status,
+            "codex",
+            ATTEMPT,
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-current",
+            bundle_location_fingerprint="bundle-current",
+            verified_at=CHECKED_AT,
+        )
+
+        codex = diagnostic_from_bundle_status(status, connection_target="codex")
+        chatgpt = diagnostic_from_bundle_status(
+            status,
+            connection_target="chatgpt-desktop-local",
+        )
+
+        self.assertTrue(codex["configured"])
+        self.assertEqual("client_connections", codex["status_source"])
+        self.assertFalse(chatgpt["configured"])
+        self.assertEqual("registration", chatgpt["first_blocking_stage"])
+        self.assertEqual("not_checked", chatgpt["stages"]["registration"]["state"])
+
+    def test_v5_diagnostic_uses_each_remote_client_record(self) -> None:
+        required_stages = {
+            "chatgpt-remote": ("transport", "registration", "loader"),
+            "chatgpt-tunnel": ("transport", "registration", "loader"),
+            "claude-api": ("transport", "registration"),
+        }
+
+        for target, stages in required_stages.items():
+            with self.subTest(target=target):
+                attempt_id = f"attempt-{target}"
+                status = begin_attempt(
+                    create_bundle_status("final", generated_at=CHECKED_AT),
+                    target,
+                    attempt_id,
+                    started_at=CHECKED_AT,
+                )
+                status = commit_success(
+                    status,
+                    target,
+                    attempt_id,
+                    verified_stages=stages,
+                    config_entry_fingerprint=f"config-{target}",
+                    runtime_fingerprint="runtime-current",
+                    verified_at=CHECKED_AT,
+                )
+
+                report = diagnostic_from_bundle_status(
+                    status,
+                    connection_target=target,
+                )
+
+                self.assertEqual("client_connections", report.get("status_source"))
+                self.assertEqual(attempt_id, report["attempt_id"])
+                self.assertTrue(report["configured"])
+
+    def test_v5_remote_diagnostic_does_not_inherit_legacy_projection_identity(self) -> None:
+        status = begin_attempt(
+            create_bundle_status("final", generated_at=CHECKED_AT),
+            "codex",
+            ATTEMPT,
+            started_at=CHECKED_AT,
+        )
+        status = commit_success(
+            status,
+            "codex",
+            ATTEMPT,
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-current",
+            bundle_location_fingerprint="bundle-current",
+            verified_at=CHECKED_AT,
+        )
+
+        for target in ("chatgpt-remote", "chatgpt-tunnel", "claude-api"):
+            with self.subTest(target=target):
+                report = diagnostic_from_bundle_status(
+                    status,
+                    connection_target=target,
+                )
+
+                self.assertEqual("client_connections", report.get("status_source"))
+                self.assertIsNone(report["attempt_id"])
+                self.assertIsNone(report["config_fingerprint"])
+                self.assertFalse(report["configured"])
+
+    def test_v5_diagnostic_rejects_runtime_bound_stages_from_an_old_runtime(self) -> None:
+        status = begin_attempt(
+            create_bundle_status("final", generated_at=CHECKED_AT),
+            "codex",
+            ATTEMPT,
+            started_at=CHECKED_AT,
+        )
+        status = commit_success(
+            status,
+            "codex",
+            ATTEMPT,
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-old",
+            bundle_location_fingerprint="bundle-current",
+            verified_at=CHECKED_AT,
+        )
+        status["runtime_fingerprint"] = "runtime-current"
+        status["client_connections"]["codex"]["effective"][
+            "runtime_fingerprint"
+        ] = "runtime-current"
+
+        report = diagnostic_from_bundle_status(status, connection_target="codex")
+
+        self.assertFalse(report["configured"])
+        for stage_name in ("loader", "transport", "fresh_app_server"):
+            with self.subTest(stage_name=stage_name):
+                self.assertEqual("stale", report["stages"][stage_name]["state"])
+                self.assertEqual(
+                    "stale_runtime_fingerprint",
+                    report["stages"][stage_name]["reason_code"],
+                )
+
+    def test_v5_diagnostic_rejects_runtime_bound_stage_without_runtime_identity(self) -> None:
+        status = begin_attempt(
+            create_bundle_status("final", generated_at=CHECKED_AT),
+            "codex",
+            ATTEMPT,
+            started_at=CHECKED_AT,
+        )
+        status = commit_success(
+            status,
+            "codex",
+            ATTEMPT,
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-current",
+            bundle_location_fingerprint="bundle-current",
+            verified_at=CHECKED_AT,
+        )
+        status["client_connections"]["codex"]["stages"]["transport"][
+            "runtime_fingerprint"
+        ] = None
+
+        report = diagnostic_from_bundle_status(status, connection_target="codex")
+
+        self.assertFalse(report["configured"])
+        self.assertEqual("stale", report["stages"]["transport"]["state"])
+        self.assertEqual(
+            "evidence_runtime_fingerprint_missing",
+            report["stages"]["transport"]["reason_code"],
+        )
+
+    def test_v5_diagnostic_binds_client_runtime_to_current_bundle_runtime(self) -> None:
+        status = begin_attempt(
+            create_bundle_status("final", generated_at=CHECKED_AT),
+            "codex",
+            ATTEMPT,
+            started_at=CHECKED_AT,
+        )
+        status = commit_success(
+            status,
+            "codex",
+            ATTEMPT,
+            verified_stages=("registration", "loader", "transport", "fresh_app_server"),
+            config_entry_fingerprint="codex-config",
+            runtime_fingerprint="runtime-old",
+            bundle_location_fingerprint="bundle-current",
+            verified_at=CHECKED_AT,
+        )
+        status["runtime_fingerprint"] = "runtime-current"
+
+        report = diagnostic_from_bundle_status(status, connection_target="codex")
+
+        self.assertFalse(report["configured"])
+        for stage_name in ("loader", "transport", "fresh_app_server"):
+            with self.subTest(stage_name=stage_name):
+                self.assertEqual("stale", report["stages"][stage_name]["state"])
+                self.assertEqual(
+                    "stale_runtime_fingerprint",
+                    report["stages"][stage_name]["reason_code"],
+                )
 
 
 if __name__ == "__main__":

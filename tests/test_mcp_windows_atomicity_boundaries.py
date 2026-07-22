@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -60,6 +61,20 @@ def _write_bundle(root: Path) -> tuple[dict[str, str], Path]:
         preferred_project_root=fake_project_root,
     )
     (bundle_dir / "data").mkdir(parents=True, exist_ok=True)
+    (fake_scripts / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "scripts" / "mcp_client_status.py",
+        fake_scripts / "mcp_client_status.py",
+    )
+    status_path = bundle_dir / "bundle_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["runtime_fingerprint"] = "sha256:" + hashlib.sha256(
+        b"runtime-current"
+    ).hexdigest()
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return files, bundle_dir
 
 
