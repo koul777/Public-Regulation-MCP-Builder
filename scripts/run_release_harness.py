@@ -65,7 +65,6 @@ class HarnessOptions:
     mcp_min_visible_records: int = 1
     bundle_doctor_json: Path = Path("reports/mcp_connection_readiness_bundle_harness.json")
     chatgpt_https_json: Path = Path("reports/mcp_connection_readiness_chatgpt_https_harness.json")
-    chatgpt_tunnel_json: Path = Path("reports/mcp_connection_readiness_chatgpt_tunnel_harness.json")
     public_audit_json: Path = Path("reports/public_release_readiness_audit.harness.json")
     cleanup_json: Path = Path("reports/public_release_cleanup_plan.harness.json")
     cleanup_md: Path = Path("reports/public_release_cleanup_plan.harness.md")
@@ -82,7 +81,6 @@ class HarnessOptions:
     skip_mcp_smoke: bool = False
     skip_mcp_transport_smoke: bool = False
     skip_public_audit: bool = False
-    require_tunnel_client: bool = False
     include_wheel_in_bundle: bool = False
     probe_public_url: bool = False
     allow_dirty_build: bool = False
@@ -118,7 +116,6 @@ _SCOPED_OUTPUT_FIELDS = (
     "mcp_bundle_transport_smoke_json",
     "bundle_doctor_json",
     "chatgpt_https_json",
-    "chatgpt_tunnel_json",
     "public_audit_json",
     "cleanup_json",
     "cleanup_md",
@@ -483,30 +480,6 @@ def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
         ]
     )
 
-    tunnel_command = [
-        python,
-        "scripts/check_mcp_connection_readiness.py",
-        "--client-profile",
-        "chatgpt",
-        "--connection-mode",
-        "openai-tunnel",
-        "--transport",
-        "stdio",
-        "--skip-data-check",
-        "--out-json",
-        _path_arg(root, options.chatgpt_tunnel_json),
-        "--fail-on-warning",
-    ]
-    if not options.require_tunnel_client:
-        tunnel_command.insert(-4, "--skip-cli-check")
-    steps.append(
-        HarnessStep(
-            "chatgpt_tunnel_doctor",
-            tuple(tunnel_command),
-            env={"CONTROL_PLANE_API_KEY": "ci-control-plane-key", "OPENAI_TUNNEL_ID": "ci-tunnel-id"},
-        )
-    )
-
     if options.mode in {"internal", "public"} and not options.skip_public_audit:
         public_required = options.mode == "public"
         steps.append(
@@ -708,7 +681,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-mcp-smoke", action="store_true")
     parser.add_argument("--skip-mcp-transport-smoke", action="store_true")
     parser.add_argument("--skip-public-audit", action="store_true")
-    parser.add_argument("--require-tunnel-client", action="store_true")
     parser.add_argument("--probe-public-url", action="store_true", help="Make bundle and ChatGPT HTTPS doctors probe the live public /mcp URL.")
     parser.add_argument(
         "--include-wheel-in-bundle",
@@ -750,7 +722,6 @@ def options_from_args(args: argparse.Namespace) -> HarnessOptions:
         skip_mcp_smoke=args.skip_mcp_smoke,
         skip_mcp_transport_smoke=args.skip_mcp_transport_smoke,
         skip_public_audit=args.skip_public_audit,
-        require_tunnel_client=args.require_tunnel_client,
         include_wheel_in_bundle=args.include_wheel_in_bundle,
         probe_public_url=args.probe_public_url,
     )

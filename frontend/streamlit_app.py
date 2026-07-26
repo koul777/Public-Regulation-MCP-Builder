@@ -7204,9 +7204,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         ensure_ascii=False,
                         indent=2,
                     )
-                elif mcp_mode == "tunnel":
-                    connection_display_label = "Tunnel 실행 스크립트"
-                    connection_display_value = str(files.get("openai_tunnel") or "")
                 selected_target_file = files.get(mcp_target_file_key)
                 local_server = (bundle_config.get("quickstart") or {}).get("run_local_stdio_server") or {}
                 _write_direct_python_quickstart_scripts(

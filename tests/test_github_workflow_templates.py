@@ -79,7 +79,7 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertIn("--zip-out reports/mcp_connection_bundle_ci.zip", text)
         self.assertIn("--include-wheel", text)
         self.assertIn("--bundle-dir reports/mcp_connection_bundle_ci", text)
-        self.assertIn("--connection-mode openai-tunnel", text)
+        self.assertNotIn("--connection-mode openai-tunnel", text)
         self.assertIn("MCP_AUTH_TOKEN=ci-token", text)
 
     def test_nightly_template_uploads_mcp_artifacts(self) -> None:
@@ -111,7 +111,7 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertIn("reports/mcp_connection_bundle_nightly/", text)
         self.assertIn("--include-wheel", text)
         self.assertIn("--bundle-dir reports/mcp_connection_bundle_nightly", text)
-        self.assertIn("--connection-mode openai-tunnel", text)
+        self.assertNotIn("--connection-mode openai-tunnel", text)
         self.assertIn("--allow-missing-optional-artifacts", text)
 
 

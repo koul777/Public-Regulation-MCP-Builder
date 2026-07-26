@@ -15,7 +15,7 @@ For MCP-specific changes, also run:
 reg-rag-mcp-smoke --fail-on-issue
 reg-rag-mcp-config --client-profile bundle --server-name sample-institution-regulations --tenant-id default --out-dir reports/mcp_connection_bundle --zip-out reports/mcp_connection_bundle.zip
 reg-rag-mcp-doctor --client-profile chatgpt --transport streamable-http --public-url https://example.invalid/mcp --skip-data-check
-reg-rag-mcp-doctor --client-profile chatgpt --connection-mode openai-tunnel --transport stdio --skip-data-check
+reg-rag-mcp-doctor --client-profile chatgpt --connection-mode direct --transport streamable-http --public-url https://example.vercel.app/mcp --skip-data-check
 ```
 
 For public/source-only workflow changes, run `reg-rag-private-release-smoke --synthetic-sample`.

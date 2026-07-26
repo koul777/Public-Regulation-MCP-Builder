@@ -36,7 +36,6 @@ HERMES_MCP_REQUIRED_ARTIFACTS = frozenset(
         "reports/mcp_connection_bundle_hermes.zip",
         "reports/mcp_connection_readiness_bundle_hermes.json",
         "reports/mcp_connection_readiness_chatgpt_https_hermes.json",
-        "reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json",
     }
 )
 MCP_PRODUCT_READINESS_REQUIRED_ARTIFACTS = frozenset(
@@ -173,7 +172,6 @@ REQUIRED_JSON_MARKERS: dict[str, dict[str, Any]] = {
     "reports/mcp_transport_smoke_hermes.json": {"report_type": "mcp_transport_smoke"},
     "reports/mcp_connection_readiness_bundle_hermes.json": {"report_type": "mcp_connection_readiness"},
     "reports/mcp_connection_readiness_chatgpt_https_hermes.json": {"report_type": "mcp_connection_readiness"},
-    "reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json": {"report_type": "mcp_connection_readiness"},
     "reports/mcp_readiness_authority_current.json": {"report_type": "mcp_readiness_authority", "authority_version": 1},
     "reports/mcp_product_readiness_current.json": {"report_type": "mcp_product_readiness"},
     "reports/table_review_source_traceability_current.json": {"report_type": "table_review_source_traceability"},

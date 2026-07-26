@@ -10,8 +10,9 @@ import unittest
 from pathlib import Path
 
 from scripts.run_mcp_windows_execution_matrix import (
-    CLAUDE_CODE_BAT,
-    CLAUDE_DESKTOP_BAT,
+    CLAUDE_CODE_STDIO,
+    CLAUDE_DESKTOP_CONFIG,
+    CONNECT_SCRIPT,
     INSTALL_SCRIPT,
     RUNTIME_IDENTITY_MODULES,
     RUNTIME_MARKER,
@@ -34,18 +35,33 @@ param([Parameter(ValueFromRemainingArguments=$true)][string[]]$ServerArgs)
 """
 
 
-def _write_bundle(root: Path, *, claude_install_package: bool = True) -> Path:
+def _write_bundle(root: Path, *, claude_code_add_stdio_contract: bool = True) -> Path:
     bundle = root / "bundle"
     bundle.mkdir()
     (bundle / INSTALL_SCRIPT).write_text(INSTALL_FIXTURE, encoding="utf-8")
     (bundle / STDIO_LAUNCHER).write_text(LAUNCHER_FIXTURE, encoding="utf-8")
-    install = "-InstallPackage " if claude_install_package else ""
-    (bundle / CLAUDE_DESKTOP_BAT).write_text(
-        f'powershell.exe -File "%~dp0connect_mcp_client.ps1" {install}-Target claude-desktop -InstallClaudeDesktop\n',
+    (bundle / CLAUDE_DESKTOP_CONFIG).write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "direct-matrix": {
+                        "command": "python.exe",
+                        "args": ["-m", "scripts.run_regulation_mcp"],
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
-    (bundle / CLAUDE_CODE_BAT).write_text(
-        f'powershell.exe -File "%~dp0connect_mcp_client.ps1" {install}-Target claude-code\n',
+    contract_line = (
+        "claude mcp add --transport stdio --scope user aks_mcp --no-warm-cache\n"
+        if claude_code_add_stdio_contract
+        else "Write-Host \"not-a-claude-code-stdio-contract\"\n"
+    )
+    (bundle / CLAUDE_CODE_STDIO).write_text(contract_line, encoding="utf-8")
+    (bundle / CONNECT_SCRIPT).write_text(
+        "param([switch]$InstallPackage)\nWrite-Host \"bundle connect helper\"\n",
         encoding="utf-8",
     )
     return bundle
@@ -283,20 +299,20 @@ class WindowsExecutionMatrixTests(unittest.TestCase):
         self.assertTrue(missing["passed"])
         self.assertTrue(missing["observed"]["path_python_fallback_invoked"])
 
-    def test_claude_bat_contract_fails_if_install_package_is_missing(self) -> None:
+    def test_direct_client_artifacts_contract_fails_if_claude_code_stdio_contract_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report = run_execution_matrix(
                 runner=SimulatedRunner(),
-                bundle_dir=_write_bundle(root, claude_install_package=False),
+                bundle_dir=_write_bundle(root, claude_code_add_stdio_contract=False),
                 powershell="powershell.exe",
                 temp_root=root,
             )
 
-        scenario = next(item for item in report["scenarios"] if item["scenario_id"] == "claude_bat_installs_package")
+        scenario = next(item for item in report["scenarios"] if item["scenario_id"] == "direct_client_artifacts_contract")
         self.assertFalse(report["passed"])
         self.assertFalse(scenario["passed"])
-        self.assertFalse(scenario["observed"]["bat_executed"])
+        self.assertFalse(scenario["observed"]["claude_code_add_stdio_contract"])
 
     def test_runner_failure_is_structured_without_subprocess_output_or_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,7 +330,7 @@ class WindowsExecutionMatrixTests(unittest.TestCase):
         self.assertNotIn("simulated failure", serialized)
         self.assertNotIn(str(root), serialized)
 
-    def test_powershell_unavailable_skips_execution_but_still_checks_bat_contract(self) -> None:
+    def test_powershell_unavailable_skips_execution_but_still_checks_direct_client_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report = run_execution_matrix(

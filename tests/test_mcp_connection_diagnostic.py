@@ -145,7 +145,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             with self.subTest(stage_name=stage_name):
                 self.assertNotEqual("verified", report["stages"][stage_name]["state"])
 
-    def test_direct_registration_cannot_be_combined_with_plugin_loader_evidence(self) -> None:
+    def test_direct_registration_requires_direct_loader_evidence(self) -> None:
         runtime_fingerprint = "runtime-current"
         report = diagnostic_from_bundle_status(
             {
@@ -155,9 +155,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
                 "installed_config_transport_runtime_fingerprint": runtime_fingerprint,
                 "fresh_codex_app_server_runtime_fingerprint": runtime_fingerprint,
                 "direct_config_registered": True,
-                "plugin_registered": False,
                 "direct_config_loader_verified": False,
-                "plugin_loader_verified": True,
                 "direct_stdio_verified": True,
                 "transport_end_to_end_verified": True,
                 "desktop_app_server_loader_verified": True,
@@ -635,7 +633,6 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
     def test_v5_diagnostic_uses_each_remote_client_record(self) -> None:
         required_stages = {
             "chatgpt-remote": ("transport", "registration", "loader"),
-            "chatgpt-tunnel": ("transport", "registration", "loader"),
             "claude-api": ("transport", "registration"),
         }
 
@@ -685,7 +682,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             verified_at=CHECKED_AT,
         )
 
-        for target in ("chatgpt-remote", "chatgpt-tunnel", "claude-api"):
+        for target in ("chatgpt-remote", "claude-api"):
             with self.subTest(target=target):
                 report = diagnostic_from_bundle_status(
                     status,

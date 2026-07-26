@@ -413,7 +413,6 @@ class McpStatusTransactionTests(unittest.TestCase):
                     "tools_discovered": True,
                     "installed_config_transport_verified": True,
                     "generated_client_configs_transport_verified": True,
-                    "plugin_stdio_verified": True,
                     "direct_stdio_verified": True,
                     "transport_end_to_end_verified": True,
                     "fresh_codex_app_server_inventory_verified": True,
@@ -468,7 +467,6 @@ class McpStatusTransactionTests(unittest.TestCase):
             "tools_discovered",
             "installed_config_transport_verified",
             "generated_client_configs_transport_verified",
-            "plugin_stdio_verified",
             "direct_stdio_verified",
             "transport_end_to_end_verified",
             "fresh_codex_app_server_inventory_verified",
@@ -678,11 +676,8 @@ class McpStatusTransactionTests(unittest.TestCase):
         }
         active_states = (
             "preflight_direct",
-            "preflight_plugin",
             "preflight_claude_desktop",
             "installing",
-            "installing_plugin",
-            "plugin_installed_pending_loader_verification",
         )
 
         with tempfile.TemporaryDirectory() as tmp:

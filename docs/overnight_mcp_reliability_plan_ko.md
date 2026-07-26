@@ -17,7 +17,9 @@
 | 7:45–8:30 | 운영 문서·PR 거버넌스·보안 handoff 정리 | 변경 파일, 위험, 재현 명령, Code Owner 검토 항목 정리 |
 | 8:30–9:00 | 최종 체크포인트와 후속 PR 준비 | 세션 로그 `can_complete=true`, 보고서·커밋·푸시 상태 확인 |
 
-## 현재 확인된 수용 기준
+## 당시 확인된 수용 기준
+
+아래 항목은 이 야간 작업 세션 당시의 검증 기록이다. 현재 지원 계약은 로컬 stdio 직접 등록과 Vercel HTTPS `/mcp` Connector 등록이다.
 
 - 전체 회귀: `python -m unittest discover -s tests -q` 2119개 통과, 14개 skip (174.0초).
 - 깨끗한 승인 MCP bundle: readiness/index visibility 277/277, stdio와 bearer 인증 HTTP smoke 통과.
@@ -25,7 +27,7 @@
 - 파서: HWP 잘림/UTF-16 손실, HWPML/HWPX DTD·entity, PDF 텍스트+이미지 혼합 페이지, HWPX 비본문 XML, 짧은 구조화 표를 review 신호로 보존.
 - Kordoc 외부 실행: 문서 메타데이터에 입력 확장자, 실행시간, timeout, table inventory 잘림 여부를 기록해 운영 중 성능·손실 원인을 추적한다.
 - Kordoc 임시 경로 생성 실패도 일반화된 오류 코드만 반환해 절대 경로가 인증 응답·JSONL로 흘러가지 않도록 한다.
-- 외부 ChatGPT/Claude API·Secure Tunnel은 `chatgpt-data` 프로필로 제한하고, 원격 smoke는 `search`→`fetch`와 내부 metadata deny-list를 검증한다.
+- 외부 ChatGPT/Claude HTTPS 경로는 `chatgpt-data` 프로필로 제한했고, 원격 smoke에서 `search`→`fetch`와 내부 metadata deny-list를 검증했다.
 - ZIP bundle smoke는 traversal/symlink/크기 제한과 `--require-console-scripts` 실행 경로 증명을 지원한다.
 - 승인 snapshot sidecar는 ZIP 해제 후에도 파일 inode/mtime에 의존하지 않고 크기+SHA-256 지문으로 재사용되며, 복사 경로 회귀 테스트를 포함한다.
 

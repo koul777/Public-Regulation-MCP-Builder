@@ -131,7 +131,7 @@ class McpClientStatusTests(unittest.TestCase):
         self.assertTrue(committed["fresh_codex_app_server_inventory_verified"])
         self.assertFalse(committed["end_to_end_verified"])
 
-    def test_commit_success_is_isolated_for_each_of_the_seven_targets(self) -> None:
+    def test_commit_success_is_isolated_for_each_supported_target(self) -> None:
         required_stages = {
             "claude-code": ("registration", "loader", "transport"),
             "codex": ("registration", "loader", "transport", "fresh_app_server"),
@@ -143,7 +143,6 @@ class McpClientStatusTests(unittest.TestCase):
                 "fresh_app_server",
             ),
             "chatgpt-remote": ("transport", "registration", "loader"),
-            "chatgpt-tunnel": ("transport", "registration", "loader"),
             "claude-api": ("transport", "registration"),
         }
         local_targets = {
@@ -493,7 +492,6 @@ class McpClientStatusTests(unittest.TestCase):
                 "fresh_app_server",
             ),
             "chatgpt-remote": ("transport", "registration", "loader"),
-            "chatgpt-tunnel": ("transport", "registration", "loader"),
             "claude-api": ("transport", "registration"),
         }
         local_targets = {
@@ -524,7 +522,7 @@ class McpClientStatusTests(unittest.TestCase):
             )
         remote_before = {
             target: copy.deepcopy(status["client_connections"][target])
-            for target in ("chatgpt-remote", "chatgpt-tunnel", "claude-api")
+            for target in ("chatgpt-remote", "claude-api")
         }
 
         invalidated = invalidate_runtime(

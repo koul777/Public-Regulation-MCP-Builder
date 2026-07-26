@@ -114,7 +114,6 @@ class StreamlitOperatorModeTests(unittest.TestCase):
                 "claude-desktop",
                 "chatgpt-desktop-local",
                 "chatgpt-remote",
-                "chatgpt-tunnel",
                 "claude-api",
             ):
                 with self.subTest(target=target):
@@ -459,30 +458,6 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("_refresh_mcp_connection_observation(", source)
         self.assertIn("이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다.", source)
 
-    @unittest.skip("legacy agent-prompt UI was removed")
-    def test_legacy_chatgpt_prompt_ui_kind_is_case_insensitive_and_never_agent_mode(self):
-        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
-        module = ast.parse(source)
-        helper_node = next(
-            node
-            for node in module.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_mcp_agent_prompt_display_kind"
-        )
-        namespace = {"Path": Path}
-        exec(
-            compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-prompt-kind>", "exec"),
-            namespace,
-        )
-        classify = namespace["_mcp_agent_prompt_display_kind"]
-
-        self.assertEqual(
-            "legacy_chatgpt_desktop",
-            classify(r"C:\moved\chatgpt_desktop_agent_connect_prompt.MD"),
-        )
-        self.assertEqual("chatgpt_desktop", classify("CHATGPT_DESKTOP_CONNECT_GUIDE.md"))
-        self.assertEqual("agent", classify("CODEX_AGENT_CONNECT_PROMPT.md"))
-
     def test_mcp_http_url_builder_normalizes_local_and_public_urls(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
@@ -701,200 +676,6 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Local RAG demo uses approved and indexed chunks only.", source)
         self.assertIn('st.button("시범 실행 (Run demo)", key=f"run-rag-chat-{document_id}", disabled=not mcp_connection_ready)', source)
 
-    @unittest.skip("legacy BAT/prompt/tunnel UI contract was replaced by direct stdio and Vercel HTTP")
-    def test_streamlit_exposes_mcp_client_config_generator(self):
-        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
-
-        self.assertIn("MCP 연결", source)
-        self.assertIn('NAV_MCP = "④ MCP 생성·AI 연결"', source)
-        self.assertIn('("4단계", "MCP 생성·AI 연결"', source)
-        self.assertIn("PRIMARY_NAV_PAGES", source)
-        self.assertIn("ADVANCED_NAV_PAGES", source)
-        self.assertIn("_mcp_bundle_created", source)
-        self.assertIn("_mcp_bundle_state_key", source)
-        self.assertIn("MCP_BUNDLE_STATE_PREFIX", source)
-        self.assertIn("mcp_first", source)
-        self.assertIn("build_mcp_client_config", source)
-        self.assertIn("write_mcp_setup_bundle", source)
-        self.assertIn("write_mcp_setup_bundle_zip", source)
-        self.assertIn("def _normalize_mcp_server_name", source)
-        self.assertIn("def _default_mcp_server_name", source)
-        self.assertIn("생성할 MCP 이름 (필수 입력)", source)
-        self.assertIn('placeholder=f"예: {suggested_mcp_server_name}"', source)
-        self.assertIn("사용자가 입력한 이름만 AI 앱에 등록됩니다.", source)
-        self.assertIn("MCP 이름을 직접 입력해야 파일 묶음과 연결 설정을 생성할 수 있습니다.", source)
-        self.assertNotIn("mcp_server_name_auto_key", source)
-        self.assertNotIn("automatic_mcp_server_name", source)
-        self.assertIn("server_name=mcp_server_name", source)
-        self.assertIn("preferred_python=sys.executable", source)
-        self.assertIn("preferred_project_root=PROJECT_ROOT", source)
-        self.assertNotIn('server_name="govreg-local"', source)
-        self.assertIn('"저장 방식"', source)
-        self.assertIn('"folder-and-zip": "폴더 + 전달용 ZIP (권장)"', source)
-        self.assertIn('"folder-only": "이 PC에 폴더만 저장"', source)
-        self.assertIn('if mcp_save_mode == "folder-and-zip":', source)
-        self.assertIn('"save_mode": mcp_save_mode', source)
-        self.assertIn("def _ensure_mcp_output_directory_writable", source)
-        self.assertIn("_ensure_mcp_output_directory_writable(mcp_bundle_output_dir)", source)
-        self.assertIn("def _mcp_bundle_zip_output_path", source)
-        self.assertIn("def _write_operator_mcp_bundle_zip", source)
-        self.assertIn('return bundle_dir / f"{bundle_name}.zip"', source)
-        self.assertIn("최종 ZIP 저장 위치", source)
-        self.assertIn("기존 ZIP 파일이 사용 중이어서 새 이름으로 저장했습니다", source)
-        self.assertIn("write_mcp_runtime_data_bundle", source)
-        self.assertIn('scope="document" if mcp_scope == "current_document" else mcp_scope', source)
-        self.assertIn("MCP_REQUIRED_SOURCE_METADATA_FIELDS", source)
-        self.assertIn("_missing_mcp_source_metadata", source)
-        self.assertIn("missing_mcp_source_metadata", source)
-        self.assertIn('document = ctx["document"]', source)
-        self.assertIn("requires citation/source metadata before export", source)
-        self.assertIn("_ensure_mcp_source_metadata", source)
-        self.assertIn("auto-fill local provenance and reindex approved chunks", source)
-        self.assertIn("출처 메타데이터 자동 보완 후 다시 색인", source)
-        self.assertIn("repair-mcp-source-metadata", source)
-        self.assertIn("disabled=not mcp_connection_ready", source)
-        self.assertIn("transport=mcp_transport", source)
-        self.assertIn("Client profile", source)
-        self.assertIn("연결할 AI 앱", source)
-        self.assertIn("mcp_connection_target_labels", source)
-        self.assertIn("mcp-connection-target", source)
-        self.assertIn("Codex CLI는 직접 설정/BAT를 기본으로 사용", source)
-        self.assertIn("연결 설정이나 비밀값을 대화 프롬프트에 넣지 마세요", source)
-        self.assertIn("mcp_target_file_keys", source)
-        self.assertIn("codex_agent_prompt", source)
-        self.assertIn("connect_claude_desktop_bat", source)
-        self.assertIn("claude_code_agent_prompt", source)
-        self.assertIn("connect_chatgpt_https_bat", source)
-        self.assertIn("connect_chatgpt_tunnel_bat", source)
-        self.assertIn("connect_claude_https_bat", source)
-        self.assertIn("chatgpt-desktop-local", source)
-        self.assertIn("chatgpt-remote", source)
-        self.assertIn("chatgpt-tunnel", source)
-        self.assertIn('"chatgpt-desktop-local": "chatgpt_desktop_agent_prompt"', source)
-        self.assertIn('"codex": "connect_codex_bat"', source)
-        self.assertIn('"claude-code": "claude_code_agent_prompt"', source)
-        self.assertIn('"chatgpt-desktop-local": "ChatGPT Desktop"', source)
-        self.assertIn('"codex": "Codex CLI"', source)
-        self.assertIn('"chatgpt-remote": "ChatGPT 원격 MCP (HTTPS)"', source)
-        self.assertIn('"chatgpt-tunnel": "ChatGPT 웹 (보안 Tunnel MCP)"', source)
-        self.assertNotIn('"all-local": "로컬 AI 앱 모두"', source)
-        target_order = [
-            '"claude-code"',
-            '"codex"',
-            '"claude-desktop"',
-            '"chatgpt-desktop-local"',
-            '"chatgpt-remote"',
-            '"chatgpt-tunnel"',
-            '"claude-api"',
-        ]
-        options_start = source.index("mcp_connection_target_options = [")
-        options_end = source.index("]", options_start)
-        options_source = source[options_start:options_end]
-        self.assertEqual(
-            sorted(options_source.index(target) for target in target_order),
-            [options_source.index(target) for target in target_order],
-        )
-        self.assertIn("connection_target_file", source)
-        self.assertIn("사용자용 연결 파일", source)
-        self.assertIn("Path(str(bundle_state.get('connection_target_file'))).name", source)
-        self.assertIn("Path(str(selected_target_file)).name", source)
-        self.assertIn("Path(str(zip_path)).name", source)
-        self.assertIn("BAT 보조 연결 방식", source)
-        self.assertIn("Claude Desktop 기본 BAT 연결 방식", source)
-        self.assertIn("로컬 프로젝트/작업공간", source)
-        self.assertIn("코드 상자 오른쪽 위의 복사 아이콘", source)
-        self.assertIn("현재 번들의 폴더 이름·정확한 절대경로·핵심 파일 구조", source)
-        self.assertIn("render_agent_connect_prompt_for_program", source)
-        self.assertIn("bundle_dir=Path(str(agent_prompt_path)).parent", source)
-        self.assertIn("st.code(agent_prompt_text, language=None)", source)
-        self.assertIn("Settings > MCP servers > Add server", source)
-        self.assertIn("Settings > Plugins", source)
-        self.assertIn("https://chatgpt.com/plugins", source)
-        self.assertIn("ChatGPT Plugins 설정에서 앱을 Refresh", source)
-        self.assertIn("Settings > Security and login", source)
-        self.assertIn("+ > More", source)
-        self.assertIn("MCP OAuth 2.1", source)
-        self.assertIn("--chatgpt-oauth-ready", source)
-        self.assertNotIn("Settings > Apps > Advanced Settings", source)
-        self.assertNotIn("Settings > Apps > Create", source)
-        self.assertIn("Claude Desktop은 전용 BAT가 기본", source)
-        self.assertIn("설치 검증이 끝날 때까지 실행", source)
-        self.assertIn("MCP의 list_regulations 도구를 사용해서 등록된 규정 목록을 보여줘", source)
-        self.assertIn('"usage_guide_bat": files.get("usage_guide_bat")', source)
-        self.assertIn('"codex_plugin_guide": files.get("codex_plugin_guide")', source)
-        self.assertIn("현재 승인된 전체 청크와 추가·개정 청크", source)
-        self.assertIn("선택된 연결 방식", source)
-        self.assertIn('"http": "HTTPS URL"', source)
-        self.assertIn('"tunnel": "보안 Tunnel"', source)
-        self.assertIn('"local": "로컬 stdio"', source)
-        self.assertIn("mcp_target_ready", source)
-        self.assertIn("ChatGPT (보안 Tunnel MCP)를 선택하세요", source)
-        self.assertIn("def _build_mcp_http_url", source)
-        self.assertIn("생성된 MCP HTTP URL", source)
-        self.assertIn('mcp_public_url = mcp_http_url if mcp_mode == "http" else ""', source)
-        self.assertIn("Selected MCP transport", source)
-        self.assertIn("claude-desktop", source)
-        self.assertIn("claude-code", source)
-        self.assertIn("chatgpt", source)
-        self.assertIn("claude-api", source)
-        self.assertIn("MCP 설정 JSON 다운로드", source)
-        self.assertIn("MCP Quickstart", source)
-        self.assertIn("Claude Code add-json arguments", source)
-        self.assertIn("MCP 파일 묶음을 만들 폴더", source)
-        self.assertIn('value="127.0.0.1"', source)
-        self.assertIn("st.warning(warning)", source)
-        self.assertIn("st.info(note)", source)
-        self.assertIn("Generate a copy/paste setup bundle", source)
-        self.assertIn("--zip-out", source)
-        self.assertIn("Fastest ChatGPT/Claude connection wizard", source)
-        self.assertIn("connect_mcp_client.ps1", source)
-        self.assertIn("MCP visibility precheck before client registration", source)
-        self.assertIn("reg-rag-mcp-index-visibility", source)
-        self.assertIn("--forbid-smoke-docs", source)
-        self.assertIn("--require-indexed", source)
-        self.assertIn("--fail-on-issue", source)
-        self.assertIn("MCP setup bundle can be written only after approved chunks are indexed and visible.", source)
-        self.assertIn("mcp_connection_ready", source)
-        self.assertIn("disabled=not mcp_connection_ready", source)
-        self.assertIn("_mcp_kordoc_preflight", source)
-        self.assertIn("Kordoc 표 파싱 사전 점검", source)
-        self.assertNotIn("현재 Kordoc 명령은 사용 가능하지만", source)
-        self.assertIn("_safe_kordoc_reprocess_documents", source)
-        self.assertIn("설치된 Kordoc으로 증거가 없는 원본을 새 초안에서 재전처리합니다", source)
-        self.assertIn("KORDOC_AUTO_REPROCESS_ATTEMPT_PREFIX", source)
-        self.assertIn("_replace_workflow_document_id", source)
-        self.assertIn("kordoc_auto_install_attempted", source)
-        self.assertIn("Kordoc 설치·검증 다시 실행", source)
-        self.assertIn("sys.prefix", source)
-        self.assertIn("Draft MCP server command; approve and index chunks before connecting a client.", source)
-        self.assertIn("MCP server command is ready for connection.", source)
-        self.assertIn("MCP로 쓸 파일 묶음 만들기", source)
-        self.assertIn("MCP 실행 데이터와 연결 파일 묶음을 만들었습니다.", source)
-        self.assertIn("runtime_data_dir", source)
-        self.assertIn("runtime_record_count", source)
-        self.assertIn("st.session_state[_mcp_bundle_state_key(document_id)]", source)
-        self.assertIn('"install_script": files.get("install")', source)
-        self.assertIn("claude_code_stdio_ps", source)
-        self.assertIn("ChatGPT data-only search/fetch server", source)
-        self.assertIn("OpenAI Secure MCP Tunnel for ChatGPT", source)
-        self.assertIn("chatgpt_connector_url", source)
-        self.assertIn("chatgpt_https_endpoint_ready", source)
-        self.assertIn("--http-bearer-token-env MCP_AUTH_TOKEN", source)
-        self.assertIn("MCP/AI connection guide", source)
-        self.assertIn("AI review draft generation is part of the main preprocessing flow", source)
-        self.assertIn("OPENAI_API_KEY", source)
-        self.assertIn("Codex can connect as an MCP client", source)
-        self.assertIn("not a replacement API key for this product runtime", source)
-        self.assertIn(
-            "아래 버튼을 누르면 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop,",
-            source,
-        )
-        self.assertIn("ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 연결 파일 묶음", source)
-        self.assertNotIn("Claude Desktop/Claude Code/ChatGPT/Claude API", source)
-        self.assertIn("AI review API and cost guard", source)
-        self.assertIn("cached_candidate_count", source)
-        self.assertIn("cost_estimate_status", source)
-
     def test_streamlit_reflects_parser_ai_review_human_approval_stages(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
@@ -922,6 +703,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
 
         self.assertNotIn("비개발자는 이 파일만 더블클릭하면 됩니다", source)
         self.assertNotIn("전용 연결 버튼을 실행하면 됩니다", source)
+        self.assertNotIn('mcp_mode == "tunnel"', source)
+        self.assertNotIn('files.get("openai_tunnel")', source)
         self.assertIn("ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)", source)
         self.assertIn("ChatGPT · Vercel HTTPS MCP", source)
         self.assertIn("Claude · Vercel HTTPS MCP", source)

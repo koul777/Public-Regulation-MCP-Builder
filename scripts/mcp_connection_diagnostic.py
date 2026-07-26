@@ -71,16 +71,6 @@ CONNECTION_TARGET_STAGE_PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "configuration_stages": ("transport", "registration", "loader"),
     },
-    "chatgpt-tunnel": {
-        "stage_order": (
-            "transport",
-            "registration",
-            "loader",
-            "desktop_surface",
-            "conversation",
-        ),
-        "configuration_stages": ("transport", "registration", "loader"),
-    },
     "claude-api": {
         "stage_order": (
             "transport",
@@ -356,23 +346,9 @@ def diagnostic_from_bundle_status(
         )
 
     direct_registered = bool(status.get("direct_config_registered"))
-    plugin_registered = bool(status.get("plugin_registered"))
     direct_loader = bool(status.get("direct_config_loader_verified"))
-    plugin_loader = bool(status.get("plugin_loader_verified"))
-    registration_source = (
-        "direct"
-        if direct_registered and not plugin_registered
-        else "plugin"
-        if plugin_registered and not direct_registered
-        else None
-    )
-    connection_source = (
-        "direct"
-        if registration_source == "direct" and direct_loader and not plugin_loader
-        else "plugin"
-        if registration_source == "plugin" and plugin_loader and not direct_loader
-        else None
-    )
+    registration_source = "direct" if direct_registered else None
+    connection_source = "direct" if direct_registered and direct_loader else None
     runtime_fingerprint = _safe_identifier_value(status.get("runtime_fingerprint"))
     if connection_source == "direct":
         transport_claimed = bool(
@@ -382,14 +358,6 @@ def diagnostic_from_bundle_status(
         )
         transport_runtime_fingerprint = _safe_identifier_value(
             status.get("installed_config_transport_runtime_fingerprint")
-        )
-    elif connection_source == "plugin":
-        transport_claimed = bool(
-            status.get("plugin_stdio_verified")
-            and status.get("transport_end_to_end_verified")
-        )
-        transport_runtime_fingerprint = _safe_identifier_value(
-            status.get("plugin_stdio_runtime_fingerprint")
         )
     else:
         transport_claimed = False
@@ -417,16 +385,11 @@ def diagnostic_from_bundle_status(
     stages: dict[str, dict[str, Any]] = {
         "registration": legacy_stage(
             registration_source is not None,
-            false_reason=(
-                "registration_source_ambiguous"
-                if direct_registered and plugin_registered
-                else "registration_not_verified"
-            ),
+            false_reason="registration_not_verified",
             stage_checked_at=status.get("desktop_mcp_registration_updated_at"),
             evidence={
                 "legacy_source": True,
                 "direct_config_registered": direct_registered,
-                "plugin_registered": plugin_registered,
                 "connection_source_id": registration_source,
             },
         ),
@@ -434,13 +397,12 @@ def diagnostic_from_bundle_status(
             connection_source is not None,
             false_reason=(
                 "loader_source_mismatch"
-                if direct_loader or plugin_loader
+                if direct_loader and not direct_registered
                 else "loader_not_verified"
             ),
             evidence={
                 "legacy_source": True,
                 "direct_config_loader_verified": direct_loader,
-                "plugin_loader_verified": plugin_loader,
                 "connection_source_id": connection_source,
             },
         ),
@@ -458,7 +420,6 @@ def diagnostic_from_bundle_status(
                 "installed_config_transport_verified": bool(
                     status.get("installed_config_transport_verified")
                 ),
-                "plugin_stdio_verified": bool(status.get("plugin_stdio_verified")),
                 "transport_end_to_end_verified": bool(
                     status.get("transport_end_to_end_verified")
                 ),
@@ -1150,7 +1111,7 @@ def _support_guidance(
             else "Open a new ChatGPT Desktop conversation and confirm the server with /mcp."
         )
     else:
-        action = "Run the generated conversation verification prompt and confirm its proof."
+        action = "Open a new conversation, call search, then call fetch with an id returned by search."
 
     if overall_state == "configured":
         summary = "MCP configuration is current; selected-client or conversation verification is still pending."

@@ -35,7 +35,6 @@ HERMES_MCP_REPORT_ARTIFACTS = (
     Path("reports/mcp_connection_bundle_hermes.zip"),
     Path("reports/mcp_connection_readiness_bundle_hermes.json"),
     Path("reports/mcp_connection_readiness_chatgpt_https_hermes.json"),
-    Path("reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json"),
 )
 MCP_PRODUCT_READINESS_REPORT_ARTIFACTS = (
     MCP_CORE_REPORT_PATHS["mcp_readiness_authority"],

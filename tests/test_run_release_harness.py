@@ -27,10 +27,8 @@ class ReleaseHarnessTests(unittest.TestCase):
         self.assertIn("mcp_bundle_doctor", steps)
         self.assertIn("mcp_transport_smoke", steps)
         self.assertIn("chatgpt_https_doctor", steps)
-        self.assertIn("chatgpt_tunnel_doctor", steps)
         self.assertIn("public_release_audit", steps)
         self.assertFalse(steps["public_release_audit"].required)
-        self.assertIn("--skip-cli-check", steps["chatgpt_tunnel_doctor"].command)
         self.assertIn("--include-wheel", steps["mcp_bundle_config"].command)
 
     def test_public_mode_requires_public_audit(self) -> None:
@@ -67,7 +65,6 @@ class ReleaseHarnessTests(unittest.TestCase):
 
         self.assertIn("--probe-public-url", steps["mcp_bundle_doctor"].command)
         self.assertIn("--probe-public-url", steps["chatgpt_https_doctor"].command)
-        self.assertNotIn("--probe-public-url", steps["chatgpt_tunnel_doctor"].command)
 
     def test_runtime_data_dir_adds_mcp_index_visibility_step(self) -> None:
         options = HarnessOptions(

@@ -25,7 +25,6 @@ CLIENT_TARGETS = (
     "claude-desktop",
     "chatgpt-desktop-local",
     "chatgpt-remote",
-    "chatgpt-tunnel",
     "claude-api",
 )
 
@@ -100,18 +99,6 @@ _TARGET_POLICIES: dict[str, dict[str, Any]] = {
             "conversation",
         ),
     },
-    "chatgpt-tunnel": {
-        "transport": "secure-mcp-tunnel",
-        "config_resource_id": "chatgpt-secure-tunnel",
-        "configuration_required_stages": ("transport", "registration", "loader"),
-        "connection_required_stages": (
-            "transport",
-            "registration",
-            "loader",
-            "client_surface",
-            "conversation",
-        ),
-    },
     "claude-api": {
         "transport": "streamable-http",
         "config_resource_id": "claude-https-connector",
@@ -128,7 +115,7 @@ _TARGET_POLICIES: dict[str, dict[str, Any]] = {
 _LOCAL_TARGETS = frozenset(
     {"claude-code", "codex", "claude-desktop", "chatgpt-desktop-local"}
 )
-_REMOTE_TARGETS = frozenset({"chatgpt-remote", "chatgpt-tunnel", "claude-api"})
+_REMOTE_TARGETS = frozenset({"chatgpt-remote", "claude-api"})
 _SAFE_SERVER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:@+-]{1,256}")
 _SAFE_REASON = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
@@ -853,8 +840,6 @@ def _legacy_target(
         return str(projected)
     if legacy_status.get("claude_desktop_config_registered") is True:
         return "claude-desktop"
-    if legacy_status.get("plugin_registered") is True:
-        return "chatgpt-desktop-local"
     # A v4 direct config was shared by Codex and ChatGPT Desktop and did not
     # record which client initiated the flow. Never duplicate that success.
     return None
@@ -871,20 +856,11 @@ def _legacy_stage_claims(
             "fresh_app_server": False,
         }
     if target in {"codex", "chatgpt-desktop-local"}:
-        plugin = legacy_status.get("plugin_registered") is True
         return {
-            "registration": plugin or legacy_status.get("direct_config_registered") is True,
-            "loader": (
-                legacy_status.get("plugin_loader_verified") is True
-                if plugin
-                else legacy_status.get("direct_config_loader_verified") is True
-            ),
+            "registration": legacy_status.get("direct_config_registered") is True,
+            "loader": legacy_status.get("direct_config_loader_verified") is True,
             "transport": legacy_status.get("transport_end_to_end_verified") is True
-            and (
-                legacy_status.get("plugin_stdio_verified") is True
-                if plugin
-                else legacy_status.get("direct_stdio_verified") is True
-            ),
+            and legacy_status.get("direct_stdio_verified") is True,
             "fresh_app_server": legacy_status.get(
                 "fresh_codex_app_server_inventory_verified"
             )

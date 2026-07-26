@@ -1410,10 +1410,6 @@ def _write_hermes_mcp_artifacts(root: Path, *, hermes_status: str = "ready", rep
             "report_type": "mcp_connection_readiness",
             "passed": True,
         },
-        "reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json": {
-            "report_type": "mcp_connection_readiness",
-            "passed": True,
-        },
     }
     for artifact, payload in payloads.items():
         path = root / artifact
