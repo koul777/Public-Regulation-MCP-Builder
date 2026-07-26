@@ -51,6 +51,7 @@ def run_mcp_client_config_smoke(
     plugin_mcp_config: str | Path | None = None,
     remote_url: str | None = None,
     remote_token_env: str | None = None,
+    allow_unauthenticated_remote: bool = False,
     query: str | None = None,
     out_json: str | Path | None = None,
     timeout_seconds: float = 20.0,
@@ -83,6 +84,8 @@ def run_mcp_client_config_smoke(
             _run_remote_client_smoke(
                 remote_url=remote_url,
                 remote_token_env=remote_token_env,
+                allow_unauthenticated_remote=allow_unauthenticated_remote,
+                query=query,
                 timeout_seconds=timeout_seconds,
             )
         )
@@ -357,6 +360,8 @@ def _run_remote_client_smoke(
     *,
     remote_url: str,
     remote_token_env: str | None,
+    allow_unauthenticated_remote: bool = False,
+    query: str | None = None,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     url = _normalize_remote_mcp_url(remote_url)
@@ -377,7 +382,23 @@ def _run_remote_client_smoke(
                 "credentials, query parameters, fragments, whitespace, or a non-public IP literal."
             ),
         }
-    if not remote_token_env:
+    if allow_unauthenticated_remote and remote_token_env:
+        return {
+            "label": "chatgpt_remote",
+            "remote_url": report_url,
+            "passed": False,
+            "launcher_ready": False,
+            "process_started": False,
+            "mcp_initialized": False,
+            "tools_discovered": False,
+            "end_to_end_verified": False,
+            "auth_wire_verified": False,
+            "error": (
+                "Choose either a bearer-token environment variable or "
+                "--allow-unauthenticated-remote, not both."
+            ),
+        }
+    if not remote_token_env and not allow_unauthenticated_remote:
         return {
             "label": "chatgpt_remote",
             "remote_url": report_url,
@@ -390,8 +411,8 @@ def _run_remote_client_smoke(
             "auth_wire_verified": False,
             "error": "A named bearer-token environment variable is required for a direct remote MCP URL.",
         }
-    token = os.getenv(remote_token_env, "").strip()
-    if not token:
+    token = os.getenv(remote_token_env, "").strip() if remote_token_env else ""
+    if remote_token_env and not token:
         return {
             "label": "chatgpt_remote",
             "remote_url": report_url,
@@ -405,12 +426,27 @@ def _run_remote_client_smoke(
             "error": f"Environment variable is not set or empty: {remote_token_env}",
         }
     try:
-        result = asyncio.run(
-            asyncio.wait_for(
-                _run_remote_entry_with_auth_verification(url=url, token=token or None),
-                timeout=timeout_seconds,
+        if allow_unauthenticated_remote:
+            remote_operation = (
+                _run_remote_entry(url=url, token=None, query=query)
+                if query
+                else _run_remote_entry(url=url, token=None)
             )
-        )
+        else:
+            remote_operation = (
+                _run_remote_entry_with_auth_verification(url=url, token=token or None, query=query)
+                if query
+                else _run_remote_entry_with_auth_verification(url=url, token=token or None)
+            )
+        result = asyncio.run(asyncio.wait_for(remote_operation, timeout=timeout_seconds))
+        if allow_unauthenticated_remote:
+            result.update(
+                {
+                    "auth_mode": "approved_public_unauthenticated",
+                    "auth_wire_verified": False,
+                    "public_unauthenticated_explicit": True,
+                }
+            )
         result.update({"label": "chatgpt_remote", "remote_url": report_url, "launcher_ready": True})
         return result
     except Exception as exc:
@@ -428,9 +464,18 @@ def _run_remote_client_smoke(
         }
 
 
-async def _run_remote_entry_with_auth_verification(*, url: str, token: str | None) -> dict[str, Any]:
+async def _run_remote_entry_with_auth_verification(
+    *,
+    url: str,
+    token: str | None,
+    query: str | None = None,
+) -> dict[str, Any]:
     auth_challenge_observed = await _remote_unauthenticated_request_is_rejected(url=url) if token else False
-    result = await _run_remote_entry(url=url, token=token)
+    result = (
+        await _run_remote_entry(url=url, token=token, query=query)
+        if query
+        else await _run_remote_entry(url=url, token=token)
+    )
     result["auth_challenge_observed"] = auth_challenge_observed
     result["auth_wire_verified"] = bool(auth_challenge_observed)
     if not token or not auth_challenge_observed:
@@ -468,7 +513,12 @@ async def _remote_unauthenticated_request_is_rejected(*, url: str) -> bool:
     return all(response.status_code in {401, 403} for response in (unauthenticated, invalid_bearer))
 
 
-async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
+async def _run_remote_entry(
+    *,
+    url: str,
+    token: str | None,
+    query: str | None = None,
+) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(headers=headers, follow_redirects=False) as http_client:
         async with streamable_http_client(url, http_client=http_client) as (read, write, get_session_id):
@@ -491,6 +541,9 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                 verification_mode = "index_status"
                 index_summary: dict[str, Any] = {}
                 verified = False
+                search_query_used: str | None = None
+                search_result_count = 0
+                fetch_has_text = False
                 if "get_index_status" in tool_names:
                     index_status = await session.call_tool(
                         "get_index_status",
@@ -504,17 +557,20 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                     # only search/fetch. Verify that content contract without
                     # requiring internal index diagnostics to cross the boundary.
                     verification_mode = "search_fetch"
+                    search_query_used = query or DEFAULT_SEARCH_QUERY
                     search = await session.call_tool(
                         "search",
-                        {"query": DEFAULT_SEARCH_QUERY},
+                        {"query": search_query_used},
                     )
                     search_payload = _successful_tool_payload(search, tool_name="search")
                     results = search_payload.get("results") if isinstance(search_payload.get("results"), list) else []
+                    search_result_count = len(results)
                     first_id = _first_search_result_id(results)
                     fetch_payload: dict[str, Any] = {}
                     if first_id:
                         fetch = await session.call_tool("fetch", {"id": first_id})
                         fetch_payload = _successful_tool_payload(fetch, tool_name="fetch")
+                    fetch_has_text = _valid_fetch_payload(fetch_payload)
                     metadata_candidates: list[Any] = []
                     if results and isinstance(results[0], dict):
                         metadata_candidates.append(results[0].get("metadata") or {})
@@ -540,6 +596,9 @@ async def _run_remote_entry(*, url: str, token: str | None) -> dict[str, Any]:
                     ),
                     "tool_names": tool_names,
                     "index_status_summary": index_summary,
+                    "search_query_used": search_query_used,
+                    "search_result_count": search_result_count,
+                    "fetch_has_text": fetch_has_text,
                     "session_id_present": bool(get_session_id()),
                 }
 
@@ -911,6 +970,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--remote-url", default=None)
     parser.add_argument("--remote-token-env", default=None)
+    parser.add_argument(
+        "--allow-unauthenticated-remote",
+        action="store_true",
+        help=(
+            "Explicitly verify an approved public read-only HTTPS MCP endpoint without a bearer token."
+        ),
+    )
     parser.add_argument("--query", default=None)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument("--out-json", default=None)
@@ -932,6 +998,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         plugin_mcp_config=args.plugin_mcp_config,
         remote_url=args.remote_url,
         remote_token_env=args.remote_token_env,
+        allow_unauthenticated_remote=args.allow_unauthenticated_remote,
         query=args.query,
         out_json=args.out_json,
         timeout_seconds=args.timeout_seconds,

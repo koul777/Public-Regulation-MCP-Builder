@@ -21,8 +21,43 @@ python scripts\prepare_vercel_mcp_deployment.py `
   --out-dir vercel-mcp-stage
 ```
 
-출력 디렉터리에는 MCP 실행에 필요한 `app/`, ASGI entrypoint, Vercel 설정,
+출력 디렉터리에는 MCP 실행에 필요한 `app/`, `api/index.py` ASGI entrypoint, Vercel 설정,
 승인 runtime만 복사된다. 기존 출력 디렉터리는 덮어쓰지 않는다.
+
+## 처음 배포하는 사람: 홈페이지와 명령창의 역할
+
+Vercel 홈페이지에서는 계정 가입, 프로젝트 확인, 환경 변수와 로그 확인을 한다. 로컬 PC에
+있는 승인 runtime을 처음 올릴 때는 PowerShell에서 Vercel CLI를 사용하는 것이 가장
+단순하다. GitHub 저장소 전체나 원본 `data/` 폴더를 Vercel 홈페이지에 직접 업로드하지
+않는다.
+
+![승인 번들을 Vercel에 배포하고 Claude 커넥터에 등록한 뒤 search와 fetch로 검증하는 순서](assets/readme-vercel-claude-connection.svg)
+
+1. https://vercel.com 에 가입하고 로그인한다.
+2. PowerShell에서 CLI를 한 번 설치하고 로그인한다.
+
+```powershell
+npm install -g vercel
+vercel login
+```
+
+3. 위 절차로 `vercel-mcp-stage`를 만든 뒤 프로젝트를 만들고 연결한다. 프로젝트 이름은
+   영문 소문자, 숫자와 하이픈으로 정한다.
+
+```powershell
+vercel project add <프로젝트-이름>
+vercel link --yes --project <프로젝트-이름> --cwd .\vercel-mcp-stage
+```
+
+4. 공개해도 되는 승인 규정만 담긴 read-only 배포라면 다음 값을 Production에 넣는다.
+
+```powershell
+vercel env add MCP_ALLOW_UNAUTHENTICATED_HTTP production --value "true" --yes --cwd .\vercel-mcp-stage
+vercel env add MCP_TOOL_PROFILE production --value "chatgpt-data" --yes --cwd .\vercel-mcp-stage
+```
+
+기관 내부 자료처럼 공개하면 안 되는 데이터에는 이 공개 모드를 사용하지 않는다. 그런
+경우 bearer 인증이나 OAuth를 먼저 구성한다.
 
 ## 환경 변수
 
@@ -52,6 +87,9 @@ vercel --cwd vercel-mcp-stage
 vercel --prod --cwd vercel-mcp-stage
 ```
 
+명령 마지막의 `Aliased https://<프로젝트-이름>.vercel.app`이 고정 Production 주소다.
+배포마다 생기는 긴 미리보기 주소보다 이 고정 주소 뒤에 `/mcp`를 붙여 등록한다.
+
 클라이언트에는 다음 주소를 Streamable HTTP MCP로 등록한다.
 
 ```text
@@ -80,6 +118,46 @@ bearer_token_env_var = "MCP_AUTH_TOKEN"
 2. `tools/list`
 3. `search`
 4. `fetch`
+
+승인된 공개 read-only endpoint는 저장소의 검증 명령으로 네 단계를 한 번에 확인할 수
+있다.
+
+```powershell
+python scripts\run_mcp_client_config_smoke.py `
+  --remote-url "https://<프로젝트-이름>.vercel.app/mcp" `
+  --allow-unauthenticated-remote `
+  --timeout-seconds 120 `
+  --fail-on-issue
+```
+
+결과에서 `mcp_initialized`, `tools_discovered`, `end_to_end_verified`가 모두 `true`이고
+`tool_names`에 `search`, `fetch`가 있어야 한다.
+
+공개 read-only 주소가 정해진 뒤 Claude용 복사 파일을 만들려면 다음처럼 명시적으로 공개
+모드를 선택한다.
+
+```powershell
+python scripts\generate_mcp_client_config.py `
+  --server-name "<MCP-이름>" `
+  --client-profile claude-remote `
+  --transport streamable-http `
+  --public-url "https://<프로젝트-이름>.vercel.app/mcp" `
+  --approved-public-unauthenticated `
+  --out-json claude_https_mcp.json
+```
+
+## Claude에 주소 등록
+
+1. Claude 웹 또는 Desktop에서 **설정 > 커넥터(Connectors)**를 연다.
+2. **사용자 지정 커넥터 추가(Add custom connector)**를 누른다.
+3. 이름에는 알아보기 쉬운 MCP 이름을, URL에는 고정 Production 주소와 `/mcp`를 입력한다.
+4. 공개 read-only 배포는 별도 토큰을 입력하지 않는다. 비공개 배포는 구성한 OAuth 흐름을
+   따른다.
+5. 저장한 뒤 새 대화를 열고 커넥터를 활성화한다.
+6. `규정 MCP의 search로 인사규정을 찾고 첫 결과 id를 fetch로 조회해 줘`라고 요청한다.
+
+로컬 Claude Desktop의 **개발자 > 구성 편집**은 PowerShell/Python STDIO 연결용이다.
+Vercel HTTPS 주소는 그 JSON 파일이 아니라 **커넥터** 화면에 등록한다.
 
 ## 운영 제약
 

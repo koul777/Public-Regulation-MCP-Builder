@@ -3834,7 +3834,7 @@ def _mcp_first_use_guide(server_name: str) -> str:
    - 등록 후 클라이언트를 완전히 종료·재실행하고 실제 도구 호출로 검증
 
 2. 공개 HTTPS Streamable HTTP
-   - `vercel_mcp.py`와 승인된 runtime bundle을 Vercel에 배포
+   - 생성된 staging의 `api/index.py`와 승인된 runtime bundle을 Vercel에 배포
    - 공개 endpoint는 `https://<deployment>/mcp`
    - `MCP_AUTH_TOKEN`, `MCP_ALLOWED_HTTP_HOSTS`와 tenant/profile 환경변수를 Vercel에 설정
    - ChatGPT 또는 Claude Connector에는 HTTPS URL과 승인된 인증만 등록
@@ -6525,6 +6525,9 @@ def _chatgpt_connector_config(
     elif not https_endpoint_ready:
         missing.append("public_url_must_use_https")
     oauth_ready = bool(chatgpt_oauth_ready)
+    config_toml = {"url": connector_url}
+    if remote_auth_token_env:
+        config_toml["bearer_token_env_var"] = remote_auth_token_env
     return {
         "profile": "chatgpt-remote",
         "transport": "streamable-http",
@@ -6560,13 +6563,10 @@ def _chatgpt_connector_config(
                 "the generated files."
             ),
         },
-        "config_toml": {
-            "url": connector_url,
-            "bearer_token_env_var": remote_auth_token_env,
-        },
+        "config_toml": config_toml,
         "deployment": {
             "platform": "vercel",
-            "entrypoint": "vercel_mcp.py",
+            "entrypoint": "api/index.py",
             "path": "/mcp",
         },
         "server_auth": {
@@ -6726,8 +6726,19 @@ def _http_auth_args(remote_auth_token_env: str | None) -> list[str]:
 
 
 def _remote_auth_summary(remote_auth_token_env: str | None) -> dict[str, Any]:
+    if not remote_auth_token_env:
+        return {
+            "required": False,
+            "mode": "approved_public_unauthenticated",
+            "token_env": None,
+            "note": (
+                "Use only for an explicitly approved public read-only deployment; "
+                "private endpoints require bearer authentication or OAuth."
+            ),
+        }
     return {
         "required": True,
+        "mode": "bearer",
         "token_env": remote_auth_token_env,
         "note": "Use bearer token auth or an approved authenticated reverse proxy before exposing HTTP/SSE MCP.",
     }
@@ -7711,6 +7722,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--approved-public-unauthenticated",
+        action="store_true",
+        help=(
+            "Generate remote connector artifacts for an explicitly approved public read-only endpoint "
+            "without a bearer-token environment variable."
+        ),
+    )
+    parser.add_argument(
         "--chatgpt-oauth-ready",
         action="store_true",
         help=(
@@ -7774,7 +7793,9 @@ def main() -> int:
         department_ids=args.department_id,
         client_profile=args.client_profile,
         public_url=args.public_url,
-        remote_auth_token_env=args.remote_auth_token_env,
+        remote_auth_token_env=(
+            None if args.approved_public_unauthenticated else args.remote_auth_token_env
+        ),
         chatgpt_oauth_ready=args.chatgpt_oauth_ready,
         min_visible_records=args.min_visible_records,
     )

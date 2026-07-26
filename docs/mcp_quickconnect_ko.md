@@ -175,7 +175,7 @@ reg-rag-mcp-vercel-stage `
   --out-dir .\vercel-mcp-stage
 ```
 
-staging 디렉터리를 Vercel에 배포합니다. 진입점은 `vercel_mcp.py`, 최종 endpoint는 다음과 같습니다.
+staging 디렉터리를 Vercel에 배포합니다. 진입점은 `api/index.py`, 최종 endpoint는 다음과 같습니다.
 
 ```text
 https://<deployment>/mcp
