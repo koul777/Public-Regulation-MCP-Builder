@@ -80,6 +80,30 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertNotIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
         self.assertNotIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
 
+    def test_readme_uses_current_workflow_images(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        expected_images = (
+            "docs/assets/pr-mcp-builder-hero.png",
+            "docs/assets/readme-guide-01-start.png",
+            "docs/assets/readme-guide-02-upload.png",
+            "docs/assets/readme-guide-02-preprocess-complete.png",
+            "docs/assets/readme-guide-03-multi-regulation.png",
+            "docs/assets/readme-guide-03-chunk-context.png",
+            "docs/assets/readme-guide-04-human-review.png",
+        )
+
+        for image_path in expected_images:
+            self.assertIn(image_path, text)
+            self.assertTrue((REPO_ROOT / image_path).is_file(), image_path)
+
+        for retired_image in (
+            "readme-guide-05-mcp-next.png",
+            "readme-guide-06-bundle.png",
+            "readme-guide-06-generated-files.png",
+            "readme-guide-09-generated-bat-files.png",
+        ):
+            self.assertNotIn(retired_image, text)
+
 
 if __name__ == "__main__":
     unittest.main()
