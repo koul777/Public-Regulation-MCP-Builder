@@ -15,13 +15,20 @@ from typing import Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _non_empty_scope_id(value: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise argparse.ArgumentTypeError("expected a non-empty scope identifier")
+    return normalized
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run local MCP, transport, temporal, readiness, and migration gates for one institution profile."
     )
     parser.add_argument("--data-dir", default="data/runtime-institution-mcp")
-    parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--profile-id", required=True)
+    parser.add_argument("--tenant-id", required=True, type=_non_empty_scope_id)
+    parser.add_argument("--profile-id", required=True, type=_non_empty_scope_id)
     parser.add_argument(
         "--run-dir",
         default=None,
