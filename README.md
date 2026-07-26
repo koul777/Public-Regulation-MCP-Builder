@@ -5,6 +5,8 @@
 [![MCP](https://img.shields.io/badge/MCP-STDIO%20%7C%20HTTPS-0F766E)](docs/mcp_quickconnect_ko.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+![규정 문서를 사람이 검토·승인한 뒤 로컬 AI와 HTTPS MCP로 연결하는 PR MCP Builder](docs/assets/pr-mcp-builder-hero.png)
+
 공공기관 규정 파일을 정리하고, **사람이 확인해 승인한 내용만** ChatGPT·Codex·Claude에서 검색하게 만드는 Windows용 프로그램입니다.
 
 PDF·HWP·HWPX·DOCX 파일을 올리면 규정명, 개정판, 목차와 조문을 정리합니다. 처리 결과를 사람이 원문과 비교해 승인하면 AI 프로그램에서 사용할 MCP 검색 도구를 만듭니다.
@@ -19,6 +21,40 @@ PDF·HWP·HWPX·DOCX 파일을 올리면 규정명, 개정판, 목차와 조문�
 3. 정리된 조문을 원문과 비교한 뒤 사용할 내용을 승인합니다.
 4. `④ MCP 생성·AI 연결`에서 MCP 이름과 연결 방식을 선택해 파일 묶음을 만듭니다.
 5. 생성 완료 화면의 값을 AI 프로그램에 입력하고, 새 대화에서 `search`와 `fetch`를 실행합니다.
+
+## 화면으로 보는 작업 순서
+
+### 1. 기관 선택
+
+기관을 만들거나 기존 기관을 선택합니다. 문서와 승인 데이터는 선택한 기관 범위로 분리됩니다.
+
+![기관을 등록하거나 선택하는 시작 화면](docs/assets/readme-guide-01-start.png)
+
+### 2. 규정 파일 올리기
+
+PDF·HWP·HWPX·DOCX 규정 파일을 한 번에 올릴 수 있습니다.
+
+![규정 파일을 올리는 화면](docs/assets/readme-guide-02-upload.png)
+
+자동 인식된 규정명, 버전과 개정일을 확인한 뒤 전처리를 시작합니다.
+
+![자동 인식된 규정 정보를 확인하는 화면](docs/assets/readme-guide-02-preprocess-complete.png)
+
+### 3. 처리 결과 확인
+
+품질 결과와 함께 처리할 규정을 선택합니다. 여러 규정을 하나의 작업 묶음으로 유지할 수 있습니다.
+
+![여러 규정의 처리 결과와 품질을 확인하는 화면](docs/assets/readme-guide-03-multi-regulation.png)
+
+원문, 전처리 결과와 앞뒤 문맥을 비교해 내용이 올바르게 정리됐는지 확인합니다.
+
+![원문과 전처리 결과 및 앞뒤 문맥을 비교하는 화면](docs/assets/readme-guide-03-chunk-context.png)
+
+### 4. 사람 검수와 승인
+
+AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내용만 검색 색인과 MCP에 들어갑니다.
+
+![AI 제안을 검토하고 사람이 승인하는 화면](docs/assets/readme-guide-04-human-review.png)
 
 ## 어떤 연결을 선택하나요?
 
