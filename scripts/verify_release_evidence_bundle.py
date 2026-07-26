@@ -36,7 +36,6 @@ HERMES_MCP_REQUIRED_ARTIFACTS = frozenset(
         "reports/mcp_connection_bundle_hermes.zip",
         "reports/mcp_connection_readiness_bundle_hermes.json",
         "reports/mcp_connection_readiness_chatgpt_https_hermes.json",
-        "reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json",
     }
 )
 MCP_PRODUCT_READINESS_REQUIRED_ARTIFACTS = frozenset(
@@ -80,7 +79,16 @@ MCP_PRODUCT_READINESS_REQUIRED_ARTIFACTS = frozenset(
         "reports/reapproval_review_burden_current.md",
     }
 )
-HERMES_BUNDLE_JSON_KEYS = frozenset({"quickstart", "claude_desktop", "claude_code", "chatgpt", "claude_api"})
+HERMES_BUNDLE_JSON_KEYS = frozenset(
+    {
+        "quickstart",
+        "chatgpt_desktop_local",
+        "claude_desktop",
+        "claude_code",
+        "chatgpt_remote",
+        "claude_remote",
+    }
+)
 MCP_PRODUCT_READINESS_AUTHORITY_EXPECTED_ARTIFACTS = {
     "product_readiness": {
         "path": "reports/mcp_product_readiness_current.json",
@@ -114,44 +122,40 @@ REQUIRED_APPROVAL_REVIEW_EVENT_TYPES = (
 HERMES_BUNDLE_QUICKSTART_KEYS = frozenset(
     {
         "validate_synthetic_chain",
+        "validate_runtime_transport",
+        "audit_index_visibility",
         "run_local_stdio_server",
-        "run_http_server",
-        "run_chatgpt_data_server",
-        "openai_secure_tunnel",
+        "chatgpt_desktop_local",
+        "claude_desktop",
+        "claude_code",
+        "chatgpt_remote",
+        "vercel_https",
+        "claude_remote",
     }
 )
 HERMES_BUNDLE_ZIP_REQUIRED_ENTRIES = frozenset(
     {
         "README.md",
         "README.ko.md",
+        "bundle_status.json",
         "manifest.json",
         "mcp_config.bundle.json",
         "connect_mcp_client.ps1",
-        "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
-        "CODEX_AGENT_CONNECT_PROMPT.md",
-        "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md",
         "MCP 사용 시작하기.txt",
-        "설치 후 MCP 사용 방법 보기.bat",
-        "Codex 플러그인 MCP 입력값.txt",
-        "ChatGPT Desktop에 연결하기.bat",
-        "Codex에 연결하기.bat",
-        "Claude Desktop에 연결하기.bat",
-        "Claude Code에 연결하기.bat",
-        "ChatGPT HTTPS에 연결하기.bat",
-        "ChatGPT 보안 Tunnel에 연결하기.bat",
-        "Claude HTTPS에 연결하기.bat",
         "install_local_package.ps1",
         "doctor_mcp_connection.ps1",
-        "연결 상태 확인하기.bat",
         "validate_mcp_smoke.ps1",
+        "validate_client_config_smoke.ps1",
+        "validate_chatgpt_remote_mcp.ps1",
         "run_local_stdio_server.ps1",
-        "run_http_server.ps1",
-        "run_chatgpt_data_server.ps1",
-        "run_openai_secure_tunnel.ps1",
+        "run_mcp_stdio_server.ps1",
+        "codex_config_snippet.toml",
+        "claude_code_add_stdio.ps1",
+        "claude_code_add_http.ps1",
         "claude_desktop_config.json",
         "chatgpt_desktop_local_mcp.json",
         "chatgpt_connector.json",
-        "claude_api_fragment.json",
+        "claude_https_mcp.json",
     }
 )
 ALLOWLIST_ARTIFACT = ".release-hygiene-allowlist.json"
@@ -168,7 +172,6 @@ REQUIRED_JSON_MARKERS: dict[str, dict[str, Any]] = {
     "reports/mcp_transport_smoke_hermes.json": {"report_type": "mcp_transport_smoke"},
     "reports/mcp_connection_readiness_bundle_hermes.json": {"report_type": "mcp_connection_readiness"},
     "reports/mcp_connection_readiness_chatgpt_https_hermes.json": {"report_type": "mcp_connection_readiness"},
-    "reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json": {"report_type": "mcp_connection_readiness"},
     "reports/mcp_readiness_authority_current.json": {"report_type": "mcp_readiness_authority", "authority_version": 1},
     "reports/mcp_product_readiness_current.json": {"report_type": "mcp_product_readiness"},
     "reports/table_review_source_traceability_current.json": {"report_type": "table_review_source_traceability"},

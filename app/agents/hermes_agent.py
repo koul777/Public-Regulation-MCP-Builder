@@ -64,9 +64,6 @@ class HermesAgent(BaseAgent):
             chatgpt_https_json=Path(
                 str(payload.get("chatgpt_https_json") or "reports/mcp_connection_readiness_chatgpt_https_hermes.json")
             ),
-            chatgpt_tunnel_json=Path(
-                str(payload.get("chatgpt_tunnel_json") or "reports/mcp_connection_readiness_chatgpt_tunnel_hermes.json")
-            ),
             public_audit_json=Path(str(payload.get("public_audit_json") or "reports/public_release_readiness_audit.hermes.json")),
             cleanup_json=Path(str(payload.get("cleanup_json") or "reports/public_release_cleanup_plan.hermes.json")),
             cleanup_md=Path(str(payload.get("cleanup_md") or "reports/public_release_cleanup_plan.hermes.md")),
@@ -76,7 +73,6 @@ class HermesAgent(BaseAgent):
             skip_mcp_smoke=bool(payload.get("skip_mcp_smoke", False)),
             skip_mcp_transport_smoke=bool(payload.get("skip_mcp_transport_smoke", False)),
             skip_public_audit=bool(payload.get("skip_public_audit", False)),
-            require_tunnel_client=bool(payload.get("require_tunnel_client", False)),
             include_wheel_in_bundle=include_wheel_in_bundle,
             probe_public_url=bool(payload.get("probe_public_url", False)),
         )

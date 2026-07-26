@@ -26,7 +26,7 @@ class PublicGithubReleaseChecklistTests(unittest.TestCase):
         self.assertIn("approval_journal", text)
         self.assertIn("reg-rag-release-evidence-index --profile mcp-product-readiness", text)
         self.assertIn("--probe-public-url", text)
-        self.assertIn("ChatGPT HTTPS/tunnel doctor", text)
+        self.assertIn("ChatGPT/Claude Vercel HTTPS doctor", text)
         self.assertIn("--client-profile chatgpt-remote", text)
 
     def test_readme_keeps_authority_backed_product_release_chain(self) -> None:
@@ -35,10 +35,13 @@ class PublicGithubReleaseChecklistTests(unittest.TestCase):
         self.assertIn("사람에게 승인되지 않은 청크", text)
         self.assertIn("승인된 규정만 MCP 데이터로 생성", text)
         self.assertIn("MCP로 쓸 파일 묶음 만들기", text)
-        self.assertIn("MCP HTTP - URL로 연결", text)
-        self.assertIn("OpenAI Secure MCP Tunnel", text)
-        self.assertIn("run_openai_secure_tunnel.ps1", text)
-        self.assertNotIn("Cloudflare Named Tunnel", text)
+        self.assertIn("ChatGPT Desktop / Codex CLI / Codex IDE", text)
+        self.assertIn("Claude Code", text)
+        self.assertIn("Claude Desktop", text)
+        self.assertIn("https://<deployment>/mcp", text)
+        self.assertIn("reg-rag-mcp-vercel-stage", text)
+        self.assertNotIn("OpenAI Secure MCP Tunnel", text)
+        self.assertNotIn("run_openai_secure_tunnel.ps1", text)
 
 
 if __name__ == "__main__":

@@ -19,21 +19,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.generate_mcp_client_config import (
+    RUNTIME_IDENTITY_MODULES as GENERATED_RUNTIME_IDENTITY_MODULES,
+)
+
 INSTALL_SCRIPT = "install_local_package.ps1"
 STDIO_LAUNCHER = "run_mcp_stdio_server.ps1"
-CLAUDE_DESKTOP_BAT = "Claude Desktop에 연결하기.bat"
-CLAUDE_CODE_BAT = "Claude Code에 연결하기.bat"
 RUNTIME_MARKER = "runtime_python.json"
-RUNTIME_IDENTITY_MODULES = (
-    "scripts.run_regulation_mcp",
-    "scripts.check_mcp_connection_readiness",
-    "scripts.run_mcp_smoke",
-    "scripts.run_mcp_transport_smoke",
-    "scripts.run_mcp_client_config_smoke",
-    "scripts.check_codex_app_server_mcp",
-    "scripts.check_chatgpt_desktop_recognition",
-    "scripts.audit_mcp_index_visibility",
-)
+CLAUDE_DESKTOP_CONFIG = "claude_desktop_config.json"
+CLAUDE_CODE_STDIO = "claude_code_add_stdio.ps1"
+CONNECT_SCRIPT = "connect_mcp_client.ps1"
+RUNTIME_IDENTITY_MODULES = tuple(GENERATED_RUNTIME_IDENTITY_MODULES)
 MCP_COMMANDS = (
     "reg-rag-mcp-server",
     "reg-rag-mcp-config",
@@ -124,9 +120,9 @@ def run_execution_matrix(
 ) -> dict[str, Any]:
     """Run destructive-free Windows MCP launcher scenarios in one temp tree.
 
-    No connection BAT is executed. The Claude BAT scenario only inspects the
-    staged text, so neither Desktop processes nor user MCP configuration can be
-    changed by this harness.
+    No connection helper is executed. The direct artifact contract scenario only
+    inspects the staged text, so neither Desktop processes nor user MCP
+    configuration can be changed by this harness.
     """
 
     powershell_command = (
@@ -142,7 +138,13 @@ def run_execution_matrix(
         staged_bundle = _stage_bundle(source_bundle, root / "staged-bundle")
         missing_files = [
             name
-            for name in (INSTALL_SCRIPT, STDIO_LAUNCHER, CLAUDE_DESKTOP_BAT, CLAUDE_CODE_BAT)
+            for name in (
+                INSTALL_SCRIPT,
+                STDIO_LAUNCHER,
+                CLAUDE_DESKTOP_CONFIG,
+                CLAUDE_CODE_STDIO,
+                CONNECT_SCRIPT,
+            )
             if not (staged_bundle / name).is_file()
         ]
         if missing_files:
@@ -195,7 +197,7 @@ def run_execution_matrix(
                         reason_code="powershell_unavailable",
                     )
                 )
-        scenarios.append(_check_claude_bat_install_package(staged_bundle))
+        scenarios.append(_check_direct_client_artifacts_contract(staged_bundle))
         return _matrix_report(scenarios, windows_supported=bool(powershell_command))
 
 
@@ -213,7 +215,13 @@ def _generate_bundle(output_dir: Path) -> Path:
 
 def _stage_bundle(source: Path, destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
-    for name in (INSTALL_SCRIPT, STDIO_LAUNCHER, CLAUDE_DESKTOP_BAT, CLAUDE_CODE_BAT):
+    for name in (
+        INSTALL_SCRIPT,
+        STDIO_LAUNCHER,
+        CLAUDE_DESKTOP_CONFIG,
+        CLAUDE_CODE_STDIO,
+        CONNECT_SCRIPT,
+    ):
         source_path = source / name
         if source_path.is_file():
             shutil.copy2(source_path, destination / name)
@@ -545,29 +553,53 @@ def _run_marker_fallback(
     )
 
 
-def _check_claude_bat_install_package(bundle: Path) -> dict[str, Any]:
-    results: dict[str, bool] = {}
-    for label, filename, target in (
-        ("claude_desktop", CLAUDE_DESKTOP_BAT, "-Target claude-desktop"),
-        ("claude_code", CLAUDE_CODE_BAT, "-Target claude-code"),
-    ):
-        try:
-            text = (bundle / filename).read_text(encoding="utf-8-sig")
-        except OSError:
-            results[label] = False
-            continue
-        install_index = text.find("-InstallPackage")
-        target_index = text.find(target)
-        results[label] = install_index >= 0 and target_index >= 0 and install_index < target_index
-    passed = all(results.values())
+def _check_direct_client_artifacts_contract(bundle: Path) -> dict[str, Any]:
+    required_phrase = "claude mcp add --transport stdio --scope user"
+    desktop_config = bundle / CLAUDE_DESKTOP_CONFIG
+    claude_code_script = bundle / CLAUDE_CODE_STDIO
+    connect_script = bundle / CONNECT_SCRIPT
+
+    connect_script_present = connect_script.is_file()
+    claude_code_add_stdio_contract = False
+    claude_desktop_has_servers = False
+    mcp_servers_count = 0
+
+    try:
+        payload = json.loads(desktop_config.read_text(encoding="utf-8-sig"))
+        mcp_servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+        if isinstance(mcp_servers, dict):
+            mcp_servers_count = len(mcp_servers)
+            claude_desktop_has_servers = mcp_servers_count > 0
+    except (OSError, json.JSONDecodeError):
+        claude_desktop_has_servers = False
+        mcp_servers_count = 0
+
+    try:
+        script_text = claude_code_script.read_text(encoding="utf-8-sig")
+        normalized = " ".join(script_text.lower().split())
+        claude_code_add_stdio_contract = required_phrase in normalized
+    except OSError:
+        claude_code_add_stdio_contract = False
+
+    passed = (
+        connect_script_present
+        and claude_desktop_has_servers
+        and claude_code_add_stdio_contract
+    )
     return _scenario_result(
-        "claude_bat_installs_package",
+        "direct_client_artifacts_contract",
         passed=passed,
-        reason_code="claude_bats_install_before_registration" if passed else "claude_bat_missing_install_package",
+        reason_code=(
+            "direct_client_artifacts_contract_verified"
+            if passed
+            else "direct_client_artifacts_contract_invalid"
+        ),
         observed={
-            "claude_desktop_install_package": results.get("claude_desktop", False),
-            "claude_code_install_package": results.get("claude_code", False),
-            "bat_executed": False,
+            "connect_script_present": connect_script_present,
+            "claude_desktop_has_mcp_servers": claude_desktop_has_servers,
+            "claude_desktop_mcp_servers_count": mcp_servers_count,
+            "claude_code_add_stdio_contract": claude_code_add_stdio_contract,
+            "claude_code_add_stdio_phrase": required_phrase,
         },
     )
 

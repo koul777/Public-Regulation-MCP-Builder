@@ -47,7 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-build", action="store_true", help="Include package build in mcp-check mode.")
     parser.add_argument("--include-wheel-in-bundle", action="store_true", help="Include the built wheel in the MCP setup bundle zip.")
     parser.add_argument("--skip-mcp-transport-smoke", action="store_true")
-    parser.add_argument("--require-tunnel-client", action="store_true")
     parser.add_argument("--probe-public-url", action="store_true", help="Forward live HTTPS /mcp probing to remote MCP doctors.")
     parser.add_argument("--timeout-seconds", type=float, default=None)
     parser.add_argument("--out-json", default=None)
@@ -89,7 +88,6 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         "include_wheel_in_bundle": args.include_wheel_in_bundle
         or (args.mode == "mcp-check" and args.include_build and not args.skip_build),
         "skip_mcp_transport_smoke": args.skip_mcp_transport_smoke,
-        "require_tunnel_client": args.require_tunnel_client,
         "probe_public_url": args.probe_public_url,
         "timeout_seconds": args.timeout_seconds,
     }

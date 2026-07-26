@@ -103,7 +103,7 @@ git diff --check
 
 `reg-rag-github-publish-owner-decisions --fail-on-blocker`는 `decision`, `decision_owner`, `decision_reference`가 모두 채워질 때까지 실패해야 정상이다. 이 gate가 실패하는 동안에는 license, 샘플 재배포, private 문서 제거/재작성, identifier fixture 처리 같은 owner decision이 완료되지 않은 상태로 본다.
 
-ChatGPT HTTPS/tunnel doctor는 설정 검증용이다. 실제 공개 또는 기관 전용 HTTPS endpoint가 준비된 경우에만 `--probe-public-url`을 추가해서 네트워크 probe까지 확인한다.
+ChatGPT/Claude Vercel HTTPS doctor는 설정 검증용이다. 실제 공개 또는 기관 전용 HTTPS `/mcp` endpoint가 준비된 경우에만 `--probe-public-url`을 추가해서 네트워크 probe까지 확인한다.
 
 ## 공개 운영 주의사항
 

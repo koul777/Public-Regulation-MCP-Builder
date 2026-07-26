@@ -540,11 +540,7 @@ async def _call_profile_tools(
     search_started_at = time.perf_counter()
     search = await session.call_tool(
         "search",
-        {
-            "query": query,
-            "top_k": 3,
-            "security_levels": ["internal"],
-        },
+        {"query": query},
     )
     search_elapsed_ms = _elapsed_ms(search_started_at)
     search_payload = _tool_payload(search)
@@ -557,10 +553,7 @@ async def _call_profile_tools(
         fetch_started_at = time.perf_counter()
         fetch = await session.call_tool(
             "fetch",
-            {
-                "id": first_id,
-                "security_levels": ["internal"],
-            },
+            {"id": first_id},
         )
         fetch_elapsed_ms = _elapsed_ms(fetch_started_at)
         fetch_payload = _tool_payload(fetch)
@@ -602,11 +595,7 @@ async def _call_profile_tools(
     warm_search_started_at = time.perf_counter()
     warm_search = await session.call_tool(
         "search",
-        {
-            "query": query,
-            "top_k": 3,
-            "security_levels": ["internal"],
-        },
+        {"query": query},
     )
     warm_search_elapsed_ms = _elapsed_ms(warm_search_started_at)
     warm_search_payload = _tool_payload(warm_search)

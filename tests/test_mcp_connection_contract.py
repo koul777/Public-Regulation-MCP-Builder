@@ -6,7 +6,7 @@ from scripts.generate_mcp_client_config import build_mcp_client_config
 
 
 class McpConnectionContractTests(unittest.TestCase):
-    def test_chatgpt_remote_server_args_do_not_duplicate_tool_profile(self) -> None:
+    def test_chatgpt_remote_uses_deployed_url_without_local_start_args(self) -> None:
         config = build_mcp_client_config(
             client_profile="chatgpt-remote",
             transport="streamable-http",
@@ -14,9 +14,16 @@ class McpConnectionContractTests(unittest.TestCase):
             server_name="govreg-local",
         )
 
-        args = config["server_start"]["args"]
-        self.assertEqual(1, args.count("--tool-profile"))
-        self.assertEqual("chatgpt-data", args[args.index("--tool-profile") + 1])
+        self.assertNotIn("server_start", config)
+        self.assertEqual(
+            "https://mcp.example.go.kr/mcp",
+            config["connector_url"],
+        )
+        self.assertEqual(["search", "fetch"], config["compatible_tools"])
+        self.assertEqual(
+            "MCP_AUTH_TOKEN",
+            config["config_toml"]["bearer_token_env_var"],
+        )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ from app.core.input_limits import (
     McpTopK,
 )
 from app.mcp_server.regulation_tools import (
+    chatgpt_data_fetch_output,
+    chatgpt_data_search_output,
     compare_versions as compare_versions_result,
     fetch_regulation,
     get_article as get_article_result,
@@ -40,6 +42,7 @@ from app.mcp_server.regulation_tools import (
     start_background_tokenizer_warmup,
     warm_mcp_runtime,
 )
+from app.schemas.mcp import ChatGPTDataFetchOutput, ChatGPTDataSearchOutput
 
 
 SERVER_INSTRUCTIONS = """Local public-institution regulation MCP server.
@@ -83,6 +86,13 @@ Verbatim evidence rule:
 If the evidence does not support an answer, state that the approved regulation index does not
 contain enough evidence instead of guessing."""
 
+CHATGPT_DATA_SERVER_INSTRUCTIONS = """Approved public-institution regulation data source for ChatGPT.
+
+Use search with only a query string, then use fetch with only a returned result id before answering.
+Use only fetched text and metadata as evidence. Do not infer definitions, conditions, or dates that the
+approved evidence does not contain. Citation URLs are either user-openable HTTP(S) source pages or empty.
+The server is read-only and exposes only the OpenAI-compatible search and fetch data-source contract."""
+
 READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -120,6 +130,12 @@ def create_regulation_mcp_server(
     allowed_http_origins: list[str] | None = None,
     tool_profile: str = "full",
     warm_cache: bool = True,
+    streamable_http_path: str = "/mcp",
+    stateless_http: bool = False,
+    json_response: bool = False,
+    api_audit_enabled: bool | None = None,
+    rag_trace_enabled: bool | None = None,
+    background_tokenizer_warmup: bool = True,
 ) -> FastMCP:
     normalized_tool_profile = tool_profile.strip().lower()
     if normalized_tool_profile not in VALID_TOOL_PROFILES:
@@ -128,6 +144,8 @@ def create_regulation_mcp_server(
         data_dir=data_dir,
         tenant_id=tenant_id,
         tenant_storage_isolation=tenant_storage_isolation,
+        api_audit_enabled=api_audit_enabled,
+        rag_trace_enabled=rag_trace_enabled,
     )
     auth = mcp_auth_context(
         tenant_id=tenant_id,
@@ -153,13 +171,21 @@ def create_regulation_mcp_server(
         if default_profile_id
         else "Runtime institution scope is unbound. Clients must provide profile_id explicitly when the tenant contains multiple institutions."
     )
+    profile_instructions = (
+        CHATGPT_DATA_SERVER_INSTRUCTIONS
+        if normalized_tool_profile == "chatgpt-data"
+        else SERVER_INSTRUCTIONS
+    )
     server = FastMCP(
         "Public Institution Regulation MCP",
-        instructions=f"{SERVER_INSTRUCTIONS}\n\n{scope_instruction}",
+        instructions=f"{profile_instructions}\n\n{scope_instruction}",
         host=host,
         port=port,
         auth=auth_settings,
         token_verifier=token_verifier,
+        streamable_http_path=streamable_http_path,
+        stateless_http=stateless_http,
+        json_response=json_response,
         transport_security=_http_transport_security_settings(
             host=host,
             port=port,
@@ -182,8 +208,55 @@ def create_regulation_mcp_server(
         server._reg_rag_warmup_status = {
             "warmed": False,
             "skipped": True,
-            "background_tokenizer_warmup": start_background_tokenizer_warmup(delay_seconds=5.0),
+            "background_tokenizer_warmup": (
+                start_background_tokenizer_warmup(delay_seconds=5.0)
+                if background_tokenizer_warmup
+                else {"started": False, "skipped": True}
+            ),
         }
+
+    if normalized_tool_profile == "chatgpt-data":
+        @server.tool(
+            name="search",
+            title="Search approved regulations",
+            description=(
+                "Search approved regulation evidence. Pass only query, then call fetch with a returned id. "
+                "Results expose the OpenAI data-source search contract and user-openable citation URLs only."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def search_tool(query: McpQuery) -> ChatGPTDataSearchOutput:
+            response = search_regulations(
+                settings=settings,
+                auth=auth,
+                query=query,
+                profile_id=default_profile_id,
+                metadata_profile=normalized_tool_profile,
+            )
+            return chatgpt_data_search_output(response)
+
+        @server.tool(
+            name="fetch",
+            title="Fetch approved regulation evidence",
+            description=(
+                "Fetch full approved regulation evidence for an id returned by search. Pass only id. "
+                "Use the returned text and citation metadata without adding unsupported facts."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def fetch_tool(id: McpResultId) -> ChatGPTDataFetchOutput:
+            response = fetch_regulation(
+                settings=settings,
+                auth=auth,
+                result_id=id,
+                profile_id=default_profile_id,
+                metadata_profile=normalized_tool_profile,
+            )
+            return chatgpt_data_fetch_output(response)
+
+        return server
 
     @server.tool(
         name="search",
@@ -192,13 +265,10 @@ def create_regulation_mcp_server(
             "Search approved local regulation chunks. Use this first for regulation questions, "
             "then call fetch with a returned id for full evidence. The response includes verbatim_text "
             "and a verbatim evidence block; show that block when the user asks for the original wording. "
-            "Answer only from returned text: "
-            "Pass profile_id when a tenant contains multiple institutions so results stay within "
-            "the selected institution. "
-            "this institution's terminology can differ from general Korean public-sector usage, so "
-            "never fill in definitions, categories, or day counts from prior knowledge. If a result "
-            "enumerates items without defining them, search or fetch the defining articles before "
-            "describing each item, and cite the document and article for every statement."
+            "Answer only from returned text. Pass profile_id when a tenant contains multiple institutions "
+            "so results stay within the selected institution. This institution's terminology can differ "
+            "from general Korean public-sector usage, so never fill in definitions, categories, or day "
+            "counts from prior knowledge."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         structured_output=True,
@@ -226,22 +296,17 @@ def create_regulation_mcp_server(
             metadata_profile=normalized_tool_profile,
         )
 
-    lookup_decorator = (
-        server.tool(
-            name="lookup",
-            title="Direct regulation lookup with RAG fallback",
-            description=(
-                "Look up an approved regulation document or article directly when document_id is known. "
-                "If the exact lookup has no result, fall back to approved-local RAG search. The response "
-                "marks retrieval_mode as direct_lookup or rag_fallback and includes verbatim evidence."
-            ),
-            annotations=READ_ONLY_TOOL_ANNOTATIONS,
-            structured_output=True,
-        )
-        if normalized_tool_profile != "chatgpt-data"
-        else (lambda function: function)
+    @server.tool(
+        name="lookup",
+        title="Direct regulation lookup with RAG fallback",
+        description=(
+            "Look up an approved regulation document or article directly when document_id is known. "
+            "If the exact lookup has no result, fall back to approved-local RAG search. The response "
+            "marks retrieval_mode as direct_lookup or rag_fallback and includes verbatim evidence."
+        ),
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+        structured_output=True,
     )
-    @lookup_decorator
     def lookup_tool(
         query: McpQuery,
         document_id: McpOptionalIdentifier | None = None,
@@ -298,9 +363,6 @@ def create_regulation_mcp_server(
             as_of_date=as_of_date,
             metadata_profile=normalized_tool_profile,
         )
-
-    if normalized_tool_profile == "chatgpt-data":
-        return server
 
     @server.tool(
         name="list_documents",

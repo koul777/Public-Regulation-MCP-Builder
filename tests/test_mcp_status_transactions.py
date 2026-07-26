@@ -413,7 +413,6 @@ class McpStatusTransactionTests(unittest.TestCase):
                     "tools_discovered": True,
                     "installed_config_transport_verified": True,
                     "generated_client_configs_transport_verified": True,
-                    "plugin_stdio_verified": True,
                     "direct_stdio_verified": True,
                     "transport_end_to_end_verified": True,
                     "fresh_codex_app_server_inventory_verified": True,
@@ -468,7 +467,6 @@ class McpStatusTransactionTests(unittest.TestCase):
             "tools_discovered",
             "installed_config_transport_verified",
             "generated_client_configs_transport_verified",
-            "plugin_stdio_verified",
             "direct_stdio_verified",
             "transport_end_to_end_verified",
             "fresh_codex_app_server_inventory_verified",
@@ -595,6 +593,10 @@ class McpStatusTransactionTests(unittest.TestCase):
                     "claude_desktop_config_path": "C:/fixture/AppData/Roaming/Claude/claude_desktop_config.json",
                     "claude_desktop_config_fingerprint": "sha256:" + ("c" * 64),
                     "claude_desktop_config_transport_verified": True,
+                    "claude_desktop_config_transport_runtime_fingerprint": completed_status[
+                        "runtime_fingerprint"
+                    ],
+                    "claude_desktop_loader_observed": True,
                     "claude_desktop_loader_verified": True,
                     "claude_desktop_conversation_verified": True,
                     "direct_stdio_verified": True,
@@ -638,6 +640,7 @@ class McpStatusTransactionTests(unittest.TestCase):
         )
         for field in (
             "claude_desktop_config_transport_verified",
+            "claude_desktop_loader_observed",
             "claude_desktop_loader_verified",
             "claude_desktop_conversation_verified",
             "direct_stdio_verified",
@@ -646,6 +649,12 @@ class McpStatusTransactionTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertFalse(refreshed_status[field])
+        self.assertIsNone(
+            refreshed_status["claude_desktop_config_transport_runtime_fingerprint"]
+        )
+        for target, record in refreshed_status["client_connections"].items():
+            with self.subTest(target=target):
+                self.assertTrue(record["readiness"]["runtime_ready"])
 
     def test_runtime_refresh_rejects_every_active_installation_state(self) -> None:
         config = build_mcp_client_config(
@@ -667,11 +676,8 @@ class McpStatusTransactionTests(unittest.TestCase):
         }
         active_states = (
             "preflight_direct",
-            "preflight_plugin",
             "preflight_claude_desktop",
             "installing",
-            "installing_plugin",
-            "plugin_installed_pending_loader_verification",
         )
 
         with tempfile.TemporaryDirectory() as tmp:

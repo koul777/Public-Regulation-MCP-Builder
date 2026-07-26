@@ -211,7 +211,8 @@ def search_rag_records(
         },
     )
     step_started_at = time.perf_counter()
-    repository.append_rag_trace(trace)
+    if settings.rag_trace_enabled:
+        repository.append_rag_trace(trace)
     timing_ms["trace_write_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     timing_ms["total_elapsed_ms"] = _perf_elapsed_ms(total_started_at)
     return results, trace
@@ -277,7 +278,8 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                 "answer_mode": "grounded_local" if backend != "extractive" else "grounded_extractive",
             },
         )
-        JsonRepository(request_settings).append_rag_trace(trace)
+        if request_settings.rag_trace_enabled:
+            JsonRepository(request_settings).append_rag_trace(trace)
         audit_api_event(
             request_settings,
             auth,

@@ -15,6 +15,8 @@ include docs/preprocessing_change_governance_ko.md
 include docs/public_release_report_allowlist.json
 include docs/public_release_report_allowlist.example.json
 include docs/ui_ux_release_scope_ko.md
+include docs/vercel_https_mcp_ko.md
+include vercel_mcp.py
 recursive-include tests *.py
 recursive-include scripts *.ps1
 recursive-include packaging *.py *.spec *.txt *.ps1

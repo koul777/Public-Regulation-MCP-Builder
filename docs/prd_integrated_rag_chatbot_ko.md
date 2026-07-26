@@ -195,7 +195,7 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 ### 11.3 MVP 운영 CLI
 
 - `reg-rag-mcp-server`: 승인된 로컬 규정 DB를 MCP 서버로 실행
-- `reg-rag-mcp-config`: MCP 클라이언트 등록용 JSON 스니펫 생성. `generic`, `claude-desktop`, `claude-code`, `chatgpt`, `claude-api`, `bundle` 프로필과 role, actor, department, tenant isolation 옵션 포함. `bundle.quickstart`는 Claude Code 등록 인자, ChatGPT Connector URL, Claude API 복사 필드, OpenAI Secure MCP Tunnel 템플릿, 로컬 검증 명령을 함께 제공
+- `reg-rag-mcp-config`: MCP 클라이언트 직접 등록용 JSON/TOML/PowerShell 생성. 로컬은 ChatGPT Desktop·Codex의 공용 설정, Claude Desktop 설정 병합, Claude Code 공식 CLI 등록에 필요한 stdio 실행 계약을 제공하고, 원격은 Vercel에 배포한 HTTPS `/mcp` Connector URL과 검증 명령을 제공
 - `reg-rag-mcp-smoke`: 승인, 인덱싱, MCP 조회, 증적 리포트 체인 점검
 
 다음 API는 프로젝트 서버 관리 UI를 만들 때의 후속 후보이며, 현재 MVP 구현 계약은 아니다.
@@ -221,7 +221,7 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 
 ### 12.3 외부 ChatGPT 연결
 
-외부 ChatGPT 개발자 모드 앱/플러그인 연결은 MVP 기본 범위가 아니다. 필요 시 공개 가능 데이터 또는 별도 승인된 망연계 환경에서 HTTPS MCP 서버로 구성한다. 내부망 MCP 서버를 외부에 직접 노출하지 않는 구성이 필요하면 OpenAI Secure MCP Tunnel 템플릿을 선택 경로로 제공한다.
+외부 ChatGPT 개발자 모드 앱/플러그인 연결은 MVP 기본 범위가 아니다. 외부 연결이 승인된 경우 공개 가능 데이터 또는 별도 승인된 망연계 환경의 runtime bundle을 Vercel에 배포하고, 최종 HTTPS `/mcp` 주소와 승인된 인증을 Connector에 직접 등록한다. 내부망 MCP 서버나 로컬 폴더를 외부 클라이언트에 직접 노출하지 않는다.
 
 ## 13. 성공 지표
 
@@ -279,7 +279,7 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 - Claude Desktop/Claude Code 예시 설정
 - ChatGPT connector와 Claude API MCP connector용 HTTPS URL 설정 템플릿
 - 내부망 AI 플랫폼용 HTTP MCP 설정 템플릿
-- `bundle.quickstart` 기반 원클릭에 가까운 연결 안내 출력. Claude Desktop/Claude Code, ChatGPT HTTPS connector, OpenAI Secure MCP Tunnel, Claude API fragment를 같은 번들에서 제공
+- 클라이언트별 직접 등록 안내 출력. ChatGPT Desktop·Codex용 공용 TOML 또는 `ui_fields`, Claude Desktop용 `mcpServers` JSON, Claude Code용 공식 CLI 등록 PowerShell, ChatGPT·Claude용 Vercel HTTPS `/mcp` Connector 값을 같은 번들에서 제공
 - 운영자 점검표와 장애 대응 문서
 
 ### Phase 5: 운영 고도화
@@ -296,7 +296,7 @@ MVP는 현재 저장소 구조를 유지하되, MCP 도구는 `Approval`과 `Mcp
 - MCP `fetch`는 결과 ID로 승인된 본문과 출처를 반환한다.
 - `get_article`은 조항 번호로 정확한 조항을 반환한다.
 - MCP 응답에는 로컬 파일 경로가 포함되지 않는다.
-- `reg-rag-mcp-config --client-profile bundle` 출력만으로 Claude Desktop, Claude Code, ChatGPT Connector, OpenAI Secure MCP Tunnel, Claude API 연결에 필요한 값과 검증 명령을 확인할 수 있다.
+- `reg-rag-mcp-config --client-profile bundle` 출력만으로 ChatGPT Desktop·Codex, Claude Desktop, Claude Code의 로컬 stdio 직접 등록 값과 ChatGPT·Claude의 Vercel HTTPS `/mcp` Connector 값, 검증 명령을 확인할 수 있다.
 - 운영자는 README 또는 운영 문서만 보고 MCP 서버를 실행하고 내부망 AI에 연결할 수 있다.
 
 ## 17. 열린 질문

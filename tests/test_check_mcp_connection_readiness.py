@@ -22,12 +22,45 @@ from app.storage.repository import JsonRepository
 from scripts.check_mcp_connection_readiness import (
     BUNDLE_REQUIRED_FILES,
     _find_smoke_artifacts,
+    _same_filesystem_path,
     check_mcp_connection_readiness,
     run,
+)
+from scripts.generate_mcp_client_config import (
+    build_mcp_client_config,
+    write_mcp_setup_bundle,
 )
 
 
 class CheckMcpConnectionReadinessTests(unittest.TestCase):
+    def test_same_filesystem_path_accepts_windows_short_name_alias(self) -> None:
+        long_path = r"C:\ci-fixture\runneradmin\Temp\bundle"
+        short_path = r"C:\ci-fixture\RUNNER~1\Temp\bundle"
+
+        with patch(
+            "scripts.check_mcp_connection_readiness.os.path.samefile",
+            return_value=True,
+        ) as samefile:
+            self.assertTrue(_same_filesystem_path(long_path, short_path))
+
+        samefile.assert_called_once_with(long_path, short_path)
+
+    def test_same_filesystem_path_resolves_alias_before_missing_leaf(self) -> None:
+        long_path = r"C:\ci-fixture\runneradmin\Temp\bundle\data"
+        short_path = r"C:\ci-fixture\RUNNER~1\Temp\bundle\data"
+
+        with (
+            patch(
+                "scripts.check_mcp_connection_readiness.os.path.samefile",
+                side_effect=FileNotFoundError,
+            ),
+            patch(
+                "scripts.check_mcp_connection_readiness.os.path.realpath",
+                side_effect=lambda value: value.replace("RUNNER~1", "runneradmin"),
+            ),
+        ):
+            self.assertTrue(_same_filesystem_path(long_path, short_path))
+
     def test_script_help_runs_from_file_path(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
 
@@ -131,26 +164,14 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("missing-remote-auth-token-env", codes)
 
-    def test_direct_remote_rejects_sse_as_unverified_transport(self) -> None:
-        with patch.dict(os.environ, {"MCP_AUTH_TOKEN": "real-token"}, clear=False), patch(
-            "scripts.run_mcp_client_config_smoke.run_mcp_client_config_smoke",
-            side_effect=AssertionError("SSE must not be probed as Streamable HTTP"),
-        ):
-            report = check_mcp_connection_readiness(
+    def test_direct_remote_rejects_legacy_sse_transport(self) -> None:
+        with self.assertRaisesRegex(ValueError, "stdio or streamable-http"):
+            check_mcp_connection_readiness(
                 client_profile="chatgpt-remote",
                 transport="sse",
-                host="127.0.0.1",
-                public_url="https://mcp.example.go.kr/mcp",
                 check_cli=False,
                 check_data=False,
-                probe_public_url=True,
             )
-
-        self.assertFalse(report["passed"])
-        self.assertIn("remote-sse-not-supported", {finding["code"] for finding in report["findings"]})
-        self.assertTrue(report["remote_probe"]["performed"])
-        self.assertFalse(report["remote_probe"]["passed"])
-        self.assertEqual("unsupported_sse_transport", report["remote_probe"]["detail"])
 
     def test_direct_remote_rejects_non_public_ip_literals(self) -> None:
         literals = (
@@ -334,75 +355,6 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
             self.assertIn("public-url-invalid", codes)
             self.assertIsNone(report["remote_probe"]["url"])
 
-    def test_openai_tunnel_blocks_without_runtime_prerequisites(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            report = check_mcp_connection_readiness(
-                client_profile="chatgpt",
-                connection_mode="openai-tunnel",
-                transport="stdio",
-                check_cli=True,
-                check_data=False,
-            )
-
-        codes = {finding["code"] for finding in report["findings"]}
-        self.assertFalse(report["passed"])
-        self.assertEqual("openai-tunnel", report["connection_mode"])
-        self.assertNotIn("remote-client-stdio", codes)
-        self.assertIn("openai-tunnel-id-env-empty", codes)
-        self.assertIn("openai-control-plane-api-key-env-empty", codes)
-
-    def test_openai_tunnel_passes_with_cli_and_credentials(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "OPENAI_TUNNEL_ID": "tunnel-123",
-                "CONTROL_PLANE_API_KEY": "runtime-key-123",
-            },
-            clear=True,
-        ), patch("scripts.check_mcp_connection_readiness.shutil.which", return_value="tunnel-client"):
-            report = check_mcp_connection_readiness(
-                client_profile="chatgpt",
-                connection_mode="openai-tunnel",
-                transport="stdio",
-                check_cli=True,
-                check_data=False,
-            )
-
-        self.assertTrue(report["passed"])
-        self.assertEqual(0, report["high_count"])
-
-    def test_openai_tunnel_is_not_valid_for_claude_api(self) -> None:
-        report = check_mcp_connection_readiness(
-            client_profile="claude-api",
-            connection_mode="openai-tunnel",
-            transport="stdio",
-            check_cli=False,
-            check_data=False,
-        )
-
-        codes = {finding["code"] for finding in report["findings"]}
-        self.assertFalse(report["passed"])
-        self.assertIn("openai-tunnel-not-claude-api", codes)
-
-    def test_openai_tunnel_rejects_placeholder_credentials(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"OPENAI_TUNNEL_ID": "<tunnel_id>", "CONTROL_PLANE_API_KEY": "<runtime-api-key>"},
-            clear=True,
-        ):
-            report = check_mcp_connection_readiness(
-                client_profile="chatgpt",
-                connection_mode="openai-tunnel",
-                transport="stdio",
-                check_cli=False,
-                check_data=False,
-            )
-
-        codes = {finding["code"] for finding in report["findings"]}
-        self.assertFalse(report["passed"])
-        self.assertIn("openai-tunnel-id-env-placeholder", codes)
-        self.assertIn("openai-control-plane-api-key-env-placeholder", codes)
-
     def test_http_auth_rejects_placeholder_token(self) -> None:
         with patch.dict(os.environ, {"MCP_AUTH_TOKEN": "<strong-token>"}, clear=True):
             report = check_mcp_connection_readiness(
@@ -450,12 +402,6 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
                                 "operator_action": "Register connector_url.",
                             },
                             {
-                                "client": "ChatGPT",
-                                "mode": "secure_mcp_tunnel",
-                                "ready": "manual_setup_required",
-                                "operator_action": "Set tunnel environment variables.",
-                            },
-                            {
                                 "client": "Claude API",
                                 "mode": "https_mcp_connector",
                                 "ready": False,
@@ -480,9 +426,9 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertEqual(3, summary["local_stdio_ready_count"])
         self.assertFalse(summary["remote_connector_ready"])
         self.assertEqual(0, summary["remote_ready_count"])
-        self.assertEqual(3, summary["remote_connector_count"])
+        self.assertEqual(2, summary["remote_connector_count"])
         self.assertEqual(2, summary["remote_not_ready_count"])
-        self.assertEqual(1, summary["remote_manual_setup_required_count"])
+        self.assertEqual(0, summary["remote_manual_setup_required_count"])
 
     def test_bundle_dir_rejects_secret_assignments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -605,7 +551,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
                             + '", "--data-dir", "'
                             + bundle_data_dir.as_posix()
                             + '", "--tenant-id", "default", "--transport", "stdio", '
-                            '"--flat-storage", "--tool-profile", "full", "--no-warm-cache"]'
+                            '"--flat-storage", "--tool-profile", "chatgpt-data", "--no-warm-cache"]'
                         ),
                     ]
                 ),
@@ -679,7 +625,69 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         summary = report["installed_client_config_summary"]["clients"]["codex"]
         self.assertEqual("invalid_contract", summary["status"])
         self.assertIn("entry is disabled", summary["contract_issues"])
-        self.assertIn("args differ from the generated bundle contract", summary["contract_issues"])
+        self.assertIn("--data-dir must occur exactly once", summary["contract_issues"])
+        self.assertIn("--tool-profile is minimal, expected chatgpt-data", summary["contract_issues"])
+
+    def test_generated_codex_config_matches_generated_direct_bundle_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            config = build_mcp_client_config(
+                server_name="govreg-local",
+                client_profile="bundle",
+                tenant_id="tenant-a",
+                profile_id="institution-dynamic",
+            )
+            files = write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="govreg-local",
+            )
+
+            report = check_mcp_connection_readiness(
+                client_profile="bundle",
+                server_name="govreg-local",
+                bundle_dir=bundle_dir,
+                codex_config=files["codex_config"],
+                check_data=False,
+                allow_local_only_bundle=True,
+            )
+
+        self.assertTrue(report["passed"], report["findings"])
+        summary = report["installed_client_config_summary"]["clients"]["codex"]
+        self.assertEqual("chatgpt-data", summary["expected_tool_profile"])
+        self.assertEqual("checked", summary["status"])
+
+    def test_bundle_dir_rejects_invalid_chatgpt_desktop_ui_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            _write_minimal_bundle(bundle_dir)
+            (bundle_dir / "chatgpt_desktop_local_mcp.json").write_text(
+                json.dumps(
+                    {
+                        "server_name": "govreg-local",
+                        "ui_fields": {
+                            "name": "govreg-local",
+                            "transport": "stdio",
+                            "command": "powershell.exe",
+                            "cwd": str(bundle_dir),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = check_mcp_connection_readiness(
+                client_profile="bundle",
+                bundle_dir=bundle_dir,
+                check_data=False,
+                allow_local_only_bundle=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "bundle-chatgpt-desktop-local-config-invalid",
+            {finding["code"] for finding in report["findings"]},
+        )
 
     def test_installed_client_config_rejects_stale_or_missing_stdio_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,118 +840,6 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("bundle-claude-desktop-config-invalid", codes)
 
-    def test_bundle_dir_rejects_snake_case_chatgpt_plugin_container(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bundle_dir = Path(tmp)
-            _write_minimal_bundle(bundle_dir)
-            plugin_mcp = (
-                bundle_dir
-                / "chatgpt-desktop-local-plugin"
-                / "plugins"
-                / "govreg-local"
-                / ".mcp.json"
-            )
-            plugin_mcp.write_text(
-                json.dumps({"mcp_servers": {"govreg-local": {"command": "python", "args": []}}}),
-                encoding="utf-8",
-            )
-
-            report = check_mcp_connection_readiness(
-                client_profile="bundle",
-                bundle_dir=bundle_dir,
-                check_cli=False,
-                check_data=False,
-                allow_local_only_bundle=True,
-            )
-
-        codes = {finding["code"] for finding in report["findings"]}
-        self.assertFalse(report["passed"])
-        self.assertIn("bundle-chatgpt-plugin-container-unsupported", codes)
-
-    def test_bundle_dir_rejects_chatgpt_plugin_source_path_traversal(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bundle_dir = Path(tmp)
-            _write_minimal_bundle(bundle_dir)
-            marketplace_path = (
-                bundle_dir / "chatgpt-desktop-local-plugin" / ".agents" / "plugins" / "marketplace.json"
-            )
-            marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
-            marketplace["plugins"][0]["source"]["path"] = "../outside"
-            marketplace_path.write_text(json.dumps(marketplace), encoding="utf-8")
-
-            report = check_mcp_connection_readiness(
-                client_profile="bundle",
-                bundle_dir=bundle_dir,
-                check_cli=False,
-                check_data=False,
-                allow_local_only_bundle=True,
-            )
-
-        self.assertFalse(report["passed"])
-        self.assertIn(
-            "bundle-chatgpt-plugin-marketplace-contract-invalid",
-            {finding["code"] for finding in report["findings"]},
-        )
-
-    def test_bundle_dir_rejects_unpaired_chatgpt_plugin_launcher_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bundle_dir = Path(tmp)
-            _write_minimal_bundle(bundle_dir)
-            mcp_path = (
-                bundle_dir
-                / "chatgpt-desktop-local-plugin"
-                / "plugins"
-                / "govreg-local"
-                / ".mcp.json"
-            )
-            payload = json.loads(mcp_path.read_text(encoding="utf-8"))
-            args = payload["mcpServers"]["govreg-local"]["args"]
-            args[args.index("-File") + 1] = "wrong-launcher.ps1"
-            args.append("run_mcp_stdio_server.ps1")
-            mcp_path.write_text(json.dumps(payload), encoding="utf-8")
-
-            report = check_mcp_connection_readiness(
-                client_profile="bundle",
-                bundle_dir=bundle_dir,
-                check_cli=False,
-                check_data=False,
-                allow_local_only_bundle=True,
-            )
-
-        self.assertFalse(report["passed"])
-        self.assertIn(
-            "bundle-chatgpt-plugin-stdio-args-invalid",
-            {finding["code"] for finding in report["findings"]},
-        )
-
-    def test_bundle_dir_rejects_duplicate_plugin_json_keys(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bundle_dir = Path(tmp)
-            _write_minimal_bundle(bundle_dir)
-            mcp_path = (
-                bundle_dir
-                / "chatgpt-desktop-local-plugin"
-                / "plugins"
-                / "govreg-local"
-                / ".mcp.json"
-            )
-            original = mcp_path.read_text(encoding="utf-8").strip()
-            duplicate = '{"mcpServers": {}, "mcpServers": ' + original[len('{"mcpServers": '):]
-            mcp_path.write_text(duplicate, encoding="utf-8")
-
-            report = check_mcp_connection_readiness(
-                client_profile="bundle",
-                bundle_dir=bundle_dir,
-                check_cli=False,
-                check_data=False,
-                allow_local_only_bundle=True,
-            )
-
-        self.assertFalse(report["passed"])
-        self.assertIn(
-            "bundle-chatgpt-plugin-mcp-invalid",
-            {finding["code"] for finding in report["findings"]},
-        )
 
     def test_bundle_dir_rejects_stale_runtime_document_artifacts_even_when_data_check_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1437,70 +1333,24 @@ def _write_minimal_bundle(bundle_dir: Path, *, chatgpt_ready: bool = True, claud
                     }
                 }
             )
+        if filename == "chatgpt_desktop_local_mcp.json":
+            content = json.dumps(
+                {
+                    "server_name": "govreg-local",
+                    "ui_fields": {
+                        "name": "govreg-local",
+                        "transport": "stdio",
+                        "command": "powershell.exe",
+                        "args": ["-NoProfile"],
+                        "cwd": str(bundle_dir),
+                        "env": {},
+                        "env_passthrough": [],
+                    },
+                }
+            )
         if filename == "connect_mcp_client.ps1":
             content = 'powershell -File "install_local_package.ps1"'
         (bundle_dir / filename).write_text(content, encoding="utf-8")
-    plugin_root = bundle_dir / "chatgpt-desktop-local-plugin"
-    plugin_dir = plugin_root / "plugins" / "govreg-local"
-    manifest_dir = plugin_dir / ".codex-plugin"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
-    (plugin_root / ".agents" / "plugins").mkdir(parents=True, exist_ok=True)
-    (plugin_root / ".agents" / "plugins" / "marketplace.json").write_text(
-        json.dumps(
-            {
-                "name": "govreg-local-local",
-                "plugins": [
-                    {
-                        "name": "govreg-local",
-                        "source": {"source": "local", "path": "./plugins/govreg-local"},
-                        "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
-                        "category": "Productivity",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    (manifest_dir / "plugin.json").write_text(
-        json.dumps(
-            {
-                "name": "govreg-local",
-                "version": "0.1.0+codex.123456789abc",
-                "mcpServers": "./.mcp.json",
-            }
-        ),
-        encoding="utf-8",
-    )
-    (plugin_dir / ".mcp.json").write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "govreg-local": {
-                        "type": "stdio",
-                        "command": "powershell.exe",
-                        "args": [
-                            "-NoProfile",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                            "run_mcp_stdio_server.ps1",
-                            "--data-dir",
-                            "data",
-                            "--tenant-id",
-                            "default",
-                            "--transport",
-                            "stdio",
-                            "--flat-storage",
-                            "--tool-profile",
-                            "full",
-                            "--no-warm-cache",
-                        ],
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
 
 
 def _prepare_indexed_document(settings: Settings, *, document_id: str) -> None:
