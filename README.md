@@ -165,3 +165,7 @@ python scripts\audit_release_hygiene.py --workflow-scope available --include-unt
 ## 업데이트 내역
 
 README에는 현재 사용법만 유지합니다. 버전별 변경 내용과 다운로드 파일은 [GitHub Releases](https://github.com/koul777/Public-Regulation-MCP-Builder/releases)에서 확인할 수 있습니다.
+
+## Kordoc 사용 고지
+
+HWP/HWPX 문서 구조와 표 추출 교차 검증에는 [Kordoc](https://github.com/chrisryugj/kordoc)을 사용했습니다. 배포 번들에는 Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이선스는 [Kordoc LICENSE](https://github.com/chrisryugj/kordoc/blob/main/LICENSE)와 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에서 확인할 수 있습니다.
