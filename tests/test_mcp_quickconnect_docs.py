@@ -62,6 +62,27 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertNotIn("run_openai_secure_tunnel.ps1", text)
         self.assertNotIn("AGENT_CONNECT_PROMPT", text)
 
+    def test_claude_beginner_guide_preserves_verified_stdio_contract(self) -> None:
+        text = (REPO_ROOT / "docs" / "mcp_quickconnect_ko.md").read_text(
+            encoding="utf-8"
+        )
+
+        for expected in (
+            '"-m"',
+            '"scripts.run_regulation_mcp"',
+            '"PYTHONPATH"',
+            '"PYTHONSAFEPATH": "1"',
+            "`initialize`, `tools/list`, `search`, `fetch`",
+            "기존 서버와 `preferences`",
+            "작업 표시줄 알림 영역에서도 **종료**",
+        ):
+            self.assertIn(expected, text)
+        self.assertTrue(
+            text.rstrip().endswith(
+                "HWP/HWPX 문서 구조와 표 추출 교차 검증에는 Kordoc을 사용했습니다."
+            )
+        )
+
     def test_readme_links_quickconnect_and_vercel_docs(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
