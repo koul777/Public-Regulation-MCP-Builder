@@ -104,6 +104,8 @@ MCP 이름을 정한 뒤 파일 묶음을 생성합니다. 생성 폴더 안에 
 세 항목은 같은 묶음이므로 `data`만 따로 옮기지 마세요. 폴더를 옮겼다면 새 위치에서
 묶음을 다시 생성하는 것이 가장 안전합니다.
 
+![PR MCP Builder에서 승인과 색인을 마치고 Claude Desktop용 MCP 파일 묶음을 생성하는 순서](docs/assets/readme-claude-mcp-01-bundle.svg)
+
 ### 2. 생성된 설정과 Claude 설정 열기
 
 1. 생성 폴더의 `claude_desktop_config.json`을 메모장으로 엽니다.
@@ -161,6 +163,8 @@ Windows 경로의 `\\`는 JSON에서 정상적인 표시입니다. `command`, `a
 
 기존 설정을 보존한 병합 결과는 다음처럼 새 서버와 기존 서버가 함께 있어야 합니다.
 
+![생성된 Claude MCP 서버 항목만 복사해 기존 preferences와 MCP 서버를 보존하며 병합하는 방법](docs/assets/readme-claude-mcp-02-config.svg)
+
 ```json
 {
   "preferences": {
@@ -203,6 +207,8 @@ Windows 경로의 `\\`는 JSON에서 정상적인 표시입니다. `command`, `a
 `id`로 `fetch`가 원문을 반환해야 정상입니다. 생성 설정의 실제 STDIO 검증도 같은
 `command`, `args`, `env`로 `initialize` → `tools/list` → `search` → `fetch` 순서까지
 통과하도록 구성돼 있습니다.
+
+![Claude Desktop을 완전히 재시작한 뒤 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](docs/assets/readme-claude-mcp-03-verify.svg)
 
 연결되지 않으면 다음을 확인합니다.
 

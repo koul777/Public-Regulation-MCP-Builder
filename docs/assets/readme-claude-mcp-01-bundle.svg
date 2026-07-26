@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Claude Desktop MCP 연결 1단계: 번들 생성</title>
+  <desc id="desc">PR MCP Builder에서 승인과 색인을 마친 뒤 MCP 파일 묶음을 생성하고 필수 파일 세 개를 확인하는 그림</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7fafc"/>
+      <stop offset="1" stop-color="#e8f4f1"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#123b35" flood-opacity=".13"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="90" y="90" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="50" font-weight="700" fill="#173d37">1. MCP 파일 묶음 만들기</text>
+  <text x="90" y="145" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="25" fill="#46655f">문서 처리 → 사람 승인 → 색인 완료 후 진행합니다.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="85" y="205" width="650" height="535" rx="28" fill="#ffffff"/>
+    <rect x="85" y="205" width="650" height="70" rx="28" fill="#0f766e"/>
+    <rect x="85" y="247" width="650" height="28" fill="#0f766e"/>
+    <circle cx="125" cy="240" r="9" fill="#ffddd8"/>
+    <circle cx="155" cy="240" r="9" fill="#ffe3a1"/>
+    <circle cx="185" cy="240" r="9" fill="#b7ebca"/>
+    <text x="220" y="250" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#ffffff">PR MCP Builder</text>
+
+    <rect x="125" y="315" width="570" height="78" rx="16" fill="#e8f4f1"/>
+    <text x="155" y="365" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#145c55">✓ 문서 처리 완료</text>
+    <rect x="125" y="415" width="570" height="78" rx="16" fill="#e8f4f1"/>
+    <text x="155" y="465" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#145c55">✓ 사람 검토·승인 완료</text>
+    <rect x="125" y="515" width="570" height="78" rx="16" fill="#e8f4f1"/>
+    <text x="155" y="565" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#145c55">✓ 승인 내용 색인 완료</text>
+    <rect x="125" y="630" width="570" height="70" rx="16" fill="#0f766e"/>
+    <text x="410" y="674" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="26" font-weight="700" fill="#ffffff">④ MCP 생성·AI 연결</text>
+  </g>
+
+  <path d="M770 470 H875" stroke="#0f766e" stroke-width="14" stroke-linecap="round"/>
+  <path d="M850 440 L890 470 L850 500" fill="none" stroke="#0f766e" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g filter="url(#shadow)">
+    <path d="M930 270 h210 l45 55 h325 v400 h-580z" fill="#ffffff" stroke="#73aaa2" stroke-width="5"/>
+    <path d="M930 270 h210 l45 55 h325" fill="none" stroke="#73aaa2" stroke-width="5"/>
+    <text x="1220" y="390" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="34" font-weight="700" fill="#173d37">생성된 MCP 폴더</text>
+
+    <rect x="985" y="435" width="470" height="72" rx="14" fill="#edf7f5"/>
+    <text x="1020" y="480" font-family="Consolas, Malgun Gothic, monospace" font-size="25" fill="#164f49">claude_desktop_config.json</text>
+    <rect x="985" y="525" width="470" height="72" rx="14" fill="#edf7f5"/>
+    <text x="1020" y="570" font-family="Consolas, Malgun Gothic, monospace" font-size="25" fill="#164f49">data/</text>
+    <rect x="985" y="615" width="470" height="72" rx="14" fill="#edf7f5"/>
+    <text x="1020" y="660" font-family="Consolas, Malgun Gothic, monospace" font-size="23" fill="#164f49">run_mcp_stdio_server.ps1</text>
+  </g>
+
+  <rect x="90" y="790" width="1420" height="70" rx="18" fill="#fff7dd" stroke="#e8b949" stroke-width="3"/>
+  <text x="800" y="835" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#775711">중요: 세 항목은 한 묶음입니다. data 폴더만 따로 옮기지 마세요.</text>
+</svg>

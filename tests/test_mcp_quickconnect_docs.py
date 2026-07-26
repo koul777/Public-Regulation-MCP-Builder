@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +130,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-guide-03-multi-regulation.png",
             "docs/assets/readme-guide-03-chunk-context.png",
             "docs/assets/readme-guide-04-human-review.png",
+            "docs/assets/readme-claude-mcp-01-bundle.svg",
+            "docs/assets/readme-claude-mcp-02-config.svg",
+            "docs/assets/readme-claude-mcp-03-verify.svg",
         )
 
         for image_path in expected_images:
@@ -142,6 +146,21 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "readme-guide-09-generated-bat-files.png",
         ):
             self.assertNotIn(retired_image, text)
+
+    def test_claude_mcp_guide_svgs_are_valid_and_accessible(self) -> None:
+        for filename in (
+            "readme-claude-mcp-01-bundle.svg",
+            "readme-claude-mcp-02-config.svg",
+            "readme-claude-mcp-03-verify.svg",
+        ):
+            path = REPO_ROOT / "docs" / "assets" / filename
+            root = ElementTree.parse(path).getroot()
+            namespace = {"svg": "http://www.w3.org/2000/svg"}
+
+            self.assertTrue(root.tag.endswith("svg"))
+            self.assertEqual("0 0 1600 900", root.attrib.get("viewBox"))
+            self.assertIsNotNone(root.find("svg:title", namespace))
+            self.assertIsNotNone(root.find("svg:desc", namespace))
 
 
 if __name__ == "__main__":
