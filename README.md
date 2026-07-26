@@ -234,6 +234,8 @@ Windows 경로의 `\\`는 JSON에서 정상적인 표시입니다. `command`, `a
 
 Vercel에 배포한 뒤 최종 `https://<deployment>/mcp` 주소를 ChatGPT·Codex·Claude의 MCP 또는 Connector 설정에 등록합니다. 이때 로컬 Command, Working directory와 Arguments는 입력하지 않습니다.
 
+![승인 번들을 Vercel에 배포하고 고정 Production URL을 Claude 커넥터에 등록한 뒤 search와 fetch로 확인하는 순서](docs/assets/readme-vercel-claude-connection.svg)
+
 - Claude 웹: `Customize > Connectors`에서 custom connector를 추가합니다.
 - 비공개 MCP: Vercel Secret, bearer token 또는 OAuth를 함께 설정합니다.
 - 공개 MCP: 공개해도 되는 승인 규정만 포함했는지 먼저 확인합니다.

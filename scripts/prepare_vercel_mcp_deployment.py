@@ -71,13 +71,15 @@ def prepare_vercel_mcp_deployment(
         target / "app",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
-    (target / "vercel_mcp.py").write_text(_vercel_entrypoint(), encoding="utf-8")
+    (target / "api").mkdir()
+    (target / "api" / "index.py").write_text(_vercel_entrypoint(), encoding="utf-8")
     shutil.copytree(source_runtime, target / "mcp_runtime")
     (target / "pyproject.toml").write_text(_deployment_pyproject(), encoding="utf-8")
     (target / "vercel.json").write_text(
         json.dumps(_vercel_config(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    (target / ".vercelignore").write_text(_vercel_ignore(), encoding="utf-8")
     (target / ".env.example").write_text(_environment_example(manifest), encoding="utf-8")
     (target / "DEPLOY.md").write_text(_deployment_guide(manifest), encoding="utf-8")
 
@@ -97,8 +99,14 @@ def prepare_vercel_mcp_deployment(
         "deploy_command": f'vercel --cwd "{target}"',
         "production_deploy_command": f'vercel --prod --cwd "{target}"',
     }
+    deployment_report = {
+        **report,
+        "out_dir": ".",
+        "deploy_command": "vercel --cwd .",
+        "production_deploy_command": "vercel --prod --cwd .",
+    }
     (target / "deployment_report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(deployment_report, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     return report
@@ -169,7 +177,7 @@ dependencies = [
 ]
 
 [tool.vercel]
-entrypoint = "vercel_mcp:app"
+entrypoint = "api.index:app"
 """
 
 
@@ -189,13 +197,29 @@ def _vercel_config() -> dict[str, Any]:
     return {
         "$schema": "https://openapi.vercel.sh/vercel.json",
         "functions": {
-            "vercel_mcp.py": {
+            "api/index.py": {
                 "maxDuration": 300,
                 "includeFiles": "mcp_runtime/**",
                 "excludeFiles": "{**/__pycache__/**,**/*.pyc,**/*.pyo}",
             }
         },
+        "rewrites": [
+            {
+                "source": "/mcp",
+                "destination": "/api/index",
+            }
+        ],
     }
+
+
+def _vercel_ignore() -> str:
+    return """.env*
+.vercel
+__pycache__
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+"""
 
 
 def _environment_example(manifest: dict[str, Any]) -> str:

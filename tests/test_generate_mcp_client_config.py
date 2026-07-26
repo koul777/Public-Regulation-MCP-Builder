@@ -2442,7 +2442,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         self.assertEqual(
             config["deployment"],
-            {"platform": "vercel", "entrypoint": "vercel_mcp.py", "path": "/mcp"},
+            {"platform": "vercel", "entrypoint": "api/index.py", "path": "/mcp"},
         )
         self.assertEqual(config["server_auth"]["mode"], "bearer-or-oauth-or-approved-public")
         self.assertEqual(config["server_auth"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
@@ -2501,6 +2501,29 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertEqual(config["config_toml"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
         self.assertEqual(config["server_auth"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
         self.assertNotIn("test-only-secret-value", json.dumps(config, ensure_ascii=False))
+
+    def test_remote_connectors_can_describe_explicit_approved_public_mode(self) -> None:
+        chatgpt = build_mcp_client_config(
+            client_profile="chatgpt-remote",
+            transport="streamable-http",
+            public_url="https://mcp.example.go.kr/mcp",
+            remote_auth_token_env=None,
+        )
+        claude = build_mcp_client_config(
+            client_profile="claude-remote",
+            transport="streamable-http",
+            public_url="https://mcp.example.go.kr/mcp",
+            remote_auth_token_env=None,
+        )
+
+        self.assertNotIn("bearer_token_env_var", chatgpt["config_toml"])
+        self.assertIsNone(chatgpt["server_auth"]["bearer_token_env_var"])
+        self.assertFalse(claude["server_auth"]["required"])
+        self.assertEqual(
+            "approved_public_unauthenticated",
+            claude["server_auth"]["mode"],
+        )
+        self.assertIsNone(claude["server_auth"]["token_env"])
 
     def test_chatgpt_connector_rejects_hostless_or_query_public_url(self) -> None:
         for public_url in ("https://", "https://?tenant=default", "https://mcp.example.go.kr/mcp?tenant=default"):

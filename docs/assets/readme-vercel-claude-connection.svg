@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Vercel에 규정 MCP를 배포하고 Claude 커넥터에 연결하는 순서</title>
+  <desc id="desc">승인 번들 생성, PowerShell Vercel 배포, 고정 Production URL 확인, Claude 커넥터 등록, search와 fetch 검증 순서</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#eef4fb"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="13" flood-color="#16324f" flood-opacity=".13"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12z" fill="#326a9c"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="80" y="78" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="47" font-weight="700" fill="#173b5e">Vercel MCP → Claude 연결, 이 순서만 따라하세요</text>
+  <text x="80" y="128" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="24" fill="#4d6980">홈페이지는 계정·환경변수·로그 확인, 실제 승인 번들 업로드는 PowerShell에서 진행합니다.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="65" y="205" width="330" height="445" rx="24" fill="#ffffff"/>
+    <circle cx="230" cy="285" r="48" fill="#e6f6eb"/>
+    <path d="M205 286 l18 18 35-42" fill="none" stroke="#34945a" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="230" y="370" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#173b5e">1. 승인 번들 준비</text>
+    <rect x="105" y="410" width="250" height="145" rx="15" fill="#f3f7fb" stroke="#b7ccdf" stroke-width="2"/>
+    <text x="130" y="452" font-family="Consolas, Malgun Gothic, monospace" font-size="21" fill="#294e70">vercel-mcp-stage/</text>
+    <text x="145" y="490" font-family="Consolas, Malgun Gothic, monospace" font-size="19" fill="#4d6980">api/index.py</text>
+    <text x="145" y="525" font-family="Consolas, Malgun Gothic, monospace" font-size="19" fill="#4d6980">mcp_runtime/</text>
+    <text x="230" y="598" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="20" fill="#6a7f91">원본 data 전체는 올리지 않음</text>
+  </g>
+
+  <path d="M410 425 H470" stroke="#326a9c" stroke-width="9" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="490" y="205" width="330" height="445" rx="24" fill="#ffffff"/>
+    <rect x="535" y="255" width="240" height="85" rx="15" fill="#17212b"/>
+    <text x="558" y="290" font-family="Consolas, monospace" font-size="18" fill="#7ee787">PS&gt; vercel login</text>
+    <text x="558" y="320" font-family="Consolas, monospace" font-size="18" fill="#d8e4ef">PS&gt; vercel --prod</text>
+    <text x="655" y="390" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#173b5e">2. PowerShell 배포</text>
+    <rect x="535" y="430" width="240" height="96" rx="15" fill="#fff5dd"/>
+    <text x="655" y="467" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#7d5b16">Production 환경변수</text>
+    <text x="655" y="498" text-anchor="middle" font-family="Consolas, monospace" font-size="12" fill="#7d5b16">MCP_ALLOW_UNAUTHENTICATED_HTTP=true</text>
+    <text x="655" y="585" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="20" fill="#6a7f91">공개 승인 자료일 때만 사용</text>
+  </g>
+
+  <path d="M835 425 H895" stroke="#326a9c" stroke-width="9" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="915" y="205" width="330" height="445" rx="24" fill="#ffffff"/>
+    <circle cx="1080" cy="292" r="58" fill="#111827"/>
+    <path d="M1043 317 L1080 250 L1117 317 Z" fill="#ffffff"/>
+    <text x="1080" y="390" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#173b5e">3. 고정 주소 복사</text>
+    <rect x="960" y="430" width="240" height="105" rx="15" fill="#edf5ff" stroke="#78a8d4" stroke-width="2"/>
+    <text x="1080" y="468" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="18" fill="#294e70">Aliased Production URL</text>
+    <text x="1080" y="499" text-anchor="middle" font-family="Consolas, monospace" font-size="17" font-weight="700" fill="#173b5e">https://name.vercel.app</text>
+    <text x="1080" y="526" text-anchor="middle" font-family="Consolas, monospace" font-size="17" font-weight="700" fill="#173b5e">/mcp</text>
+    <text x="1080" y="585" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="20" fill="#6a7f91">끝의 /mcp까지 포함</text>
+  </g>
+
+  <path d="M1260 425 H1320" stroke="#326a9c" stroke-width="9" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="1340" y="205" width="200" height="445" rx="24" fill="#ffffff"/>
+    <rect x="1370" y="255" width="140" height="100" rx="18" fill="#f1e8ff"/>
+    <text x="1440" y="296" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="#62408b">Claude</text>
+    <text x="1440" y="327" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="17" fill="#62408b">Connectors</text>
+    <text x="1440" y="410" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#173b5e">4. URL 등록</text>
+    <text x="1440" y="468" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="18" fill="#4d6980">설정</text>
+    <text x="1440" y="498" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="18" fill="#4d6980">→ 커넥터</text>
+    <text x="1440" y="528" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="18" fill="#4d6980">→ 사용자 지정</text>
+    <rect x="1370" y="565" width="140" height="45" rx="12" fill="#e6f6eb"/>
+    <text x="1440" y="594" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="18" font-weight="700" fill="#287047">저장 ✓</text>
+  </g>
+
+  <rect x="120" y="720" width="1360" height="118" rx="24" fill="#ffffff" stroke="#88aeca" stroke-width="3"/>
+  <text x="205" y="768" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#173b5e">마지막 확인</text>
+  <rect x="385" y="744" width="250" height="64" rx="17" fill="#f1e8ff"/>
+  <text x="510" y="784" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#62408b">search “인사규정”</text>
+  <path d="M655 776 H745" stroke="#326a9c" stroke-width="8" marker-end="url(#arrow)"/>
+  <rect x="770" y="744" width="205" height="64" rx="17" fill="#fff5dd"/>
+  <text x="872" y="784" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#7d5b16">첫 결과 id</text>
+  <path d="M995 776 H1085" stroke="#326a9c" stroke-width="8" marker-end="url(#arrow)"/>
+  <rect x="1110" y="744" width="250" height="64" rx="17" fill="#e6f6eb"/>
+  <text x="1235" y="784" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#287047">fetch 원문 반환 ✓</text>
+</svg>

@@ -371,6 +371,50 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertFalse(result["auth_wire_verified"])
         self.assertIn("bearer-token environment variable", result["error"])
 
+    def test_remote_allows_explicit_approved_public_read_only_probe(self) -> None:
+        async def fake_remote_entry(*, url, token, query):
+            self.assertEqual("https://mcp.example.test/mcp", url)
+            self.assertIsNone(token)
+            self.assertEqual("제23조 승진임용", query)
+            return {
+                "passed": True,
+                "process_started": True,
+                "mcp_initialized": True,
+                "tools_discovered": True,
+                "contract_verified": True,
+                "end_to_end_verified": True,
+                "verification_mode": "search_fetch",
+                "tool_names": ["fetch", "search"],
+            }
+
+        with patch(
+            "scripts.run_mcp_client_config_smoke._run_remote_entry",
+            new=fake_remote_entry,
+        ):
+            report = run_mcp_client_config_smoke(
+                remote_url="https://mcp.example.test/mcp",
+                allow_unauthenticated_remote=True,
+                query="제23조 승진임용",
+                server_name="aksmcp",
+            )
+
+        result = report["results"][0]
+        self.assertTrue(report["passed"])
+        self.assertTrue(result["public_unauthenticated_explicit"])
+        self.assertEqual("approved_public_unauthenticated", result["auth_mode"])
+        self.assertFalse(result["auth_wire_verified"])
+
+    def test_remote_rejects_conflicting_public_and_bearer_modes(self) -> None:
+        report = run_mcp_client_config_smoke(
+            remote_url="https://mcp.example.test/mcp",
+            remote_token_env="MCP_TEST_TOKEN",
+            allow_unauthenticated_remote=True,
+            server_name="aksmcp",
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertIn("not both", report["results"][0]["error"])
+
     def test_remote_url_rejects_and_sanitizes_credentials_query_and_fragment(self) -> None:
         urls = (
             "https://user:sentinel-password@mcp.example.test/mcp",

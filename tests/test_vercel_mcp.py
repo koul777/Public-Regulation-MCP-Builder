@@ -153,12 +153,27 @@ class PrepareVercelMcpDeploymentTests(unittest.TestCase):
                 out_dir=target,
             )
 
-            self.assertTrue((target / "vercel_mcp.py").is_file())
+            self.assertTrue((target / "api" / "index.py").is_file())
             self.assertTrue((target / "app" / "mcp_server" / "vercel_app.py").is_file())
             self.assertTrue((target / "mcp_runtime" / "mcp_runtime_manifest.json").is_file())
+            self.assertTrue((target / ".vercelignore").is_file())
             self.assertFalse((target / "tests").exists())
             self.assertEqual("/mcp", report["mcp_path"])
             self.assertTrue(report["stateless_http"])
+            vercel_config = json.loads((target / "vercel.json").read_text(encoding="utf-8"))
+            self.assertIn("api/index.py", vercel_config["functions"])
+            self.assertEqual(
+                [{"source": "/mcp", "destination": "/api/index"}],
+                vercel_config["rewrites"],
+            )
+            vercel_ignore = (target / ".vercelignore").read_text(encoding="utf-8")
+            self.assertIn(".env*", vercel_ignore)
+            self.assertIn(".vercel", vercel_ignore)
+            deployment_report = json.loads(
+                (target / "deployment_report.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(".", deployment_report["out_dir"])
+            self.assertEqual("vercel --prod --cwd .", deployment_report["production_deploy_command"])
 
     def test_rejects_raw_preprocessing_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
