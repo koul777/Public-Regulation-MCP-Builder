@@ -101,6 +101,24 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertNotIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
         self.assertNotIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
 
+    def test_readme_contains_beginner_claude_stdio_walkthrough(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "### 1. MCP 파일 묶음 만들기",
+            "### 2. 생성된 설정과 Claude 설정 열기",
+            "### 3. 새 서버 항목 합치기",
+            "### 4. Claude Desktop 완전히 다시 시작하기",
+            "### 5. search와 fetch로 실제 연결 확인하기",
+            '"scripts.run_regulation_mcp"',
+            '"PYTHONPATH"',
+            '"PYTHONSAFEPATH": "1"',
+            "`initialize` → `tools/list` → `search` → `fetch`",
+            "다른 서버나\n`preferences`",
+            "상태가 `running`",
+        ):
+            self.assertIn(expected, text)
+
     def test_readme_uses_current_workflow_images(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         expected_images = (
