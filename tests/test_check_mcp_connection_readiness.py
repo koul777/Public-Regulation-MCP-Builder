@@ -22,6 +22,7 @@ from app.storage.repository import JsonRepository
 from scripts.check_mcp_connection_readiness import (
     BUNDLE_REQUIRED_FILES,
     _find_smoke_artifacts,
+    _same_filesystem_path,
     check_mcp_connection_readiness,
     run,
 )
@@ -32,6 +33,34 @@ from scripts.generate_mcp_client_config import (
 
 
 class CheckMcpConnectionReadinessTests(unittest.TestCase):
+    def test_same_filesystem_path_accepts_windows_short_name_alias(self) -> None:
+        long_path = r"C:\ci-fixture\runneradmin\Temp\bundle"
+        short_path = r"C:\ci-fixture\RUNNER~1\Temp\bundle"
+
+        with patch(
+            "scripts.check_mcp_connection_readiness.os.path.samefile",
+            return_value=True,
+        ) as samefile:
+            self.assertTrue(_same_filesystem_path(long_path, short_path))
+
+        samefile.assert_called_once_with(long_path, short_path)
+
+    def test_same_filesystem_path_resolves_alias_before_missing_leaf(self) -> None:
+        long_path = r"C:\ci-fixture\runneradmin\Temp\bundle\data"
+        short_path = r"C:\ci-fixture\RUNNER~1\Temp\bundle\data"
+
+        with (
+            patch(
+                "scripts.check_mcp_connection_readiness.os.path.samefile",
+                side_effect=FileNotFoundError,
+            ),
+            patch(
+                "scripts.check_mcp_connection_readiness.os.path.realpath",
+                side_effect=lambda value: value.replace("RUNNER~1", "runneradmin"),
+            ),
+        ):
+            self.assertTrue(_same_filesystem_path(long_path, short_path))
+
     def test_script_help_runs_from_file_path(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
 

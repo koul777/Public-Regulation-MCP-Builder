@@ -1447,11 +1447,21 @@ def _arg_values(args: Sequence[str], flag: str) -> list[str]:
 
 
 def _same_filesystem_path(left: str | Path, right: str | Path) -> bool:
+    left_path = _expand_filesystem_path(left)
+    right_path = _expand_filesystem_path(right)
+    try:
+        if os.path.samefile(left_path, right_path):
+            return True
+    except (OSError, ValueError):
+        # One or both paths may not exist yet. Preserve the lexical fallback so
+        # missing/stale configuration paths can still be compared deterministically.
+        pass
     return _normalized_filesystem_path(left) == _normalized_filesystem_path(right)
 
 
 def _normalized_filesystem_path(value: str | Path) -> str:
-    return os.path.normcase(os.path.abspath(_expand_filesystem_path(value)))
+    absolute_path = os.path.abspath(_expand_filesystem_path(value))
+    return os.path.normcase(os.path.realpath(absolute_path))
 
 
 def _expand_filesystem_path(value: str | Path) -> str:

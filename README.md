@@ -2,67 +2,40 @@
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&logoColor=white)](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![MCP](https://img.shields.io/badge/MCP-local%20stdio%20%7C%20HTTPS-0F766E)](docs/mcp_quickconnect_ko.md)
-[![Latest release](https://img.shields.io/github/v/release/koul777/Public-Regulation-MCP-Builder?display_name=tag&sort=semver)](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)
+[![MCP](https://img.shields.io/badge/MCP-STDIO%20%7C%20HTTPS-0F766E)](docs/mcp_quickconnect_ko.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-PDF, HWP, HWPX, DOCX 규정을 읽어 구조화하고, 승인된 규정만 MCP 데이터로 생성해서 ChatGPT, Codex, Claude가 `search`와 `fetch`로 조회할 수 있게 준비하는 Windows 중심 도구입니다.
+공공기관 규정 파일을 정리하고, **사람이 확인해 승인한 내용만** ChatGPT·Codex·Claude에서 검색하게 만드는 Windows용 프로그램입니다.
+
+PDF·HWP·HWPX·DOCX 파일을 올리면 규정명, 개정판, 목차와 조문을 정리합니다. 처리 결과를 사람이 원문과 비교해 승인하면 AI 프로그램에서 사용할 MCP 검색 도구를 만듭니다.
 
 > [!IMPORTANT]
-> 현재 개발 중인 공개 소스 기반 개발판입니다. Windows 10/11 64비트 우선 지원입니다. Streamlit 화면은 로컬 운영자용이며 완성형 SaaS 화면이 아닙니다. 사람에게 승인되지 않은 청크는 검색 결과와 MCP 응답에 포함하지 않습니다.
+> 문서를 올렸다고 바로 AI 검색에 공개되지 않습니다. 승인하지 않은 내용은 MCP의 `search`와 `fetch` 결과에 포함하지 않습니다.
 
-## 한눈에 보기
+## 5단계로 사용하기
 
-이 프로그램은 아래 순서로 동작합니다.
+1. [최신 Windows 실행판](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)을 내려받아 압축을 풉니다.
+2. `PR MCP Builder.exe`를 실행하고 기관과 규정 파일을 선택합니다.
+3. 정리된 조문을 원문과 비교한 뒤 사용할 내용을 승인합니다.
+4. `④ MCP 생성·AI 연결`에서 MCP 이름과 연결 방식을 선택해 파일 묶음을 만듭니다.
+5. 생성 완료 화면의 값을 AI 프로그램에 입력하고, 새 대화에서 `search`와 `fetch`를 실행합니다.
 
-1. 규정 파일을 읽어 기관, 규정명, 개정 이력, 목차, 조문 구조를 정리합니다.
-2. 운영자가 결과를 검토하고 사람 검수 단계를 거칩니다.
-3. 승인된 규정만 MCP 데이터로 생성합니다.
-4. ChatGPT Desktop / Codex Desktop·CLI·IDE / Claude Desktop / Claude Code 또는 `https://<deployment>/mcp` 원격 주소에 연결할 수 있는 파일을 만듭니다.
+## 어떤 연결을 선택하나요?
 
-핵심은 “문서를 넣으면 바로 공개 검색용 데이터가 된다”가 아닙니다. 전처리 결과는 검토용 미리보기이고, 최종 MCP에는 승인 완료 데이터만 반영됩니다.
-
-## 어떤 연결을 만들 수 있나
-
-연결 방식은 두 가지뿐입니다.
-
-| 사용 위치 | 방식 | 사용 값 |
+| 사용하려는 곳 | 선택할 방식 | 입력할 것 |
 | --- | --- | --- |
-| ChatGPT Desktop / Codex Desktop / Codex CLI / Codex IDE | 로컬 stdio | `chatgpt_desktop_local_mcp.json`의 `ui_fields` 또는 `codex_config_snippet.toml` |
-| Claude Desktop | 로컬 stdio | `claude_desktop_config.json` |
-| Claude Code | 로컬 stdio | `claude_code_add_stdio.ps1` |
-| ChatGPT / Codex / Claude 원격 연결 | Vercel HTTPS | 배포 후 최종 `https://<deployment>/mcp` |
+| 같은 PC의 ChatGPT/Codex Desktop | 로컬 STDIO | 생성 화면의 Name·Command·Working directory·Arguments |
+| 같은 PC의 Codex CLI/IDE | 로컬 STDIO | `codex_config_snippet.toml` |
+| 같은 PC의 Claude Desktop | 로컬 STDIO | `claude_desktop_config.json` |
+| 같은 PC의 Claude Code | 로컬 STDIO | `claude_code_add_stdio.ps1` |
+| 웹이나 여러 기기의 ChatGPT·Codex·Claude | Vercel HTTPS | 배포된 `https://<deployment>/mcp` 주소 |
 
-- 로컬 stdio: 같은 PC에서 MCP 서버를 직접 실행합니다.
-- Vercel HTTPS: Vercel에 배포한 뒤 `https://<deployment>/mcp` 주소로 연결합니다.
+- **로컬 STDIO**는 같은 PC에서 사용합니다. 인터넷에 MCP 서버를 공개할 필요가 없습니다.
+- **Vercel HTTPS**는 웹이나 여러 기기에서 쓸 때 선택합니다. 로컬 폴더 대신 배포된 HTTPS 주소를 등록합니다.
 
-## 제일 쉬운 사용 순서
+## ChatGPT/Codex Desktop에 연결하기
 
-비전공자 기준으로는 아래 5단계만 보면 됩니다.
-
-1. Windows 실행판의 압축을 풀고 `PR MCP Builder.exe`를 실행합니다.
-2. 기관을 선택하고 규정 파일을 올린 뒤 원문과 처리 결과를 비교합니다.
-3. 사용할 규정을 승인하고 `MCP로 쓸 파일 묶음 만들기`를 누릅니다.
-4. 생성 완료 화면에 나온 값을 AI 프로그램 설정에 그대로 입력합니다.
-5. 저장 후 AI 프로그램을 완전히 종료·재실행하고, 새 대화에서 `search`와 `fetch`를 호출합니다.
-
-잘 안 붙는 대부분의 원인은 아래 둘입니다.
-
-- 서버 이름을 `Command` 칸에 넣은 경우
-- `Arguments`를 일부 빼먹은 경우
-
-로컬 stdio는 “폴더만 지정”해서 끝나는 방식이 아닙니다. `command`, `args`, `cwd`, `env`를 생성 화면에 나온 그대로 넣어야 합니다.
-
-## 생성 완료 화면 그대로 입력하기
-
-경로나 서버 이름을 예시에서 가져올 필요가 없습니다. 생성 완료 화면은 방금 만든 `chatgpt_desktop_local_mcp.json`의 `ui_fields`를 읽어 실제 값을 보여 줍니다.
-
-> [!WARNING]
-> MCP 서버 이름은 **Name에만** 입력합니다. Command에는 서버 이름을 넣지 마세요. Arguments는 한 입력 칸에 하나씩 순서대로 모두 넣어야 하며, 하나라도 빠지면 서버가 실행되지 않습니다.
-
-### ChatGPT Desktop / Codex Desktop
-
-`Settings > MCP servers > Add server`에서 생성 완료 화면의 **ChatGPT/Codex Desktop에 등록하는 방법**을 보며 입력합니다.
+생성 완료 화면의 **ChatGPT/Codex Desktop에 등록하는 방법**을 보면서 `Settings > MCP servers > Add server`에 입력합니다. 표시값은 방금 생성한 `chatgpt_desktop_local_mcp.json`의 `ui_fields`에서 읽으므로 예시 경로로 바꾸지 마세요.
 
 | 설정 칸 | 넣을 값 |
 | --- | --- |
@@ -71,129 +44,88 @@ PDF, HWP, HWPX, DOCX 규정을 읽어 구조화하고, 승인된 규정만 MCP �
 | Command | `ui_fields.command` |
 | Working directory | `ui_fields.cwd` |
 | Arguments | `ui_fields.args`를 번호 순서대로 한 칸에 하나씩 |
-| Environment | 화면에 `입력하지 않음`이 보이면 비워 둠 |
-| Environment passthrough | 화면에 `입력하지 않음`이 보이면 비워 둠 |
+| Environment | `입력하지 않음`이면 비워 둠 |
+| Environment passthrough | `입력하지 않음`이면 비워 둠 |
 
-Command, Working directory와 Arguments 전체 목록은 화면의 복사 영역을 사용하면 됩니다. 각 인자도 번호가 붙은 목록에서 하나씩 복사할 수 있습니다.
+> [!WARNING]
+> 서버 이름은 **Name에만** 넣습니다. Command에는 서버 이름이나 폴더 이름을 넣지 마세요. Arguments는 하나라도 빠지면 실행되지 않습니다.
 
-### Codex CLI / Codex IDE
+Command, Working directory, Arguments 전체 목록과 각 인자는 생성 완료 화면에서 복사할 수 있습니다.
 
-생성된 `codex_config_snippet.toml`의 MCP 항목을 공용 `~/.codex/config.toml`에 반영합니다. 파일 안의 서버 이름과 경로는 방금 만든 번들 기준이므로 예시값으로 바꾸지 않습니다.
+## Claude Desktop에 연결하기
 
-### Claude Desktop
+1. Claude Desktop에서 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**을 누릅니다.
+2. `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다.
+3. 생성된 `claude_desktop_config.json`의 해당 `mcpServers` 항목을 기존 설정에 합칩니다.
+4. 기존에 등록한 다른 MCP 서버 항목은 삭제하지 않습니다.
+5. 저장 후 Claude Desktop을 완전히 종료하고 다시 실행합니다.
+6. 새 대화에서 **파일·커넥터 추가 > Connectors**를 열어 생성한 서버 이름을 확인합니다.
 
-- 위치: `설정 > 개발자 > 로컬 MCP 서버 > 구성 편집`
-- 영문 UI: `Settings > Developer > Edit Config`
-- 실제 파일: `%APPDATA%\Claude\claude_desktop_config.json`
-- 번들에 들어 있는 `claude_desktop_config.json`의 `mcpServers` 항목만 기존 설정에 병합합니다.
-- 등록 후에는 Claude Desktop을 완전히 종료한 뒤 다시 실행합니다.
-- 새 대화에서 `파일·커넥터 추가 > Connectors`를 열어 서버가 보이는지 확인합니다.
+`command`는 실행 프로그램이고 `args`는 순서가 있는 전체 인자입니다. 서버 이름이나 폴더 이름으로 바꾸지 마세요.
 
-### Claude Code
+## Codex CLI·IDE와 Claude Code에 연결하기
 
-- 사용 파일: `claude_code_add_stdio.ps1`
-- 역할: 공식 `claude mcp add --transport stdio --scope user` 등록을 대신 실행합니다.
+- **Codex CLI·IDE**: `codex_config_snippet.toml`의 MCP 항목을 `~/.codex/config.toml`에 반영합니다.
+- **Claude Code 로컬 연결**: `claude_code_add_stdio.ps1`을 실행합니다. 공식 `claude mcp add --transport stdio --scope user` 방식으로 등록됩니다.
+- **Claude Code HTTPS 연결**: Vercel 주소가 준비된 뒤 `claude_code_add_http.ps1`을 실행합니다.
 
-### ChatGPT / Codex / Claude 원격 HTTPS
+서버 이름, 경로, profile ID와 tool profile은 생성할 때마다 달라질 수 있습니다. 생성 파일의 실제 값을 그대로 사용하세요.
 
-- 사용 값: Vercel 배포 후 최종 `https://<deployment>/mcp`
-- 로컬 폴더 경로나 stdio 인자는 넣지 않습니다.
-- ChatGPT는 MCP 설정 화면에 URL을 넣고, Claude 웹은 `Customize > Connectors`에서 custom connector를 추가합니다.
-- 인증이 필요한 경우 `bearer_token_env_var` 또는 서버 측 인증 구성을 함께 사용합니다.
+## Vercel HTTPS로 연결하기
 
-자세한 예시는 [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md), [Vercel HTTPS MCP 배포 안내](docs/vercel_https_mcp_ko.md), 공식 [MCP 로컬 서버 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)를 참고하세요.
+Vercel에 배포한 뒤 최종 `https://<deployment>/mcp` 주소를 ChatGPT·Codex·Claude의 MCP 또는 Connector 설정에 등록합니다. 이때 로컬 Command, Working directory와 Arguments는 입력하지 않습니다.
 
-## 필요할 때 확인하는 생성 파일
+- Claude 웹: `Customize > Connectors`에서 custom connector를 추가합니다.
+- 비공개 MCP: Vercel Secret, bearer token 또는 OAuth를 함께 설정합니다.
+- 공개 MCP: 공개해도 되는 승인 규정만 포함했는지 먼저 확인합니다.
 
-대부분은 생성 완료 화면의 안내만 따르면 됩니다. 설정을 직접 확인해야 할 때는 아래 파일을 사용합니다.
+처음 배포하는 방법은 [Vercel HTTPS MCP 배포 안내](docs/vercel_https_mcp_ko.md)를 따라가세요.
 
-| 파일 | 쓰는 곳 |
+## 연결됐는지 확인하기
+
+설정을 저장한 뒤 AI 프로그램을 **완전히 종료하고 다시 실행**합니다. 새 대화에서 다음 두 작업이 모두 성공해야 연결 완료입니다.
+
+1. `search`로 규정을 검색합니다.
+2. 검색 결과의 첫 `id`를 `fetch`에 넣어 해당 내용을 가져옵니다.
+
+서버 이름만 보이거나 도구가 0개이면 아직 연결된 것이 아닙니다. `Connection closed`가 나오면 생성 완료 화면과 Command, Working directory, Arguments 전체를 다시 비교하세요.
+
+## 지원 범위와 안전 원칙
+
+| 항목 | 현재 지원 |
 | --- | --- |
-| `chatgpt_desktop_local_mcp.json` | ChatGPT Desktop 수동 입력 기준 |
-| `codex_config_snippet.toml` | Codex Desktop / Codex CLI / Codex IDE |
-| `claude_desktop_config.json` | Claude Desktop 설정 병합 |
-| `claude_code_add_stdio.ps1` | Claude Code 로컬 stdio 등록 |
-| `claude_code_add_http.ps1` | Claude Code 원격 HTTPS 등록 |
-| `chatgpt_connector.json`, `claude_https_mcp.json` | 원격 HTTPS 연결 참고 |
-| `connect_mcp_client.ps1` | 번들 설치/연결 보조 |
-| `doctor_mcp_connection.ps1`, `validate_client_config_smoke.ps1` | 연결 점검 |
+| 운영체제 | Windows 10/11 64비트 우선 |
+| 입력 파일 | PDF, HWP, HWPX, DOCX |
+| 검색 데이터 | 사람이 승인한 최신 유효 규정 |
+| 로컬 연결 | ChatGPT/Codex Desktop·CLI·IDE, Claude Desktop, Claude Code |
+| 원격 연결 | Vercel에 배포한 HTTPS `/mcp` |
 
-## 로컬 실행
+- 전처리 결과는 검토용 초안이며 자동 승인이 아닙니다.
+- 원문, API 키, 토큰, 기관 내부 식별자와 사용자 로컬 경로를 공개 저장소에 올리지 마세요.
+- 원격 MCP의 응답은 외부 AI 서비스로 전송될 수 있습니다. 공개 자료나 반출 승인을 받은 자료에만 사용하세요.
+- 공개 또는 기관 운영 전에는 [SECURITY.md](SECURITY.md)를 확인하세요.
 
-### Windows 실행판
+## 더 자세한 안내
 
-1. [최신 GitHub Release](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)에서 Windows ZIP을 받습니다.
-2. 압축을 풉니다.
-3. `PR MCP Builder.exe`를 실행합니다.
+- [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)
+- [Vercel HTTPS MCP 배포 안내](docs/vercel_https_mcp_ko.md)
+- [MCP 로컬 서버 공식 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)
+- [OpenAI MCP 공식 문서](https://learn.chatgpt.com/docs/extend/mcp)
+- [Claude Code MCP 공식 문서](https://code.claude.com/docs/en/mcp)
 
-작업 데이터는 기본적으로 `%LOCALAPPDATA%\PR MCP Builder\data`에 저장됩니다.
+## 개발자용 실행과 검증
 
-### 소스 코드 실행
-
-- `Python 3.11 이상`이 필요합니다.
-- 가장 쉬운 시작 방법은 `START_HERE.bat`입니다.
-- 직접 실행하려면 아래 명령을 사용합니다.
+Python 3.11 이상에서 프로젝트 루트 기준으로 실행합니다.
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run frontend\streamlit_app.py --server.address 127.0.0.1
-```
-
-소스 코드 실행 시 작업 데이터는 프로젝트 폴더의 `data\` 아래에 저장됩니다.
-
-실행 조건만 확인하려면 아래 명령을 사용할 수 있습니다.
-
-```powershell
-.\START_HERE.bat --check
-```
-
-## 문서 처리와 검토 원칙
-
-- 전처리 결과는 운영자 검토용입니다.
-- 사람 검수와 승인 없이 바로 공식 검색 데이터가 되지 않습니다.
-- 사람에게 승인되지 않은 청크는 MCP 응답과 검색 결과에서 제외됩니다.
-- 승인된 규정만 MCP 데이터로 생성되며, 최신 유효본과 개정 이력은 분리해서 관리합니다.
-- 동일 기관 안에서도 규정명, 버전, 조문 구조를 기준으로 이력을 묶습니다.
-
-## Vercel HTTPS 배포
-
-원격 연결이 필요하면 로컬 번들에서 만든 승인 데이터만 별도 staging 폴더로 내보내 Vercel에 배포합니다.
-
-```powershell
-reg-rag-mcp-vercel-stage --runtime-data-dir .\reports\mcp_connection_bundle\data --out-dir .\vercel-mcp-stage
-```
-
-- 최종 연결 주소는 `https://<deployment>/mcp` 입니다.
-- 공개 read-only MCP라면 서버 측에서 `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`를 명시할 수 있습니다.
-- 비공개 운영이면 bearer token 또는 별도 인증 구성을 사용합니다.
-- 원격 MCP는 승인된 규정 응답이 외부 AI 서비스로 전달될 수 있으므로, 공개 가능 범위인지 먼저 결정해야 합니다.
-
-## 선택 사항: Kordoc
-
-HWP 보강이 필요하면 [Kordoc 프로젝트](https://github.com/chrisryugj/kordoc)를 별도로 설치해 함께 사용할 수 있습니다.
-
-- Kordoc 설치·실행 파일은 포함하지 않음
-- Kordoc 소스나 실행 파일이 포함되지 않음
-- 라이선스: <https://github.com/chrisryugj/kordoc/blob/main/LICENSE>
-- 제3자 고지: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-
-## 보안과 공개 저장소 원칙
-
-- 전처리 자체를 보안 통제로 간주하지 않습니다.
-- 원문 문서, 비밀값, 기관 내부 식별자, 로컬 경로는 공개 저장소와 MCP 응답에 넣지 않습니다.
-- 공개 배포 전에는 [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), [docs/public_repository_history_policy_ko.md](docs/public_repository_history_policy_ko.md)를 확인해야 합니다.
-
-## 개발자용 검증과 빌드
-
-```powershell
+python -m streamlit run frontend\streamlit_app.py --server.address 127.0.0.1
 python -m unittest discover -s tests -v
 python -m build --sdist --wheel
 python scripts\audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan
 ```
 
-Windows 실행 ZIP은 아래 명령으로 빌드합니다.
+기여 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md), 공개 저장소 이력 원칙은 [docs/public_repository_history_policy_ko.md](docs/public_repository_history_policy_ko.md)를 확인하세요.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_windows_portable.ps1
-```
+## 업데이트 내역
 
-최신 배포와 다운로드는 [releases/latest](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)에서 확인할 수 있습니다.
+README에는 현재 사용법만 유지합니다. 버전별 변경 내용과 다운로드 파일은 [GitHub Releases](https://github.com/koul777/Public-Regulation-MCP-Builder/releases)에서 확인할 수 있습니다.
