@@ -1748,9 +1748,22 @@ def _render_claude_desktop_registration_guide(
     st.code(r"%APPDATA%\Claude\claude_desktop_config.json", language=None)
     st.markdown("**병합할 `mcpServers` JSON 복사**")
     st.code(str(registration.get("merge_json") or ""), language="json")
+    st.markdown("**생성된 Command**")
+    st.code(str(registration.get("command") or ""), language=None)
+    st.markdown("**생성된 Arguments**")
+    st.code(
+        json.dumps(registration.get("arguments") or [], ensure_ascii=False, indent=2),
+        language="json",
+    )
+    if registration.get("environment"):
+        st.markdown("**생성된 Environment**")
+        st.code(
+            json.dumps(registration["environment"], ensure_ascii=False, indent=2),
+            language="json",
+        )
     st.warning(
         "MCP 서버 이름은 `mcpServers` 아래의 키에만 둡니다.\n\n"
-        "생성된 Command와 모든 Arguments는 순서까지 그대로 유지합니다.\n\n"
+        "생성된 Command, 모든 Arguments의 순서, Environment를 표시된 그대로 유지합니다.\n\n"
         "기존 설정에 다른 MCP 서버가 있으면 삭제하지 말고 위 서버 항목만 병합합니다."
     )
     st.markdown("**등록 후 절차**")

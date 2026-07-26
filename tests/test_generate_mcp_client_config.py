@@ -31,6 +31,7 @@ from scripts.generate_mcp_client_config import (
     _powershell_stdio_launcher_script,
     _runtime_identity_builder_base64,
     _runtime_identity_verifier_base64,
+    _resolve_claude_source_runtime,
     build_mcp_client_config,
     main,
     parse_args,
@@ -432,6 +433,68 @@ def _run_claude_code_transaction_failure(
 
 
 class GenerateMcpClientConfigTests(unittest.TestCase):
+    def test_claude_source_runtime_candidate_priority_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "source"
+            scripts_dir = project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (project_root / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+            (scripts_dir / "run_regulation_mcp.py").write_text("", encoding="utf-8")
+            marker_python = root / "marker" / "python.exe"
+            project_python = project_root / ".venv" / "Scripts" / "python.exe"
+            env_python = root / "environment" / "python.exe"
+            selected_python = root / "selected" / "python.exe"
+            for candidate in (
+                marker_python,
+                project_python,
+                env_python,
+                selected_python,
+            ):
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"test-python-placeholder")
+
+            cases = (
+                ("marker", marker_python, marker_python),
+                ("project-venv", None, project_python),
+                ("environment", None, env_python),
+                ("selected", None, selected_python),
+            )
+            for name, marker_value, expected in cases:
+                with (
+                    self.subTest(name=name),
+                    patch.dict(
+                        os.environ,
+                        {"REG_RAG_PYTHON": str(env_python)},
+                        clear=False,
+                    ),
+                    patch(
+                        "scripts.generate_mcp_client_config._runtime_marker_python",
+                        return_value=marker_value,
+                    ),
+                    patch(
+                        "scripts.generate_mcp_client_config._python_imports_source_project",
+                        side_effect=lambda candidate, _root, expected=expected: candidate
+                        == expected.resolve(),
+                    ),
+                ):
+                    if name == "selected":
+                        os.environ.pop("REG_RAG_PYTHON", None)
+                    if name == "environment":
+                        project_python.unlink()
+                    if name == "selected":
+                        project_python.unlink(missing_ok=True)
+                    resolved = _resolve_claude_source_runtime(
+                        output_dir=root / "bundle",
+                        preferred_python=selected_python,
+                        preferred_project_root=project_root,
+                    )
+                self.assertIsNotNone(resolved)
+                assert resolved is not None
+                self.assertEqual(expected.resolve(), resolved[0])
+                if name == "project-venv":
+                    project_python.write_bytes(b"test-python-placeholder")
+
     def test_setup_bundle_embeds_separate_chatgpt_and_claude_fallback_configs(self) -> None:
         config = build_mcp_client_config(
             server_name="product-source-mcp",
@@ -1601,6 +1664,81 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             invocation = invocation_log.read_text(encoding="utf-8")
             self.assertIn("-m scripts.run_regulation_mcp", invocation)
             self.assertIn("--transport stdio", invocation)
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell launcher diagnostics are Windows-specific.")
+    def test_stdio_launcher_reports_dependency_import_failure_instead_of_python_not_found(
+        self,
+    ) -> None:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is not available.")
+
+        config = build_mcp_client_config(
+            server_name="diagnostic-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "source project"
+            scripts_dir = project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (project_root / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+            (scripts_dir / "run_regulation_mcp.py").write_text("", encoding="utf-8")
+            fake_python = root / "selected python.cmd"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "@echo off",
+                        'if "%1"=="-c" (',
+                        "  echo fixture dependency import traceback 1>&2",
+                        "  exit /b 43",
+                        ")",
+                        "exit /b 9",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bundle_dir = root / "bundle"
+            files = write_mcp_setup_bundle(
+                config,
+                bundle_dir,
+                server_name="diagnostic-mcp",
+                preferred_python=fake_python,
+                preferred_project_root=project_root,
+            )
+            (bundle_dir / "data").mkdir()
+            env = dict(os.environ)
+            windows_dir = Path(env.get("SystemRoot", r"C:\Windows"))
+            powershell_dir = windows_dir / "System32" / "WindowsPowerShell" / "v1.0"
+            env["PATH"] = os.pathsep.join(
+                [str(windows_dir / "System32"), str(powershell_dir)]
+            )
+            env.pop("REG_RAG_PYTHON", None)
+            completed = subprocess.run(
+                [
+                    str(powershell_dir / "powershell.exe"),
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    files["stdio_launcher"],
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+        diagnostics = completed.stdout + completed.stderr
+        self.assertNotEqual(0, completed.returncode, diagnostics)
+        self.assertIn("Required dependency import failed", diagnostics)
+        self.assertIn("fixture dependency import traceback", diagnostics)
+        self.assertNotIn("Python was not found", diagnostics)
 
     @unittest.skipUnless(os.name == "nt", "PowerShell launcher behavior is Windows-specific.")
     def test_installed_runtime_survives_desktop_restart_with_different_path_python(self) -> None:
@@ -3581,7 +3719,17 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 installed["mcpServers"]["aks_mcp"],
             )
             aks_args = installed["mcpServers"]["aks_mcp"]["args"]
-            self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), aks_args)
+            if aks_args[:2] == ["-m", "scripts.run_regulation_mcp"]:
+                self.assertEqual(
+                    str(Path(__file__).resolve().parents[1]),
+                    installed["mcpServers"]["aks_mcp"]["env"]["PYTHONPATH"],
+                )
+                self.assertEqual(
+                    "1",
+                    installed["mcpServers"]["aks_mcp"]["env"]["PYTHONSAFEPATH"],
+                )
+            else:
+                self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), aks_args)
             self.assertIn(str((bundle_dir / "data").resolve()), aks_args)
             self.assertIn("--claude-source-marker", aks_args)
             self.assertNotIn("--chatgpt-source-marker", aks_args)
@@ -4183,8 +4331,13 @@ $Result | ConvertTo-Json -Depth 6
             installed_path = appdata_dir / "Claude" / "claude_desktop_config.json"
             installed = json.loads(installed_path.read_text(encoding="utf-8-sig"))
             for payload in (recovered_source, installed):
-                args = payload["mcpServers"]["aksmcp"]["args"]
-                self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), args)
+                entry = payload["mcpServers"]["aksmcp"]
+                args = entry["args"]
+                if args[:2] == ["-m", "scripts.run_regulation_mcp"]:
+                    self.assertEqual("1", entry["env"]["PYTHONSAFEPATH"])
+                    self.assertTrue(Path(entry["env"]["PYTHONPATH"]).is_absolute())
+                else:
+                    self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), args)
                 self.assertIn(str((bundle_dir / "data").resolve()), args)
 
     @unittest.skipUnless(os.name == "nt", "Windows stdio launcher fallback test")
@@ -4324,6 +4477,248 @@ $Result | ConvertTo-Json -Depth 6
                 wizard,
             )
 
+    def test_claude_desktop_prefers_valid_project_venv_direct_source_runtime(self) -> None:
+        config = build_mcp_client_config(
+            server_name="direct-source",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+            profile_id="institution-test",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "Public Regulation MCP"
+            scripts_dir = project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (project_root / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+            (scripts_dir / "run_regulation_mcp.py").write_text("", encoding="utf-8")
+            project_python = project_root / ".venv" / "Scripts" / "python.exe"
+            project_python.parent.mkdir(parents=True)
+            project_python.write_bytes(b"test-python-placeholder")
+            selected_python = root / "selected" / "python.exe"
+            selected_python.parent.mkdir()
+            selected_python.write_bytes(b"selected-placeholder")
+            bundle_dir = root / "MCP bundle"
+
+            with patch(
+                "scripts.generate_mcp_client_config._python_imports_source_project",
+                side_effect=lambda candidate, _project: candidate == project_python.resolve(),
+            ):
+                write_mcp_setup_bundle(
+                    config,
+                    bundle_dir,
+                    server_name="direct-source",
+                    preferred_python=selected_python,
+                    preferred_project_root=project_root,
+                )
+
+            payload = json.loads(
+                (bundle_dir / "claude_desktop_config.json").read_text(encoding="utf-8")
+            )
+            entry = payload["mcpServers"]["direct-source"]
+
+        self.assertNotIn("type", entry)
+        self.assertEqual(str(project_python.resolve()), entry["command"])
+        self.assertEqual(["-m", "scripts.run_regulation_mcp"], entry["args"][:2])
+        self.assertEqual(
+            str((bundle_dir / "data").resolve()),
+            entry["args"][entry["args"].index("--data-dir") + 1],
+        )
+        self.assertEqual(str(project_root.resolve()), entry["env"]["PYTHONPATH"])
+        self.assertEqual("1", entry["env"]["PYTHONSAFEPATH"])
+
+    def test_claude_desktop_direct_config_round_trips_spaces_and_korean_paths(self) -> None:
+        config = build_mcp_client_config(
+            server_name="korean-paths",
+            client_profile="bundle",
+            tenant_id="tenant-korean",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "테스트 사용자" / "Public Regulation MCP"
+            scripts_dir = project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (project_root / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+            (scripts_dir / "run_regulation_mcp.py").write_text("", encoding="utf-8")
+            project_python = project_root / ".venv" / "Scripts" / "python.exe"
+            project_python.parent.mkdir(parents=True)
+            project_python.write_bytes(b"test-python-placeholder")
+            bundle_dir = root / "MCP 번들" / "기관 규정"
+
+            with patch(
+                "scripts.generate_mcp_client_config._python_imports_source_project",
+                return_value=True,
+            ):
+                write_mcp_setup_bundle(
+                    config,
+                    bundle_dir,
+                    server_name="korean-paths",
+                    preferred_python=project_python,
+                    preferred_project_root=project_root,
+                )
+
+            raw = (bundle_dir / "claude_desktop_config.json").read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            entry = payload["mcpServers"]["korean-paths"]
+
+        self.assertIn("테스트 사용자", entry["command"])
+        self.assertIn("MCP 번들", entry["args"][entry["args"].index("--data-dir") + 1])
+        self.assertEqual(str(project_root.resolve()), entry["env"]["PYTHONPATH"])
+        self.assertEqual(payload, json.loads(json.dumps(payload, ensure_ascii=False)))
+
+    def test_claude_desktop_keeps_powershell_fallback_without_source_project(self) -> None:
+        config = build_mcp_client_config(
+            server_name="wheel-fallback",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle_dir = root / "standalone bundle"
+            with patch(
+                "scripts.generate_mcp_client_config._is_source_project_root",
+                return_value=False,
+            ):
+                write_mcp_setup_bundle(
+                    config,
+                    bundle_dir,
+                    server_name="wheel-fallback",
+                    preferred_python=sys.executable,
+                    preferred_project_root=root / "missing-source",
+                )
+            payload = json.loads(
+                (bundle_dir / "claude_desktop_config.json").read_text(encoding="utf-8")
+            )
+            entry = payload["mcpServers"]["wheel-fallback"]
+
+        self.assertEqual("powershell.exe", entry["command"])
+        self.assertEqual("-File", entry["args"][3])
+        self.assertTrue(entry["args"][4].endswith("run_mcp_stdio_server.ps1"))
+
+    def test_portable_handoff_zip_reverts_direct_source_config_to_wrapper(self) -> None:
+        config = build_mcp_client_config(
+            server_name="portable-fallback",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "source"
+            scripts_dir = project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (project_root / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+            (scripts_dir / "run_regulation_mcp.py").write_text("", encoding="utf-8")
+            project_python = project_root / ".venv" / "Scripts" / "python.exe"
+            project_python.parent.mkdir(parents=True)
+            project_python.write_bytes(b"test-python-placeholder")
+            bundle_dir = root / "bundle"
+            zip_path = root / "handoff.zip"
+            with patch(
+                "scripts.generate_mcp_client_config._python_imports_source_project",
+                return_value=True,
+            ):
+                write_mcp_setup_bundle(
+                    config,
+                    bundle_dir,
+                    server_name="portable-fallback",
+                    preferred_python=project_python,
+                    preferred_project_root=project_root,
+                )
+            write_mcp_setup_bundle_zip(bundle_dir, zip_path)
+            with zipfile.ZipFile(zip_path) as archive:
+                payload = json.loads(
+                    archive.read("claude_desktop_config.json").decode("utf-8")
+                )
+            entry = payload["mcpServers"]["portable-fallback"]
+
+        self.assertEqual("powershell.exe", entry["command"])
+        self.assertEqual("-File", entry["args"][3])
+        self.assertEqual(
+            "<BUNDLE_DIR>\\run_mcp_stdio_server.ps1",
+            entry["args"][4],
+        )
+        self.assertNotIn("env", entry)
+
+    def test_generated_direct_claude_config_completes_jsonrpc_initialize_from_other_cwd(
+        self,
+    ) -> None:
+        config = build_mcp_client_config(
+            server_name="handshake-direct",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "소스 프로젝트"
+            scripts_dir = project_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (project_root / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+            (scripts_dir / "__init__.py").write_text("", encoding="utf-8")
+            (scripts_dir / "run_regulation_mcp.py").write_text(
+                "\n".join(
+                    [
+                        "import json, sys",
+                        "def main():",
+                        "    request = json.loads(sys.stdin.readline())",
+                        "    response = {",
+                        "        'jsonrpc': '2.0',",
+                        "        'id': request['id'],",
+                        "        'result': {",
+                        "            'protocolVersion': request['params']['protocolVersion'],",
+                        "            'capabilities': {'tools': {}},",
+                        "            'serverInfo': {'name': 'fixture', 'version': '1'},",
+                        "        },",
+                        "    }",
+                        "    print(json.dumps(response), flush=True)",
+                        "if __name__ == '__main__': main()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bundle_dir = root / "MCP 번들"
+            other_cwd = root / "unrelated cwd"
+            other_cwd.mkdir()
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("REG_RAG_PYTHON", None)
+                write_mcp_setup_bundle(
+                    config,
+                    bundle_dir,
+                    server_name="handshake-direct",
+                    preferred_python=sys.executable,
+                    preferred_project_root=project_root,
+                )
+            (bundle_dir / "data").mkdir(exist_ok=True)
+            payload = json.loads(
+                (bundle_dir / "claude_desktop_config.json").read_text(encoding="utf-8")
+            )
+            entry = payload["mcpServers"]["handshake-direct"]
+            initialize = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "bundle-test", "version": "1.0"},
+                },
+            }
+            completed = subprocess.run(
+                [entry["command"], *entry["args"]],
+                cwd=other_cwd,
+                env={**os.environ, **entry["env"]},
+                input=json.dumps(initialize) + "\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        response = json.loads(completed.stdout.strip())
+        self.assertEqual(1, response["id"])
+        self.assertEqual("2025-06-18", response["result"]["protocolVersion"])
+
     def test_setup_bundle_normalizes_python_stdio_client_configs(self) -> None:
         stale_data_dir = r"C:\stale\mcp_connection_bundle\data"
         stale_script = r"C:\stale\source\scripts\run_regulation_mcp.py"
@@ -4349,7 +4744,10 @@ $Result | ConvertTo-Json -Depth 6
         config["claude_code"]["command"] = sys.executable
         config["claude_code"]["args"] = list(server["args"])
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "scripts.generate_mcp_client_config._python_imports_source_project",
+            return_value=True,
+        ):
             write_mcp_setup_bundle(
                 config,
                 tmp,
@@ -4366,12 +4764,19 @@ $Result | ConvertTo-Json -Depth 6
             claude_args = claude_desktop["mcpServers"]["govreg-local"]["args"]
             stdio_launcher = (output_dir / "run_mcp_stdio_server.ps1").read_text(encoding="utf-8")
 
+        self.assertEqual("-File", codex_args[3])
+        self.assertEqual(launcher, codex_args[4])
+        self.assertEqual(["-m", "scripts.run_regulation_mcp"], claude_args[:2])
         for args in (codex_args, claude_args):
-            self.assertEqual("-File", args[3])
-            self.assertEqual(launcher, args[4])
             self.assertIn(bundle_data_dir, args)
             self.assertNotIn(stale_script, args)
             self.assertNotIn(stale_data_dir, args)
+        claude_entry = claude_desktop["mcpServers"]["govreg-local"]
+        self.assertEqual(
+            str(Path(__file__).resolve().parents[1]),
+            claude_entry["env"]["PYTHONPATH"],
+        )
+        self.assertEqual("1", claude_entry["env"]["PYTHONSAFEPATH"])
         self.assertNotIn(stale_script, stdio_launcher)
         self.assertIn(f"$PreferredPython = '{sys.executable}'", stdio_launcher)
 

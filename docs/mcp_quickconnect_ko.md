@@ -56,7 +56,7 @@ PowerShell에서 다음 파일을 실행합니다.
 
 ### Claude Desktop
 
-Claude Desktop의 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**(영문 UI: **Settings > Developer > Edit Config**)을 눌러 `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다. 생성된 `claude_desktop_config.json`의 해당 `mcpServers` 항목만 기존 설정에 병합하고, 다른 서버 항목은 삭제하지 않습니다. 생성된 서버 이름은 `mcpServers`의 키로만 사용하고 `command`나 `args`로 옮기지 않습니다. 모든 `args`를 원래 순서대로 유지합니다. 저장 후 앱을 완전히 종료·재실행하고, 새 대화의 **파일·커넥터 추가 > Connectors**에서 서버를 확인한 뒤 `search`와 `fetch`를 실제로 호출합니다. 왼쪽의 **커넥터** 메뉴는 Vercel 같은 원격 HTTPS MCP용이고, 로컬 stdio는 **개발자 > 구성 편집**에서 등록합니다. Windows 설정 경로와 재시작 절차는 공식 [MCP 로컬 서버 연결 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)를 따릅니다.
+Claude Desktop의 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**(영문 UI: **Settings > Developer > Edit Config**)을 눌러 `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다. 생성된 `claude_desktop_config.json`의 해당 `mcpServers` 항목만 기존 설정에 병합하고, 다른 서버 항목이나 최상위 preferences는 삭제하지 않습니다. 생성된 서버 이름은 `mcpServers`의 키로만 사용합니다. 소스 프로젝트와 Python 3.11+ import probe가 확인되면 설정은 Python을 `-m scripts.run_regulation_mcp`로 직접 실행하며 `env.PYTHONPATH`와 `env.PYTHONSAFEPATH`를 포함합니다. 그 조건을 충족하지 못하거나 독립 배포 ZIP/wheel을 사용하는 경우에는 `run_mcp_stdio_server.ps1` fallback을 사용합니다. 어느 방식이 생성되든 `command`, 모든 `args`의 순서, `env`를 생성된 값 그대로 유지합니다. 저장 후 앱을 완전히 종료·재실행하고, 새 대화의 **파일·커넥터 추가 > Connectors**에서 서버를 확인한 뒤 `search`와 `fetch`를 실제로 호출합니다. 왼쪽의 **커넥터** 메뉴는 Vercel 같은 원격 HTTPS MCP용이고, 로컬 stdio는 **개발자 > 구성 편집**에서 등록합니다. Windows 설정 경로와 재시작 절차는 공식 [MCP 로컬 서버 연결 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)를 따릅니다.
 
 ### ChatGPT Desktop
 

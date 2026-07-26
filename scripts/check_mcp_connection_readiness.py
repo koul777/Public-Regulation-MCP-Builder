@@ -1261,15 +1261,35 @@ def _installed_stdio_contract_issues(
         issues.append(f"type is {entry_type or '<empty>'}, expected stdio")
 
     command = str(entry.get("command") or "")
-    if command.casefold() != "powershell.exe":
-        issues.append(f"command is {command or '<empty>'}, expected powershell.exe")
+    is_wrapper = command.casefold() == "powershell.exe"
+    is_direct_source = (
+        len(args) >= 2
+        and args[0] == "-m"
+        and args[1] == "scripts.run_regulation_mcp"
+        and Path(_expand_filesystem_path(command)).is_file()
+    )
+    if not (is_wrapper or is_direct_source):
+        issues.append(
+            f"command is {command or '<empty>'}, expected powershell.exe wrapper or an existing direct Python executable"
+        )
     required_pairs = {
-        "-File": None,
         "--data-dir": None,
         "--tenant-id": None,
         "--transport": "stdio",
         "--tool-profile": expected_tool_profile,
     }
+    if is_wrapper:
+        required_pairs["-File"] = None
+    if is_direct_source:
+        configured_env = entry.get("env")
+        if not isinstance(configured_env, dict):
+            issues.append("direct source command requires env")
+        else:
+            pythonpath = str(configured_env.get("PYTHONPATH") or "")
+            if not pythonpath or not Path(_expand_filesystem_path(pythonpath)).is_absolute():
+                issues.append("direct source command requires an absolute env.PYTHONPATH")
+            if str(configured_env.get("PYTHONSAFEPATH") or "") != "1":
+                issues.append('direct source command requires env.PYTHONSAFEPATH="1"')
     for flag, expected_value in required_pairs.items():
         values = _arg_values(args, flag)
         if len(values) != 1:
