@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Claude Desktop MCP 연결 2단계: 설정 병합</title>
+  <desc id="desc">생성된 Claude 설정에서 새 서버 항목만 복사하여 Claude Desktop 기존 설정의 mcpServers에 추가하고 preferences와 기존 서버를 보존하는 그림</desc>
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#eef0fb"/>
+    </linearGradient>
+    <filter id="shadow2" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#26345d" flood-opacity=".14"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg2)"/>
+  <text x="80" y="82" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="49" font-weight="700" fill="#283556">2. 생성된 서버 항목만 기존 설정에 합치기</text>
+  <text x="80" y="135" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="24" fill="#5d6680">Claude Desktop: 설정 → 개발자 → 로컬 MCP 서버 → 구성 편집</text>
+
+  <g filter="url(#shadow2)">
+    <rect x="70" y="200" width="625" height="535" rx="24" fill="#ffffff"/>
+    <rect x="70" y="200" width="625" height="70" rx="24" fill="#334b87"/>
+    <rect x="70" y="245" width="625" height="25" fill="#334b87"/>
+    <text x="105" y="247" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#ffffff">생성 폴더의 claude_desktop_config.json</text>
+    <rect x="105" y="305" width="555" height="390" rx="16" fill="#172033"/>
+    <text x="135" y="350" font-family="Consolas, Malgun Gothic, monospace" font-size="22" fill="#dce7ff">{</text>
+    <text x="155" y="390" font-family="Consolas, Malgun Gothic, monospace" font-size="22" fill="#8fd3ff">"mcpServers"</text>
+    <text x="315" y="390" font-family="Consolas, monospace" font-size="22" fill="#dce7ff">: {</text>
+    <rect x="135" y="410" width="500" height="225" rx="12" fill="#24355d" stroke="#7fcfc6" stroke-width="4"/>
+    <text x="165" y="452" font-family="Consolas, Malgun Gothic, monospace" font-size="21" fill="#ffe3a1">"기관-규정"</text>
+    <text x="315" y="452" font-family="Consolas, monospace" font-size="21" fill="#dce7ff">: {</text>
+    <text x="185" y="493" font-family="Consolas, monospace" font-size="19" fill="#b7ebca">"command": "...python.exe",</text>
+    <text x="185" y="532" font-family="Consolas, monospace" font-size="19" fill="#b7ebca">"args": ["-m", "..."],</text>
+    <text x="185" y="571" font-family="Consolas, monospace" font-size="19" fill="#b7ebca">"env": {"PYTHONPATH": "...",</text>
+    <text x="300" y="608" font-family="Consolas, monospace" font-size="19" fill="#b7ebca">"PYTHONSAFEPATH": "1"}</text>
+    <text x="165" y="667" font-family="Consolas, monospace" font-size="22" fill="#dce7ff">}</text>
+  </g>
+
+  <path d="M725 470 H850" stroke="#4e67a6" stroke-width="14" stroke-linecap="round"/>
+  <path d="M825 440 L865 470 L825 500" fill="none" stroke="#4e67a6" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="795" y="420" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#334b87">이 상자만 복사</text>
+
+  <g filter="url(#shadow2)">
+    <rect x="900" y="200" width="630" height="535" rx="24" fill="#ffffff"/>
+    <rect x="900" y="200" width="630" height="70" rx="24" fill="#6b4fa3"/>
+    <rect x="900" y="245" width="630" height="25" fill="#6b4fa3"/>
+    <text x="935" y="247" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#ffffff">%APPDATA%\Claude\claude_desktop_config.json</text>
+    <rect x="935" y="305" width="560" height="390" rx="16" fill="#172033"/>
+    <text x="965" y="350" font-family="Consolas, monospace" font-size="20" fill="#dce7ff">{</text>
+    <text x="985" y="390" font-family="Consolas, monospace" font-size="20" fill="#ffcca8">"preferences": {"theme": "dark"},</text>
+    <text x="985" y="430" font-family="Consolas, monospace" font-size="20" fill="#8fd3ff">"mcpServers": {</text>
+    <text x="1005" y="470" font-family="Consolas, Malgun Gothic, monospace" font-size="20" fill="#dce7ff">"기존-서버": { ... },</text>
+    <rect x="980" y="495" width="480" height="145" rx="12" fill="#24355d" stroke="#7fcfc6" stroke-width="4"/>
+    <text x="1010" y="537" font-family="Consolas, Malgun Gothic, monospace" font-size="20" fill="#ffe3a1">"기관-규정": {</text>
+    <text x="1030" y="577" font-family="Consolas, monospace" font-size="18" fill="#b7ebca">"command", "args", "env" ...</text>
+    <text x="1010" y="617" font-family="Consolas, monospace" font-size="20" fill="#dce7ff">}</text>
+    <text x="985" y="675" font-family="Consolas, monospace" font-size="20" fill="#dce7ff">}}</text>
+  </g>
+
+  <g>
+    <rect x="95" y="785" width="675" height="72" rx="18" fill="#e8f7ee" stroke="#4ba56a" stroke-width="3"/>
+    <text x="432" y="830" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#28643d">✓ 기존 서버와 preferences는 그대로 둡니다.</text>
+    <rect x="830" y="785" width="675" height="72" rx="18" fill="#fff0ef" stroke="#d96b65" stroke-width="3"/>
+    <text x="1167" y="830" text-anchor="middle" font-family="Segoe UI, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#923a35">✕ command·args·env를 임의로 고치지 않습니다.</text>
+  </g>
+</svg>

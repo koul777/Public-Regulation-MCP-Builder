@@ -61,7 +61,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
             )
             seen: dict[str, object] = {}
 
-            async def fake_run_client_entry(*, command, args, query):
+            async def fake_run_client_entry(*, command, args, env, query):
                 seen.update({"command": command, "args": args, "query": query})
                 return {
                     "passed": True,
@@ -108,6 +108,10 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                                     "--flat-storage",
                                     "--no-warm-cache",
                                 ],
+                                "env": {
+                                    "PYTHONPATH": str(root / "source"),
+                                    "PYTHONSAFEPATH": "1",
+                                },
                             }
                         }
                     },
@@ -116,7 +120,10 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            async def fake_run_client_entry(*, command, args, query):
+            seen: dict[str, object] = {}
+
+            async def fake_run_client_entry(*, command, args, env, query):
+                seen.update({"command": command, "args": args, "env": env})
                 return {
                     "passed": True,
                     "process_started": True,
@@ -141,6 +148,8 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual("claude_desktop", report["results"][0]["label"])
         self.assertEqual("임원", report["results"][0]["query"])
+        self.assertEqual("1", seen["env"]["PYTHONSAFEPATH"])
+        self.assertEqual(str(root / "source"), seen["env"]["PYTHONPATH"])
 
     def test_claude_code_config_smoke_keeps_client_identity_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,7 +171,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            async def fake_run_client_entry(*, command, args, query):
+            async def fake_run_client_entry(*, command, args, env, query):
                 return {
                     "passed": True,
                     "process_started": True,
@@ -203,7 +212,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            async def fake_run_client_entry(*, command, args, query):
+            async def fake_run_client_entry(*, command, args, env, query):
                 return {
                     "passed": True,
                     "process_started": True,
@@ -282,7 +291,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
             payload = {"mcpServers": {"aksmcp": {"command": "python", "args": []}}}
             config.write_text(json.dumps(payload), encoding="utf-8-sig")
 
-            async def fake_run_client_entry(*, command, args, query):
+            async def fake_run_client_entry(*, command, args, env, query):
                 return {
                     "passed": True,
                     "process_started": True,

@@ -90,14 +90,137 @@ Command, Working directory, Arguments 전체 목록과 각 인자는 생성 완�
 
 ## Claude Desktop에 연결하기
 
-1. Claude Desktop에서 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**을 누릅니다.
-2. `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다.
-3. 생성된 `claude_desktop_config.json`의 해당 `mcpServers` 항목을 기존 설정에 합칩니다.
-4. 기존에 등록한 다른 MCP 서버 항목은 삭제하지 않습니다.
-5. 저장 후 Claude Desktop을 완전히 종료하고 다시 실행합니다.
-6. 새 대화에서 **파일·커넥터 추가 > Connectors**를 열어 생성한 서버 이름을 확인합니다.
+처음 설치한 경우에도 다음 순서를 위에서부터 그대로 진행하면 됩니다.
 
-`command`는 실행 프로그램이고 `args`는 순서가 있는 전체 인자입니다. 서버 이름이나 폴더 이름으로 바꾸지 마세요.
+### 1. MCP 파일 묶음 만들기
+
+PR MCP Builder에서 문서 처리와 사람 승인을 마치고 `④ MCP 생성·AI 연결`로 이동합니다.
+MCP 이름을 정한 뒤 파일 묶음을 생성합니다. 생성 폴더 안에 다음 항목이 있어야 합니다.
+
+- `claude_desktop_config.json`: Claude Desktop에 등록할 설정
+- `data`: 승인된 검색 데이터
+- `run_mcp_stdio_server.ps1`: 독립 배포 환경에서 사용하는 예비 실행 파일
+
+세 항목은 같은 묶음이므로 `data`만 따로 옮기지 마세요. 폴더를 옮겼다면 새 위치에서
+묶음을 다시 생성하는 것이 가장 안전합니다.
+
+![PR MCP Builder에서 승인과 색인을 마치고 Claude Desktop용 MCP 파일 묶음을 생성하는 순서](docs/assets/readme-claude-mcp-01-bundle.svg)
+
+### 2. 생성된 설정과 Claude 설정 열기
+
+1. 생성 폴더의 `claude_desktop_config.json`을 메모장으로 엽니다.
+2. Claude Desktop에서 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**을 누릅니다.
+3. 영문 화면에서는 **Settings > Developer > Edit Config**입니다.
+4. Claude가 `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다.
+
+왼쪽의 일반 **커넥터** 메뉴는 원격 HTTPS MCP용입니다. 같은 PC의 로컬 STDIO 서버는
+반드시 **개발자 > 구성 편집**에서 등록합니다.
+
+### 3. 새 서버 항목 합치기
+
+Claude 설정이 비어 있다면 생성된 JSON 전체를 복사해도 됩니다. 이미 다른 서버나
+`preferences`가 있다면 모두 지우지 말고, 생성 파일의 `mcpServers` 안에 있는 새 서버
+한 항목만 기존 `mcpServers`에 추가합니다.
+
+정상적으로 생성된 소스 프로젝트 직접 실행 설정은 다음 형태입니다. 아래 예시를 직접
+입력하지 말고, 생성된 파일의 실제 서버 이름·경로·ID를 그대로 복사하세요.
+
+```json
+{
+  "mcpServers": {
+    "<생성된-서버-이름>": {
+      "command": "C:\\project\\Public-Regulation-MCP-Builder\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "scripts.run_regulation_mcp",
+        "--data-dir",
+        "C:\\MCP 번들\\기관 규정\\data",
+        "--tenant-id",
+        "<생성된-tenant-id>",
+        "--transport",
+        "stdio",
+        "--profile-id",
+        "<생성된-profile-id>",
+        "--flat-storage",
+        "--tool-profile",
+        "<생성된-tool-profile>",
+        "--no-warm-cache"
+      ],
+      "env": {
+        "PYTHONPATH": "C:\\project\\Public-Regulation-MCP-Builder",
+        "PYTHONSAFEPATH": "1"
+      }
+    }
+  }
+}
+```
+
+Windows 경로의 `\\`는 JSON에서 정상적인 표시입니다. `command`, `args`, `env`는 한
+세트이므로 인자를 빼거나 순서를 바꾸지 마세요. `type: "stdio"`는 현재 Claude Desktop
+로컬 설정에 필수가 아니므로 없어도 정상입니다. 프로젝트 Python을 직접 사용할 수 없는
+독립 ZIP/wheel 번들에서는 생성기가 자동으로 PowerShell 실행 항목을 만들며, 이 경우에도
+생성된 값을 그대로 복사하면 됩니다.
+
+기존 설정을 보존한 병합 결과는 다음처럼 새 서버와 기존 서버가 함께 있어야 합니다.
+
+![생성된 Claude MCP 서버 항목만 복사해 기존 preferences와 MCP 서버를 보존하며 병합하는 방법](docs/assets/readme-claude-mcp-02-config.svg)
+
+```json
+{
+  "preferences": {
+    "theme": "dark"
+  },
+  "mcpServers": {
+    "기존-서버": {
+      "command": "existing-command"
+    },
+    "<생성된-서버-이름>": {
+      "command": "<생성 파일의 command>",
+      "args": ["<생성 파일의 args 전체>"],
+      "env": {
+        "PYTHONPATH": "<생성 파일의 프로젝트 절대경로>",
+        "PYTHONSAFEPATH": "1"
+      }
+    }
+  }
+}
+```
+
+### 4. Claude Desktop 완전히 다시 시작하기
+
+1. JSON을 저장합니다.
+2. Claude 창만 닫지 말고 작업 표시줄 알림 영역의 Claude 아이콘에서도 **종료**합니다.
+3. Claude Desktop을 다시 실행합니다.
+4. 새 대화에서 **파일·커넥터 추가 > Connectors**를 엽니다.
+5. 생성한 서버 이름이 보이고 상태가 `running`인지 확인합니다.
+
+### 5. search와 fetch로 실제 연결 확인하기
+
+새 대화에서 다음 두 문장을 차례대로 요청합니다.
+
+```text
+연결한 규정 MCP의 search 도구로 인사규정을 찾아줘.
+첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여줘.
+```
+
+서버 이름만 보이는 것으로는 연결 완료가 아닙니다. `search`가 결과를 반환하고 그 결과의
+`id`로 `fetch`가 원문을 반환해야 정상입니다. 생성 설정의 실제 STDIO 검증도 같은
+`command`, `args`, `env`로 `initialize` → `tools/list` → `search` → `fetch` 순서까지
+통과하도록 구성돼 있습니다.
+
+![Claude Desktop을 완전히 재시작한 뒤 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](docs/assets/readme-claude-mcp-03-verify.svg)
+
+연결되지 않으면 다음을 확인합니다.
+
+- `disconnected`: 생성 파일의 `command`, 모든 `args`, `env`를 빠짐없이 복사했는지 확인
+- 서버가 안 보임: JSON의 쉼표·중괄호를 확인하고 Claude를 완전히 종료한 뒤 다시 실행
+- 도구가 0개: 새 대화에서 해당 서버를 활성화했는지 확인
+- 폴더를 옮긴 뒤 실패: 경로를 손으로 고치지 말고 새 위치에서 MCP 묶음을 다시 생성
+- Python 오류: 번들의 `doctor_mcp_connection.ps1`을 실행하고 stderr의 버전·프로젝트
+  루트·모듈 import 진단 확인
+
+더 자세한 화면별 설명과 다른 MCP 클라이언트 연결은
+[MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)를 참고하세요.
 
 ## Codex CLI·IDE와 Claude Code에 연결하기
 
@@ -165,3 +288,7 @@ python scripts\audit_release_hygiene.py --workflow-scope available --include-unt
 ## 업데이트 내역
 
 README에는 현재 사용법만 유지합니다. 버전별 변경 내용과 다운로드 파일은 [GitHub Releases](https://github.com/koul777/Public-Regulation-MCP-Builder/releases)에서 확인할 수 있습니다.
+
+## Kordoc 사용 고지
+
+HWP/HWPX 문서 구조와 표 추출 교차 검증에는 [Kordoc](https://github.com/chrisryugj/kordoc)을 사용했습니다. 배포 번들에는 Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이선스는 [Kordoc LICENSE](https://github.com/chrisryugj/kordoc/blob/main/LICENSE)와 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에서 확인할 수 있습니다.

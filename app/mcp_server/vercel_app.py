@@ -36,10 +36,15 @@ def create_vercel_mcp_app(environ: Mapping[str, str]) -> Starlette:
 
     bearer_token = str(environ.get("MCP_AUTH_TOKEN") or "").strip() or None
     allow_unauthenticated = _env_bool(environ, "MCP_ALLOW_UNAUTHENTICATED_HTTP")
+    tool_profile = str(environ.get("MCP_TOOL_PROFILE") or "chatgpt-data").strip().lower()
     if not bearer_token and not allow_unauthenticated:
         raise RuntimeError(
             "Vercel MCP refuses unauthenticated startup. Set MCP_AUTH_TOKEN or explicitly set "
             "MCP_ALLOW_UNAUTHENTICATED_HTTP=true for an approved public read-only deployment."
+        )
+    if not bearer_token and tool_profile != "chatgpt-data":
+        raise RuntimeError(
+            "Unauthenticated Vercel MCP deployments must use MCP_TOOL_PROFILE=chatgpt-data."
         )
 
     issuer_url = str(environ.get("MCP_AUTH_ISSUER_URL") or "").strip() or None
@@ -81,7 +86,7 @@ def create_vercel_mcp_app(environ: Mapping[str, str]) -> Starlette:
         auth_issuer_url=issuer_url,
         allowed_http_hosts=sorted(allowed_hosts),
         allowed_http_origins=_csv_values(environ.get("MCP_ALLOWED_HTTP_ORIGINS")),
-        tool_profile=str(environ.get("MCP_TOOL_PROFILE") or "chatgpt-data").strip(),
+        tool_profile=tool_profile,
         warm_cache=_env_bool(environ, "MCP_WARM_CACHE"),
         streamable_http_path=str(
             environ.get("MCP_STREAMABLE_HTTP_PATH") or DEFAULT_VERCEL_MCP_PATH

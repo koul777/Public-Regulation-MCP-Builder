@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import zipfile
 from functools import wraps
@@ -124,6 +125,184 @@ RUNTIME_IDENTITY_MODULES = (
 )
 
 
+def _is_source_project_root(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    root = Path(path).expanduser()
+    return (
+        root.is_dir()
+        and (root / "pyproject.toml").is_file()
+        and (root / "scripts" / "run_regulation_mcp.py").is_file()
+    )
+
+
+def _runtime_marker_python(marker_path: Path) -> Path | None:
+    """Return the marker Python only when the complete v2 identity is valid."""
+
+    if not marker_path.is_file():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(marker, dict):
+            return None
+        module_sha256 = marker.get("module_sha256")
+        if (
+            marker.get("schema_version") != RUNTIME_PYTHON_MARKER_SCHEMA_VERSION
+            or marker.get("minimum_python") != "3.11"
+            or marker.get("package_import") != "scripts.run_regulation_mcp"
+            or marker.get("identity_scope") != RUNTIME_IDENTITY_SCOPE
+            or marker.get("hash_algorithm") != "sha256"
+            or not isinstance(module_sha256, dict)
+            or set(module_sha256) != set(RUNTIME_IDENTITY_MODULES)
+            or any(
+                not re.fullmatch(r"sha256:[0-9a-f]{64}", str(module_sha256.get(name) or ""))
+                for name in RUNTIME_IDENTITY_MODULES
+            )
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(marker.get("build_identity_sha256") or ""),
+            )
+        ):
+            return None
+        datetime.fromisoformat(str(marker.get("written_at") or "").replace("Z", "+00:00"))
+        candidate = Path(str(marker.get("python_executable") or "")).expanduser()
+        if not candidate.is_absolute() or not candidate.is_file():
+            return None
+        if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", candidate.stem, re.IGNORECASE):
+            return None
+
+        names_json = json.dumps(list(RUNTIME_IDENTITY_MODULES), separators=(",", ":"))
+        expected_json = json.dumps(module_sha256, separators=(",", ":"))
+        verifier = subprocess.run(
+            [
+                str(candidate.resolve()),
+                "-c",
+                "import base64,sys;exec(base64.b64decode(sys.argv.pop(1)))",
+                _runtime_identity_verifier_base64(),
+                base64.b64encode(names_json.encode("utf-8")).decode("ascii"),
+                base64.b64encode(expected_json.encode("utf-8")).decode("ascii"),
+                str(marker["build_identity_sha256"]),
+            ],
+            cwd=str(marker_path.parent.resolve()),
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key.upper() != "PYTHONPATH"
+            }
+            | {"PYTHONSAFEPATH": "1"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+        return candidate.resolve() if verifier.returncode == 0 else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError):
+        return None
+
+
+def _python_imports_source_project(python_path: Path, project_root: Path) -> bool:
+    """Probe the exact source import with an explicit, cwd-independent PYTHONPATH."""
+
+    try:
+        completed = subprocess.run(
+            [
+                str(python_path),
+                "-c",
+                (
+                    "import sys; "
+                    "sys.version_info >= (3, 11) or sys.exit(41); "
+                    "import scripts.run_regulation_mcp"
+                ),
+            ],
+            cwd=str(project_root),
+            env={
+                **os.environ,
+                "PYTHONPATH": str(project_root.resolve()),
+                "PYTHONSAFEPATH": "1",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _resolve_claude_source_runtime(
+    *,
+    output_dir: Path,
+    preferred_python: str | Path | None,
+    preferred_project_root: str | Path | None,
+) -> tuple[Path, Path] | None:
+    """Resolve a Claude source runtime in the documented deterministic order."""
+
+    project_root = (
+        Path(preferred_project_root).expanduser().resolve()
+        if _is_source_project_root(preferred_project_root)
+        else PROJECT_ROOT.resolve()
+        if _is_source_project_root(PROJECT_ROOT)
+        else None
+    )
+    if project_root is None:
+        return None
+
+    candidates: list[Path | None] = [
+        _runtime_marker_python(output_dir / RUNTIME_PYTHON_MARKER_FILENAME),
+        project_root / ".venv" / "Scripts" / "python.exe",
+        Path(os.environ["REG_RAG_PYTHON"]).expanduser()
+        if os.environ.get("REG_RAG_PYTHON", "").strip()
+        else None,
+        Path(preferred_python).expanduser() if str(preferred_python or "").strip() else None,
+    ]
+    checked: set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in checked:
+            continue
+        checked.add(key)
+        if not resolved.is_absolute() or not resolved.is_file():
+            continue
+        if _python_imports_source_project(resolved, project_root):
+            return resolved, project_root
+    return None
+
+
+def _with_direct_claude_source_runtime(
+    config: dict[str, Any],
+    *,
+    server_name: str,
+    python_path: Path,
+    project_root: Path,
+) -> dict[str, Any]:
+    """Replace one Claude stdio entry with a cwd-independent source invocation."""
+
+    normalized = _local_stdio_config_for_server(config, server_name=server_name)
+    source = normalized["mcpServers"][server_name]
+    server_args = _stdio_server_args_from_client_entry(source)
+    if server_args is None:
+        raise ValueError(f"Claude Desktop server {server_name} is not a local stdio entry.")
+    entry: dict[str, Any] = {
+        "command": str(python_path.resolve()),
+        "args": ["-m", "scripts.run_regulation_mcp", *server_args],
+        "env": {
+            **(dict(source.get("env") or {}) if isinstance(source.get("env"), dict) else {}),
+            "PYTHONPATH": str(project_root.resolve()),
+            "PYTHONSAFEPATH": "1",
+        },
+    }
+    return {"mcpServers": {server_name: entry}}
+
+
 def _runtime_identity_builder_base64() -> str:
     code = """\
 import base64
@@ -177,6 +356,38 @@ for name in names:
 canonical = json.dumps(actual, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 actual_build = "sha256:" + hashlib.sha256(canonical).hexdigest()
 raise SystemExit(0 if actual == expected and actual_build == expected_build else 44)
+"""
+    return base64.b64encode(code.encode("utf-8")).decode("ascii")
+
+
+def _python_runtime_probe_base64() -> str:
+    code = """\
+import importlib
+import importlib.util
+import sys
+import traceback
+
+module_name = "scripts.run_regulation_mcp"
+if sys.version_info < (3, 11):
+    print(
+        f"Python version is below 3.11: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        file=sys.stderr,
+    )
+    raise SystemExit(41)
+try:
+    spec = importlib.util.find_spec(module_name)
+except Exception:
+    traceback.print_exc(file=sys.stderr)
+    raise SystemExit(42)
+if spec is None:
+    print(f"MCP module import failed: {module_name} was not found", file=sys.stderr)
+    raise SystemExit(42)
+try:
+    importlib.import_module(module_name)
+except BaseException:
+    print(f"Required dependency import failed while importing {module_name}:", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    raise SystemExit(43)
 """
     return base64.b64encode(code.encode("utf-8")).decode("ascii")
 
@@ -612,6 +823,7 @@ def _write_mcp_setup_bundle_untransactional(
     server_name: str,
     preferred_python: str | Path | None = None,
     preferred_project_root: str | Path | None = None,
+    claude_source_runtime: tuple[Path, Path] | None = None,
 ) -> dict[str, str]:
     """Write copy/paste-ready MCP setup artifacts for common clients."""
     server_name = _validate_mcp_server_name(server_name)
@@ -631,6 +843,14 @@ def _write_mcp_setup_bundle_untransactional(
         bundle_data_dir=output_dir / "data",
     )
     json_config = _with_bundle_stdio_launcher(json_config, launcher_path=stdio_launcher_path, server_name=server_name)
+    if claude_source_runtime is not None and isinstance(json_config.get("claude_desktop"), dict):
+        direct_python, direct_project_root = claude_source_runtime
+        json_config["claude_desktop"] = _with_direct_claude_source_runtime(
+            json_config["claude_desktop"],
+            server_name=server_name,
+            python_path=direct_python,
+            project_root=direct_project_root,
+        )
     quickstart = json_config.get("quickstart") if isinstance(json_config, dict) else None
     if not isinstance(quickstart, dict):
         quickstart = {}
@@ -806,6 +1026,11 @@ def write_mcp_setup_bundle(
     output_dir = Path(out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _assert_no_active_bundle_installation(output_dir)
+    claude_source_runtime = _resolve_claude_source_runtime(
+        output_dir=output_dir,
+        preferred_python=preferred_python,
+        preferred_project_root=preferred_project_root,
+    )
     backup_dir = output_dir.parent / f".{output_dir.name}.setup-backup-{uuid4().hex}"
     retired_artifact_root = output_dir / "chatgpt-desktop-local-plugin"
     targets = [
@@ -891,6 +1116,7 @@ def write_mcp_setup_bundle(
             server_name=server_name,
             preferred_python=preferred_python,
             preferred_project_root=preferred_project_root,
+            claude_source_runtime=claude_source_runtime,
         )
     except BaseException as setup_error:
         if mutation_started:
@@ -1435,12 +1661,26 @@ def _with_bundle_stdio_launcher(config: dict[str, Any], *, launcher_path: str | 
         if not isinstance(server, dict):
             return
         args = server.get("args")
+        direct_source = (
+            isinstance(args, list)
+            and len(args) >= 2
+            and str(args[0]) == "-m"
+            and str(args[1]) == "scripts.run_regulation_mcp"
+        )
         stdio_server_args = _stdio_server_args_from_client_entry(server)
         if stdio_server_args is not None:
             transport = _arg_value(stdio_server_args, "--transport")
             if transport in {None, "stdio"}:
                 server["command"] = "powershell.exe"
                 server["args"] = _powershell_stdio_launcher_client_args(launcher, stdio_server_args)
+                if direct_source and isinstance(server.get("env"), dict):
+                    env = dict(server["env"])
+                    env.pop("PYTHONPATH", None)
+                    env.pop("PYTHONSAFEPATH", None)
+                    if env:
+                        server["env"] = env
+                    else:
+                        server.pop("env", None)
         server_command = server.get("serverCommand")
         if isinstance(server_command, dict):
             patch_server(server_command)
@@ -1456,6 +1696,12 @@ def _stdio_server_args_from_client_entry(server: dict[str, Any]) -> list[str] | 
     command = str(server.get("command") or "")
     if command == "reg-rag-mcp-server":
         return args_text
+    if (
+        len(args_text) >= 2
+        and args_text[0] == "-m"
+        and args_text[1] == "scripts.run_regulation_mcp"
+    ):
+        return args_text[2:]
     if _is_python_command(command) and args_text and _is_run_regulation_mcp_script(args_text[0]):
         return args_text[1:]
     if _is_powershell_command(command):
@@ -1478,7 +1724,10 @@ def _case_insensitive_arg_index(args: list[str], expected: str) -> int | None:
 
 def _is_python_command(command: str) -> bool:
     leaf = _path_leaf(command)
-    return leaf in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+    return bool(
+        leaf in {"py", "py.exe"}
+        or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", leaf)
+    )
 
 
 def _is_powershell_command(command: str) -> bool:
@@ -2848,7 +3097,21 @@ def _portable_handoff_payload(path: Path, *, arcname: str, source_dir: Path) -> 
     normalized_arcname = arcname.replace("\\", "/")
     if normalized_arcname in PORTABLE_HANDOFF_JSON_FILES:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        portable = _replace_bundle_path_with_placeholder(payload, source_dir=source_dir)
+        portable_source = _with_bundle_stdio_launcher(
+            payload,
+            launcher_path=source_dir / SETUP_BUNDLE_FILES["stdio_launcher"],
+            server_name=str(
+                payload.get("server_name")
+                or (
+                    next(iter(payload["mcpServers"]))
+                    if isinstance(payload.get("mcpServers"), dict) and payload["mcpServers"]
+                    else "regulation_mcp"
+                )
+            )
+            if isinstance(payload, dict)
+            else "regulation_mcp",
+        )
+        portable = _replace_bundle_path_with_placeholder(portable_source, source_dir=source_dir)
         return (json.dumps(portable, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if normalized_arcname == SETUP_BUNDLE_FILES["codex_config"]:
         text = path.read_text(encoding="utf-8-sig")
@@ -5420,6 +5683,17 @@ function Assert-ClaudeDesktopInstalledContract(
   if (-not (Test-SameMcpArguments @($InstalledServer.args) @($GeneratedServer.args))) {
     throw "Claude Desktop config contract verification found incomplete, reordered, or mismatched arguments for ${ServerName}."
   }
+  $ExpectedEnvProperties = @($(if ($GeneratedServer.env) { $GeneratedServer.env.PSObject.Properties } else { @() }))
+  $InstalledEnvProperties = @($(if ($InstalledServer.env) { $InstalledServer.env.PSObject.Properties } else { @() }))
+  if ($ExpectedEnvProperties.Count -ne $InstalledEnvProperties.Count) {
+    throw "Claude Desktop config contract verification found a mismatched environment for ${ServerName}."
+  }
+  foreach ($ExpectedEnvProperty in $ExpectedEnvProperties) {
+    $InstalledEnvProperty = $InstalledServer.env.PSObject.Properties[$ExpectedEnvProperty.Name]
+    if (-not $InstalledEnvProperty -or -not [string]::Equals([string]$InstalledEnvProperty.Value, [string]$ExpectedEnvProperty.Value, [System.StringComparison]::Ordinal)) {
+      throw "Claude Desktop config contract verification found a mismatched environment value for ${ServerName}: $($ExpectedEnvProperty.Name)."
+    }
+  }
   $ActualFingerprint = "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
   if (-not [string]::IsNullOrWhiteSpace($ExpectedFingerprint) -and
       -not [string]::Equals($ActualFingerprint, $ExpectedFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -6957,12 +7231,14 @@ def _powershell_stdio_launcher_script(
 ) -> str:
     preferred_python_value = str(preferred_python or "").strip()
     preferred_project_root_value = str(preferred_project_root or "").strip()
+    runtime_probe_base64 = _powershell_single_quoted_json(_python_runtime_probe_base64())
     lines = [
             'param([Parameter(ValueFromRemainingArguments=$true)][string[]]$ServerArgs)',
             '$ErrorActionPreference = "Stop"',
             *_powershell_bundle_data_dir_lines(),
             "$PreferredPython = " + _powershell_single_quoted_json(preferred_python_value),
             "$PreferredProjectRoot = " + _powershell_single_quoted_json(preferred_project_root_value),
+            "$RuntimeProbeBase64 = " + runtime_probe_base64,
             "$DefaultServerArgs = " + _powershell_array_literal(default_server_args),
             'if (-not $ServerArgs -or $ServerArgs.Count -eq 0) { $ServerArgs = $DefaultServerArgs }',
     ]
@@ -6997,15 +7273,60 @@ def _powershell_stdio_launcher_script(
             '    $Marker = Get-Content -LiteralPath $MarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop',
             '    $null = [DateTimeOffset]::Parse([string]$Marker.written_at)',
             '    $Candidate = [string]$Marker.python_executable',
-            '    if (-not [System.IO.Path]::IsPathRooted($Candidate) -or -not (Test-Path -LiteralPath $Candidate -PathType Leaf)) { throw "recorded Python is unavailable" }',
+            '    if (-not [System.IO.Path]::IsPathRooted($Candidate) -or -not (Test-Path -LiteralPath $Candidate -PathType Leaf)) { throw "recorded runtime Python path is invalid or unavailable: $Candidate" }',
             '    $Leaf = [System.IO.Path]::GetFileNameWithoutExtension($Candidate)',
             '    if ($Leaf -notmatch "^python(?:\\d+(?:\\.\\d+)*)?$") { throw "recorded executable is not Python" }',
             '    $Resolved = (Resolve-Path -LiteralPath $Candidate).Path',
-            '    if (-not (Test-RuntimeMarkerIdentity $Resolved $Marker)) { throw "recorded MCP command-module identity mismatch" }',
-            '    return $Resolved',
+            '    if (-not (Test-RuntimeMarkerIdentity $Resolved $Marker)) { throw "runtime marker validation failed: recorded MCP command-module identity mismatch" }',
+            '    if (-not (Test-McpPython $Resolved "runtime_python.json")) { throw "recorded runtime failed the Python 3.11 and package import probe" }',
+            '    return $script:ValidatedMcpPython',
             '  } catch {',
-            '    throw "runtime_python.json is invalid. Re-run install_local_package.ps1. $($_.Exception.Message)"',
+            '    throw "runtime_python.json validation failed. Re-run install_local_package.ps1. $($_.Exception.Message)"',
             '  }',
+            '}',
+            'function Test-McpPython([string]$Candidate, [string]$CandidateLabel, [string]$SourceRoot = "") {',
+            '  if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }',
+            '  $Command = $null',
+            '  if (Test-Path -LiteralPath $Candidate -PathType Leaf) { $Command = (Resolve-Path -LiteralPath $Candidate).Path }',
+            '  else {',
+            '    $ResolvedCommand = Get-Command $Candidate -ErrorAction SilentlyContinue',
+            '    if ($ResolvedCommand) { $Command = $ResolvedCommand.Source }',
+            '  }',
+            '  if (-not $Command) {',
+            '    [Console]::Error.WriteLine("Python executable not found [$CandidateLabel]: $Candidate")',
+            '    return $false',
+            '  }',
+            '  $HadPythonPath = Test-Path Env:PYTHONPATH',
+            '  $PreviousPythonPath = $env:PYTHONPATH',
+            '  $HadSafePath = Test-Path Env:PYTHONSAFEPATH',
+            '  $PreviousSafePath = $env:PYTHONSAFEPATH',
+            '  $PreviousErrorActionPreference = $ErrorActionPreference',
+            '  try {',
+            '    $ErrorActionPreference = "Continue"',
+            '    if ($SourceRoot) { $env:PYTHONPATH = $SourceRoot } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }',
+            '    $env:PYTHONSAFEPATH = "1"',
+            '    $ProbeDiagnostics = @(& $Command -c "import base64;exec(base64.b64decode(\'$RuntimeProbeBase64\'))" 2>&1)',
+            '    $ProbeExitCode = $LASTEXITCODE',
+            '  } catch {',
+            '    $ProbeDiagnostics = @($_.Exception.Message)',
+            '    $ProbeExitCode = 44',
+            '  } finally {',
+            '    $ErrorActionPreference = $PreviousErrorActionPreference',
+            '    if ($HadPythonPath) { $env:PYTHONPATH = $PreviousPythonPath } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }',
+            '    if ($HadSafePath) { $env:PYTHONSAFEPATH = $PreviousSafePath } else { Remove-Item Env:PYTHONSAFEPATH -ErrorAction SilentlyContinue }',
+            '  }',
+            '  if ($ProbeExitCode -eq 0) { $script:ValidatedMcpPython = $Command; return $true }',
+            '  $Category = switch ($ProbeExitCode) {',
+            '    41 { "Python version is below 3.11" }',
+            '    42 { "scripts.run_regulation_mcp import failed" }',
+            '    43 { "Required dependency import failed" }',
+            '    default { "Python runtime probe failed with exit code $ProbeExitCode" }',
+            '  }',
+            '  [Console]::Error.WriteLine("$Category [$CandidateLabel]: $Command")',
+            '  foreach ($DiagnosticLine in $ProbeDiagnostics) {',
+            '    if (-not [string]::IsNullOrWhiteSpace([string]$DiagnosticLine)) { [Console]::Error.WriteLine([string]$DiagnosticLine) }',
+            '  }',
+            '  return $false',
             '}',
             'function Get-PyLauncherPython {',
             '  $Py = Get-Command "py" -ErrorAction SilentlyContinue',
@@ -7050,37 +7371,23 @@ def _powershell_stdio_launcher_script(
             '  exit [int]$ServerExitCode',
             '}',
             'function Invoke-ServerFromSource([string]$ProjectRoot, [string[]]$ArgsToPass) {',
-            '  $ScriptPath = Join-Path $ProjectRoot "scripts\\run_regulation_mcp.py"',
-            '  $PythonCandidates = @()',
-            '  $RecordedRuntimePython = Get-RecordedRuntimePython',
-            '  if ($RecordedRuntimePython) { $PythonCandidates += $RecordedRuntimePython }',
-            '  if ($env:REG_RAG_PYTHON) { $PythonCandidates += $env:REG_RAG_PYTHON }',
-            '  if ($PreferredPython) { $PythonCandidates += $PreferredPython }',
-            '  $PythonCandidates += (Join-Path $ProjectRoot ".venv\\Scripts\\python.exe")',
-            '  $PythonCandidates += "python"',
+            '  $PythonCandidates = @(',
+            '    [pscustomobject]@{ Path = (Join-Path $ProjectRoot ".venv\\Scripts\\python.exe"); Label = "project .venv" },',
+            '    [pscustomobject]@{ Path = $env:REG_RAG_PYTHON; Label = "REG_RAG_PYTHON" },',
+            '    [pscustomobject]@{ Path = $PreferredPython; Label = "selected Python" },',
+            '    [pscustomobject]@{ Path = "python"; Label = "PATH python" }',
+            '  )',
             '  $PyLauncherPython = Get-PyLauncherPython',
-            '  if ($PyLauncherPython) { $PythonCandidates += $PyLauncherPython }',
+            '  if ($PyLauncherPython) { $PythonCandidates += [pscustomobject]@{ Path = $PyLauncherPython; Label = "py launcher" } }',
             '  foreach ($Candidate in $PythonCandidates) {',
-            '    if (-not $Candidate) { continue }',
-            '    $Command = $null',
-            '    if (Test-Path -LiteralPath $Candidate) { $Command = $Candidate }',
-            '    else {',
-            '      $Resolved = Get-Command $Candidate -ErrorAction SilentlyContinue',
-            '      if ($Resolved) { $Command = $Resolved.Source }',
-            '    }',
-            '    if ($Command) {',
-            '      $env:PYTHONPATH = if ($env:PYTHONPATH) { "$ProjectRoot;$env:PYTHONPATH" } else { $ProjectRoot }',
-            '      $ProbeErrorAction = $ErrorActionPreference',
-            '      $ErrorActionPreference = "Continue"',
-            '      & $Command -c "import scripts.run_regulation_mcp,sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 41)" 1>$null 2>$null',
-            '      $ProbeExitCode = $LASTEXITCODE',
-            '      $ErrorActionPreference = $ProbeErrorAction',
-            '      if ($ProbeExitCode -ne 0) { continue }',
-            '      & $Command $ScriptPath @ArgsToPass',
+            '    if (Test-McpPython ([string]$Candidate.Path) ([string]$Candidate.Label) $ProjectRoot) {',
+            '      $env:PYTHONPATH = $ProjectRoot',
+            '      $env:PYTHONSAFEPATH = "1"',
+            '      & $script:ValidatedMcpPython -m scripts.run_regulation_mcp @ArgsToPass',
             '      exit $LASTEXITCODE',
             '    }',
             '  }',
-            '  throw "Python was not found. Install the bundled wheel or set REG_RAG_PYTHON to the project Python executable."',
+            '  [Console]::Error.WriteLine("No Python 3.11+ source runtime could import scripts.run_regulation_mcp from project root: $ProjectRoot")',
             '}',
             '$RecordedRuntimePython = Get-RecordedRuntimePython',
             'if ($RecordedRuntimePython) {',
@@ -7094,27 +7401,24 @@ def _powershell_stdio_launcher_script(
             '  if (Test-Path -LiteralPath $PreferredScript) { $ProjectRoot = $PreferredProjectRoot }',
             '}',
             'if ($ProjectRoot) { Invoke-ServerFromSource $ProjectRoot $ServerArgs }',
+            'else { [Console]::Error.WriteLine("Project root discovery failed: no pyproject.toml and scripts\\run_regulation_mcp.py source root was found.") }',
             '# An extracted bundle may not contain the source checkout. When the operator points',
             '# REG_RAG_PYTHON at the installed wheel environment, invoke its packaged module',
             '# directly instead of relying on a stale console script from another PATH entry.',
             '$PackagedPythonCandidates = @()',
             '$RecordedRuntimePython = Get-RecordedRuntimePython',
-            'if ($RecordedRuntimePython) { $PackagedPythonCandidates += $RecordedRuntimePython }',
-            'if ($env:REG_RAG_PYTHON) { $PackagedPythonCandidates += $env:REG_RAG_PYTHON }',
-            'if ($PreferredPython) { $PackagedPythonCandidates += $PreferredPython }',
+            'if ($RecordedRuntimePython) { $PackagedPythonCandidates += [pscustomobject]@{ Path = $RecordedRuntimePython; Label = "runtime_python.json" } }',
+            'if ($env:REG_RAG_PYTHON) { $PackagedPythonCandidates += [pscustomobject]@{ Path = $env:REG_RAG_PYTHON; Label = "REG_RAG_PYTHON" } }',
+            'if ($PreferredPython) { $PackagedPythonCandidates += [pscustomobject]@{ Path = $PreferredPython; Label = "selected Python" } }',
             '$PathPython = Get-Command "python" -ErrorAction SilentlyContinue',
-            'if ($PathPython) { $PackagedPythonCandidates += $PathPython.Source }',
+            'if ($PathPython) { $PackagedPythonCandidates += [pscustomobject]@{ Path = $PathPython.Source; Label = "PATH python" } }',
             '$PyLauncherPython = Get-PyLauncherPython',
-            'if ($PyLauncherPython) { $PackagedPythonCandidates += $PyLauncherPython }',
+            'if ($PyLauncherPython) { $PackagedPythonCandidates += [pscustomobject]@{ Path = $PyLauncherPython; Label = "py launcher" } }',
             'foreach ($Candidate in $PackagedPythonCandidates) {',
-            '  if (-not $Candidate -or -not (Test-Path -LiteralPath $Candidate)) { continue }',
-            '  $PackagedProbeErrorAction = $ErrorActionPreference',
-            '  $ErrorActionPreference = "Continue"',
-            '  & $Candidate -c "import scripts.run_regulation_mcp,sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 41)" 1>$null 2>$null',
-            '  $PackagedProbeExitCode = $LASTEXITCODE',
-            '  $ErrorActionPreference = $PackagedProbeErrorAction',
-            '  if ($PackagedProbeExitCode -eq 0) {',
-            '    & $Candidate -m scripts.run_regulation_mcp @ServerArgs',
+            '  if (Test-McpPython ([string]$Candidate.Path) ([string]$Candidate.Label)) {',
+            '    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue',
+            '    $env:PYTHONSAFEPATH = "1"',
+            '    & $script:ValidatedMcpPython -m scripts.run_regulation_mcp @ServerArgs',
             '    exit $LASTEXITCODE',
             '  }',
             '}',
@@ -7127,7 +7431,7 @@ def _powershell_stdio_launcher_script(
             '  }',
             '  throw "The installed MCP console command is not importable. Install the bundle wheel or set REG_RAG_PYTHON to its Python executable before reconnecting."',
             '}',
-            'throw "reg-rag-mcp-server was not found on PATH, and neither the generated project runtime nor a source checkout is available. Run install_local_package.ps1 once, then restart the MCP client."',
+            'throw "No usable MCP Python runtime or reg-rag-mcp-server command is available. Review the stderr diagnostics above, run install_local_package.ps1 if needed, then restart the MCP client."',
         ]
     )
     return "\n".join(lines)

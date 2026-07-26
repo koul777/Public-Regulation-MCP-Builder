@@ -56,7 +56,110 @@ PowerShell에서 다음 파일을 실행합니다.
 
 ### Claude Desktop
 
-Claude Desktop의 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**(영문 UI: **Settings > Developer > Edit Config**)을 눌러 `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다. 생성된 `claude_desktop_config.json`의 해당 `mcpServers` 항목만 기존 설정에 병합하고, 다른 서버 항목은 삭제하지 않습니다. 생성된 서버 이름은 `mcpServers`의 키로만 사용하고 `command`나 `args`로 옮기지 않습니다. 모든 `args`를 원래 순서대로 유지합니다. 저장 후 앱을 완전히 종료·재실행하고, 새 대화의 **파일·커넥터 추가 > Connectors**에서 서버를 확인한 뒤 `search`와 `fetch`를 실제로 호출합니다. 왼쪽의 **커넥터** 메뉴는 Vercel 같은 원격 HTTPS MCP용이고, 로컬 stdio는 **개발자 > 구성 편집**에서 등록합니다. Windows 설정 경로와 재시작 절차는 공식 [MCP 로컬 서버 연결 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)를 따릅니다.
+처음 연결한다면 아래 순서를 그대로 따릅니다. 왼쪽의 **커넥터** 메뉴는 Vercel 같은 원격
+HTTPS MCP용입니다. 같은 PC에서 실행하는 로컬 stdio 서버는
+**설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**(영문 UI: **Settings > Developer > Edit Config**)에서 등록합니다.
+
+1. PR MCP Builder에서 MCP 번들 생성을 완료합니다.
+2. 생성 폴더의 `claude_desktop_config.json`을 메모장으로 엽니다. 이 파일에 표시된 경로를
+   예시 경로로 바꾸거나 직접 다시 입력하지 않습니다.
+3. Claude Desktop에서 **구성 편집**을 눌러
+   `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다.
+4. 생성 파일의 `mcpServers` 안에 있는 새 서버 항목만 Claude 설정의 `mcpServers`에
+   복사합니다. 기존 서버와 `preferences` 같은 다른 최상위 설정은 그대로 둡니다.
+5. JSON을 저장합니다. Windows 경로는 JSON 안에서 `C:\\폴더\\파일`처럼 역슬래시가
+   두 번 표시되는 것이 정상입니다.
+6. Claude Desktop 창만 닫지 말고 작업 표시줄 알림 영역에서도 **종료**한 뒤 다시
+   실행합니다.
+7. 새 대화를 열고 **파일·커넥터 추가 > Connectors**에서 생성한 서버 이름이
+   `running`인지 확인합니다.
+
+예를 들어 기존 설정이 다음과 같다면:
+
+```json
+{
+  "preferences": {
+    "theme": "dark"
+  },
+  "mcpServers": {
+    "already-used-server": {
+      "command": "existing-command"
+    }
+  }
+}
+```
+
+새 서버를 추가한 뒤에도 `preferences`와 `already-used-server`를 남겨야 합니다.
+검증된 소스 프로젝트 Python을 직접 실행하는 항목은 다음 형태입니다.
+
+```json
+{
+  "preferences": {
+    "theme": "dark"
+  },
+  "mcpServers": {
+    "already-used-server": {
+      "command": "existing-command"
+    },
+    "<생성된-서버-이름>": {
+      "command": "C:\\project\\Public-Regulation-MCP-Builder\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "scripts.run_regulation_mcp",
+        "--data-dir",
+        "C:\\MCP 번들\\기관 규정\\data",
+        "--tenant-id",
+        "<생성된-tenant-id>",
+        "--transport",
+        "stdio",
+        "--profile-id",
+        "<생성된-profile-id>",
+        "--flat-storage",
+        "--tool-profile",
+        "<생성된-tool-profile>",
+        "--no-warm-cache"
+      ],
+      "env": {
+        "PYTHONPATH": "C:\\project\\Public-Regulation-MCP-Builder",
+        "PYTHONSAFEPATH": "1"
+      }
+    }
+  }
+}
+```
+
+`command`, `args`, `env`는 하나의 실행 계약입니다. `args`의 순서를 바꾸거나
+`PYTHONPATH`를 빼면 Claude Desktop의 시작 폴더에 따라 모듈을 찾지 못할 수 있습니다.
+`type: "stdio"`는 현재 Claude Desktop 로컬 서버에 필수가 아니므로 생성되지 않을 수
+있습니다. 소스 프로젝트와 Python 3.11+ import 검사가 통과하지 않거나 독립 배포
+ZIP/wheel을 쓰는 경우에는 같은 자리에 `run_mcp_stdio_server.ps1`을 실행하는 fallback
+항목이 생성됩니다. 어느 형식이든 생성 파일의 값을 그대로 복사합니다.
+
+연결 후 새 대화에서 다음처럼 확인합니다.
+
+```text
+연결한 규정 MCP의 search 도구로 인사규정을 찾아줘.
+첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여줘.
+```
+
+서버 이름만 보이는 것으로는 충분하지 않습니다. `search`가 결과를 반환하고, 그 결과의
+`id`를 사용한 `fetch`가 원문을 반환해야 연결이 완료된 것입니다. 실제 stdio 통합
+검증에서도 생성된 `command`, `args`, `env`를 수정 없이 subprocess에 전달해 MCP
+`initialize`, `tools/list`, `search`, `fetch` 순서로 성공하는 것을 확인합니다.
+
+문제가 생기면 다음 순서로 확인합니다.
+
+- `disconnected`: 생성 파일의 `command`, 모든 `args`, `env`가 빠짐없이 복사됐는지 확인
+- `Python was not found`: 번들 폴더에서 `run_mcp_stdio_server.ps1`을 직접 실행하지 말고
+  stderr에 표시된 Python 버전·marker·project root·import 진단을 확인
+- 서버가 목록에 없음: JSON 쉼표와 중괄호를 확인하고 Claude Desktop을 완전히 종료·재실행
+- 도구가 0개: 새 대화에서 서버를 활성화했는지 확인한 뒤 `doctor_mcp_connection.ps1`과
+  `validate_mcp_smoke.ps1` 실행
+- 폴더를 옮긴 뒤 실패: 이전 절대경로를 고치지 말고 새 위치에서 번들을 다시 생성
+
+Windows 설정 경로와 재시작 절차는 공식
+[MCP 로컬 서버 연결 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)를
+따릅니다.
 
 ### ChatGPT Desktop
 
@@ -141,3 +244,5 @@ ChatGPT Desktop·Codex 연결은 토큰 값을 설정 파일에 직접 쓰지 �
   https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp
 - Vercel MCP 배포:
   https://vercel.com/docs/mcp/deploy-mcp-servers-to-vercel
+
+HWP/HWPX 문서 구조와 표 추출 교차 검증에는 Kordoc을 사용했습니다.

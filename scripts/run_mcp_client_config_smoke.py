@@ -212,12 +212,23 @@ def _run_single_client_config_smoke(
         entry = _read_client_server_entry(client_key=client_key, config_path=config_path, server_name=server_name)
         command = str(entry.get("command") or "")
         args = entry.get("args")
+        configured_env = entry.get("env")
         if not command or not isinstance(args, list) or not all(isinstance(value, str) for value in args):
             raise ValueError(f"{label} server {server_name} must contain command and string args for local stdio.")
+        if configured_env is not None and (
+            not isinstance(configured_env, dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in configured_env.items())
+        ):
+            raise ValueError(f"{label} server {server_name} env must contain only string keys and values.")
         smoke_query = query or _recommended_query_from_args(args) or DEFAULT_SEARCH_QUERY
         result = asyncio.run(
             asyncio.wait_for(
-                _run_client_entry(command=command, args=list(args), query=smoke_query),
+                _run_client_entry(
+                    command=command,
+                    args=list(args),
+                    env=dict(configured_env or {}),
+                    query=smoke_query,
+                ),
                 timeout=timeout_seconds,
             )
         )
@@ -553,17 +564,26 @@ def _arg_value(args: Sequence[str], flag: str) -> str | None:
     return None
 
 
-async def _run_client_entry(*, command: str, args: list[str], query: str) -> dict[str, Any]:
+async def _run_client_entry(
+    *,
+    command: str,
+    args: list[str],
+    env: dict[str, str],
+    query: str,
+) -> dict[str, Any]:
     started_at = time.perf_counter()
     # The MCP client library intentionally inherits a narrow environment and
     # drops custom interpreter selectors. Preserve the explicit runtime
     # selector used by generated bundle launchers so smoke tests exercise the
     # same wheel/source fallback that operators configure.
     runtime_python = os.getenv("REG_RAG_PYTHON", "").strip()
+    process_env = dict(env)
+    if runtime_python and "REG_RAG_PYTHON" not in process_env:
+        process_env["REG_RAG_PYTHON"] = runtime_python
     params = StdioServerParameters(
         command=command,
         args=args,
-        env={"REG_RAG_PYTHON": runtime_python} if runtime_python else None,
+        env=process_env or None,
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:

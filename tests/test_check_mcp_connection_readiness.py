@@ -575,6 +575,71 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertEqual("checked", summary["clients"]["codex"]["status"])
         self.assertEqual(launcher_path.as_posix(), summary["clients"]["codex"]["stdio_launcher_path"])
 
+    def test_installed_claude_config_accepts_direct_python_source_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle_dir = root / "bundle"
+            _write_minimal_bundle(bundle_dir)
+            bundle_data_dir = bundle_dir / "data"
+            bundle_data_dir.mkdir()
+            (bundle_data_dir / "mcp_runtime_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "tenant_id": "default",
+                        "tenant_storage_isolation": False,
+                        "document_ids": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_root = root / "source project"
+            source_root.mkdir()
+            claude_config = root / "claude_desktop_config.json"
+            claude_config.write_text(
+                json.dumps(
+                    {
+                        "preferences": {"theme": "dark"},
+                        "mcpServers": {
+                            "govreg-local": {
+                                "command": sys.executable,
+                                "args": [
+                                    "-m",
+                                    "scripts.run_regulation_mcp",
+                                    "--data-dir",
+                                    str(bundle_data_dir),
+                                    "--tenant-id",
+                                    "default",
+                                    "--transport",
+                                    "stdio",
+                                    "--flat-storage",
+                                    "--tool-profile",
+                                    "full",
+                                    "--no-warm-cache",
+                                ],
+                                "env": {
+                                    "PYTHONPATH": str(source_root.resolve()),
+                                    "PYTHONSAFEPATH": "1",
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = check_mcp_connection_readiness(
+                client_profile="bundle",
+                server_name="govreg-local",
+                bundle_dir=bundle_dir,
+                claude_desktop_config=claude_config,
+                check_data=False,
+            )
+
+        self.assertTrue(report["passed"], report["findings"])
+        summary = report["installed_client_config_summary"]["clients"]["claude_desktop"]
+        self.assertEqual("checked", summary["status"])
+        self.assertNotIn("stdio_launcher_path", summary)
+
     def test_installed_codex_config_rejects_disabled_and_duplicate_contract_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp) / "bundle"

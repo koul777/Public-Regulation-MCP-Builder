@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,27 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertNotIn("run_openai_secure_tunnel.ps1", text)
         self.assertNotIn("AGENT_CONNECT_PROMPT", text)
 
+    def test_claude_beginner_guide_preserves_verified_stdio_contract(self) -> None:
+        text = (REPO_ROOT / "docs" / "mcp_quickconnect_ko.md").read_text(
+            encoding="utf-8"
+        )
+
+        for expected in (
+            '"-m"',
+            '"scripts.run_regulation_mcp"',
+            '"PYTHONPATH"',
+            '"PYTHONSAFEPATH": "1"',
+            "`initialize`, `tools/list`, `search`, `fetch`",
+            "기존 서버와 `preferences`",
+            "작업 표시줄 알림 영역에서도 **종료**",
+        ):
+            self.assertIn(expected, text)
+        self.assertTrue(
+            text.rstrip().endswith(
+                "HWP/HWPX 문서 구조와 표 추출 교차 검증에는 Kordoc을 사용했습니다."
+            )
+        )
+
     def test_readme_links_quickconnect_and_vercel_docs(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -80,6 +102,24 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertNotIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
         self.assertNotIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
 
+    def test_readme_contains_beginner_claude_stdio_walkthrough(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "### 1. MCP 파일 묶음 만들기",
+            "### 2. 생성된 설정과 Claude 설정 열기",
+            "### 3. 새 서버 항목 합치기",
+            "### 4. Claude Desktop 완전히 다시 시작하기",
+            "### 5. search와 fetch로 실제 연결 확인하기",
+            '"scripts.run_regulation_mcp"',
+            '"PYTHONPATH"',
+            '"PYTHONSAFEPATH": "1"',
+            "`initialize` → `tools/list` → `search` → `fetch`",
+            "다른 서버나\n`preferences`",
+            "상태가 `running`",
+        ):
+            self.assertIn(expected, text)
+
     def test_readme_uses_current_workflow_images(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         expected_images = (
@@ -90,6 +130,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-guide-03-multi-regulation.png",
             "docs/assets/readme-guide-03-chunk-context.png",
             "docs/assets/readme-guide-04-human-review.png",
+            "docs/assets/readme-claude-mcp-01-bundle.svg",
+            "docs/assets/readme-claude-mcp-02-config.svg",
+            "docs/assets/readme-claude-mcp-03-verify.svg",
         )
 
         for image_path in expected_images:
@@ -103,6 +146,21 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "readme-guide-09-generated-bat-files.png",
         ):
             self.assertNotIn(retired_image, text)
+
+    def test_claude_mcp_guide_svgs_are_valid_and_accessible(self) -> None:
+        for filename in (
+            "readme-claude-mcp-01-bundle.svg",
+            "readme-claude-mcp-02-config.svg",
+            "readme-claude-mcp-03-verify.svg",
+        ):
+            path = REPO_ROOT / "docs" / "assets" / filename
+            root = ElementTree.parse(path).getroot()
+            namespace = {"svg": "http://www.w3.org/2000/svg"}
+
+            self.assertTrue(root.tag.endswith("svg"))
+            self.assertEqual("0 0 1600 900", root.attrib.get("viewBox"))
+            self.assertIsNotNone(root.find("svg:title", namespace))
+            self.assertIsNotNone(root.find("svg:desc", namespace))
 
 
 if __name__ == "__main__":
