@@ -19,19 +19,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.audit_mcp_index_visibility import audit_mcp_index_visibility
-from scripts.mcp_bundle_contract import (
-    CHATGPT_PLUGIN_MCP_PATH,
-    CHATGPT_PLUGIN_VERSION_PATTERN,
-    REQUIRED_SETUP_BUNDLE_FILES,
-    chatgpt_local_marketplace_name,
-    normalized_chatgpt_plugin_name,
-)
+from scripts.mcp_bundle_contract import REQUIRED_SETUP_BUNDLE_FILES
 from scripts.report_metadata import current_repo_commit
 from app.core.tenant_access import tenant_storage_key
 
 
-PROFILE_ALIASES = {"chatgpt": "chatgpt-remote"}
-REMOTE_CLIENTS = {"chatgpt-remote", "claude-api"}
+PROFILE_ALIASES = {
+    "chatgpt": "chatgpt-remote",
+    "claude-api": "claude-remote",
+}
+REMOTE_CLIENTS = {"chatgpt-remote", "claude-remote"}
 VALID_CLIENTS = {
     "bundle",
     "claude-desktop",
@@ -39,6 +36,7 @@ VALID_CLIENTS = {
     "chatgpt-desktop-local",
     "chatgpt-remote",
     "chatgpt",
+    "claude-remote",
     "claude-api",
 }
 VALID_CONNECTION_MODES = {"direct", "openai-tunnel"}
@@ -102,7 +100,7 @@ def check_mcp_connection_readiness(
     if requested_profile not in VALID_CLIENTS:
         raise ValueError(
             "client_profile must be bundle, claude-desktop, claude-code, chatgpt-desktop-local, "
-            "chatgpt-remote, chatgpt (legacy alias), or claude-api."
+            "chatgpt-remote, claude-remote, or legacy chatgpt/claude-api aliases."
         )
     profile = PROFILE_ALIASES.get(requested_profile, requested_profile)
     mode = connection_mode.strip().lower()
@@ -410,13 +408,13 @@ def _check_openai_tunnel(
     check_cli: bool,
     findings: list[McpConnectionFinding],
 ) -> None:
-    if profile == "claude-api":
+    if profile == "claude-remote":
         findings.append(
             McpConnectionFinding(
                 "high",
                 "openai-tunnel-not-claude-api",
-                "OpenAI Secure MCP Tunnel is for supported OpenAI products, not Claude API.",
-                "Use direct HTTPS /mcp for Claude API, or connect Claude Desktop/Code locally with stdio/http.",
+                "OpenAI Secure MCP Tunnel is not a Claude remote MCP transport.",
+                "Use the direct HTTPS /mcp URL for Claude, or connect Claude Desktop/Code locally with stdio/http.",
             )
         )
     if check_cli and not shutil.which("tunnel-client"):
@@ -474,7 +472,7 @@ def _check_public_url(public_url: str | None, findings: list[McpConnectionFindin
             McpConnectionFinding(
                 "high",
                 "missing-public-url",
-                "ChatGPT and Claude API remote MCP connectors need a reachable HTTPS /mcp URL.",
+                "ChatGPT and Claude remote MCP clients need a reachable HTTPS /mcp URL.",
                 "Regenerate with --public-url https://your-host.example/mcp.",
             )
         )
@@ -1089,7 +1087,6 @@ def _check_bundle_dir(
                     "Regenerate the bundle so operators get a clear first-run install path.",
                 )
             )
-    _check_chatgpt_desktop_plugin_bundle(bundle_dir, findings)
     _check_bundle_manifest_readiness(bundle_dir, findings, allow_local_only_bundle=allow_local_only_bundle)
     bundle_data_dir = bundle_dir / "data"
     if bundle_data_dir.is_dir():
@@ -1625,20 +1622,14 @@ def _installed_stdio_contract_issues(
 
 
 def _expected_bundle_stdio_entry(expected_data_dir: Path, server_name: str) -> dict[str, object] | None:
-    plugin_name = normalized_chatgpt_plugin_name(server_name)
-    path = (
-        expected_data_dir.parent
-        / "chatgpt-desktop-local-plugin"
-        / "plugins"
-        / plugin_name
-        / ".mcp.json"
-    )
+    path = expected_data_dir.parent / "chatgpt_desktop_local_mcp.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
-    entry = servers.get(server_name) if isinstance(servers, dict) else None
+    entry = payload.get("ui_fields") if isinstance(payload, dict) else None
+    if isinstance(entry, dict) and str(entry.get("name") or "") != server_name:
+        return None
     return entry if isinstance(entry, dict) else None
 
 
@@ -1867,13 +1858,13 @@ def _check_bundle_manifest_readiness(
                 "high",
                 "bundle-manifest-ready-missing",
                 "Generated MCP setup bundle manifest does not contain ready flags.",
-                "Regenerate the setup bundle so ChatGPT and Claude API readiness is explicit.",
+                "Regenerate the setup bundle so ChatGPT and Claude remote readiness is explicit.",
             )
         )
         return
     readiness_checks = (
         (("chatgpt_remote", "chatgpt"), "ChatGPT remote"),
-        (("claude_api",), "Claude API"),
+        (("claude_remote", "claude_api"), "Claude remote"),
     )
     for keys, label in readiness_checks:
         if not any(ready.get(key) is True for key in keys):

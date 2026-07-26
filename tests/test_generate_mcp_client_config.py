@@ -221,6 +221,53 @@ def _mutating_claude_code_smoke_source() -> str:
     )
 
 
+def _successful_direct_app_server_check_source(server_name: str = "aksmcp") -> str:
+    return (
+        "\n".join(
+            [
+                "import hashlib, json, os, sys",
+                "from datetime import datetime, timezone",
+                "from pathlib import Path",
+                "args = sys.argv[1:]",
+                "out = Path(args[args.index('--out-json') + 1])",
+                "codex_path = str(Path(args[args.index('--codex-executable') + 1]).resolve())",
+                "codex_path_fingerprint = hashlib.sha256(os.path.normcase(codex_path).encode('utf-8')).hexdigest()",
+                "config_path = str((Path(os.environ['CODEX_HOME']) / 'config.toml').resolve())",
+                "config_fingerprint = hashlib.sha256(os.path.normcase(config_path).encode('utf-8')).hexdigest()",
+                "config_content_fingerprint = 'sha256:' + hashlib.sha256(Path(config_path).read_bytes()).hexdigest()",
+                "payload = {",
+                "    'report_type': 'codex_app_server_mcp_status',",
+                "    'probe_scope': 'fresh_codex_app_server_process',",
+                "    'probe_id': 'fixture-retry-fresh-probe',",
+                "    'generated_at': datetime.now(timezone.utc).isoformat(),",
+                "    'provenance': {",
+                "        'executable_file_name': Path(codex_path).name,",
+                "        'executable_path_sha256': codex_path_fingerprint,",
+                "        'process_id': os.getpid(),",
+                "        'config_scope': {",
+                "            'config_exists': True,",
+                "            'config_path_sha256': config_fingerprint,",
+                "            'config_content_stable_during_probe': True,",
+                "            'config_content_sha256': config_content_fingerprint,",
+                "        },",
+                "    },",
+                "    'passed': True,",
+                "    'app_server_initialized': True,",
+                "    'status_list_received': True,",
+                f"    'server_name': {server_name!r},",
+                "    'server_found': True,",
+                "    'tool_count': 3,",
+                "    'tool_names': ['fetch', 'get_index_status', 'search'],",
+                "    'server_info': {'name': 'regulation-mcp', 'version': 'test'},",
+                "    'error': None,",
+                "}",
+                "out.write_text(json.dumps(payload), encoding='utf-8')",
+            ]
+        )
+        + "\n"
+    )
+
+
 def _fake_claude_transaction_cli_source() -> str:
     return (
         "import json, os, sys\n"
@@ -358,10 +405,14 @@ def _run_claude_code_transaction_failure(
     env["CLAUDE_EXPECTED_DATA"] = str((bundle_dir / "data").resolve())
     completed = subprocess.run(
         [
-            str(windows_dir / "System32" / "cmd.exe"),
-            "/d",
-            "/c",
-            files["connect_claude_code_bat"],
+            str(powershell_dir / "powershell.exe"),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            files["connect"],
+            "-Target",
+            "claude-code",
         ],
         cwd=root,
         env=env,
@@ -416,6 +467,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         self.assertEqual("claude-desktop", claude_server["env"]["PRODUCT_SOURCE"])
         self.assertEqual("chatgpt-desktop", chatgpt_server["env"]["PRODUCT_SOURCE"])
 
+    @unittest.skip("legacy generated-plugin bundle contract was removed")
     def test_setup_bundle_replaces_stale_plugin_tree_when_server_name_changes(self) -> None:
         first_config = build_mcp_client_config(
             server_name="first-mcp",
@@ -1274,6 +1326,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
             self.assertFalse((bundle_dir / "runtime_python.json").exists())
 
     @unittest.skipUnless(os.name == "nt", "Secure tunnel PowerShell behavior is Windows-specific.")
+    @unittest.skip("Secure MCP Tunnel artifact was removed in favor of Vercel Streamable HTTP")
     def test_secure_tunnel_expands_unicode_bundle_data_dir_as_one_command_argument(self) -> None:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         if not powershell:
@@ -1541,17 +1594,16 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         )
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
         codex_start = wizard.index("function Invoke-CodexCommandCapture")
-        codex_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", codex_start)
+        codex_end = wizard.index("\nfunction Install-CodexConfig", codex_start)
         codex_function = wizard[codex_start:codex_end]
         claude_script = config["quickstart"]["copy_paste"]["claude_code_stdio_ps"]
         claude_start = claude_script.index("function Invoke-ClaudeMcpCli")
         claude_end = claude_script.index("\nfunction Get-ClaudeUserConfigPath", claude_start)
         claude_function = claude_script[claude_start:claude_end]
 
-        # The direct loader and the nested plugin adapter must share the tested
-        # UTF-8-aware Codex wrapper instead of introducing raw native captures.
+        # The direct loader must use the tested UTF-8-aware Codex wrapper
+        # instead of introducing raw native captures.
         self.assertIn('$LoaderResult = Invoke-CodexCli @("mcp", "get", $ServerName, "--json")', wizard)
-        self.assertIn("return Invoke-CodexCli -Arguments $Arguments", wizard)
         self.assertNotIn("$LoaderOutput = @(& codex", wizard)
         self.assertNotIn("$CommandOutput = @(& codex @Arguments 2>&1)", wizard)
         self.assertEqual(1, wizard.count("$CommandOutput = @(& $Command @Arguments 2>&1)"))
@@ -1661,7 +1713,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
         resolver_start = wizard.index("function Invoke-CodexCommandCapture")
-        resolver_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", resolver_start)
+        resolver_end = wizard.index("\nfunction Install-CodexConfig", resolver_start)
         resolver_source = wizard[resolver_start:resolver_end]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1721,7 +1773,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
         resolver_start = wizard.index("function Invoke-CodexCommandCapture")
-        resolver_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", resolver_start)
+        resolver_end = wizard.index("\nfunction Install-CodexConfig", resolver_start)
         resolver_source = wizard[resolver_start:resolver_end]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1777,7 +1829,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
         resolver_start = wizard.index("function Invoke-CodexCommandCapture")
-        resolver_end = wizard.index("\nfunction Remove-GeneratedPluginConflictForDirectConfig", resolver_start)
+        resolver_end = wizard.index("\nfunction Install-CodexConfig", resolver_start)
         resolver_source = wizard[resolver_start:resolver_end]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2431,7 +2483,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["MCP_AUTH_TOKEN"] = "test-only-strong-mcp-auth-token"
             env.pop("REG_RAG_PYTHON", None)
 
-            for script_name in ("run_http_server.ps1", "run_local_stdio_server.ps1"):
+            for script_name in ("run_local_stdio_server.ps1",):
                 with self.subTest(script_name=script_name):
                     runtime_log.write_text("", encoding="utf-8")
                     completed = subprocess.run(
@@ -2750,50 +2802,59 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             chatgpt_oauth_ready=True,
         )
 
+        self.assertEqual(config["profile"], "chatgpt-remote")
+        self.assertEqual(config["transport"], "streamable-http")
         self.assertEqual(config["connector_url"], "https://mcp.example.go.kr/govreg/mcp")
+        self.assertTrue(config["ready"])
+        self.assertTrue(config["configuration_ready"])
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertTrue(config["chatgpt_setup"]["https_endpoint_ready"])
-        self.assertIn("Settings > Security and login", config["chatgpt_setup"]["location"])
-        self.assertIn("Settings > Plugins", config["chatgpt_setup"]["location"])
-        self.assertIn("Developer mode", " ".join(config["connection_steps"]))
-        self.assertIn("+ > More", " ".join(config["connection_steps"]))
-        direct_setup = json.dumps(
+        self.assertEqual(
+            config["chatgpt_setup"]["location"],
+            "ChatGPT Desktop Settings > MCP servers > Add server",
+        )
+        self.assertEqual(config["chatgpt_setup"]["transport"], "streamable-http")
+        self.assertEqual(config["chatgpt_setup"]["shared_config_file"], "~/.codex/config.toml")
+        self.assertEqual(
+            config["chatgpt_setup"]["authentication_modes"],
+            ["bearer_token_env_var", "oauth", "approved_public_unauthenticated"],
+        )
+        self.assertEqual(config["chatgpt_setup"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
+        self.assertTrue(config["chatgpt_setup"]["oauth_ready"])
+        self.assertEqual(
+            config["config_toml"],
             {
-                "chatgpt_setup": config["chatgpt_setup"],
-                "connection_steps": config["connection_steps"],
+                "url": "https://mcp.example.go.kr/govreg/mcp",
+                "bearer_token_env_var": "MCP_AUTH_TOKEN",
             },
-            ensure_ascii=False,
         )
-        self.assertIn("Settings > Security and login", direct_setup)
-        self.assertIn("Settings > Plugins", direct_setup)
-        self.assertIn("https://chatgpt.com/plugins", direct_setup)
-        self.assertNotIn("Settings > Apps > Advanced Settings", direct_setup)
-        self.assertNotIn("Settings > Apps > Create", direct_setup)
-        self.assertIn(
-            "Settings > Security and login",
-            " ".join(config["openai_secure_tunnel"]["chatgpt_setup"]),
+        self.assertEqual(
+            config["deployment"],
+            {"platform": "vercel", "entrypoint": "vercel_mcp.py", "path": "/mcp"},
         )
-        self.assertNotIn("@", json.dumps(config, ensure_ascii=False))
+        self.assertEqual(config["server_auth"]["mode"], "bearer-or-oauth-or-approved-public")
+        self.assertEqual(config["server_auth"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
+        self.assertTrue(config["server_auth"]["oauth_ready"])
+        self.assertTrue(config["server_auth"]["bearer_supported_by_chatgpt_desktop_and_codex"])
+        connection_steps = " ".join(config["connection_steps"])
+        self.assertIn("reg-rag-mcp-vercel-stage", connection_steps)
+        self.assertIn("Streamable HTTP", connection_steps)
+        self.assertIn("bearer_token_env_var", connection_steps)
+        self.assertIn("OAuth", connection_steps)
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
         self.assertEqual(["search", "fetch"], config["compatible_tools"])
         self.assertIn("search(query)", " ".join(config["notes"]))
         self.assertIn("fetch(id)", " ".join(config["notes"]))
         self.assertIn("user-openable HTTP(S)", " ".join(config["notes"]))
-        self.assertIn("--tenant-storage-isolation", config["server_start"]["args"])
-        self.assertIn("--tool-profile", config["server_start"]["args"])
-        self.assertIn("chatgpt-data", config["server_start"]["args"])
-        self.assertIn("--allowed-http-host", config["server_start"]["args"])
-        self.assertIn("--allowed-http-origin", config["server_start"]["args"])
-        self.assertIn("--no-warm-cache", config["server_start"]["args"])
-        self.assertIn("--http-bearer-token-env", config["server_start"]["args"])
-        self.assertIn("--auth-issuer-url", config["server_start"]["args"])
-        self.assertIn("https://mcp.example.go.kr/govreg", config["server_start"]["args"])
-        self.assertEqual(config["server_auth"]["backend_token_env"], "MCP_AUTH_TOKEN")
-        self.assertEqual(config["server_auth"]["mode"], "mcp-oauth-2.1")
-        self.assertTrue(config["server_auth"]["oauth_ready"])
-        self.assertFalse(config["server_auth"]["custom_static_bearer_supported_by_chatgpt"])
-        self.assertNotIn("$BundleDataDir", config["openai_secure_tunnel"]["copy_paste_ps"])
+        serialized = json.dumps(config, ensure_ascii=False)
+        for retired in (
+            "openai_secure_tunnel",
+            "run_openai_secure_tunnel.ps1",
+            "AGENT_CONNECT_PROMPT",
+            ".bat",
+        ):
+            self.assertNotIn(retired, serialized)
 
     def test_chatgpt_connector_requires_https_public_url(self) -> None:
         config = build_mcp_client_config(
@@ -2808,19 +2869,26 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertTrue(config["chatgpt_setup"]["requires_reachable_https"])
         self.assertFalse(config["chatgpt_setup"]["https_endpoint_ready"])
 
-    def test_chatgpt_connector_does_not_treat_static_bearer_as_chatgpt_auth(self) -> None:
-        config = build_mcp_client_config(
-            client_profile="chatgpt-remote",
-            transport="streamable-http",
-            public_url="https://mcp.example.go.kr/mcp",
-            remote_auth_token_env="MCP_AUTH_TOKEN",
-        )
+    def test_chatgpt_connector_uses_bearer_env_reference_without_embedding_token(self) -> None:
+        with patch.dict(os.environ, {"MCP_AUTH_TOKEN": "test-only-secret-value"}):
+            config = build_mcp_client_config(
+                client_profile="chatgpt-remote",
+                transport="streamable-http",
+                public_url="https://mcp.example.go.kr/mcp",
+                remote_auth_token_env="MCP_AUTH_TOKEN",
+            )
 
-        self.assertFalse(config["ready"])
-        self.assertIn("chatgpt_mcp_oauth_2_1_not_attested", config["missing"])
+        self.assertTrue(config["ready"])
+        self.assertEqual([], config["missing"])
         self.assertFalse(config["chatgpt_setup"]["oauth_ready"])
-        self.assertIn("cannot present a custom API key", config["chatgpt_setup"]["authentication_note"])
-        self.assertIn("static MCP_AUTH_TOKEN alone cannot authenticate", " ".join(config["notes"]))
+        self.assertEqual(config["chatgpt_setup"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
+        self.assertIn(
+            "bearer_token_env_var",
+            config["chatgpt_setup"]["authentication_modes"],
+        )
+        self.assertEqual(config["config_toml"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
+        self.assertEqual(config["server_auth"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
+        self.assertNotIn("test-only-secret-value", json.dumps(config, ensure_ascii=False))
 
     def test_chatgpt_connector_rejects_hostless_or_query_public_url(self) -> None:
         for public_url in ("https://", "https://?tenant=default", "https://mcp.example.go.kr/mcp?tenant=default"):
@@ -2849,9 +2917,15 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("claude_code", config)
         self.assertIn("chatgpt_desktop_local", config)
         self.assertIn("chatgpt_remote", config)
-        self.assertIn("claude_api", config)
+        self.assertIn("claude_remote", config)
+        self.assertNotIn("claude_api", config)
         self.assertEqual(config["chatgpt_remote"]["connector_url"], "https://mcp.example.go.kr/mcp")
-        self.assertEqual(config["claude_api"]["mcp_servers"][0]["url"], "https://mcp.example.go.kr/mcp")
+        self.assertEqual(config["claude_remote"]["profile"], "claude-remote")
+        self.assertEqual(config["claude_remote"]["transport"], "streamable-http")
+        self.assertEqual(config["claude_remote"]["connector_url"], "https://mcp.example.go.kr/mcp")
+        self.assertNotIn("mcp_servers", config["claude_remote"])
+        self.assertNotIn("tools", config["claude_remote"])
+        self.assertNotIn("betas", config["claude_remote"])
         self.assertEqual(config["quickstart"]["claude_code"]["command"], "claude")
         self.assertEqual(
             config["quickstart"]["claude_code"]["args"][:7],
@@ -2877,7 +2951,18 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["search", "fetch"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["requires_reachable_https"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
-        self.assertIn("openai_secure_tunnel", config["quickstart"]["chatgpt_remote"]["connection_options"])
+        self.assertEqual(
+            config["quickstart"]["chatgpt_remote"]["connection_options"],
+            ["vercel_https_endpoint"],
+        )
+        self.assertEqual(
+            config["quickstart"]["chatgpt_remote"]["authentication_modes"],
+            ["bearer_token_env_var", "oauth", "approved_public_unauthenticated"],
+        )
+        self.assertEqual(
+            config["quickstart"]["chatgpt_remote"]["bearer_token_env_var"],
+            "MCP_AUTH_TOKEN",
+        )
         self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["profile"], "chatgpt-desktop-local")
         self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["tool_profile"], "chatgpt-data")
         self.assertEqual(
@@ -2890,108 +2975,128 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         self.assertFalse(config["quickstart"]["chatgpt_desktop_local"]["connection_prompt_required"])
         self.assertTrue(config["quickstart"]["chatgpt_desktop_local"]["conversation_attachment_unverified"])
-        self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["tunnel_id_env"], "OPENAI_TUNNEL_ID")
-        self.assertEqual(config["quickstart"]["openai_secure_tunnel"]["setup_state"], "manual_setup_required")
-        self.assertIn("--tool-profile chatgpt-data", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
-        self.assertIn("--no-warm-cache", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
-        self.assertIn("--flat-storage", config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
-        self.assertIn("--fail-on-warning", config["quickstart"]["openai_secure_tunnel"]["commands"]["readiness"]["args"])
-        self.assertIn(
-            "--audit-index-visibility",
-            config["quickstart"]["openai_secure_tunnel"]["commands"]["readiness"]["args"],
+        self.assertEqual(
+            config["quickstart"]["vercel_https"],
+            {
+                "stage_command": "reg-rag-mcp-vercel-stage",
+                "connector_url": "https://mcp.example.go.kr/mcp",
+                "mcp_path": "/mcp",
+                "shared_by_clients": [
+                    "ChatGPT Desktop",
+                    "Codex CLI",
+                    "Codex IDE",
+                    "Claude",
+                ],
+                "bearer_token_env_var": "MCP_AUTH_TOKEN",
+            },
         )
-        self.assertEqual(config["quickstart"]["claude_api"]["copy_fields"], ["mcp_servers", "tools", "betas"])
-        self.assertIn("--http-bearer-token-env", config["quickstart"]["run_http_server"]["args"])
-        self.assertIn("--auth-issuer-url", config["quickstart"]["run_http_server"]["args"])
-        self.assertIn("--no-warm-cache", config["quickstart"]["run_http_server"]["args"])
-        self.assertIn("https://mcp.example.go.kr", config["quickstart"]["run_http_server"]["args"])
-        self.assertEqual("chatgpt-data", config["quickstart"]["run_chatgpt_data_server"]["tool_profile"])
-        self.assertIn("--tool-profile", config["chatgpt_remote"]["server_start"]["args"])
-        self.assertIn("chatgpt-data", config["chatgpt_remote"]["server_start"]["args"])
-        self.assertIn("chatgpt-data", config["claude_api"]["server_start"]["args"])
+        self.assertEqual(
+            config["quickstart"]["claude_remote"],
+            {
+                "profile": "claude-remote",
+                "transport": "streamable-http",
+                "connector_url": "https://mcp.example.go.kr/mcp",
+                "ready": True,
+                "authentication_modes": [
+                    "bearer_header_environment_reference",
+                    "oauth",
+                    "approved_public_unauthenticated",
+                ],
+                "authorization_token_env": "MCP_AUTH_TOKEN",
+            },
+        )
         self.assertEqual(["search", "fetch"], config["quickstart"]["chatgpt_remote"]["verification_tools"])
-        self.assertIn("--no-warm-cache", config["quickstart"]["run_chatgpt_data_server"]["args"])
-        self.assertIn("copy_paste", config["quickstart"])
+        serialized = json.dumps(config, ensure_ascii=False)
+        for retired in (
+            "openai_secure_tunnel",
+            "run_openai_secure_tunnel.ps1",
+            "AGENT_CONNECT_PROMPT",
+            ".bat",
+        ):
+            self.assertNotIn(retired, serialized)
+        copy_paste = config["quickstart"]["copy_paste"]
+        self.assertNotIn("run_http_server_ps", copy_paste)
+        self.assertNotIn("run_chatgpt_data_server_ps", copy_paste)
+        self.assertNotIn("openai_secure_tunnel_ps", copy_paste)
         self.assertIn(
             '$ClaudeAddArgs = @("mcp", "add", "--transport", "stdio", "--scope", "user"',
-            config["quickstart"]["copy_paste"]["claude_code_stdio_ps"],
+            copy_paste["claude_code_stdio_ps"],
         )
-        self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["claude_code_stdio_ps"])
-        self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["run_local_stdio_server_ps"])
-        self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn('Assert-EnvVar "MCP_AUTH_TOKEN"', config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn("Invoke-BundlePythonModule $DoctorPython", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn("'--client-profile', 'bundle'", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn("--audit-index-visibility", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn('Resolve-BundleModulePython "scripts.check_mcp_connection_readiness"', config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn("if ($DoctorExitCode -ne 0)", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn("'--tool-profile'", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
-        self.assertIn("'chatgpt-data'", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
-        self.assertIn("--no-warm-cache", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
-        self.assertIn("Invoke-BundlePythonModule $DoctorPython", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
-        self.assertIn("'--client-profile', 'chatgpt-remote'", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
-        self.assertIn("--audit-index-visibility", config["quickstart"]["copy_paste"]["run_chatgpt_data_server_ps"])
-        tunnel_script = config["quickstart"]["copy_paste"]["openai_secure_tunnel_ps"]
-        self.assertIn("tunnel-client init", tunnel_script)
-        encoded_match = re.search(r"-EncodedCommand ([A-Za-z0-9+/=]+)'", tunnel_script)
-        self.assertIsNotNone(encoded_match)
-        assert encoded_match is not None
-        decoded_tunnel_launcher = base64.b64decode(encoded_match.group(1)).decode("utf-16-le")
-        self.assertIn("'--no-warm-cache'", decoded_tunnel_launcher)
-        self.assertIn('$ErrorActionPreference = "Stop"', config["quickstart"]["copy_paste"]["openai_secure_tunnel_ps"])
-        self.assertIn('Assert-Command "tunnel-client"', config["quickstart"]["copy_paste"]["openai_secure_tunnel_ps"])
-        self.assertIn('Assert-EnvVar "CONTROL_PLANE_API_KEY"', config["quickstart"]["copy_paste"]["openai_secure_tunnel_ps"])
-        self.assertIn('Assert-EnvVar "OPENAI_TUNNEL_ID"', config["quickstart"]["copy_paste"]["openai_secure_tunnel_ps"])
-        self.assertIn("if ($LASTEXITCODE -ne 0)", config["quickstart"]["copy_paste"]["openai_secure_tunnel_ps"])
-        self.assertIn('Resolve-BundleModulePython "scripts.check_mcp_connection_readiness"', config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("'--bundle-dir'", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("= $BundleDir", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("--audit-index-visibility", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("'--tenant-id', 'tenant-a'", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("mcp_connection_readiness.json", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("'--out-json'", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("= $DoctorReport", config["quickstart"]["copy_paste"]["doctor_ps"])
+        self.assertIn("--no-warm-cache", copy_paste["claude_code_stdio_ps"])
+        self.assertIn("--no-warm-cache", copy_paste["run_local_stdio_server_ps"])
+        self.assertEqual(
+            copy_paste["claude_code_http_ps"],
+            "claude mcp add --transport http --scope user "
+            "--header 'Authorization: Bearer ${MCP_AUTH_TOKEN}' "
+            "aks_mcp https://mcp.example.go.kr/mcp",
+        )
+        self.assertIn(
+            'Resolve-BundleModulePython "scripts.check_mcp_connection_readiness"',
+            copy_paste["doctor_ps"],
+        )
+        self.assertIn("'--bundle-dir'", copy_paste["doctor_ps"])
+        self.assertIn("= $BundleDir", copy_paste["doctor_ps"])
+        self.assertIn("--audit-index-visibility", copy_paste["doctor_ps"])
+        self.assertIn("'--tenant-id', 'tenant-a'", copy_paste["doctor_ps"])
+        self.assertIn("mcp_connection_readiness.json", copy_paste["doctor_ps"])
+        self.assertIn("'--out-json'", copy_paste["doctor_ps"])
+        self.assertIn("= $DoctorReport", copy_paste["doctor_ps"])
         self.assertEqual("reg-rag-mcp-index-visibility", config["quickstart"]["audit_index_visibility"]["command"])
-        self.assertIn("reg-rag-mcp-index-visibility", config["quickstart"]["copy_paste"]["audit_index_visibility_ps"])
-        self.assertNotIn("--allow-local-only-bundle", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("chatgpt-tunnel", config["quickstart"]["copy_paste"]["connect_wizard_ps"])
-        self.assertIn("Claude Desktop config updated", config["quickstart"]["copy_paste"]["connect_wizard_ps"])
-        self.assertIn("Claude Code CLI was not found", config["quickstart"]["copy_paste"]["connect_wizard_ps"])
-        self.assertIn("No ChatGPT remote connector_url is ready", config["quickstart"]["copy_paste"]["connect_wizard_ps"])
-        self.assertTrue(config["quickstart"]["warnings"])
+        self.assertIn("reg-rag-mcp-index-visibility", copy_paste["audit_index_visibility_ps"])
+        self.assertNotIn("--allow-local-only-bundle", copy_paste["doctor_ps"])
+        self.assertNotIn("chatgpt-tunnel", copy_paste["connect_wizard_ps"])
+        self.assertIn("Claude Desktop config updated", copy_paste["connect_wizard_ps"])
+        self.assertIn("Claude Code CLI was not found", copy_paste["connect_wizard_ps"])
+        self.assertIn("Streamable HTTP URL", copy_paste["connect_wizard_ps"])
+        self.assertIn("Claude Vercel HTTPS MCP", copy_paste["connect_wizard_ps"])
+        self.assertEqual([], config["quickstart"]["warnings"])
 
-    def test_builds_claude_api_connector_config(self) -> None:
+    def test_builds_claude_remote_connector_config(self) -> None:
         config = build_mcp_client_config(
-            client_profile="claude-api",
+            client_profile="claude-remote",
             transport="streamable-http",
             public_url="https://mcp.example.go.kr",
             server_name="govreg-local",
         )
 
-        self.assertEqual(config["mcp_servers"][0]["type"], "url")
-        self.assertEqual(config["mcp_servers"][0]["url"], "https://mcp.example.go.kr/mcp")
-        self.assertNotIn("authorization_token_env", config["mcp_servers"][0])
+        self.assertEqual(config["profile"], "claude-remote")
+        self.assertEqual(config["transport"], "streamable-http")
+        self.assertEqual(config["connector_name"], "govreg-local")
+        self.assertEqual(config["connector_url"], "https://mcp.example.go.kr/mcp")
+        self.assertTrue(config["ready"])
+        self.assertEqual(config["missing"], [])
+        self.assertEqual(
+            config["registration"],
+            {
+                "claude": "Customize > Connectors > Add custom connector",
+                "claude_code_script": "claude_code_add_http.ps1",
+            },
+        )
         self.assertEqual(config["server_auth"]["token_env"], "MCP_AUTH_TOKEN")
-        self.assertIn("--no-warm-cache", config["server_start"]["args"])
-        self.assertEqual(config["tools"][0]["type"], "mcp_toolset")
-        self.assertEqual(config["tools"][0]["mcp_server_name"], "govreg-local")
-        self.assertIn("mcp-client-2025-11-20", config["betas"])
-        self.assertIn("--auth-issuer-url", config["server_start"]["args"])
-        self.assertIn("https://mcp.example.go.kr", config["server_start"]["args"])
+        self.assertNotIn("mcp_servers", config)
+        self.assertNotIn("tools", config)
+        self.assertNotIn("betas", config)
+        self.assertNotIn("server_start", config)
+        self.assertIn("reg-rag-mcp-vercel-stage", " ".join(config["connection_steps"]))
+        self.assertIn("final deployed HTTPS /mcp URL", " ".join(config["connection_steps"]))
+        self.assertIn("bearer credentials", " ".join(config["connection_steps"]))
+        self.assertIn("approved OAuth flow", " ".join(config["connection_steps"]))
         self.assertIn("connection_steps", config)
 
-    def test_claude_api_rejects_non_https_public_url(self) -> None:
+    def test_claude_remote_rejects_non_https_public_url(self) -> None:
         config = build_mcp_client_config(
-            client_profile="claude-api",
+            client_profile="claude-remote",
             transport="streamable-http",
             public_url="http://mcp.example.go.kr/mcp",
             server_name="govreg-local",
         )
 
         self.assertFalse(config["ready"])
-        self.assertEqual([], config["mcp_servers"])
-        self.assertEqual([], config["tools"])
+        self.assertEqual("http://mcp.example.go.kr/mcp", config["connector_url"])
         self.assertIn("public_url_must_use_https", config["missing"])
+        self.assertNotIn("mcp_servers", config)
+        self.assertNotIn("tools", config)
+        self.assertNotIn("betas", config)
 
     def test_remote_auth_token_env_rejects_powershell_metacharacters(self) -> None:
         for token_env in ("TOKEN;Write-Output-INJECT", "TOKEN|whoami", "$(whoami)"):
@@ -3011,7 +3116,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
 
         script = config["quickstart"]["copy_paste"]["claude_code_http_ps"]
-        self.assertIn("'Authorization: Bearer ${MCP_AUTH_TOKEN}'", script)
+        self.assertEqual(
+            script,
+            "claude mcp add --transport http --scope user "
+            "--header 'Authorization: Bearer ${MCP_AUTH_TOKEN}' "
+            "regulation_mcp https://mcp.example.go.kr/mcp",
+        )
         self.assertNotIn("$env:MCP_AUTH_TOKEN", script)
 
     def test_bundle_without_public_url_marks_remote_profiles_not_ready(self) -> None:
@@ -3021,10 +3131,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("public_url_https_mcp_endpoint", config["chatgpt"]["missing"])
         self.assertFalse(config["chatgpt"]["chatgpt_setup"]["https_endpoint_ready"])
         self.assertFalse(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
-        self.assertFalse(config["claude_api"]["ready"])
-        self.assertEqual([], config["claude_api"]["mcp_servers"])
+        self.assertFalse(config["claude_remote"]["ready"])
+        self.assertIsNone(config["claude_remote"]["connector_url"])
         self.assertIsNone(config["quickstart"]["chatgpt_remote"]["connector_url"])
-        self.assertIsNone(config["quickstart"]["claude_api"]["mcp_server_url"])
+        self.assertIsNone(config["quickstart"]["claude_remote"]["connector_url"])
         self.assertIsNone(config["quickstart"]["copy_paste"]["claude_code_http_ps"])
         self.assertIn("--allow-local-only-bundle", config["quickstart"]["copy_paste"]["doctor_ps"])
 
@@ -3038,12 +3148,35 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("5000", config["quickstart"]["audit_index_visibility"]["args"])
         self.assertIn("'--min-visible-records'", config["quickstart"]["copy_paste"]["doctor_ps"])
         self.assertIn("'5000'", config["quickstart"]["copy_paste"]["doctor_ps"])
-        self.assertIn("'--min-visible-records', '5000'", config["quickstart"]["copy_paste"]["run_http_server_ps"])
-        self.assertIn(
-            "5000",
-            config["quickstart"]["openai_secure_tunnel"]["commands"]["readiness"]["args"],
+        self.assertNotIn("run_http_server_ps", config["quickstart"]["copy_paste"])
+        self.assertNotIn("openai_secure_tunnel", config["quickstart"])
+
+    def test_writes_claude_remote_url_only_handoff_artifact(self) -> None:
+        config = build_mcp_client_config(
+            server_name="govreg-local",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+            public_url="https://mcp.example.go.kr/mcp",
+            remote_auth_token_env="MCP_AUTH_TOKEN",
         )
 
+        with tempfile.TemporaryDirectory() as tmp:
+            files = write_mcp_setup_bundle(config, tmp, server_name="govreg-local")
+            output_dir = Path(tmp)
+            remote_path = Path(files["claude_remote"])
+            remote = json.loads(remote_path.read_text(encoding="utf-8"))
+
+            self.assertEqual("claude_https_mcp.json", remote_path.name)
+            self.assertEqual("claude-remote", remote["profile"])
+            self.assertEqual("streamable-http", remote["transport"])
+            self.assertEqual("https://mcp.example.go.kr/mcp", remote["connector_url"])
+            self.assertEqual("MCP_AUTH_TOKEN", remote["server_auth"]["token_env"])
+            for messages_api_field in ("mcp_servers", "tools", "betas", "server_start"):
+                self.assertNotIn(messages_api_field, remote)
+            self.assertNotIn("claude_api", files)
+            self.assertFalse((output_dir / "claude_api_fragment.json").exists())
+
+    @unittest.skip("legacy BAT/prompt/plugin bundle contract was removed")
     def test_writes_copy_paste_setup_bundle(self) -> None:
         config = build_mcp_client_config(
             server_name="govreg-local",
@@ -3667,9 +3800,6 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             for script_name in [
                 "claude_code_add_stdio.ps1",
                 "run_local_stdio_server.ps1",
-                "run_http_server.ps1",
-                "run_chatgpt_data_server.ps1",
-                "run_openai_secure_tunnel.ps1",
                 "doctor_mcp_connection.ps1",
             ]:
                 script = (output_dir / script_name).read_text(encoding="utf-8")
@@ -3803,12 +3933,24 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             expected_label="codex",
         )
 
-    @unittest.skipUnless(os.name == "nt", "Codex Windows installer script test")
-    def test_installed_plugin_smoke_rejects_misattributed_fresh_reports(self) -> None:
-        self._assert_installed_smoke_report_guards(
-            function_name="Run-InstalledPluginConfigSmoke",
-            expected_label="chatgpt_desktop_local",
+    def test_generated_wizard_omits_retired_plugin_installation_code(self) -> None:
+        config = build_mcp_client_config(
+            server_name="direct-config-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
         )
+        wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
+
+        for retired in (
+            "Run-InstalledPluginConfigSmoke",
+            "Get-ChatGptDesktopPluginRoot",
+            "Get-ChatGptDesktopPluginMcpPath",
+            "Remove-GeneratedPluginConflictForDirectConfig",
+            "Install-ChatGptDesktopPlugin",
+        ):
+            self.assertNotIn(retired, wizard)
+        self.assertIn("Run-InstalledCodexConfigSmoke", wizard)
+        self.assertIn("Run-InstalledClaudeDesktopConfigSmoke", wizard)
 
     @unittest.skipUnless(os.name == "nt", "Claude Desktop Windows installer script test")
     def test_installed_claude_desktop_smoke_rejects_misattributed_fresh_reports(self) -> None:
@@ -4096,48 +4238,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
             fake_app_server_check = fake_project_root / "scripts" / "check_codex_app_server_mcp.py"
             fake_app_server_check.write_text(
-                "\n".join(
-                    [
-                        "import hashlib, json, os, sys",
-                        "from datetime import datetime, timezone",
-                        "from pathlib import Path",
-                        "args = sys.argv[1:]",
-                        "out = Path(args[args.index('--out-json') + 1])",
-                        "codex_path = str(Path(args[args.index('--codex-executable') + 1]).resolve())",
-                        "codex_path_fingerprint = hashlib.sha256(os.path.normcase(codex_path).encode('utf-8')).hexdigest()",
-                        "config_path = str((Path(os.environ['CODEX_HOME']) / 'config.toml').resolve())",
-                        "config_fingerprint = hashlib.sha256(os.path.normcase(config_path).encode('utf-8')).hexdigest()",
-                        "config_content_fingerprint = 'sha256:' + hashlib.sha256(Path(config_path).read_bytes()).hexdigest()",
-                        "payload = {",
-                        "    'report_type': 'codex_app_server_mcp_status',",
-                        "    'probe_scope': 'fresh_codex_app_server_process',",
-                        "    'probe_id': 'fixture-fresh-probe',",
-                        "    'generated_at': datetime.now(timezone.utc).isoformat(),",
-                        "    'provenance': {",
-                        "        'executable_file_name': Path(codex_path).name,",
-                        "        'executable_path_sha256': codex_path_fingerprint,",
-                        "        'process_id': os.getpid(),",
-                        "        'config_scope': {",
-                        "            'config_exists': True,",
-                        "            'config_path_sha256': config_fingerprint,",
-                        "            'config_content_stable_during_probe': True,",
-                        "            'config_content_sha256': config_content_fingerprint,",
-                        "        },",
-                        "    },",
-                        "    'passed': True,",
-                        "    'app_server_initialized': True,",
-                        "    'status_list_received': True,",
-                        "    'server_name': 'aks_mcp',",
-                        "    'server_found': True,",
-                        "    'tool_count': 3,",
-                        "    'tool_names': ['fetch', 'get_index_status', 'search'],",
-                        "    'server_info': {'name': 'regulation-mcp', 'version': 'test'},",
-                        "    'error': None,",
-                        "}",
-                        "out.write_text(json.dumps(payload), encoding='utf-8')",
-                    ]
-                )
-                + "\n",
+                _successful_direct_app_server_check_source("aks_mcp"),
                 encoding="utf-8",
             )
             files = write_mcp_setup_bundle(
@@ -4189,16 +4290,14 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             fake_bin.mkdir()
             legacy_plugin_marker = root / "legacy-plugin.marker"
             legacy_plugin_marker.write_text("installed\n", encoding="utf-8")
+            plugin_list_called_marker = root / "plugin-list-called.marker"
             (fake_bin / "codex.cmd").write_text(
                 "@echo off\r\n"
                 "if \"%1\"==\"--version\" echo codex-cli fixture&& exit /b 0\r\n"
                 "if \"%1 %2\"==\"plugin list\" (\r\n"
-                "  if exist \"%CODEX_PLUGIN_MARKER%\" (\r\n"
-                "    echo {\"installed\":[{\"pluginId\":\"aks-mcp@aks-mcp-local\",\"installed\":true,\"enabled\":true}]}\r\n"
-                "  ) else (\r\n"
-                "    echo {\"installed\":[]}\r\n"
-                "  )\r\n"
-                "  exit /b 0\r\n"
+                "  type nul > \"%CODEX_PLUGIN_LIST_CALLED%\"\r\n"
+                "  echo transient plugin inventory failure 1>&2\r\n"
+                "  exit /b 77\r\n"
                 ")\r\n"
                 "if \"%1 %2\"==\"plugin remove\" (\r\n"
                 "  del /q \"%CODEX_PLUGIN_MARKER%\" 2^>nul\r\n"
@@ -4232,6 +4331,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["CODEX_EXPECTED_ENABLED"] = "false"
             env["CODEX_EXPECTED_TOOL_PROFILE"] = "chatgpt-data"
             env["CODEX_PLUGIN_MARKER"] = str(legacy_plugin_marker)
+            env["CODEX_PLUGIN_LIST_CALLED"] = str(plugin_list_called_marker)
             env["CODEX_HOME"] = str(codex_config.parent)
 
             disabled = subprocess.run(
@@ -4266,10 +4366,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 disabled_status["client_connections"]["chatgpt-desktop-local"]["last_attempt"]["state"],
                 disabled.stdout + disabled.stderr,
             )
-            self.assertTrue(
-                disabled_status["legacy_plugin_restored_after_direct_failure"],
-                disabled.stdout + disabled.stderr,
-            )
+            self.assertFalse(disabled_status["legacy_plugin_restored_after_direct_failure"])
             self.assertFalse(disabled_status["legacy_plugin_removed_for_direct_config"])
             self.assertTrue(legacy_plugin_marker.exists())
             self.assertEqual(original_codex_config, codex_config.read_text(encoding="utf-8"))
@@ -4302,7 +4399,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("contract-mismatched", mismatched_args.stdout + mismatched_args.stderr)
             mismatched_status = json.loads((moved_bundle_dir / "bundle_status.json").read_text(encoding="utf-8"))
             self.assertTrue(mismatched_status["direct_config_rollback_performed"])
-            self.assertTrue(mismatched_status["legacy_plugin_restored_after_direct_failure"])
+            self.assertFalse(mismatched_status["legacy_plugin_restored_after_direct_failure"])
             self.assertTrue(legacy_plugin_marker.exists())
             self.assertEqual(original_codex_config, codex_config.read_text(encoding="utf-8"))
 
@@ -4354,11 +4451,18 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertTrue(status["transport_end_to_end_verified"])
             self.assertTrue(status["desktop_app_server_loader_verified"])
             self.assertTrue(status["fresh_codex_app_server_inventory_verified"])
-            self.assertTrue(status["legacy_plugin_conflict_detected"])
-            self.assertTrue(status["legacy_plugin_removed_for_direct_config"])
+            self.assertFalse(status["legacy_plugin_conflict_detected"])
+            self.assertFalse(status["legacy_plugin_removed_for_direct_config"])
             self.assertFalse(status["legacy_plugin_restored_after_direct_failure"])
             self.assertFalse(status["legacy_plugin_marketplace_removed"])
-            self.assertFalse(legacy_plugin_marker.exists())
+            self.assertTrue(legacy_plugin_marker.exists())
+            self.assertFalse(plugin_list_called_marker.exists())
+            self.assertEqual("not_applicable", status["plugin_conflict_check_state"])
+            self.assertEqual(
+                "direct_config_does_not_require_plugin_inventory",
+                status["plugin_conflict_check_reason"],
+            )
+            self.assertEqual(0, status["plugin_conflict_check_attempts"])
             self.assertEqual(3, status["desktop_app_server_tool_count"])
             self.assertEqual(["fetch", "get_index_status", "search"], status["desktop_app_server_tool_names"])
             _assert_same_existing_path(self, codex_config, status["direct_config_path"])
@@ -4441,14 +4545,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
 
             generated_entry = json.loads(
-                (
-                    bundle_dir
-                    / "chatgpt-desktop-local-plugin"
-                    / "plugins"
-                    / "aksmcp"
-                    / ".mcp.json"
-                ).read_text(encoding="utf-8")
-            )["mcpServers"]["aksmcp"]
+                (bundle_dir / "chatgpt_desktop_local_mcp.json").read_text(encoding="utf-8")
+            )["ui_fields"]
             loader_payload = {
                 "name": "aksmcp",
                 "enabled": True,
@@ -4485,21 +4583,22 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             )
             env["CODEX_HOME"] = str(codex_config.parent)
             env["CODEX_GET_JSON"] = json.dumps(loader_payload, separators=(",", ":"))
+            install_command = [
+                str(powershell_dir / "powershell.exe"),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                files["connect"],
+                "-Target",
+                "codex",
+                "-InstallCodex",
+                "-CodexConfigPath",
+                str(codex_config),
+            ]
 
             completed = subprocess.run(
-                [
-                    str(powershell_dir / "powershell.exe"),
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    files["connect"],
-                    "-Target",
-                    "codex",
-                    "-InstallCodex",
-                    "-CodexConfigPath",
-                    str(codex_config),
-                ],
+                install_command,
                 cwd=root,
                 env=env,
                 capture_output=True,
@@ -4526,8 +4625,48 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual("verified", codex_record["stages"]["loader"]["state"])
             self.assertEqual("verified", codex_record["stages"]["transport"]["state"])
             self.assertEqual("not_checked", codex_record["stages"]["fresh_app_server"]["state"])
+            partial_attempt_id = codex_record["last_attempt"]["id"]
+
+            (fake_scripts / "check_codex_app_server_mcp.py").write_text(
+                _successful_direct_app_server_check_source(),
+                encoding="utf-8",
+            )
+            retry = subprocess.run(
+                install_command,
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+            self.assertEqual(0, retry.returncode, retry.stdout + retry.stderr)
+            retry_status = json.loads(
+                (bundle_dir / "bundle_status.json").read_text(encoding="utf-8")
+            )
+            retry_record = retry_status["client_connections"]["codex"]
+            retry_attempt_id = retry_record["last_attempt"]["id"]
+            self.assertNotEqual(partial_attempt_id, retry_attempt_id)
+            self.assertEqual("completed", retry_record["last_attempt"]["state"])
+            self.assertEqual("configured", retry_record["effective"]["state"])
+            self.assertEqual(retry_attempt_id, retry_record["effective"]["attempt_id"])
+            for stage_name in ("registration", "loader", "transport", "fresh_app_server"):
+                with self.subTest(stage=stage_name):
+                    self.assertEqual("verified", retry_record["stages"][stage_name]["state"])
+                    self.assertEqual(
+                        retry_attempt_id,
+                        retry_record["stages"][stage_name]["attempt_id"],
+                    )
+            self.assertTrue(retry_status["direct_config_registered"])
+            self.assertTrue(retry_status["direct_config_loader_verified"])
+            self.assertTrue(retry_status["direct_stdio_verified"])
+            self.assertTrue(retry_status["fresh_codex_app_server_inventory_verified"])
+            self.assertTrue(retry_status["desktop_app_server_loader_verified"])
 
     @unittest.skipUnless(os.name == "nt", "Desktop-only Codex config behavior is Windows-specific.")
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_chatgpt_desktop_keeps_verified_config_pending_when_codex_cli_is_absent(self) -> None:
         config = build_mcp_client_config(
             server_name="desktop-only-mcp",
@@ -4697,11 +4836,11 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 json.dumps(claude_bundle_config, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            plugin_config_path = Path(files["chatgpt_desktop_plugin_mcp"])
-            plugin_config = json.loads(plugin_config_path.read_text(encoding="utf-8"))
-            plugin_config["mcpServers"]["aks_mcp"]["args"].append("--chatgpt-source-marker")
-            plugin_config_path.write_text(
-                json.dumps(plugin_config, ensure_ascii=False, indent=2) + "\n",
+            desktop_config_path = Path(files["chatgpt_desktop_local"])
+            desktop_config = json.loads(desktop_config_path.read_text(encoding="utf-8"))
+            desktop_config["ui_fields"]["args"].append("--chatgpt-source-marker")
+            desktop_config_path.write_text(
+                json.dumps(desktop_config, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
             appdata_dir = root / "AppData" / "Roaming"
@@ -4988,10 +5127,14 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             env["CLAUDE_EXPECTED_DATA"] = str((bundle_dir / "data").resolve())
             completed = subprocess.run(
                 [
-                    str(windows_dir / "System32" / "cmd.exe"),
-                    "/d",
-                    "/c",
-                    files["connect_claude_code_bat"],
+                    str(powershell_dir / "powershell.exe"),
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    files["connect"],
+                    "-Target",
+                    "claude-code",
                 ],
                 cwd=root,
                 env=env,
@@ -5243,6 +5386,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(status["claude_code_transport_verified"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop BAT automation test")
+    @unittest.skip("legacy generated-plugin BAT installer was removed")
     def test_chatgpt_desktop_bat_registers_plugin_idempotently_from_korean_space_path(self) -> None:
         config = build_mcp_client_config(
             server_name="aksmcp",
@@ -5475,6 +5619,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn(str((bundle_dir / "data").resolve()), plugin_args)
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop fresh inventory failure test")
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_chatgpt_desktop_plugin_keeps_loader_verified_pending_when_fresh_inventory_fails(self) -> None:
         config = build_mcp_client_config(
             server_name="aksmcp",
@@ -5641,6 +5786,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertEqual("not_checked", desktop_record["stages"]["fresh_app_server"]["state"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop MCP name-conflict test")
+    @unittest.skip("legacy generated-plugin conflict path was removed")
     def test_chatgpt_desktop_installer_rejects_existing_direct_mcp_with_same_name(self) -> None:
         config = build_mcp_client_config(
             server_name="aksmcp",
@@ -5723,7 +5869,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         config = build_mcp_client_config(server_name="aksmcp", client_profile="bundle")
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
         start = wizard.index("function Get-ChatGptDesktopRestartState")
-        end = wizard.index("\nfunction Get-ChatGptDesktopPluginRoot", start)
+        end = wizard.index("\nfunction Get-BundleDataDir", start)
         function_source = wizard[start:end]
         probe = r'''
 $Registration = [DateTimeOffset]::Parse("2026-07-20T09:00:00Z")
@@ -5766,6 +5912,7 @@ $Result | ConvertTo-Json -Depth 6
         self.assertIsNone(result["unknown"]["desktop_restart_required"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop stale discovery test")
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_chatgpt_desktop_installer_rejects_stale_discovered_plugin_version(self) -> None:
         config = build_mcp_client_config(
             server_name="aksmcp",
@@ -5865,6 +6012,7 @@ $Result | ConvertTo-Json -Depth 6
             )
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop MCP loader verification test")
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_chatgpt_desktop_installer_rejects_plugin_missing_from_mcp_loader(self) -> None:
         config = build_mcp_client_config(
             server_name="aksmcp",
@@ -5962,6 +6110,7 @@ $Result | ConvertTo-Json -Depth 6
             self.assertTrue(status["plugin_rollback_complete"])
 
     @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop BAT failure-state test")
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_chatgpt_desktop_plugin_installer_does_not_mark_failed_registration_connected(self) -> None:
         config = build_mcp_client_config(
             server_name="aksmcp",
@@ -6100,7 +6249,17 @@ $Result | ConvertTo-Json -Depth 6
                 [str(windows_dir / "System32"), str(powershell_dir)]
             )
             completed = subprocess.run(
-                [str(windows_dir / "System32" / "cmd.exe"), "/d", "/c", files["connect_claude_desktop_bat"]],
+                [
+                    str(powershell_dir / "powershell.exe"),
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    files["connect"],
+                    "-Target",
+                    "claude-desktop",
+                    "-InstallClaudeDesktop",
+                ],
                 cwd=root,
                 env=env,
                 input="\n",
@@ -6225,9 +6384,6 @@ $Result | ConvertTo-Json -Depth 6
             for script_name in [
                 "claude_code_add_stdio.ps1",
                 "run_local_stdio_server.ps1",
-                "run_http_server.ps1",
-                "run_chatgpt_data_server.ps1",
-                "run_openai_secure_tunnel.ps1",
                 "doctor_mcp_connection.ps1",
             ]:
                 script = (output_dir / script_name).read_text(encoding="utf-8")
@@ -6250,33 +6406,10 @@ $Result | ConvertTo-Json -Depth 6
             self.assertIn("--scope", claude_code_cli_args)
             self.assertIn("user", claude_code_cli_args)
             self.assertIn(bundle_data_dir, claude_code_cli_args)
-            self.assertNotIn(stale_data_dir, bundle_config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"])
-            self.assertIn(
-                f"--data-dir {bundle_data_dir}",
-                bundle_config["quickstart"]["openai_secure_tunnel"]["stdio_mcp_command"],
-            )
+            self.assertNotIn("openai_secure_tunnel", bundle_config["quickstart"])
             self.assertNotIn(stale_data_dir, json.dumps(bundle_config, ensure_ascii=False))
             for profile_name in ("chatgpt_remote", "chatgpt"):
-                relocated_tunnel_script = bundle_config[profile_name]["openai_secure_tunnel"]["copy_paste_ps"]
-                self.assertIn(
-                    "$env:PRMCPBUILDER_TUNNEL_DATA_DIR = $BundleDataDir",
-                    relocated_tunnel_script,
-                )
-                self.assertIn('$BundleDataDir = Join-Path $BundleDir "data"', relocated_tunnel_script)
-                self.assertNotIn(stale_data_dir, relocated_tunnel_script)
-                self.assertNotIn(str(output_dir), relocated_tunnel_script)
-            for config_name in ("mcp_config.bundle.json", "chatgpt_connector.json"):
-                config_text = (output_dir / config_name).read_text(encoding="utf-8")
-                encoded_launchers = re.findall(
-                    r"-EncodedCommand ([A-Za-z0-9+/=]+)",
-                    config_text,
-                )
-                self.assertTrue(encoded_launchers, config_name)
-                for encoded_launcher in encoded_launchers:
-                    launcher_source = base64.b64decode(encoded_launcher).decode("utf-16-le")
-                    self.assertIn("$env:PRMCPBUILDER_TUNNEL_DATA_DIR", launcher_source)
-                    self.assertNotIn(stale_data_dir, launcher_source)
-                    self.assertNotIn(str(output_dir), launcher_source)
+                self.assertNotIn("openai_secure_tunnel", bundle_config[profile_name])
 
             wizard = (output_dir / "connect_mcp_client.ps1").read_text(encoding="utf-8")
             self.assertIn("Get-BundleDataDir", wizard)
@@ -6377,6 +6510,7 @@ $Result | ConvertTo-Json -Depth 6
                 status["stale_status_reports_cleared_on_generation"],
             )
 
+    @unittest.skip("legacy BAT/prompt/plugin ZIP contract was removed")
     def test_zips_setup_bundle_for_operator_handoff(self) -> None:
         config = build_mcp_client_config(
             server_name="govreg-local",

@@ -40,6 +40,7 @@ class Settings:
     rag_llm_max_output_chars: int = int(os.getenv("RAG_LLM_MAX_OUTPUT_CHARS", "2000"))
     rag_rate_limit_requests_per_window: int = int(os.getenv("RAG_RATE_LIMIT_REQUESTS_PER_WINDOW", "120"))
     rag_rate_limit_window_seconds: int = int(os.getenv("RAG_RATE_LIMIT_WINDOW_SECONDS", "60"))
+    rag_trace_enabled: bool = _env_bool("RAG_TRACE_ENABLED", True)
     agent_review_model: str = os.getenv("AGENT_REVIEW_MODEL", "gpt-4.1-mini")
     agent_review_api_base_url: str = os.getenv("AGENT_REVIEW_API_BASE_URL", "https://api.openai.com")
     agent_review_timeout_seconds: int = int(os.getenv("AGENT_REVIEW_TIMEOUT_SECONDS", "60"))

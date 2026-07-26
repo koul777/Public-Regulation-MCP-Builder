@@ -261,6 +261,8 @@ def settings_for_mcp_project(
     data_dir: str | Path,
     tenant_id: str,
     tenant_storage_isolation: bool | None = None,
+    api_audit_enabled: bool | None = None,
+    rag_trace_enabled: bool | None = None,
 ) -> Settings:
     base_dir = Path(data_dir)
     tenant_key = tenant_storage_key(tenant_id)
@@ -269,6 +271,16 @@ def settings_for_mcp_project(
     base_settings = Settings(
         data_dir=base_dir,
         tenant_storage_isolation=auto_isolated if tenant_storage_isolation is None else tenant_storage_isolation,
+        **(
+            {"api_audit_enabled": api_audit_enabled}
+            if api_audit_enabled is not None
+            else {}
+        ),
+        **(
+            {"rag_trace_enabled": rag_trace_enabled}
+            if rag_trace_enabled is not None
+            else {}
+        ),
     )
     return settings_for_tenant(base_settings, tenant_id)
 

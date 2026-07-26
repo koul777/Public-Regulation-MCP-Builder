@@ -461,7 +461,7 @@ class BuildMcpHandoffReportTests(unittest.TestCase):
             readiness = root / "readiness.json"
             bundle = root / "bundle"
             _seed_bundle(bundle, server_name="aks-regulation-mcp")
-            bundle.joinpath("run_http_server.ps1").unlink()
+            bundle.joinpath("run_mcp_stdio_server.ps1").unlink()
             _write_json(product, _product_payload())
             _write_json(demo, _demo_payload())
             _write_json(readiness, _readiness_payload())
@@ -477,7 +477,7 @@ class BuildMcpHandoffReportTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertFalse(report["handoff_ready"])
         self.assertIn("bundle-files-missing", {item["code"] for item in report["findings"]})
-        self.assertIn("run_http_server.ps1", report["bundle_summary"]["missing_files"])
+        self.assertIn("run_mcp_stdio_server.ps1", report["bundle_summary"]["missing_files"])
 
     def test_bundle_runtime_manifest_must_match_product_readiness_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

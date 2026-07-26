@@ -147,15 +147,15 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
 
-    def test_path_checks_reject_snake_case_chatgpt_plugin_container(self) -> None:
+    def test_path_checks_reject_missing_chatgpt_desktop_ui_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "bundle"
             bundle.mkdir()
             _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
-            plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
-            payload = json.loads(plugin_path.read_text(encoding="utf-8"))
-            payload["mcp_servers"] = payload.pop("mcpServers")
-            plugin_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+            desktop_path = bundle / "chatgpt_desktop_local_mcp.json"
+            payload = json.loads(desktop_path.read_text(encoding="utf-8"))
+            payload["removed_ui_fields"] = payload.pop("ui_fields")
+            desktop_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
             checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
 
@@ -163,15 +163,15 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
-        self.assertIn("expected mcpServers", checks["clients"]["chatgpt_desktop_local"]["schema_error"])
+        self.assertIn("ui_fields", checks["clients"]["chatgpt_desktop_local"]["schema_error"])
 
-    def test_path_checks_reject_chatgpt_plugin_bom(self) -> None:
+    def test_path_checks_reject_chatgpt_desktop_config_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "bundle"
             bundle.mkdir()
             _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
-            plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
-            plugin_path.write_bytes(b"\xef\xbb\xbf" + plugin_path.read_bytes())
+            desktop_path = bundle / "chatgpt_desktop_local_mcp.json"
+            desktop_path.write_bytes(b"\xef\xbb\xbf" + desktop_path.read_bytes())
 
             checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
 
@@ -180,14 +180,14 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertIn("EF BB BF", checks["clients"]["chatgpt_desktop_local"]["encoding_error"])
 
-    def test_path_checks_reject_duplicate_chatgpt_plugin_json_keys(self) -> None:
+    def test_path_checks_reject_duplicate_chatgpt_desktop_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "bundle"
             bundle.mkdir()
             _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
-            plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
-            plugin_path.write_text(
-                '{"mcpServers":{"govreg-local":{"command":"powershell.exe","command":"other","args":[]}}}',
+            desktop_path = bundle / "chatgpt_desktop_local_mcp.json"
+            desktop_path.write_text(
+                '{"ui_fields":{"name":"govreg-local","command":"powershell.exe","command":"other","args":[]}}',
                 encoding="utf-8",
             )
 
@@ -283,17 +283,17 @@ def _write_client_configs(bundle: Path, *, launcher: Path, data_dir: Path) -> No
         + "\n",
         encoding="utf-8",
     )
-    plugin_path = bundle / "chatgpt-desktop-local-plugin" / "plugins" / "govreg-local" / ".mcp.json"
-    plugin_path.parent.mkdir(parents=True)
-    plugin_path.write_text(
+    (bundle / "chatgpt_desktop_local_mcp.json").write_text(
         json.dumps(
             {
-                "mcpServers": {
-                    "govreg-local": {
-                        "type": "stdio",
-                        "command": "powershell.exe",
-                        "args": args,
-                    }
+                "profile": "chatgpt-desktop-local",
+                "server_name": "govreg-local",
+                "ui_fields": {
+                    "name": "govreg-local",
+                    "command": "powershell.exe",
+                    "args": args,
+                    "cwd": str(bundle),
+                    "env": {},
                 }
             },
             ensure_ascii=False,

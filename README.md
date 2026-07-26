@@ -18,16 +18,29 @@ kordoc --version
 
 자세한 PATH·portable·wheel 안내는 [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)를 참고하세요. 승인 JSON을 직접 수정하거나 Kordoc 게이트를 끄면 안 됩니다.
 
-독립적으로 옮긴 MCP 번들에서 `McpError: Connection closed`가 나오면 오래된 전역 콘솔 스크립트가 선택된 것일 수 있습니다. 번들에 포함된 `install_local_package.ps1`을 먼저 실행하거나, 설치된 wheel 환경을 명시한 뒤 연결 BAT를 다시 실행합니다.
+독립적으로 옮긴 MCP 번들에서 `McpError: Connection closed`가 나오면 오래된 전역 콘솔 스크립트가 선택된 것일 수 있습니다. 번들의 `install_local_package.ps1`을 실행하거나 설치된 wheel 환경을 명시한 뒤 직접 연결 설정을 갱신합니다.
 
 ```powershell
 $env:REG_RAG_PYTHON = (Join-Path $env:USERPROFILE 'venvs\reg-rag\Scripts\python.exe')
 & '.\run_mcp_stdio_server.ps1'
 ```
 
-생성 launcher는 source/package Python을 import probe하고 PATH의 `reg-rag-mcp-server`도 `--help` 검증 후에만 사용합니다. 검증에 실패하면 설치 또는 `REG_RAG_PYTHON` 지정 안내를 출력합니다. PowerShell에 표시되는 사용자 홈 경로 같은 호스트 경로를 MCP 설정이나 공개 응답에 복사하지 말고 생성된 번들의 `.bat`/`.ps1` 파일을 사용하세요.
+생성 launcher는 source/package Python을 import probe하고 PATH의 `reg-rag-mcp-server`도 `--help` 검증 후에만 사용합니다. 검증에 실패하면 설치 또는 `REG_RAG_PYTHON` 지정 안내를 출력합니다. 로컬은 생성된 설정 JSON/TOML과 PowerShell만 사용하고, 원격은 Vercel HTTPS `/mcp` 주소만 Connector에 등록합니다.
 
 원본 문서가 현재 공개 소스 checkout에 없으면 해당 기관의 원본 파일이 있는 운영 환경에서 위 순서로 재처리·승인·색인을 완료한 뒤 번들을 다시 생성해야 합니다.
+
+## MCP 연결 정석
+
+생성 번들은 MCP 연결용 BAT, 에이전트 프롬프트, 로컬 플러그인 마켓플레이스를 만들지 않습니다. 로컬 stdio와 원격 Streamable HTTP를 다음과 같이 직접 연결합니다.
+
+| 클라이언트 | 전송 | 등록할 값 |
+| --- | --- | --- |
+| ChatGPT Desktop / Codex CLI / Codex IDE | stdio | `codex_config_snippet.toml`의 `command`, `args`, `cwd`를 공용 `~/.codex/config.toml`에 등록하거나, Desktop 수동 입력 시 `chatgpt_desktop_local_mcp.json`의 `ui_fields` 사용 |
+| Claude Desktop | stdio | `claude_desktop_config.json`의 `mcpServers`를 사용자 설정에 병합 |
+| Claude Code | stdio | `claude_code_add_stdio.ps1`로 공식 `claude mcp add --transport stdio --scope user` 실행 |
+| ChatGPT Desktop / Codex / Claude 원격 연결 | Streamable HTTP | Vercel에 배포한 하나의 `https://<deployment>/mcp` 주소와 승인된 인증 등록 |
+
+stdio는 디렉터리명만 지정하면 실행되지 않습니다. 반드시 실행 파일인 `command`와 `args`, 올바른 `cwd`, 서버가 요구하는 경우 `env`를 함께 등록해야 합니다. HTTP 연결에는 로컬 폴더가 아니라 외부에서 접근 가능한 최종 HTTPS `/mcp` 주소를 입력합니다. 자세한 설정은 [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)와 [Vercel HTTPS MCP 배포](docs/vercel_https_mcp_ko.md)를 참고하세요.
 
 ## MCP 구축 후 사용 예시
 
@@ -43,21 +56,20 @@ $env:REG_RAG_PYTHON = (Join-Path $env:USERPROFILE 'venvs\reg-rag\Scripts\python.
 
 이번 v1.2는 **MCP 첫 연결 신뢰성**과 **파싱·전처리 변경 보호**를 강화한 업데이트입니다.
 
-- ChatGPT Desktop 로컬 direct MCP·선택형 플러그인과 ChatGPT 원격 HTTPS MCP 프로필을 실행 방식 기준으로 분리했습니다.
-- 플러그인 등록, 현재 대화 첨부, MCP 초기화, 도구 검색, 종단간 검증 상태를 각각 구분합니다.
-- `initialize` → `tools/list` → `get_index_status`가 모두 성공해야 연결 검증 완료로 표시합니다.
-- Windows BAT의 한글·공백 경로, PowerShell 5.1 UTF-8, 반복 실행과 손상된 설정 복구를 보강했습니다.
+- ChatGPT Desktop·Codex CLI·Codex IDE는 공용 `~/.codex/config.toml`의 직접 MCP 설정을 사용하며, 같은 설정에서 로컬 stdio와 원격 Streamable HTTP를 모두 지원합니다.
+- 직접 설정 등록, MCP 초기화, 도구 검색, 실제 도구 호출 검증 상태를 각각 구분합니다.
+- `initialize` → `tools/list` 뒤 서버 프로필의 실제 도구 호출까지 성공해야 연결 검증 완료로 표시합니다. `chatgpt-data`는 `search` → `fetch`, full 프로필은 `get_index_status`를 검증합니다.
+- PowerShell 5.1의 한글·공백 경로, UTF-8, 반복 실행과 손상된 설정 복구를 보강했습니다.
 - Windows PowerShell 5.1의 `Set-Content -Encoding UTF8`이 companion JSON에 BOM을 다시 붙이던 공급자 측 결함을 제거하고, 모든 기계 판독 JSON/TOML을 BOM 없는 UTF-8로 저장합니다.
-- 동일 이름의 오래된 로컬 마켓플레이스를 현재 번들 경로로 교체하고, `codex plugin list --json`의 활성 플러그인 버전·공급 경로가 모두 일치해야 등록 성공으로 판정합니다.
-- 동일 MCP의 로컬 마켓플레이스 설치를 직렬화하고, Codex가 방금 등록한 마켓플레이스를 일시적으로 찾지 못하면 플러그인 설치를 최대 3회 재시도합니다.
-- ChatGPT/Codex 플러그인은 `.codex-plugin/plugin.json`의 `mcpServers`가 플러그인 루트의 `./.mcp.json`을 가리키고, companion `.mcp.json`은 현재 Codex 플러그인 검증기·번들 플러그인·app-server가 함께 승인하는 `mcpServers` 컨테이너를 사용합니다. Codex 독립 로컬 설정의 `config.toml`은 snake_case `[mcp_servers.*]`를 사용하며 플러그인 JSON과 계약이 다릅니다. Claude API의 `mcp_servers`는 또 다른 API 요청 계약입니다.
-- Claude Code BAT는 MCP를 `--scope user`로 등록하고 `claude mcp get`으로 다시 확인하므로 생성 폴더 밖의 다른 프로젝트에서도 같은 사용자에게 보입니다.
-- 내용 기반 플러그인 cachebuster, strict JSON-RPC stdout 검사, ZIP 별도 경로 추출 smoke와 wheel-only 공급 검증을 추가했습니다.
+- 직접 Codex MCP 등록은 선택형 플러그인 목록을 조회하지 않습니다. 따라서 `codex plugin list --json`의 일시적 실패가 `config.toml` 등록을 막지 않습니다.
+- 생성 번들은 BAT, 에이전트 프롬프트, 로컬 플러그인 마켓플레이스를 만들지 않습니다.
+- Claude Code 등록 PowerShell은 MCP를 `--scope user`로 등록하고 `claude mcp get`으로 다시 확인하므로 생성 폴더 밖의 다른 프로젝트에서도 같은 사용자에게 보입니다.
+- strict JSON-RPC stdout 검사, ZIP 별도 경로 추출 smoke와 wheel-only 공급 검증을 추가했습니다.
 - 파싱·전처리·MCP 연결 로직은 집중 회귀 테스트, 보호 PR 항목, Code Owner 검토를 거치도록 하네스를 추가했습니다.
 
-연결 대상은 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 순서로 표시합니다. ChatGPT Desktop은 `Settings > MCP servers > Add server` 내장 등록 안내가 기본이며 프로그램이 Name·STDIO·Command·Arguments를 실제 번들 경로로 표시합니다. Claude Code와 Codex CLI는 대상별 연결 요청문을 실행하고, 로컬 에이전트 실행이 어려울 때만 생성된 `.bat`를 보조 수단으로 사용합니다. Claude Desktop은 전용 BAT가 기본입니다. [1.2 MCP 연결 상세](#12-업데이트-mcp-첫-연결-신뢰성)에서 대상별 절차와 검증 상태를 확인할 수 있습니다.
+연결은 두 방식만 사용합니다. 로컬은 stdio의 `command`, `args`, `cwd`, `env` 실행 계약을 클라이언트에 직접 등록하고, 원격은 승인 runtime bundle을 Vercel에 배포한 뒤 HTTPS `/mcp` 주소를 Connector에 등록합니다. 폴더명만 지정해서는 stdio MCP가 등록되지 않습니다.
 
-공급자 회귀 하네스는 Windows 설치를 두 번 반복한 뒤에도 `.mcp.json`이 `EF BB BF`로 시작하지 않는지 확인하고, `initialize` → `tools/list` → `get_index_status`가 실제로 성공해야 직접 연결 검증을 완료합니다. 공급 ZIP에서는 `.venv`, `__pycache__`, 빌드 캐시와 로컬 런타임 부산물을 제외합니다.
+공급자 회귀 하네스는 Windows 설치를 두 번 반복하고, `initialize` → `tools/list` 뒤 해당 프로필의 필수 도구 호출까지 실제로 성공해야 직접 연결 검증을 완료합니다. 공급 ZIP에서는 `.venv`, `__pycache__`, 빌드 캐시와 로컬 런타임 부산물을 제외합니다.
 
 ## v1.1.0 업데이트 내역
 
@@ -71,7 +83,7 @@ $env:REG_RAG_PYTHON = (Join-Path $env:USERPROFILE 'venvs\reg-rag\Scripts\python.
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&logoColor=white)](#windows-실행판)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![MCP](https://img.shields.io/badge/MCP-local%20stdio%20%7C%20HTTPS-0F766E)](#ai-프로그램에-mcp-연결)
+[![MCP](https://img.shields.io/badge/MCP-local%20stdio%20%7C%20HTTPS-0F766E)](#mcp-연결-정석)
 [![Kordoc](https://img.shields.io/badge/HWP%20표-Kordoc%20선택%20보강-6B7280)](https://github.com/chrisryugj/kordoc)
 [![승인 데이터만](https://img.shields.io/badge/색인-승인%20데이터만-15803D)](#처리-구조)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -94,27 +106,18 @@ PDF, HWP, HWPX, DOCX 형식의 공공기관 규정을 **기관 → 규정 → �
 
 ## 1.2 업데이트: MCP 첫 연결 신뢰성
 
-1.2의 연결 대상은 `Claude Code → Codex CLI → Claude Desktop → ChatGPT Desktop → ChatGPT 원격 MCP → ChatGPT 웹 → Claude (HTTPS)` 순서로 안내합니다. ChatGPT Desktop은 내장 MCP 서버 등록 화면이 기본이고, Codex CLI와 Claude Code에는 대상별 에이전트 연결 요청문을 제공합니다. BAT는 보조 수단이며 Claude Desktop은 전용 BAT를 기본으로 사용합니다.
+1.2의 공식 연결 경로는 로컬 stdio와 공개 HTTPS Streamable HTTP입니다. BAT와 에이전트 연결 프롬프트는 생성하지 않습니다.
 
 - `claude-code`: 공식 CLI의 사용자 범위(`--scope user`)로 로컬 stdio MCP를 등록한 뒤 `claude mcp get`으로 확인합니다.
-- Codex CLI: 대상별 요청문으로 사용자 Codex MCP 설정을 등록하고 `codex mcp get`으로 확인합니다.
-- `claude-desktop`: 전용 BAT가 `%APPDATA%\Claude\claude_desktop_config.json`을 백업·병합하고 설치된 설정의 stdio를 검증합니다. 앱을 완전히 재시작한 뒤 Connectors와 실제 도구 호출은 별도로 확인합니다.
-- `chatgpt-desktop-local`: 생성 안내의 Name·STDIO·Command·Working directory·Arguments를 ChatGPT Desktop의 `Settings > MCP servers > Add server`에 등록합니다. 이 내장 화면이 기본 경로이며 Codex CLI를 실행하라는 뜻이 아닙니다. 현재 로컬 direct MCP 설정은 Codex CLI와 같은 사용자 파일 `~/.codex/config.toml`을 공유하므로 같은 이름의 항목을 서로 덮어쓰지 않도록 주의합니다. 저장 후 Desktop을 완전히 재시작하고 새 대화에서 `/mcp`와 실제 도구 호출을 확인합니다.
-- ChatGPT Desktop 전용 BAT는 위 공유 `~/.codex/config.toml`을 백업·기록하고 설치된 stdio 항목을 검증하는 보조 수단입니다. BAT 성공은 Desktop 메뉴·도구 노출 성공이 아니며, 제품에 없는 MCP 기능을 새로 활성화하지도 않습니다. 메뉴가 보이지 않으면 앱 업데이트와 계정·워크스페이스 제공 여부를 확인하고, 재시작 후에도 `/mcp`가 없다면 원격 HTTPS MCP 또는 Secure MCP Tunnel을 사용합니다.
-- `chatgpt-remote`: 인증된 HTTPS Streamable HTTP 엔드포인트를 ChatGPT 개발자 모드 앱에 등록합니다.
-- ChatGPT 웹: localhost 대신 승인된 Secure MCP Tunnel을 사용합니다.
-- `claude-api`: 공개 HTTPS MCP를 Claude custom connector 또는 Messages API 설정에 사용합니다.
-- 같은 로컬 플러그인 연결 BAT가 겹쳐 실행되면 먼저 시작한 설치가 끝날 때까지 대기합니다. 마켓플레이스 등록 직후의 일시적인 `marketplace ... is not configured or installed` 오류는 마켓플레이스를 재확인한 뒤 최대 3회 재시도합니다.
-- `plugin_registered`는 manifest 검증, 설치 명령 성공, `codex plugin list --json`에서 새 cachebuster 버전·활성 상태·현재 번들의 마켓플레이스 경로가 모두 일치한 경우에만 참입니다. 현재 대화의 도구 첨부와 동일하게 취급하지 않습니다.
-- 실제 MCP `initialize` → `tools/list` → `get_index_status`가 모두 성공하면 `transport_end_to_end_verified=true`가 됩니다. ChatGPT Desktop의 `end_to_end_verified=true`는 Desktop 도구 노출과 현재 대화의 실제 호출까지 확인하기 전에는 기록하지 않습니다.
+- ChatGPT Desktop·Codex CLI·Codex IDE: `codex_config_snippet.toml`을 공용 사용자 설정 `~/.codex/config.toml`에 반영하고 `codex mcp get` 또는 `/mcp`로 확인합니다. 직접 등록 과정은 `codex plugin list`를 호출하지 않습니다.
+- `claude-desktop`: `claude_desktop_config.json`의 `mcpServers`를 `%APPDATA%\Claude\claude_desktop_config.json`에 병합합니다. 앱을 완전히 재시작한 뒤 Connectors와 실제 도구 호출을 별도로 확인합니다.
+- ChatGPT Desktop에서 수동 등록할 때는 `chatgpt_desktop_local_mcp.json`의 `ui_fields`에 있는 Name·Command·Working directory·Arguments·Environment를 그대로 입력합니다. 폴더명만 입력하는 방식이 아닙니다.
+- ChatGPT Desktop 메뉴가 보이지 않으면 앱 업데이트와 계정·워크스페이스 제공 여부를 확인하고, 재시작 후에도 `/mcp`가 없다면 Vercel HTTPS MCP를 사용합니다.
+- ChatGPT Desktop / Codex Vercel HTTP: 배포된 `https://<deployment>/mcp`를 `Settings > MCP servers > Add server`의 Streamable HTTP URL 또는 공용 `config.toml`의 `url`로 등록합니다. 비공개 endpoint는 `bearer_token_env_var` 또는 OAuth를 사용할 수 있습니다.
+- Claude Vercel HTTP: 같은 `https://<deployment>/mcp`를 Claude custom connector에 등록합니다. 서버를 따로 배포할 필요가 없습니다.
+- 실제 MCP `initialize` → `tools/list` 뒤 `search` → `fetch`가 모두 성공하면 `transport_end_to_end_verified=true`가 됩니다. ChatGPT Desktop의 `end_to_end_verified=true`는 Desktop 도구 노출과 현재 대화의 실제 호출까지 확인하기 전에는 기록하지 않습니다.
 
-ChatGPT Desktop 새 대화의 첫 검증 문장은 다음과 같습니다.
-
-```text
-aksmcp MCP의 연결 상태와 사용 가능한 규정 도구를 보여줘.
-```
-
-direct MCP가 보이지 않으면 설치·로더 검증이 완료됐는지 확인한 뒤 ChatGPT Desktop을 완전히 종료해 재시작하고 새 대화에서 `/mcp`를 다시 확인합니다. 그 뒤에도 로컬 MCP가 보이지 않는 제품 구성에서는 `chatgpt-remote` 또는 Secure MCP Tunnel을 사용합니다. 선택형 플러그인은 Work/Codex 배포가 명시적으로 필요할 때만 사용하며, `@aksmcp` 반복 입력만으로 설치나 연결이 이루어지지는 않습니다.
+direct MCP가 보이지 않으면 ChatGPT Desktop을 완전히 종료해 재시작하고 새 대화에서 `/mcp`를 확인합니다. 그 뒤에도 로컬 MCP가 보이지 않는 제품 구성에서는 Vercel HTTPS MCP를 사용합니다.
 
 ### 1.2 연결 상태와 검증 기준
 
@@ -124,19 +127,17 @@ direct MCP가 보이지 않으면 설치·로더 검증이 완료됐는지 확�
 - `process_started`: 로컬 프로세스 또는 원격 MCP 세션이 실제로 시작됨
 - `mcp_initialized`: MCP `initialize` 성공
 - `tools_discovered`: MCP `tools/list` 성공 및 도구 발견
-- `plugin_install_command_succeeded`: 플러그인 설치 명령 종료 코드 성공
-- `plugin_manifest_validated`: `plugin.json`, `.mcp.json`, `marketplace.json`의 strict UTF-8/JSON 검증 성공
-- `plugin_discoverable`: 설치된 selector가 `codex plugin list`에서 발견됨
-- `plugin_registered`: 위 manifest·설치와 정확한 버전·공급 경로 discoverability 조건이 모두 성공
-- `direct_stdio_verified`: 생성 launcher로 직접 `initialize`, `tools/list`, `get_index_status` 성공
+- `direct_config_registered`: 공용 `config.toml`에 직접 MCP 항목 등록 성공
+- `direct_config_loader_verified`: `codex mcp get`이 등록된 stdio 실행 계약을 동일하게 읽음
+- `direct_stdio_verified`: 생성 launcher로 직접 `initialize`, `tools/list`와 서버 프로필의 필수 도구 호출 성공
 - `desktop_tool_scan_verified`: ChatGPT Desktop 자체 도구 scan에서 MCP 도구 노출 확인
-- `conversation_attachment_verified`: 현재 대화에서 플러그인 도구 첨부 확인
+- `conversation_attachment_verified`: 현재 대화에서 MCP 도구 첨부 확인
 - `conversation_attachment_unverified`: 제품 UI의 도구 노출 및 현재 대화의 실제 도구 호출이 아직 확인되지 않음
 - `end_to_end_verified`: 해당 smoke 보고서의 MCP 전송 계약(`initialize`, `tools/list`, 필수 도구 호출)이 모두 성공함. ChatGPT Desktop의 현재 대화 첨부 완료를 뜻하지 않음
 
-로컬 stdio와 원격 Streamable HTTP는 실제 MCP 세션으로 따로 검증합니다. `.mcp.json`은 첫 3바이트가 `EF BB BF`이면 계약 실패이며, 기계 판독 JSON/TOML은 BOM 없는 UTF-8로 저장합니다. Windows BAT는 한글·공백 경로, 반복 실행, 등록 실패 시 거짓 성공 방지와 손상된 Claude Desktop 생성 JSON 복구를 회귀 테스트합니다. 원격 연결은 인증된 HTTPS 엔드포인트를 대상으로 생성된 `validate_chatgpt_remote_mcp.ps1`에서 다시 검증하며, 이 성공도 ChatGPT의 현재 대화에 도구가 첨부됐다는 뜻은 아닙니다.
+로컬 stdio와 원격 Streamable HTTP는 실제 MCP 세션으로 따로 검증합니다. 기계 판독 JSON/TOML은 BOM 없는 UTF-8로 저장합니다. PowerShell은 한글·공백 경로, 반복 실행, 등록 실패 시 거짓 성공 방지와 손상된 Claude Desktop 생성 JSON 복구를 회귀 테스트합니다. 원격 연결은 인증된 HTTPS 엔드포인트를 대상으로 생성된 `validate_chatgpt_remote_mcp.ps1`에서 다시 검증합니다.
 
-공급 ZIP은 생성 번들, 승인 runtime data, 빌드된 wheel만 allowlist로 포함합니다. `.venv`, `venv`, `__pycache__`, 테스트/빌드 캐시와 로컬 부산물은 포함하지 않으며, 로컬 플러그인의 세 companion JSON은 압축 직전에 다시 strict 검증합니다.
+공급 ZIP은 생성 번들, 승인 runtime data, 빌드된 wheel만 allowlist로 포함합니다. `.venv`, `venv`, `__pycache__`, 테스트/빌드 캐시와 로컬 부산물은 포함하지 않습니다.
 
 파싱·전처리·MCP 연결 로직과 회귀 기준은 보호 대상입니다. 관련 변경은 집중 회귀 테스트, PR 본문의 영향·불변조건·검증 근거, Code Owner 검토와 `preprocessing-reviewed` 라벨을 요구합니다. 자세한 절차는 [파싱·전처리·MCP 연결 변경 보호 하네스](docs/preprocessing_change_governance_ko.md)를 따릅니다.
 
@@ -279,13 +280,13 @@ README 촬영용 샘플에서는 외부 API 키를 넣지 않았으므로 실제
 
 `선택한 규정 N개`에서는 각 규정의 승인 청크 수와 MCP 노출 기록 수를 표로 확인합니다. 하나라도 검수·승인·색인이 끝나지 않았으면 누락된 채 생성하지 않고 MCP 생성 버튼을 잠급니다.
 
-그다음 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 중 실제로 사용할 대상을 선택합니다. ChatGPT Desktop을 선택하면 프로그램이 현재 번들 폴더명·절대경로·핵심 구조와 Name·STDIO·Command·Arguments를 표시하며, 이 값을 `Settings > MCP servers > Add server`에 등록합니다. Codex CLI와 Claude Code는 대상별 에이전트 연결 요청문을 사용하고, 내장 등록이나 로컬 에이전트 실행이 어려울 때만 BAT를 보조 수단으로 사용합니다.
+그다음 사용할 클라이언트와 연결 방식을 선택합니다. 로컬 stdio를 선택하면 화면에는 클라이언트에 등록할 실제 `command`, `args`, `cwd`, `env` JSON을 표시합니다. HTTP를 선택하면 Vercel 또는 승인 서버의 최종 HTTPS `/mcp` 주소만 표시합니다.
 
 ![기관 범위와 MCP 연결 대상을 선택하는 화면](docs/assets/readme-guide-05-mcp-next.png)
 
 ### 6. MCP 파일 묶음 생성
 
-`생성할 MCP 이름`을 사용자가 직접 입력하고 저장 폴더를 확인한 뒤 `MCP로 쓸 파일 묶음 만들기` 버튼을 누릅니다. 폴더명에서 만든 값은 입력 예시로만 표시되며 자동으로 적용되지 않습니다. 이름을 입력하지 않으면 ZIP, BAT, 연결 설정을 생성할 수 없고, 입력한 이름만 각 AI 앱의 MCP 이름으로 등록됩니다.
+`생성할 MCP 이름`을 사용자가 직접 입력하고 저장 폴더를 확인한 뒤 `MCP로 쓸 파일 묶음 만들기` 버튼을 누릅니다. 폴더명에서 만든 값은 입력 예시로만 표시되며 자동으로 적용되지 않습니다. 이름을 입력하지 않으면 ZIP과 연결 설정을 생성할 수 없고, 입력한 이름만 각 AI 앱의 MCP 이름으로 등록됩니다.
 
 ![서버 이름과 저장 위치를 정하는 MCP 생성 화면](docs/assets/readme-guide-06-bundle.png)
 
@@ -295,9 +296,7 @@ README 촬영용 샘플에서는 외부 API 키를 넣지 않았으므로 실제
 
 ![완성된 MCP 폴더와 ZIP 파일](docs/assets/readme-guide-06-generated-files.png)
 
-생성 폴더에는 선택한 클라이언트에 맞는 더블클릭용 파일이 들어갑니다.
-
-![Codex, Claude, ChatGPT 연결 배치 파일](docs/assets/readme-guide-09-generated-bat-files.png)
+생성 폴더에는 직접 등록할 JSON/TOML, 실행·검증 PowerShell, 승인 runtime data가 들어갑니다. BAT와 에이전트 연결 프롬프트는 생성하지 않습니다.
 
 ## 대량 규정 진행 표시
 
@@ -315,61 +314,42 @@ README 촬영용 샘플에서는 외부 API 키를 넣지 않았으므로 실제
 
 ## 프로그램별 연결
 
-비개발자는 PowerShell 스크립트나 JSON 설정을 직접 편집할 필요가 없습니다.
+공식 연결 경로는 다음 두 가지뿐입니다.
 
-1. Claude Code는 압축을 푼 폴더에서 `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`를 실행합니다.
-2. Codex CLI는 같은 방식으로 `CODEX_AGENT_CONNECT_PROMPT.md`를 실행합니다.
-3. Claude Desktop은 전용 BAT로 `%APPDATA%\Claude\claude_desktop_config.json`을 백업·병합합니다.
-4. ChatGPT Desktop은 `CHATGPT_DESKTOP_CONNECT_GUIDE.md`의 값을 `Settings > MCP servers > Add server`에 입력합니다. ZIP 원본의 `<PROGRAM_BUNDLE_DIR>`은 그대로 입력하지 않습니다.
-5. ChatGPT 원격 MCP는 승인된 공개 HTTPS `/mcp`를 `Settings > Apps > Create`의 개발자 모드 custom app에 등록합니다.
-6. ChatGPT 웹에서 내부망 MCP를 쓸 때는 승인된 Secure MCP Tunnel을 준비한 뒤 `Settings > Plugins`의 `+`에서 Connection을 Tunnel로 선택합니다.
-7. Claude (HTTPS)는 Claude 앱 custom connector와 Messages API를 구분합니다. 앱은 HTTPS URL만 `Customize > Connectors`에 등록하고, API는 생성된 `claude_api_fragment.json`을 요청에 사용합니다.
-8. 로컬 대상은 설치 또는 등록 후 해당 앱을 완전히 종료·재실행합니다. ChatGPT Desktop·Codex CLI·Claude Code는 새 대화 또는 task에서 `/mcp`와 실제 `get_index_status` 호출을 확인합니다. Claude Desktop은 새 대화에서 이름을 지정해 실제 규정 도구 호출을 요청합니다. 이때 `/mcp` 대신 Connectors에서 서버를 먼저 확인합니다. 원격 ChatGPT/Claude 연결은 새 대화에서 만든 앱 또는 Connector를 첨부합니다.
+1. 로컬 stdio: 생성 화면의 `command`, `args`, `cwd`, `env`를 클라이언트 MCP 설정에 등록합니다. 디렉터리명만 입력하는 방식이 아닙니다.
+2. 원격 HTTPS: 승인 runtime bundle을 Vercel에 배포하고 표시된 `https://<deployment>/mcp` 주소를 Connector에 등록합니다.
+
+로컬 클라이언트별 실제 설정 파일은 다음과 같습니다.
 
 `/mcp`에 서버 이름은 보이지만 도구가 0개이거나 `Connection closed`가 나오면 연결 완료가 아닙니다. 설정 항목은 남아 있어도 이전 번들의 `runtime_python.json`과 현재 wheel/모듈 identity가 달라 서버가 시작 직후 종료될 수 있으므로, 최신 번들의 대상별 연결 절차를 다시 실행해 package 설치·runtime 기록·doctor·stdio·loader 검증을 한 번에 갱신합니다.
 
-| 대상 | 사용자가 실행할 파일 | 프로그램이 처리하는 설정 |
+| 대상 | 직접 적용할 파일 | 설정 위치 |
 | --- | --- | --- |
-| Claude Code | `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md` | `claude mcp add --transport stdio --scope user ...`로 사용자 범위 stdio 등록 후 `claude mcp get` 검증; BAT는 보조 수단 |
-| Codex CLI | `CODEX_AGENT_CONNECT_PROMPT.md` | 사용자 Codex 설정에 현재 MCP 서버명과 실제 폴더 경로를 등록하고 `codex mcp get` 검증; BAT는 보조 수단 |
-| Claude Desktop | `Claude Desktop에 연결하기.bat` | `%APPDATA%\Claude\claude_desktop_config.json` 백업·병합 후 설치된 설정으로 stdio 검증; 앱 인식은 재시작 후 별도 확인 |
-| ChatGPT Desktop | `CHATGPT_DESKTOP_CONNECT_GUIDE.md` | `Settings > MCP servers > Add server`에 생성값 등록 후 Save·Restart; 로컬 direct 저장소는 Codex CLI와 `~/.codex/config.toml`을 공유하지만 기본 사용 경로는 Desktop 설정 화면 |
-| ChatGPT 원격 MCP | `ChatGPT HTTPS에 연결하기.bat` | 승인된 서버의 공개 HTTPS `/mcp` 주소와 인증을 준비하고 `Settings > Apps > Create`의 개발자 모드 custom app에 등록 |
-| ChatGPT 웹 | `ChatGPT 보안 Tunnel에 연결하기.bat` | OpenAI Secure MCP Tunnel을 준비한 뒤 `Settings > Plugins` 또는 `https://chatgpt.com/plugins`의 `+`에서 Connection을 Tunnel로 선택; Work mode marketplace 플러그인 설치는 별도 경로 |
-| Claude (HTTPS MCP) | `Claude HTTPS에 연결하기.bat` | Messages API용 `claude_api_fragment.json` 생성값을 안내; Claude 앱에서는 JSON이 아니라 HTTPS URL만 `Customize > Connectors`에 등록 |
+| Claude Code | `claude_code_add_stdio.ps1` | 공식 `claude mcp add --transport stdio --scope user` |
+| ChatGPT Desktop / Codex CLI / Codex IDE | `codex_config_snippet.toml` | 공용 `~/.codex/config.toml` |
+| Claude Desktop | `claude_desktop_config.json` | `%APPDATA%\Claude\claude_desktop_config.json`의 `mcpServers` |
+| ChatGPT Desktop 수동 입력 | `chatgpt_desktop_local_mcp.json`의 `ui_fields` | `Settings > MCP servers > Add server` |
+| Vercel HTTPS | 배포 후 표시되는 URL | ChatGPT/Claude Connector의 HTTPS `/mcp` |
 
-각 앱은 같은 승인 데이터를 사용하지만 연결 화면과 설정 파일이 다릅니다. ChatGPT Desktop의 기본 사용 경로는 `Settings > MCP servers > Add server`이며 Codex CLI 명령을 실행하는 방식이 아닙니다. 다만 현재 로컬 direct 등록은 Codex CLI와 사용자 설정 `~/.codex/config.toml`을 공유하므로 동일한 MCP 이름의 경로 변경은 두 클라이언트에 함께 영향을 줄 수 있습니다. Claude Desktop은 이 파일을 사용하지 않고 전용 BAT로 `%APPDATA%\Claude\claude_desktop_config.json`을 병합하며, 앱 재시작 후 Connectors와 실제 도구 호출을 확인합니다.
-
-같은 MCP 이름으로 다시 생성하면 Claude Code와 Codex CLI는 대상별 에이전트 프롬프트를 다시 실행하고, Claude Desktop은 전용 BAT를 다시 실행합니다. ChatGPT Desktop은 새 안내 값을 기존 `Settings > MCP servers` 항목에 반영합니다. 생성할 때 현재 승인된 전체 청크를 다시 묶으므로 추가 규정과 개정판 청크도 같은 MCP 이름으로 조회됩니다. 폴더를 옮겼다면 모든 로컬 대상에서 새 폴더 기준으로 등록을 갱신해야 합니다.
-
-업데이트 전 번들의 `CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md`는 ChatGPT Desktop에 Codex CLI 설치를 요청하던 구형 형식일 수 있습니다. 프로그램은 이 파일을 감지하면 구형 지시를 그대로 표시하지 않고, 검증 가능한 stdio 입력값이 있으면 현행 Desktop Settings 안내로 변환합니다. 복구할 수 없으면 재생성을 요구하며 구형 ChatGPT Desktop BAT도 실행하지 않도록 안내합니다.
-
-생성 폴더의 `설치 후 MCP 사용 방법 보기.bat`는 클라이언트별 확인 명령과 실제 MCP 이름이 들어간 첫 호출 문장을 보여줍니다. `Codex 플러그인 MCP 입력값.txt`는 Codex CLI 수동 호환 설정용입니다.
+같은 MCP 이름으로 다시 생성하면 현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다. 저장 폴더를 옮겼다면 로컬 클라이언트의 디렉터리 설정을 갱신하고, Vercel 배포를 갱신했다면 Connector의 `/mcp` 주소와 인증 상태를 확인합니다.
 
 생성 파일의 의미, 수동 점검 명령과 장애 해결 절차는 [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)에 정리되어 있습니다.
 
-## ChatGPT 원격 MCP와 ChatGPT 웹 연결
+## ChatGPT Desktop / Codex Vercel HTTPS 연결
 
-`chatgpt-desktop-local`과 `chatgpt-remote`는 서로 다른 실행 방식입니다. ChatGPT 사용자 지정 MCP 앱은 인터넷에서 접근 가능한 원격 MCP 엔드포인트가 필요합니다. `localhost`나 로컬 stdio에 직접 연결할 수 없으므로 HTTPS 배포 또는 승인된 보안 Tunnel을 사용합니다.
+ChatGPT Desktop, Codex CLI, Codex IDE는 같은 Codex host의 MCP 설정을 공유하며 stdio와 Streamable HTTP를 모두 지원합니다. Vercel 원격 MCP에는 로컬 폴더가 아니라 배포된 HTTPS `/mcp` URL을 등록합니다.
 
-생성 화면의 연결 방식 표기에서 `MCP HTTP - URL로 연결`은 운영자가 준비한 HTTPS 주소를 사용하고, `OpenAI Secure MCP Tunnel`은 생성된 `run_openai_secure_tunnel.ps1`을 이용하는 보안 Tunnel 흐름을 뜻합니다.
+1. 생성 화면에서 `ChatGPT · Vercel HTTPS MCP`를 선택하고 배포된 `https://<deployment>/mcp` 주소를 입력합니다.
+2. ChatGPT Desktop의 `Settings > MCP servers > Add server`에서 `Streamable HTTP`를 선택해 URL을 저장하거나, 공용 `~/.codex/config.toml`에 `url`을 등록합니다.
+3. 공개 규정 read-only endpoint는 보안 검토 후 `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`를 명시합니다.
+4. 비공개 endpoint는 Vercel Secret `MCP_AUTH_TOKEN`을 두고 클라이언트 설정의 `bearer_token_env_var`로 전달하거나 OAuth를 구성합니다. 토큰 값을 README나 설정 파일에 직접 기록하지 않습니다.
+5. Desktop을 Restart한 뒤 `/mcp`에서 서버를 확인하고 `search` 결과의 첫 id를 `fetch`로 조회합니다.
 
-1. 생성 화면에서 `ChatGPT HTTPS` 또는 `ChatGPT 보안 Tunnel`을 선택합니다.
-2. 공개 HTTPS 방식이면 기본 주소를 입력하고 MCP 묶음을 승인된 서버에 배포해 TLS와 인증을 구성합니다.
-3. 공개 HTTPS custom app은 `Settings > Apps > Advanced Settings`에서 Developer mode를 켠 뒤 `Settings > Apps > Create`에 생성한 HTTPS MCP URL을 등록합니다.
-4. Secure MCP Tunnel 방식은 전용 공식 가이드에 따라 `Settings > Security and login`에서 Developer mode를 켠 뒤 `Settings > Plugins` 또는 `https://chatgpt.com/plugins`의 `+`에서 앱을 만들고 Connection을 Tunnel로 선택합니다.
-5. 표시된 도구 목록에 `search`와 `fetch`가 있는지 확인합니다.
-6. 공개 HTTPS 앱은 새 대화의 tools 메뉴에서, Tunnel 앱은 `+ > More`에서 선택한 뒤 `MCP이름 MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 fetch 도구로 조회해 조문 원문과 출처를 보여줘.`라고 요청합니다.
-
-ChatGPT 웹은 로컬 `~/.codex/config.toml`, 로컬 stdio 서버 또는 ChatGPT Desktop의 `/mcp` 메뉴를 읽지 않습니다. Secure Tunnel의 `Settings > Plugins` 개발자 앱 생성과 Work mode marketplace 플러그인 설치는 같은 화면 이름을 쓸 수 있지만 목적과 절차가 다릅니다.
-
-![ChatGPT용 HTTPS MCP 설정](docs/assets/readme-guide-07-chatgpt-https.png)
-
-플랜과 워크스페이스 관리자 정책에 따라 MCP 또는 사용자 지정 앱 메뉴가 보이지 않을 수 있습니다. 최신 조건과 Desktop 등록 순서는 OpenAI 공식 문서의 [ChatGPT Desktop MCP](https://learn.chatgpt.com/docs/extend/mcp), [Developer mode와 MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta), [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) 및 [Apps in ChatGPT](https://help.openai.com/en/articles/11487775-connectors-in-chatgpt)를 확인합니다.
+ChatGPT 웹의 hosted plugin 연결은 이 로컬 Codex-host 설정과 별도이며 이 빌더의 자동 연결 범위가 아닙니다. 최신 Desktop 등록과 공유 설정 기준은 OpenAI 공식 [Model Context Protocol 문서](https://learn.chatgpt.com/docs/extend/mcp)를 확인합니다.
 
 ## Claude 연결
 
-같은 PC의 Claude Code와 Claude Desktop은 로컬 stdio 방식이 가장 간단합니다. Claude Code는 번들을 작업공간으로 연 뒤 `CLAUDE_CODE_AGENT_CONNECT_PROMPT.md`를 실행하며 공식 CLI의 `--scope user`로 등록합니다. Claude Desktop은 별도의 전용 BAT를 실행해 Windows 사용자 설정 `%APPDATA%\Claude\claude_desktop_config.json`을 병합합니다. 두 제품은 같은 설정 파일이나 같은 scope 등록 방식을 쓰지 않습니다. Claude Desktop은 완전히 종료·재실행한 뒤 새 대화의 Connectors에서 서버를 확인해야 합니다.
+같은 PC의 Claude Code와 Claude Desktop은 로컬 stdio 방식이 가장 간단합니다. Claude Code는 `claude_code_add_stdio.ps1`로 공식 CLI의 `--scope user`에 등록합니다. Claude Desktop에서는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**(영문 UI: **Settings > Developer > Edit Config**)을 열고, 생성된 `claude_desktop_config.json`의 해당 `mcpServers` 항목을 Windows 사용자 설정 `%APPDATA%\Claude\claude_desktop_config.json`에 병합합니다. 기존 다른 서버 항목은 삭제하지 않습니다. `command`는 실행 파일이고 `args`는 순서가 있는 전체 인자 목록이므로 서버 이름이나 번들 폴더명으로 바꾸거나 일부를 생략하면 안 됩니다. 두 제품은 같은 설정 파일이나 같은 scope 등록 방식을 쓰지 않습니다. 저장 후 Claude Desktop을 완전히 종료·재실행하고, 새 대화의 **파일·커넥터 추가 > Connectors**에서 생성된 서버 이름을 확인한 뒤 `search`와 `fetch`를 실제로 호출합니다. 왼쪽의 **커넥터** 메뉴는 Vercel 같은 원격 HTTPS MCP용이며, 로컬 stdio는 **개발자 > 구성 편집**에서 등록합니다.
 
 Claude Code의 `.mcp.json`은 파일을 둔 프로젝트에서 공유하는 `project` scope입니다. 사용자 전체 등록을 위해 `~/.claude/settings.json`에 `mcpServers`를 복사하거나 `enabledMcpjsonServers`에 이름만 추가하지 않습니다. 공식 `user` scope 저장소는 `~/.claude.json`이며, `enabledMcpjsonServers`는 user-scope 서버 등록 목록이 아닙니다. 이 저장소는 `claude mcp add --scope user`로 등록하고 `claude mcp get <이름>`의 User scope·`Status: Connected`·command·launcher·data 경로를 다시 확인한 뒤 같은 launch contract로 실제 stdio protocol smoke를 수행합니다. 이 검증 후에도 새 Claude Code 세션의 `/mcp` 노출과 실제 도구 호출 전에는 대화 연결 완료로 표시하지 않습니다.
 
@@ -380,15 +360,23 @@ Claude 웹 또는 원격 환경에서 사용하려면 다음 순서로 연결합
 3. 개인 Pro/Max는 Claude의 `Customize > Connectors`에서 `Add custom connector`를 선택합니다. Team/Enterprise는 Owner가 먼저 `Organization settings > Connectors`에서 조직에 추가합니다.
 4. 최종 `/mcp` URL과 필요한 인증 정보를 등록하고, 대화의 `+` → `Connectors`에서 활성화합니다.
 
-생성된 `claude_api_fragment.json`은 별도의 Claude Messages API 요청용입니다. Claude 앱의 Connectors 화면에는 이 JSON을 붙여 넣지 않고 HTTPS MCP URL만 입력합니다.
+Claude 앱의 Connectors 화면에는 최종 HTTPS `/mcp` URL과 승인된 인증만 입력합니다. Claude Code는 공개 URL이 있는 번들에서 생성되는 `claude_code_add_http.ps1`로 같은 endpoint를 user scope에 등록할 수 있습니다.
 
 ![Claude용 HTTPS MCP 설정](docs/assets/readme-guide-08-claude-https.png)
 
-로컬 Claude Desktop 설정과 원격 커넥터 설정은 서로 다릅니다. 원격 MCP URL을 `claude_desktop_config.json`의 로컬 stdio 항목처럼 넣지 않습니다. 자세한 내용은 Anthropic 공식 문서의 [로컬 Claude Desktop MCP](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)와 [원격 custom connectors](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)를 확인합니다.
+로컬 Claude Desktop 설정과 원격 커넥터 설정은 서로 다릅니다. 원격 MCP URL을 `claude_desktop_config.json`의 로컬 stdio 항목처럼 넣지 않습니다. 자세한 내용은 공식 [MCP 로컬 서버 연결 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers), Anthropic의 [로컬 Claude Desktop MCP](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop), [원격 custom connectors](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)를 확인합니다.
 
 ## HTTPS 배포 경계
 
-PR MCP Builder가 자동으로 만드는 범위는 승인 데이터, 계층 검색 DB, MCP 서버 실행 파일, 클라이언트 설정과 연결 스크립트입니다. 다음 항목은 기관 전산 담당자가 운영 환경에 맞게 준비해야 합니다.
+Vercel 배포용 staging 디렉터리는 다음 명령으로 만듭니다. 로컬 `data/` 전체가 아니라 승인 runtime bundle만 포함합니다.
+
+```powershell
+reg-rag-mcp-vercel-stage --runtime-data-dir .\reports\mcp_connection_bundle\data --out-dir .\vercel-mcp-stage
+```
+
+Vercel 프로젝트의 진입점은 `vercel_mcp.py`, 공개 endpoint는 `https://<deployment>/mcp`입니다. 공개 read-only MCP는 보안 검토 후 `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`를 명시합니다. 비공개 ChatGPT Desktop·Codex 연결은 Vercel Secret `MCP_AUTH_TOKEN`과 클라이언트의 `bearer_token_env_var`를 함께 사용하거나 OAuth를 구성합니다. 필요하면 manifest와 일치하는 `MCP_TENANT_ID`, `MCP_PROFILE_ID`, 사용자 도메인용 `MCP_ALLOWED_HTTP_HOSTS`를 설정합니다. 자세한 절차는 [Vercel HTTPS MCP 배포](docs/vercel_https_mcp_ko.md)를 참고하세요.
+
+PR MCP Builder가 자동 생성하는 범위는 승인 데이터, 계층 검색 DB, MCP 서버 실행 파일과 클라이언트 설정입니다. Vercel staging은 위 명령을 실행해 별도로 준비합니다. 다음 항목은 기관 전산 담당자가 운영 환경에 맞게 준비해야 합니다.
 
 - 공개 또는 기관 승인 도메인과 DNS
 - TLS 인증서와 HTTPS reverse proxy
@@ -421,7 +409,7 @@ PR MCP Builder가 자동으로 만드는 범위는 승인 데이터, 계층 검�
 | 검색 | 계층 탐색 + 최신 유효본 필터 + BM25/벡터 후보 검색 |
 | HWP 표 | 기본 추출 후 선택적 Kordoc CLI로 보강, 사람 검수 필요 |
 | 스캔 PDF | OCR 백엔드와 한국어 언어 지원을 별도 설정해야 함 |
-| 외부 연결 | 승인된 HTTPS 배포 또는 보안 Tunnel 필요 |
+| 외부 연결 | Vercel에 배포한 승인된 HTTPS `/mcp` |
 
 ### 선택적 Kordoc 보강
 

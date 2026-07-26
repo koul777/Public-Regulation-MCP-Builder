@@ -443,8 +443,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Claude Code 연결 진단", source)
         self.assertIn("Claude Desktop 연결 진단", source)
         self.assertNotIn("ChatGPT Desktop·Codex CLI 7단계 연결 진단", source)
-        self.assertIn("재시작 후 최종 확인 프롬프트", source)
-        self.assertIn("MCP의 get_index_status를 실행하고 사용 가능한 규정 도구를 보여줘.", source)
+        self.assertNotIn("재시작 후 최종 확인 프롬프트", source)
         self.assertIn('if diagnostic_state == "connected":', source)
         self.assertIn('"codex": "Codex CLI",', source)
         self.assertIn('"claude-code": "Claude Code",', source)
@@ -455,13 +454,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("아래 최종 도구 호출 성공은 해당 대화에서 직접 확인", source)
         self.assertIn("support_summary:", source)
         self.assertIn("next_action:", source)
-        self.assertIn("st.code(agent_prompt_text, language=None)", source)
-        self.assertIn("_mcp_agent_prompt_display_kind(prompt_path)", source)
-        self.assertIn("구형 ChatGPT Desktop 에이전트 프롬프트를 감지했습니다", source)
-        self.assertIn("source_name=prompt_path.name", source)
+        self.assertNotIn("st.code(agent_prompt_text, language=None)", source)
+        self.assertNotIn("_mcp_agent_prompt_display_kind(prompt_path)", source)
         self.assertIn("_refresh_mcp_connection_observation(", source)
         self.assertIn("이 결과만으로 현재 대화의 도구 연결 완료를 주장하지 않습니다.", source)
 
+    @unittest.skip("legacy agent-prompt UI was removed")
     def test_legacy_chatgpt_prompt_ui_kind_is_case_insensitive_and_never_agent_mode(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
@@ -703,6 +701,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Local RAG demo uses approved and indexed chunks only.", source)
         self.assertIn('st.button("시범 실행 (Run demo)", key=f"run-rag-chat-{document_id}", disabled=not mcp_connection_ready)', source)
 
+    @unittest.skip("legacy BAT/prompt/tunnel UI contract was replaced by direct stdio and Vercel HTTP")
     def test_streamlit_exposes_mcp_client_config_generator(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
@@ -918,66 +917,369 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         # 기술 상세(비용 가드)는 유지하되 전산 담당자용으로 접어 둔다.
         self.assertIn("AI review API and cost guard", source)
 
-    def test_connection_handoff_uses_current_chatgpt_plugin_flow(self):
+    def test_connection_handoff_uses_direct_stdio_and_vercel_http(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
         self.assertNotIn("비개발자는 이 파일만 더블클릭하면 됩니다", source)
         self.assertNotIn("전용 연결 버튼을 실행하면 됩니다", source)
-        self.assertIn("연결 준비 버튼을 만들었습니다", source)
-        self.assertIn("아래 대상별 등록·재시작·최종 확인 절차", source)
-        self.assertIn("새 대화에서 + > More를 열어 앱을 선택", source)
-        self.assertNotIn("앱을 선택하거나 @이름", source)
+        self.assertIn("ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)", source)
+        self.assertIn("ChatGPT · Vercel HTTPS MCP", source)
+        self.assertIn("Claude · Vercel HTTPS MCP", source)
+        self.assertIn("배포된 Vercel HTTPS `/mcp` 주소 (필수)", source)
+        options_start = source.index("mcp_connection_target_options = [")
+        options_end = source.index("]", options_start)
+        options_source = source[options_start:options_end]
+        self.assertEqual(
+            [
+                options_source.index(f'"{target}"')
+                for target in (
+                    "claude-code",
+                    "codex",
+                    "claude-desktop",
+                    "chatgpt-remote",
+                    "claude-api",
+                )
+            ],
+            sorted(
+                options_source.index(f'"{target}"')
+                for target in (
+                    "claude-code",
+                    "codex",
+                    "claude-desktop",
+                    "chatgpt-remote",
+                    "claude-api",
+                )
+            ),
+        )
+        self.assertNotIn('"claude-remote"', options_source)
+        self.assertNotIn('"chatgpt-tunnel"', options_source)
+        self.assertNotIn('"chatgpt-desktop-plugin"', options_source)
+        self.assertIn('elif mcp_connection_target == "claude-api":', source)
+        self.assertIn('mcp_profile = "claude-remote"', source)
+        self.assertIn('"http": "Vercel HTTPS /mcp"', source)
+        self.assertIn('"local": "로컬 stdio"', source)
+        self.assertIn(
+            '"command": desktop_registration.get("command")',
+            source,
+        )
+        self.assertIn(
+            '"args": desktop_registration.get("arguments") or []',
+            source,
+        )
+        self.assertIn(
+            '"cwd": desktop_registration.get("working_directory")',
+            source,
+        )
+        self.assertIn(
+            '"chatgpt_desktop_local_config": str(',
+            source,
+        )
+        self.assertIn(
+            "_read_chatgpt_codex_desktop_registration(",
+            source,
+        )
+        self.assertIn(
+            "_render_chatgpt_codex_desktop_registration_guide(",
+            source,
+        )
+        self.assertIn(
+            'mcp_quickstart.get("chatgpt_remote")',
+            source,
+        )
+        self.assertIn("Streamable HTTP를 선택", source)
+        self.assertIn("bearer_token_env_var", source)
+        self.assertIn("OAuth", source)
 
-    def test_final_verification_prompts_match_the_client_tool_profile(self):
-        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        target_files_start = source.index("mcp_target_file_keys = {")
+        target_files_end = source.index("}", target_files_start)
+        target_files_source = source[target_files_start:target_files_end]
+        self.assertIn('"claude-api": "claude_remote"', target_files_source)
+        for retired in (
+            "connect_codex_bat",
+            "connect_chatgpt_desktop_bat",
+            "AGENT_CONNECT_PROMPT",
+            "plugin",
+            "tunnel",
+        ):
+            self.assertNotIn(retired, target_files_source)
+
+    def test_chatgpt_codex_desktop_registration_uses_generated_ui_fields(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
         module = ast.parse(source)
-        helper_node = next(
+        helper_names = {
+            "_mcp_argument_value",
+            "_chatgpt_codex_desktop_registration",
+            "_read_chatgpt_codex_desktop_registration",
+        }
+        helper_nodes = [
             node
             for node in module.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_mcp_final_verification_prompts"
-        )
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
         namespace = {
-            "MCP_EXTERNAL_DATA_TARGETS": frozenset(
-                {"chatgpt-remote", "chatgpt-tunnel", "claude-api"}
-            ),
-            "MCP_SEARCH_FETCH_TARGETS": frozenset(
-                {
-                    "chatgpt-desktop-local",
-                    "codex",
-                    "chatgpt-remote",
-                    "chatgpt-tunnel",
-                    "claude-api",
-                }
-            ),
+            "Any": Any,
+            "Path": Path,
+            "json": json,
         }
         exec(
-            compile(ast.Module(body=[helper_node], type_ignores=[]), "<mcp-verification-prompts>", "exec"),
+            compile(
+                ast.Module(body=helper_nodes, type_ignores=[]),
+                "<desktop-registration-guide>",
+                "exec",
+            ),
             namespace,
         )
-        prompts_for = namespace["_mcp_final_verification_prompts"]
+        read_registration = namespace[
+            "_read_chatgpt_codex_desktop_registration"
+        ]
 
-        for target in ("chatgpt-remote", "chatgpt-tunnel", "claude-api"):
-            with self.subTest(target=target):
-                remote_prompts = prompts_for(target, "govreg-local")
-                self.assertEqual(1, len(remote_prompts))
-                self.assertIn("search 도구", remote_prompts[0])
-                self.assertIn("fetch 도구", remote_prompts[0])
-                self.assertNotIn("get_index_status", remote_prompts[0])
-                self.assertNotIn("list_regulations", remote_prompts[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = (
+                Path(tmp)
+                / "한글 경로"
+                / "chatgpt_desktop_local_mcp.json"
+            )
+            config_path.parent.mkdir()
+            dynamic_cwd = str(config_path.parent.resolve())
+            dynamic_command = str(
+                (config_path.parent / "동적 런타임" / "powershell.exe").resolve()
+            )
+            dynamic_args = [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(
+                    (
+                        config_path.parent
+                        / "run_mcp_stdio_server.ps1"
+                    ).resolve()
+                ),
+                "--profile-id",
+                "profile-runtime-782",
+                "--tool-profile",
+                "chatgpt-data-runtime",
+                "--data-dir",
+                str((config_path.parent / "승인 데이터").resolve()),
+            ]
+            payload = {
+                "server_name": "ignored-fallback-name",
+                "ui_fields": {
+                    "name": "generated-server-782",
+                    "transport": "stdio",
+                    "command": dynamic_command,
+                    "cwd": dynamic_cwd,
+                    "args": dynamic_args,
+                    "env": {},
+                    "env_passthrough": [],
+                },
+            }
+            config_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
-        for target in ("chatgpt-desktop-local", "codex"):
-            with self.subTest(target=target):
-                local_prompts = prompts_for(target, "govreg-local")
-                self.assertEqual(1, len(local_prompts))
-                self.assertIn("search 도구", local_prompts[0])
-                self.assertIn("fetch 도구", local_prompts[0])
-                self.assertNotIn("get_index_status", local_prompts[0])
-                self.assertNotIn("list_regulations", local_prompts[0])
+            registration = read_registration(config_path)
 
-        claude_prompts = prompts_for("claude-desktop", "govreg-local")
-        self.assertEqual(2, len(claude_prompts))
-        self.assertIn("get_index_status", claude_prompts[0])
-        self.assertIn("list_regulations", claude_prompts[1])
+            self.assertEqual("generated-server-782", registration["name"])
+            self.assertEqual("STDIO", registration["transport"])
+            self.assertEqual(dynamic_command, registration["command"])
+            self.assertEqual(dynamic_cwd, registration["working_directory"])
+            self.assertEqual(dynamic_args, registration["arguments"])
+            self.assertEqual("\n".join(dynamic_args), registration["arguments_copy"])
+            self.assertEqual(
+                [f"{index}. {value}" for index, value in enumerate(dynamic_args, 1)],
+                registration["numbered_arguments"],
+            )
+            self.assertEqual("입력하지 않음", registration["environment_display"])
+            self.assertEqual(
+                "입력하지 않음",
+                registration["environment_passthrough_display"],
+            )
+            self.assertEqual("profile-runtime-782", registration["profile_id"])
+            self.assertEqual(
+                "chatgpt-data-runtime",
+                registration["tool_profile"],
+            )
+            self.assertFalse(registration["command_matches_server_name"])
+
+            payload["ui_fields"]["command"] = "generated-server-782"
+            config_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            collision = read_registration(config_path)
+            self.assertTrue(collision["command_matches_server_name"])
+            self.assertEqual(
+                "generated-server-782",
+                payload["ui_fields"]["command"],
+            )
+
+        helper_start = source.index(
+            "def _chatgpt_codex_desktop_registration("
+        )
+        helper_end = source.index(
+            "def _direct_python_mcp_config(",
+            helper_start,
+        )
+        helper_source = source[helper_start:helper_end]
+        self.assertIn('ui_fields.get("command")', helper_source)
+        self.assertIn('ui_fields.get("cwd")', helper_source)
+        self.assertIn('ui_fields.get("args")', helper_source)
+        self.assertIn(
+            '_mcp_argument_value(arguments, "--profile-id")',
+            helper_source,
+        )
+        self.assertIn(
+            '_mcp_argument_value(arguments, "--tool-profile")',
+            helper_source,
+        )
+        self.assertNotIn("C:\\ttt", helper_source)
+        self.assertNotIn("profile-default", helper_source)
+        self.assertNotIn("\ufffd", helper_source)
+
+    def test_chatgpt_codex_desktop_registration_guide_has_required_warnings(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
+        guide_start = source.index(
+            "def _render_chatgpt_codex_desktop_registration_guide("
+        )
+        guide_end = source.index(
+            "def _direct_python_mcp_config(",
+            guide_start,
+        )
+        guide_source = source[guide_start:guide_end]
+
+        for expected in (
+            "ChatGPT/Codex Desktop에 등록하는 방법",
+            "Name (MCP 서버 이름)",
+            "Transport",
+            "Command 복사",
+            "Working directory 복사",
+            "Arguments 전체 목록 복사",
+            "번호가 붙은 인자별 목록",
+            "Environment",
+            "Environment passthrough",
+            "입력하지 않음",
+            "MCP 서버 이름은 Name에만 입력합니다.",
+            "Command에는 서버 이름을 입력하지 않습니다.",
+            "각 Argument는 한 입력 칸에 하나씩 순서대로 넣어야 합니다.",
+            "Arguments를 일부라도 누락하면 서버가 실행되지 않습니다.",
+            "자동 수정하지 않았으므로",
+            "MCP 서버 설정을 저장합니다.",
+            "ChatGPT/Codex Desktop을 완전 종료합니다.",
+            "앱을 재실행합니다.",
+            "새 대화에서 MCP 서버가 보이는지 확인합니다.",
+            "`search`와 `fetch`를 실제로 호출해 연결을 검증합니다.",
+        ):
+            self.assertIn(expected, guide_source)
+        self.assertNotIn("\ufffd", guide_source)
+
+    def test_claude_desktop_final_guide_uses_generated_config(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_read_claude_desktop_registration"
+        )
+        namespace = {
+            "Any": Any,
+            "Path": Path,
+            "json": json,
+        }
+        exec(
+            compile(
+                ast.Module(body=[reader_node], type_ignores=[]),
+                "<claude-desktop-registration-guide>",
+                "exec",
+            ),
+            namespace,
+        )
+        read_registration = namespace["_read_claude_desktop_registration"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = (
+                Path(tmp) / "클로드 번들" / "claude_desktop_config.json"
+            )
+            config_path.parent.mkdir()
+            dynamic_args = [
+                "-NoProfile",
+                "-File",
+                str((config_path.parent / "런처.ps1").resolve()),
+                "--profile-id",
+                "claude-profile-dynamic",
+            ]
+            payload = {
+                "mcpServers": {
+                    "claude-server-dynamic": {
+                        "command": str(
+                            (config_path.parent / "powershell.exe").resolve()
+                        ),
+                        "args": dynamic_args,
+                        "cwd": str(config_path.parent.resolve()),
+                        "env": {},
+                    }
+                }
+            }
+            config_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            registration = read_registration(config_path)
+
+        self.assertEqual("claude-server-dynamic", registration["name"])
+        self.assertEqual(dynamic_args, registration["arguments"])
+        self.assertEqual(
+            payload,
+            registration["merge_payload"],
+        )
+        self.assertEqual(
+            payload,
+            json.loads(registration["merge_json"]),
+        )
+
+        guide_start = source.index(
+            "def _render_claude_desktop_registration_guide("
+        )
+        guide_end = source.index(
+            "def _direct_python_mcp_config(",
+            guide_start,
+        )
+        guide_source = source[guide_start:guide_end]
+        for expected in (
+            "Claude Desktop에 등록하는 방법",
+            "생성된 설정 파일 경로 복사",
+            r"%APPDATA%\Claude\claude_desktop_config.json",
+            "병합할 `mcpServers` JSON 복사",
+            "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
+            "트레이까지 완전 종료",
+            "파일·커넥터 추가 > Connectors",
+            "`search`와 `fetch`를 실제로 호출해 연결을 검증합니다.",
+            "원격 HTTPS MCP용",
+            "로컬 STDIO MCP",
+        ):
+            self.assertIn(expected, guide_source)
+        self.assertIn(
+            '"claude_desktop_config": str(files["claude_desktop"])',
+            source,
+        )
+        self.assertIn("_read_claude_desktop_registration(", source)
+        self.assertIn("_render_claude_desktop_registration_guide(", source)
+        self.assertNotIn("\ufffd", guide_source)
+
+    def test_connection_handoff_does_not_render_copy_paste_prompts(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("def _mcp_final_verification_prompts", source)
+        self.assertNotIn("재시작 후 최종 확인 프롬프트", source)
+        self.assertNotIn("새 대화 또는 새 task에 아래 문장을 그대로 입력합니다.", source)
 
     def test_streamlit_exposes_parsing_goldset_review_gate(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")

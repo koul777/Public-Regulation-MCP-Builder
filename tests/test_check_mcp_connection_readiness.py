@@ -679,7 +679,8 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         summary = report["installed_client_config_summary"]["clients"]["codex"]
         self.assertEqual("invalid_contract", summary["status"])
         self.assertIn("entry is disabled", summary["contract_issues"])
-        self.assertIn("args differ from the generated bundle contract", summary["contract_issues"])
+        self.assertIn("--data-dir must occur exactly once", summary["contract_issues"])
+        self.assertIn("--tool-profile is minimal, expected full", summary["contract_issues"])
 
     def test_installed_client_config_rejects_stale_or_missing_stdio_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,6 +833,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("bundle-claude-desktop-config-invalid", codes)
 
+    @unittest.skip("legacy generated-plugin bundle contract was removed")
     def test_bundle_dir_rejects_snake_case_chatgpt_plugin_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp)
@@ -860,6 +862,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("bundle-chatgpt-plugin-container-unsupported", codes)
 
+    @unittest.skip("legacy generated-plugin bundle contract was removed")
     def test_bundle_dir_rejects_chatgpt_plugin_source_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp)
@@ -885,6 +888,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
             {finding["code"] for finding in report["findings"]},
         )
 
+    @unittest.skip("legacy generated-plugin bundle contract was removed")
     def test_bundle_dir_rejects_unpaired_chatgpt_plugin_launcher_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp)
@@ -916,6 +920,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
             {finding["code"] for finding in report["findings"]},
         )
 
+    @unittest.skip("legacy generated-plugin bundle contract was removed")
     def test_bundle_dir_rejects_duplicate_plugin_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp)

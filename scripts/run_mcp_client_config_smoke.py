@@ -47,6 +47,7 @@ def run_mcp_client_config_smoke(
     codex_config: str | Path | None = None,
     claude_code_config: str | Path | None = None,
     claude_desktop_config: str | Path | None = None,
+    chatgpt_desktop_config: str | Path | None = None,
     plugin_mcp_config: str | Path | None = None,
     remote_url: str | None = None,
     remote_token_env: str | None = None,
@@ -61,8 +62,10 @@ def run_mcp_client_config_smoke(
         targets.append(("claude_code", Path(claude_code_config)))
     if claude_desktop_config is not None:
         targets.append(("claude_desktop", Path(claude_desktop_config)))
+    if chatgpt_desktop_config is not None:
+        targets.append(("chatgpt_desktop_local", Path(chatgpt_desktop_config)))
     if plugin_mcp_config is not None:
-        targets.append(("chatgpt_desktop_local", Path(plugin_mcp_config)))
+        targets.append(("legacy_plugin", Path(plugin_mcp_config)))
 
     results: list[dict[str, Any]] = []
     for client_key, config_path in targets:
@@ -202,7 +205,8 @@ def _run_single_client_config_smoke(
         "codex": "Codex",
         "claude_code": "Claude Code",
         "claude_desktop": "Claude Desktop",
-        "chatgpt_desktop_local": "ChatGPT Desktop local plugin",
+        "chatgpt_desktop_local": "ChatGPT Desktop",
+        "legacy_plugin": "Legacy ChatGPT Desktop plugin",
     }.get(client_key, client_key)
     try:
         entry = _read_client_server_entry(client_key=client_key, config_path=config_path, server_name=server_name)
@@ -254,9 +258,19 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     elif client_key == "chatgpt_desktop_local":
         payload = _read_strict_utf8_json(config_path)
+        entry = payload.get("ui_fields") if isinstance(payload, dict) else None
+        if not isinstance(entry, dict):
+            raise ValueError(f"{config_path} does not contain ChatGPT Desktop ui_fields.")
+        if str(entry.get("name") or "") != server_name:
+            raise ValueError(f"{config_path} does not contain MCP server {server_name}.")
+        if str(entry.get("transport") or "stdio") != "stdio":
+            raise ValueError(f"{config_path} server {server_name} is not local stdio.")
+        return entry
+    elif client_key == "legacy_plugin":
+        payload = _read_strict_utf8_json(config_path)
         if isinstance(payload, dict) and "mcp_servers" in payload:
             raise ValueError(
-                f"{config_path} uses unsupported mcp_servers; Codex plugin .mcp.json requires mcpServers."
+            f"{config_path} uses unsupported mcp_servers; legacy Codex plugin .mcp.json requires mcpServers."
             )
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     else:
@@ -869,7 +883,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-config", default=None)
     parser.add_argument("--claude-code-config", default=None)
     parser.add_argument("--claude-desktop-config", default=None)
-    parser.add_argument("--plugin-mcp-config", default=None)
+    parser.add_argument("--chatgpt-desktop-config", default=None)
+    parser.add_argument(
+        "--plugin-mcp-config",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--remote-url", default=None)
     parser.add_argument("--remote-token-env", default=None)
     parser.add_argument("--query", default=None)
@@ -889,6 +908,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         codex_config=args.codex_config,
         claude_code_config=args.claude_code_config,
         claude_desktop_config=args.claude_desktop_config,
+        chatgpt_desktop_config=args.chatgpt_desktop_config,
         plugin_mcp_config=args.plugin_mcp_config,
         remote_url=args.remote_url,
         remote_token_env=args.remote_token_env,

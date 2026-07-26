@@ -19,7 +19,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.mcp_bundle_contract import normalized_chatgpt_plugin_name
 from scripts.report_metadata import current_repo_commit
 
 
@@ -203,13 +202,13 @@ def _client_config_path_checks(*, target_dir: Path, server_name: str) -> dict[st
     expected_data_dir = str((target_dir / "data").resolve())
     codex = _codex_server(target_dir / "codex_config_snippet.toml", server_name)
     claude = _claude_desktop_server(target_dir / "claude_desktop_config.json", server_name)
-    plugin, plugin_encoding = _chatgpt_desktop_plugin_server(target_dir, server_name)
+    desktop, desktop_encoding = _chatgpt_desktop_direct_server(target_dir, server_name)
     clients = {
         "codex": _entry_path_check(codex, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
         "claude_desktop": _entry_path_check(claude, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
         "chatgpt_desktop_local": {
-            **_entry_path_check(plugin, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
-            **plugin_encoding,
+            **_entry_path_check(desktop, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
+            **desktop_encoding,
         },
     }
     return {
@@ -234,12 +233,11 @@ def _claude_desktop_server(path: Path, server_name: str) -> dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
-def _chatgpt_desktop_plugin_server(
+def _chatgpt_desktop_direct_server(
     target_dir: Path,
     server_name: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    plugin_name = normalized_chatgpt_plugin_name(server_name)
-    path = target_dir / "chatgpt-desktop-local-plugin" / "plugins" / plugin_name / ".mcp.json"
+    path = target_dir / "chatgpt_desktop_local_mcp.json"
     try:
         raw = path.read_bytes()
         if raw.startswith(b"\xef\xbb\xbf"):
@@ -247,7 +245,7 @@ def _chatgpt_desktop_plugin_server(
         text = raw.decode("utf-8", errors="strict")
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         return {}, {
-            "plugin_config_path": str(path),
+            "desktop_config_path": str(path),
             "strict_utf8_without_bom": False,
             "config_schema_verified": False,
             "encoding_error": str(exc),
@@ -255,23 +253,20 @@ def _chatgpt_desktop_plugin_server(
     try:
         payload = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
         if not isinstance(payload, dict):
-            raise ValueError("plugin config must be a JSON object")
-        if "mcp_servers" in payload:
-            raise ValueError("unsupported mcp_servers container; expected mcpServers")
-        servers = payload.get("mcpServers")
-        if not isinstance(servers, dict) or set(servers) != {server_name}:
-            raise ValueError(f"mcpServers must contain exactly {server_name}")
-        entry = servers[server_name]
+            raise ValueError("desktop config must be a JSON object")
+        entry = payload.get("ui_fields")
         if not isinstance(entry, dict):
-            raise ValueError(f"mcpServers.{server_name} must be an object")
+            raise ValueError("ui_fields must be an object")
+        if str(entry.get("name") or "") != server_name:
+            raise ValueError(f"ui_fields.name must equal {server_name}")
         return entry, {
-            "plugin_config_path": str(path),
+            "desktop_config_path": str(path),
             "strict_utf8_without_bom": True,
             "config_schema_verified": True,
         }
     except (json.JSONDecodeError, ValueError) as exc:
         return {}, {
-            "plugin_config_path": str(path),
+            "desktop_config_path": str(path),
             "strict_utf8_without_bom": True,
             "config_schema_verified": False,
             "schema_error": str(exc),

@@ -185,6 +185,7 @@ class McpWindowsAtomicityBoundaryTests(unittest.TestCase):
                     + completed.stderr,
                 )
 
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_plugin_failure_restores_prior_marketplace_without_installed_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -248,6 +249,7 @@ class McpWindowsAtomicityBoundaryTests(unittest.TestCase):
                 + completed.stderr,
             )
 
+    @unittest.skip("legacy generated-plugin installer was removed")
     def test_plugin_failure_restores_prior_disabled_state_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

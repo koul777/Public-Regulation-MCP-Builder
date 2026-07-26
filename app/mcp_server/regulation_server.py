@@ -130,6 +130,12 @@ def create_regulation_mcp_server(
     allowed_http_origins: list[str] | None = None,
     tool_profile: str = "full",
     warm_cache: bool = True,
+    streamable_http_path: str = "/mcp",
+    stateless_http: bool = False,
+    json_response: bool = False,
+    api_audit_enabled: bool | None = None,
+    rag_trace_enabled: bool | None = None,
+    background_tokenizer_warmup: bool = True,
 ) -> FastMCP:
     normalized_tool_profile = tool_profile.strip().lower()
     if normalized_tool_profile not in VALID_TOOL_PROFILES:
@@ -138,6 +144,8 @@ def create_regulation_mcp_server(
         data_dir=data_dir,
         tenant_id=tenant_id,
         tenant_storage_isolation=tenant_storage_isolation,
+        api_audit_enabled=api_audit_enabled,
+        rag_trace_enabled=rag_trace_enabled,
     )
     auth = mcp_auth_context(
         tenant_id=tenant_id,
@@ -175,6 +183,9 @@ def create_regulation_mcp_server(
         port=port,
         auth=auth_settings,
         token_verifier=token_verifier,
+        streamable_http_path=streamable_http_path,
+        stateless_http=stateless_http,
+        json_response=json_response,
         transport_security=_http_transport_security_settings(
             host=host,
             port=port,
@@ -197,7 +208,11 @@ def create_regulation_mcp_server(
         server._reg_rag_warmup_status = {
             "warmed": False,
             "skipped": True,
-            "background_tokenizer_warmup": start_background_tokenizer_warmup(delay_seconds=5.0),
+            "background_tokenizer_warmup": (
+                start_background_tokenizer_warmup(delay_seconds=5.0)
+                if background_tokenizer_warmup
+                else {"started": False, "skipped": True}
+            ),
         }
 
     if normalized_tool_profile == "chatgpt-data":

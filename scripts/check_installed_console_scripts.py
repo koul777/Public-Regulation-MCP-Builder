@@ -79,6 +79,7 @@ DEFAULT_COMMANDS = (
     "reg-rag-rag-security-evidence",
     "reg-rag-secure-rag-smoke",
     "reg-rag-mcp-server",
+    "reg-rag-mcp-vercel-stage",
     "reg-rag-mcp-smoke",
     "reg-rag-mcp-transport-smoke",
     "reg-rag-mcp-client-config-smoke",

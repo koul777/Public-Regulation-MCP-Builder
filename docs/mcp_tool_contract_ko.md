@@ -7,7 +7,7 @@
 | Profile | Intended client | Exposed tools |
 | --- | --- | --- |
 | `full` | Claude Desktop, Claude Code, 내부 운영자용 생성형 AI | `search`, `fetch`, `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `list_documents`, `get_article`, `get_table`, `compare_versions`, `get_citation`, `get_index_status` |
-| `chatgpt-data` | ChatGPT Desktop, Codex, ChatGPT 원격 앱·Tunnel, Claude API | `search`, `fetch` |
+| `chatgpt-data` | ChatGPT Desktop, Codex, Claude의 원격 HTTPS MCP | `search`, `fetch` |
 
 서버 CLI 기본값은 `full`이다. 생성 번들은 ChatGPT Desktop·Codex·외부 모델 연결에 `--tool-profile chatgpt-data`를 명시해 내부 진단·식별자 노출을 줄인다.
 
@@ -33,7 +33,7 @@ reg-rag-mcp-server `
 - 로컬 전용 `govreg://` URI, tenant/profile/approval 내부 식별자와 운영 증적 경로는 공개 응답에 넣지 않습니다.
 - 두 도구는 `readOnlyHint: true`입니다. 로컬 ChatGPT Desktop·Codex는 stdio, 원격 앱은 Streamable HTTP `/mcp`로 같은 축약 계약을 노출합니다.
 
-연결 구성은 Settings, BAT, CLI 또는 설정 파일에 직접 적용합니다. 연결 설정·로컬 경로·토큰·API 키·tunnel ID를 대화 프롬프트에 넣지 않습니다. 연결 후의 일반 `search`·`fetch` 질의에는 이러한 비밀값이 없어야 합니다.
+연결 구성은 Settings, 공식 CLI 또는 설정 파일에 직접 적용합니다. 연결 설정·로컬 경로·토큰·API 키·tunnel ID를 대화에 넣지 않습니다. 연결 후의 일반 `search`·`fetch` 질의에는 이러한 비밀값이 없어야 합니다.
 
 `full` 프로필은 운영자용 필터와 진단 입력을 계속 제공하므로 이 축약 계약의 적용 대상이 아닙니다.
 

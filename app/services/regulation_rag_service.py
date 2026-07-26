@@ -178,7 +178,8 @@ def search_records(*, query: RegulationQuery, auth, settings):
         },
     )
     step_started_at = time.perf_counter()
-    repository.append_rag_trace(trace)
+    if settings.rag_trace_enabled:
+        repository.append_rag_trace(trace)
     timing_ms["trace_write_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     timing_ms["total_elapsed_ms"] = _perf_elapsed_ms(total_started_at)
     return results, trace

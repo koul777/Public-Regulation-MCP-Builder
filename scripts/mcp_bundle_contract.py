@@ -36,7 +36,7 @@ SETUP_BUNDLE_FILES = {
     "claude_code_http": "claude_code_add_http.ps1",
     "stdio_launcher": "run_mcp_stdio_server.ps1",
     "chatgpt": "chatgpt_connector.json",
-    "claude_api": "claude_api_fragment.json",
+    "claude_remote": "claude_https_mcp.json",
     "run_stdio": "run_local_stdio_server.ps1",
     "run_http": "run_http_server.ps1",
     "run_chatgpt": "run_chatgpt_data_server.ps1",
@@ -47,22 +47,32 @@ SETUP_BUNDLE_FILES = {
     "doctor": "doctor_mcp_connection.ps1",
     "connect": "connect_mcp_client.ps1",
     "usage_guide": "MCP 사용 시작하기.txt",
-    "usage_guide_bat": "설치 후 MCP 사용 방법 보기.bat",
-    "codex_plugin_guide": "Codex 플러그인 MCP 입력값.txt",
-    "connect_codex_bat": "Codex에 연결하기.bat",
-    "connect_chatgpt_desktop_bat": "ChatGPT Desktop에 연결하기.bat",
-    "connect_claude_desktop_bat": "Claude Desktop에 연결하기.bat",
-    "connect_claude_code_bat": "Claude Code에 연결하기.bat",
-    "connect_chatgpt_https_bat": "ChatGPT HTTPS에 연결하기.bat",
-    "connect_chatgpt_tunnel_bat": "ChatGPT 보안 Tunnel에 연결하기.bat",
-    "connect_claude_https_bat": "Claude HTTPS에 연결하기.bat",
     "chatgpt_desktop_local": "chatgpt_desktop_local_mcp.json",
-    "chatgpt_desktop_agent_prompt": "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
-    "codex_agent_prompt": "CODEX_AGENT_CONNECT_PROMPT.md",
-    "claude_code_agent_prompt": "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md",
-    "doctor_bat": "연결 상태 확인하기.bat",
     "install": "install_local_package.ps1",
 }
+
+LEGACY_CONNECTION_ARTIFACT_FILENAMES = frozenset(
+    {
+        "설치 후 MCP 사용 방법 보기.bat",
+        "Codex에 연결하기.bat",
+        "ChatGPT Desktop에 연결하기.bat",
+        "Claude Desktop에 연결하기.bat",
+        "Claude Code에 연결하기.bat",
+        "ChatGPT HTTPS에 연결하기.bat",
+        "ChatGPT 보안 Tunnel에 연결하기.bat",
+        "Claude HTTPS에 연결하기.bat",
+        "CHATGPT_DESKTOP_CONNECT_GUIDE.md",
+        "CHATGPT_DESKTOP_AGENT_CONNECT_PROMPT.md",
+        "CODEX_AGENT_CONNECT_PROMPT.md",
+        "CLAUDE_CODE_AGENT_CONNECT_PROMPT.md",
+        "claude_api_fragment.json",
+        "연결 상태 확인하기.bat",
+        "Codex 플러그인 MCP 입력값.txt",
+        "run_http_server.ps1",
+        "run_chatgpt_data_server.ps1",
+        "run_openai_secure_tunnel.ps1",
+    }
+)
 
 OPTIONAL_SETUP_BUNDLE_FILES = frozenset(
     {
@@ -71,5 +81,12 @@ OPTIONAL_SETUP_BUNDLE_FILES = frozenset(
     }
 )
 
-ALL_SETUP_BUNDLE_FILES = frozenset(SETUP_BUNDLE_FILES.values())
+RETIRED_SETUP_BUNDLE_FILES = frozenset(
+    {
+        SETUP_BUNDLE_FILES["run_http"],
+        SETUP_BUNDLE_FILES["run_chatgpt"],
+        SETUP_BUNDLE_FILES["openai_tunnel"],
+    }
+)
+ALL_SETUP_BUNDLE_FILES = frozenset(SETUP_BUNDLE_FILES.values()) - RETIRED_SETUP_BUNDLE_FILES
 REQUIRED_SETUP_BUNDLE_FILES = frozenset(ALL_SETUP_BUNDLE_FILES - OPTIONAL_SETUP_BUNDLE_FILES)
