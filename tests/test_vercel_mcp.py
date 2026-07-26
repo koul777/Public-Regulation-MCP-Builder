@@ -81,6 +81,44 @@ class VercelMcpAppTests(unittest.TestCase):
                 )
 
         self.assertIsNone(create_server.call_args.kwargs["http_bearer_token"])
+        self.assertEqual("chatgpt-data", create_server.call_args.kwargs["tool_profile"])
+
+    def test_rejects_full_tool_profile_for_unauthenticated_public_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir)
+            _write_manifest(runtime)
+            with patch("app.mcp_server.vercel_app.create_regulation_mcp_server") as create_server:
+                with self.assertRaisesRegex(RuntimeError, "must use MCP_TOOL_PROFILE=chatgpt-data"):
+                    create_vercel_mcp_app(
+                        {
+                            "MCP_DATA_DIR": str(runtime),
+                            "MCP_ALLOW_UNAUTHENTICATED_HTTP": "true",
+                            "MCP_ALLOWED_HTTP_HOSTS": "mcp.example.go.kr",
+                            "MCP_TOOL_PROFILE": "full",
+                        }
+                    )
+
+        create_server.assert_not_called()
+
+    def test_allows_full_tool_profile_when_bearer_authenticated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir)
+            _write_manifest(runtime)
+            fake_server = _FakeMcpServer()
+            with patch(
+                "app.mcp_server.vercel_app.create_regulation_mcp_server",
+                return_value=fake_server,
+            ) as create_server:
+                create_vercel_mcp_app(
+                    {
+                        "MCP_DATA_DIR": str(runtime),
+                        "MCP_AUTH_TOKEN": "secret",
+                        "VERCEL_URL": "preview.example.vercel.app",
+                        "MCP_TOOL_PROFILE": "full",
+                    }
+                )
+
+        self.assertEqual("full", create_server.call_args.kwargs["tool_profile"])
 
     def test_rejects_tenant_override_that_does_not_match_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
