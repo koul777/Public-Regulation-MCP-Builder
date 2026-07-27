@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">ChatGPT Desktop 로컬 STDIO MCP 서버 추가 화면 예시</title>
+  <desc id="desc">플러그인 설정에서 STDIO를 선택하고 powershell.exe와 생성된 인수를 각각 입력하는 과정을 번호로 표시한 개인정보 없는 안내 화면입니다.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0f172a" flood-opacity=".14"/>
+    </filter>
+    <style>
+      text { font-family: "Malgun Gothic", "Segoe UI", sans-serif; }
+      .label { font-size: 22px; font-weight: 700; }
+      .body { font-size: 20px; }
+      .small { font-size: 17px; }
+      .mono { font-family: Consolas, monospace; font-size: 17px; }
+      .step { font-size: 21px; font-weight: 800; fill: white; text-anchor: middle; dominant-baseline: middle; }
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="#eef3f8"/>
+  <rect x="50" y="40" width="1500" height="820" rx="24" fill="white" filter="url(#shadow)"/>
+  <rect x="50" y="40" width="1500" height="78" rx="24" fill="#101827"/>
+  <circle cx="88" cy="79" r="10" fill="#ff6b6b"/><circle cx="118" cy="79" r="10" fill="#ffd43b"/><circle cx="148" cy="79" r="10" fill="#51cf66"/>
+  <text x="190" y="89" font-size="27" font-weight="800" fill="white">ChatGPT Desktop · Settings · Plugins · Add MCP server</text>
+  <text x="1285" y="87" font-size="17" fill="#cbd5e1">설명용 화면 · 개인정보 없음</text>
+
+  <rect x="50" y="118" width="320" height="742" fill="#f7f9fc"/>
+  <text x="90" y="170" font-size="25" font-weight="800">Settings</text>
+  <text x="90" y="225" class="body" fill="#64748b">General</text>
+  <rect x="74" y="252" width="270" height="58" rx="13" fill="#dbeafe"/>
+  <text x="95" y="288" class="label" fill="#1d4ed8">Plugins / MCP</text>
+  <text x="95" y="350" class="body" fill="#64748b">Connected servers</text>
+  <text x="95" y="395" class="body" fill="#64748b">Privacy</text>
+  <rect x="82" y="720" width="252" height="92" rx="14" fill="#fff7ed" stroke="#fdba74"/>
+  <text x="102" y="750" class="small" font-weight="700" fill="#9a3412">로컬 STDIO</text>
+  <text x="102" y="777" class="small" fill="#9a3412">URL 입력 화면이 아닙니다.</text>
+
+  <text x="410" y="165" font-size="31" font-weight="800">Add MCP server</text>
+  <text x="410" y="199" class="body" fill="#64748b">생성된 chatgpt_desktop_local_mcp.json의 ui_fields를 한 칸씩 옮깁니다.</text>
+
+  <circle cx="430" cy="258" r="22" fill="#2563eb"/><text x="430" y="259" class="step">1</text>
+  <text x="468" y="266" class="label">Name</text>
+  <rect x="720" y="225" width="740" height="60" rx="10" fill="#fff" stroke="#b8c3d4" stroke-width="2"/>
+  <text x="745" y="263" class="body">기관 규정 MCP</text>
+
+  <circle cx="430" cy="334" r="22" fill="#2563eb"/><text x="430" y="335" class="step">2</text>
+  <text x="468" y="342" class="label">Transport</text>
+  <rect x="720" y="301" width="380" height="60" rx="10" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="745" y="339" class="body" font-weight="700" fill="#1d4ed8">STDIO</text>
+
+  <circle cx="430" cy="410" r="22" fill="#2563eb"/><text x="430" y="411" class="step">3</text>
+  <text x="468" y="418" class="label">Executable / Command</text>
+  <rect x="720" y="377" width="740" height="60" rx="10" fill="#fff" stroke="#b8c3d4" stroke-width="2"/>
+  <text x="745" y="416" class="mono">powershell.exe</text>
+
+  <circle cx="430" cy="486" r="22" fill="#2563eb"/><text x="430" y="487" class="step">4</text>
+  <text x="468" y="494" class="label">Working directory</text>
+  <rect x="720" y="453" width="740" height="60" rx="10" fill="#fff" stroke="#b8c3d4" stroke-width="2"/>
+  <text x="745" y="492" class="mono">C:\MCP 번들\기관 규정</text>
+
+  <circle cx="430" cy="562" r="22" fill="#2563eb"/><text x="430" y="563" class="step">5</text>
+  <text x="468" y="570" class="label">Arguments</text>
+  <rect x="720" y="529" width="740" height="170" rx="10" fill="#0f172a"/>
+  <text x="745" y="564" class="mono" fill="#e2e8f0">1  -NoProfile</text>
+  <text x="745" y="594" class="mono" fill="#e2e8f0">2  -ExecutionPolicy     3  Bypass     4  -File</text>
+  <text x="745" y="624" class="mono" fill="#93c5fd">5  C:\MCP 번들\기관 규정\run_mcp_stdio_server.ps1</text>
+  <text x="745" y="654" class="mono" fill="#e2e8f0">6  --data-dir     7  C:\MCP 번들\기관 규정\data</text>
+  <text x="745" y="684" class="mono" fill="#e2e8f0">… 생성 파일의 args를 빠짐없이 같은 순서로 추가</text>
+
+  <circle cx="430" cy="752" r="22" fill="#2563eb"/><text x="430" y="753" class="step">6</text>
+  <text x="468" y="760" class="label">Environment</text>
+  <rect x="720" y="719" width="430" height="60" rx="10" fill="#fff" stroke="#b8c3d4" stroke-width="2"/>
+  <text x="745" y="757" class="small" fill="#64748b">ui_fields.env가 비어 있으면 비워 둠</text>
+  <rect x="1190" y="719" width="270" height="60" rx="12" fill="#2563eb"/>
+  <text x="1325" y="757" class="label" fill="white" text-anchor="middle">Save / Add</text>
+
+  <rect x="405" y="802" width="1065" height="42" rx="10" fill="#ecfdf5" stroke="#6ee7b7"/>
+  <text x="430" y="830" class="small" fill="#047857">중요: Command 칸에는 powershell.exe만, 나머지는 Arguments에 한 항목씩 넣습니다. 실제 값은 생성 JSON을 우선합니다.</text>
+</svg>

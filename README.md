@@ -39,6 +39,7 @@ Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 �
 
 바로 이동:
 
+- [완전 처음이라면 여기부터](#0-완전-처음이라면-여기부터)
 - [처음 설치하고 승인 데이터 만들기](#1-처음-설치하고-승인-데이터-만들기)
 - [로컬 STDIO와 Vercel HTTPS 중 선택하기](#2-연결-방식-선택하기)
 - [강의 A: 같은 PC의 Claude Desktop에 STDIO 연결하기](#강의-a-claude-desktop-로컬-stdio-연결)
@@ -59,6 +60,67 @@ Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 �
 `search`는 승인된 규정을 찾아 결과 목록과 `id`를 돌려줍니다. `fetch`는 그 `id`를 받아
 원문 내용과 출처를 돌려줍니다. 따라서 **서버 이름이 보이는 것만으로는 성공이 아니며,
 두 도구가 모두 동작해야 연결 완료**입니다.
+
+## 0. 완전 처음이라면 여기부터
+
+처음에는 **로컬 STDIO부터 성공시킨 뒤**, 꼭 인터넷 주소가 필요할 때만 Vercel HTTPS로
+넘어가는 것을 권장합니다. 로컬 STDIO는 Vercel 계정, Node.js, 도메인과 공개 서버가
+필요하지 않아 문제 원인을 찾기 쉽습니다.
+
+### 0-1. 나에게 맞는 출발점
+
+| 지금 상황 | 먼저 읽을 곳 | 필요한 것 |
+| --- | --- | --- |
+| Claude Desktop과 이 프로그램을 같은 PC에서 사용 | [강의 A](#강의-a-claude-desktop-로컬-stdio-연결) | Claude Desktop, 생성한 번들 폴더 |
+| 다른 PC·웹에서도 접속할 인터넷 주소가 필요 | 강의 A 성공 후 [강의 B](#강의-b-vercel-https-배포와-연결) | Vercel 계정, Node.js, 공개 승인 데이터 |
+| 아직 규정 파일을 처리하지 않음 | [1장](#1-처음-설치하고-승인-데이터-만들기) | Windows PC, 규정 원문 |
+
+**처음 연결하는 사람의 권장 순서**
+
+```text
+Windows 실행판 설치
+  → 규정 1개 업로드
+  → 원문과 비교
+  → 사람 승인
+  → 색인 완료 확인
+  → Claude Desktop 로컬 STDIO 연결
+  → search와 fetch 확인
+  → 필요할 때만 Vercel HTTPS 배포
+```
+
+### 0-2. 이 문서의 명령과 경로 읽는 법
+
+- 회색 명령 상자 오른쪽 위에 복사 버튼이 보이면 눌러서 복사합니다.
+- `<프로젝트-이름>`처럼 `< >`로 감싼 말은 **내 값으로 바꾸라는 자리 표시자**입니다.
+  `<`와 `>`까지 그대로 입력하지 않습니다.
+- `C:\MCP-Bundles\...`는 설명용 예시입니다. 생성 완료 화면이나 내 파일 탐색기의 실제
+  경로를 복사합니다.
+- JSON 안의 `C:\\MCP-Bundles\\...`처럼 역슬래시가 두 개인 것은 정상입니다. JSON이
+  Windows 경로를 안전하게 저장한 모습입니다.
+- PowerShell 명령이 여러 줄이면 줄 끝의 백틱 `` ` ``까지 포함해 한 덩어리로
+  복사합니다. 불편하면 한 줄로 붙여 넣어도 됩니다.
+- 명령을 실행하는 검은색 또는 파란색 창을 이 문서에서는 **PowerShell**이라고 부릅니다.
+
+### 0-3. 원하는 폴더에서 PowerShell 여는 가장 쉬운 방법
+
+1. 파일 탐색기로 명령을 실행할 폴더를 엽니다.
+2. 위쪽 주소 표시줄의 폴더 경로를 한 번 클릭합니다.
+3. 경로 대신 `powershell`이라고 입력하고 `Enter`를 누릅니다.
+4. 열린 창의 줄 앞에 현재 폴더 이름이 보이면 준비 완료입니다.
+5. 문서의 명령을 붙여 넣고 `Enter`를 누릅니다.
+
+명령 실행 중 빨간 글씨가 보이면 창을 바로 닫지 마세요. 마지막 20줄을 복사하거나
+캡처해 두면 [문제 해결표](#4-문제-해결표)에서 원인을 찾기 쉽습니다. API 키, 토큰,
+기관명과 개인 경로가 포함됐다면 공유하기 전에 가립니다.
+
+### 0-4. 시작 전 1분 점검
+
+- [ ] 규정 파일 한 개 이상을 사람이 원문과 비교했다.
+- [ ] 사용할 조문을 승인했다.
+- [ ] 승인 데이터의 검색 색인이 완료됐다.
+- [ ] 번들 폴더를 앞으로 이동하거나 이름을 바꾸지 않을 위치에 만들었다.
+- [ ] 로컬 연결이면 Claude Desktop을 설치하고 로그인했다.
+- [ ] Vercel 연결이면 외부 공개가 허용된 데이터인지 담당자에게 확인했다.
 
 ## 1. 처음 설치하고 승인 데이터 만들기
 
@@ -164,12 +226,27 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 >
 > 로컬 설정에는 `command/args/env`가 필요하고, Vercel 연결에는 HTTPS URL만 필요합니다.
 
+### 초보자용 한 줄 결정
+
+- Claude Desktop이 지금 이 Windows PC에서 같은 규정 데이터를 읽어야 한다면 `로컬 STDIO`를 선택합니다.
+- Claude가 웹이나 다른 PC에서도 같은 주소로 접속해야 한다면 `Vercel HTTPS`를 선택합니다.
+- `Connectors` 화면에 로컬 `command`, `args`, `PYTHONPATH`를 넣지 않습니다.
+- `Developer > Edit Config` 화면에 Vercel URL만 넣지 않습니다.
+- 두 방식 중 하나만 선택해서 끝까지 따라가면 됩니다. 중간에 섞으면 거의 항상 실패합니다.
+
 ### 생성 완료 화면 읽는 법
 
 `MCP 파일 묶음 생성 완료`가 나오면 아래의 **직접 MCP 연결 및 최종 확인**까지 내려갑니다.
 이 영역은 두 방식을 항상 비교해 보여 주고, 이번에 선택한 방식에는 실제 다음 명령과 등록
 위치를 표시합니다.
 
+- **같은 Windows PC에서 지금 바로 Claude Desktop에 붙일 것**이면 로컬 STDIO 절차만 따라갑니다.
+- **다른 PC, 다른 계정, 모바일, 클라우드 AI에서 쓸 것**이면 Vercel HTTPS 절차로 갑니다.
+- 화면에 `command`, `args`, `env`가 보이면 로컬 STDIO 안내입니다. 이때는 URL을 넣지 않습니다.
+- 화면에 `https://.../mcp`가 보이면 Vercel HTTPS 안내입니다. 이때는 내 PC의 폴더 경로나
+  `command`, `args`, `env`를 넣지 않습니다.
+- 어느 쪽이든 마지막은 서버 이름이 보이는 것에서 끝나지 않고 `search`와 `fetch`가 실제로
+  성공해야 완료입니다.
 - **로컬 STDIO를 선택한 경우**: 생성된 실제 `command/args/env`, 앱별 설정 파일,
   `doctor_mcp_connection.ps1`, `validate_mcp_smoke.ps1`, 완전 재시작 순서가 보입니다.
 - **Vercel HTTPS를 선택한 경우**: 입력한 Production `/mcp` URL, staging 명령,
@@ -178,6 +255,31 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
   완료합니다.
 - `MCP 파일 묶음 생성 완료`는 Vercel 배포 완료가 아닙니다. Vercel은 `Ready`와
   `Aliased` URL을 확인하고 원격 smoke까지 통과해야 합니다.
+
+화면의 문구를 다음처럼 읽으면 됩니다.
+
+| 완료 화면에 보이는 항목 | 정확한 뜻 | 지금 할 일 |
+| --- | --- | --- |
+| `MCP 실행 데이터와 연결 파일 묶음을 만들었습니다` | 내 PC에 번들 폴더를 만들었음 | 아래 `최근 생성한 MCP 파일 묶음` 경로 열기 |
+| `HTTP MCP 주소` | 앞으로 등록할 원격 주소 | Vercel이 `Ready`가 되기 전에는 아직 사용하지 않기 |
+| `선택한 AI 앱` | 이번에 우선 보여 줄 등록 절차 | 표시된 앱의 안내부터 따라 하기 |
+| `생성된 파일` | 로컬 번들 안의 설정·진단 파일 목록 | 파일명과 폴더 경로 확인 |
+| `직접 MCP 연결 및 최종 확인` | 실제 설치·배포·검증 강의 | 이 영역 끝의 `search`·`fetch`까지 완료 |
+
+> [!IMPORTANT]
+> 완료 화면에 HTTPS 주소가 이미 적혀 있어도 서버가 자동으로 인터넷에 올라간 것은
+> 아닙니다. **번들 생성 → staging 생성 → Vercel Production 배포 → 원격 smoke**는 서로
+> 다른 네 단계입니다.
+
+초보자 기준으로는 이 화면을 아래처럼 읽으면 됩니다.
+
+1. 맨 위 `이번에 선택한 방식` 줄을 먼저 봅니다.
+2. `로컬 STDIO`라면 `claude_desktop_config.json` 또는 해당 앱 설정 파일만 따라갑니다.
+3. `Vercel Streamable HTTP(HTTPS)`라면 로컬 명령은 무시하고 `https://<host>/mcp`와
+   `vercel --prod` 안내만 따라갑니다.
+4. `doctor_mcp_connection.ps1`, `validate_mcp_smoke.ps1`는 로컬 진단용입니다.
+5. `reg-rag-mcp-vercel-stage`, `vercel`, `reg-rag-mcp-client-config-smoke`는 원격 배포 및 검증용입니다.
+6. 마지막 줄의 `search then fetch` 예시까지 성공해야 끝입니다. 서버 이름만 보여도 아직 완료가 아닙니다.
 
 ![MCP 생성 완료 화면에서 로컬 STDIO와 Vercel HTTPS의 다음 단계를 구분하는 설명용 화면](docs/assets/readme-course-00-completion-guide.png)
 
@@ -258,7 +360,42 @@ Claude Desktop이 어느 폴더에서 시작되더라도 동작하도록 생성 
 - `command`가 `powershell.exe`여도 오류가 아닙니다. 소스 프로젝트나 검증된 Python을
   직접 사용할 수 없는 독립 ZIP/wheel 환경에서는 기존 래퍼가 fallback으로 생성됩니다.
 
-### A-3. Claude Desktop 설정 파일 열기
+### A-3. 자동 연결 마법사 실행 — 처음 사용자는 이 방법을 권장
+
+수동으로 JSON을 편집하기 전에 생성 번들의 자동 연결 마법사를 사용하세요. 이 방법은
+기존 Claude 설정을 백업하고, 다른 MCP 서버와 `preferences`는 보존하면서 **이번 서버
+키만 병합**한 뒤 실제 STDIO 설정도 검사합니다.
+
+1. Claude Desktop을 완전히 종료합니다.
+2. 생성한 번들 폴더를 파일 탐색기로 엽니다.
+3. 주소 표시줄에 `powershell`을 입력하고 `Enter`를 누릅니다.
+4. 아래 명령을 통째로 복사해 붙여 넣고 `Enter`를 누릅니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".\connect_mcp_client.ps1" `
+  -InstallPackage `
+  -Target claude-desktop `
+  -InstallClaudeDesktop
+```
+
+5. 설치와 진단이 끝날 때까지 창을 닫지 않습니다.
+6. `Installed-config stdio verification passed`가 보이면 설정 파일 병합과 직접 STDIO
+   검사가 통과한 것입니다.
+7. `CLAUDE DESKTOP VERIFICATION REQUIRED`는 실패가 아닙니다. 이제 Claude Desktop을
+   다시 시작해 앱 안의 최종 확인을 하라는 뜻입니다.
+
+연결 마법사는 기존
+`%APPDATA%\Claude\claude_desktop_config.json` 옆에
+`claude_desktop_config.json.bak-...` 백업을 만듭니다. 설치 후 검증이 실패하면 기존
+설정을 복원하도록 설계되어 있습니다.
+
+> [!TIP]
+> 명령을 실행했는데 PowerShell이 스크립트 실행을 막는다는 메시지가 나오면 명령 앞부분의
+> `-ExecutionPolicy Bypass`가 빠지지 않았는지 확인합니다. 관리자 권한 PowerShell은
+> 일반적으로 필요하지 않습니다.
+
+### A-4. 자동 연결이 안 될 때 Claude Desktop 설정 파일 열기
 
 1. Claude Desktop을 실행합니다.
 2. 왼쪽 아래 프로필 또는 메뉴에서 **설정(Settings)**을 엽니다.
@@ -269,12 +406,39 @@ Claude Desktop이 어느 폴더에서 시작되더라도 동작하도록 생성 
 한글 경로는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**, 영문 경로는
 **Settings > Developer > Edit Config**입니다.
 
+메뉴를 못 찾겠다면 Windows에서 `Win + R`을 누르고 아래 경로를 그대로 붙여도 됩니다.
+
+```text
+%APPDATA%\Claude\claude_desktop_config.json
+```
+
+파일이 열리지 않으면 Claude Desktop을 한 번 실행한 뒤 다시 시도하세요.
+
 ![Claude Desktop에서 로컬 STDIO 구성 편집을 여는 설명용 화면](docs/assets/readme-course-02-claude-stdio-config.png)
 
 이 단계에서 일반 **커넥터(Connectors)** 메뉴를 열면 안 됩니다. 그 메뉴는 강의 B의
 Vercel 같은 원격 HTTPS 서버용입니다.
 
-### A-4. 기존 설정을 지우지 않고 새 서버만 합치기
+아래 캡처형 화면처럼 **Developer → Local MCP servers → Edit Config** 순서로 들어가고,
+열린 파일 안에는 URL이 아니라 생성된 `command`, `args`, `env` 서버 객체를 넣습니다.
+
+![Claude Desktop 개발자 로컬 MCP Config에서 기존 설정을 보존하고 직접 Python command args env를 병합하는 설명용 설정 화면](docs/assets/readme-course-07-claude-desktop-config-editor.svg)
+
+| Config에서 찾을 위치 | 넣을 내용 |
+| --- | --- |
+| 맨 바깥 객체 | 기존 `preferences` 등은 그대로 유지 |
+| `mcpServers` 객체 안 | 생성 파일의 서버 이름 한 키 추가 |
+| 새 서버의 `command` | 생성된 절대 Python 경로 또는 fallback `powershell.exe` |
+| 새 서버의 `args` | 생성된 배열 전체를 같은 순서로 복사 |
+| 새 서버의 `env` | 생성 파일에 있을 때 전체 복사. 소스 직접 실행은 `PYTHONPATH`, `PYTHONSAFEPATH` 필수 |
+
+Claude Desktop 로컬 STDIO Config에는 Vercel 주소만 단독으로 넣지 않습니다. 반대로
+원격 **Connectors** 화면에는 이 JSON을 넣지 않습니다.
+
+### A-5. 기존 설정을 지우지 않고 새 서버만 수동 병합하기
+
+이 절은 A-3 자동 연결이 실패했거나 설정을 직접 검토해야 할 때만 사용합니다. 먼저
+열린 Claude 설정 파일을 다른 이름으로 복사해 백업합니다.
 
 Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_config.json` 전체를
 복사해도 됩니다.
@@ -325,9 +489,27 @@ Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_con
 앞 항목 뒤의 쉼표 하나를 빠뜨리거나 마지막 항목 뒤에 불필요한 쉼표를 넣으면 JSON이
 열리지 않습니다.
 
+JSON 편집이 자신 없으면 아래 순서로 복구합니다.
+
+1. `%APPDATA%\Claude\claude_desktop_config.json`을 수정하기 전에 같은 폴더에
+   `claude_desktop_config.backup.json`으로 한 번 복사합니다.
+2. 저장 후 Claude Desktop이 열리지 않거나 서버가 모두 사라졌다면 백업 파일로 먼저 되돌립니다.
+3. 그다음 생성 번들의 `claude_desktop_config.json`을 다시 열고, 새 서버 한 항목만
+   천천히 다시 병합합니다.
+4. 확신이 없으면 생성된 JSON의 값은 타이핑하지 말고 `command`, `args`, `env`를 그대로 복사합니다.
+
 ![기존 preferences와 MCP 서버를 보존하고 새 서버 항목만 병합하는 방법](docs/assets/readme-claude-mcp-02-config.svg)
 
-### A-5. 저장하고 Claude Desktop을 완전히 다시 시작
+저장 전에 다음 세 가지를 다시 확인합니다.
+
+- 맨 바깥쪽 `{ }`가 정확히 한 쌍입니다.
+- 기존 서버 다음에 새 서버를 붙였다면 두 서버 항목 사이에 쉼표가 하나 있습니다.
+- 마지막 서버 항목 뒤에는 쉼표가 없습니다.
+
+JSON이 잘못되어 Claude가 시작되지 않으면 편집한 파일을 닫고, A-3에서 만들어진 최신
+`claude_desktop_config.json.bak-...` 파일을 원래 이름으로 복사해 복구합니다.
+
+### A-6. 저장하고 Claude Desktop을 완전히 다시 시작
 
 1. 메모장에서 `Ctrl+S`를 눌러 JSON을 저장합니다.
 2. Claude 창 오른쪽 위 `X`만 누르지 말고 작업 표시줄 알림 영역의 Claude 아이콘을
@@ -341,7 +523,13 @@ Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_con
 `disconnected`라면 다음 단계로 넘어가지 말고 [문제 해결표](#4-문제-해결표)를
 확인합니다.
 
-### A-6. 번들 자체를 먼저 진단하는 방법
+성공과 실패를 아주 단순하게 구분하면 아래와 같습니다.
+
+- 성공: 서버 이름이 보이고 상태가 `running`이며 도구 목록에 `search`, `fetch`가 나타남
+- 실패: `disconnected`, `failed`, 서버가 전혀 안 보임, 도구가 0개임
+- 실패 시 첫 조치: Claude를 다시 종료 후 실행하고 `doctor_mcp_connection.ps1`와 `validate_mcp_smoke.ps1`를 순서대로 실행
+
+### A-7. 번들 자체를 먼저 진단하는 방법
 
 Claude 화면에서 이유를 찾기 어렵다면 생성 번들 폴더를 파일 탐색기로 열고, 주소 표시줄에
 `powershell`을 입력해 Enter를 누릅니다. 열린 PowerShell에서 실행합니다.
@@ -369,18 +557,60 @@ Claude 화면에서 이유를 찾기 어렵다면 생성 번들 폴더를 파일
 ### ChatGPT/Codex Desktop
 
 생성 완료 화면의 **ChatGPT/Codex Desktop에 등록하는 방법** 또는 번들의
-`chatgpt_desktop_local_mcp.json`을 엽니다. `Settings > MCP servers > Add server`에서
-다음처럼 입력합니다.
+`chatgpt_desktop_local_mcp.json`을 엽니다. 앱 버전에 따라 **플러그인(Plugins) >
+MCP 서버 추가** 또는 **Settings > MCP servers > Add server**를 엽니다.
+
+#### 화면의 각 칸에 넣을 정확한 값
+
+아래 표의 오른쪽 값은 직접 추측하지 말고
+`chatgpt_desktop_local_mcp.json`의 `ui_fields`에서 복사합니다.
 
 | 설정 칸 | 넣을 값 |
 | --- | --- |
-| Name | 생성된 MCP 서버 이름 |
-| Transport | `STDIO` |
-| Command | `ui_fields.command` |
-| Working directory | `ui_fields.cwd` |
-| Arguments | `ui_fields.args`를 표시된 순서대로 한 항목씩 |
-| Environment | `ui_fields.env`가 비어 있으면 비워 둠 |
-| Environment passthrough | 생성 안내가 비워 두라고 하면 비워 둠 |
+| **Name** | `ui_fields.name` |
+| **Transport / Type** | `ui_fields.transport`, 즉 `STDIO` |
+| **Executable / Command** | `ui_fields.command` 한 값만. PowerShell 방식이면 `powershell.exe` |
+| **Working directory / cwd** | `ui_fields.cwd`의 전체 절대경로 |
+| **Arguments / args** | `ui_fields.args` 배열을 **첫 항목부터 한 항목씩 같은 순서로** |
+| **Environment / env** | `ui_fields.env`의 각 키와 값. `{}`이면 비워 둠 |
+| **Environment passthrough** | `ui_fields.env_passthrough`가 `[]`이면 비워 둠 |
+
+![ChatGPT Desktop 플러그인에서 STDIO, powershell.exe, 작업 폴더와 Arguments를 정확한 칸에 입력하는 설명용 설정 화면](docs/assets/readme-course-06-chatgpt-desktop-stdio-settings.svg)
+
+#### Command가 powershell.exe일 때 Arguments 넣는 법
+
+생성 파일이 PowerShell wrapper 방식을 사용한다면 **Command 칸에는
+`powershell.exe`만** 넣습니다. 아래 값은 Command 칸에 붙이지 않고 **Arguments 칸에
+각각 별도 항목으로** 넣습니다.
+
+```text
+1. -NoProfile
+2. -ExecutionPolicy
+3. Bypass
+4. -File
+5. C:\내-번들\run_mcp_stdio_server.ps1
+6. --data-dir
+7. C:\내-번들\data
+8. --tenant-id
+9. 생성된 tenant ID
+10. --transport
+11. stdio
+12. --profile-id
+13. 생성된 profile ID
+14. --flat-storage
+15. --tool-profile
+16. 생성된 tool profile
+17. --no-warm-cache
+```
+
+위 목록은 구조 설명용입니다. 실제 생성 파일에 항목이 더 있거나 순서가 다르면
+**`ui_fields.args`가 정답**입니다. Arguments 입력 화면이 여러 행을 지원하면 한 행에
+한 항목을 넣고, `Add argument` 버튼 방식이면 위에서부터 한 번씩 추가합니다.
+
+직접 Python 방식이 생성되었다면 Command에는 생성된
+`...\python.exe`, Arguments의 첫 두 항목에는 `-m`,
+`scripts.run_regulation_mcp`가 들어갑니다. 이 경우에도 화면 예시를 억지로 따라
+`powershell.exe`로 바꾸지 말고 생성된 `ui_fields`를 그대로 사용합니다.
 
 서버 이름은 **Name에만** 넣습니다. Command에는 서버 이름이나 폴더 이름을 넣지 않습니다.
 저장 후 앱을 완전히 종료했다가 다시 실행하고 `/mcp` 또는 MCP 서버 목록을 확인합니다.
@@ -414,6 +644,9 @@ Vercel HTTPS는 승인된 MCP runtime을 인터넷에서 접속 가능한 서버
 Vercel 홈페이지는 계정·환경변수·로그를 관리하고, 처음 배포할 파일 준비와 업로드는 내
 PC의 PowerShell에서 진행합니다.
 
+처음이라면 강의 A의 로컬 `search`와 `fetch`가 먼저 성공한 뒤 진행하세요. 로컬에서도
+검색되지 않는 데이터는 Vercel에 올린다고 검색되기 시작하지 않습니다.
+
 > [!WARNING]
 > Vercel로 전송한 MCP 응답은 외부 AI 서비스로 전달될 수 있습니다. 공개 자료 또는
 > 반출 승인을 받은 자료에만 사용하세요. 기관 내부 자료에는 공개 무인증 모드를 사용하지
@@ -421,8 +654,8 @@ PC의 PowerShell에서 진행합니다.
 
 ### B-1. 준비물 확인
 
-- Vercel 계정: <https://vercel.com>
-- Node.js와 npm: <https://nodejs.org>
+- Vercel 계정: <https://vercel.com>에서 **Sign Up** 후 이메일 또는 GitHub 계정으로 가입
+- Node.js LTS와 npm: <https://nodejs.org>에서 **LTS** 설치판 사용
 - Python 3.11 이상
 - 사람 승인과 검색 색인이 끝난 MCP 번들의 `data` 폴더
 - 프로젝트 소스가 있는 이 저장소
@@ -430,10 +663,20 @@ PC의 PowerShell에서 진행합니다.
 `④ MCP 생성·AI 연결`에서 HTTPS 연결을 선택하면 앱별 안내를 볼 수 있습니다. 앱 안에
 표시되는 공개 URL은 실제 배포가 끝난 Production 주소로 입력해야 합니다.
 
+Node.js를 설치한 뒤 새 PowerShell을 열고 다음 두 명령을 실행합니다.
+
+```powershell
+node --version
+npm --version
+```
+
+두 명령 모두 숫자 버전을 보여야 합니다. `'node' 또는 'npm'을 찾을 수 없습니다`가
+나오면 모든 PowerShell 창을 닫고 새로 연 뒤 다시 확인합니다.
+
 ### B-2. 배포 전용 폴더 만들기
 
-PowerShell을 프로젝트 루트에서 열고 다음 명령을 실행합니다. 두 경로는 내 실제 경로로
-바꿉니다.
+프로젝트 폴더, 즉 `README.md`, `app`, `scripts`가 함께 보이는 폴더에서 PowerShell을
+엽니다. 다음 명령의 두 경로는 내 실제 경로로 바꿉니다.
 
 ```powershell
 python scripts\prepare_vercel_mcp_deployment.py `
@@ -460,6 +703,17 @@ reg-rag-mcp-vercel-stage `
 기존 출력 폴더는 자동 덮어쓰지 않습니다. 기존 폴더를 재사용하려면 내용과 비밀값을
 확인하고 새 빈 폴더를 선택하는 것이 안전합니다.
 
+명령이 끝나면 `C:\MCP-Deploy\vercel-mcp-stage`를 파일 탐색기로 열어 최소한 다음
+항목이 보이는지 확인합니다.
+
+- `api` 폴더
+- `app` 폴더
+- `mcp_runtime` 폴더
+- `vercel.json`
+- `pyproject.toml`
+
+하나라도 없으면 아직 배포하지 말고 staging 명령의 빨간 오류부터 해결합니다.
+
 > [!CAUTION]
 > `.env.local`, `.vercel`, 토큰, 원본 업로드와 보고서 전체를 ZIP이나 Git으로 함께
 > 올리지 마세요. `.gitignore`만 믿고 폴더 전체를 수동 업로드하지 말고, 위 staging
@@ -471,11 +725,21 @@ reg-rag-mcp-vercel-stage `
 
 ```powershell
 npm install -g vercel
+vercel --version
 vercel login
 ```
 
-`vercel login`이 브라우저를 열면 로그인과 승인 절차를 마치고 PowerShell로 돌아옵니다.
-토큰이나 로그인 링크를 다른 사람에게 보내지 마세요.
+`vercel --version`이 버전을 보여야 설치된 것입니다. `vercel login`이 브라우저를 열면
+방금 만든 Vercel 계정으로 로그인하고 승인합니다. 브라우저에 성공 표시가 나오면
+PowerShell로 돌아와 로그인 완료 문구를 확인합니다. 토큰이나 로그인 링크를 다른
+사람에게 보내지 마세요.
+
+> [!NOTE]
+> Vercel 홈페이지에서 빈 프로젝트를 먼저 만들 수도 있지만 필수는 아닙니다. 아래 CLI가
+> 프로젝트 생성과 로컬 staging 폴더 연결을 수행합니다. 홈페이지는 이후 상태와 로그를
+> 확인할 때 사용합니다.
+>
+> 즉, **홈페이지에도 들어가지만 실제 배포 명령은 PowerShell에서 실행**합니다.
 
 ### B-4. Vercel 프로젝트 만들고 staging 폴더 연결
 
@@ -489,6 +753,13 @@ vercel link --yes `
 ```
 
 완료 후 Vercel 홈페이지 Dashboard에 해당 프로젝트가 보입니다.
+
+Dashboard에 프로젝트가 보인다고 배포가 끝난 것은 아닙니다. 반드시 뒤의
+`vercel --prod`까지 실행하고, 출력의 마지막에 `Ready`와 `Aliased` 주소가 보여야 합니다.
+
+명령이 팀을 선택하라고 물으면 개인 연습은 본인 계정을 선택합니다. 기존 프로젝트에
+연결할지 묻고 처음 만드는 경우에는 새 프로젝트를 선택합니다. 프로젝트 이름에는 공백과
+한글 대신 영문 소문자, 숫자, 하이픈을 사용합니다.
 
 ### B-5. 공개 또는 비공개 방식 선택
 
@@ -508,6 +779,14 @@ vercel env add MCP_TOOL_PROFILE production `
 ```
 
 이 모드는 쓰기 도구 없이 원격 공개 범위를 `search`, `fetch`로 제한하는 용도입니다.
+
+명령 실행 뒤 Vercel 홈페이지에서도 확인할 수 있습니다.
+
+1. Dashboard에서 만든 프로젝트를 엽니다.
+2. **Settings > Environment Variables**로 이동합니다.
+3. `MCP_ALLOW_UNAUTHENTICATED_HTTP`와 `MCP_TOOL_PROFILE`이 Production에 있는지
+   확인합니다.
+4. 값이 없거나 오타가 있으면 배포하지 말고 먼저 수정합니다.
 
 #### 기관 내부 자료나 비공개 endpoint
 
@@ -550,6 +829,18 @@ https://<프로젝트-이름>.vercel.app/mcp
 배포와 `/mcp` endpoint를 ChatGPT·Codex·Claude가 함께 사용하므로 앱마다 새 서버를
 배포할 필요가 없습니다.
 
+PowerShell 출력을 놓쳤다면 Vercel 홈페이지에서 다시 찾을 수 있습니다.
+
+1. Dashboard에서 프로젝트를 엽니다.
+2. **Deployments**에서 가장 최근 Production 배포를 엽니다.
+3. 상태가 **Ready**인지 확인합니다.
+4. **Domains** 또는 배포의 **Aliased** 주소에서 `.vercel.app` 주소를 복사합니다.
+5. 복사한 주소 끝에 `/mcp`를 붙입니다.
+
+브라우저 주소창에 `/mcp`를 열었을 때 일반 웹페이지 대신 오류나 메서드 안내가 보일 수
+있습니다. MCP는 브라우저로 읽는 홈페이지가 아니므로 이것만으로 실패라고 판단하지 말고
+반드시 다음 smoke 명령으로 프로토콜을 검사합니다.
+
 ### B-7. 주소를 등록하기 전에 프로토콜 검증
 
 프로젝트 루트에서 실제 Production URL로 실행합니다.
@@ -572,6 +863,10 @@ endpoint에는 설정한 인증을 사용합니다.
 - `end_to_end_verified`: `true`
 - `tool_names`: `search`, `fetch` 포함
 
+이 네 값 중 하나라도 `false`이면 Claude에 등록하지 않습니다. Vercel Dashboard의
+**Logs**에서 가장 최근 Function 오류를 확인하고 [문제 해결표](#4-문제-해결표)의
+Vercel 항목을 먼저 처리합니다.
+
 ### B-8. Claude에 Vercel URL 등록
 
 1. Claude 웹 또는 Desktop을 엽니다.
@@ -581,11 +876,48 @@ endpoint에는 설정한 인증을 사용합니다.
 5. URL에는 고정 Production 주소와 `/mcp`를 입력합니다.
 6. 공개 read-only 배포는 별도 토큰을 입력하지 않습니다.
 7. 저장한 뒤 새 대화에서 커넥터를 활성화합니다.
+8. 커넥터가 목록에 보이면 [3장](#3-search와-fetch로-최종-확인하기)의 문장을 그대로
+   보내 실제 도구 호출을 확인합니다.
+
+이 화면은 로컬 STDIO 화면과 다릅니다. 아래 항목은 넣지 않습니다.
+
+- `C:\\...\\python.exe`
+- `-m scripts.run_regulation_mcp`
+- `PYTHONPATH`
+- `run_mcp_stdio_server.ps1`
 
 ![Claude 사용자 지정 커넥터에 Vercel MCP URL을 등록하는 설명용 화면](docs/assets/readme-course-04-claude-remote-connector.png)
 
 Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입력하지 않습니다.
 필요한 것은 최종 HTTPS `/mcp` URL과, 비공개 서버일 때 승인된 인증뿐입니다.
+
+#### 원격 MCP 설정 화면의 각 칸에 넣을 정확한 값
+
+![Vercel Production의 Ready와 Aliased 주소를 확인하고 슬래시 mcp를 붙여 원격 MCP URL 칸에 넣는 설명용 설정 화면](docs/assets/readme-course-08-vercel-http-mcp-settings.svg)
+
+| 원격 설정 칸 | 넣을 값 |
+| --- | --- |
+| **Name** | 사용자가 알아볼 이름. 예: `기관 규정 MCP` |
+| **Transport / Type** | 선택 칸이 있으면 `Streamable HTTP` 또는 `HTTP` |
+| **MCP URL / Server URL** | Vercel의 고정 `Aliased` 주소 끝에 `/mcp`를 붙인 전체 URL |
+| **Authentication** | 공개 read-only endpoint는 없음. 비공개는 서버와 클라이언트가 지원하는 승인된 인증 |
+| **Command / Executable** | 넣지 않음 |
+| **Arguments / Working directory / PYTHONPATH** | 넣지 않음 |
+
+예를 들어 Vercel `Aliased` 주소가 다음이라면
+
+```text
+https://my-regulation-mcp.vercel.app
+```
+
+MCP URL 칸에는 정확히 다음을 넣습니다.
+
+```text
+https://my-regulation-mcp.vercel.app/mcp
+```
+
+`https://`를 빼거나, 끝의 `/mcp`를 빼거나, 배포 staging 폴더의 `C:\...` 경로를
+넣으면 연결되지 않습니다.
 
 전체 흐름을 한 장으로 보면 다음과 같습니다.
 
@@ -638,6 +970,13 @@ claude mcp list
 3. 그중 하나의 `id`로 MCP `fetch` 도구가 실행됩니다.
 4. 승인된 규정 본문과 출처가 표시됩니다.
 
+반대로 아래 중 하나라도 보이면 아직 완료가 아닙니다.
+
+- 서버 이름만 보이고 도구 목록이 비어 있다.
+- `running`이 아니라 `disconnected`다.
+- `search`는 되지만 결과마다 `id`가 없다.
+- `fetch`에 제목이나 본문을 넣고 있고, `search`가 준 `id`를 넣지 않았다.
+
 ![MCP initialize와 search 및 fetch가 모두 성공한 설명용 검증 화면](docs/assets/readme-course-05-mcp-verification.png)
 
 ![Claude에서 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](docs/assets/readme-claude-mcp-03-verify.svg)
@@ -656,14 +995,19 @@ claude mcp list
 | --- | --- | --- |
 | 서버가 목록에 없음 | 잘못된 설정 화면, JSON 문법 오류, 재시작 안 함 | 로컬은 Developer > Edit Config, 원격은 Connectors인지 확인하고 완전히 재시작 |
 | Claude Desktop가 `disconnected` | `command`, `args`, `env` 일부 누락 | 생성 JSON의 한 서버 항목을 수정 없이 다시 병합 |
+| 연결 마법사 실행이 차단됨 | PowerShell 실행 정책 또는 명령 일부 누락 | README의 `powershell.exe -NoProfile -ExecutionPolicy Bypass ...` 전체 명령을 다시 복사 |
+| Claude가 JSON 편집 뒤 시작되지 않음 | 쉼표·중괄호 오류 | 최신 `claude_desktop_config.json.bak-...`를 원래 파일명으로 복사해 복구 |
 | `Python was not found` | 파일 없음 또는 wrapper probe 실패 | `doctor_mcp_connection.ps1`을 실행해 버전·marker·project root·import 진단 확인 |
 | Python은 있는데 import 실패 | Python 3.11 미만, 잘못된 프로젝트 Python, 의존성 누락 | 생성기가 검증한 프로젝트 Python을 사용하고 진단 stderr 확인 |
 | 도구가 0개 | 서버 미활성화 또는 시작 실패 | 새 대화에서 서버를 활성화하고 `validate_mcp_smoke.ps1` 실행 |
 | `search` 결과가 0개 | 검색어 불일치 또는 승인·색인된 데이터 없음 | 승인 및 색인 상태를 다시 확인하고 실제 규정 용어로 검색 |
 | `fetch` 실패 | 검색 결과의 `id`가 아닌 제목을 전달 | `search` 응답의 정확한 `id` 값을 사용 |
 | 폴더를 옮긴 뒤 실패 | 설정의 절대경로가 이전 위치를 가리킴 | 새 위치에서 MCP 번들을 다시 생성 |
+| `node`, `npm`, `vercel`을 찾을 수 없음 | 설치 뒤 이전 PowerShell을 계속 사용하거나 PATH 미반영 | Node.js LTS와 Vercel CLI를 설치하고 모든 PowerShell을 닫은 뒤 새 창에서 버전 확인 |
+| Vercel 프로젝트가 안 보임 | 다른 Vercel 계정·팀으로 로그인 | `vercel whoami`와 Dashboard의 현재 계정·팀을 비교 |
 | Vercel `404` | `/mcp`를 빼먹음 또는 잘못된 Preview URL | `https://<고정-host>/mcp` 사용 |
 | Vercel `401/403` | 공개/비공개 인증 방식 불일치 | 공개 승인 데이터 여부와 환경변수·토큰/OAuth 설정을 다시 확인 |
+| 브라우저에서 `/mcp`가 웹페이지처럼 안 열림 | MCP endpoint를 일반 GET 웹페이지처럼 확인 | 브라우저 화면 대신 `run_mcp_client_config_smoke.py` 결과로 판정 |
 | Vercel은 Ready지만 도구 호출 실패 | 환경변수, runtime, host 설정 오류 | Vercel Function Logs와 원격 smoke 명령 결과 확인 |
 | 다른 MCP 서버가 사라짐 | Claude 설정 전체를 덮어씀 | 백업에서 복구하고 새 `mcpServers` 항목만 병합 |
 
