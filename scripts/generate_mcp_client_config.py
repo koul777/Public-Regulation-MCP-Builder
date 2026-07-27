@@ -5827,7 +5827,7 @@ function Install-ClaudeDesktopConfig {
   Write-Host "Claude Desktop config updated: $TargetPath"
   Write-Host "Verified MCP server name and bundle paths: $ServerName"
   Write-Host "Installed-config stdio verification passed."
-  Write-Host "[CONFIGURED - CLAUDE DESKTOP VERIFICATION REQUIRED] Restart Claude Desktop, confirm the server in Connectors, and invoke get_index_status in a new conversation."
+  Write-Host "[CONFIGURED - CLAUDE DESKTOP VERIFICATION REQUIRED] Restart Claude Desktop, open Settings > Developer > Local MCP servers, confirm the server is running, then invoke search and fetch in a new conversation."
   } catch {
     $InstallError = $_
     $RollbackComplete = $false

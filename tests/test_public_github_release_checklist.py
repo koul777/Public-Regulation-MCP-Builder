@@ -38,7 +38,7 @@ class PublicGithubReleaseChecklistTests(unittest.TestCase):
         self.assertIn("ChatGPT Desktop / Codex CLI / Codex IDE", text)
         self.assertIn("Claude Code", text)
         self.assertIn("Claude Desktop", text)
-        self.assertIn("https://<deployment>/mcp", text)
+        self.assertIn("Aliased:", text)
         self.assertIn("reg-rag-mcp-vercel-stage", text)
         self.assertNotIn("OpenAI Secure MCP Tunnel", text)
         self.assertNotIn("run_openai_secure_tunnel.ps1", text)
