@@ -71,9 +71,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
 
         for expected in (
             '"-m"',
-            '"scripts.run_regulation_mcp"',
-            '"PYTHONPATH"',
-            '"PYTHONSAFEPATH": "1"',
+            "scripts.run_regulation_mcp",
+            "PYTHONPATH",
+            "PYTHONSAFEPATH",
             "`initialize`, `tools/list`, `search`, `fetch`",
             "기존 서버와 `preferences`",
             "작업 표시줄 알림 영역에서도 **종료**",
@@ -98,7 +98,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
             text,
         )
-        self.assertIn("https://<deployment>/mcp", text)
+        self.assertIn("Aliased:", text)
         self.assertNotIn("CHATGPT_DESKTOP_CONNECT_GUIDE.md", text)
         self.assertNotIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
         self.assertNotIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
@@ -112,14 +112,20 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "### 0-3. 원하는 폴더에서 PowerShell 여는 가장 쉬운 방법",
             "## 강의 A: Claude Desktop 로컬 STDIO 연결",
             "### A-1. 로컬 STDIO 번들 만들기",
-            "### A-2. 생성 파일을 먼저 확인",
-            "### A-3. 자동 연결 마법사 실행 — 처음 사용자는 이 방법을 권장",
+            "### A-2. Builder에서 복사 버튼 찾기",
+            "### A-3. 자동 연결 명령 한 줄 실행",
             "### A-4. 자동 연결이 안 될 때 Claude Desktop 설정 파일 열기",
-            "### A-5. 기존 설정을 지우지 않고 새 서버만 수동 병합하기",
+            "### A-5. 복사해서 넣기 — Claude 설정 파일이 비어 있을 때만",
             "### A-6. 저장하고 Claude Desktop을 완전히 다시 시작",
             "### A-7. 번들 자체를 먼저 진단하는 방법",
             "같은 Windows PC에서 지금 바로 Claude Desktop에 붙일 것",
-            "JSON 편집이 자신 없으면 아래 순서로 복구합니다.",
+            "**완전 처음이면 아래 여섯 가지만 하면 됩니다.**",
+            "자동 연결에 성공하면 A-4와 A-5의 JSON 편집 설명은 읽지 않아도 됩니다.",
+            "아래 **한 줄 전체**를 복사해 붙여 넣고",
+            "파일이 비어 있거나 `{}`만 보이면",
+            "**복사 → 붙여넣기 → 저장**만 합니다.",
+            "다른 서버나 `preferences`가 이미 보이면",
+            "Windows 작업표시줄도 제거했습니다.",
             "connect_mcp_client.ps1",
             "-InstallClaudeDesktop",
             "Installed-config stdio verification passed",
@@ -130,12 +136,10 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-course-02d-claude-config-file-explorer.png",
             "docs/assets/readme-course-02b-claude-local-mcp-server.png",
             "docs/assets/readme-course-07-claude-config-editor.png",
-            "생성된 절대 Python 경로 또는 fallback `powershell.exe`",
-            '"scripts.run_regulation_mcp"',
-            '"PYTHONPATH"',
-            '"PYTHONSAFEPATH": "1"',
+            "scripts.run_regulation_mcp",
+            "PYTHONPATH",
+            "PYTHONSAFEPATH",
             "`initialize` → `tools/list` → `search` → `fetch`",
-            "기존 내용과 새 내용이 모두 남아 있어야 합니다",
             "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
             "Settings > Developer > Local MCP servers > Edit Config",
             "%APPDATA%\\Claude\\claude_desktop_config.json",
@@ -143,8 +147,10 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "claude_desktop_config.json.txt",
             "ConvertFrom-Json -ErrorAction Stop | Out-Null",
             "상태가 `running`",
+            "claude mcp get test2",
         ):
             self.assertIn(expected, text)
+        self.assertNotIn("<생성된-", text)
 
     def test_readme_contains_beginner_vercel_https_walkthrough(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -176,9 +182,18 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "end_to_end_verified",
             "Customize > Connectors",
             "run_mcp_stdio_server.ps1",
-            "https://<deployment>/mcp",
+            '$VercelProject = Read-Host "새 Vercel 프로젝트 이름"',
+            '$McpUrl = Read-Host "B-6에서 복사한 전체 /mcp 주소"',
+            "claude mcp add --transport http --scope user",
+            "최종 URL을 넣어 번들을 **다시 생성한 경우에만**",
         ):
             self.assertIn(expected, text)
+        self.assertGreaterEqual(
+            text.count('$StageDir = Read-Host "B-2에서 만든 배포 전용 폴더 전체 경로"'),
+            3,
+        )
+        self.assertNotIn("<프로젝트-이름>", text)
+        self.assertNotIn("<deployment>", text)
 
     def test_readme_uses_current_workflow_images(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -293,6 +308,18 @@ class McpQuickConnectDocsTests(unittest.TestCase):
                 for private_chunk in (b"tEXt", b"zTXt", b"iTXt", b"eXIf"):
                     self.assertNotIn(private_chunk, chunk_types)
 
+    def test_claude_config_editor_capture_excludes_windows_taskbar(self) -> None:
+        path = (
+            REPO_ROOT
+            / "docs"
+            / "assets"
+            / "readme-course-07-claude-config-editor.png"
+        )
+        png = path.read_bytes()
+
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack(">II", png[16:24]), (1_586, 952))
+
     def test_readme_explains_real_capture_clicks_values_and_success_states(
         self,
     ) -> None:
@@ -307,21 +334,21 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "완주 경로 C — ChatGPT Desktop 로컬 STDIO",
             "완주 경로 B — Vercel Streamable HTTP",
             "생성 버튼을 누르기 전 — 연결 앱·저장 폴더·서버 이름",
-            "Builder의 실제 Claude Desktop 등록 안내 읽는 법",
+            "Builder에서 복사 버튼 찾기",
             "Builder의 실제 ChatGPT STDIO 결과에서 복사할 값 찾기",
             "Vercel은 [B-6](#b-6-production-배포)의 `vercel --prod`",
             "실제 화면 1 — Claude Desktop에서 설정 열기",
             "실제 화면 2 — 개발자에서 구성 편집 누르기",
             "실제 화면 3 — Claude 설정 파일 찾기",
-            "실제 화면 4 — `claude_desktop_config.json`에서 병합할 위치",
+            "실제 화면 4 — 붙여 넣을 Claude 설정 파일",
             "실제 화면 5 — `running` 확인",
             "**보기 > 표시 > 파일 확장명**",
             "`claude_desktop_config.json.txt`",
-            "**`JSON syntax OK`**",
+            "`JSON syntax OK`",
             "search와 fetch가 보이는지 알려줘",
             "플러그인 / 앱 / MCP / 스킬",
             "**+ 서버 추가**",
-            "**예시 placeholder**",
+            "**예시 문구**",
             "**이름 (Name)**",
             "**실행 명령 (Executable / Command)**",
             "**인자 (Arguments / args)**",
@@ -332,6 +359,8 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "**스트리밍 가능한 HTTP**",
             "`https://mcp.example.com/mcp`",
             "`MCP_BEARER_TOKEN`",
+            "아래 **한 줄 전체**를 복사해 붙여 넣고",
+            "**복사 → 붙여넣기 → 저장**만 합니다.",
         ):
             self.assertIn(expected, text)
 

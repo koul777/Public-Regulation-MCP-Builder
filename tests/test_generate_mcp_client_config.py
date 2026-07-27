@@ -3765,6 +3765,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertIn("Verified MCP server name and bundle paths: aks_mcp", completed.stdout)
             self.assertIn("Installed-config stdio verification passed", completed.stdout)
             self.assertIn("CLAUDE DESKTOP VERIFICATION REQUIRED", completed.stdout)
+            self.assertIn(
+                "Settings > Developer > Local MCP servers",
+                completed.stdout,
+            )
+            self.assertIn("invoke search and fetch", completed.stdout)
+            self.assertNotIn("confirm the server in Connectors", completed.stdout)
             status = json.loads((bundle_dir / "bundle_status.json").read_text(encoding="utf-8"))
             self.assertEqual("installed_pending_claude_desktop_verification", status["installation_state"])
             self.assertEqual("pending_claude_desktop_restart", status["connection_state"])
