@@ -92,7 +92,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertIn("docs/vercel_https_mcp_ko.md", text)
         self.assertIn("Settings > MCP servers > Add server", text)
         self.assertIn("설정 > 개발자 > 로컬 MCP 서버 > 구성 편집", text)
-        self.assertIn("파일·커넥터 추가 > Connectors", text)
+        self.assertIn("설정 > 개발자 > 로컬 MCP 서버", text)
         self.assertIn("Customize > Connectors", text)
         self.assertIn(
             "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
@@ -125,7 +125,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "Installed-config stdio verification passed",
             "CLAUDE DESKTOP VERIFICATION REQUIRED",
             "claude_desktop_config.json.bak-",
-            "docs/assets/readme-course-07-claude-desktop-config-editor.svg",
+            "docs/assets/readme-course-02-claude-settings-menu.png",
+            "docs/assets/readme-course-02b-claude-local-mcp-server.png",
+            "docs/assets/readme-course-07-claude-config-editor.png",
             "생성된 절대 Python 경로 또는 fallback `powershell.exe`",
             '"scripts.run_regulation_mcp"',
             '"PYTHONPATH"',
@@ -159,8 +161,10 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "MCP_TOOL_PROFILE",
             "Aliased",
             "브라우저로 읽는 홈페이지가 아니므로",
-            "docs/assets/readme-course-08-vercel-http-mcp-settings.svg",
-            "**MCP URL / Server URL**",
+            "docs/assets/readme-course-08-chatgpt-http-form.png",
+            "**기본 token 환경 변수**",
+            "**환경 변수의 헤더**",
+            "**URL (MCP URL / Server URL)**",
             "**Command / Executable** | 넣지 않음",
             "run_mcp_client_config_smoke.py",
             "mcp_initialized",
@@ -191,14 +195,20 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-claude-mcp-03-verify.svg",
             "docs/assets/readme-vercel-claude-connection.svg",
             "docs/assets/readme-course-00-completion-guide.png",
+            "docs/assets/readme-course-00b-real-completion.png",
             "docs/assets/readme-course-01-stdio-bundle.png",
-            "docs/assets/readme-course-02-claude-stdio-config.png",
             "docs/assets/readme-course-03-vercel-production.png",
             "docs/assets/readme-course-04-claude-remote-connector.png",
             "docs/assets/readme-course-05-mcp-verification.png",
-            "docs/assets/readme-course-06-chatgpt-desktop-stdio-settings.svg",
-            "docs/assets/readme-course-07-claude-desktop-config-editor.svg",
-            "docs/assets/readme-course-08-vercel-http-mcp-settings.svg",
+            "docs/assets/readme-course-02-claude-settings-menu.png",
+            "docs/assets/readme-course-02b-claude-local-mcp-server.png",
+            "docs/assets/readme-course-06-chatgpt-plugin-home.png",
+            "docs/assets/readme-course-06-chatgpt-plugin-settings.png",
+            "docs/assets/readme-course-06-chatgpt-mcp-tab.png",
+            "docs/assets/readme-course-06-chatgpt-stdio-form.png",
+            "docs/assets/readme-course-06b-chatgpt-stdio-filled.png",
+            "docs/assets/readme-course-07-claude-config-editor.png",
+            "docs/assets/readme-course-08-chatgpt-http-form.png",
         )
 
         for image_path in expected_images:
@@ -232,6 +242,58 @@ class McpQuickConnectDocsTests(unittest.TestCase):
                 self.assertEqual(struct.unpack(">II", png[16:24]), (1600, 900))
                 self.assertGreater(path.stat().st_size, 10_000)
 
+    def test_readme_real_settings_captures_are_valid_pngs(self) -> None:
+        for filename in (
+            "readme-course-00b-real-completion.png",
+            "readme-course-02-claude-settings-menu.png",
+            "readme-course-02b-claude-local-mcp-server.png",
+            "readme-course-06-chatgpt-plugin-home.png",
+            "readme-course-06-chatgpt-plugin-settings.png",
+            "readme-course-06-chatgpt-mcp-tab.png",
+            "readme-course-06-chatgpt-stdio-form.png",
+            "readme-course-06b-chatgpt-stdio-filled.png",
+            "readme-course-07-claude-config-editor.png",
+            "readme-course-08-chatgpt-http-form.png",
+        ):
+            path = REPO_ROOT / "docs" / "assets" / filename
+            with self.subTest(filename=filename):
+                self.assertTrue(path.is_file(), path)
+                png = path.read_bytes()
+                self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+                width, height = struct.unpack(">II", png[16:24])
+                self.assertGreaterEqual(width, 1_580)
+                self.assertGreaterEqual(height, 900)
+                self.assertGreater(path.stat().st_size, 50_000)
+
+    def test_readme_explains_real_capture_clicks_values_and_success_states(
+        self,
+    ) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "계정 이름, 이메일, 최근 대화, 로컬 절대경로",
+            "가려진 빈칸을 비워 두라는 뜻은 아닙니다.",
+            "실제 생성 완료 화면에서 확인할 곳",
+            "Vercel은 [B-6](#b-6-production-배포)의 `vercel --prod`",
+            "실제 화면 1 — Claude Desktop에서 설정 열기",
+            "실제 화면 2 — `claude_desktop_config.json`에서 병합할 위치",
+            "실제 화면 3 — `running` 확인",
+            "플러그인 / 앱 / MCP / 스킬",
+            "**+ 서버 추가**",
+            "**예시 placeholder**",
+            "**이름 (Name)**",
+            "**실행 명령 (Executable / Command)**",
+            "**인자 (Arguments / args)**",
+            "**작업 중인 디렉터리 (Working directory / cwd)**",
+            "실제 입력 완료 화면 — `powershell.exe` 방식",
+            "`-File` 바로 다음 칸",
+            "캡처의 마지막 보이는 줄에서 임의로 끝내지 마세요.",
+            "**스트리밍 가능한 HTTP**",
+            "`https://mcp.example.com/mcp`",
+            "`MCP_BEARER_TOKEN`",
+        ):
+            self.assertIn(expected, text)
+
     def test_claude_mcp_guide_svgs_are_valid_and_accessible(self) -> None:
         for filename in (
             "readme-claude-mcp-01-bundle.svg",
@@ -254,13 +316,13 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
-            "**Name** | `ui_fields.name`",
-            "**Transport / Type** | `ui_fields.transport`",
-            "**Executable / Command** | `ui_fields.command`",
-            "**Working directory / cwd** | `ui_fields.cwd`",
-            "**Arguments / args** | `ui_fields.args`",
-            "**Environment / env** | `ui_fields.env`",
-            "**Environment passthrough** | `ui_fields.env_passthrough`",
+            "**이름 (Name)** | `ui_fields.name`",
+            "**유형 (Transport / Type)** | `ui_fields.transport`",
+            "**실행 명령 (Executable / Command)** | `ui_fields.command`",
+            "**작업 중인 디렉터리 (Working directory / cwd)** | `ui_fields.cwd`",
+            "**인자 (Arguments / args)** | `ui_fields.args`",
+            "**환경 변수 (Environment / env)** | `ui_fields.env`",
+            "**환경 변수 패스스루 (Environment passthrough)** | `ui_fields.env_passthrough`",
             "Command 칸에는\n`powershell.exe`만",
             "Arguments 칸에\n각각 별도 항목",
             "직접 Python 방식이 생성되었다면",
