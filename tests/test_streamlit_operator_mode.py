@@ -937,7 +937,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         guide_source = source[guide_start:guide_end]
 
         for expected in (
-            "ChatGPT/Codex Desktop에 등록하는 방법",
+            "ChatGPT Desktop에 등록하는 방법",
             "Name (MCP 서버 이름)",
             "Transport",
             "Command 복사",
@@ -966,7 +966,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "Environment 첫 키·값은 이미 보이는 첫 행",
             "Environment passthrough 첫 값도 이미 보이는 첫 칸",
             "오른쪽 아래 저장을 누릅니다.",
-            "ChatGPT/Codex Desktop을 완전 종료했다가 다시 실행합니다.",
+            "ChatGPT Desktop을 완전 종료했다가 다시 실행합니다.",
             "설정 > 플러그인 > MCP에서 새 서버를 켭니다.",
             "`search`와 `fetch`를 실제로 호출해 연결을 검증합니다.",
         ):
@@ -1072,6 +1072,123 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         ):
             self.assertIn(expected, rendered_text)
 
+    def test_method_b_completion_separates_chatgpt_form_from_codex_toml(
+        self,
+    ) -> None:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
+        module = ast.parse(source)
+        reader_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_read_codex_config_snippet"
+        )
+        renderer_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_render_codex_registration_guide"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snippet_path = Path(tmp) / "코덱스 번들" / "codex_config_snippet.toml"
+            snippet_path.parent.mkdir()
+            snippet = (
+                "[mcp_servers.기관_규정]\n"
+                'command = "powershell.exe"\n'
+                'args = ["-NoProfile"]\n'
+            )
+            snippet_path.write_text(snippet, encoding="utf-8")
+            namespace = {"Path": Path}
+            exec(
+                compile(
+                    ast.Module(body=[reader_node], type_ignores=[]),
+                    "<codex-config-reader>",
+                    "exec",
+                ),
+                namespace,
+            )
+            self.assertEqual(
+                snippet,
+                namespace["_read_codex_config_snippet"](snippet_path),
+            )
+
+        class FakeStreamlit:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, str]] = []
+
+            def markdown(self, value: str) -> None:
+                self.events.append(("markdown", value))
+
+            def caption(self, value: str) -> None:
+                self.events.append(("caption", value))
+
+            def info(self, value: str) -> None:
+                self.events.append(("info", value))
+
+            def code(self, value: str, *, language=None) -> None:
+                self.events.append(("code", value))
+
+            def warning(self, value: str) -> None:
+                self.events.append(("warning", value))
+
+        fake_st = FakeStreamlit()
+        namespace = {"st": fake_st}
+        exec(
+            compile(
+                ast.Module(body=[renderer_node], type_ignores=[]),
+                "<codex-registration-guide>",
+                "exec",
+            ),
+            namespace,
+        )
+        namespace["_render_codex_registration_guide"](
+            snippet,
+            generated_config_path=r"C:\MCP 번들\codex_config_snippet.toml",
+        )
+        rendered_text = "\n".join(value for _, value in fake_st.events)
+        for expected in (
+            "Codex CLI / Codex IDE에 등록하는 방법",
+            "`%USERPROFILE%\\.codex\\config.toml`",
+            "notepad %USERPROFILE%\\.codex\\config.toml",
+            "파일 맨 아래",
+            "기존 그 블록만 지운 뒤 새 블록으로 바꿉니다.",
+            "`search`",
+            "`fetch`",
+        ):
+            self.assertIn(expected, rendered_text)
+        code_values = [
+            value for event, value in fake_st.events if event == "code"
+        ]
+        self.assertEqual(
+            [
+                r"C:\MCP 번들\codex_config_snippet.toml",
+                snippet,
+            ],
+            code_values,
+        )
+
+        self.assertIn(
+            'if installed_target == "chatgpt-desktop-local":',
+            source,
+        )
+        self.assertIn('elif installed_target == "codex":', source)
+        for expected in (
+            "방법 B에서 실제로 연결할 앱 하나 선택",
+            "이번에 연결할 앱",
+            "ChatGPT Desktop — 인자를 한 줄씩 서로 다른 칸에 입력",
+            "Codex CLI / Codex IDE — 생성된 TOML 블록 전체 붙여 넣기",
+            'if method_b_destination == "chatgpt-desktop-local":',
+            "diagnostic_target =",
+        ):
+            self.assertIn(expected, source)
+        self.assertNotIn(
+            'if installed_target in {"chatgpt-desktop-local", "codex"}:',
+            source,
+        )
+
     def test_claude_desktop_final_guide_uses_generated_config(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
             encoding="utf-8"
@@ -1155,8 +1272,14 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "Claude Desktop에 등록하는 방법",
             "생성된 설정 파일 경로 복사",
             r"%APPDATA%\Claude\claude_desktop_config.json",
+            "첫 번째 JSON 상자는 빈 `claude_desktop_config.json` 파일 전체를 덮어쓸 때",
+            "두 번째 JSON 상자는 기존 서버가 이미 있을 때",
+            "`mcpServers` 안에만 추가합니다.",
             "처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사",
             "기존 서버가 있을 때: `mcpServers` 안에 넣을 새 서버 한 항목 복사",
+            "붙여 넣을 위치 확인",
+            "기존 마지막 서버 `}` 뒤에 쉼표 `,`를 하나 붙입니다.",
+            "기존 `preferences` 같은 최상위 설정은 `mcpServers` 밖에 그대로 둡니다.",
             "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
             "트레이까지 완전 종료",
             "상태가 `running`인지 확인합니다.",
@@ -1211,6 +1334,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "reg-rag-mcp-client-config-smoke",
             "MCP_ALLOW_UNAUTHENTICATED_HTTP",
             "MCP_TOOL_PROFILE",
+            "방법 A · Claude Code 로컬 STDIO",
+            "방법 B · ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+            "방법 C · Claude Desktop 로컬 STDIO",
+            "방법 D · ChatGPT · Vercel HTTPS MCP",
+            "방법 E · Claude · Vercel HTTPS MCP",
+            "`Claude Code`는 Claude CLI용, `Claude Desktop`은 설정 JSON 편집용",
             "search",
             "fetch",
         ):
