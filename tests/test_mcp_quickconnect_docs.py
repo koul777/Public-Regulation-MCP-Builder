@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import unittest
 from pathlib import Path
 from xml.etree import ElementTree
@@ -106,17 +107,43 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
-            "### 1. MCP 파일 묶음 만들기",
-            "### 2. 생성된 설정과 Claude 설정 열기",
-            "### 3. 새 서버 항목 합치기",
-            "### 4. Claude Desktop 완전히 다시 시작하기",
-            "### 5. search와 fetch로 실제 연결 확인하기",
+            "## 강의 A: Claude Desktop 로컬 STDIO 연결",
+            "### A-1. 로컬 STDIO 번들 만들기",
+            "### A-2. 생성 파일을 먼저 확인",
+            "### A-3. Claude Desktop 설정 파일 열기",
+            "### A-4. 기존 설정을 지우지 않고 새 서버만 합치기",
+            "### A-5. 저장하고 Claude Desktop을 완전히 다시 시작",
+            "### A-6. 번들 자체를 먼저 진단하는 방법",
             '"scripts.run_regulation_mcp"',
             '"PYTHONPATH"',
             '"PYTHONSAFEPATH": "1"',
             "`initialize` → `tools/list` → `search` → `fetch`",
-            "다른 서버나\n`preferences`",
+            "기존 내용과 새 내용이 모두 남아 있어야 합니다",
+            "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
+            "Settings > Developer > Edit Config",
             "상태가 `running`",
+        ):
+            self.assertIn(expected, text)
+
+    def test_readme_contains_beginner_vercel_https_walkthrough(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "## 강의 B: Vercel HTTPS 배포와 연결",
+            "### B-2. 배포 전용 폴더 만들기",
+            "prepare_vercel_mcp_deployment.py",
+            "생성 완료 화면 읽는 법",
+            "MCP 파일 묶음 생성 완료`는 Vercel 배포 완료가 아닙니다",
+            "### B-3. Vercel CLI 설치하고 로그인",
+            "vercel login",
+            "MCP_ALLOW_UNAUTHENTICATED_HTTP",
+            "MCP_TOOL_PROFILE",
+            "Aliased",
+            "run_mcp_client_config_smoke.py",
+            "mcp_initialized",
+            "end_to_end_verified",
+            "Customize > Connectors",
+            "https://<deployment>/mcp",
         ):
             self.assertIn(expected, text)
 
@@ -125,14 +152,26 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         expected_images = (
             "docs/assets/pr-mcp-builder-hero.png",
             "docs/assets/readme-guide-01-start.png",
+            "docs/assets/readme-guide-01-dashboard.png",
             "docs/assets/readme-guide-02-upload.png",
+            "docs/assets/readme-guide-02-progress.png",
             "docs/assets/readme-guide-02-preprocess-complete.png",
+            "docs/assets/readme-guide-03-load.png",
             "docs/assets/readme-guide-03-multi-regulation.png",
             "docs/assets/readme-guide-03-chunk-context.png",
             "docs/assets/readme-guide-04-human-review.png",
+            "docs/assets/readme-guide-04-approval-actions.png",
+            "docs/assets/readme-guide-04-indexed.png",
             "docs/assets/readme-claude-mcp-01-bundle.svg",
             "docs/assets/readme-claude-mcp-02-config.svg",
             "docs/assets/readme-claude-mcp-03-verify.svg",
+            "docs/assets/readme-vercel-claude-connection.svg",
+            "docs/assets/readme-course-00-completion-guide.png",
+            "docs/assets/readme-course-01-stdio-bundle.png",
+            "docs/assets/readme-course-02-claude-stdio-config.png",
+            "docs/assets/readme-course-03-vercel-production.png",
+            "docs/assets/readme-course-04-claude-remote-connector.png",
+            "docs/assets/readme-course-05-mcp-verification.png",
         )
 
         for image_path in expected_images:
@@ -143,9 +182,28 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "readme-guide-05-mcp-next.png",
             "readme-guide-06-bundle.png",
             "readme-guide-06-generated-files.png",
+            "readme-guide-07-chatgpt-https.png",
+            "readme-guide-08-claude-https.png",
             "readme-guide-09-generated-bat-files.png",
         ):
             self.assertNotIn(retired_image, text)
+
+    def test_readme_course_captures_are_valid_pngs(self) -> None:
+        for filename in (
+            "readme-course-00-completion-guide.png",
+            "readme-course-01-stdio-bundle.png",
+            "readme-course-02-claude-stdio-config.png",
+            "readme-course-03-vercel-production.png",
+            "readme-course-04-claude-remote-connector.png",
+            "readme-course-05-mcp-verification.png",
+        ):
+            path = REPO_ROOT / "docs" / "assets" / filename
+            with self.subTest(filename=filename):
+                self.assertTrue(path.is_file(), path)
+                png = path.read_bytes()
+                self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(struct.unpack(">II", png[16:24]), (1600, 900))
+                self.assertGreater(path.stat().st_size, 10_000)
 
     def test_claude_mcp_guide_svgs_are_valid_and_accessible(self) -> None:
         for filename in (

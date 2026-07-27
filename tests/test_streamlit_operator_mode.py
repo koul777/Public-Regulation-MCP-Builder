@@ -769,8 +769,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             'mcp_quickstart.get("chatgpt_remote")',
             source,
         )
-        self.assertIn("Streamable HTTP를 선택", source)
-        self.assertIn("bearer_token_env_var", source)
+        self.assertIn("Streamable HTTP", source)
+        self.assertIn("bearer", source)
         self.assertIn("OAuth", source)
 
         target_files_start = source.index("mcp_target_file_keys = {")
@@ -1063,6 +1063,131 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertNotIn("def _mcp_final_verification_prompts", source)
         self.assertNotIn("재시작 후 최종 확인 프롬프트", source)
         self.assertNotIn("새 대화 또는 새 task에 아래 문장을 그대로 입력합니다.", source)
+
+    def test_bundle_completion_renders_mcp_connection_course(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_render_mcp_completion_connection_course"
+        )
+        helper_source = ast.get_source_segment(source, helper_node) or ""
+
+        for expected in (
+            "로컬 STDIO",
+            "Vercel",
+            "HTTPS",
+            "파일 묶음 생성 완료가 Vercel 배포 완료를 뜻하지 않습니다",
+            "Direct Python(프로젝트 Python 직접 실행)",
+            "command/args/env",
+            "PowerShell 래퍼는 fallback",
+            "Settings > Developer > Edit Config",
+            "Connectors",
+            "HTTPS /mcp",
+            "doctor_mcp_connection.ps1",
+            "validate_mcp_smoke.ps1",
+            "reg-rag-mcp-vercel-stage",
+            "reg-rag-mcp-client-config-smoke",
+            "MCP_ALLOW_UNAUTHENTICATED_HTTP",
+            "MCP_TOOL_PROFILE",
+            "search",
+            "fetch",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, helper_source)
+
+        self.assertIn('"vercel"', helper_source)
+        self.assertIn('"--prod", "--cwd"', helper_source)
+        self.assertIn("이 PC의 폴더·Command·", helper_source)
+        self.assertIn("Arguments를 입력하지 않습니다", helper_source)
+        completion_start = source.index(
+            'if isinstance(bundle_state, dict) and bundle_state.get("written"):'
+        )
+        completion_source = source[completion_start:]
+        self.assertIn("_render_mcp_completion_connection_course(", completion_source)
+        for generated_file_label in (
+            "ChatGPT/Codex HTTPS 설정",
+            "Claude HTTPS 설정",
+            "Vercel 원격 검증",
+            "Claude Code HTTPS 등록",
+        ):
+            self.assertIn(generated_file_label, source)
+
+    def test_bundle_completion_course_renders_local_and_remote_values(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_render_mcp_completion_connection_course"
+        )
+
+        class StreamlitRecorder:
+            def __init__(self):
+                self.values: list[str] = []
+
+            def __getattr__(self, _name):
+                def record(*args, **_kwargs):
+                    self.values.extend(str(value) for value in args)
+
+                return record
+
+        recorder = StreamlitRecorder()
+
+        def powershell_command(command, args=None):
+            return " ".join([str(command), *(str(value) for value in (args or []))])
+
+        namespace = {
+            "Path": Path,
+            "st": recorder,
+            "_powershell_command": powershell_command,
+        }
+        exec(
+            compile(
+                ast.Module(body=[helper_node], type_ignores=[]),
+                "<mcp-completion-course>",
+                "exec",
+            ),
+            namespace,
+        )
+        render = namespace["_render_mcp_completion_connection_course"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            runtime_dir = bundle_dir / "data"
+            render(
+                target="claude-desktop",
+                server_name="local-demo",
+                bundle_dir=str(bundle_dir),
+                runtime_data_dir=str(runtime_dir),
+                connection_display_value="{}",
+            )
+            local_output = "\n".join(recorder.values)
+            self.assertIn("local-demo", local_output)
+            self.assertIn("doctor_mcp_connection.ps1", local_output)
+            self.assertIn("validate_mcp_smoke.ps1", local_output)
+            self.assertIn("Settings > Developer > Edit Config", local_output)
+
+            recorder.values.clear()
+            render(
+                target="claude-api",
+                server_name="remote-demo",
+                bundle_dir=str(bundle_dir),
+                runtime_data_dir=str(runtime_dir),
+                connection_display_value="https://example.test/mcp",
+            )
+            remote_output = "\n".join(recorder.values)
+            self.assertIn("https://example.test/mcp", remote_output)
+            self.assertIn("reg-rag-mcp-vercel-stage", remote_output)
+            self.assertIn("vercel --prod --cwd", remote_output)
+            self.assertIn("reg-rag-mcp-client-config-smoke", remote_output)
 
     def test_streamlit_exposes_parsing_goldset_review_gate(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
