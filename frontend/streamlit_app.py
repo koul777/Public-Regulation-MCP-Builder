@@ -1618,10 +1618,63 @@ def _read_chatgpt_codex_desktop_registration(
     return _chatgpt_codex_desktop_registration(payload)
 
 
+def _read_codex_config_snippet(config_path: str | Path) -> str:
+    resolved_path = Path(config_path)
+    snippet = resolved_path.read_text(encoding="utf-8").strip()
+    if not snippet:
+        raise ValueError("생성된 codex_config_snippet.toml이 비어 있습니다.")
+    if "[mcp_servers." not in snippet:
+        raise ValueError(
+            "생성된 codex_config_snippet.toml에 [mcp_servers.<이름>] 블록이 없습니다."
+        )
+    return snippet + "\n"
+
+
+def _render_codex_registration_guide(
+    snippet: str,
+    *,
+    generated_config_path: str,
+) -> None:
+    st.markdown("### Codex CLI / Codex IDE에 등록하는 방법")
+    st.caption(
+        "아래 TOML은 방금 만든 번들의 실제 값입니다. 경로나 서버 이름을 다시 타이핑하지 "
+        "말고 코드 상자 오른쪽 위 복사 버튼으로 블록 전체를 복사하세요."
+    )
+    st.info(
+        "ChatGPT의 인자 입력 화면을 열지 않습니다. Codex는 생성된 TOML 블록을 사용자 "
+        "`%USERPROFILE%\\.codex\\config.toml`에 넣습니다."
+    )
+    st.markdown("**1. 생성된 TOML 파일 위치 확인**")
+    st.code(generated_config_path, language=None)
+    st.markdown("**2. 아래 TOML 블록 전체 복사**")
+    st.code(snippet, language="toml")
+    st.markdown(
+        "**3. 붙여 넣을 파일 열기**\n\n"
+        "1. Codex CLI와 Codex IDE를 완전히 종료합니다.\n"
+        "2. `Win + R`을 누릅니다.\n"
+        "3. `notepad %USERPROFILE%\\.codex\\config.toml`을 입력하고 `Enter`를 누릅니다.\n"
+        "4. 파일 맨 아래를 클릭하고 빈 줄을 한 줄 만든 뒤, 위에서 복사한 TOML 블록 "
+        "전체를 붙여 넣습니다.\n"
+        "5. `Ctrl + S`로 저장합니다."
+    )
+    st.warning(
+        "기존 `model`, `projects`, 다른 `[mcp_servers.<이름>]` 블록은 지우지 마세요.\n\n"
+        "같은 `[mcp_servers.<이번 서버 이름>]` 블록이 이미 있으면 두 개를 만들지 말고 "
+        "기존 그 블록만 지운 뒤 새 블록으로 바꿉니다."
+    )
+    st.markdown(
+        "**4. 등록 후 확인**\n\n"
+        "1. Codex CLI 또는 Codex IDE를 다시 실행합니다.\n"
+        "2. MCP 목록에서 방금 만든 서버가 보이는지 확인합니다.\n"
+        "3. 새 대화에서 `search`를 호출합니다.\n"
+        "4. 첫 검색 결과의 `id`를 `fetch`에 넣어 본문과 출처가 나오는지 확인합니다."
+    )
+
+
 def _render_chatgpt_codex_desktop_registration_guide(
     registration: dict[str, Any],
 ) -> None:
-    st.markdown("### ChatGPT/Codex Desktop에 등록하는 방법")
+    st.markdown("### ChatGPT Desktop에 등록하는 방법")
     st.caption(
         "아래 값은 방금 만든 연결 설정에서 그대로 읽어 온 실제 값입니다. "
         "예시값으로 바꾸거나 다시 타이핑하지 말고 복사 버튼을 사용하세요."
@@ -1721,7 +1774,7 @@ def _render_chatgpt_codex_desktop_registration_guide(
         "`+ 변수 추가`를 누릅니다.\n"
         "6. Working directory를 작업 중인 디렉터리 칸에 넣습니다.\n"
         "7. 오른쪽 아래 저장을 누릅니다.\n"
-        "8. ChatGPT/Codex Desktop을 완전 종료했다가 다시 실행합니다.\n"
+        "8. ChatGPT Desktop을 완전 종료했다가 다시 실행합니다.\n"
         "9. 설정 > 플러그인 > MCP에서 새 서버를 켭니다.\n"
         "10. 새 대화에서 `search`와 `fetch`를 실제로 호출해 연결을 검증합니다."
     )
@@ -1789,6 +1842,11 @@ def _render_claude_desktop_registration_guide(
     )
     st.markdown("**Claude Desktop 설정 위치**")
     st.code(r"%APPDATA%\Claude\claude_desktop_config.json", language=None)
+    st.info(
+        "첫 번째 JSON 상자는 빈 `claude_desktop_config.json` 파일 전체를 덮어쓸 때 "
+        "사용합니다. 두 번째 JSON 상자는 기존 서버가 이미 있을 때 "
+        "`mcpServers` 안에만 추가합니다."
+    )
     st.markdown("**처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**")
     st.caption(
         "Claude 설정 파일이 비어 있거나 `{}`만 보이면 아래 코드 상자를 복사해 "
@@ -1801,6 +1859,18 @@ def _render_claude_desktop_registration_guide(
         "`\"mcpServers\": { ... }`의 중괄호 안에 추가합니다."
     )
     st.code(str(registration.get("server_entry_json") or ""), language="json")
+    st.markdown("**붙여 넣을 위치 확인**")
+    st.markdown(
+        "1. 기존 설정 파일에서 `\"mcpServers\": {`를 찾습니다.\n"
+        "2. 그 중괄호 안의 기존 마지막 서버 `}` 뒤에 쉼표 `,`를 하나 붙입니다.\n"
+        "3. 바로 다음 줄에 위에서 복사한 서버 한 항목을 붙여 넣습니다.\n"
+        "4. 기존 `preferences` 같은 최상위 설정은 `mcpServers` 밖에 그대로 둡니다."
+    )
+    st.caption(
+        "새 서버를 파일 맨 아래나 `args` 안에 넣지 말고, 두 번째 `mcpServers`를 "
+        "새로 만들지도 마세요. 쉼표가 어렵다면 생성된 `connect_mcp_client.ps1`의 "
+        "Claude Desktop 자동 병합을 사용합니다."
+    )
     st.markdown("**생성된 Command**")
     st.code(str(registration.get("command") or ""), language=None)
     st.markdown("**생성된 Arguments**")
@@ -1856,6 +1926,16 @@ def _render_mcp_completion_connection_course(
         if target in remote_targets
         else "로컬 STDIO"
     )
+    target_method_labels = {
+        "claude-code": "방법 A · Claude Code 로컬 STDIO",
+        "codex": "방법 B · ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+        "chatgpt-desktop-local": (
+            "방법 B · ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO"
+        ),
+        "claude-desktop": "방법 C · Claude Desktop 로컬 STDIO",
+        "chatgpt-remote": "방법 D · ChatGPT · Vercel HTTPS MCP",
+        "claude-api": "방법 E · Claude · Vercel HTTPS MCP",
+    }
     resolved_bundle_dir = Path(bundle_dir).resolve()
     resolved_runtime_data_dir = Path(runtime_data_dir).resolve()
     stage_dir = resolved_bundle_dir.parent / "vercel-mcp-stage"
@@ -1863,7 +1943,14 @@ def _render_mcp_completion_connection_course(
 
     st.markdown("#### 직접 MCP 연결 및 최종 확인")
     st.markdown(f"**등록할 MCP 이름:** `{server_name}`")
+    st.markdown(
+        f"**이번에 고른 방법:** `{target_method_labels.get(target, target)}`"
+    )
     st.markdown(f"**이번에 선택한 방식:** `{selected_mode}`")
+    st.caption(
+        "`Claude Code`는 Claude CLI용, `Claude Desktop`은 설정 JSON 편집용, "
+        "`ChatGPT Desktop / Codex CLI / Codex IDE`는 개별 칸 또는 TOML 입력용입니다."
+    )
     st.markdown(
         """
 | 구분 | 로컬 STDIO | Vercel Streamable HTTP(HTTPS) |
@@ -1871,7 +1958,7 @@ def _render_mcp_completion_connection_course(
 | 실행 위치 | 같은 PC에서 AI 앱이 Python 프로세스를 직접 실행 | Vercel에 배포된 서버가 실행 |
 | 등록값 | 생성된 `command/args/env`와 클라이언트별 설정 | 고정 Production `HTTPS /mcp` URL과 승인된 인증 |
 | 입력하지 않는 값 | 인터넷 URL을 입력하지 않음 | 이 PC의 폴더·로컬 `command/args/env`를 입력하지 않음 |
-| 성공 확인 | `running` 후 `search` then `fetch` | 원격 smoke 후 `search` then `fetch` |
+| 성공 확인 | 앱별 등록·활성화 확인 후 `search` then `fetch` | 원격 smoke 후 `search` then `fetch` |
 """
     )
     st.caption(
@@ -1891,7 +1978,7 @@ def _render_mcp_completion_connection_course(
     )
 
     if target in local_targets:
-        st.markdown("##### A. 이번 번들: 로컬 STDIO — 이 PC에서 직접 실행")
+        st.markdown("##### 이번 번들: 로컬 STDIO — 이 PC에서 직접 실행")
         st.info(
             "Direct Python(프로젝트 Python 직접 실행)이 우선입니다. 생성기는 Python "
             "3.11 이상과 `scripts.run_regulation_mcp` import를 확인한 뒤 실제 절대 "
@@ -1901,11 +1988,25 @@ def _render_mcp_completion_connection_course(
         )
         st.markdown("**초보자 실수 방지**")
         st.markdown(
-            "- Claude Desktop 로컬 STDIO는 **Developer > Edit Config**에서 등록합니다.\n"
-            "- 일반 Connectors 화면에 로컬 `command/args/env`를 넣는 방식이 아닙니다.\n"
-            "- 서버 이름을 Command 칸에 직접 쓰지 않습니다. 생성된 JSON 값을 그대로 씁니다.\n"
-            "- 같은 PC가 아니라면 이 절차를 멈추고 Vercel HTTPS 경로를 선택해야 합니다."
+            "- 로컬 STDIO에는 인터넷 URL을 입력하지 않습니다.\n"
+            "- 서버 이름을 Command 칸에 직접 쓰지 않습니다. 생성된 값을 사용합니다.\n"
+            "- 같은 PC가 아니라면 이 절차를 멈추고 Vercel HTTPS 방법 D 또는 E를 선택합니다."
         )
+        if target == "claude-desktop":
+            st.markdown(
+                "- Claude Desktop은 **Developer > Edit Config**에서 등록합니다.\n"
+                "- 일반 Connectors 화면에 로컬 `command/args/env`를 넣지 않습니다."
+            )
+        elif target in {"codex", "chatgpt-desktop-local"}:
+            st.markdown(
+                "- ChatGPT Desktop은 **설정 > 플러그인 > MCP > + 서버 추가 > STDIO**를 사용합니다.\n"
+                "- Codex CLI·IDE는 생성된 TOML 블록을 사용자 `~/.codex/config.toml`에 넣습니다."
+            )
+        elif target == "claude-code":
+            st.markdown(
+                "- Claude Code는 생성된 등록 PowerShell을 실행하고 `claude mcp list`로 확인합니다.\n"
+                "- Claude Desktop의 JSON 설정 파일에는 넣지 않습니다."
+            )
 
         st.markdown("**1. 선택한 앱의 등록 위치**")
         if target == "chatgpt-desktop-local":
@@ -1916,6 +2017,8 @@ def _render_mcp_completion_connection_course(
             )
         elif target == "codex":
             st.markdown(
+                "ChatGPT Desktop은 완료 화면의 Name·Command·Arguments·Environment를 "
+                "각각 같은 이름의 입력 칸에 넣습니다. Codex CLI·IDE는 "
                 "`codex_config_snippet.toml`의 `[mcp_servers.<이름>]` 블록을 "
                 "`~/.codex/config.toml`에 반영합니다."
             )
@@ -1989,12 +2092,12 @@ def _render_mcp_completion_connection_course(
             "`validate_mcp_smoke.ps1`은 실제 STDIO initialize와 search/fetch를 검사합니다."
         )
 
-        st.markdown("**3. 완전히 재시작하고 running 확인**")
+        st.markdown("**3. 완전히 재시작하고 앱별 등록 상태 확인**")
         st.markdown(
             "설정을 저장한 뒤 창만 닫지 말고 앱을 트레이까지 완전히 종료합니다. 앱을 다시 "
-            "열고 새 대화에서 서버가 `running`인지 확인합니다. Claude Desktop 로컬 "
-            "STDIO는 일반 **Connectors** 메뉴가 아니라 **Developer > Edit Config**에서 "
-            "등록합니다."
+            "열고 새 대화에서 서버가 등록·활성화됐는지 확인합니다. Claude Desktop은 "
+            "`running`, ChatGPT Desktop은 MCP 스위치, Claude Code는 `claude mcp list`, "
+            "Codex는 적용된 `config.toml`과 도구 목록으로 확인합니다."
         )
         st.caption(
             "Vercel을 사용하려면 Vercel HTTPS 대상을 선택하고 실제 Production "
@@ -2002,7 +2105,7 @@ def _render_mcp_completion_connection_course(
         )
     else:
         st.markdown(
-            "##### B. 이번 번들: Vercel Streamable HTTP(HTTPS) — 배포된 서버에 URL로 연결"
+            "##### 이번 번들: Vercel Streamable HTTP(HTTPS) — 배포된 서버에 URL로 연결"
         )
         st.warning(
             "파일 묶음 생성 완료가 Vercel 배포 완료를 뜻하지 않습니다. 이 화면은 승인 "
@@ -7748,7 +7851,8 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.info(f"최근 생성한 MCP 파일 묶음: {recent_output}")
             installed_server_name = str(bundle_state.get("server_name") or mcp_server_name)
             installed_target = str(bundle_state.get("connection_target") or "")
-            if installed_target in {"chatgpt-desktop-local", "codex"}:
+            method_b_destination = ""
+            if installed_target == "chatgpt-desktop-local":
                 desktop_config_path = str(
                     bundle_state.get("chatgpt_desktop_local_config") or ""
                 ).strip()
@@ -7768,6 +7872,67 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         _render_chatgpt_codex_desktop_registration_guide(
                             desktop_registration
                         )
+            elif installed_target == "codex":
+                st.markdown("### 방법 B에서 실제로 연결할 앱 하나 선택")
+                st.caption(
+                    "ChatGPT Desktop과 Codex의 등록 화면은 다릅니다. 실제로 사용할 앱 "
+                    "하나만 고르면 바로 아래에 그 앱의 절차만 표시됩니다."
+                )
+                method_b_destination = st.radio(
+                    "이번에 연결할 앱",
+                    ["chatgpt-desktop-local", "codex"],
+                    format_func=lambda value: {
+                        "chatgpt-desktop-local": "ChatGPT Desktop — 인자를 한 줄씩 서로 다른 칸에 입력",
+                        "codex": "Codex CLI / Codex IDE — 생성된 TOML 블록 전체 붙여 넣기",
+                    }[value],
+                    key=f"method-b-destination-{document_id}-{mcp_scope}",
+                )
+                if method_b_destination == "chatgpt-desktop-local":
+                    desktop_config_path = str(
+                        bundle_state.get("chatgpt_desktop_local_config") or ""
+                    ).strip()
+                    if desktop_config_path:
+                        try:
+                            desktop_registration = (
+                                _read_chatgpt_codex_desktop_registration(
+                                    desktop_config_path
+                                )
+                            )
+                        except (
+                            OSError,
+                            UnicodeError,
+                            json.JSONDecodeError,
+                            ValueError,
+                        ) as exc:
+                            st.warning(
+                                "생성된 ChatGPT Desktop 등록값을 다시 읽지 "
+                                f"못했습니다: {exc}"
+                            )
+                        else:
+                            _render_chatgpt_codex_desktop_registration_guide(
+                                desktop_registration
+                            )
+                else:
+                    codex_config_path = str(
+                        bundle_state.get("connection_target_file") or ""
+                    ).strip()
+                    if codex_config_path:
+                        try:
+                            codex_snippet = _read_codex_config_snippet(
+                                codex_config_path
+                            )
+                        except (OSError, UnicodeError, ValueError) as exc:
+                            st.warning(
+                                "생성된 Codex TOML 등록값을 다시 읽지 못했습니다: "
+                                f"{exc}"
+                            )
+                        else:
+                            _render_codex_registration_guide(
+                                codex_snippet,
+                                generated_config_path=str(
+                                    Path(codex_config_path).resolve()
+                                ),
+                            )
             elif installed_target == "claude-desktop":
                 claude_config_path = str(
                     bundle_state.get("claude_desktop_config") or ""
@@ -7788,7 +7953,12 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         _render_claude_desktop_registration_guide(
                             claude_registration
                         )
-            if installed_target in {
+            diagnostic_target = (
+                method_b_destination
+                if installed_target == "codex" and method_b_destination
+                else installed_target
+            )
+            if diagnostic_target in {
                 "chatgpt-desktop-local",
                 "codex",
                 "claude-code",
@@ -7799,13 +7969,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "codex": "Codex CLI 연결 진단",
                     "claude-code": "Claude Code 연결 진단",
                     "claude-desktop": "Claude Desktop 연결 진단",
-                }[installed_target]
+                }[diagnostic_target]
                 diagnostic_client_label = {
                     "chatgpt-desktop-local": "ChatGPT Desktop",
                     "codex": "Codex CLI",
                     "claude-code": "Claude Code",
                     "claude-desktop": "Claude Desktop",
-                }[installed_target]
+                }[diagnostic_target]
                 st.markdown(f"#### {diagnostic_title}")
                 st.caption(
                     "이 표는 화면이 다시 실행될 때마다 번들의 bundle_status.json을 새로 읽습니다. "
@@ -7820,23 +7990,23 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 )
                 refresh_succeeded = False
                 refresh_message = ""
-                if diagnostic_refreshed and installed_target in {
+                if diagnostic_refreshed and diagnostic_target in {
                     "chatgpt-desktop-local",
                     "claude-desktop",
                 }:
                     refresh_succeeded, refresh_message = _refresh_mcp_connection_observation(
                         str(bundle_state.get("bundle_dir") or ""),
-                        installed_target,
+                        diagnostic_target,
                         installed_server_name,
                     )
                 connection_diagnostic, diagnostic_read_error = _read_mcp_connection_diagnostic(
                     str(bundle_state.get("bundle_dir") or ""),
-                    installed_target,
+                    diagnostic_target,
                 )
                 if diagnostic_refreshed:
-                    if installed_target in {"codex", "claude-code"}:
+                    if diagnostic_target in {"codex", "claude-code"}:
                         client_label = (
-                            "Claude Code" if installed_target == "claude-code" else "Codex CLI"
+                            "Claude Code" if diagnostic_target == "claude-code" else "Codex CLI"
                         )
                         st.caption(
                             f"bundle_status.json을 다시 읽어 {client_label} 진단을 갱신했습니다."

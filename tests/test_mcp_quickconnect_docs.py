@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import unittest
 from pathlib import Path
@@ -103,6 +104,55 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         self.assertNotIn("CODEX_AGENT_CONNECT_PROMPT.md", text)
         self.assertNotIn("CLAUDE_CODE_AGENT_CONNECT_PROMPT.md", text)
 
+    def test_readme_maps_the_five_builder_targets_to_methods_a_through_e(
+        self,
+    ) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "## 2. 다섯 방법 중 하나 선택하기",
+            "### 방법 A — Claude Code 로컬 STDIO",
+            "### 방법 B — ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+            "### 방법 C — Claude Desktop 로컬 STDIO",
+            "### 방법 D — ChatGPT · Vercel HTTPS MCP",
+            "### 방법 E — Claude · Vercel HTTPS MCP",
+            "`Claude Code`",
+            "`ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)`",
+            "`Claude Desktop`",
+            "`ChatGPT · Vercel HTTPS MCP`",
+            "`Claude · Vercel HTTPS MCP`",
+            "**Claude Code / Claude CLI**에 붙일 것 → **방법 A**",
+            "**Claude Desktop 앱의 JSON 설정 파일**에 붙일 것 → **방법 C**",
+            "**A는 Claude Code(Claude CLI)** 입니다.",
+            "**C는 Claude Desktop** 입니다.",
+            "Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다.",
+            "주소가 있어야 생성 버튼이 켜집니다.",
+            "방법 A·B·C는 로컬 STDIO이고, 방법 D·E는 Vercel HTTPS입니다.",
+            "같은 PC의 Claude Code에서 사용",
+            "같은 PC의 ChatGPT Desktop에서 사용",
+            "같은 PC의 Codex CLI 또는 IDE에서 사용",
+            "ChatGPT에서 Vercel 주소로 원격 사용",
+            "Claude에서 Vercel 주소로 원격 사용",
+        ):
+            self.assertIn(expected, text)
+
+        detailed_headings = (
+            "## 방법 A 상세: Claude Code 로컬 STDIO 연결",
+            "## 방법 B 상세: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO 연결",
+            "## 방법 C 상세: Claude Desktop 로컬 STDIO 연결",
+            "## 방법 D·E 공통 준비: Vercel HTTPS 배포와 검증",
+            "## 방법 D 상세: ChatGPT · Vercel HTTPS MCP 연결",
+            "## 방법 E 상세: Claude · Vercel HTTPS MCP 연결",
+        )
+        positions = [text.index(heading) for heading in detailed_headings]
+        self.assertEqual(sorted(positions), positions)
+
+        self.assertNotIn("완주 경로", text)
+        self.assertNotIn("### 초보자용 한 줄 결정", text)
+        self.assertNotIn("두 화면을 섞지 마세요.", text)
+        self.assertNotIn("로컬은 Developer > Edit Config", text)
+        self.assertNotIn("로컬 연결이면 Claude Desktop을 설치", text)
+
     def test_readme_contains_beginner_claude_stdio_walkthrough(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -110,18 +160,19 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "## 0. 완전 처음이라면 여기부터",
             "### 0-2. 이 문서의 명령과 경로 읽는 법",
             "### 0-3. 원하는 폴더에서 PowerShell 여는 가장 쉬운 방법",
-            "## 강의 A: Claude Desktop 로컬 STDIO 연결",
-            "### A-1. Builder에서 Claude Desktop 번들 만들기",
-            "### A-2. Builder에서 JSON 복사하기",
-            "### A-3. Claude Desktop 설정 파일 열기",
-            "### A-4. JSON 붙여 넣고 저장하기",
-            "### A-5. Claude Desktop 완전히 종료하고 다시 열기",
-            "### A-6. `running` 확인하기",
-            "### A-7. `search`와 `fetch` 확인하기",
-            "### A-8. 기존 설정이 있을 때 병합하기",
-            "### A-9. `disconnected`일 때 진단하기",
-            "같은 Windows PC에서 지금 바로 Claude Desktop에 붙일 것",
-            "**처음 연결이면 A-1부터 A-7까지만 그대로 하면 끝입니다.**",
+            "## 방법 C 상세: Claude Desktop 로컬 STDIO 연결",
+            "### C-1. Builder에서 Claude Desktop 번들 만들기",
+            "### C-2. Builder에서 JSON 복사하기",
+            "### C-3. Claude Desktop 설정 파일 열기",
+            "### C-4. JSON 붙여 넣고 저장하기",
+            "### C-5. Claude Desktop 완전히 종료하고 다시 열기",
+            "### C-6. `running` 확인하기",
+            "### C-7. `search`와 `fetch` 확인하기",
+            "### C-8. 기존 설정이 있을 때 병합하기",
+            "### C-9. `disconnected`일 때 진단하기",
+            "**Builder의 첫 번째 JSON 상자 전체를 복사해서, 열린 `claude_desktop_config.json` 파일 전체를 덮어씁니다.**",
+            "Claude Desktop과 이 프로그램을 같은 PC에서 사용",
+            "**처음 연결이면 C-1부터 C-7까지만 그대로 하면 끝입니다.**",
             "이 두 상자의 복사 아이콘은 누르지 않습니다.",
             "처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사",
             "병합할 `mcpServers` JSON 복사",
@@ -145,18 +196,50 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn("<생성된-", text)
 
+    def test_readme_shows_exact_claude_json_merge_before_and_after(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "#### 직접 병합할 때 정확히 어디에 붙여 넣는지",
+            "**첫 번째 JSON 상자**는 새 파일이거나 빈 파일일 때 파일 전체에 붙여 넣습니다.",
+            "**두 번째 JSON 상자**는 기존 파일에 다른 서버가 있을 때 `\"mcpServers\"` 중괄호 안에만 붙여 넣습니다.",
+            "기존 `weather-mcp`의 마지막 `}` 뒤에 쉼표 `,`를 하나 붙이고",
+            "새 서버는 `\"mcpServers\": {`와 그 닫는 `}` **사이**에 있습니다.",
+            "기존 `preferences`는 `mcpServers` 밖에 그대로 남아 있습니다.",
+            '"PYTHONPATH": "C:\\\\Public Regulation MCP"',
+            '"PYTHONSAFEPATH": "1"',
+        ):
+            self.assertIn(expected, text)
+
+        final_marker = "최종 파일은 아래처럼 됩니다."
+        final_start = text.index("```json", text.index(final_marker)) + len("```json")
+        final_end = text.index("```", final_start)
+        merged = json.loads(text[final_start:final_end])
+
+        self.assertEqual({"weather-mcp", "기관-규정"}, set(merged["mcpServers"]))
+        self.assertEqual({"theme": "dark"}, merged["preferences"])
+        self.assertEqual(
+            "C:\\Public Regulation MCP",
+            merged["mcpServers"]["기관-규정"]["env"]["PYTHONPATH"],
+        )
+        self.assertEqual(
+            ["-m", "scripts.run_regulation_mcp"],
+            merged["mcpServers"]["기관-규정"]["args"][:2],
+        )
+
     def test_readme_contains_field_by_field_chatgpt_stdio_walkthrough(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
-            "## ChatGPT Desktop 로컬 STDIO 연결",
-            "### C-1. Builder에서 ChatGPT Desktop 번들 만들기",
-            "### C-2. Builder에서 복사할 값 찾기",
-            "### C-3. ChatGPT Desktop에서 MCP 추가 화면 열기",
-            "### C-4. Name과 Command 넣기",
-            "### C-5. Arguments를 한 줄씩 서로 다른 칸에 넣기",
-            "### C-6. Environment와 Working directory 넣고 저장하기",
-            "### C-7. 서버 켜고 `search`와 `fetch` 확인하기",
+            "## 방법 B 상세: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO 연결",
+            "### B-1. Builder에서 ChatGPT Desktop 또는 Codex 번들 만들기",
+            "### B-2. Builder에서 복사할 값 찾기",
+            "### B-3. ChatGPT Desktop에서 MCP 추가 화면 열기",
+            "### B-4. Name과 Command 넣기",
+            "### B-5. Arguments를 한 줄씩 서로 다른 칸에 넣기",
+            "### B-6. Environment와 Working directory 넣고 저장하기",
+            "### B-7. 서버 켜고 `search`와 `fetch` 확인하기",
+            "### B-8. Codex CLI·IDE에 생성된 TOML 넣기",
             "Argument 1/17 — 아래 한 줄만 복사",
             "Argument 2/17 — 아래 한 줄만 복사",
             "`Argument 17/17`이 마지막",
@@ -174,6 +257,14 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "긴 JSON을 해석하지 말고 현재 화면의 개별 복사",
             "docs/assets/readme-course-06-chatgpt-stdio-form.png",
             "docs/assets/readme-course-06b-chatgpt-stdio-filled.png",
+            "notepad %USERPROFILE%\\.codex\\config.toml",
+            "`codex_config_snippet.toml` 전체를 **그 아래에** 붙이면",
+            "[mcp_servers.weather]",
+            "[mcp_servers.기관_규정]",
+            "같은 `[mcp_servers.기관_규정]` 제목이 이미 있으면 두 개를 만들지 말고",
+            "Codex 연결\n완료입니다.",
+            "docs/assets/readme-course-01-stdio-bundle.png",
+            "docs/assets/readme-course-05-mcp-verification.png",
         ):
             self.assertIn(expected, text)
 
@@ -181,13 +272,13 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
-            "## 강의 B: Vercel HTTPS 배포와 연결",
-            "### B-2. 배포 전용 폴더 만들기",
+            "## 방법 D·E 공통 준비: Vercel HTTPS 배포와 검증",
+            "### V-2. 배포 전용 폴더 만들기",
             "prepare_vercel_mcp_deployment.py",
             "생성 완료 화면 읽는 법",
             "MCP 파일 묶음 생성 완료`는 Vercel 배포 완료가 아닙니다",
-            "다른 PC, 다른 계정, 모바일, 클라우드 AI에서 쓸 것",
-            "### B-3. Vercel CLI 설치하고 로그인",
+            "ChatGPT에서 Vercel 주소로 원격 사용",
+            "### V-3. Vercel CLI 설치하고 로그인",
             "node --version",
             "npm --version",
             "vercel --version",
@@ -208,13 +299,15 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "Customize > Connectors",
             "run_mcp_stdio_server.ps1",
             '$VercelProject = Read-Host "새 Vercel 프로젝트 이름"',
-            '$McpUrl = Read-Host "B-6에서 복사한 전체 /mcp 주소"',
-            "claude mcp add --transport http --scope user",
-            "최종 URL을 넣어 번들을 **다시 생성한 경우에만**",
+            '$McpUrl = Read-Host "V-6에서 복사한 전체 /mcp 주소"',
         ):
             self.assertIn(expected, text)
+        self.assertNotIn(
+            "### 선택 사항: Codex CLI·IDE와 Claude Code에도 같은 원격 URL 사용",
+            text,
+        )
         self.assertGreaterEqual(
-            text.count('$StageDir = Read-Host "B-2에서 만든 배포 전용 폴더 전체 경로"'),
+            text.count('$StageDir = Read-Host "V-2에서 만든 배포 전용 폴더 전체 경로"'),
             3,
         )
         self.assertNotIn("<프로젝트-이름>", text)
@@ -351,13 +444,15 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "계정 이름, 이메일, 최근 대화, 로컬 절대경로",
             "가려진 빈칸을 비워 두라는 뜻은 아닙니다.",
             "실제 생성 완료 화면에서 확인할 곳",
-            "처음부터 연결 완료까지 완주 지도",
-            "완주 경로 A — Claude Desktop 로컬 STDIO",
-            "완주 경로 C — ChatGPT Desktop 로컬 STDIO",
-            "완주 경로 B — Vercel Streamable HTTP",
+            "## 2. 다섯 방법 중 하나 선택하기",
+            "### 방법 A — Claude Code 로컬 STDIO",
+            "### 방법 B — ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+            "### 방법 C — Claude Desktop 로컬 STDIO",
+            "### 방법 D — ChatGPT · Vercel HTTPS MCP",
+            "### 방법 E — Claude · Vercel HTTPS MCP",
             "생성 버튼을 누르기 전 — 연결 앱·저장 폴더·서버 이름",
             "Builder에서 JSON 복사하기",
-            "Vercel은 [B-6](#b-6-production-배포)의 `vercel --prod`",
+            "Vercel은 [V-6](#v-6-production-배포)의 `vercel --prod`",
             "왼쪽 아래 **프로필 영역**",
             "**구성 편집**",
             "**`claude_desktop_config`** 파일",
