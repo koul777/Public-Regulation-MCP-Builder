@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Vercel HTTPS MCP 주소 생성과 원격 커넥터 등록 화면 예시</title>
+  <desc id="desc">Vercel Production 배포의 Ready와 Aliased 주소를 확인한 뒤 슬래시 mcp를 붙여 Claude 또는 ChatGPT 원격 MCP URL 칸에 입력하는 과정을 표시한 개인정보 없는 안내 화면입니다.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0f172a" flood-opacity=".14"/></filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 Z" fill="#2563eb"/></marker>
+    <style>
+      text{font-family:"Malgun Gothic","Segoe UI",sans-serif}.body{font-size:20px}.small{font-size:17px}.label{font-size:22px;font-weight:700}.mono{font-family:Consolas,monospace;font-size:17px}.step{font-size:21px;font-weight:800;fill:white;text-anchor:middle;dominant-baseline:middle}
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="#edf2f7"/>
+  <rect x="45" y="38" width="1510" height="824" rx="24" fill="white" filter="url(#shadow)"/>
+  <rect x="45" y="38" width="1510" height="75" rx="24" fill="#050505"/>
+  <text x="85" y="85" font-size="28" font-weight="800" fill="white">Vercel Production 주소 → 원격 MCP 설정</text>
+  <text x="1340" y="83" class="small" fill="#d1d5db">설명용 화면 · 개인정보 없음</text>
+
+  <text x="82" y="160" font-size="27" font-weight="800">Vercel Dashboard · Deployments</text>
+  <rect x="75" y="185" width="680" height="515" rx="16" fill="#fafafa" stroke="#cbd5e1" stroke-width="2"/>
+  <circle cx="112" cy="235" r="22" fill="#111827"/><text x="112" y="236" class="step">1</text>
+  <text x="150" y="243" class="label">Production deployment</text>
+  <rect x="525" y="210" width="175" height="50" rx="25" fill="#dcfce7"/>
+  <circle cx="555" cy="235" r="8" fill="#16a34a"/>
+  <text x="580" y="242" class="label" fill="#15803d">Ready</text>
+  <line x1="105" y1="285" x2="725" y2="285" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="112" cy="345" r="22" fill="#111827"/><text x="112" y="346" class="step">2</text>
+  <text x="150" y="335" class="label">Domains / Aliased</text>
+  <rect x="150" y="360" width="550" height="64" rx="11" fill="white" stroke="#94a3b8" stroke-width="2"/>
+  <text x="175" y="400" class="mono">https://my-regulation-mcp.vercel.app</text>
+  <circle cx="112" cy="485" r="22" fill="#111827"/><text x="112" y="486" class="step">3</text>
+  <text x="150" y="475" class="label">주소 끝에 /mcp 붙이기</text>
+  <rect x="150" y="500" width="550" height="68" rx="11" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="171" y="542" class="mono" fill="#1d4ed8">https://my-regulation-mcp.vercel.app/mcp</text>
+  <rect x="100" y="610" width="630" height="60" rx="12" fill="#fff7ed" stroke="#fdba74"/>
+  <text x="125" y="647" class="small" fill="#9a3412">Ready + Aliased 확인 전에는 커넥터에 등록하지 않습니다.</text>
+
+  <line x1="775" y1="435" x2="870" y2="435" stroke="#2563eb" stroke-width="8" marker-end="url(#arrow)"/>
+
+  <text x="895" y="160" font-size="27" font-weight="800">Claude / ChatGPT · Add custom connector</text>
+  <rect x="880" y="185" width="640" height="515" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <circle cx="920" cy="250" r="22" fill="#2563eb"/><text x="920" y="251" class="step">4</text>
+  <text x="958" y="258" class="label">Name</text>
+  <rect x="1035" y="217" width="435" height="60" rx="10" fill="white" stroke="#94a3b8" stroke-width="2"/>
+  <text x="1060" y="256" class="body">기관 규정 MCP</text>
+  <circle cx="920" cy="345" r="22" fill="#2563eb"/><text x="920" y="346" class="step">5</text>
+  <text x="958" y="353" class="label">MCP URL</text>
+  <rect x="1100" y="312" width="370" height="88" rx="10" fill="white" stroke="#60a5fa" stroke-width="3"/>
+  <text x="1120" y="348" class="mono" fill="#1d4ed8">https://my-regulation-</text>
+  <text x="1120" y="377" class="mono" fill="#1d4ed8">mcp.vercel.app/mcp</text>
+  <circle cx="920" cy="455" r="22" fill="#2563eb"/><text x="920" y="456" class="step">6</text>
+  <text x="958" y="463" class="label">Authentication</text>
+  <rect x="1170" y="422" width="300" height="60" rx="10" fill="white" stroke="#94a3b8" stroke-width="2"/>
+  <text x="1195" y="460" class="small">공개 read-only: 없음</text>
+  <rect x="1035" y="525" width="435" height="65" rx="12" fill="#2563eb"/>
+  <text x="1252" y="566" class="label" fill="white" text-anchor="middle">Add / Save connector</text>
+  <rect x="920" y="615" width="550" height="60" rx="12" fill="#ecfdf5" stroke="#6ee7b7"/>
+  <text x="945" y="652" class="small" fill="#047857">새 대화에서 활성화 → search → fetch 확인</text>
+
+  <rect x="75" y="742" width="1445" height="92" rx="15" fill="#fef2f2" stroke="#fca5a5"/>
+  <text x="105" y="778" class="label" fill="#b91c1c">원격 URL 설정칸에 넣지 않는 것</text>
+  <text x="105" y="811" class="body" fill="#b91c1c">powershell.exe · C:\ 로컬 경로 · run_mcp_stdio_server.ps1 · command/args · PYTHONPATH</text>
+</svg>

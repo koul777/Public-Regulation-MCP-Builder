@@ -1085,6 +1085,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "Direct Python(프로젝트 Python 직접 실행)",
             "command/args/env",
             "PowerShell 래퍼는 fallback",
+            "초보자 실수 방지",
             "Settings > Developer > Edit Config",
             "Connectors",
             "HTTPS /mcp",
@@ -1173,7 +1174,11 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             self.assertIn("local-demo", local_output)
             self.assertIn("doctor_mcp_connection.ps1", local_output)
             self.assertIn("validate_mcp_smoke.ps1", local_output)
+            self.assertIn("connect_mcp_client.ps1", local_output)
+            self.assertIn("-InstallClaudeDesktop", local_output)
+            self.assertIn("Installed-config stdio verification passed", local_output)
             self.assertIn("Settings > Developer > Edit Config", local_output)
+            self.assertIn("서버 이름을 Command 칸에 직접 쓰지 않습니다", local_output)
 
             recorder.values.clear()
             render(
@@ -1188,6 +1193,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             self.assertIn("reg-rag-mcp-vercel-stage", remote_output)
             self.assertIn("vercel --prod --cwd", remote_output)
             self.assertIn("reg-rag-mcp-client-config-smoke", remote_output)
+            self.assertIn("Claude/ChatGPT 원격 커넥터에는 URL만 넣습니다", remote_output)
 
     def test_streamlit_exposes_parsing_goldset_review_gate(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")

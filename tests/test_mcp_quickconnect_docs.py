@@ -107,13 +107,26 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
+            "## 0. 완전 처음이라면 여기부터",
+            "### 0-2. 이 문서의 명령과 경로 읽는 법",
+            "### 0-3. 원하는 폴더에서 PowerShell 여는 가장 쉬운 방법",
             "## 강의 A: Claude Desktop 로컬 STDIO 연결",
             "### A-1. 로컬 STDIO 번들 만들기",
             "### A-2. 생성 파일을 먼저 확인",
-            "### A-3. Claude Desktop 설정 파일 열기",
-            "### A-4. 기존 설정을 지우지 않고 새 서버만 합치기",
-            "### A-5. 저장하고 Claude Desktop을 완전히 다시 시작",
-            "### A-6. 번들 자체를 먼저 진단하는 방법",
+            "### A-3. 자동 연결 마법사 실행 — 처음 사용자는 이 방법을 권장",
+            "### A-4. 자동 연결이 안 될 때 Claude Desktop 설정 파일 열기",
+            "### A-5. 기존 설정을 지우지 않고 새 서버만 수동 병합하기",
+            "### A-6. 저장하고 Claude Desktop을 완전히 다시 시작",
+            "### A-7. 번들 자체를 먼저 진단하는 방법",
+            "같은 Windows PC에서 지금 바로 Claude Desktop에 붙일 것",
+            "JSON 편집이 자신 없으면 아래 순서로 복구합니다.",
+            "connect_mcp_client.ps1",
+            "-InstallClaudeDesktop",
+            "Installed-config stdio verification passed",
+            "CLAUDE DESKTOP VERIFICATION REQUIRED",
+            "claude_desktop_config.json.bak-",
+            "docs/assets/readme-course-07-claude-desktop-config-editor.svg",
+            "생성된 절대 Python 경로 또는 fallback `powershell.exe`",
             '"scripts.run_regulation_mcp"',
             '"PYTHONPATH"',
             '"PYTHONSAFEPATH": "1"',
@@ -121,6 +134,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "기존 내용과 새 내용이 모두 남아 있어야 합니다",
             "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
             "Settings > Developer > Edit Config",
+            "%APPDATA%\\Claude\\claude_desktop_config.json",
             "상태가 `running`",
         ):
             self.assertIn(expected, text)
@@ -134,15 +148,25 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "prepare_vercel_mcp_deployment.py",
             "생성 완료 화면 읽는 법",
             "MCP 파일 묶음 생성 완료`는 Vercel 배포 완료가 아닙니다",
+            "다른 PC, 다른 계정, 모바일, 클라우드 AI에서 쓸 것",
             "### B-3. Vercel CLI 설치하고 로그인",
+            "node --version",
+            "npm --version",
+            "vercel --version",
             "vercel login",
+            "홈페이지에도 들어가지만 실제 배포 명령은 PowerShell에서 실행",
             "MCP_ALLOW_UNAUTHENTICATED_HTTP",
             "MCP_TOOL_PROFILE",
             "Aliased",
+            "브라우저로 읽는 홈페이지가 아니므로",
+            "docs/assets/readme-course-08-vercel-http-mcp-settings.svg",
+            "**MCP URL / Server URL**",
+            "**Command / Executable** | 넣지 않음",
             "run_mcp_client_config_smoke.py",
             "mcp_initialized",
             "end_to_end_verified",
             "Customize > Connectors",
+            "run_mcp_stdio_server.ps1",
             "https://<deployment>/mcp",
         ):
             self.assertIn(expected, text)
@@ -172,6 +196,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-course-03-vercel-production.png",
             "docs/assets/readme-course-04-claude-remote-connector.png",
             "docs/assets/readme-course-05-mcp-verification.png",
+            "docs/assets/readme-course-06-chatgpt-desktop-stdio-settings.svg",
+            "docs/assets/readme-course-07-claude-desktop-config-editor.svg",
+            "docs/assets/readme-course-08-vercel-http-mcp-settings.svg",
         )
 
         for image_path in expected_images:
@@ -210,6 +237,9 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "readme-claude-mcp-01-bundle.svg",
             "readme-claude-mcp-02-config.svg",
             "readme-claude-mcp-03-verify.svg",
+            "readme-course-06-chatgpt-desktop-stdio-settings.svg",
+            "readme-course-07-claude-desktop-config-editor.svg",
+            "readme-course-08-vercel-http-mcp-settings.svg",
         ):
             path = REPO_ROOT / "docs" / "assets" / filename
             root = ElementTree.parse(path).getroot()
@@ -219,6 +249,23 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             self.assertEqual("0 0 1600 900", root.attrib.get("viewBox"))
             self.assertIsNotNone(root.find("svg:title", namespace))
             self.assertIsNotNone(root.find("svg:desc", namespace))
+
+    def test_readme_maps_chatgpt_desktop_fields_to_generated_ui_fields(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "**Name** | `ui_fields.name`",
+            "**Transport / Type** | `ui_fields.transport`",
+            "**Executable / Command** | `ui_fields.command`",
+            "**Working directory / cwd** | `ui_fields.cwd`",
+            "**Arguments / args** | `ui_fields.args`",
+            "**Environment / env** | `ui_fields.env`",
+            "**Environment passthrough** | `ui_fields.env_passthrough`",
+            "Command 칸에는\n`powershell.exe`만",
+            "Arguments 칸에\n각각 별도 항목",
+            "직접 Python 방식이 생성되었다면",
+        ):
+            self.assertIn(expected, text)
 
 
 if __name__ == "__main__":

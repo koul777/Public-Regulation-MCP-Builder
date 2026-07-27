@@ -1826,6 +1826,16 @@ def _render_mcp_completion_connection_course(
         "STDIO에는 URL을 입력하지 않습니다. Vercel 연결에는 이 PC의 폴더·Command·"
         "Arguments를 입력하지 않습니다."
     )
+    st.warning(
+        "AI 앱이 PR MCP Builder와 같은 Windows PC에 있으면 로컬 STDIO, 다른 PC·다른 "
+        "계정·모바일·클라우드에서 쓸 것이면 Vercel HTTPS를 따릅니다. 두 방식을 섞어 "
+        "입력하면 연결되지 않습니다."
+    )
+    st.caption(
+        "이 화면에서 복사할 것은 한 가지 방식뿐입니다. 위에 `로컬 STDIO`가 보이면 "
+        "`command/args/env`만, `Vercel Streamable HTTP(HTTPS)`가 보이면 최종 "
+        "`https://.../mcp` URL만 따라가세요."
+    )
 
     if target in local_targets:
         st.markdown("##### A. 이번 번들: 로컬 STDIO — 이 PC에서 직접 실행")
@@ -1835,6 +1845,13 @@ def _render_mcp_completion_connection_course(
             "`command/args/env`를 만듭니다. 검증된 소스 Python을 사용할 수 없으면 "
             "PowerShell 래퍼는 fallback으로 유지됩니다. 어느 형태든 위에서 표시된 생성 "
             "설정을 수정하지 말고 그대로 등록하세요."
+        )
+        st.markdown("**초보자 실수 방지**")
+        st.markdown(
+            "- Claude Desktop 로컬 STDIO는 **Developer > Edit Config**에서 등록합니다.\n"
+            "- 일반 Connectors 화면에 로컬 `command/args/env`를 넣는 방식이 아닙니다.\n"
+            "- 서버 이름을 Command 칸에 직접 쓰지 않습니다. 생성된 JSON 값을 그대로 씁니다.\n"
+            "- 같은 PC가 아니라면 이 절차를 멈추고 Vercel HTTPS 경로를 선택해야 합니다."
         )
 
         st.markdown("**1. 선택한 앱의 등록 위치**")
@@ -1856,10 +1873,34 @@ def _render_mcp_completion_connection_course(
             )
         elif target == "claude-desktop":
             st.markdown(
-                "Claude Desktop의 **Settings > Developer > Edit Config**에서 "
-                "`%APPDATA%\\Claude\\claude_desktop_config.json`을 열고, 생성된 "
-                "`claude_desktop_config.json`의 새 `mcpServers` 항목만 병합합니다. "
-                "기존 서버와 `preferences`는 삭제하지 않습니다."
+                "처음 사용자는 아래 자동 연결 마법사를 권장합니다. 기존 Claude 설정을 "
+                "백업하고 다른 서버와 `preferences`를 보존한 채 이번 `mcpServers` "
+                "항목만 병합하고 STDIO 설정을 검사합니다."
+            )
+            st.code(
+                _powershell_command(
+                    "powershell.exe",
+                    [
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(resolved_bundle_dir / "connect_mcp_client.ps1"),
+                        "-InstallPackage",
+                        "-Target",
+                        "claude-desktop",
+                        "-InstallClaudeDesktop",
+                    ],
+                ),
+                language="powershell",
+            )
+            st.caption(
+                "`Installed-config stdio verification passed` 뒤에 "
+                "`CLAUDE DESKTOP VERIFICATION REQUIRED`가 나오면 실패가 아니라, "
+                "Claude Desktop을 완전히 재시작해 앱 안에서 최종 확인하라는 뜻입니다. "
+                "자동 연결이 실패할 때만 **Settings > Developer > Edit Config**에서 "
+                "`%APPDATA%\\Claude\\claude_desktop_config.json`을 열어 생성된 새 "
+                "`mcpServers` 항목을 수동 병합하세요."
             )
 
         st.markdown("**2. AI 앱을 열기 전에 번들 자체 진단**")
@@ -1919,6 +1960,13 @@ def _render_mcp_completion_connection_course(
             "Vercel 원격 연결은 **Connectors** 또는 Streamable HTTP 설정에 URL만 "
             "등록합니다. 로컬 `command/args/env`, Working directory와 PowerShell "
             "스크립트는 원격 커넥터 입력값이 아닙니다."
+        )
+        st.markdown("**초보자 실수 방지**")
+        st.markdown(
+            "- 이 화면에 URL이 보여도 아직 배포가 끝난 것이 아닐 수 있습니다.\n"
+            "- `vercel --prod` 결과에서 `Ready`와 `Aliased`를 확인한 뒤 그 주소에 `/mcp`를 붙입니다.\n"
+            "- Claude/ChatGPT 원격 커넥터에는 URL만 넣습니다. 로컬 폴더나 PowerShell 스크립트는 넣지 않습니다.\n"
+            "- 기관 비공개 데이터라면 공개 무인증 endpoint 대신 bearer 토큰이나 OAuth 구성을 먼저 검토해야 합니다."
         )
         st.markdown("**1. 등록 예정 Production URL 확인**")
         if remote_url:
@@ -2021,6 +2069,10 @@ def _render_mcp_completion_connection_course(
         st.caption(
             "마지막 출력의 `Ready`와 `Aliased: https://<project>.vercel.app`을 확인하고, "
             "고정 Aliased 주소 뒤에 `/mcp`를 붙여 등록합니다."
+        )
+        st.caption(
+            "Vercel 홈페이지에서 프로젝트가 보인다고 끝난 것이 아닙니다. `vercel --prod` 출력과 "
+            "원격 smoke 결과가 모두 성공해야 실제 연결할 주소가 준비된 것입니다."
         )
 
         st.markdown("**4. 선택한 앱의 원격 커넥터에 URL만 등록**")
