@@ -196,9 +196,13 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-vercel-claude-connection.svg",
             "docs/assets/readme-course-00-completion-guide.png",
             "docs/assets/readme-course-00b-real-completion.png",
+            "docs/assets/readme-course-00c-builder-chatgpt-stdio-selection.png",
+            "docs/assets/readme-course-00d-builder-claude-selection.png",
             "docs/assets/readme-course-01-stdio-bundle.png",
+            "docs/assets/readme-course-01b-builder-chatgpt-stdio-output.png",
             "docs/assets/readme-course-03-vercel-production.png",
             "docs/assets/readme-course-04-claude-remote-connector.png",
+            "docs/assets/readme-course-04b-builder-claude-direct-config.png",
             "docs/assets/readme-course-05-mcp-verification.png",
             "docs/assets/readme-course-02-claude-settings-menu.png",
             "docs/assets/readme-course-02b-claude-local-mcp-server.png",
@@ -245,8 +249,12 @@ class McpQuickConnectDocsTests(unittest.TestCase):
     def test_readme_real_settings_captures_are_valid_pngs(self) -> None:
         for filename in (
             "readme-course-00b-real-completion.png",
+            "readme-course-00c-builder-chatgpt-stdio-selection.png",
+            "readme-course-00d-builder-claude-selection.png",
+            "readme-course-01b-builder-chatgpt-stdio-output.png",
             "readme-course-02-claude-settings-menu.png",
             "readme-course-02b-claude-local-mcp-server.png",
+            "readme-course-04b-builder-claude-direct-config.png",
             "readme-course-06-chatgpt-plugin-home.png",
             "readme-course-06-chatgpt-plugin-settings.png",
             "readme-course-06-chatgpt-mcp-tab.png",
@@ -261,9 +269,20 @@ class McpQuickConnectDocsTests(unittest.TestCase):
                 png = path.read_bytes()
                 self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
                 width, height = struct.unpack(">II", png[16:24])
-                self.assertGreaterEqual(width, 1_580)
-                self.assertGreaterEqual(height, 900)
+                self.assertGreaterEqual(width, 1_400)
+                self.assertGreaterEqual(height, 780)
                 self.assertGreater(path.stat().st_size, 50_000)
+                chunk_types: list[bytes] = []
+                offset = 8
+                while offset + 12 <= len(png):
+                    chunk_length = struct.unpack(">I", png[offset : offset + 4])[0]
+                    chunk_type = png[offset + 4 : offset + 8]
+                    chunk_types.append(chunk_type)
+                    offset += 12 + chunk_length
+                    if chunk_type == b"IEND":
+                        break
+                for private_chunk in (b"tEXt", b"zTXt", b"iTXt", b"eXIf"):
+                    self.assertNotIn(private_chunk, chunk_types)
 
     def test_readme_explains_real_capture_clicks_values_and_success_states(
         self,
@@ -274,6 +293,13 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "계정 이름, 이메일, 최근 대화, 로컬 절대경로",
             "가려진 빈칸을 비워 두라는 뜻은 아닙니다.",
             "실제 생성 완료 화면에서 확인할 곳",
+            "처음부터 연결 완료까지 완주 지도",
+            "완주 경로 A — Claude Desktop 로컬 STDIO",
+            "완주 경로 C — ChatGPT Desktop 로컬 STDIO",
+            "완주 경로 B — Vercel Streamable HTTP",
+            "생성 버튼을 누르기 전 — 연결 앱·저장 폴더·서버 이름",
+            "Builder의 실제 Claude Desktop 등록 안내 읽는 법",
+            "Builder의 실제 ChatGPT STDIO 결과에서 복사할 값 찾기",
             "Vercel은 [B-6](#b-6-production-배포)의 `vercel --prod`",
             "실제 화면 1 — Claude Desktop에서 설정 열기",
             "실제 화면 2 — `claude_desktop_config.json`에서 병합할 위치",

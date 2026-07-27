@@ -234,6 +234,62 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 - `Developer > Edit Config` 화면에 Vercel URL만 넣지 않습니다.
 - 두 방식 중 하나만 선택해서 끝까지 따라가면 됩니다. 중간에 섞으면 거의 항상 실패합니다.
 
+### 처음부터 연결 완료까지 완주 지도
+
+아래에서 내가 사용할 경로 **하나만** 고른 뒤 번호 순서대로 진행합니다. 각 번호의 자세한
+화면과 입력값은 뒤 강의에 이어집니다.
+
+#### 완주 경로 A — Claude Desktop 로컬 STDIO
+
+1. `① 문서 올려서 전처리`에서 규정 파일을 처리합니다.
+2. `② 결과 확인`에서 원문과 처리 결과를 검수합니다.
+3. `③ 검수하고 승인`에서 사용할 청크를 승인하고 **색인 완료**를 확인합니다.
+4. `④ MCP 생성·AI 연결`에서 **Claude Desktop**을 누릅니다.
+5. 저장 폴더와 MCP 서버 이름을 넣고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
+6. 생성 결과에서 `claude_desktop_config.json`의 `command`, `args`, `env`를 찾습니다.
+7. Claude Desktop 왼쪽 아래 프로필 → **설정** → **개발자** → **로컬 MCP 서버** →
+   **구성 편집**을 누릅니다.
+8. 기존 다른 서버와 `preferences`는 남기고 새 서버 한 항목만 병합합니다.
+9. Claude Desktop을 완전히 종료했다가 다시 열고 서버 옆의 **`running`**을 확인합니다.
+10. 새 대화에서 `search`로 찾은 `chunk_id`를 `fetch`로 열어 실제 규정 내용이 나오면
+    연결 완료입니다.
+
+자세히 따라가기: [강의 A: Claude Desktop 로컬 STDIO 연결](#강의-a-claude-desktop-로컬-stdio-연결)
+
+#### 완주 경로 C — ChatGPT Desktop 로컬 STDIO
+
+1. 승인과 색인 완료 후 `④ MCP 생성·AI 연결`을 엽니다.
+2. **ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)**을 누릅니다.
+3. 저장 폴더와 서버 이름을 넣고 번들을 생성합니다.
+4. 생성 결과 또는 `chatgpt_desktop_local_mcp.json`에서 `ui_fields`를 찾습니다.
+5. ChatGPT Desktop 왼쪽의 **플러그인**을 누릅니다.
+6. 계정 메뉴 → **설정** → **플러그인** → 위쪽 **MCP** 탭으로 이동합니다.
+7. **+ 서버 추가** → **STDIO**를 선택합니다.
+8. `Name`, `Command`, 각 `Argument`, `env`, `cwd`를 `ui_fields`와 같은 값·같은
+   순서로 넣고 **저장**을 누릅니다.
+9. ChatGPT Desktop을 완전히 종료했다가 다시 열고 새 서버가 켜져 있는지 확인합니다.
+10. 새 대화에서 `search`와 `fetch`를 실제로 한 번씩 호출하면 연결 완료입니다.
+
+자세히 따라가기:
+[ChatGPT/Codex Desktop과 CLI에 로컬 연결하기](#chatgptcodex-desktop과-cli에-로컬-연결하기)
+
+#### 완주 경로 B — Vercel Streamable HTTP
+
+1. 승인과 색인 완료 후 원격으로 사용할 AI 앱의 **Vercel HTTPS MCP**를 선택합니다.
+2. 번들을 생성하고 `vercel-mcp-stage` 또는 화면에 표시된 staging 폴더를 찾습니다.
+3. PowerShell에서 `vercel login`으로 로그인합니다.
+4. staging 폴더에서 `vercel link`로 새 Vercel 프로젝트를 연결합니다.
+5. 공개 read-only 또는 승인된 인증 방식을 선택하고 필요한 환경변수를 설정합니다.
+6. `vercel --prod`를 실행합니다.
+7. 출력에서 **`Ready`**와 고정 **`Aliased`** 주소를 확인합니다.
+8. 그 주소 뒤에 `/mcp`를 붙여 원격 smoke의
+   `initialize → tools/list → search → fetch`를 통과시킵니다.
+9. AI 앱에서 **Streamable HTTP** 또는 **Connector**를 선택하고 검증한
+   `https://<고정-host>/mcp`만 입력합니다.
+10. 새 대화에서 `search`와 `fetch`가 실제로 성공하면 연결 완료입니다.
+
+자세히 따라가기: [강의 B: Vercel HTTPS 배포와 연결](#강의-b-vercel-https-배포와-연결)
+
 ### 생성 완료 화면 읽는 법
 
 `MCP 파일 묶음 생성 완료`가 나오면 아래의 **직접 MCP 연결 및 최종 확인**까지 내려갑니다.
@@ -261,6 +317,47 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 > 이 화면의 초록색 완료 문구는 **로컬 파일 생성 완료**입니다. Vercel 배포 완료가
 > 아닙니다. Vercel은 [B-6](#b-6-production-배포)의 `vercel --prod`를 실행한 뒤
 > `Ready`, `Aliased`와 원격 smoke 성공까지 확인해야 합니다.
+
+#### 생성 버튼을 누르기 전 — 연결 앱·저장 폴더·서버 이름
+
+완료 화면보다 먼저 아래 입력 화면이 나옵니다. 여기서 선택한 앱에 따라 아래쪽에 표시되는
+등록 강의와 생성 설정 파일이 달라집니다. 캡처의 규정명, 저장 경로, ZIP 경로와 서버 이름은
+공개용으로 지웠습니다. **내 화면에서는 이 칸을 비우지 말고 실제 값을 입력해야 합니다.**
+
+##### ChatGPT Desktop 또는 Codex에 로컬 STDIO로 연결할 때
+
+![PR MCP Builder에서 ChatGPT Desktop과 Codex 공용 로컬 STDIO 설정, 저장 폴더와 MCP 이름을 선택하는 실제 화면](docs/assets/readme-course-00c-builder-chatgpt-stdio-selection.png)
+
+위 화면에서는 다음 순서로만 움직입니다.
+
+1. 맨 위 **선택 규정 MCP 준비 상태**의 오른쪽 상태가 `준비 완료`인지 확인합니다.
+2. **연결할 AI 앱**에서
+   `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)` 왼쪽 동그라미를 누릅니다.
+3. 바로 아래에 `선택된 연결 방식: 로컬 stdio`가 보이는지 확인합니다.
+4. **Windows 탐색기에서 저장 폴더 선택**을 누르고, 나중에 옮기지 않을 폴더를 고릅니다.
+5. 처음에는 **폴더 + 전달용 ZIP (권장)**을 그대로 선택합니다.
+6. **생성할 MCP 이름 (필수 입력)**에 앱에서 알아보기 쉬운 이름을 넣습니다.
+   이 값은 폴더 경로나 실행 명령이 아니라 MCP 서버 목록에 표시될 이름입니다.
+7. 빨간 **MCP로 쓸 파일 묶음 만들기** 버튼을 한 번 누르고 100%가 될 때까지 기다립니다.
+
+`Claude Desktop`, `ChatGPT · Vercel HTTPS MCP` 같은 다른 동그라미를 동시에 선택하는 것이
+아닙니다. 한 번 생성할 때 하나의 연결 앱만 고릅니다.
+
+##### Claude Desktop에 로컬 STDIO로 연결할 때
+
+![PR MCP Builder에서 Claude Desktop 로컬 STDIO 설정, 저장 폴더와 MCP 이름을 선택하는 실제 화면](docs/assets/readme-course-00d-builder-claude-selection.png)
+
+Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
+
+1. **연결할 AI 앱**에서 `Claude Desktop` 왼쪽 동그라미를 누릅니다.
+2. `Claude · Vercel HTTPS MCP`가 아니라 `Claude Desktop`이 선택됐는지 다시 봅니다.
+3. 저장 폴더와 MCP 이름을 채우고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
+4. 생성이 끝나면 아래 강의 A에서 `claude_desktop_config.json`의
+   `command`, `args`, `env`를 확인합니다.
+
+> [!TIP]
+> 저장 경로와 서버 이름이 회색 또는 흰색 빈칸처럼 보이는 것은 공개용 비식별 처리입니다.
+> 실제 사용자는 Builder가 표시한 경로와 자신이 입력한 서버 이름을 그대로 사용합니다.
 
 - **같은 Windows PC에서 지금 바로 Claude Desktop에 붙일 것**이면 로컬 STDIO 절차만 따라갑니다.
 - **다른 PC, 다른 계정, 모바일, 클라우드 AI에서 쓸 것**이면 Vercel HTTPS 절차로 갑니다.
@@ -341,6 +438,36 @@ Claude Desktop이 어느 폴더에서 시작되더라도 동작하도록 생성 
 
 생성 폴더의 `claude_desktop_config.json`을 메모장으로 엽니다. 정상적인 소스 프로젝트
 직접 실행 설정은 다음 구조입니다.
+
+#### Builder의 실제 Claude Desktop 등록 안내 읽는 법
+
+아래 화면은 Claude Desktop을 선택해 번들을 만든 뒤 Builder가 보여 주는 실제 등록
+안내입니다. 서버 이름, 생성 파일 경로, 프로젝트 Python 경로, data 경로, profile ID와
+`PYTHONPATH`는 공개용으로 지웠습니다.
+
+![PR MCP Builder가 Claude Desktop용 직접 Python command, args, env와 설정 파일 위치를 보여 주는 실제 화면](docs/assets/readme-course-04b-builder-claude-direct-config.png)
+
+위에서 아래로 네 부분을 확인합니다.
+
+1. **생성된 설정 파일 경로 복사**: 방금 만든 번들의
+   `claude_desktop_config.json` 위치입니다. 이 파일이 복사 원본입니다.
+2. **Claude Desktop 설정 위치**:
+   `%APPDATA%\Claude\claude_desktop_config.json`이 실제로 수정할 대상입니다.
+3. **병합할 `mcpServers` JSON 복사**: 기존 Claude 설정 전체를 지우지 않고 이 서버 한
+   항목만 기존 `mcpServers` 안에 합칩니다.
+4. 코드 블록: 실제 `command`, `args`, `env`입니다. 이미지에서 가려진 값은 내 Builder
+   화면과 생성 JSON에는 실제 절대경로와 ID로 채워져 있습니다.
+
+프로젝트 Python 직접 실행이 선택된 정상 화면은 다음 네 표시가 함께 나옵니다.
+
+- `command`가 프로젝트의 절대 `...\python.exe` 경로
+- `args` 첫 두 항목이 `-m`, `scripts.run_regulation_mcp`
+- `env.PYTHONPATH`가 프로젝트 루트 절대경로
+- `env.PYTHONSAFEPATH`가 `"1"`
+
+반대로 `command`가 `powershell.exe`이면 설치된 wheel, 독립 번들 또는 프로젝트 소스를
+찾지 못한 환경을 위한 fallback입니다. 오류라고 단정하거나 Python 예시로 억지로 바꾸지
+말고 **그때 생성된 `command`, 모든 `args`, 전체 `env`를 그대로 복사**합니다.
 
 ```json
 {
@@ -630,6 +757,29 @@ Claude 화면에서 이유를 찾기 어렵다면 생성 번들 폴더를 파일
 생성 완료 화면의 **ChatGPT/Codex Desktop에 등록하는 방법** 또는 번들의
 `chatgpt_desktop_local_mcp.json`을 엽니다. 앱 버전에 따라 **플러그인(Plugins) >
 MCP 서버 추가** 또는 **Settings > MCP servers > Add server**를 엽니다.
+
+#### Builder의 실제 ChatGPT STDIO 결과에서 복사할 값 찾기
+
+아래는 ChatGPT Desktop/Codex 공용 설정으로 번들을 만든 직후 Builder가 보여 주는 실제
+STDIO 결과입니다. 재생성 해시, 서버 이름, wrapper 경로, data 경로, profile ID와 `cwd`는
+공개용으로 지웠습니다.
+
+![PR MCP Builder의 ChatGPT Desktop STDIO 생성 결과에서 powershell.exe, args, cwd와 env를 확인하는 실제 화면](docs/assets/readme-course-01b-builder-chatgpt-stdio-output.png)
+
+초보자는 코드 블록을 다음처럼 읽으면 됩니다.
+
+1. `"transport": "STDIO"`이면 URL 연결이 아니라 내 PC에서 실행하는 로컬 연결입니다.
+2. `"command": "powershell.exe"`이면 ChatGPT의 **실행 명령** 칸에는
+   `powershell.exe` 한 값만 넣습니다.
+3. `"args"`의 대괄호 안 값은 위에서 아래로 **한 항목씩 별도 인자 칸**에 넣습니다.
+4. 이미지에서 `-File`, `--data-dir`, `--profile-id` 다음에 비어 보이는 줄에는 실제
+   생성 경로와 ID가 들어 있습니다. 스크린샷의 빈칸을 그대로 따라 하지 않습니다.
+5. `"cwd"`와 `"env"`도 생성된 값이 있을 때만 해당 설정 칸에 그대로 옮깁니다.
+6. 가장 안전한 복사 원본은 화면을 눈으로 다시 타이핑한 값이 아니라 번들의
+   `chatgpt_desktop_local_mcp.json` 안 `ui_fields`입니다.
+
+파란색 `MCP 파일 묶음 생성 완료`와 초록색 `연결 파일 묶음을 만들었습니다`는 **파일 생성
+성공**을 뜻합니다. 아직 ChatGPT Desktop 등록과 실제 `search`·`fetch` 검증은 남아 있습니다.
 
 #### 실제 화면 따라 하기
 
