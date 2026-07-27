@@ -942,24 +942,135 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "Transport",
             "Command 복사",
             "Working directory 복사",
-            "Arguments 전체 목록 복사",
-            "번호가 붙은 인자별 목록",
-            "Environment",
-            "Environment passthrough",
+            "Arguments (",
+            "한 줄씩 따로 복사",
+            "첫 번째 인자 칸에 Argument 1",
+            "`+ 인자 추가`",
+            "아래 한 줄만 복사",
+            "Environment (",
+            "키와 값을 따로 복사",
+            "왼쪽 키 칸에 복사",
+            "오른쪽 값 칸에 복사",
+            "Environment passthrough (",
+            "Passthrough",
             "입력하지 않음",
             "MCP 서버 이름은 Name에만 입력합니다.",
             "Command에는 서버 이름을 입력하지 않습니다.",
             "각 Argument는 한 입력 칸에 하나씩 순서대로 넣어야 합니다.",
             "Arguments를 일부라도 누락하면 서버가 실행되지 않습니다.",
             "자동 수정하지 않았으므로",
-            "MCP 서버 설정을 저장합니다.",
-            "ChatGPT/Codex Desktop을 완전 종료합니다.",
-            "앱을 재실행합니다.",
-            "새 대화에서 MCP 서버가 보이는지 확인합니다.",
+            "왼쪽 아래 계정 > 설정 > 플러그인 > MCP > ",
+            "+ 서버 추가 > STDIO",
+            "위 Name을 ChatGPT의 이름 칸에 넣습니다.",
+            "Argument 1을 첫 인자 칸에 넣고 `+ 인자 추가`",
+            "Environment 첫 키·값은 이미 보이는 첫 행",
+            "Environment passthrough 첫 값도 이미 보이는 첫 칸",
+            "오른쪽 아래 저장을 누릅니다.",
+            "ChatGPT/Codex Desktop을 완전 종료했다가 다시 실행합니다.",
+            "설정 > 플러그인 > MCP에서 새 서버를 켭니다.",
             "`search`와 `fetch`를 실제로 호출해 연결을 검증합니다.",
         ):
             self.assertIn(expected, guide_source)
         self.assertNotIn("\ufffd", guide_source)
+
+    def test_chatgpt_codex_desktop_registration_renders_each_value_separately(
+        self,
+    ) -> None:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
+            encoding="utf-8"
+        )
+        module = ast.parse(source)
+        renderer_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_render_chatgpt_codex_desktop_registration_guide"
+        )
+
+        class FakeStreamlit:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, str]] = []
+
+            def markdown(self, value: str) -> None:
+                self.events.append(("markdown", value))
+
+            def caption(self, value: str) -> None:
+                self.events.append(("caption", value))
+
+            def info(self, value: str) -> None:
+                self.events.append(("info", value))
+
+            def code(self, value: str, *, language=None) -> None:
+                self.events.append(("code", value))
+
+            def warning(self, value: str) -> None:
+                self.events.append(("warning", value))
+
+            def error(self, value: str) -> None:
+                self.events.append(("error", value))
+
+        fake_st = FakeStreamlit()
+        namespace = {"Any": Any, "st": fake_st}
+        exec(
+            compile(
+                ast.Module(body=[renderer_node], type_ignores=[]),
+                "<chatgpt-desktop-registration-guide>",
+                "exec",
+            ),
+            namespace,
+        )
+        render = namespace["_render_chatgpt_codex_desktop_registration_guide"]
+        arguments = [
+            "-NoProfile",
+            "-File",
+            r"C:\MCP 번들\기관 규정\run_mcp_stdio_server.ps1",
+        ]
+        render(
+            {
+                "name": "기관 규정",
+                "transport": "STDIO",
+                "command": "powershell.exe",
+                "arguments": arguments,
+                "environment": {
+                    "PYTHONPATH": r"C:\Users\테스트 사용자\Public Regulation MCP",
+                    "PYTHONSAFEPATH": "1",
+                },
+                "environment_passthrough": ["REG_RAG_TOKEN"],
+                "working_directory": r"C:\MCP 번들\기관 규정",
+                "profile_id": "institution-test",
+                "tool_profile": "full",
+                "command_matches_server_name": False,
+            }
+        )
+
+        code_values = [
+            value for event, value in fake_st.events if event == "code"
+        ]
+        self.assertEqual(
+            [
+                "기관 규정",
+                "powershell.exe",
+                *arguments,
+                "PYTHONPATH",
+                r"C:\Users\테스트 사용자\Public Regulation MCP",
+                "PYTHONSAFEPATH",
+                "1",
+                "REG_RAG_TOKEN",
+                r"C:\MCP 번들\기관 규정",
+            ],
+            code_values,
+        )
+        rendered_text = "\n".join(value for _, value in fake_st.events)
+        for expected in (
+            "Argument 1/3",
+            "Argument 2/3",
+            "Argument 3/3",
+            "Environment 1/2 — 왼쪽 키 칸에 복사",
+            "Environment 2/2 — 오른쪽 값 칸에 복사",
+            "Passthrough 1/1",
+            "마지막 Argument 3까지 각각 다른 칸",
+        ):
+            self.assertIn(expected, rendered_text)
 
     def test_claude_desktop_final_guide_uses_generated_config(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(
@@ -1027,6 +1138,10 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             payload,
             json.loads(registration["merge_json"]),
         )
+        self.assertEqual(
+            payload["mcpServers"],
+            json.loads("{" + registration["server_entry_json"] + "}"),
+        )
 
         guide_start = source.index(
             "def _render_claude_desktop_registration_guide("
@@ -1040,10 +1155,11 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "Claude Desktop에 등록하는 방법",
             "생성된 설정 파일 경로 복사",
             r"%APPDATA%\Claude\claude_desktop_config.json",
-            "병합할 `mcpServers` JSON 복사",
+            "처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사",
+            "기존 서버가 있을 때: `mcpServers` 안에 넣을 새 서버 한 항목 복사",
             "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
             "트레이까지 완전 종료",
-            "파일·커넥터 추가 > Connectors",
+            "상태가 `running`인지 확인합니다.",
             "`search`와 `fetch`를 실제로 호출해 연결을 검증합니다.",
             "원격 HTTPS MCP용",
             "로컬 STDIO MCP",
