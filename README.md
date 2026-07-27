@@ -413,6 +413,19 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 > 이 강의에서는 명령어나 경로를 직접 만들지 않습니다. Builder에서 복사하고,
 > Claude Desktop 설정 파일에 붙여 넣은 다음 `running`만 확인합니다.
 
+> [!TIP]
+> **처음 연결이면 A-1부터 A-7까지만 그대로 하면 끝입니다.**
+>
+> 1. Builder에서 `Claude Desktop`과 `로컬 STDIO`를 선택하고 번들을 만듭니다.
+> 2. 완료 화면에서 **처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**를 누릅니다.
+> 3. Claude Desktop에서 **프로필 → 설정 → 개발자 → 구성 편집**으로 들어갑니다.
+> 4. 열린 `claude_desktop_config.json` 파일 전체에 `Ctrl+A` → `Ctrl+V` → `Ctrl+S`를 합니다.
+> 5. Claude Desktop을 **종료(Quit)**까지 해서 완전히 끕니다.
+> 6. Claude Desktop을 다시 켭니다.
+> 7. **프로필 → 설정 → 개발자 → 로컬 MCP 서버**에서 파란색 `running`을 확인합니다.
+>
+> **A-8과 A-9는 실패했을 때만 읽습니다.**
+
 > [!NOTE]
 > 실제 캡처에서는 계정 이름, 이메일, 최근 대화, 로컬 절대경로, 서버 이름과 ID처럼
 > 공개하면 안 되는 글자만 주변과 같은 색으로 가렸습니다.
@@ -484,6 +497,12 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 파일 확장명이 숨겨진 Windows에서는 `.json`이 보이지 않을 수 있습니다.
 파일 종류가 **JSON 원본 파일**이면 맞습니다.
 
+직접 폴더를 열어야 한다면 실제 위치는 아래입니다.
+
+```text
+%APPDATA%\Claude\claude_desktop_config.json
+```
+
 ### A-4. JSON 붙여 넣고 저장하기
 
 처음 설치해 설정 파일이 비어 있거나 `{}`만 보이는 경우입니다.
@@ -496,6 +515,8 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 
 > **붙여 넣을 위치는 파일 전체입니다.** `{}` 안쪽에 넣는 것이 아닙니다.
 > `{}`가 보이면 `Ctrl+A`로 `{}`까지 선택한 뒤 복사한 전체 JSON으로 바꿉니다.
+> 초보자는 `mcpServers` 안쪽 줄을 손으로 맞추지 않습니다. **파일 전체 선택 후 그대로
+> 붙여 넣기**만 하면 됩니다.
 
 ![Claude Desktop 설정 파일 전체에 Builder JSON을 붙여 넣는 실제 화면](docs/assets/readme-course-07-claude-config-editor.png)
 
@@ -533,6 +554,8 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 
 `running`이 보이면 서버 실행까지 성공한 것입니다.
 
+여기서 끝내지 말고 바로 아래 A-7까지 진행해야 실제 검색도 되는지 확인됩니다.
+
 ### A-7. `search`와 `fetch` 확인하기
 
 1. Claude Desktop 설정 창을 닫습니다.
@@ -549,6 +572,8 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 1. 설정 화면의 서버 상태가 `running`
 2. 대화에서 `search` 도구가 호출됨
 3. 첫 검색 결과를 `fetch`로 열어 본문과 출처가 표시됨
+
+여기까지 되면 Claude Desktop 연결은 끝입니다.
 
 ### A-8. 기존 설정이 있을 때 병합하기
 
@@ -567,6 +592,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\connect_mcp_client.ps
 
 6. 명령이 끝나면 Claude Desktop을 다시 실행합니다.
 7. A-6으로 돌아가 `running`을 확인합니다.
+
+정상이라면 PowerShell에서 `Installed-config stdio verification passed`가 보입니다.
+이어서 `CLAUDE DESKTOP VERIFICATION REQUIRED`가 보여도 정상입니다. Claude를 다시 열어
+`running`을 확인하라는 뜻입니다.
 
 직접 붙여 넣기를 원한다면 Builder의 두 번째 상자인
 **기존 서버가 있을 때: `mcpServers` 안에 넣을 새 서버 한 항목 복사**를 사용합니다.
