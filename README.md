@@ -546,22 +546,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 ### A-4. 자동 연결이 안 될 때 Claude Desktop 설정 파일 열기
 
-1. Claude Desktop을 실행합니다.
-2. 왼쪽 아래 프로필 또는 메뉴에서 **설정(Settings)**을 엽니다.
-3. **개발자(Developer)**를 누릅니다.
-4. **로컬 MCP 서버(Local MCP servers)** 영역에서 **구성 편집(Edit Config)**을 누릅니다.
-5. Windows가 `%APPDATA%\Claude\claude_desktop_config.json`을 엽니다.
+이 절의 목표는 **Claude Desktop이 실제로 읽는 설정 파일**을 찾는 것입니다. 생성 번들
+안의 파일과 Claude 사용자 설정 파일은 이름이 같을 수 있지만 서로 다른 파일입니다.
 
-한글 경로는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**, 영문 경로는
-**Settings > Developer > Edit Config**입니다.
+| 구분 | 위치 | 여기서 할 일 |
+| --- | --- | --- |
+| 생성 번들의 복사 원본 | `<내가 선택한 번들 폴더>\claude_desktop_config.json` | `command`, `args`, `env`를 복사 |
+| Claude가 실제로 읽는 대상 | `%APPDATA%\Claude\claude_desktop_config.json` | 기존 내용을 보존하면서 새 서버를 병합하고 저장 |
 
-메뉴를 못 찾겠다면 Windows에서 `Win + R`을 누르고 아래 경로를 그대로 붙여도 됩니다.
+#### 1단계 — Claude Desktop의 설정 메뉴 열기
 
-```text
-%APPDATA%\Claude\claude_desktop_config.json
-```
-
-파일이 열리지 않으면 Claude Desktop을 한 번 실행한 뒤 다시 시도하세요.
+1. **Claude 웹사이트가 아니라 설치된 Claude Desktop 앱**을 실행합니다.
+2. Claude 창 왼쪽 아래에서 내 이름이나 프로필 아이콘이 보이는 영역을 한 번 누릅니다.
+3. 작은 메뉴가 열리면 톱니바퀴 아이콘이 있는 **설정(Settings)**을 누릅니다.
+4. **설정**, **언어**, **도움 받기** 같은 항목이 보이면 올바른 메뉴를 연 것입니다.
 
 > [!NOTE]
 > 아래부터 나오는 실제 앱 캡처는 메뉴·버튼·입력 칸·상태 표시는 원본 그대로 두고,
@@ -576,8 +574,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 ![Claude Desktop 홈 화면 왼쪽 아래 프로필 메뉴에서 설정 행을 여는 실제 예시](docs/assets/readme-course-02-claude-settings-menu.png)
 
-캡처에서 이름과 이메일은 가렸지만 **설정** 행은 그대로 보입니다. 이 행을 누른 뒤
-설정 창 왼쪽 메뉴에서 **개발자**를 선택하고, 화면 위쪽의 **구성 편집**을 누릅니다.
+캡처에서 이름과 이메일은 가렸지만 **설정** 행은 그대로 보입니다. 이 행을 누릅니다.
+
+#### 2단계 — 개발자 화면에서 구성 편집 누르기
+
+1. 설정 창의 **왼쪽 메뉴를 아래로 내려** `데스크톱 앱` 묶음을 찾습니다.
+2. 스패너 아이콘이 붙은 **개발자(Developer)**를 누릅니다.
+3. 오른쪽 화면 위쪽에 **로컬 MCP 서버**라는 제목이 나오는지 확인합니다.
+4. 제목 아래의 **구성 편집(Edit Config)** 버튼을 한 번 누릅니다.
+5. Windows 파일 탐색기나 JSON 편집기가 열릴 때까지 잠시 기다립니다.
+
+#### 실제 화면 2 — 개발자에서 구성 편집 누르기
+
+![Claude Desktop 설정의 개발자 화면에서 로컬 MCP 서버 구성 편집 버튼을 누르는 실제 예시](docs/assets/readme-course-02c-claude-developer-config-edit.png)
+
+이 화면에서 확인할 곳을 한 줄씩 짚으면 다음과 같습니다.
+
+- **왼쪽에서 누를 곳:** `개발자`
+- **오른쪽에서 확인할 제목:** `로컬 MCP 서버`
+- **마지막으로 누를 버튼:** `구성 편집`
+- **버튼을 누른 다음 정상 동작:** 파일 탐색기의 Claude 폴더 또는 JSON 편집기가 열림
+- **이 단계에서 누르지 않을 곳:** `커넥터`, `플러그인`, `확장 프로그램`
 
 이 단계에서 일반 **커넥터(Connectors)** 메뉴를 열면 안 됩니다. 그 메뉴는 강의 B의
 Vercel 같은 원격 HTTPS 서버용입니다.
@@ -585,10 +602,68 @@ Vercel 같은 원격 HTTPS 서버용입니다.
 Claude Desktop 로컬 STDIO Config에는 Vercel 주소만 단독으로 넣지 않습니다. 반대로
 원격 **Connectors** 화면에는 이 JSON을 넣지 않습니다.
 
+#### 3단계 — 파일 탐색기에서 정확한 JSON 파일 찾기
+
+Claude Desktop 버전에 따라 **구성 편집**을 눌렀을 때 JSON 파일이 바로 열리기도 하고,
+아래처럼 파일이 들어 있는 폴더만 열리기도 합니다. 폴더가 열리면 다음 순서로 진행합니다.
+
+1. 탐색기 위쪽 주소 표시줄에
+   **`사용자 > 내 Windows 사용자 폴더 > AppData > Roaming > Claude`**가 보이는지
+   확인합니다.
+2. 가운데 파일 목록에서 **`claude_desktop_config`**를 찾습니다.
+3. Windows가 확장자를 숨기고 있으면 화면에는 `.json`이 보이지 않습니다. 이 경우에도
+   파일 종류가 **JSON 원본 파일**이면 정확한 파일입니다.
+4. 확실히 확인하려면 탐색기 위쪽의
+   **보기 > 표시 > 파일 확장명**을 차례로 눌러 확장자를 표시합니다.
+5. 전체 이름이 **`claude_desktop_config.json`**인지 확인합니다.
+6. 파일을 두 번 클릭합니다. 앱 선택 창이 나오면 **메모장**이나 **Visual Studio Code**를
+   선택합니다.
+7. `logs`, `GPUCache`, `Local Storage`, `buddy-tokens` 같은 다른 파일이나 폴더는
+   MCP 설정 파일이 아니므로 건드리지 않습니다.
+
+#### 실제 화면 3 — Claude 설정 파일 찾기
+
+![Windows 파일 탐색기의 AppData Roaming Claude 폴더에서 claude_desktop_config JSON 파일을 찾는 실제 예시](docs/assets/readme-course-02d-claude-config-file-explorer.png)
+
+이 캡처에서는 개인정보 보호를 위해 Windows 사용자명, 개인 바로가기, 관련 없는 폴더명,
+날짜와 절대경로를 같은 배경색으로 가렸습니다. 실제로 찾아야 할 것은 가운데 파란색으로
+선택된 **`claude_desktop_config`** 파일 하나입니다.
+
+> [!WARNING]
+> 파일 이름이 `claude_desktop_config.json.txt`라면 잘못 만든 텍스트 파일입니다.
+> **보기 > 표시 > 파일 확장명**을 켠 뒤 끝의 `.txt`를 제거해야 합니다. 이름이 비슷한
+> 파일을 새로 만들기보다, 가능하면 A-3의 자동 연결 마법사가 만든 파일을 사용하세요.
+
+메뉴를 찾을 수 없거나 **구성 편집** 버튼을 눌러도 아무 반응이 없다면 다음 우회 방법을
+사용합니다.
+
+1. 키보드에서 `Win + R`을 누릅니다.
+2. 실행 창에 아래 **폴더 경로**를 그대로 붙여 넣고 `Enter`를 누릅니다.
+
+   ```text
+   %APPDATA%\Claude
+   ```
+
+3. 열린 폴더에서 `claude_desktop_config.json`을 찾습니다.
+4. 파일이 없다면 Claude Desktop을 한 번 실행하고 완전히 종료한 뒤 A-3 자동 연결
+   마법사를 다시 실행합니다.
+
+한글 메뉴의 전체 경로는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**, 영문 메뉴는
+**Settings > Developer > Local MCP servers > Edit Config**입니다.
+
 ### A-5. 기존 설정을 지우지 않고 새 서버만 수동 병합하기
 
 이 절은 A-3 자동 연결이 실패했거나 설정을 직접 검토해야 할 때만 사용합니다. 먼저
 열린 Claude 설정 파일을 다른 이름으로 복사해 백업합니다.
+
+#### 1단계 — 수정 대상과 복사 원본을 나란히 준비하기
+
+1. `%APPDATA%\Claude\claude_desktop_config.json`을 같은 폴더에
+   `claude_desktop_config.backup.json`이라는 이름으로 한 번 복사합니다.
+2. 첫 번째 편집기 창에는 **Claude가 실제로 읽는 대상 파일**을 엽니다.
+3. 두 번째 편집기 창에는 **생성 번들 안의 복사 원본 파일**을 엽니다.
+4. 두 창의 경로가 서로 다른지 확인합니다. 번들 파일만 수정하면 Claude에는 반영되지
+   않습니다.
 
 Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_config.json` 전체를
 복사해도 됩니다.
@@ -596,7 +671,7 @@ Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_con
 이미 다른 MCP 서버나 `preferences`가 있다면 파일 전체를 덮어쓰지 않습니다. 생성 파일의
 `mcpServers` 안에 있는 **새 서버 한 항목만** 기존 `mcpServers` 중괄호 안에 추가합니다.
 
-#### 실제 화면 2 — `claude_desktop_config.json`에서 병합할 위치
+#### 실제 화면 4 — `claude_desktop_config.json`에서 병합할 위치
 
 아래 캡처는 **구성 편집**을 눌렀을 때 열린 실제 JSON 화면입니다. 캡처의 경로와 식별자는
 공개용으로 가렸으므로 이미지의 빈 부분을 타이핑하지 마세요. 생성 번들에 있는
@@ -608,7 +683,9 @@ Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_con
 초보자 기준으로는 이미지를 보고 구조를 확인하고, 실제 글자는 생성 번들의
 `claude_desktop_config.json`에서 그대로 복사한다고 이해하면 가장 안전합니다.
 
-화면에서 다음 위치를 순서대로 찾습니다.
+#### 2단계 — 새 서버 한 항목만 병합하기
+
+화면에서 다음 위치를 위에서 아래로 찾습니다.
 
 1. 맨 바깥쪽의 `"mcpServers"`를 찾습니다.
 2. 그 중괄호 안에 생성된 **서버 이름 한 항목**을 추가합니다.
@@ -617,6 +694,16 @@ Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_con
 5. 생성 파일에 `"env"`가 있으면 객체 전체를 복사합니다. 소스 프로젝트 직접 실행 방식은
    `PYTHONPATH`와 `PYTHONSAFEPATH`가 반드시 있어야 합니다.
 6. 캡처 아래쪽에 보이는 기존 `"preferences"` 등 다른 설정은 삭제하지 않습니다.
+
+초보자가 가장 많이 실수하는 부분은 다음 네 가지입니다.
+
+- 캡처에 보이는 예시 경로를 직접 타이핑하지 않습니다. **내 번들 파일의 값**을 복사합니다.
+- Windows 경로의 `\`는 JSON에서 `\\`로 보일 수 있습니다. 정상입니다. 생성된 문자열을
+  그대로 복사하면 됩니다.
+- `"args"`의 각 값은 한 줄에 하나인 **별도 항목**입니다. 여러 인자를 한 문자열로
+  합치지 않습니다.
+- 직접 Python 실행 설정에는 `"env"` 안의 `PYTHONPATH`와 `PYTHONSAFEPATH`가 모두
+  있어야 하며, `cwd`에 의존하도록 바꾸지 않습니다.
 
 | Config에서 찾을 위치 | 넣을 내용 |
 | --- | --- |
@@ -671,12 +758,12 @@ Claude 설정 파일이 완전히 비어 있으면 생성된 `claude_desktop_con
 
 JSON 편집이 자신 없으면 아래 순서로 복구합니다.
 
-1. `%APPDATA%\Claude\claude_desktop_config.json`을 수정하기 전에 같은 폴더에
-   `claude_desktop_config.backup.json`으로 한 번 복사합니다.
-2. 저장 후 Claude Desktop이 열리지 않거나 서버가 모두 사라졌다면 백업 파일로 먼저 되돌립니다.
-3. 그다음 생성 번들의 `claude_desktop_config.json`을 다시 열고, 새 서버 한 항목만
+1. 저장 후 Claude Desktop이 열리지 않거나 서버가 모두 사라졌다면 백업 파일로 먼저
+   되돌립니다.
+2. 그다음 생성 번들의 `claude_desktop_config.json`을 다시 열고, 새 서버 한 항목만
    천천히 다시 병합합니다.
-4. 확신이 없으면 생성된 JSON의 값은 타이핑하지 말고 `command`, `args`, `env`를 그대로 복사합니다.
+3. 확신이 없으면 생성된 JSON의 값은 타이핑하지 말고 `command`, `args`, `env`를 그대로
+   복사합니다.
 
 ![기존 preferences와 MCP 서버를 보존하고 새 서버 항목만 병합하는 방법](docs/assets/readme-claude-mcp-02-config.svg)
 
@@ -686,22 +773,60 @@ JSON 편집이 자신 없으면 아래 순서로 복구합니다.
 - 기존 서버 다음에 새 서버를 붙였다면 두 서버 항목 사이에 쉼표가 하나 있습니다.
 - 마지막 서버 항목 뒤에는 쉼표가 없습니다.
 
+#### 3단계 — 저장 전에 JSON 문법 확인하기
+
+1. 편집기에서 `Ctrl+S`를 눌러 저장합니다.
+2. Windows 시작 메뉴에서 **PowerShell**을 검색해 엽니다.
+3. 아래 명령을 통째로 붙여 넣고 `Enter`를 누릅니다.
+
+   ```powershell
+   try {
+     Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw |
+       ConvertFrom-Json -ErrorAction Stop | Out-Null
+     Write-Host "JSON syntax OK"
+   } catch {
+     Write-Error "JSON syntax error: $($_.Exception.Message)"
+   }
+   ```
+
+4. 빨간 오류 없이 **`JSON syntax OK`**가 보이면 중괄호, 따옴표와 쉼표 문법이
+   정상입니다.
+5. 빨간 오류가 나오면 Claude를 실행하기 전에 편집기로 돌아가 오류 줄 주변의 쉼표와
+   중괄호를 확인합니다.
+
+이 검사는 JSON 모양만 확인합니다. 실제 MCP 실행 성공 여부는 A-6에서 `running`,
+`search`, `fetch`까지 확인해야 합니다.
+
 JSON이 잘못되어 Claude가 시작되지 않으면 편집한 파일을 닫고, A-3에서 만들어진 최신
 `claude_desktop_config.json.bak-...` 파일을 원래 이름으로 복사해 복구합니다.
 
 ### A-6. 저장하고 Claude Desktop을 완전히 다시 시작
 
-1. 메모장에서 `Ctrl+S`를 눌러 JSON을 저장합니다.
-2. Claude 창 오른쪽 위 `X`만 누르지 말고 작업 표시줄 알림 영역의 Claude 아이콘을
-   우클릭해 **종료(Quit)**합니다.
-3. 작업 관리자에 Claude가 남아 있지 않은지 확인합니다.
-4. Claude Desktop을 다시 실행합니다.
-5. 왼쪽 아래 프로필 메뉴에서 **설정 > 개발자 > 로컬 MCP 서버**를 다시 엽니다.
-6. 방금 추가한 서버 행을 선택합니다.
-7. 서버 이름 옆의 파란 상태 배지가 `running`인지 확인합니다.
-8. 새 대화를 열고 도구 목록에서 `search`와 `fetch`가 보이는지 확인합니다.
+#### 1단계 — Claude를 창만 닫지 말고 완전히 종료하기
 
-#### 실제 화면 3 — `running` 확인
+1. 편집기에서 `Ctrl+S`를 한 번 더 눌러 저장합니다.
+2. Claude 창 오른쪽 위 `X`를 눌러 창을 닫습니다.
+3. Windows 작업 표시줄 오른쪽 끝의 `^` **숨겨진 아이콘 표시**를 누릅니다.
+4. Claude 아이콘을 마우스 오른쪽 버튼으로 누르고 **종료(Quit)**를 선택합니다.
+5. `Ctrl+Shift+Esc`로 작업 관리자를 열어 Claude가 남아 있지 않은지 확인합니다.
+6. 10초가 지나도 Claude가 남아 있으면 작업 관리자에서 Claude를 선택하고
+   **작업 끝내기**를 누릅니다.
+7. Claude 프로세스가 사라진 것을 확인한 뒤 Claude Desktop을 다시 실행합니다.
+
+설정 파일은 앱 시작 때 다시 읽히므로, 창만 닫았다가 여는 것으로는 변경 내용이 반영되지
+않을 수 있습니다.
+
+#### 2단계 — 로컬 MCP 서버가 `running`인지 확인하기
+
+1. Claude Desktop을 다시 실행합니다.
+2. 왼쪽 아래 프로필을 눌러 **설정**을 엽니다.
+3. **개발자 > 로컬 MCP 서버**로 이동합니다.
+4. 방금 추가한 서버 이름을 왼쪽 목록에서 누릅니다.
+5. 서버 이름 옆에 파란색 **`running`** 배지가 있는지 확인합니다.
+6. 가운데에 **명령어**, **인수**, **로그 보기**가 보이면 서버 상세 화면을 제대로 연
+   것입니다.
+
+#### 실제 화면 5 — `running` 확인
 
 아래 캡처에서 봐야 할 핵심은 파란색 **`running`** 배지입니다. 서버 이름, Python 절대경로,
 data 경로와 profile ID는 공개용으로 지웠지만 **로컬 MCP 서버**, **명령어**, **인수**,
@@ -726,6 +851,35 @@ data 경로와 profile ID는 공개용으로 지웠지만 **로컬 MCP 서버**,
 - 성공: 서버 이름이 보이고 상태가 `running`이며 도구 목록에 `search`, `fetch`가 나타남
 - 실패: `disconnected`, `failed`, 서버가 전혀 안 보임, 도구가 0개임
 - 실패 시 첫 조치: Claude를 다시 종료 후 실행하고 `doctor_mcp_connection.ps1`와 `validate_mcp_smoke.ps1`를 순서대로 실행
+
+#### 3단계 — `search`와 `fetch`를 실제로 한 번씩 사용하기
+
+1. Claude에서 **새 대화**를 엽니다.
+2. 먼저 다음처럼 요청합니다.
+
+   ```text
+   연결된 MCP 도구 목록을 확인하고 search와 fetch가 보이는지 알려줘.
+   ```
+
+3. `search`가 보이면 실제 규정에 포함된 단어를 넣어 다음처럼 요청합니다.
+
+   ```text
+   search 도구로 "복무"를 검색해 줘.
+   ```
+
+4. 검색 결과에 문서 ID나 결과 ID가 나오면 그 값을 사용해 다음처럼 요청합니다.
+
+   ```text
+   방금 검색 결과의 첫 번째 ID를 fetch 도구로 열어 줘.
+   ```
+
+5. 규정 제목, 조문 또는 본문이 반환되면 연결이 끝난 것입니다.
+
+최종 성공 기준은 세 항목이 **모두** 충족되는 것입니다.
+
+- 설정 화면에서 서버 상태가 `running`
+- 새 대화의 도구 목록에 `search`와 `fetch`가 노출됨
+- `search` 결과를 받은 뒤 그 결과를 `fetch`로 열 수 있음
 
 ### A-7. 번들 자체를 먼저 진단하는 방법
 
