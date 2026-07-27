@@ -43,7 +43,7 @@ Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 �
 - [처음 설치하고 승인 데이터 만들기](#1-처음-설치하고-승인-데이터-만들기)
 - [로컬 STDIO와 Vercel HTTPS 중 선택하기](#2-연결-방식-선택하기)
 - [강의 A: 같은 PC의 Claude Desktop에 STDIO 연결하기](#강의-a-claude-desktop-로컬-stdio-연결)
-- [ChatGPT/Codex Desktop과 CLI에 로컬 연결하기](#chatgptcodex-desktop과-cli에-로컬-연결하기)
+- [ChatGPT Desktop 로컬 STDIO 연결](#chatgpt-desktop-로컬-stdio-연결)
 - [강의 B: Vercel에 배포하고 HTTPS로 연결하기](#강의-b-vercel-https-배포와-연결)
 - [search와 fetch로 최종 확인하기](#3-search와-fetch로-최종-확인하기)
 - [문제 해결표](#4-문제-해결표)
@@ -92,7 +92,7 @@ Windows 실행판 설치
 
 - 회색 명령 상자 오른쪽 위에 복사 버튼이 보이면 눌러서 복사합니다.
 - **Claude Desktop 로컬 연결에서는 서버 이름이나 Python 경로를 다시 타이핑하지
-  않습니다.** Builder가 만든 자동 연결 명령을 한 번 실행하면 됩니다.
+  않습니다.** Builder가 만든 JSON 복사 상자를 사용합니다.
 - Vercel 주소도 예시를 고쳐 쓰지 않습니다. 배포가 끝난 뒤 PowerShell의 `Aliased:`
   줄에 나온 실제 주소를 복사합니다.
 - `C:\MCP-Bundles\...`는 설명용 예시입니다. 생성 완료 화면이나 내 파일 탐색기의 실제
@@ -214,8 +214,8 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 | 사용하려는 곳 | 선택할 방식 | 최종 입력값 |
 | --- | --- | --- |
-| 같은 PC의 Claude Desktop | 로컬 STDIO | 생성 폴더에서 자동 연결 명령 한 줄 실행 |
-| 같은 PC의 ChatGPT/Codex Desktop | 로컬 STDIO | `chatgpt_desktop_local_mcp.json`의 `ui_fields` |
+| 같은 PC의 Claude Desktop | 로컬 STDIO | Builder에서 JSON 복사 후 Claude 설정 파일에 붙여 넣기 |
+| 같은 PC의 ChatGPT/Codex Desktop | 로컬 STDIO | Builder 완료 화면의 Name·Command·Argument 개별 복사 상자 |
 | 같은 PC의 Codex CLI·IDE | 로컬 STDIO | `codex_config_snippet.toml` |
 | 같은 PC의 Claude Code | 로컬 STDIO | `claude_code_add_stdio.ps1` |
 | 웹이나 여러 기기의 ChatGPT·Codex·Claude | Vercel HTTPS | 생성 완료 화면에 나온 Production 주소 전체 |
@@ -248,8 +248,9 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 3. `③ 검수하고 승인`에서 사용할 청크를 승인하고 **색인 완료**를 확인합니다.
 4. `④ MCP 생성·AI 연결`에서 **Claude Desktop**을 누릅니다.
 5. 저장 폴더와 MCP 서버 이름을 넣고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
-6. 생성 폴더에서 PowerShell을 열고, 강의 A에 있는 **자동 연결 명령 한 줄**을
-   그대로 붙여 넣습니다. JSON은 직접 고치지 않습니다.
+6. Builder 완료 화면의
+   **처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**를 누른 뒤,
+   Claude Desktop의 `claude_desktop_config.json` 파일 전체에 붙여 넣고 저장합니다.
 7. Claude Desktop을 완전히 종료했다가 다시 열고 서버 옆의 **`running`**을 확인합니다.
 8. 새 대화에서 `search`로 찾은 결과를 `fetch`로 열어 실제 규정 내용이 나오면 연결
    완료입니다.
@@ -261,17 +262,21 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 1. 승인과 색인 완료 후 `④ MCP 생성·AI 연결`을 엽니다.
 2. **ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)**을 누릅니다.
 3. 저장 폴더와 서버 이름을 넣고 번들을 생성합니다.
-4. 생성 결과 또는 `chatgpt_desktop_local_mcp.json`에서 `ui_fields`를 찾습니다.
+4. 생성 완료 화면의 **ChatGPT/Codex Desktop에 등록하는 방법**까지 내려갑니다.
 5. ChatGPT Desktop 왼쪽의 **플러그인**을 누릅니다.
 6. 계정 메뉴 → **설정** → **플러그인** → 위쪽 **MCP** 탭으로 이동합니다.
 7. **+ 서버 추가** → **STDIO**를 선택합니다.
-8. `Name`, `Command`, 각 `Argument`, `env`, `cwd`를 `ui_fields`와 같은 값·같은
-   순서로 넣고 **저장**을 누릅니다.
-9. ChatGPT Desktop을 완전히 종료했다가 다시 열고 새 서버가 켜져 있는지 확인합니다.
-10. 새 대화에서 `search`와 `fetch`를 실제로 한 번씩 호출하면 연결 완료입니다.
+8. Builder의 `Name`과 `Command`를 같은 이름의 ChatGPT 칸에 붙여 넣습니다.
+9. Builder의 첫 번째 Argument 코드 상자 한 줄을 첫 인자 칸에 넣고,
+   **+ 인자 추가**를 누른 뒤 두 번째 Argument 코드 상자 한 줄을 둘째 칸에 넣습니다.
+   Builder의 마지막 번호까지 한 줄씩 반복합니다.
+10. Builder의 `Environment`, `Environment passthrough`, `Working directory`도 같은
+    이름의 ChatGPT 칸에 옮기고 **저장**을 누릅니다.
+11. ChatGPT Desktop을 완전히 종료했다가 다시 열고 새 서버가 켜져 있는지 확인합니다.
+12. 새 대화에서 `search`와 `fetch`를 실제로 한 번씩 호출하면 연결 완료입니다.
 
 자세히 따라가기:
-[ChatGPT/Codex Desktop과 CLI에 로컬 연결하기](#chatgptcodex-desktop과-cli에-로컬-연결하기)
+[ChatGPT Desktop 로컬 STDIO 연결](#chatgpt-desktop-로컬-stdio-연결)
 
 #### 완주 경로 B — Vercel Streamable HTTP
 
@@ -352,7 +357,8 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 1. **연결할 AI 앱**에서 `Claude Desktop` 왼쪽 동그라미를 누릅니다.
 2. `Claude · Vercel HTTPS MCP`가 아니라 `Claude Desktop`이 선택됐는지 다시 봅니다.
 3. 저장 폴더와 MCP 이름을 채우고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
-4. 생성이 끝나면 아래 강의 A의 **자동 연결 명령 한 줄**을 실행합니다.
+4. 생성이 끝나면 아래 강의 A에서 **JSON 복사 → 구성 편집 → 파일 전체 붙여 넣기**를
+   순서대로 진행합니다.
 
 > [!TIP]
 > 저장 경로와 서버 이름이 회색 또는 흰색 빈칸처럼 보이는 것은 공개용 비식별 처리입니다.
@@ -403,539 +409,371 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 
 ## 강의 A: Claude Desktop 로컬 STDIO 연결
 
-STDIO 연결에서는 Claude Desktop이 내 PC의 Python 서버를 자식 프로세스로 실행합니다.
-그래서 웹 주소가 없어도 되지만, 생성된 Python 경로·인자·환경변수가 정확해야 합니다.
-Claude Desktop이 어느 폴더에서 시작되더라도 동작하도록 생성 설정은 절대경로와
-`PYTHONPATH`를 사용합니다.
-
 > [!IMPORTANT]
-> **완전 처음이면 아래 여섯 가지만 하면 됩니다.**
->
-> 1. Builder에서 **Claude Desktop → 로컬 STDIO**를 선택해 번들을 만듭니다.
-> 2. Claude Desktop을 완전히 종료합니다.
-> 3. 생성 폴더에서 PowerShell을 엽니다.
-> 4. [A-3](#a-3-자동-연결-명령-한-줄-실행)에 있는 명령 한 줄을 통째로 붙여 넣습니다.
-> 5. `Installed-config stdio verification passed`가 나오면 Claude를 다시 실행합니다.
-> 6. **설정 → 개발자 → 로컬 MCP 서버**에서 `running`을 확인하고 `search`, `fetch`를
->    한 번씩 사용합니다.
->
-> 자동 연결에 성공하면 A-4와 A-5의 JSON 편집 설명은 읽지 않아도 됩니다.
+> 이 강의에서는 명령어나 경로를 직접 만들지 않습니다. Builder에서 복사하고,
+> Claude Desktop 설정 파일에 붙여 넣은 다음 `running`만 확인합니다.
 
-### A-1. 로컬 STDIO 번들 만들기
+> [!NOTE]
+> 실제 캡처에서는 계정 이름, 이메일, 최근 대화, 로컬 절대경로, 서버 이름과 ID처럼
+> 공개하면 안 되는 글자만 주변과 같은 색으로 가렸습니다.
+> 가려진 빈칸을 비워 두라는 뜻은 아닙니다.
+> Windows 작업표시줄도 개인정보 노출을 막기 위해 제거했습니다.
 
-1. `④ MCP 생성·AI 연결`에서 앱으로 **Claude Desktop**을 선택합니다.
-2. 연결 방식으로 **로컬 STDIO**를 선택합니다.
-3. 알아보기 쉬운 MCP 이름을 입력합니다.
-4. 저장 폴더를 선택합니다. 처음에는 짧고 이동하지 않을 폴더가 좋습니다.
-5. `MCP로 쓸 파일 묶음 만들기`를 누릅니다.
-6. 완료될 때까지 앱과 PowerShell 창을 닫지 않습니다.
+### A-1. Builder에서 Claude Desktop 번들 만들기
 
-![PR MCP Builder에서 승인과 색인을 마치고 Claude Desktop용 로컬 STDIO 번들을 생성하는 순서](docs/assets/readme-claude-mcp-01-bundle.svg)
+1. Builder의 `④ MCP 생성·AI 연결` 화면까지 내려갑니다.
+2. **연결할 AI 앱**에서 `Claude Desktop`을 누릅니다.
+3. **로컬 STDIO**가 선택되었는지 확인합니다.
+4. 저장할 폴더와 MCP 이름을 입력합니다.
+5. 빨간 **MCP로 쓸 파일 묶음 만들기** 버튼을 누릅니다.
+6. 파란 진행 막대가 `100%`가 되고 **MCP 파일 묶음 생성 완료**가 보일 때까지 기다립니다.
 
-생성 폴더에는 최소한 다음 항목이 있어야 합니다.
+![Builder에서 Claude Desktop 로컬 STDIO를 선택하는 실제 화면](docs/assets/readme-course-00d-builder-claude-selection.png)
 
-- `claude_desktop_config.json`: Claude Desktop에 합칠 설정
-- `data\`: 사람이 승인한 검색 데이터
-- `run_mcp_stdio_server.ps1`: 직접 Python 실행이 불가능할 때의 fallback 실행 파일
-- `doctor_mcp_connection.ps1`: Python·프로젝트·import 상태 진단
-- `validate_mcp_smoke.ps1`: 실제 MCP 통신 검사
-- `mcp_config.bundle.json`: 번들 전체 연결 계약
+### A-2. Builder에서 JSON 복사하기
 
-![로컬 STDIO 번들 폴더에서 확인할 파일을 표시한 설명용 화면](docs/assets/readme-course-01-stdio-bundle.png)
+1. 생성 완료 화면을 아래로 내립니다.
+2. **Claude Desktop에 등록하는 방법**을 찾습니다.
+3. 먼저 보이는 **생성된 설정 파일 경로 복사**와 **Claude Desktop 설정 위치**는
+   경로 확인용입니다. 이 두 상자의 복사 아이콘은 누르지 않습니다.
+4. 제목이 정확히
+   **처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**를 찾습니다.
+5. 그 제목 바로 아래 코드 상자 오른쪽 위 **복사 아이콘**을 한 번 누릅니다.
+6. 복사한 내용은 수정하지 않습니다. 서버 이름, Python 경로, `args`, `env`가 모두
+   들어 있습니다.
 
-`data`만 따로 옮기면 설정의 절대경로와 달라져 실행되지 않습니다. 폴더를 옮겨야 한다면
-경로를 손으로 고치기보다 새 위치에서 번들을 다시 생성하세요.
+> 아래 캡처는 이전 버전 Builder 화면이라 같은 상자의 제목이
+> **병합할 `mcpServers` JSON 복사**로 보일 수 있습니다. 처음 연결이라면 그 상자 전체를
+> 복사하면 됩니다. 현재 Builder에서는
+> **처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**로 표시됩니다.
 
-### A-2. Builder에서 복사 버튼 찾기
+![Builder에서 Claude Desktop용 JSON을 복사하는 실제 화면](docs/assets/readme-course-04b-builder-claude-direct-config.png)
 
-자동 연결을 사용할 때는 이 값을 직접 복사할 필요가 없습니다. A-3의 명령이 설정 백업과
-병합을 대신합니다. **자동 연결이 실패했을 때만** 아래 복사 버튼을 사용합니다.
+스크린샷에서 개인정보 보호를 위해 가린 서버 이름과 경로를 직접 입력하지 마세요.
+**내 Builder 화면의 복사 아이콘으로 가져온 값만 사용합니다.**
 
-1. 번들 생성 완료 화면에서 **Claude Desktop에 등록하는 방법**까지 내려갑니다.
-2. **병합할 `mcpServers` JSON 복사** 제목을 찾습니다.
-3. 바로 아래 코드 상자의 **오른쪽 위 복사 아이콘**을 누릅니다.
-4. README의 예시나 캡처 속 글자를 복사하지 않습니다. 내 Builder 화면의 복사 버튼만
-   사용합니다.
+### A-3. Claude Desktop 설정 파일 열기
 
-![PR MCP Builder에서 Claude Desktop용 병합 JSON의 복사 위치를 보여 주는 실제 화면](docs/assets/readme-course-04b-builder-claude-direct-config.png)
+#### 1. Claude Desktop에서 설정 열기
 
-캡처에서 서버 이름과 경로가 빈칸처럼 보이는 것은 공개용 비식별 처리입니다. 실제 Builder
-화면에서는 서버 이름, Python 경로, data 경로와 `env`가 이미 완성되어 있습니다. 빈칸을
-직접 채우거나 경로를 다시 타이핑하지 마세요.
+1. 설치된 **Claude Desktop 앱**을 엽니다.
+2. 왼쪽 아래 **프로필 영역**을 누릅니다.
+3. 열린 메뉴에서 톱니바퀴 모양 **설정**을 누릅니다.
 
-<details>
-<summary>생성된 실행 설정이 정상인지 확인하는 고급 정보</summary>
+![Claude Desktop 왼쪽 아래에서 설정을 여는 실제 화면](docs/assets/readme-course-02-claude-settings-menu.png)
 
-- 프로젝트 소스 직접 실행이면 `command`가 절대 `...\python.exe` 경로입니다.
-- `args`의 첫 두 항목은 `-m`, `scripts.run_regulation_mcp`입니다.
-- `env`에는 프로젝트 절대경로인 `PYTHONPATH`와 `"1"`인 `PYTHONSAFEPATH`가 있습니다.
-- 독립 ZIP이나 설치된 wheel 환경에서는 `command`가 `powershell.exe`일 수 있습니다.
-  이 경우도 정상 fallback이므로 생성 값을 Python 예시로 바꾸지 않습니다.
-- Windows 경로가 JSON에서 `\\`로 보이는 것은 정상입니다.
-- 현재 Claude Desktop에서 필수가 아닌 `"type": "stdio"`는 생략될 수 있습니다.
+#### 2. 구성 편집 누르기
 
-</details>
+1. 설정 창 왼쪽 메뉴를 아래로 내립니다.
+2. `데스크톱 앱` 아래의 **개발자**를 누릅니다.
+3. 오른쪽 **로컬 MCP 서버** 화면에서 **구성 편집**을 누릅니다.
 
-### A-3. 자동 연결 명령 한 줄 실행
+클릭 경로는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**입니다.
 
-이 방법에서는 JSON 파일을 열거나 서버 이름, `command`, `args`, `env`를 직접 복사하지
-않습니다.
+![Claude Desktop 개발자 화면에서 구성 편집을 누르는 실제 화면](docs/assets/readme-course-02c-claude-developer-config-edit.png)
 
-1. Claude Desktop을 완전히 종료합니다.
-2. 파일 탐색기에서 방금 만든 **번들 폴더**를 엽니다.
-3. 탐색기 위쪽 주소 표시줄을 한 번 누르고 `powershell`이라고 입력한 뒤 `Enter`를
-   누릅니다.
-4. 열린 파란색 PowerShell 창에 아래 **한 줄 전체**를 복사해 붙여 넣고 `Enter`를
-   누릅니다.
+#### 3. 설정 파일 열기
+
+1. Windows 파일 탐색기가 열리면 가운데에서
+   **`claude_desktop_config`** 파일을 찾습니다.
+2. 파일을 두 번 클릭합니다.
+3. 어떤 앱으로 열지 묻는다면 **메모장** 또는 **Visual Studio Code**를 선택합니다.
+
+![파일 탐색기에서 claude_desktop_config 파일을 여는 실제 화면](docs/assets/readme-course-02d-claude-config-file-explorer.png)
+
+파일 확장명이 숨겨진 Windows에서는 `.json`이 보이지 않을 수 있습니다.
+파일 종류가 **JSON 원본 파일**이면 맞습니다.
+
+### A-4. JSON 붙여 넣고 저장하기
+
+처음 설치해 설정 파일이 비어 있거나 `{}`만 보이는 경우입니다.
+
+1. 열린 설정 파일 안을 한 번 클릭합니다.
+2. 키보드에서 `Ctrl+A`를 눌러 기존 내용을 모두 선택합니다.
+3. `Ctrl+V`를 눌러 A-2에서 복사한 JSON을 붙여 넣습니다.
+4. `Ctrl+S`를 눌러 저장합니다.
+5. 편집기를 닫습니다.
+
+> **붙여 넣을 위치는 파일 전체입니다.** `{}` 안쪽에 넣는 것이 아닙니다.
+> `{}`가 보이면 `Ctrl+A`로 `{}`까지 선택한 뒤 복사한 전체 JSON으로 바꿉니다.
+
+![Claude Desktop 설정 파일 전체에 Builder JSON을 붙여 넣는 실제 화면](docs/assets/readme-course-07-claude-config-editor.png)
+
+스크린샷의 서버 이름, 경로, profile ID는 공개용으로 가렸고 Windows 작업표시줄도
+제거했습니다. 빈칸을 따라 입력하지 말고 A-2에서 복사한 JSON을 그대로 붙여 넣습니다.
+
+파일 안에 다른 서버나 `preferences`가 이미 있었다면 덮어쓰지 마세요. 저장하지 말고
+닫은 뒤 [A-8](#a-8-기존-설정이-있을-때-병합하기)로 내려갑니다.
+
+### A-5. Claude Desktop 완전히 종료하고 다시 열기
+
+1. Claude Desktop 창 오른쪽 위 `X`를 누릅니다.
+2. Windows 화면 오른쪽 아래의 `^` **숨겨진 아이콘 표시**를 누릅니다.
+3. Claude 아이콘을 마우스 오른쪽 버튼으로 누릅니다.
+4. **종료(Quit)**를 누릅니다.
+5. Claude Desktop을 다시 실행합니다.
+
+창만 닫으면 이전 설정이 남을 수 있으므로 **종료(Quit)**까지 해야 합니다.
+
+### A-6. `running` 확인하기
+
+1. Claude Desktop 왼쪽 아래 **프로필**을 누릅니다.
+2. **설정**을 누릅니다.
+3. 왼쪽의 **개발자**를 누릅니다.
+4. **로컬 MCP 서버**에서 방금 만든 서버 이름을 누릅니다.
+5. 서버 이름 옆 파란 배지가 **`running`**인지 확인합니다.
+
+![Claude Desktop 로컬 MCP 서버에서 running을 확인하는 실제 화면](docs/assets/readme-course-02b-claude-local-mcp-server.png)
+
+이 화면에서는 다음 세 곳만 보면 됩니다.
+
+1. 서버 이름 옆에 **`running`**
+2. 가운데에 **명령어**와 **인수**
+3. 아래에 **로그 보기**
+
+`running`이 보이면 서버 실행까지 성공한 것입니다.
+
+### A-7. `search`와 `fetch` 확인하기
+
+1. Claude Desktop 설정 창을 닫습니다.
+2. **새 대화**를 엽니다.
+3. 아래 두 줄을 통째로 복사해 대화창에 붙여 넣고 전송합니다.
+
+```text
+연결한 규정 MCP의 search 도구로 복무를 검색해 줘.
+첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여 줘.
+```
+
+아래 세 가지가 모두 보이면 연결 완료입니다.
+
+1. 설정 화면의 서버 상태가 `running`
+2. 대화에서 `search` 도구가 호출됨
+3. 첫 검색 결과를 `fetch`로 열어 본문과 출처가 표시됨
+
+### A-8. 기존 설정이 있을 때 병합하기
+
+`claude_desktop_config.json`에 다른 서버나 `preferences`가 이미 있으면
+`Ctrl+A`로 지우면 안 됩니다. 가장 쉬운 방법은 자동 병합입니다.
+
+1. Claude Desktop을 **종료(Quit)**합니다.
+2. 파일 탐색기에서 Builder가 만든 **번들 폴더**를 엽니다.
+3. 탐색기 위쪽 주소 표시줄을 클릭합니다.
+4. `powershell`이라고 입력하고 `Enter`를 누릅니다.
+5. 열린 PowerShell에 아래 한 줄 전체를 붙여 넣고 `Enter`를 누릅니다.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\connect_mcp_client.ps1" -InstallPackage -Target claude-desktop -InstallClaudeDesktop
 ```
 
-5. 검사가 끝날 때까지 PowerShell 창을 닫지 않습니다.
-6. `Installed-config stdio verification passed`가 보이는지 확인합니다.
-7. 이어서 `CLAUDE DESKTOP VERIFICATION REQUIRED`가 나와도 정상입니다. Claude 앱을
-   다시 시작해 최종 확인하라는 뜻입니다.
-8. 성공했다면 **A-4와 A-5는 건너뛰고 [A-6](#a-6-저장하고-claude-desktop을-완전히-다시-시작)으로
-   이동합니다.**
-
-이 명령은 다음 작업을 자동으로 처리합니다.
-
-- 기존 `claude_desktop_config.json`을 `claude_desktop_config.json.bak-...`로 백업
-- 기존 다른 MCP 서버와 `preferences` 보존
-- 이번에 만든 서버 한 개만 병합
-- Python·프로젝트·import 및 실제 STDIO 통신 검사
-- 실패하면 기존 설정 복원
-
-> [!TIP]
-> `connect_mcp_client.ps1`을 찾을 수 없다는 오류가 나오면 PowerShell을 번들 폴더가 아닌
-> 다른 폴더에서 연 것입니다. 창을 닫고 2번부터 다시 하세요. 관리자 권한은 일반적으로
-> 필요하지 않습니다.
-
-### A-4. 자동 연결이 안 될 때 Claude Desktop 설정 파일 열기
-
-A-4와 A-5는 A-3에서 `Installed-config stdio verification passed`가 나오지 않았을
-때만 사용합니다. 여기서는 아직 JSON을 수정하지 않고 **Claude가 실제로 읽는 파일을
-여는 것까지만** 합니다.
-
-해야 할 일은 다음 다섯 번의 클릭입니다.
-
-1. Claude Desktop 왼쪽 아래 **프로필**
-2. **설정**
-3. 왼쪽 메뉴의 **개발자**
-4. 오른쪽의 **구성 편집**
-5. 열린 폴더의 **`claude_desktop_config`** 파일
-
-#### 1단계 — Claude Desktop의 설정 메뉴 열기
-
-1. **Claude 웹사이트가 아니라 설치된 Claude Desktop 앱**을 실행합니다.
-2. Claude 창 왼쪽 아래에서 내 이름이나 프로필 아이콘이 보이는 영역을 한 번 누릅니다.
-3. 작은 메뉴가 열리면 톱니바퀴 아이콘이 있는 **설정(Settings)**을 누릅니다.
-4. **설정**, **언어**, **도움 받기** 같은 항목이 보이면 올바른 메뉴를 연 것입니다.
-
-> [!NOTE]
-> 아래부터 나오는 실제 앱 캡처는 메뉴·버튼·입력 칸·상태 표시는 원본 그대로 두고,
-> 계정 이름, 이메일, 최근 대화, 로컬 절대경로, 서버 이름과 profile ID처럼 공개하면 안
-> 되는 글자 부분만 주변 배경색으로 지웠습니다. 가려진 빈칸을 비워 두라는 뜻은 아닙니다.
-
-#### 실제 화면 1 — Claude Desktop에서 설정 열기
-
-1. Claude Desktop 왼쪽 아래의 프로필 영역을 누릅니다.
-2. 열린 메뉴에서 톱니바퀴 아이콘이 있는 **설정** 행을 누릅니다.
-3. 아래 캡처처럼 **설정**, **언어**, **도움 받기** 등이 보이면 올바른 메뉴입니다.
-
-![Claude Desktop 홈 화면 왼쪽 아래 프로필 메뉴에서 설정 행을 여는 실제 예시](docs/assets/readme-course-02-claude-settings-menu.png)
-
-캡처에서 이름과 이메일은 가렸지만 **설정** 행은 그대로 보입니다. 이 행을 누릅니다.
-
-#### 2단계 — 개발자 화면에서 구성 편집 누르기
-
-1. 설정 창의 **왼쪽 메뉴를 아래로 내려** `데스크톱 앱` 묶음을 찾습니다.
-2. 스패너 아이콘이 붙은 **개발자(Developer)**를 누릅니다.
-3. 오른쪽 화면 위쪽에 **로컬 MCP 서버**라는 제목이 나오는지 확인합니다.
-4. 제목 아래의 **구성 편집(Edit Config)** 버튼을 한 번 누릅니다.
-5. Windows 파일 탐색기나 JSON 편집기가 열릴 때까지 잠시 기다립니다.
-
-#### 실제 화면 2 — 개발자에서 구성 편집 누르기
-
-![Claude Desktop 설정의 개발자 화면에서 로컬 MCP 서버 구성 편집 버튼을 누르는 실제 예시](docs/assets/readme-course-02c-claude-developer-config-edit.png)
-
-이 화면에서 확인할 곳을 한 줄씩 짚으면 다음과 같습니다.
-
-- **왼쪽에서 누를 곳:** `개발자`
-- **오른쪽에서 확인할 제목:** `로컬 MCP 서버`
-- **마지막으로 누를 버튼:** `구성 편집`
-- **버튼을 누른 다음 정상 동작:** 파일 탐색기의 Claude 폴더 또는 JSON 편집기가 열림
-- **이 단계에서 누르지 않을 곳:** `커넥터`, `플러그인`, `확장 프로그램`
-
-이 단계에서 일반 **커넥터(Connectors)** 메뉴를 열면 안 됩니다. 그 메뉴는 강의 B의
-Vercel 같은 원격 HTTPS 서버용입니다.
-
-Claude Desktop 로컬 STDIO Config에는 Vercel 주소만 단독으로 넣지 않습니다. 반대로
-원격 **Connectors** 화면에는 이 JSON을 넣지 않습니다.
-
-#### 3단계 — 파일 탐색기에서 정확한 JSON 파일 찾기
-
-Claude Desktop 버전에 따라 **구성 편집**을 눌렀을 때 JSON 파일이 바로 열리기도 하고,
-아래처럼 파일이 들어 있는 폴더만 열리기도 합니다. 폴더가 열리면 다음 순서로 진행합니다.
-
-1. 탐색기 위쪽 주소 표시줄에
-   **`사용자 > 내 Windows 사용자 폴더 > AppData > Roaming > Claude`**가 보이는지
-   확인합니다.
-2. 가운데 파일 목록에서 **`claude_desktop_config`**를 찾습니다.
-3. Windows가 확장자를 숨기고 있으면 화면에는 `.json`이 보이지 않습니다. 이 경우에도
-   파일 종류가 **JSON 원본 파일**이면 정확한 파일입니다.
-4. 확실히 확인하려면 탐색기 위쪽의
-   **보기 > 표시 > 파일 확장명**을 차례로 눌러 확장자를 표시합니다.
-5. 전체 이름이 **`claude_desktop_config.json`**인지 확인합니다.
-6. 파일을 두 번 클릭합니다. 앱 선택 창이 나오면 **메모장**이나 **Visual Studio Code**를
-   선택합니다.
-7. `logs`, `GPUCache`, `Local Storage`, `buddy-tokens` 같은 다른 파일이나 폴더는
-   MCP 설정 파일이 아니므로 건드리지 않습니다.
-
-#### 실제 화면 3 — Claude 설정 파일 찾기
-
-![Windows 파일 탐색기의 AppData Roaming Claude 폴더에서 claude_desktop_config JSON 파일을 찾는 실제 예시](docs/assets/readme-course-02d-claude-config-file-explorer.png)
-
-이 캡처에서는 개인정보 보호를 위해 Windows 사용자명, 개인 바로가기, 관련 없는 폴더명,
-날짜와 절대경로를 같은 배경색으로 가렸습니다. 실제로 찾아야 할 것은 가운데 파란색으로
-선택된 **`claude_desktop_config`** 파일 하나입니다.
-
-> [!WARNING]
-> 파일 이름이 `claude_desktop_config.json.txt`라면 잘못 만든 텍스트 파일입니다.
-> **보기 > 표시 > 파일 확장명**을 켠 뒤 끝의 `.txt`를 제거해야 합니다. 이름이 비슷한
-> 파일을 새로 만들기보다, 가능하면 A-3의 자동 연결 마법사가 만든 파일을 사용하세요.
-
-메뉴를 찾을 수 없거나 **구성 편집** 버튼을 눌러도 아무 반응이 없다면 다음 우회 방법을
-사용합니다.
-
-1. 키보드에서 `Win + R`을 누릅니다.
-2. 실행 창에 아래 **폴더 경로**를 그대로 붙여 넣고 `Enter`를 누릅니다.
-
-   ```text
-   %APPDATA%\Claude
-   ```
-
-3. 열린 폴더에서 `claude_desktop_config.json`을 찾습니다.
-4. 파일이 없다면 Claude Desktop을 한 번 실행하고 완전히 종료한 뒤 A-3 자동 연결
-   마법사를 다시 실행합니다.
-
-한글 메뉴의 전체 경로는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**, 영문 메뉴는
-**Settings > Developer > Local MCP servers > Edit Config**입니다.
-
-### A-5. 복사해서 넣기 — Claude 설정 파일이 비어 있을 때만
-
-먼저 A-4에서 연 `%APPDATA%\Claude\claude_desktop_config.json`의 내용을 봅니다.
-
-#### 파일이 비어 있거나 `{}`만 보이면
-
-1. Builder 완료 화면의 **병합할 `mcpServers` JSON 복사** 코드 상자 오른쪽 위에 있는
-   **복사 아이콘**을 누릅니다.
-2. Builder를 이미 닫았다면 번들 폴더의 `claude_desktop_config.json`을 열고
-   `Ctrl+A`, `Ctrl+C`를 누릅니다.
-3. Claude 설정 파일 창을 누릅니다.
-4. `Ctrl+A`를 눌러 빈 내용을 선택합니다.
-5. `Ctrl+V`로 붙여 넣습니다.
-6. `Ctrl+S`로 저장합니다.
-
-여기서는 서버 이름이나 경로를 입력하지 않습니다. **복사 → 붙여넣기 → 저장**만 합니다.
-
-#### 다른 서버나 `preferences`가 이미 보이면
-
-`Ctrl+A`를 누르거나 파일 전체를 붙여 넣으면 안 됩니다. 기존 설정을 지울 수 있습니다.
-
-1. 편집기를 **저장하지 않고 닫습니다.**
-2. [A-3 자동 연결 명령](#a-3-자동-연결-명령-한-줄-실행)을 다시 실행합니다.
-3. 자동 연결은 기존 내용을 남기고 이번 서버만 추가합니다.
-4. 자동 연결이 다시 실패하면 JSON을 억지로 편집하지 말고
-   [A-7 진단](#a-7-번들-자체를-먼저-진단하는-방법)을 실행합니다.
-
-#### 실제 화면 4 — 붙여 넣을 Claude 설정 파일
-
-![Claude Desktop 설정 파일에서 mcpServers JSON을 확인하는 실제 예시](docs/assets/readme-course-07-claude-config-editor.png)
-
-캡처의 경로, 서버 이름과 인자는 공개용으로 가렸습니다. Windows 작업표시줄도 제거했습니다.
-이 이미지의 빈칸이나 `--redacted--` 글자를 입력하지 말고, 내 Builder의 복사 버튼으로
-가져온 실제 JSON만 붙여 넣습니다.
-
-#### 저장한 JSON 문법 확인하기
-
-1. Windows 시작 메뉴에서 **PowerShell**을 검색해 엽니다.
-2. 아래 명령 전체를 붙여 넣고 `Enter`를 누릅니다.
-
-   ```powershell
-   try {
-     Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw |
-       ConvertFrom-Json -ErrorAction Stop | Out-Null
-     Write-Host "JSON syntax OK"
-   } catch {
-     Write-Error "JSON syntax error: $($_.Exception.Message)"
-   }
-   ```
-
-3. 빨간 오류 없이 `JSON syntax OK`가 나오면 저장 형식은 정상입니다.
-4. 빨간 오류가 나오면 저장한 파일을 닫고 최신
-   `claude_desktop_config.json.bak-...` 백업으로 되돌립니다.
-
-<details>
-<summary>기존 설정에 직접 수동 병합해야 하는 고급 사용자만 펼치기</summary>
-
-생성 번들의 `claude_desktop_config.json`에는 `mcpServers` 아래 서버가 정확히 한 개
-들어 있습니다. 그 서버 이름 줄부터 해당 서버 객체가 끝나는 `}`까지 통째로 복사해,
-Claude 설정 파일의 기존 `mcpServers` 안에 붙입니다.
-
-- 기존 다른 서버와 `preferences`는 삭제하지 않습니다.
-- 두 서버 항목 사이에는 쉼표가 하나 있어야 합니다.
-- 마지막 서버 뒤에는 쉼표를 넣지 않습니다.
-- `command`, `args`, `env` 안 값은 한 글자도 바꾸지 않습니다.
-- Windows 경로의 `\\`도 그대로 둡니다.
-
-![기존 preferences와 MCP 서버를 보존하고 새 서버 항목만 병합하는 방법](docs/assets/readme-claude-mcp-02-config.svg)
-
-</details>
-
-### A-6. 저장하고 Claude Desktop을 완전히 다시 시작
-
-#### 1단계 — Claude를 창만 닫지 말고 완전히 종료하기
-
-1. A-5에서 수동으로 붙여 넣었다면 편집기에서 `Ctrl+S`를 누릅니다. A-3 자동 연결을
-   사용했다면 이 단계는 건너뜁니다.
-2. Claude가 열려 있으면 창 오른쪽 위 `X`를 눌러 닫습니다.
-3. Windows 작업 표시줄 오른쪽 끝의 `^` **숨겨진 아이콘 표시**를 누릅니다.
-4. Claude 아이콘을 마우스 오른쪽 버튼으로 누르고 **종료(Quit)**를 선택합니다.
-5. `Ctrl+Shift+Esc`로 작업 관리자를 열어 Claude가 남아 있지 않은지 확인합니다.
-6. 10초가 지나도 남아 있으면 작업 관리자에서 Claude를 선택하고
-   **작업 끝내기**를 누릅니다.
-7. Claude 프로세스가 사라진 것을 확인한 뒤 앱을 다시 실행합니다.
-
-설정 파일은 앱 시작 때 다시 읽히므로, 창만 닫았다가 여는 것으로는 변경 내용이 반영되지
-않을 수 있습니다.
-
-#### 2단계 — 로컬 MCP 서버가 `running`인지 확인하기
-
-1. 왼쪽 아래 프로필을 눌러 **설정**을 엽니다.
-2. **개발자 > 로컬 MCP 서버**로 이동합니다.
-3. 방금 추가한 서버 이름을 왼쪽 목록에서 누릅니다.
-4. 서버 이름 옆에 파란색 **`running`** 배지가 있는지 확인합니다.
-5. 가운데에 **명령어**, **인수**, **로그 보기**가 보이면 서버 상세 화면을 제대로 연
-   것입니다.
-
-#### 실제 화면 5 — `running` 확인
-
-아래 캡처에서 봐야 할 핵심은 파란색 **`running`** 배지입니다. 서버 이름, Python 절대경로,
-data 경로와 profile ID는 공개용으로 지웠지만 **로컬 MCP 서버**, **명령어**, **인수**,
-**로그 보기**와 `running` 표시는 원본 그대로입니다.
-
-![Claude Desktop 설정의 개발자 로컬 MCP 서버 화면에서 running 상태를 확인하는 실제 예시](docs/assets/readme-course-02b-claude-local-mcp-server.png)
-
-이 화면에서 `running`이어도 마지막 확인은 끝나지 않았습니다. 새 대화에서 실제로
-`search`와 `fetch`를 한 번씩 호출해야 데이터까지 정상 연결된 것입니다.
-
-이 캡처에서 초보자가 꼭 볼 항목은 세 가지입니다.
-
-- 서버 이름 옆 파란 배지가 **`running`** 인지
-- 가운데 본문에 **명령어**, **인수** 제목이 보이는지
-- 아래쪽에 **로그 보기** 버튼이 있는지
-
-`disconnected`라면 다음 단계로 넘어가지 말고 [문제 해결표](#4-문제-해결표)를
-확인합니다.
-
-성공과 실패를 아주 단순하게 구분하면 아래와 같습니다.
-
-- 성공: 서버 이름이 보이고 상태가 `running`이며 도구 목록에 `search`, `fetch`가 나타남
-- 실패: `disconnected`, `failed`, 서버가 전혀 안 보임, 도구가 0개임
-- 실패 시 첫 조치: Claude를 다시 종료 후 실행하고 `doctor_mcp_connection.ps1`와 `validate_mcp_smoke.ps1`를 순서대로 실행
-
-#### 3단계 — `search`와 `fetch`를 실제로 한 번씩 사용하기
-
-1. Claude에서 **새 대화**를 엽니다.
-2. 먼저 다음처럼 요청합니다.
-
-   ```text
-   연결된 MCP 도구 목록을 확인하고 search와 fetch가 보이는지 알려줘.
-   ```
-
-3. `search`가 보이면 실제 규정에 포함된 단어를 넣어 다음처럼 요청합니다.
-
-   ```text
-   search 도구로 "복무"를 검색해 줘.
-   ```
-
-4. 검색 결과에 문서 ID나 결과 ID가 나오면 그 값을 사용해 다음처럼 요청합니다.
-
-   ```text
-   방금 검색 결과의 첫 번째 ID를 fetch 도구로 열어 줘.
-   ```
-
-5. 규정 제목, 조문 또는 본문이 반환되면 연결이 끝난 것입니다.
-
-최종 성공 기준은 세 항목이 **모두** 충족되는 것입니다.
-
-- 설정 화면에서 서버 상태가 `running`
-- 새 대화의 도구 목록에 `search`와 `fetch`가 노출됨
-- `search` 결과를 받은 뒤 그 결과를 `fetch`로 열 수 있음
-
-### A-7. 번들 자체를 먼저 진단하는 방법
-
-Claude 화면에서 이유를 찾기 어렵다면 생성 번들 폴더를 파일 탐색기로 열고, 주소 표시줄에
-`powershell`을 입력해 Enter를 누릅니다. 열린 PowerShell에서 실행합니다.
+6. 명령이 끝나면 Claude Desktop을 다시 실행합니다.
+7. A-6으로 돌아가 `running`을 확인합니다.
+
+직접 붙여 넣기를 원한다면 Builder의 두 번째 상자인
+**기존 서버가 있을 때: `mcpServers` 안에 넣을 새 서버 한 항목 복사**를 사용합니다.
+이 상자는 기존 파일의 `"mcpServers": { ... }` 중괄호 안에만 추가합니다. JSON 쉼표가
+헷갈리면 직접 편집하지 말고 위 자동 병합을 사용하세요.
+
+### A-9. `disconnected`일 때 진단하기
+
+1. Builder가 만든 번들 폴더를 엽니다.
+2. 탐색기 위쪽 주소 표시줄에 `powershell`을 입력하고 `Enter`를 누릅니다.
+3. 아래 첫 줄을 실행하고, 끝나면 둘째 줄을 실행합니다.
 
 ```powershell
 .\doctor_mcp_connection.ps1
 .\validate_mcp_smoke.ps1
 ```
 
-첫 명령은 Python 파일 존재 여부만 보지 않고 다음 원인을 구분합니다.
+첫 명령은 Python·프로젝트·import 오류를 정확히 표시합니다. 둘째 명령은
+`initialize` → `tools/list` → `search` → `fetch`까지 실제 STDIO 연결을 확인합니다.
 
-- Python 실행 파일이 없음
-- Python 3.11 미만
-- 프로젝트 루트를 찾지 못함
-- `scripts.run_regulation_mcp` import 실패
-- 필수 의존성 import 실패
-- runtime marker 검증 실패
-- 기록된 runtime Python 경로가 유효하지 않음
+## ChatGPT Desktop 로컬 STDIO 연결
 
-진단은 MCP 프로토콜 stdout을 오염시키지 않도록 stderr에 표시됩니다. `validate`는
-`initialize` → `tools/list` → `search` → `fetch` 순서의 STDIO 통신을 검사합니다.
+> [!IMPORTANT]
+> ChatGPT의 **인자**는 여러 줄을 한 칸에 붙여 넣는 것이 아닙니다.
+> Builder의 `Argument 1`을 첫 번째 칸에 넣고, **+ 인자 추가**를 눌러
+> `Argument 2`를 두 번째 칸에 넣습니다. 마지막 번호까지 한 줄씩 반복합니다.
 
-## ChatGPT/Codex Desktop과 CLI에 로컬 연결하기
+### C-1. Builder에서 ChatGPT Desktop 번들 만들기
 
-### ChatGPT/Codex Desktop
+1. Builder의 `④ MCP 생성·AI 연결` 화면까지 내려갑니다.
+2. **연결할 AI 앱**에서
+   `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)`을 누릅니다.
+3. **로컬 STDIO**가 선택되었는지 확인합니다.
+4. 저장할 폴더와 MCP 이름을 입력합니다.
+5. 빨간 **MCP로 쓸 파일 묶음 만들기** 버튼을 누릅니다.
+6. `100%`와 **MCP 파일 묶음 생성 완료**가 보일 때까지 기다립니다.
 
-생성 완료 화면의 **ChatGPT/Codex Desktop에 등록하는 방법** 또는 번들의
-`chatgpt_desktop_local_mcp.json`을 엽니다. 앱 버전에 따라 **플러그인(Plugins) >
-MCP 서버 추가** 또는 **Settings > MCP servers > Add server**를 엽니다.
+![Builder에서 ChatGPT Desktop 로컬 STDIO를 선택하는 실제 화면](docs/assets/readme-course-00c-builder-chatgpt-stdio-selection.png)
 
-#### Builder의 실제 ChatGPT STDIO 결과에서 복사할 값 찾기
+### C-2. Builder에서 복사할 값 찾기
 
-아래는 ChatGPT Desktop/Codex 공용 설정으로 번들을 만든 직후 Builder가 보여 주는 실제
-STDIO 결과입니다. 재생성 해시, 서버 이름, wrapper 경로, data 경로, profile ID와 `cwd`는
-공개용으로 지웠습니다.
+1. 생성 완료 화면을 아래로 내립니다.
+2. **ChatGPT/Codex Desktop에 등록하는 방법**을 찾습니다.
+3. 아래 순서로 값이 나오는지 확인합니다.
+
+```text
+Name 복사 상자
+Transport: STDIO 표시
+Command 복사 상자
+Argument 1부터 마지막 번호까지 각각의 복사 상자
+Environment 키·값 복사 상자
+Environment passthrough 복사 상자
+Working directory 복사 상자
+```
+
+4. `Transport: STDIO`는 복사 상자가 아닙니다. C-3에서 ChatGPT의 **STDIO** 버튼을
+   누르면 됩니다.
+5. 화면은 닫지 않습니다. 다음 단계에서 나머지 코드 상자를 하나씩 복사합니다.
 
 ![PR MCP Builder의 ChatGPT Desktop STDIO 생성 결과에서 powershell.exe, args, cwd와 env를 확인하는 실제 화면](docs/assets/readme-course-01b-builder-chatgpt-stdio-output.png)
 
-초보자는 코드 블록을 다음처럼 읽으면 됩니다.
+이 캡처는 생성 결과가 나타나는 위치를 보여 주는 이전 버전 화면입니다. 현재 Builder는
+한 개의 긴 JSON 대신 `Name`, `Command`, `Argument 1/17`, `Argument 2/17`처럼
+각 값을 별도 복사 상자로 보여 줍니다. **긴 JSON을 해석하지 말고 현재 화면의 개별 복사
+상자를 사용하세요.**
 
-1. `"transport": "STDIO"`이면 URL 연결이 아니라 내 PC에서 실행하는 로컬 연결입니다.
-2. `"command": "powershell.exe"`이면 ChatGPT의 **실행 명령** 칸에는
-   `powershell.exe` 한 값만 넣습니다.
-3. `"args"`의 대괄호 안 값은 위에서 아래로 **한 항목씩 별도 인자 칸**에 넣습니다.
-4. 이미지에서 `-File`, `--data-dir`, `--profile-id` 다음에 비어 보이는 줄에는 실제
-   생성 경로와 ID가 들어 있습니다. 스크린샷의 빈칸을 그대로 따라 하지 않습니다.
-5. `"cwd"`와 `"env"`도 생성된 값이 있을 때만 해당 설정 칸에 그대로 옮깁니다.
-6. 가장 안전한 복사 원본은 화면을 눈으로 다시 타이핑한 값이 아니라 번들의
-   `chatgpt_desktop_local_mcp.json` 안 `ui_fields`입니다.
+스크린샷에서 가린 서버 이름과 경로를 직접 입력하지 마세요. 내 Builder 화면에는 실제 값이
+들어 있습니다. **각 코드 상자의 복사 아이콘을 눌러 사용합니다.**
 
-파란색 `MCP 파일 묶음 생성 완료`와 초록색 `연결 파일 묶음을 만들었습니다`는 **파일 생성
-성공**을 뜻합니다. 아직 ChatGPT Desktop 등록과 실제 `search`·`fetch` 검증은 남아 있습니다.
+### C-3. ChatGPT Desktop에서 MCP 추가 화면 열기
 
-#### 실제 화면 따라 하기
+#### 1. 플러그인 열기
 
-1. ChatGPT Desktop 왼쪽 사이드바에서 **플러그인**을 누릅니다.
-2. 가운데 위쪽에 큰 **플러그인** 제목과 플러그인 검색창이 보이면 첫 진입은 성공입니다.
+1. 설치된 **ChatGPT Desktop 앱**을 엽니다.
+2. 왼쪽 메뉴에서 **플러그인**을 누릅니다.
 
-![ChatGPT Desktop 왼쪽 사이드바에서 플러그인을 열어 플러그인 홈으로 들어가는 실제 예시](docs/assets/readme-course-06-chatgpt-plugin-home.png)
+![ChatGPT Desktop 왼쪽 메뉴에서 플러그인을 누르는 실제 화면](docs/assets/readme-course-06-chatgpt-plugin-home.png)
 
-3. 왼쪽 아래 계정 메뉴에서 **설정**을 열고, 설정 창 왼쪽의 **플러그인**을 누릅니다.
-4. 화면 위쪽의 `플러그인 / 앱 / MCP / 스킬` 탭에서 **MCP**를 누릅니다.
+#### 2. MCP 탭 열기
 
-![ChatGPT Desktop 설정의 플러그인 화면 위쪽에서 MCP 탭 위치를 찾는 실제 예시](docs/assets/readme-course-06-chatgpt-plugin-settings.png)
+1. 왼쪽 아래 계정 영역을 누릅니다.
+2. **설정**을 누릅니다.
+3. 설정 왼쪽 메뉴의 **플러그인**을 누릅니다.
+4. 화면 위쪽의 `플러그인 / 앱 / MCP / 스킬` 중 **MCP**를 누릅니다.
 
-5. `MCP` 탭으로 바뀌면 오른쪽의 **+ 서버 추가**를 누릅니다.
-6. 기존 서버 이름은 공개용 캡처에서 지웠습니다. 서버 이름이 비어 보이는 것은 입력을
-   생략하라는 뜻이 아닙니다.
+![ChatGPT Desktop 설정에서 플러그인과 MCP 탭을 여는 실제 화면](docs/assets/readme-course-06-chatgpt-plugin-settings.png)
 
-![ChatGPT Desktop MCP 탭에서 오른쪽 위의 서버 추가 버튼을 누르는 실제 예시](docs/assets/readme-course-06-chatgpt-mcp-tab.png)
+#### 3. 새 서버 추가하기
 
-7. **맞춤형 MCP에 연결** 화면에서 유형 **STDIO**를 선택합니다.
+1. MCP 화면 오른쪽 위 **+ 서버 추가**를 누릅니다.
 
-![ChatGPT Desktop 맞춤형 MCP 연결 화면에서 STDIO 이름, 실행 명령, 인수, 환경 변수와 작업 디렉터리 칸을 확인하는 실제 예시](docs/assets/readme-course-06-chatgpt-stdio-form.png)
+![ChatGPT Desktop MCP 탭에서 서버 추가를 누르는 실제 화면](docs/assets/readme-course-06-chatgpt-mcp-tab.png)
+
+2. **맞춤형 MCP에 연결** 화면에서 유형 **STDIO**를 누릅니다.
+
+![ChatGPT Desktop 맞춤형 MCP에서 STDIO를 선택한 실제 화면](docs/assets/readme-course-06-chatgpt-stdio-form.png)
 
 화면의 `openai-dev-mcp serve-sqlite`, `~/code`, `MCP server name`은 앱이 회색으로
-보여 주는 **예시 문구**입니다. 이 문자열을 복사하면 안 됩니다. 반드시 생성 번들의
-`chatgpt_desktop_local_mcp.json`에 있는 `ui_fields` 값을 사용하세요.
+보여 주는 예시입니다. 그대로 입력하지 말고 Builder의 복사 상자 값으로 바꿉니다.
 
-즉, 화면에 빈칸처럼 보이거나 예시 문구가 보이는 부분은 직접 판단해서 채우는 영역이
-아니라, 생성된 JSON의 값을 **칸 이름에 맞춰 그대로 옮겨 적는 영역**입니다.
+### C-4. Name과 Command 넣기
 
-#### 화면의 각 칸에 넣을 정확한 값
+#### Name 넣기
 
-아래 표의 오른쪽 값은 직접 추측하지 말고
-`chatgpt_desktop_local_mcp.json`의 `ui_fields`에서 복사합니다.
+1. Builder로 돌아갑니다.
+2. **Name** 아래 코드 상자의 복사 아이콘을 누릅니다.
+3. ChatGPT로 돌아옵니다.
+4. 맨 위 **이름** 칸을 클릭하고 `Ctrl+V`를 누릅니다.
 
-| 실제 화면의 설정 칸 | 넣을 값 |
-| --- | --- |
-| **이름 (Name)** | `ui_fields.name` |
-| **유형 (Transport / Type)** | `ui_fields.transport`, 즉 `STDIO` |
-| **실행 명령 (Executable / Command)** | `ui_fields.command` 한 값만. PowerShell 방식이면 `powershell.exe` |
-| **인자 (Arguments / args)** | `ui_fields.args` 배열을 **첫 항목부터 한 항목씩 같은 순서로** |
-| **환경 변수 (Environment / env)** | `ui_fields.env`의 각 키와 값. `{}`이면 비워 둠 |
-| **환경 변수 패스스루 (Environment passthrough)** | `ui_fields.env_passthrough`가 `[]`이면 비워 둠 |
-| **작업 중인 디렉터리 (Working directory / cwd)** | `ui_fields.cwd`의 전체 절대경로 |
+#### Command 넣기
 
-`인자`는 전체 명령문 한 줄을 넣는 칸이 아닙니다. 배열의 첫 값 하나를 넣고 **+ 인자 추가**를
-눌러 다음 값을 새 줄에 넣는 방식으로, 마지막 값까지 반복합니다. `환경 변수`도 키와 값을
-각각 왼쪽·오른쪽 칸에 넣습니다. 모두 입력한 뒤 오른쪽 아래 **저장**을 누릅니다.
+1. Builder의 **Command 복사** 아래 코드 상자를 복사합니다.
+2. ChatGPT의 **실행 명령** 칸을 클릭하고 `Ctrl+V`를 누릅니다.
 
-#### 실제 입력 완료 화면 — `powershell.exe` 방식
+Command 칸에는 코드 상자 안의 **한 값만** 넣습니다. 생성 결과가 `powershell.exe`라면
+`powershell.exe`만 넣습니다. 서버 이름이나 Arguments를 Command 칸에 넣지 않습니다.
 
-아래 캡처처럼 **실행 명령**에는 `powershell.exe` 하나만 들어가고, 그 아래 **인자**에는
-각 값이 한 칸에 하나씩 들어가야 합니다. 서버 이름, 번들 경로와 profile ID는 공개용으로
-지웠습니다.
+### C-5. Arguments를 한 줄씩 서로 다른 칸에 넣기
 
-![ChatGPT Desktop STDIO 설정에서 powershell.exe와 각 실행 인자를 한 칸씩 순서대로 입력한 실제 화면](docs/assets/readme-course-06b-chatgpt-stdio-filled.png)
+Builder에 `Arguments (17개)`라고 보인다면 ChatGPT에도 인자 칸이 17개 있어야 합니다.
+내 화면이 19개라고 표시되면 19칸을 만듭니다. **Builder에 표시된 숫자와 ChatGPT의
+인자 칸 수가 같아야 합니다.**
 
-캡처에서 비어 보이는 세 칸은 삭제하거나 비워 둘 칸이 아닙니다.
+#### Argument 1 넣기
 
-| 캡처에서 가린 칸 | 내 화면에 넣을 값 |
-| --- | --- |
-| `-File` 바로 다음 칸 | 생성된 `run_mcp_stdio_server.ps1`의 절대경로 |
-| `--data-dir` 바로 다음 칸 | 생성 번들 안 `data` 폴더의 절대경로 |
-| `--profile-id` 바로 다음 칸 | 생성된 profile ID |
+1. Builder의 첫 번째 제목을 찾습니다. 17개인 예시는
+   **Argument 1/17 — 아래 한 줄만 복사**로 보입니다.
+2. 바로 아래 코드 상자의 복사 아이콘을 누릅니다.
+3. ChatGPT의 첫 번째 **인자** 칸을 클릭합니다.
+4. `Ctrl+V`를 누릅니다.
 
-보이는 순서는 `-NoProfile` → `-ExecutionPolicy` → `Bypass` → `-File` → 래퍼 경로 →
-`--data-dir` → data 경로 → `--tenant-id` → tenant 값 → `--transport` → `stdio` →
-`--profile-id` → profile 값 → `--flat-storage` → `--tool-profile` → tool profile 값입니다.
-화면 아래로 더 내려가 생성된 `ui_fields.args`에 `--no-warm-cache` 같은 다음 항목이 있으면
-그것까지 추가해야 합니다. 캡처의 마지막 보이는 줄에서 임의로 끝내지 마세요.
+#### Argument 2 넣기
 
-#### Command가 powershell.exe일 때 Arguments 넣는 법
+1. ChatGPT에서 **+ 인자 추가**를 한 번 누릅니다.
+2. 두 번째 인자 칸이 생겼는지 확인합니다.
+3. Builder의 다음 제목을 찾습니다. 17개인 예시는
+   **Argument 2/17 — 아래 한 줄만 복사**로 보입니다.
+4. 바로 아래 코드 상자의 **복사 아이콘**을 누릅니다.
+5. ChatGPT의 두 번째 인자 칸을 클릭하고 `Ctrl+V`를 누릅니다.
 
-생성 파일이 PowerShell wrapper 방식을 사용한다면 **Command 칸에는
-`powershell.exe`만** 넣습니다. 아래 값은 Command 칸에 붙이지 않고 **Arguments 칸에
-각각 별도 항목으로** 넣습니다.
+#### 마지막 Argument까지 반복하기
+
+1. ChatGPT에서 **+ 인자 추가**를 한 번 누릅니다.
+2. Builder에서 다음 번호의 Argument 코드 상자 **한 줄만** 복사합니다.
+3. ChatGPT에서 새로 생긴 다음 칸에 붙여 넣습니다.
+4. Builder에서 분자가 분모와 같은 마지막 제목까지 반복합니다.
+   17개인 예시는 `Argument 17/17`이 마지막입니다.
+5. 마지막에는 **Builder에 표시된 개수 = ChatGPT의 인자 칸 개수**인지 셉니다.
+
+> **한 인자 칸에는 한 줄만 넣습니다.**
+> 번호, 따옴표, 쉼표, 대괄호를 추가하지 않습니다. 여러 Argument를 한 칸에 한꺼번에
+> 붙여 넣지도 않습니다.
+
+![ChatGPT Desktop에서 powershell.exe와 Arguments를 서로 다른 칸에 넣은 실제 화면](docs/assets/readme-course-06b-chatgpt-stdio-filled.png)
+
+스크린샷에서 가린 경로와 ID 칸도 실제로는 비우면 안 됩니다. Builder의 같은 번호
+Argument 상자에 들어 있는 실제 경로 또는 ID를 그대로 붙여 넣습니다.
+
+### C-6. Environment와 Working directory 넣고 저장하기
+
+#### Environment
+
+1. Builder에 `Environment (0개)`와 `입력하지 않음`이 보이면 ChatGPT의 환경 변수 칸을
+   비워 둡니다.
+2. `Environment (1개)` 이상이면 ChatGPT에 이미 보이는 첫 번째 빈 키·값 행을
+   사용합니다. 첫 값부터 **+ 환경 변수 추가**를 누르지 않습니다.
+3. Builder의 **왼쪽 키 칸에 복사** 코드 상자를 복사해 첫 행의 왼쪽 **키** 칸에
+   붙여 넣습니다.
+4. Builder의 **오른쪽 값 칸에 복사** 코드 상자를 복사해 같은 행의 오른쪽 **값** 칸에
+   붙여 넣습니다.
+5. 두 번째 Environment가 보이면 **+ 환경 변수 추가**를 다시 누르고 같은 방식으로
+   다음 키와 값을 넣습니다.
+
+#### Environment passthrough
+
+1. Builder에 `Environment passthrough (0개)`와 `입력하지 않음`이 보이면 비워 둡니다.
+2. 1개 이상이면 ChatGPT에 이미 보이는 첫 번째 빈 패스스루 칸을 사용합니다.
+   첫 값부터 **+ 변수 추가**를 누르지 않습니다.
+3. Builder의 첫 번째 Passthrough 코드 상자 아래 한 줄을 그 첫 칸에 붙여 넣습니다.
+4. 다음 번호가 있으면 **+ 변수 추가**를 다시 누르고 다음 한 줄을 새 칸에 넣습니다.
+
+#### Working directory
+
+1. Builder의 **Working directory 복사** 아래 코드 상자를 복사합니다.
+2. ChatGPT의 **작업 중인 디렉터리** 칸에 보이는 `~/code` 예시를 지웁니다.
+3. 복사한 값을 붙여 넣습니다.
+4. 오른쪽 아래 **저장**을 누릅니다.
+
+### C-7. 서버 켜고 `search`와 `fetch` 확인하기
+
+1. ChatGPT Desktop을 완전히 종료했다가 다시 실행합니다.
+2. **설정 → 플러그인 → MCP**로 이동합니다.
+3. 방금 만든 서버가 목록에 있는지 확인합니다.
+4. 서버 오른쪽 스위치가 꺼져 있으면 눌러 켭니다.
+
+![ChatGPT Desktop MCP 목록에서 새 서버와 오른쪽 스위치를 확인하는 실제 화면](docs/assets/readme-course-06-chatgpt-mcp-tab.png)
+
+5. 새 대화를 엽니다.
+6. 아래 두 줄을 통째로 복사해 대화창에 붙여 넣고 전송합니다.
 
 ```text
-1. -NoProfile
-2. -ExecutionPolicy
-3. Bypass
-4. -File
-5. C:\내-번들\run_mcp_stdio_server.ps1
-6. --data-dir
-7. C:\내-번들\data
-8. --tenant-id
-9. 생성된 tenant ID
-10. --transport
-11. stdio
-12. --profile-id
-13. 생성된 profile ID
-14. --flat-storage
-15. --tool-profile
-16. 생성된 tool profile
-17. --no-warm-cache
+연결한 규정 MCP의 search 도구로 복무를 검색해 줘.
+첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여 줘.
 ```
 
-위 목록은 구조 설명용입니다. 실제 생성 파일에 항목이 더 있거나 순서가 다르면
-**`ui_fields.args`가 정답**입니다. Arguments 입력 화면이 여러 행을 지원하면 한 행에
-한 항목을 넣고, `Add argument` 버튼 방식이면 위에서부터 한 번씩 추가합니다.
-
-직접 Python 방식이 생성되었다면 Command에는 생성된
-`...\python.exe`, Arguments의 첫 두 항목에는 `-m`,
-`scripts.run_regulation_mcp`가 들어갑니다. 이 경우에도 화면 예시를 억지로 따라
-`powershell.exe`로 바꾸지 말고 생성된 `ui_fields`를 그대로 사용합니다.
-
-서버 이름은 **Name에만** 넣습니다. Command에는 서버 이름이나 폴더 이름을 넣지 않습니다.
-저장 후 앱을 완전히 종료했다가 다시 실행하고 `/mcp` 또는 MCP 서버 목록을 확인합니다.
+`search` 결과와 `fetch` 본문·출처가 모두 나오면 ChatGPT Desktop 로컬 STDIO 연결
+완료입니다.
 
 ### Codex CLI·IDE
 

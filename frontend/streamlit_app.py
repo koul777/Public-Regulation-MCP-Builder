@@ -1623,42 +1623,71 @@ def _render_chatgpt_codex_desktop_registration_guide(
 ) -> None:
     st.markdown("### ChatGPT/Codex Desktop에 등록하는 방법")
     st.caption(
-        "아래 값은 방금 생성된 `chatgpt_desktop_local_mcp.json`의 `ui_fields`를 "
-        "그대로 읽은 결과입니다. 예시값으로 바꾸지 마세요."
+        "아래 값은 방금 만든 연결 설정에서 그대로 읽어 온 실제 값입니다. "
+        "예시값으로 바꾸거나 다시 타이핑하지 말고 복사 버튼을 사용하세요."
     )
-    st.markdown(f"**Name (MCP 서버 이름):** `{registration.get('name') or ''}`")
+    st.info(
+        "ChatGPT Desktop에서 **왼쪽 아래 계정 > 설정 > 플러그인 > MCP > "
+        "+ 서버 추가 > STDIO** 순서로 누른 뒤, 아래 복사 상자를 위에서부터 "
+        "같은 이름의 칸에 넣습니다."
+    )
+    st.markdown("**Name (MCP 서버 이름) 복사**")
+    st.code(str(registration.get("name") or ""), language=None)
     st.markdown(f"**Transport:** `{registration.get('transport') or ''}`")
 
     st.markdown("**Command 복사**")
     st.code(str(registration.get("command") or ""), language=None)
-    st.markdown("**Working directory 복사**")
-    st.code(str(registration.get("working_directory") or ""), language=None)
 
     arguments = registration.get("arguments")
     if not isinstance(arguments, list):
         arguments = []
-    st.markdown(f"**Arguments ({len(arguments)}개, 입력 순서 유지)**")
-    st.caption("Arguments 전체 목록 복사 — 아래 각 줄을 위에서부터 한 입력 칸에 하나씩 넣습니다.")
-    st.code(str(registration.get("arguments_copy") or ""), language=None)
-    st.caption("번호가 붙은 인자별 목록")
-    st.code(
-        str(registration.get("numbered_arguments_copy") or "입력하지 않음"),
-        language=None,
+    st.markdown(f"**Arguments ({len(arguments)}개) — 한 줄씩 따로 복사**")
+    st.caption(
+        "ChatGPT의 첫 번째 인자 칸에 Argument 1을 넣고, `+ 인자 추가`를 누른 뒤 "
+        "다음 칸에 Argument 2를 넣습니다. 마지막 번호까지 같은 방법으로 반복합니다."
     )
+    if arguments:
+        for index, argument in enumerate(arguments, start=1):
+            st.markdown(
+                f"**Argument {index}/{len(arguments)} — 아래 한 줄만 복사**"
+            )
+            st.code(str(argument), language=None)
+    else:
+        st.code("입력하지 않음", language=None)
 
-    st.markdown("**Environment**")
-    st.code(
-        str(registration.get("environment_display") or "입력하지 않음"),
-        language="json" if registration.get("environment") else None,
+    environment = registration.get("environment")
+    if not isinstance(environment, dict):
+        environment = {}
+    st.markdown(f"**Environment ({len(environment)}개) — 키와 값을 따로 복사**")
+    if environment:
+        for index, (key, value) in enumerate(environment.items(), start=1):
+            st.markdown(
+                f"**Environment {index}/{len(environment)} — 왼쪽 키 칸에 복사**"
+            )
+            st.code(str(key), language=None)
+            st.markdown(
+                f"**Environment {index}/{len(environment)} — 오른쪽 값 칸에 복사**"
+            )
+            st.code(str(value), language=None)
+    else:
+        st.code("입력하지 않음", language=None)
+
+    passthrough = registration.get("environment_passthrough")
+    if not isinstance(passthrough, list):
+        passthrough = []
+    st.markdown(
+        f"**Environment passthrough ({len(passthrough)}개) — 한 칸씩 따로 복사**"
     )
-    st.markdown("**Environment passthrough**")
-    st.code(
-        str(
-            registration.get("environment_passthrough_display")
-            or "입력하지 않음"
-        ),
-        language=None,
-    )
+    if passthrough:
+        for index, variable in enumerate(passthrough, start=1):
+            st.markdown(
+                f"**Passthrough {index}/{len(passthrough)} — 아래 한 줄만 복사**"
+            )
+            st.code(str(variable), language=None)
+    else:
+        st.code("입력하지 않음", language=None)
+    st.markdown("**Working directory 복사**")
+    st.code(str(registration.get("working_directory") or ""), language=None)
 
     profile_id = str(registration.get("profile_id") or "")
     tool_profile = str(registration.get("tool_profile") or "")
@@ -1682,11 +1711,19 @@ def _render_chatgpt_codex_desktop_registration_guide(
 
     st.markdown("**등록 후 절차**")
     st.markdown(
-        "1. MCP 서버 설정을 저장합니다.\n"
-        "2. ChatGPT/Codex Desktop을 완전 종료합니다.\n"
-        "3. 앱을 재실행합니다.\n"
-        "4. 새 대화에서 MCP 서버가 보이는지 확인합니다.\n"
-        "5. `search`와 `fetch`를 실제로 호출해 연결을 검증합니다."
+        "1. 위 Name을 ChatGPT의 이름 칸에 넣습니다.\n"
+        "2. 위 Command를 실행 명령 칸에 넣습니다.\n"
+        f"3. Argument 1을 첫 인자 칸에 넣고 `+ 인자 추가`를 눌러 "
+        f"마지막 Argument {len(arguments)}까지 각각 다른 칸에 넣습니다.\n"
+        "4. Environment 첫 키·값은 이미 보이는 첫 행에 넣고, 두 번째부터 "
+        "`+ 환경 변수 추가`를 누릅니다.\n"
+        "5. Environment passthrough 첫 값도 이미 보이는 첫 칸에 넣고, 두 번째부터 "
+        "`+ 변수 추가`를 누릅니다.\n"
+        "6. Working directory를 작업 중인 디렉터리 칸에 넣습니다.\n"
+        "7. 오른쪽 아래 저장을 누릅니다.\n"
+        "8. ChatGPT/Codex Desktop을 완전 종료했다가 다시 실행합니다.\n"
+        "9. 설정 > 플러그인 > MCP에서 새 서버를 켭니다.\n"
+        "10. 새 대화에서 `search`와 `fetch`를 실제로 호출해 연결을 검증합니다."
     )
 
 
@@ -1710,6 +1747,11 @@ def _read_claude_desktop_registration(
     if not isinstance(arguments, list):
         arguments = []
     merge_payload = {"mcpServers": {str(name): server}}
+    server_entry_json = (
+        json.dumps(str(name), ensure_ascii=False)
+        + ": "
+        + json.dumps(server, ensure_ascii=False, indent=2)
+    )
     return {
         "name": str(name),
         "generated_config_path": str(resolved_path.resolve()),
@@ -1727,6 +1769,7 @@ def _read_claude_desktop_registration(
             ensure_ascii=False,
             indent=2,
         ),
+        "server_entry_json": server_entry_json,
     }
 
 
@@ -1746,8 +1789,18 @@ def _render_claude_desktop_registration_guide(
     )
     st.markdown("**Claude Desktop 설정 위치**")
     st.code(r"%APPDATA%\Claude\claude_desktop_config.json", language=None)
-    st.markdown("**병합할 `mcpServers` JSON 복사**")
+    st.markdown("**처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**")
+    st.caption(
+        "Claude 설정 파일이 비어 있거나 `{}`만 보이면 아래 코드 상자를 복사해 "
+        "파일 전체에 붙여 넣습니다."
+    )
     st.code(str(registration.get("merge_json") or ""), language="json")
+    st.markdown("**기존 서버가 있을 때: `mcpServers` 안에 넣을 새 서버 한 항목 복사**")
+    st.caption(
+        "Claude 설정 파일에 다른 서버가 이미 있으면 아래 코드 상자만 복사해 기존 "
+        "`\"mcpServers\": { ... }`의 중괄호 안에 추가합니다."
+    )
+    st.code(str(registration.get("server_entry_json") or ""), language="json")
     st.markdown("**생성된 Command**")
     st.code(str(registration.get("command") or ""), language=None)
     st.markdown("**생성된 Arguments**")
@@ -1769,10 +1822,10 @@ def _render_claude_desktop_registration_guide(
     st.markdown("**등록 후 절차**")
     st.markdown(
         "1. Claude Desktop의 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**을 누릅니다.\n"
-        "2. 위 `mcpServers` JSON을 기존 설정에 병합하고 저장합니다.\n"
+        "2. 설정 파일 상태에 맞는 위 복사 상자를 사용하고 저장합니다.\n"
         "3. Claude Desktop을 트레이까지 완전 종료합니다.\n"
         "4. 앱을 재실행합니다.\n"
-        "5. 새 대화의 **파일·커넥터 추가 > Connectors**에서 MCP 서버를 확인합니다.\n"
+        "5. **설정 > 개발자 > 로컬 MCP 서버**에서 상태가 `running`인지 확인합니다.\n"
         "6. `search`와 `fetch`를 실제로 호출해 연결을 검증합니다."
     )
     st.info(
