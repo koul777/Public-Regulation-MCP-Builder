@@ -1781,6 +1781,294 @@ def _render_claude_desktop_registration_guide(
     )
 
 
+def _render_mcp_completion_connection_course(
+    *,
+    target: str,
+    server_name: str,
+    bundle_dir: str,
+    runtime_data_dir: str,
+    connection_display_value: str,
+) -> None:
+    """Render a beginner-safe handoff that distinguishes local and remote MCP."""
+
+    local_targets = {
+        "chatgpt-desktop-local",
+        "codex",
+        "claude-code",
+        "claude-desktop",
+    }
+    remote_targets = {"chatgpt-remote", "claude-api"}
+    selected_mode = (
+        "Vercel Streamable HTTP(HTTPS)"
+        if target in remote_targets
+        else "로컬 STDIO"
+    )
+    resolved_bundle_dir = Path(bundle_dir).resolve()
+    resolved_runtime_data_dir = Path(runtime_data_dir).resolve()
+    stage_dir = resolved_bundle_dir.parent / "vercel-mcp-stage"
+    remote_url = connection_display_value.strip() if target in remote_targets else ""
+
+    st.markdown("#### 직접 MCP 연결 및 최종 확인")
+    st.markdown(f"**등록할 MCP 이름:** `{server_name}`")
+    st.markdown(f"**이번에 선택한 방식:** `{selected_mode}`")
+    st.markdown(
+        """
+| 구분 | 로컬 STDIO | Vercel Streamable HTTP(HTTPS) |
+| --- | --- | --- |
+| 실행 위치 | 같은 PC에서 AI 앱이 Python 프로세스를 직접 실행 | Vercel에 배포된 서버가 실행 |
+| 등록값 | 생성된 `command/args/env`와 클라이언트별 설정 | 고정 Production `HTTPS /mcp` URL과 승인된 인증 |
+| 입력하지 않는 값 | 인터넷 URL을 입력하지 않음 | 이 PC의 폴더·로컬 `command/args/env`를 입력하지 않음 |
+| 성공 확인 | `running` 후 `search` then `fetch` | 원격 smoke 후 `search` then `fetch` |
+"""
+    )
+    st.caption(
+        "HTTP는 MCP 전송 방식이고 실제 외부 주소는 HTTPS입니다. "
+        "STDIO에는 URL을 입력하지 않습니다. Vercel 연결에는 이 PC의 폴더·Command·"
+        "Arguments를 입력하지 않습니다."
+    )
+
+    if target in local_targets:
+        st.markdown("##### A. 이번 번들: 로컬 STDIO — 이 PC에서 직접 실행")
+        st.info(
+            "Direct Python(프로젝트 Python 직접 실행)이 우선입니다. 생성기는 Python "
+            "3.11 이상과 `scripts.run_regulation_mcp` import를 확인한 뒤 실제 절대 "
+            "`command/args/env`를 만듭니다. 검증된 소스 Python을 사용할 수 없으면 "
+            "PowerShell 래퍼는 fallback으로 유지됩니다. 어느 형태든 위에서 표시된 생성 "
+            "설정을 수정하지 말고 그대로 등록하세요."
+        )
+
+        st.markdown("**1. 선택한 앱의 등록 위치**")
+        if target == "chatgpt-desktop-local":
+            st.markdown(
+                "ChatGPT Desktop의 **Settings > MCP servers > Add server**에서 "
+                "`chatgpt_desktop_local_mcp.json`의 Name·STDIO·Command·Working "
+                "directory·Arguments·Environment를 그대로 입력하고 Save합니다."
+            )
+        elif target == "codex":
+            st.markdown(
+                "`codex_config_snippet.toml`의 `[mcp_servers.<이름>]` 블록을 "
+                "`~/.codex/config.toml`에 반영합니다."
+            )
+        elif target == "claude-code":
+            st.markdown(
+                "번들 폴더의 `claude_code_add_stdio.ps1`을 실행한 뒤 "
+                "`claude mcp list`로 등록을 확인합니다."
+            )
+        elif target == "claude-desktop":
+            st.markdown(
+                "Claude Desktop의 **Settings > Developer > Edit Config**에서 "
+                "`%APPDATA%\\Claude\\claude_desktop_config.json`을 열고, 생성된 "
+                "`claude_desktop_config.json`의 새 `mcpServers` 항목만 병합합니다. "
+                "기존 서버와 `preferences`는 삭제하지 않습니다."
+            )
+
+        st.markdown("**2. AI 앱을 열기 전에 번들 자체 진단**")
+        st.code(
+            _powershell_command(
+                "powershell.exe",
+                [
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(resolved_bundle_dir / "doctor_mcp_connection.ps1"),
+                ],
+            ),
+            language="powershell",
+        )
+        st.code(
+            _powershell_command(
+                "powershell.exe",
+                [
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(resolved_bundle_dir / "validate_mcp_smoke.ps1"),
+                ],
+            ),
+            language="powershell",
+        )
+        st.caption(
+            "`doctor_mcp_connection.ps1`은 Python 파일 없음, 3.11 미만, 프로젝트 루트, "
+            "runtime marker, 모듈·필수 의존성 import 실패를 구분합니다. "
+            "`validate_mcp_smoke.ps1`은 실제 STDIO initialize와 search/fetch를 검사합니다."
+        )
+
+        st.markdown("**3. 완전히 재시작하고 running 확인**")
+        st.markdown(
+            "설정을 저장한 뒤 창만 닫지 말고 앱을 트레이까지 완전히 종료합니다. 앱을 다시 "
+            "열고 새 대화에서 서버가 `running`인지 확인합니다. Claude Desktop 로컬 "
+            "STDIO는 일반 **Connectors** 메뉴가 아니라 **Developer > Edit Config**에서 "
+            "등록합니다."
+        )
+        st.caption(
+            "Vercel을 사용하려면 Vercel HTTPS 대상을 선택하고 실제 Production "
+            "`https://.../mcp` 주소를 입력해 다시 생성한 뒤 아래 배포 절차를 진행합니다."
+        )
+    else:
+        st.markdown(
+            "##### B. 이번 번들: Vercel Streamable HTTP(HTTPS) — 배포된 서버에 URL로 연결"
+        )
+        st.warning(
+            "파일 묶음 생성 완료가 Vercel 배포 완료를 뜻하지 않습니다. 이 화면은 승인 "
+            "runtime과 연결 파일을 만든 것입니다. 아래 staging과 Production 배포를 "
+            "마치고 실제 `HTTPS /mcp` 응답을 검증해야 합니다."
+        )
+        st.info(
+            "Vercel 원격 연결은 **Connectors** 또는 Streamable HTTP 설정에 URL만 "
+            "등록합니다. 로컬 `command/args/env`, Working directory와 PowerShell "
+            "스크립트는 원격 커넥터 입력값이 아닙니다."
+        )
+        st.markdown("**1. 등록 예정 Production URL 확인**")
+        if remote_url:
+            st.code(remote_url, language=None)
+            if not remote_url.lower().startswith("https://") or not remote_url.rstrip(
+                "/"
+            ).lower().endswith("/mcp"):
+                st.error(
+                    "원격 URL은 고정 Production `https://<host>/mcp` 형식이어야 합니다."
+                )
+        else:
+            st.warning(
+                "아직 원격 URL이 없습니다. Vercel 대상을 선택하고 고정 Production "
+                "`https://<host>/mcp` 주소를 입력해 번들을 다시 생성하세요."
+            )
+
+        st.markdown("**2. 승인 runtime만 Vercel staging 폴더로 준비**")
+        st.code(
+            _powershell_command(
+                "reg-rag-mcp-vercel-stage",
+                [
+                    "--runtime-data-dir",
+                    str(resolved_runtime_data_dir),
+                    "--out-dir",
+                    str(stage_dir),
+                ],
+            ),
+            language="powershell",
+        )
+        st.warning(
+            "원본 업로드, 미승인 데이터, `.env.local`, `.vercel`, 토큰과 로컬 운영 보고서를 "
+            "staging 폴더에 복사하지 마세요. 기존 staging 폴더를 덮어쓰지 말고 새 빈 "
+            "폴더를 사용하세요."
+        )
+
+        st.markdown("**3. Vercel 프로젝트 연결과 Production 배포**")
+        st.code(
+            "\n".join(
+                [
+                    "vercel login",
+                    _powershell_command(
+                        "vercel",
+                        ["link", "--yes", "--cwd", str(stage_dir)],
+                    ),
+                ]
+            ),
+            language="powershell",
+        )
+        st.markdown(
+            "공개가 허용된 승인 규정의 **read-only endpoint인 경우에만** 다음 두 "
+            "Production 환경변수를 설정합니다."
+        )
+        st.code(
+            "\n".join(
+                [
+                    _powershell_command(
+                        "vercel",
+                        [
+                            "env",
+                            "add",
+                            "MCP_ALLOW_UNAUTHENTICATED_HTTP",
+                            "production",
+                            "--value",
+                            "true",
+                            "--yes",
+                            "--cwd",
+                            str(stage_dir),
+                        ],
+                    ),
+                    _powershell_command(
+                        "vercel",
+                        [
+                            "env",
+                            "add",
+                            "MCP_TOOL_PROFILE",
+                            "production",
+                            "--value",
+                            "chatgpt-data",
+                            "--yes",
+                            "--cwd",
+                            str(stage_dir),
+                        ],
+                    ),
+                ]
+            ),
+            language="powershell",
+        )
+        st.warning(
+            "기관 내부 자료는 위 공개 무인증 설정을 사용하지 마세요. "
+            "`MCP_AUTH_TOKEN` Secret 또는 OAuth를 먼저 구성하고 토큰 값을 설정 파일이나 "
+            "Git에 기록하지 않습니다."
+        )
+        st.code(
+            _powershell_command(
+                "vercel",
+                ["--prod", "--cwd", str(stage_dir)],
+            ),
+            language="powershell",
+        )
+        st.caption(
+            "마지막 출력의 `Ready`와 `Aliased: https://<project>.vercel.app`을 확인하고, "
+            "고정 Aliased 주소 뒤에 `/mcp`를 붙여 등록합니다."
+        )
+
+        st.markdown("**4. 선택한 앱의 원격 커넥터에 URL만 등록**")
+        if target == "chatgpt-remote":
+            st.markdown(
+                "ChatGPT/Codex Desktop의 **Settings > MCP servers > Add server**에서 "
+                "**Streamable HTTP**를 선택하고 위 `HTTPS /mcp` URL을 입력한 뒤 "
+                "앱을 Restart합니다."
+            )
+        elif target == "claude-api":
+            st.markdown(
+                "Claude의 **Customize > Connectors > Add custom connector**에서 이름과 "
+                "위 `HTTPS /mcp` URL을 입력합니다. 이 화면에는 로컬 Command·Arguments를 "
+                "넣지 않습니다."
+            )
+
+        st.markdown("**5. 클라이언트 등록 전에 원격 MCP smoke 검증**")
+        smoke_args: list[object] = [
+            "--server-name",
+            server_name,
+            "--remote-url",
+            remote_url or "https://<production-host>/mcp",
+            "--allow-unauthenticated-remote",
+            "--fail-on-issue",
+        ]
+        st.code(
+            _powershell_command("reg-rag-mcp-client-config-smoke", smoke_args),
+            language="powershell",
+        )
+        st.caption(
+            "`--allow-unauthenticated-remote`는 공개가 승인된 무인증 endpoint에서만 "
+            "사용합니다. 비공개 endpoint는 승인된 bearer 환경변수 또는 OAuth를 사용합니다. "
+            "결과의 `mcp_initialized`, `tools_discovered`, `end_to_end_verified`가 모두 "
+            "`true`이고 도구에 `search`, `fetch`가 있어야 합니다."
+        )
+
+    st.markdown("**마지막 확인 — 새 대화에서 search then fetch**")
+    st.code(
+        "연결한 규정 MCP의 search 도구로 인사규정을 찾아줘.\n"
+        "첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여줘.",
+        language=None,
+    )
+    st.caption(
+        "서버 이름만 보이는 것으로는 완료가 아닙니다. `search`가 결과와 `id`를 반환하고, "
+        "그 `id`로 `fetch`가 승인된 본문과 출처를 반환해야 최종 연결 성공입니다."
+    )
+
+
 def _direct_python_mcp_config(payload: dict, *, tenant_storage_isolation: bool = False) -> dict:
     config = json.loads(json.dumps(payload, ensure_ascii=False))
     server_script = str((PROJECT_ROOT / "scripts" / "run_regulation_mcp.py").resolve())
@@ -7320,6 +7608,17 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"- 한국어 안내문: `{Path(str(files.get('readme_ko'))).name}`",
                     ]
                 )
+                for label, file_key in (
+                    ("ChatGPT/Codex HTTPS 설정", "chatgpt"),
+                    ("Claude HTTPS 설정", "claude_remote"),
+                    ("Vercel 원격 검증", "remote_validate"),
+                    ("Claude Code HTTPS 등록", "claude_code_http"),
+                ):
+                    generated_path = files.get(file_key)
+                    if generated_path:
+                        generated_file_lines.append(
+                            f"- {label}: `{Path(str(generated_path)).name}`"
+                        )
                 st.markdown("\n".join(generated_file_lines))
             except Exception as exc:
                 if "bundle_status" in locals():
@@ -7487,77 +7786,15 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     ),
                     language=None,
                 )
-            st.markdown("#### 직접 MCP 연결 및 최종 확인")
-            st.markdown(f"**등록할 MCP 이름:** `{installed_server_name}`")
-            if installed_target == "chatgpt-desktop-local":
-                st.info(
-                    "ChatGPT Desktop의 Settings > MCP servers > Add server가 기본 연결 방식입니다. "
-                    "위 안내에 표시된 Name·STDIO·Command·Working directory·Arguments를 입력하고 Save한 뒤 Restart하세요. "
-                    f"새 대화에서 먼저 `/mcp`로 {installed_server_name}을 확인하세요. `@이름` 반복 입력은 설치나 연결 확인을 대신하지 않습니다."
-                )
-            elif installed_target == "codex":
-                st.info(
-                    "생성된 TOML 스니펫을 `~/.codex/config.toml`에 반영한 뒤 Codex를 다시 시작하고 "
-                    "새 task에서 `/mcp`와 실제 도구 호출을 확인하세요."
-                )
-            elif installed_target == "claude-code":
-                st.info("Claude Code를 다시 시작하고 대화에서 `/mcp` 또는 터미널의 `claude mcp list`로 확인하세요.")
-            elif installed_target == "claude-desktop":
-                st.info(
-                    "Claude Desktop의 설정 > 개발자 > 로컬 MCP 서버 > 구성 편집(영문 UI: "
-                    "Settings > Developer > Edit Config)을 열고, 생성된 "
-                    "`claude_desktop_config.json`의 해당 `mcpServers` 항목을 "
-                    "`%APPDATA%\\Claude\\claude_desktop_config.json`에 병합합니다. 기존 "
-                    "다른 서버는 보존하고 command와 모든 args를 그대로 유지하세요. 저장 후 "
-                    "앱을 완전히 종료·재실행한 뒤 새 대화의 파일·커넥터 추가 > Connectors에서 "
-                    "서버를 확인하고 실제 search·fetch 호출을 요청하세요. 왼쪽 커넥터 메뉴는 "
-                    "Vercel 같은 원격 HTTPS MCP용입니다."
-                )
-            elif installed_target == "chatgpt-remote":
-                st.info(
-                    "ChatGPT Desktop의 Settings > MCP servers > Add server에서 Streamable HTTP를 선택하고 "
-                    "배포된 Vercel HTTPS /mcp URL을 등록한 뒤 Restart하세요. 같은 설정은 Codex CLI·IDE와 "
-                    "공유됩니다. 공개 read-only endpoint는 승인 후 무인증 모드를 명시하고, 비공개 endpoint는 "
-                    "Vercel Secret MCP_AUTH_TOKEN과 config.toml의 bearer_token_env_var를 함께 사용하거나 OAuth를 "
-                    "구성하세요. 새 대화에서 /mcp와 실제 search/fetch 호출로 확인합니다."
-                )
-            elif installed_target == "claude-api":
-                st.info(
-                    "Claude의 Customize > Connectors에 배포된 Vercel HTTPS /mcp URL과 승인된 "
-                    "인증만 등록하세요. Claude Code는 생성된 claude_code_add_http.ps1을 실행한 뒤 "
-                    "새 대화에서 실제 search·fetch 호출을 확인하세요."
-                )
-            if installed_target == "claude-desktop":
-                st.caption(
-                    "같은 이름으로 다시 생성하면 Claude Desktop 사용자 설정의 해당 `mcpServers` 항목을 교체합니다. "
-                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
-                )
-            elif installed_target == "chatgpt-desktop-local":
-                st.caption(
-                    "같은 이름으로 다시 생성하면 Settings > MCP servers의 기존 항목을 새 안내 값으로 갱신합니다. "
-                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
-                )
-            elif installed_target == "codex":
-                st.caption(
-                    "같은 이름으로 다시 생성하면 Codex TOML 설정을 직접 교체해 기존 연결을 갱신합니다. "
-                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
-                )
-            elif installed_target == "claude-code":
-                st.caption(
-                    "같은 이름으로 다시 생성하면 Claude Code 등록 PowerShell을 다시 실행해 기존 연결을 교체합니다. "
-                    "현재 승인된 전체 청크와 추가·개정 청크가 같은 MCP에 반영됩니다."
-                )
-            elif installed_target == "chatgpt-remote":
-                st.caption(
-                    "같은 이름으로 번들을 다시 생성했다면 원격 서버를 다시 준비하고, "
-                    "ChatGPT Desktop의 Settings > MCP servers 항목 또는 공용 config.toml의 URL을 갱신한 뒤 "
-                    "Restart하고 새 대화에서 확인하세요."
-                )
-            elif installed_target == "claude-api":
-                st.caption(
-                    "같은 이름으로 번들을 다시 생성했다면 배포 URL 또는 인증이 바뀐 경우에만 "
-                    "Claude Connector나 Claude Code 등록을 갱신하고 search·fetch를 다시 확인하세요."
-                )
+            _render_mcp_completion_connection_course(
+                target=installed_target,
+                server_name=installed_server_name,
+                bundle_dir=str(bundle_state.get("bundle_dir") or ""),
+                runtime_data_dir=str(bundle_state.get("runtime_data_dir") or ""),
+                connection_display_value=str(
+                    bundle_state.get("connection_display_value") or ""
+                ),
+            )
         with st.expander("전산 담당자용 JSON/명령어 보기", expanded=False):
             if isinstance(mcp_quickstart, dict):
                 for warning in mcp_quickstart.get("warnings") or []:
