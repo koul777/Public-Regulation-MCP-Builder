@@ -3,10 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
 from contextlib import contextmanager
+from datetime import datetime, timezone
+import errno
+import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import socket
 from threading import Lock
 import time
 from uuid import uuid4
@@ -25,10 +30,23 @@ _LOCK_POLL_SECONDS = 0.05
 _LOCK_TIMEOUT_SECONDS = 30.0
 _REPLACE_RETRY_SECONDS = 2.0
 _REPLACE_RETRY_INTERVAL_SECONDS = 0.05
+_LEGACY_PROGRESS_STALE_SECONDS = 24 * 60 * 60
+_INTERRUPTED_PROCESSING_ERROR = (
+    "Processing was interrupted because its worker process is no longer active."
+)
+try:
+    _PROGRESS_OWNER_HOST = socket.gethostname().strip().casefold()
+except OSError:
+    _PROGRESS_OWNER_HOST = str(
+        os.environ.get("COMPUTERNAME")
+        or os.environ.get("HOSTNAME")
+        or ""
+    ).strip().casefold()
 
 _FileIdentity = tuple[int, int, int, int]
 
 _JOURNAL_ID_FIELDS: dict[str, tuple[str, ...]] = {
+    "runs": ("run_id",),
     "approvals": ("approval_record_id", "approval_id"),
     "review_decisions": ("review_id",),
     "indexing_jobs": ("indexing_job_id",),
@@ -37,6 +55,20 @@ _JOURNAL_ID_FIELDS: dict[str, tuple[str, ...]] = {
     "security_scans": ("scan_id",),
     "maintenance_events": ("event_id",),
 }
+_MANIFEST_JOURNAL_MIRRORS: dict[str, str] = {
+    "runs": "runs",
+    "approvals": "approvals",
+    "review_decisions": "review_decisions",
+    "indexing_jobs": "indexing_jobs",
+    "rag_feedback": "rag_feedback",
+    "security_scans": "security_scans",
+}
+_JOURNAL_IDENTITY_CACHE: dict[str, tuple[_FileIdentity | None, dict[str, str]]] = {}
+_JOURNAL_RECORD_CACHE: dict[str, tuple[_FileIdentity | None, list[dict]]] = {}
+_CURRENT_PROCESS_IDENTITY: tuple[int, str | None] | None = None
+_TERMINAL_DOCUMENT_STATUSES = frozenset(
+    {"completed", "failed", "approved", "rejected", "superseded"}
+)
 
 
 class JournalIntegrityError(RuntimeError):
@@ -62,25 +94,79 @@ class JsonRepository:
         self.legacy_path = settings.data_dir / "repository.json"
         self.root = settings.data_dir / "repository"
         self.manifest_path = self.root / "manifest.json"
+        self.job_progress_root = self.root / "job_progress"
+        self.document_progress_root = self.root / "document_progress"
         self._manifest_cache: dict | None = None
         self._manifest_identity: _FileIdentity | None = None
         self._legacy_cache: dict | None = None
         self._legacy_identity: _FileIdentity | None = None
+        self._enforce_regulation_version_admission = False
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.manifest_path.exists():
             with _REPOSITORY_LOCK, self._repository_write_lock():
                 if not self.manifest_path.exists():
                     self._write_json(self.manifest_path, self._empty_manifest())
 
+    def enforce_unique_regulation_version_admission(self) -> JsonRepository:
+        """Make new regulation-version inserts fail atomically on duplicates.
+
+        The check runs inside the same cross-process repository write lock as
+        the manifest update. Existing document IDs remain freely updatable.
+        """
+
+        self._enforce_regulation_version_admission = True
+        return self
+
     def upsert_document(self, document: Document) -> None:
         with _REPOSITORY_LOCK, self._repository_write_lock():
             data = self._read_manifest_for_update()
             data.setdefault("documents", {})
+            if (
+                self._enforce_regulation_version_admission
+                and document.document_id not in data["documents"]
+            ):
+                self._require_unique_regulation_version(data, document)
             data["documents"][document.document_id] = document.model_dump(mode="json")
             self._write_json(self.manifest_path, data)
+            self._document_progress_path(document.document_id).unlink(missing_ok=True)
+
+    def upsert_document_progress(self, document: Document) -> None:
+        """Persist in-flight document metadata without rewriting the manifest."""
+
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            self.document_progress_root.mkdir(parents=True, exist_ok=True)
+            payload = document.model_dump(mode="json")
+            payload.update(self._progress_owner_metadata())
+            self._write_json(
+                self._document_progress_path(document.document_id),
+                payload,
+            )
 
     def get_document(self, document_id: str) -> Document | None:
-        raw = self._read_manifest()["documents"].get(document_id)
+        manifest_raw = self._read_manifest()["documents"].get(document_id)
+        progress_raw = self._read_document_progress_path(
+            self._document_progress_path(document_id)
+        )
+        if (
+            progress_raw is not None
+            and self._progress_sidecar_is_stale(
+                self._document_progress_path(document_id),
+                progress_raw,
+            )
+        ):
+            self.recover_stale_processing_progress(document_id=document_id)
+            manifest_raw = self._read_manifest()["documents"].get(document_id)
+            progress_raw = self._read_document_progress_path(
+                self._document_progress_path(document_id)
+            )
+        if (
+            manifest_raw is not None
+            and str(manifest_raw.get("status") or "").strip().casefold()
+            in _TERMINAL_DOCUMENT_STATUSES
+        ):
+            raw = manifest_raw
+        else:
+            raw = progress_raw or manifest_raw
         if raw is None:
             raw = self._read_legacy().get("documents", {}).get(document_id)
         return Document.model_validate(raw) if raw else None
@@ -102,6 +188,11 @@ class JsonRepository:
                 if str(raw.get("document_id") or "") == document_id:
                     del jobs[job_id]
             self._write_json(self.manifest_path, data)
+            for path in self.job_progress_root.glob("*.json"):
+                raw = self._read_job_progress_path(path)
+                if raw is not None and str(raw.get("document_id") or "") == document_id:
+                    path.unlink(missing_ok=True)
+            self._document_progress_path(document_id).unlink(missing_ok=True)
             for result_type in ("nodes", "chunks", "issues", "quality"):
                 path = self._result_path(document_id, result_type)
                 if path.exists():
@@ -110,8 +201,22 @@ class JsonRepository:
         return removed
 
     def list_documents(self) -> list[Document]:
+        self.recover_stale_processing_progress()
         docs = dict(self._read_legacy().get("documents", {}))
         docs.update(self._read_manifest()["documents"])
+        if self.document_progress_root.is_dir():
+            for path in self.document_progress_root.glob("*.json"):
+                raw = self._read_document_progress_path(path)
+                if raw is not None and str(raw.get("document_id") or "").strip():
+                    document_id = str(raw["document_id"])
+                    committed = docs.get(document_id)
+                    if (
+                        isinstance(committed, dict)
+                        and str(committed.get("status") or "").strip().casefold()
+                        in _TERMINAL_DOCUMENT_STATUSES
+                    ):
+                        continue
+                    docs[document_id] = raw
         return [Document.model_validate(raw) for raw in docs.values()]
 
     def find_documents_by_source(
@@ -182,18 +287,290 @@ class JsonRepository:
             ),
         )
 
+    def _require_unique_regulation_version(
+        self,
+        data: dict,
+        document: Document,
+    ) -> None:
+        regulation_id = self._normalize_key(document.regulation_id)
+        regulation_version = self._normalize_key(document.regulation_version)
+        profile_id = self._normalize_key(document.profile_id)
+        tenant_id = self._normalize_key(document.tenant_id)
+        if not regulation_id or not regulation_version:
+            return
+        candidates: dict[str, dict] = {}
+        legacy_documents = self._read_legacy().get("documents", {})
+        if isinstance(legacy_documents, dict):
+            candidates.update(
+                {
+                    str(document_id): raw
+                    for document_id, raw in legacy_documents.items()
+                    if isinstance(raw, dict)
+                }
+            )
+        candidates.update(
+            {
+                str(document_id): raw
+                for document_id, raw in data.get("documents", {}).items()
+                if isinstance(raw, dict)
+            }
+        )
+        for existing_document_id, raw in candidates.items():
+            if existing_document_id == document.document_id:
+                continue
+            if (
+                self._normalize_key(raw.get("tenant_id")) == tenant_id
+                and self._normalize_key(raw.get("profile_id")) == profile_id
+                and self._normalize_key(raw.get("regulation_id")) == regulation_id
+                and self._normalize_key(raw.get("regulation_version"))
+                == regulation_version
+            ):
+                raise ValueError(
+                    "The same regulation version already exists for the selected institution. "
+                    "Register a new version instead of overwriting the existing document."
+                )
+
     def upsert_job(self, job: ProcessingJob) -> None:
         with _REPOSITORY_LOCK, self._repository_write_lock():
+            if job.status == "processing":
+                self.job_progress_root.mkdir(parents=True, exist_ok=True)
+                payload = job.model_dump(mode="json")
+                payload.update(self._progress_owner_metadata())
+                self._write_json(
+                    self._job_progress_path(job.job_id),
+                    payload,
+                )
+                return
             data = self._read_manifest_for_update()
             data.setdefault("jobs", {})
             data["jobs"][job.job_id] = job.model_dump(mode="json")
             self._write_json(self.manifest_path, data)
+            self._job_progress_path(job.job_id).unlink(missing_ok=True)
 
     def get_job(self, job_id: str) -> ProcessingJob | None:
-        raw = self._read_manifest()["jobs"].get(job_id)
+        manifest_raw = self._read_manifest()["jobs"].get(job_id)
+        progress_raw = self._read_job_progress_path(self._job_progress_path(job_id))
+        if (
+            progress_raw is not None
+            and self._progress_sidecar_is_stale(
+                self._job_progress_path(job_id),
+                progress_raw,
+            )
+        ):
+            self.recover_stale_processing_progress(job_id=job_id)
+            manifest_raw = self._read_manifest()["jobs"].get(job_id)
+            progress_raw = self._read_job_progress_path(self._job_progress_path(job_id))
+        if (
+            manifest_raw is not None
+            and str(manifest_raw.get("status") or "").strip().casefold()
+            in {"completed", "failed"}
+        ):
+            return ProcessingJob.model_validate(manifest_raw)
+        if progress_raw is not None:
+            return ProcessingJob.model_validate(progress_raw)
+        raw = manifest_raw
         if raw is None:
             raw = self._read_legacy().get("jobs", {}).get(job_id)
         return ProcessingJob.model_validate(raw) if raw else None
+
+    def recover_stale_processing_progress(
+        self,
+        *,
+        job_id: str | None = None,
+        document_id: str | None = None,
+    ) -> int:
+        """Commit orphaned processing sidecars as failed terminal state.
+
+        New sidecars carry the writer process identity, so a crashed local
+        worker is detected immediately while a live long-running parser is
+        never expired by elapsed time. Legacy or remote-host sidecars use a
+        conservative 24-hour heartbeat timeout.
+        """
+
+        normalized_job_id = str(job_id or "").strip()
+        normalized_document_id = str(document_id or "").strip()
+        preflight_job_paths = (
+            [self._job_progress_path(normalized_job_id)]
+            if normalized_job_id
+            else list(self.job_progress_root.glob("*.json"))
+        )
+        stale_candidate = False
+        for path in preflight_job_paths:
+            raw = self._read_job_progress_path(path)
+            if raw is None:
+                continue
+            if (
+                normalized_document_id
+                and str(raw.get("document_id") or "").strip()
+                != normalized_document_id
+            ):
+                continue
+            if self._progress_sidecar_is_stale(path, raw):
+                stale_candidate = True
+                break
+        if not stale_candidate:
+            preflight_document_paths = (
+                [self._document_progress_path(normalized_document_id)]
+                if normalized_document_id
+                else list(self.document_progress_root.glob("*.json"))
+            )
+            for path in preflight_document_paths:
+                raw = self._read_document_progress_path(path)
+                if raw is not None and self._progress_sidecar_is_stale(path, raw):
+                    stale_candidate = True
+                    break
+        if not stale_candidate:
+            return 0
+
+        recovered_jobs = 0
+        cleanup_paths: set[Path] = set()
+        now = datetime.now(timezone.utc)
+        failure_message = _INTERRUPTED_PROCESSING_ERROR
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            data = self._read_manifest_for_update()
+            job_paths = (
+                [self._job_progress_path(normalized_job_id)]
+                if normalized_job_id
+                else list(self.job_progress_root.glob("*.json"))
+            )
+            sidecars: list[tuple[Path, dict]] = []
+            live_document_ids: set[str] = set()
+            for path in job_paths:
+                raw = self._read_job_progress_path(path)
+                if raw is None:
+                    continue
+                raw_job_id = str(raw.get("job_id") or "").strip()
+                raw_document_id = str(raw.get("document_id") or "").strip()
+                if normalized_job_id and raw_job_id != normalized_job_id:
+                    continue
+                if normalized_document_id and raw_document_id != normalized_document_id:
+                    continue
+                sidecars.append((path, raw))
+                if not self._progress_sidecar_is_stale(path, raw):
+                    live_document_ids.add(raw_document_id)
+
+            # A stale older attempt must not fail the document while another
+            # process is actively retrying the same document.
+            target_document_ids = {
+                str(raw.get("document_id") or "").strip()
+                for _path, raw in sidecars
+                if str(raw.get("document_id") or "").strip()
+            }
+            if normalized_document_id:
+                target_document_ids.add(normalized_document_id)
+            if target_document_ids:
+                for path in self.job_progress_root.glob("*.json"):
+                    raw = self._read_job_progress_path(path)
+                    if (
+                        raw is not None
+                        and str(raw.get("document_id") or "").strip()
+                        in target_document_ids
+                        and not self._progress_sidecar_is_stale(path, raw)
+                    ):
+                        live_document_ids.add(
+                            str(raw.get("document_id") or "").strip()
+                        )
+
+            failed_document_ids: set[str] = set()
+            for path, raw in sidecars:
+                raw_job_id = str(raw.get("job_id") or "").strip()
+                raw_document_id = str(raw.get("document_id") or "").strip()
+                committed_job = data.setdefault("jobs", {}).get(raw_job_id)
+                if (
+                    isinstance(committed_job, dict)
+                    and str(committed_job.get("status") or "").strip().casefold()
+                    in {"completed", "failed"}
+                ):
+                    cleanup_paths.add(path)
+                    continue
+                if not self._progress_sidecar_is_stale(path, raw):
+                    continue
+                try:
+                    failed_job = ProcessingJob.model_validate(raw).model_copy(
+                        update={
+                            "status": "failed",
+                            "message": failure_message,
+                            "completed_at": now,
+                            "error": failure_message,
+                        }
+                    )
+                except Exception:
+                    cleanup_paths.add(path)
+                    if raw_document_id not in live_document_ids:
+                        failed_document_ids.add(raw_document_id)
+                    continue
+                data.setdefault("jobs", {})[failed_job.job_id] = failed_job.model_dump(
+                    mode="json"
+                )
+                recovered_jobs += 1
+                cleanup_paths.add(path)
+                if raw_document_id not in live_document_ids:
+                    failed_document_ids.add(raw_document_id)
+
+            document_paths = (
+                [self._document_progress_path(normalized_document_id)]
+                if normalized_document_id
+                else list(self.document_progress_root.glob("*.json"))
+            )
+            for progress_path in document_paths:
+                progress_raw = self._read_document_progress_path(progress_path)
+                progress_document_id = str(
+                    (progress_raw or {}).get("document_id") or ""
+                ).strip()
+                if (
+                    progress_raw is not None
+                    and progress_document_id
+                    and progress_document_id not in live_document_ids
+                    and self._progress_sidecar_is_stale(progress_path, progress_raw)
+                ):
+                    failed_document_ids.add(progress_document_id)
+
+            for failed_document_id in failed_document_ids:
+                if not failed_document_id:
+                    continue
+                progress_path = self._document_progress_path(failed_document_id)
+                raw_document = self._read_document_progress_path(progress_path)
+                if raw_document is None:
+                    raw_document = data.setdefault("documents", {}).get(
+                        failed_document_id
+                    )
+                if not isinstance(raw_document, dict):
+                    cleanup_paths.add(progress_path)
+                    continue
+                committed_document = data.setdefault("documents", {}).get(
+                    failed_document_id
+                )
+                if (
+                    isinstance(committed_document, dict)
+                    and str(committed_document.get("status") or "").strip().casefold()
+                    in {"completed", "failed"}
+                ):
+                    cleanup_paths.add(progress_path)
+                    continue
+                try:
+                    failed_document = Document.model_validate(raw_document).model_copy(
+                        update={
+                            "status": "failed",
+                            "processed_at": now,
+                            "error": failure_message,
+                        }
+                    )
+                except Exception:
+                    cleanup_paths.add(progress_path)
+                    continue
+                data.setdefault("documents", {})[
+                    failed_document.document_id
+                ] = failed_document.model_dump(mode="json")
+                cleanup_paths.add(progress_path)
+
+            if recovered_jobs or failed_document_ids:
+                self._write_json(self.manifest_path, data)
+            for path in cleanup_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return recovered_jobs
 
     def save_processing_result(
         self,
@@ -247,13 +624,8 @@ class JsonRepository:
         approval_id = str(record.get("approval_id") or "").strip()
         if not approval_id:
             raise ValueError("approval_id is required.")
-        record_key = str(record.get("approval_record_id") or approval_id).strip()
         with _REPOSITORY_LOCK, self._repository_write_lock():
             append_required = self._require_journal_append_compatible("approvals", record)
-            data = self._read_manifest_for_update()
-            data.setdefault("approvals", {})
-            data["approvals"][record_key] = record
-            self._write_json(self.manifest_path, data)
             if append_required:
                 self._append_journal_record("approvals", record, identity_validated=True)
 
@@ -276,10 +648,6 @@ class JsonRepository:
             raise ValueError("review_id is required.")
         with _REPOSITORY_LOCK, self._repository_write_lock():
             append_required = self._require_journal_append_compatible("review_decisions", record)
-            data = self._read_manifest_for_update()
-            data.setdefault("review_decisions", {})
-            data["review_decisions"][review_id] = record
-            self._write_json(self.manifest_path, data)
             if append_required:
                 self._append_journal_record("review_decisions", record, identity_validated=True)
 
@@ -295,10 +663,6 @@ class JsonRepository:
             raise ValueError("indexing_job_id is required.")
         with _REPOSITORY_LOCK, self._repository_write_lock():
             append_required = self._require_journal_append_compatible("indexing_jobs", record)
-            data = self._read_manifest_for_update()
-            data.setdefault("indexing_jobs", {})
-            data["indexing_jobs"][job_id] = record
-            self._write_json(self.manifest_path, data)
             if append_required:
                 self._append_journal_record("indexing_jobs", record, identity_validated=True)
 
@@ -333,10 +697,6 @@ class JsonRepository:
             raise ValueError("feedback_id is required.")
         with _REPOSITORY_LOCK, self._repository_write_lock():
             append_required = self._require_journal_append_compatible("rag_feedback", record)
-            data = self._read_manifest_for_update()
-            data.setdefault("rag_feedback", {})
-            data["rag_feedback"][feedback_id] = record
-            self._write_json(self.manifest_path, data)
             if append_required:
                 self._append_journal_record("rag_feedback", record, identity_validated=True)
 
@@ -352,10 +712,6 @@ class JsonRepository:
             raise ValueError("scan_id is required.")
         with _REPOSITORY_LOCK, self._repository_write_lock():
             append_required = self._require_journal_append_compatible("security_scans", record)
-            data = self._read_manifest_for_update()
-            data.setdefault("security_scans", {})
-            data["security_scans"][scan_id] = record
-            self._write_json(self.manifest_path, data)
             if append_required:
                 self._append_journal_record("security_scans", record, identity_validated=True)
 
@@ -398,17 +754,95 @@ class JsonRepository:
 
     def upsert_run(self, run: ProcessingRun) -> None:
         with _REPOSITORY_LOCK, self._repository_write_lock():
+            record = run.model_dump(mode="json")
+            append_required = self._require_journal_append_compatible("runs", record)
+            if append_required:
+                self._append_journal_record("runs", record, identity_validated=True)
+
+    def commit_processing_outcome(
+        self,
+        *,
+        document: Document,
+        job: ProcessingJob,
+        run: ProcessingRun,
+    ) -> None:
+        """Exception-atomically commit one terminal document, job, and run outcome."""
+
+        if document.document_id != job.document_id or document.document_id != run.document_id:
+            raise ValueError("Processing outcome document identifiers must match.")
+        if job.job_id != run.job_id:
+            raise ValueError("Processing outcome job identifiers must match.")
+        if job.status not in {"completed", "failed"} or run.status not in {"completed", "failed"}:
+            raise ValueError("Processing outcome must be terminal.")
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            run_journal_path = self._journal_path("runs")
+            manifest_snapshot = _capture_file_snapshot(self.manifest_path)
+            run_journal_snapshot = _capture_file_snapshot(run_journal_path)
+            run_record = run.model_dump(mode="json")
+            append_required = self._require_journal_append_compatible("runs", run_record)
             data = self._read_manifest_for_update()
-            data.setdefault("runs", {})
-            data["runs"][run.run_id] = run.model_dump(mode="json")
-            self._write_json(self.manifest_path, data)
+            data.setdefault("documents", {})[document.document_id] = document.model_dump(mode="json")
+            data.setdefault("jobs", {})[job.job_id] = job.model_dump(mode="json")
+            try:
+                # Publish terminal document/job state before the run marker so
+                # a process crash cannot leave a false completed run that is
+                # later reused while the manifest still says "processing".
+                self._write_json(self.manifest_path, data)
+                if append_required:
+                    self._append_journal_record(
+                        "runs",
+                        run_record,
+                        identity_validated=True,
+                    )
+            except BaseException as exc:
+                rollback_errors: list[str] = []
+                for path, snapshot in (
+                    (run_journal_path, run_journal_snapshot),
+                    (self.manifest_path, manifest_snapshot),
+                ):
+                    try:
+                        _restore_file_snapshot(path, snapshot)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{path.name}: {rollback_exc}")
+                self._manifest_cache = None
+                self._manifest_identity = None
+                journal_cache_key = str(run_journal_path.resolve())
+                _JOURNAL_RECORD_CACHE.pop(journal_cache_key, None)
+                _JOURNAL_IDENTITY_CACHE.pop(journal_cache_key, None)
+                if rollback_errors and hasattr(exc, "add_note"):
+                    exc.add_note(
+                        "Processing outcome rollback also failed: "
+                        + "; ".join(rollback_errors)
+                    )
+                raise
+            for progress_path in (
+                self._job_progress_path(job.job_id),
+                self._document_progress_path(document.document_id),
+            ):
+                try:
+                    progress_path.unlink(missing_ok=True)
+                except Exception:
+                    # Terminal manifest state takes precedence over stale
+                    # progress sidecars in all readers, so cleanup failure must
+                    # not turn a successful commit into a false failure.
+                    pass
 
     def get_run(self, run_id: str) -> ProcessingRun | None:
-        raw = self._read_manifest().get("runs", {}).get(run_id)
+        raw = next(
+            (
+                record
+                for record in self._list_records_with_journal("runs", "runs", ("run_id",))
+                if str(record.get("run_id") or "") == run_id
+            ),
+            None,
+        )
         return ProcessingRun.model_validate(raw) if raw else None
 
     def list_runs(self, document_id: str | None = None) -> list[ProcessingRun]:
-        runs = [ProcessingRun.model_validate(raw) for raw in self._read_manifest().get("runs", {}).values()]
+        runs = [
+            ProcessingRun.model_validate(raw)
+            for raw in self._list_records_with_journal("runs", "runs", ("run_id",))
+        ]
         if document_id:
             runs = [run for run in runs if run.document_id == document_id]
         return sorted(runs, key=lambda run: run.started_at)
@@ -629,7 +1063,40 @@ class JsonRepository:
         data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("Repository manifest must contain a JSON object.")
+        self._migrate_manifest_runs_to_journal(data)
+        self._remove_exact_journal_mirrors(data)
         return data
+
+    def _migrate_manifest_runs_to_journal(self, data: dict) -> None:
+        """Copy legacy run rows to their journal before removing exact mirrors."""
+
+        runs = data.get("runs")
+        if not isinstance(runs, dict) or not runs:
+            return
+        for record in runs.values():
+            if not isinstance(record, dict):
+                continue
+            append_required = self._require_journal_append_compatible("runs", record)
+            if append_required:
+                self._append_journal_record("runs", record, identity_validated=True)
+
+    def _remove_exact_journal_mirrors(self, data: dict) -> None:
+        """Drop legacy manifest copies only when the journal has the same row."""
+
+        for manifest_key, journal_name in _MANIFEST_JOURNAL_MIRRORS.items():
+            mirrored = data.get(manifest_key)
+            if not isinstance(mirrored, dict) or not mirrored:
+                continue
+            id_fields = _JOURNAL_ID_FIELDS[journal_name]
+            journal_index = self._journal_identity_index(journal_name)
+            if not journal_index:
+                continue
+            for manifest_record_key, record in list(mirrored.items()):
+                if not isinstance(record, dict):
+                    continue
+                record_id = self._record_identity(record, id_fields)
+                if record_id and journal_index.get(record_id) == self._record_digest(record):
+                    del mirrored[manifest_record_key]
 
     def _read_legacy(self) -> dict:
         current_identity = self._file_identity(self.legacy_path)
@@ -651,12 +1118,75 @@ class JsonRepository:
     def _result_path(self, document_id: str, result_type: str) -> Path:
         return self.root / f"{document_id}_{result_type}.json"
 
+    def _job_progress_path(self, job_id: str) -> Path:
+        digest = hashlib.sha256(str(job_id or "").encode("utf-8")).hexdigest()
+        return self.job_progress_root / f"{digest}.json"
+
+    def _document_progress_path(self, document_id: str) -> Path:
+        digest = hashlib.sha256(str(document_id or "").encode("utf-8")).hexdigest()
+        return self.document_progress_root / f"{digest}.json"
+
+    def _progress_owner_metadata(self) -> dict[str, object]:
+        return {
+            "_progress_owner_host": _PROGRESS_OWNER_HOST,
+            "_progress_owner_pid": os.getpid(),
+            "_progress_owner_identity": _own_process_identity() or "",
+            "_progress_updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _progress_sidecar_is_stale(self, path: Path, raw: dict) -> bool:
+        owner_host = str(raw.get("_progress_owner_host") or "").strip().casefold()
+        try:
+            owner_pid = int(raw.get("_progress_owner_pid") or 0)
+        except (TypeError, ValueError):
+            owner_pid = 0
+        if owner_host and owner_host == _PROGRESS_OWNER_HOST and owner_pid > 0:
+            current_identity = (
+                _own_process_identity()
+                if owner_pid == os.getpid()
+                else _process_identity(owner_pid)
+            )
+            if current_identity is None:
+                return True
+            expected_identity = str(
+                raw.get("_progress_owner_identity") or ""
+            ).strip()
+            if (
+                current_identity.startswith("live:")
+                or expected_identity.startswith("live:")
+            ):
+                return False
+            return bool(
+                expected_identity and current_identity != expected_identity
+            )
+        try:
+            age_seconds = max(0.0, time.time() - path.stat().st_mtime)
+        except OSError:
+            return False
+        return age_seconds >= _LEGACY_PROGRESS_STALE_SECONDS
+
+    def _read_job_progress_path(self, path: Path) -> dict | None:
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def _read_document_progress_path(self, path: Path) -> dict | None:
+        return self._read_job_progress_path(path)
+
     def _read_result(self, document_id: str, result_type: str) -> list | dict:
         path = self._result_path(document_id, result_type)
         if path.exists():
             if result_type in {"nodes", "chunks", "issues"}:
                 return list(self._iter_json_array(path))
             with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        compressed_path = Path(f"{path}.gz")
+        if compressed_path.is_file():
+            with gzip.open(compressed_path, "rt", encoding="utf-8") as handle:
                 return json.load(handle)
         legacy = self._read_legacy()
         return legacy.get(result_type, {}).get(document_id, [])
@@ -675,15 +1205,49 @@ class JsonRepository:
             return
         path = self._journal_path(journal_name)
         path.parent.mkdir(parents=True, exist_ok=True)
+        before_identity = self._file_identity(path)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        cache_key = str(path.resolve())
+        cached = _JOURNAL_IDENTITY_CACHE.get(cache_key)
+        if cached is not None and cached[0] == before_identity:
+            updated_index = dict(cached[1])
+            id_fields = _JOURNAL_ID_FIELDS.get(journal_name, ())
+            record_id = self._record_identity(record, id_fields) if id_fields else ""
+            if record_id:
+                updated_index[record_id] = self._record_digest(record)
+            _JOURNAL_IDENTITY_CACHE[cache_key] = (self._file_identity(path), updated_index)
+        else:
+            _JOURNAL_IDENTITY_CACHE.pop(cache_key, None)
+        cached_records = _JOURNAL_RECORD_CACHE.get(cache_key)
+        if cached_records is not None and cached_records[0] == before_identity:
+            updated_records = list(cached_records[1])
+            updated_records.append(record)
+            _JOURNAL_RECORD_CACHE[cache_key] = (
+                self._file_identity(path),
+                updated_records,
+            )
+        else:
+            _JOURNAL_RECORD_CACHE.pop(cache_key, None)
 
     def _read_journal_records(self, journal_name: str) -> list[dict]:
         path = self._journal_path(journal_name)
+        compressed_path = Path(f"{path}.gz")
+        if not path.is_file() and compressed_path.is_file():
+            path = compressed_path
         if not path.is_file():
             return []
+        identity = self._file_identity(path)
+        cache_key = str(path.resolve())
+        cached = _JOURNAL_RECORD_CACHE.get(cache_key)
+        if cached is not None and cached[0] == identity:
+            return list(cached[1])
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            if path.suffix.casefold() == ".gz":
+                with gzip.open(path, "rt", encoding="utf-8") as handle:
+                    lines = handle.read().splitlines()
+            else:
+                lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeError) as exc:
             raise JournalIntegrityError(f"Journal '{journal_name}' could not be read as UTF-8 JSONL.") from exc
         records: list[dict] = []
@@ -720,6 +1284,7 @@ class JsonRepository:
             if record_id and previous is None:
                 records_by_id[record_id] = item
             records.append(item)
+        _JOURNAL_RECORD_CACHE[cache_key] = (identity, records)
         return records
 
     def _require_journal_append_compatible(self, journal_name: str, record: dict) -> bool:
@@ -729,16 +1294,39 @@ class JsonRepository:
         record_id = self._record_identity(record, id_fields)
         if not record_id:
             raise ValueError(f"Journal '{journal_name}' record identity is required.")
-        for existing in self._read_journal_records(journal_name):
-            if self._record_identity(existing, id_fields) != record_id:
-                continue
-            if existing != record:
+        existing_digest = self._journal_identity_index(journal_name).get(record_id)
+        if existing_digest is not None:
+            if existing_digest != self._record_digest(record):
                 raise JournalIntegrityError(
                     f"Journal '{journal_name}' already contains a conflicting record for identity "
                     f"'{record_id[:128]}'."
                 )
             return False
         return True
+
+    def _journal_identity_index(self, journal_name: str) -> dict[str, str]:
+        path = self._journal_path(journal_name)
+        compressed_path = Path(f"{path}.gz")
+        if not path.is_file() and compressed_path.is_file():
+            path = compressed_path
+        identity = self._file_identity(path)
+        cache_key = str(path.resolve())
+        cached = _JOURNAL_IDENTITY_CACHE.get(cache_key)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        id_fields = _JOURNAL_ID_FIELDS.get(journal_name, ())
+        index: dict[str, str] = {}
+        if id_fields and identity is not None:
+            for record in self._read_journal_records(journal_name):
+                record_id = self._record_identity(record, id_fields)
+                if record_id:
+                    index[record_id] = self._record_digest(record)
+        _JOURNAL_IDENTITY_CACHE[cache_key] = (identity, index)
+        return index
+
+    def _record_digest(self, record: dict) -> str:
+        payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _list_records_with_journal(
         self,
@@ -897,7 +1485,13 @@ class JsonRepository:
         except FileNotFoundError:
             try:
                 handle = lock_path.open("a+b")
-            except PermissionError:
+            except OSError as exc:
+                if not isinstance(exc, PermissionError) and exc.errno not in {
+                    errno.EACCES,
+                    errno.EPERM,
+                    errno.EROFS,
+                }:
+                    raise
                 # A read-only repository without a lock file cannot be changed
                 # by this process. Strict parsing still fails closed if an
                 # external writer exposes an incomplete record.
@@ -919,6 +1513,120 @@ class JsonRepository:
                 yield
             finally:
                 _unlock_handle(handle)
+
+
+def _capture_file_snapshot(path: Path) -> tuple[bool, bytes]:
+    return (True, path.read_bytes()) if path.is_file() else (False, b"")
+
+
+def _restore_file_snapshot(path: Path, snapshot: tuple[bool, bytes]) -> None:
+    existed, payload = snapshot
+    if not existed:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.rollback.tmp")
+    try:
+        with tmp_path.open("wb") as handle:
+            handle.write(payload)
+        _replace_with_retry(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _own_process_identity() -> str | None:
+    global _CURRENT_PROCESS_IDENTITY
+    pid = os.getpid()
+    if (
+        _CURRENT_PROCESS_IDENTITY is None
+        or _CURRENT_PROCESS_IDENTITY[0] != pid
+    ):
+        _CURRENT_PROCESS_IDENTITY = (pid, _process_identity(pid))
+    return _CURRENT_PROCESS_IDENTITY[1]
+
+
+def _process_identity(pid: int) -> str | None:
+    """Return a process-start identity, or ``None`` when the PID is not live."""
+
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(
+                process_query_limited_information,
+                False,
+                pid,
+            )
+            if handle:
+                try:
+                    created = wintypes.FILETIME()
+                    exited = wintypes.FILETIME()
+                    kernel = wintypes.FILETIME()
+                    user = wintypes.FILETIME()
+                    if kernel32.GetProcessTimes(
+                        handle,
+                        ctypes.byref(created),
+                        ctypes.byref(exited),
+                        ctypes.byref(kernel),
+                        ctypes.byref(user),
+                    ):
+                        exit_ticks = (
+                            (exited.dwHighDateTime << 32)
+                            | exited.dwLowDateTime
+                        )
+                        if exit_ticks:
+                            return None
+                        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                        return f"windows:{ticks}"
+                finally:
+                    kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
+            pass
+    else:
+        proc_stat = Path(f"/proc/{pid}/stat")
+        if proc_stat.is_file():
+            try:
+                text = proc_stat.read_text(encoding="utf-8")
+                closing_paren = text.rfind(")")
+                fields = text[closing_paren + 2 :].split()
+                if closing_paren >= 0 and len(fields) > 19:
+                    if fields[0] == "Z":
+                        return None
+                    return f"proc:{fields[19]}"
+            except (OSError, UnicodeError):
+                pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return f"live:{pid}"
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return None
+        return f"live:{pid}"
+    return f"live:{pid}"
 
 
 def _lock_handle(handle) -> None:

@@ -591,6 +591,12 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             repository.upsert_run(
                 run.model_copy(
                     update={
+                        # Processing-run journal entries are immutable. Seed a
+                        # later completed run instead of rewriting the original
+                        # run identity solely to prepare this UI fixture.
+                        "run_id": "run-streamlit-approval-remaining-review",
+                        "started_at": datetime.now(timezone.utc),
+                        "completed_at": datetime.now(timezone.utc),
                         "stats": {
                             "agent_review": {
                                 "status": "planned",

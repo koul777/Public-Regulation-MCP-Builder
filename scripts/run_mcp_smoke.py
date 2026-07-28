@@ -18,7 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.api import routes_documents
 from app.core.config import Settings
 from app.core.security import AuthContext
-from app.core.tenant_access import settings_for_tenant
+from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.ingestion.vector_upsert import load_vector_records_jsonl
 from app.mcp_server.regulation_tools import (
     compare_versions,
     fetch_regulation,
@@ -30,6 +31,10 @@ from app.mcp_server.regulation_tools import (
     list_documents,
     mcp_auth_context,
     search_regulations,
+)
+from app.retrieval.hierarchical_index import (
+    build_hierarchical_runtime_index,
+    hierarchical_index_path,
 )
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
@@ -155,6 +160,21 @@ def _run_smoke_with_data_dir(
                 routes_documents.IndexRequest(target_type="local-jsonl", embedding_dimensions=8),
                 auth,
             )
+
+    vector_path = (
+        repository_settings.data_dir
+        / "vector_db"
+        / tenant_storage_key(tenant_id)
+        / "approved_vectors.jsonl"
+    )
+    vector_records = load_vector_records_jsonl(vector_path)
+    hierarchy_summary = build_hierarchical_runtime_index(
+        hierarchical_index_path(repository_settings.data_dir),
+        vector_records,
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        vector_offsets=_vector_record_offsets(vector_path),
+    )
 
     mcp_auth = mcp_auth_context(tenant_id=tenant_id)
     search = search_regulations(
@@ -289,6 +309,10 @@ def _run_smoke_with_data_dir(
                 "record_count": evidence.get("vector_record_count"),
                 "synthetic_runtime": True,
                 "provenance": "run_mcp_smoke",
+                "hierarchical_index_status": "ready",
+                "files": {
+                    "hierarchical_index_sha256": hierarchy_summary["sha256"],
+                },
             },
             ensure_ascii=False,
             indent=2,
@@ -300,6 +324,28 @@ def _run_smoke_with_data_dir(
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
+
+
+def _vector_record_offsets(path: Path) -> dict[tuple[str, str], tuple[int, int]]:
+    offsets: dict[tuple[str, str], tuple[int, int]] = {}
+    with path.open("rb") as handle:
+        while True:
+            offset = handle.tell()
+            payload = handle.readline()
+            if not payload:
+                break
+            try:
+                record = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            document_id = str(record.get("document_id") or metadata.get("document_id") or "").strip()
+            chunk_id = str(record.get("chunk_id") or metadata.get("chunk_id") or "").strip()
+            if document_id and chunk_id:
+                offsets[(document_id, chunk_id)] = (offset, len(payload))
+    return offsets
 
 
 def _write_smoke_approval_evidence(

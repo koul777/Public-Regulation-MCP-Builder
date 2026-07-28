@@ -18,4 +18,4 @@
 
 ## 범위
 
-이 정책은 현재 full MCP tool profile의 `lookup`에 적용된다. ChatGPT data profile은 기존 `search`/`fetch` 계약을 유지하므로, 해당 클라이언트에서는 `search` 후 `fetch`를 사용한다.
+이 정책은 현재 full MCP tool profile의 `lookup`에 적용된다. ChatGPT data profile은 `list_regulations`로 규정을 식별하고 `get_regulation_toc` 또는 `get_regulation_article`로 계층·정확 조문을 조회할 수 있다. 자연어 검색은 기존과 같이 `search` 후 `fetch`를 사용한다.

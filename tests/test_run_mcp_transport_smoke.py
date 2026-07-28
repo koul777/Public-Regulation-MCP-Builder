@@ -31,7 +31,21 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(report["full_profile"]["search_result_count"], 1)
         self.assertGreaterEqual(report["full_profile"]["warm_search_result_count"], 1)
         self.assertTrue(report["full_profile"]["fetch_has_text"])
-        self.assertEqual(set(report["chatgpt_data_profile"]["tool_names"]), {"search", "fetch"})
+        self.assertEqual(
+            set(report["chatgpt_data_profile"]["tool_names"]),
+            {
+                "search",
+                "fetch",
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+            },
+        )
+        self.assertTrue(report["chatgpt_data_profile"]["catalog_verified"])
+        self.assertTrue(report["chatgpt_data_profile"]["hierarchy_verified"])
+        self.assertTrue(report["chatgpt_data_profile"]["exact_article_verified"])
         self.assertIsInstance(report["full_profile"]["search_metadata"].get("timing_ms"), dict)
         for profile_name in ("full_profile", "chatgpt_data_profile"):
             profile = report[profile_name]
@@ -63,7 +77,21 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(report["full_profile"]["warm_search_result_count"], 1)
         self.assertTrue(report["full_profile"]["fetch_has_text"])
         self.assertTrue(report["full_profile"]["session_id_present"])
-        self.assertEqual(set(report["chatgpt_data_profile"]["tool_names"]), {"search", "fetch"})
+        self.assertEqual(
+            set(report["chatgpt_data_profile"]["tool_names"]),
+            {
+                "search",
+                "fetch",
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+            },
+        )
+        self.assertTrue(report["chatgpt_data_profile"]["catalog_verified"])
+        self.assertTrue(report["chatgpt_data_profile"]["hierarchy_verified"])
+        self.assertTrue(report["chatgpt_data_profile"]["exact_article_verified"])
         self.assertTrue(report["chatgpt_data_profile"]["session_id_present"])
 
     def test_authenticated_streamable_http_transport_verifies_bearer_wire(self) -> None:

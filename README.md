@@ -5,16 +5,59 @@
 [![MCP](https://img.shields.io/badge/MCP-STDIO%20%7C%20HTTPS-0F766E)](docs/mcp_quickconnect_ko.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+**흩어진 공공기관 규정을, AI가 목록·목차·조문·참조 관계까지 찾아 쓰는 승인형 규정
+MCP로 바꿉니다.**
+
+![기관 선택부터 규정 전처리, 검수·승인, MCP 생성과 AI 연결까지 보여 주는 PR MCP Builder 데모](docs/assets/pr-mcp-builder-demo.gif)
+
+PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **사람이 원문과
+비교해 승인한 내용만** ChatGPT·Codex·Claude에서 조회하게 만드는 Windows용
+프로그램입니다. 단순한 문서 검색기가 아니라 다음 세 부분을 한 흐름으로 묶습니다.
+
+1. **계층형 규정 카탈로그** — 규정 목록과 장·절·조·별표·서식·부칙 구조를 보존합니다.
+2. **승인 기반 RAG 검색엔진** — 사람이 승인한 청크만 검색하고 원문 근거를 돌려줍니다.
+3. **MCP 서버** — 로컬 STDIO 또는 Vercel HTTPS로 AI 프로그램에 도구를 제공합니다.
+
+### 무엇을 할 수 있나요?
+
+| 필요한 일 | PR MCP Builder가 제공하는 방법 |
+| --- | --- |
+| 승인된 규정 전체 목록 확인 | `list_regulations`가 중복 없는 규정 목록, 페이지, `total_count`를 반환 |
+| 규정 구조 탐색 | `get_regulation_toc`로 장·절·조·별표·서식 계층 확인 |
+| “인사규정 제16조” 정확히 찾기 | `get_regulation_article`로 규정과 조문 번호를 지정해 조회 |
+| 다른 규정을 인용한 부분 찾기 | `get_regulation_references`로 들어오고 나가는 참조 확인 |
+| 서로 물고 도는 참조 점검 | `list_regulation_reference_cycles`로 순환참조 묶음 확인 |
+| 자연어로 관련 규정 찾기 | `search`로 후보를 찾고 `fetch`로 승인 원문과 출처 확인 |
+| 최신 개정본 반영 | 같은 규정의 새 버전을 등록하고 해당 규정만 다시 처리·색인 |
+| 시행일에 맞는 현재본 조회 | 개정 이력과 효력 기간을 보존하고 조회 기준일에 맞는 버전 선택 |
+| 내 PC 또는 원격 AI에서 사용 | 같은 PC는 STDIO, 원격은 Vercel HTTPS `/mcp`로 연결 |
+
+### 규정 한 건이 AI 도구가 되기까지
+
+```text
+규정 파일 추가
+  → 규정명·버전·장·절·조·별표·부칙 구조화
+  → 원문과 처리 결과 비교
+  → 사람이 승인
+  → 승인 데이터만 검색 색인
+  → MCP 번들 생성
+  → ChatGPT·Codex·Claude에서 목록·목차·조문·검색 도구 사용
+```
+
+개정본도 같은 원칙을 따릅니다. 새 파일을 기존 규정의 다음 버전으로 등록하고 시행일과
+개정 관계를 확인한 뒤 승인합니다. 그러면 변경된 규정 단위만 갱신되며, 나머지 규정을
+전부 다시 처리할 필요가 없습니다.
+
+<details>
+<summary><strong>프로그램 전체 화면 구성 보기</strong></summary>
+
 ![규정 문서를 사람이 검토·승인한 뒤 로컬 AI와 HTTPS MCP로 연결하는 PR MCP Builder](docs/assets/pr-mcp-builder-hero.png)
 
-공공기관 규정 파일을 정리하고, **사람이 확인해 승인한 내용만** ChatGPT·Codex·Claude에서
-검색하게 만드는 Windows용 프로그램입니다.
+</details>
 
-PDF·HWP·HWPX·DOCX 파일을 올리면 규정명, 개정판, 목차와 조문을 정리합니다. 처리 결과를
-사람이 원문과 비교해 승인하면 AI 프로그램에서 사용할 MCP 검색 도구를 만듭니다.
-
-현재 개발 중인 공개 소스 프로젝트이며 Windows 10/11 64비트 우선 지원입니다.
-Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 아닙니다.
+> [!NOTE]
+> 현재 개발 중인 공개 소스 프로젝트이며 Windows 10/11 64비트 우선 지원입니다.
+> Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 아닙니다.
 
 > [!IMPORTANT]
 > 문서를 올렸다고 바로 AI 검색에 공개되지 않습니다. 승인하지 않은 내용은 MCP의
@@ -22,25 +65,31 @@ Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 �
 > 사람 검수와 승인을 거쳐 승인된 규정만 MCP 데이터로 생성합니다.
 > 사람에게 승인되지 않은 청크는 검색 색인과 MCP 번들에 포함하지 않습니다.
 
-이 안내서는 MCP를 처음 들어 본 사람도 위에서부터 그대로 따라 할 수 있도록 작성했습니다.
-화면 예시는 이해를 돕기 위한 샘플이며 앱 버전에 따라 버튼 위치나 이름이 조금 달라질 수
-있습니다. **경로, 서버 이름, ID는 예시를 타이핑하지 말고 내 PC에서 생성된 값을
-복사하세요.**
+이 README는 처음 설치하는 운영자부터 Vercel 배포와 소스 검증이 필요한 개발자까지
+순서대로 필요한 깊이만 읽도록 구성했습니다. 화면 예시는 이해를 돕기 위한 샘플이며 앱
+버전에 따라 버튼 위치나 이름이 조금 달라질 수 있습니다. **경로, 서버 이름, ID는
+예시를 타이핑하지 말고 내 PC에서 생성된 값을 복사하세요.**
 
 ## 이 문서에서 할 일
 
-1. 프로그램을 내려받고 규정 파일을 처리합니다.
-2. 원문과 처리 결과를 비교한 뒤 사용할 조문을 승인합니다.
-3. 아래 두 연결 중 하나를 선택합니다.
-   - 같은 PC에서 쓰는 **로컬 STDIO**
-   - 웹이나 다른 기기에서도 쓰는 **Vercel HTTPS**
-4. AI 프로그램에 MCP를 등록합니다.
-5. `search`와 `fetch`를 실제로 호출해 연결을 검증합니다.
+처음 사용하는 운영자는 0→1→2→3→4 순서로 읽으면 됩니다. 이미 번들을 만든 사람은
+사용할 AI 앱의 방법 A~E로 바로 이동하세요. 보안·개발·배포 세부 정보는 뒤쪽에 모아
+두었으므로 처음부터 모두 이해할 필요는 없습니다.
+
+| 단계 | 내가 하는 일 | 끝났다는 신호 |
+| --- | --- | --- |
+| 0. 출발점 선택 | 로컬 STDIO와 Vercel HTTPS 중 맞는 경로 선택 | 사용할 앱과 연결 방식 결정 |
+| 1. 규정 준비 | 파일 추가 → 결과 확인 → 사람 검수·승인 | 승인 데이터의 색인 완료 |
+| 2. MCP 연결 | 방법 A~E 중 실제 사용할 앱 하나만 설정 | 서버 또는 커넥터가 활성 상태 |
+| 3. 기능 검증 | 목록·목차·조문·`search`·`fetch` 호출 | 승인 원문과 출처 반환 |
+| 4. 문제 해결 | 증상별 표에서 원인 확인 | 실패한 단계의 성공 신호 확인 |
 
 바로 이동:
 
+- [이 프로그램이 제공하는 기능](#무엇을-할-수-있나요)
 - [완전 처음이라면 여기부터](#0-완전-처음이라면-여기부터)
 - [처음 설치하고 승인 데이터 만들기](#1-처음-설치하고-승인-데이터-만들기)
+- [새 규정과 개정본 관리하기](#새-규정과-개정본-관리하기)
 - [방법 A~E 중 내 앱 하나 고르기](#2-다섯-방법-중-하나-선택하기)
 - [방법 A: Claude Code 로컬 STDIO](#method-a)
 - [방법 B: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO](#method-b)
@@ -59,9 +108,16 @@ Streamlit 화면은 로컬 운영자용이며 완성형 공개 SaaS 화면이 �
 | STDIO | 같은 PC의 AI 프로그램이 Python 서버를 직접 켜고 대화하는 로컬 연결 |
 | HTTPS | Vercel에 서버를 배포하고 `https://.../mcp` 주소로 접속하는 원격 연결 |
 
-`search`는 승인된 규정을 찾아 결과 목록과 `id`를 돌려줍니다. `fetch`는 그 `id`를 받아
-원문 내용과 출처를 돌려줍니다. 따라서 **서버 이름이 보이는 것만으로는 성공이 아니며,
-두 도구가 모두 동작해야 연결 완료**입니다.
+MCP에는 두 종류의 읽기 도구가 함께 들어 있습니다.
+
+- **구조를 알고 찾을 때**: `list_regulations` → `get_regulation_toc` →
+  `get_regulation_article` 순서로 목록, 목차, 정확 조문을 조회합니다. 규정 간 관계는
+  `get_regulation_references`와 `list_regulation_reference_cycles`로 확인합니다.
+- **질문으로 찾을 때**: `search`가 승인된 규정 후보와 `id`를 돌려주고, `fetch`가 그
+  `id`의 원문 내용과 출처를 돌려줍니다.
+
+따라서 **서버 이름이 보이는 것만으로는 성공이 아닙니다.** 도구 목록을 확인하고 실제
+규정 목록 또는 검색 결과와 승인 원문까지 반환돼야 연결 완료입니다.
 
 ## 0. 완전 처음이라면 여기부터
 
@@ -132,6 +188,16 @@ Windows 실행판 설치
 
 ## 1. 처음 설치하고 승인 데이터 만들기
 
+이 장의 각 단계는 다음 성공 신호를 확인하고 넘어갑니다.
+
+| 단계 | 클릭하거나 할 일 | 왜 필요한가 | 성공 신호 | 막히면 |
+| --- | --- | --- | --- | --- |
+| 1-1 | Release ZIP 압축 해제 후 `PR MCP Builder.exe` 실행 | 운영 화면 시작 | 기관 선택 화면 표시 | ZIP 안에서 바로 실행하지 않았는지 확인 |
+| 1-2 | 기관 생성 또는 기존 기관 선택 | 데이터와 승인을 기관 범위로 분리 | 선택한 기관의 대시보드 표시 | 잘못 골랐다면 파일을 올리기 전에 다시 선택 |
+| 1-3 | `① 파일 추가·전처리`에서 규정 파일 추가 | 문서를 규정·조문 구조로 변환 | 전처리 완료 표시 | 규정명·버전·날짜와 오류 단계 확인 |
+| 1-4 | `② 결과 확인`에서 원문과 결과 비교 | 잘못 나뉜 조문·표·별표를 승인 전에 발견 | 검토할 청크와 앞뒤 문맥 확인 | 원문과 다르면 수정 또는 재처리 |
+| 1-5 | 검토한 청크 승인 후 색인 | 승인된 근거만 RAG와 MCP에 포함 | **승인 완료 + 색인 완료** | [문제 해결표](#4-문제-해결표)에서 승인·색인 상태 확인 |
+
 ### 1-1. 프로그램 내려받기
 
 1. [최신 Windows 실행판](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)을
@@ -145,6 +211,8 @@ Windows 실행판 설치
 개발자가 소스에서 실행하는 방법은 [개발자용 실행과 검증](#개발자용-실행과-검증)에
 있습니다.
 
+**성공 신호:** 기관을 새로 만들거나 기존 기관을 고르는 첫 화면이 열립니다.
+
 ### 1-2. 기관 선택
 
 기관을 만들거나 기존 기관을 선택합니다. 문서와 승인 데이터는 선택한 기관 범위로
@@ -155,6 +223,9 @@ Windows 실행판 설치
 선택 후 대시보드에서 현재 작업 상태와 다음 단계를 확인합니다.
 
 ![기관 선택 뒤 나타나는 작업 대시보드](docs/assets/readme-guide-01-dashboard.png)
+
+**성공 신호:** 대시보드 위쪽에 지금 작업할 기관이 표시됩니다. 기관을 잘못 선택했다면
+규정 파일을 올리기 전에 돌아가서 바꿉니다.
 
 ### 1-3. 규정 파일 올리기
 
@@ -172,6 +243,10 @@ Windows 실행판 설치
 
 ![규정 전처리 완료 화면](docs/assets/readme-guide-02-preprocess-complete.png)
 
+**왜 하나요?** 이 단계가 문서의 평면 텍스트를 규정명·버전·장·절·조·별표·부칙
+단위로 나눕니다. **성공 신호는 진행률 숫자가 아니라 전처리 완료 상태와 결과 확인
+단계에서 실제 청크를 열 수 있는 것**입니다.
+
 ### 1-4. 처리 결과 확인
 
 `② 결과 확인`에서 처리할 규정을 불러옵니다. 품질 결과가 표시되어도 자동 승인된 것은
@@ -188,6 +263,9 @@ Windows 실행판 설치
 
 ![원문과 전처리 결과 및 앞뒤 문맥을 비교하는 화면](docs/assets/readme-guide-03-chunk-context.png)
 
+**성공 신호:** 규정명과 조문 번호가 원문과 일치하고, 조문 본문·표·별표가 엉뚱한
+조문에 섞이지 않았습니다. 다르면 다음 단계로 넘기지 말고 수정하거나 다시 처리합니다.
+
 ### 1-5. 사람이 검수하고 승인
 
 AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내용만 검색 색인과 MCP에
@@ -203,9 +281,72 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 ![승인 데이터의 검색 색인이 완료된 화면](docs/assets/readme-guide-04-indexed.png)
 
+**성공 신호:** 승인 완료와 검색 색인 완료가 함께 표시됩니다. 승인만 끝나고 색인이
+실패했다면 MCP를 만들기 전에 색인 복구를 실행합니다.
+
 > [!WARNING]
 > 원문 업로드, 미승인 데이터, API 키, 비밀번호와 기관 내부 비밀 자료를 공개 저장소나
 > 공개 Vercel 배포에 넣지 마세요.
+
+## 새 규정과 개정본 관리하기
+
+규정 데이터는 파일이 들어온 순서가 아니라 다음 논리 계층으로 관리됩니다.
+
+```text
+기관
+└─ 규정
+   ├─ 개정 버전과 효력 기간
+   └─ 장 → 절 → 조 → 항·호
+      └─ 별표·서식·부칙
+```
+
+### 처음 보는 규정을 추가할 때
+
+1. `① 파일 추가·전처리`에서 파일을 올립니다.
+2. 자동 인식된 규정명, 규정 번호, 버전, 개정일과 시행일을 원문과 비교합니다.
+3. `② 결과 확인`에서 구조와 내용을 검수합니다.
+4. 사용할 청크를 승인하고 색인 완료를 확인합니다.
+5. MCP를 다시 만들거나 기존 운영 절차에 따라 갱신한 뒤 `list_regulations`의
+   `total_count`와 새 규정명을 확인합니다.
+
+**성공 신호:** 새 규정은 목록에 한 번만 나타나고, 목차에서 조문·별표·부칙으로
+내려갈 수 있습니다.
+
+### 기존 규정의 최신 개정본을 넣을 때
+
+기존 파일을 덮어쓰지 말고 **같은 규정의 새 버전**으로 추가합니다. 그래야 언제 어떤
+본문이 유효했는지 이력을 잃지 않습니다.
+
+1. 개정본 파일을 추가하고 기존 규정과 같은 규정 계열인지 확인합니다.
+2. 새 버전, 개정일, 시행일과 이전 버전 관계를 확인합니다.
+3. 바뀐 조문뿐 아니라 목차·별표·부칙과 인용 관계도 원문과 비교합니다.
+4. 새 버전을 승인하고 색인합니다.
+5. 변경된 규정 단위의 색인이 끝났는지 확인합니다. 변경 없는 다른 규정은 다시
+   색인하지 않습니다.
+6. 현재 날짜 조회와 과거 기준일 조회를 각각 실행해 올바른 버전이 선택되는지 봅니다.
+
+**성공 신호:** 기본 조회에는 기준일에 유효한 현재본이 나오고, 이력 포함 또는 과거
+`as_of_date` 조회에는 승인된 이전 버전과 효력 기간이 구분되어 나옵니다.
+
+> [!IMPORTANT]
+> 제목이 비슷하다는 이유만으로 새 파일을 기존 규정에 임의로 연결하지 마세요. 규정
+> 번호·버전·시행일과 원문의 개정 관계가 불명확하면 별도 규정으로 검토하거나 담당자가
+> 계보를 확인한 뒤 승인합니다.
+
+### 구조·조문·참조·개정 상태를 확인하는 질문 예시
+
+```text
+승인된 규정 전체 목록과 total_count를 보여줘.
+인사규정의 목차에서 장·절·조·별표·부칙을 보여줘.
+인사규정 제16조의 승인 원문과 출처를 보여줘.
+인사규정이 다른 규정을 참조하는 부분과 인사규정을 참조하는 규정을 보여줘.
+현재 적재된 규정 사이의 순환참조를 보여줘.
+2026-08-01을 기준으로 인사규정 제16조에 적용되는 버전을 보여줘.
+```
+
+목록·목차·조문은 구조 도구로 확인하고, 주제나 표현을 모를 때는 `search`와 `fetch`를
+사용합니다. 참조 대상 규정이 아직 적재되지 않았다면 참조는 미해결 상태로 표시될 수
+있으므로, “미해결”을 “참조가 없음”으로 해석하지 않습니다.
 
 ## 2. 다섯 방법 중 하나 선택하기
 
@@ -248,6 +389,8 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 ### 방법 A — Claude Code 로컬 STDIO
 
+**언제 선택하나요?** Builder와 Claude Code를 같은 PC에서 사용할 때 선택합니다.
+
 1. Builder에서 `Claude Code` 왼쪽 동그라미를 누릅니다.
 2. 저장 폴더와 MCP 이름을 넣고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
 3. 생성된 번들 폴더를 열고 그 폴더에서 PowerShell을 엽니다.
@@ -257,7 +400,13 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 [방법 A 화면과 명령을 그대로 따라가기](#method-a)
 
+**성공 신호:** `claude mcp list`에 서버가 보이고 실제 승인 원문이 반환됩니다.
+**막히면:** 상세 절차의 `claude mcp get` 결과와 번들 진단 스크립트를 확인합니다.
+
 ### 방법 B — ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO
+
+**언제 선택하나요?** ChatGPT Desktop 또는 Codex를 Builder와 같은 PC에서 사용할 때
+선택합니다.
 
 1. Builder에서
    `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)` 왼쪽 동그라미를 누릅니다.
@@ -276,7 +425,14 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 [방법 B 화면과 각 입력 칸을 그대로 따라가기](#method-b)
 
+**성공 신호:** ChatGPT의 MCP 서버가 켜지거나 Codex가 설정 블록을 읽고 도구 목록을
+표시합니다. **막히면:** `Command`와 `Arguments`를 한 칸에 합치지 않았는지, 번들
+폴더를 생성 뒤 옮기지 않았는지 확인합니다.
+
 ### 방법 C — Claude Desktop 로컬 STDIO
+
+**언제 선택하나요?** Claude Desktop과 Builder를 같은 Windows PC에서 사용할 때
+선택합니다.
 
 1. Builder에서 `Claude Desktop` 왼쪽 동그라미를 누릅니다.
 2. 저장 폴더와 MCP 이름을 넣고 번들을 만듭니다.
@@ -295,6 +451,10 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 [방법 C 화면과 JSON 위치를 그대로 따라가기](#method-c)
 
+**성공 신호:** 서버 이름 옆 파란 배지가 `running`이고 승인 원문이 반환됩니다.
+**막히면:** 기존 서버 설정을 지우지 말고 상세 절차의 JSON 병합 예시와
+`disconnected` 진단을 확인합니다.
+
 ### 방법 D — ChatGPT · Vercel HTTPS MCP
 
 Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다. 원격 선택지는 검증된
@@ -312,7 +472,14 @@ Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다. 원
 
 [방법 D의 정확한 URL 입력 칸 보기](#method-d)
 
+**성공 신호:** Production `/mcp` URL의 원격 smoke가 통과하고 ChatGPT에 일곱 개의
+읽기 도구가 보입니다. **막히면:** Preview URL이 아니라 `Aliased:` Production
+주소인지, 끝에 `/mcp`가 있는지 확인합니다.
+
 ### 방법 E — Claude · Vercel HTTPS MCP
+
+**언제 선택하나요?** Vercel에 배포한 하나의 HTTPS 주소를 Claude의 원격
+Connector로 사용할 때 선택합니다.
 
 1. 주소가 아직 없다면 먼저
    [Vercel 공통 준비 V-1~V-7](#vercel-common)을
@@ -326,6 +493,13 @@ Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다. 원
 6. 새 대화에서 `search`와 `fetch`를 차례로 호출합니다.
 
 [방법 E의 정확한 Connector 입력 칸 보기](#method-e)
+
+**성공 신호:** Connector가 활성화되고 목록·목차·조문 또는 `search`·`fetch` 호출이
+성공합니다. **막히면:** 로컬 `command`를 입력하지 않았는지와 인증 방식을 확인합니다.
+
+<a id="생성-완료-화면-읽는-법"></a>
+<details>
+<summary><strong>생성 완료 화면의 각 항목이 궁금하면 펼치기</strong></summary>
 
 ### 생성 완료 화면 읽는 법
 
@@ -440,7 +614,12 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 
 ![MCP 생성 완료 화면에서 로컬 STDIO와 Vercel HTTPS의 다음 단계를 구분하는 설명용 화면](docs/assets/readme-course-00-completion-guide.png)
 
+</details>
+
 <a id="method-a"></a>
+
+<details>
+<summary><strong>방법 A 상세 절차 펼치기 — Claude Code 로컬 STDIO</strong></summary>
 
 ## 방법 A 상세: Claude Code 로컬 STDIO 연결
 
@@ -489,7 +668,12 @@ claude mcp get test2
 
 ![Claude Code 로컬 MCP의 initialize, search, fetch 성공 결과를 읽는 설명용 화면](docs/assets/readme-course-05-mcp-verification.png)
 
+</details>
+
 <a id="method-b"></a>
+
+<details>
+<summary><strong>방법 B 상세 절차 펼치기 — ChatGPT Desktop / Codex 로컬 STDIO</strong></summary>
 
 ## 방법 B 상세: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO 연결
 
@@ -757,7 +941,12 @@ args = [
 `search` 결과와 그 결과의 `id`를 사용한 `fetch` 본문·출처가 모두 나오면 Codex 연결
 완료입니다.
 
+</details>
+
 <a id="method-c"></a>
+
+<details>
+<summary><strong>방법 C 상세 절차 펼치기 — Claude Desktop 로컬 STDIO</strong></summary>
 
 ## 방법 C 상세: Claude Desktop 로컬 STDIO 연결
 
@@ -1080,7 +1269,12 @@ JSON 쉼표나 중괄호 오류를 먼저 찾을 수 있습니다.
 첫 명령은 Python·프로젝트·import 오류를 정확히 표시합니다. 둘째 명령은
 `initialize` → `tools/list` → `search` → `fetch`까지 실제 STDIO 연결을 확인합니다.
 
+</details>
+
 <a id="vercel-common"></a>
+
+<details>
+<summary><strong>Vercel HTTPS 배포 V-1~V-7 전체 절차 펼치기</strong></summary>
 
 ## 방법 D·E 공통 준비: Vercel HTTPS 배포와 검증
 
@@ -1223,8 +1417,8 @@ Dashboard에 프로젝트가 보인다고 배포가 끝난 것은 아닙니다. 
 
 #### 공개해도 되는 승인 규정의 read-only endpoint
 
-공개가 허용된 규정만 포함했고 누구나 `search`·`fetch`를 호출해도 되는 경우에만 다음
-값을 Production 환경에 넣습니다.
+공개가 허용된 규정만 포함했고 누구나 읽기 전용 목록·계층·조문·검색 도구를 호출해도 되는
+경우에만 다음 값을 Production 환경에 넣습니다.
 
 ```powershell
 $StageDir = Read-Host "V-2에서 만든 배포 전용 폴더 전체 경로"
@@ -1237,7 +1431,9 @@ vercel env add MCP_TOOL_PROFILE production `
   --cwd "$StageDir"
 ```
 
-이 모드는 쓰기 도구 없이 원격 공개 범위를 `search`, `fetch`로 제한하는 용도입니다.
+이 모드는 쓰기 도구 없이 원격 공개 범위를 `list_regulations`, `get_regulation_toc`,
+`get_regulation_article`, `get_regulation_references`,
+`list_regulation_reference_cycles`, `search`, `fetch`로 제한하는 용도입니다.
 
 명령 실행 뒤 Vercel 홈페이지에서도 확인할 수 있습니다.
 
@@ -1319,13 +1515,19 @@ endpoint에는 설정한 인증을 사용합니다.
 - `mcp_initialized`: `true`
 - `tools_discovered`: `true`
 - `end_to_end_verified`: `true`
-- `tool_names`: `search`, `fetch` 포함
+- `tool_names`: `list_regulations`, `get_regulation_toc`, `get_regulation_article`,
+  `get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch` 포함
 
 이 네 값 중 하나라도 `false`이면 Claude나 ChatGPT에 등록하지 않습니다. Vercel Dashboard의
 **Logs**에서 가장 최근 Function 오류를 확인하고 [문제 해결표](#4-문제-해결표)의
 Vercel 항목을 먼저 처리합니다.
 
+</details>
+
 <a id="method-d"></a>
+
+<details>
+<summary><strong>방법 D 상세 절차 펼치기 — ChatGPT · Vercel HTTPS MCP</strong></summary>
 
 ## 방법 D 상세: ChatGPT · Vercel HTTPS MCP 연결
 
@@ -1396,7 +1598,12 @@ https://my-regulation-mcp.vercel.app/mcp
 7. [3장](#3-search와-fetch로-최종-확인하기)의 문장을 보내 `search`와 `fetch`를
    실제로 호출합니다.
 
+</details>
+
 <a id="method-e"></a>
+
+<details>
+<summary><strong>방법 E 상세 절차 펼치기 — Claude · Vercel HTTPS MCP</strong></summary>
 
 ## 방법 E 상세: Claude · Vercel HTTPS MCP 연결
 
@@ -1432,14 +1639,52 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 
 ![승인 번들을 Vercel에 배포하고 고정 Production URL을 Claude 커넥터에 등록한 뒤 search와 fetch로 확인하는 순서](docs/assets/readme-vercel-claude-connection.svg)
 
+</details>
+
 ## 3. search와 fetch로 최종 확인하기
 
-로컬 STDIO와 Vercel HTTPS 모두 같은 방식으로 최종 확인합니다.
+로컬 STDIO와 Vercel HTTPS 모두 같은 방식으로 최종 확인합니다. 연결 직후에는
+`search`만 시험하지 말고 **목록 → 구조 → 정확 조문 → 참조 → 검색 원문** 순서로
+확인해야 규정 MCP가 제대로 만들어졌는지 알 수 있습니다.
 
 1. AI 프로그램을 완전히 종료하고 다시 실행합니다.
 2. 새 대화를 만듭니다.
 3. 방금 등록한 MCP 서버 또는 커넥터를 활성화합니다.
-4. 다음 요청을 그대로 보내되 검색어는 내 규정에 있는 말로 바꿉니다.
+4. 아래 요청을 차례로 보내되 규정명과 검색어는 내 데이터에 있는 값으로 바꿉니다.
+
+### 3-1. 전체 목록과 수 확인
+
+```text
+연결한 규정 MCP의 list_regulations 도구로 승인된 규정 목록을 보여줘.
+페이지를 끝까지 확인하고 total_count와 중복 없는 규정 수를 알려줘.
+```
+
+**성공 신호:** 조항·별표·부칙 청크가 각각 규정처럼 중복되지 않고, 하나의 규정이 목록에
+한 번만 나타납니다. 규정이 많으면 페이지를 넘겨도 `total_count`가 유지됩니다.
+
+### 3-2. 계층과 정확 조문 확인
+
+```text
+목록에서 인사규정을 찾아 get_regulation_toc으로 목차를 보여줘.
+그다음 get_regulation_article로 인사규정 제16조의 승인 원문과 출처를 보여줘.
+```
+
+**성공 신호:** 목차가 장·절·조·별표·부칙의 부모-자식 관계로 나오고, 제16조 요청에는
+다른 조문의 유사 문장이 아니라 **제16조의 본문**이 반환됩니다.
+
+### 3-3. 다른 규정 참조와 순환참조 확인
+
+```text
+get_regulation_references로 인사규정이 참조하는 규정과 인사규정을 참조하는 규정을 보여줘.
+list_regulation_reference_cycles로 현재 승인 규정 사이의 순환참조를 보여줘.
+```
+
+**성공 신호:** 들어오는 참조와 나가는 참조가 구분됩니다. 아직 적재되지 않은 대상은
+미해결로 표시될 수 있고, 순환참조가 없으면 빈 목록이 정상입니다.
+
+### 3-4. 자연어 검색과 원문 확인
+
+다음 요청의 검색어만 내 규정에 있는 말로 바꿉니다.
 
 ```text
 연결한 규정 MCP의 search 도구로 인사규정을 찾아줘.
@@ -1453,10 +1698,16 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 3. 그중 하나의 `id`로 MCP `fetch` 도구가 실행됩니다.
 4. 승인된 규정 본문과 출처가 표시됩니다.
 
-반대로 아래 중 하나라도 보이면 아직 완료가 아닙니다.
+**왜 둘 다 호출하나요?** `search` 성공은 후보를 찾았다는 뜻이고, `fetch` 성공은 그
+후보의 승인 원문과 출처를 실제로 읽을 수 있다는 뜻입니다.
+
+반대로 아래 중 하나라도 보이면 아직 완료가 아닙니다. 해당 현상을 그대로
+[문제 해결표](#4-문제-해결표)에서 찾습니다.
 
 - 서버 이름만 보이고 도구 목록이 비어 있다.
 - Claude Desktop에서 `running`이 아니라 `disconnected`다.
+- `list_regulations`의 수가 예상과 다르거나 같은 규정이 청크별로 반복된다.
+- 목차에서 장·절·조 관계가 끊기거나 정확 조문 요청에 다른 조문이 나온다.
 - `search`는 되지만 결과마다 `id`가 없다.
 - `fetch`에 제목이나 본문을 넣고 있고, `search`가 준 `id`를 넣지 않았다.
 
@@ -1464,11 +1715,13 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 
 ![Claude에서 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](docs/assets/readme-claude-mcp-03-verify.svg)
 
-다섯 항목을 모두 체크하면 연결 완료입니다.
+다음 항목을 모두 체크하면 연결 완료입니다.
 
 - [ ] 서버 또는 커넥터가 목록에 보인다.
 - [ ] Claude Desktop은 `running`이고, 다른 로컬 앱은 서버가 등록·활성화되어 있다.
-- [ ] 도구 목록에 `search`와 `fetch`가 보인다.
+- [ ] 도구 목록에 `list_regulations`, `get_regulation_toc`, `get_regulation_article`,
+  `get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch`가 보인다.
+- [ ] `list_regulations`의 `total_count`와 페이지별 고유 규정 수가 맞고, 첫 규정의 목차·조문 조회가 된다.
 - [ ] `search`가 한 개 이상의 결과를 반환한다.
 - [ ] 검색 결과의 `id`로 `fetch`가 본문과 출처를 반환한다.
 
@@ -1480,14 +1733,21 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 | ChatGPT Desktop 서버가 목록에 없음 | 다른 MCP 화면에 입력했거나 저장 안 함 | **설정 > 플러그인 > MCP**에서 STDIO 또는 Streamable HTTP 유형과 저장 상태 확인 |
 | Claude Code 또는 Codex 서버가 목록에 없음 | 등록 스크립트 미실행 또는 TOML 미반영 | `claude mcp list` 또는 `~/.codex/config.toml`을 확인하고 앱을 다시 시작 |
 | Vercel 원격 서버가 목록에 없음 | 로컬 설정 화면에 URL을 입력했거나 Connector 저장 안 함 | 방법 D는 ChatGPT의 Streamable HTTP, 방법 E는 Claude Connectors에서 확인 |
-| Claude Desktop가 `disconnected` | `command`, `args`, `env` 일부 누락 | 생성 JSON의 한 서버 항목을 수정 없이 다시 병합 |
+| Claude Desktop이 `disconnected` | `command`, `args`, `env` 일부 누락 | 생성 JSON의 한 서버 항목을 수정 없이 다시 병합 |
 | 연결 마법사 실행이 차단됨 | PowerShell 실행 정책 또는 명령 일부 누락 | README의 `powershell.exe -NoProfile -ExecutionPolicy Bypass ...` 전체 명령을 다시 복사 |
 | Claude가 JSON 편집 뒤 시작되지 않음 | 쉼표·중괄호 오류 | 최신 `claude_desktop_config.json.bak-...`를 원래 파일명으로 복사해 복구 |
 | `Python was not found` | 파일 없음 또는 wrapper probe 실패 | `doctor_mcp_connection.ps1`을 실행해 버전·marker·project root·import 진단 확인 |
 | Python은 있는데 import 실패 | Python 3.11 미만, 잘못된 프로젝트 Python, 의존성 누락 | 생성기가 검증한 프로젝트 Python을 사용하고 진단 stderr 확인 |
 | 도구가 0개 | 서버 미활성화 또는 시작 실패 | 새 대화에서 서버를 활성화하고 `validate_mcp_smoke.ps1` 실행 |
+| 규정 목록이 예상보다 적음 | 첫 페이지만 봤거나 승인·색인이 끝나지 않은 규정이 있음 | `total_count`와 다음 페이지를 확인하고 각 규정의 승인·색인 상태 점검 |
+| 같은 규정이 목록에 반복됨 | 오래된 번들 또는 규정 계열·버전 식별이 잘못됨 | 최신 번들을 다시 만들고 규정명·번호·버전 연결을 검토 |
+| 목차에서 장·절·조가 끊김 | 전처리 구조가 잘못됐거나 필요한 청크가 미승인 | `② 결과 확인`에서 앞뒤 문맥과 계층을 다시 검수한 뒤 승인·색인 |
+| 정확 조문이 안 나옴 | 조문 번호 표기가 다르거나 잘못된 규정을 선택 | 먼저 `list_regulations`와 `get_regulation_toc`로 규정·조문 번호를 확인 |
+| 참조가 `unresolved`로 표시됨 | 대상 규정이 아직 없거나 대상 조문을 정확히 연결하지 못함 | 대상 규정을 적재·승인하고 규정명·조문 번호를 원문과 비교 |
+| 개정 후에도 이전 본문이 나옴 | 시행일 전이거나 버전·효력 기간·계보가 잘못됨 | 현재 날짜와 `as_of_date`를 확인하고 새 버전의 개정일·시행일·이전 버전 관계 검토 |
 | `search` 결과가 0개 | 검색어 불일치 또는 승인·색인된 데이터 없음 | 승인 및 색인 상태를 다시 확인하고 실제 규정 용어로 검색 |
 | `fetch` 실패 | 검색 결과의 `id`가 아닌 제목을 전달 | `search` 응답의 정확한 `id` 값을 사용 |
+| 전처리·색인이 오래 걸림 | 큰 HWP·표·다수 규정 처리 또는 색인 복구 진행 중 | 현재 단계, 처리 규정 수, 마지막 갱신 시각을 확인하고 같은 버튼을 반복해서 누르지 않기 |
 | 폴더를 옮긴 뒤 실패 | 설정의 절대경로가 이전 위치를 가리킴 | 새 위치에서 MCP 번들을 다시 생성 |
 | `node`, `npm`, `vercel`을 찾을 수 없음 | 설치 뒤 이전 PowerShell을 계속 사용하거나 PATH 미반영 | Node.js LTS와 Vercel CLI를 설치하고 모든 PowerShell을 닫은 뒤 새 창에서 버전 확인 |
 | Vercel 프로젝트가 안 보임 | 다른 Vercel 계정·팀으로 로그인 | `vercel whoami`와 Dashboard의 현재 계정·팀을 비교 |
@@ -1503,9 +1763,15 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 | --- | --- |
 | 운영체제 | Windows 10/11 64비트 우선 |
 | 입력 파일 | PDF, HWP, HWPX, DOCX |
-| 검색 데이터 | 사람이 승인한 최신 유효 규정 |
+| 규정 구조 | 규정 → 버전 → 장·절·조·항·호, 별표·서식·부칙 |
+| 목록·조문 | 승인된 고유 규정 페이지 목록, 목차, 정확 조문 |
+| 관계 | 규정·조문 간 들어오는/나가는 참조와 순환참조 |
+| 개정 관리 | 규정 단위 갱신, 효력 기간에 따른 현재본과 승인 이력 |
+| 검색 데이터 | 사람이 승인한 규정 중 조회 기준일에 유효한 버전 |
 | 로컬 연결 | ChatGPT Desktop / Codex CLI / Codex IDE, Claude Desktop, Claude Code |
 | 원격 연결 | Vercel에 배포한 HTTPS `/mcp` |
+
+### 꼭 지켜야 할 운영 원칙
 
 - 전처리 결과는 검토용 초안이며 자동 승인이 아닙니다.
 - 원문, API 키, 토큰, 기관 내부 식별자와 사용자 로컬 경로를 공개 저장소에 올리지 마세요.
@@ -1514,10 +1780,28 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 - Vercel Function 로그는 기관용 영속 감사 저널을 대신하지 않습니다.
 - 공개 또는 기관 운영 전에는 [SECURITY.md](SECURITY.md)를 확인하세요.
 
+<details>
+<summary><strong>“승인 기반”이 실제로 뜻하는 범위</strong></summary>
+
+- 파일 업로드와 전처리 완료만으로는 검색 대상이 되지 않습니다.
+- 사람이 원문과 비교해 승인한 청크만 공식 색인과 MCP 번들에 들어갑니다.
+- 목록·목차·조문·참조·검색 도구도 호출자의 기관·프로필·접근 범위 안에서만
+  승인 데이터를 반환합니다.
+- 과거 개정본은 승인 증거와 효력 기간이 확인되고 과거 기준일 또는 이력 조회를
+  명시했을 때 구분해 사용합니다.
+- 공개 Vercel endpoint는 read-only 도구만 노출하고, 공개가 허용된 데이터인지
+  기관 담당자가 별도로 판단해야 합니다.
+
+</details>
+
 ## 더 자세한 안내
+
+처음 설치 중이라면 이 README만 따라가고, 특정 연결이나 운영 계약을 확인할 때 아래
+문서를 여세요.
 
 - [MCP 빠른 연결 안내](docs/mcp_quickconnect_ko.md)
 - [MCP 클라이언트 설정 예시](docs/mcp_client_config_examples_ko.md)
+- [MCP 도구 계약과 프로필](docs/mcp_tool_contract_ko.md)
 - [Vercel HTTPS MCP 배포 안내](docs/vercel_https_mcp_ko.md)
 - [MCP 로컬 서버 공식 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)
 - [OpenAI MCP 공식 문서](https://learn.chatgpt.com/docs/extend/mcp)
@@ -1526,6 +1810,9 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 - [Vercel CLI 배포 공식 안내](https://vercel.com/docs/projects/deploy-from-cli)
 
 ## 개발자용 실행과 검증
+
+<details>
+<summary><strong>소스에서 실행·테스트·패키징하는 명령 펼치기</strong></summary>
 
 Python 3.11 이상에서 프로젝트 루트 기준으로 실행합니다.
 
@@ -1549,6 +1836,8 @@ python scripts\audit_release_hygiene.py `
 기여 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md), 공개 저장소 이력 원칙은
 [docs/public_repository_history_policy_ko.md](docs/public_repository_history_policy_ko.md)를
 확인하세요.
+
+</details>
 
 ## 업데이트 내역
 

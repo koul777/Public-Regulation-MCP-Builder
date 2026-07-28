@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
-from typing import Annotated, Any, Self, Sequence
+import time
+from typing import Annotated, Any, Callable, Mapping, Self, Sequence
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic.fields import FieldInfo
@@ -42,6 +43,7 @@ from app.ingestion.vector_adapter import (
 )
 from app.ingestion.vector_integrity import embedded_vector_integrity_reason
 from app.ingestion.vector_upsert import (
+    LocalJsonlVectorTarget,
     validate_vector_record_tenant_scope,
     validate_vector_target_tenant_scope,
     vector_upsert_target,
@@ -145,6 +147,8 @@ class ApprovalRequest(BaseModel):
         max_length=MAX_REVIEW_DECISION_EVENTS,
     )
     approval_override_reason: str | None = Field(default=None, max_length=1000)
+    defer_vector_sync: bool = False
+    vector_sync_batch_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_CHARS)
 
     @field_validator("review_decision_events")
     @classmethod
@@ -155,6 +159,12 @@ class ApprovalRequest(BaseModel):
             max_items=MAX_REVIEW_EVENT_JSON_ITEMS,
             max_text_chars=MAX_REVIEW_EVENT_JSON_TEXT_CHARS,
         )
+
+    @model_validator(mode="after")
+    def validate_deferred_vector_sync(self) -> Self:
+        if self.defer_vector_sync and not str(self.vector_sync_batch_id or "").strip():
+            raise ValueError("vector_sync_batch_id is required when defer_vector_sync is true.")
+        return self
 
 
 class ReviewChunkUpdateRequest(BaseModel):
@@ -545,7 +555,7 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 def _public_upsert_summary(result: dict) -> dict:
-    hidden = {"target_path", "local_path_leak_samples"}
+    hidden = {"target_path", "bm25_index_path", "local_path_leak_samples"}
     return {key: value for key, value in result.items() if key not in hidden}
 
 
@@ -803,6 +813,9 @@ def _run_document_indexing(
     action: str,
     chunks: list[Chunk] | None = None,
 ) -> dict:
+    indexing_started = time.perf_counter()
+    timing_ms: dict[str, float] = {}
+    step_started = indexing_started
     document = repository.get_document(document_id)
     if document is None:
         raise HTTPException(status_code=404, detail=f"Document not found: {document_id}")
@@ -810,26 +823,36 @@ def _run_document_indexing(
     target_type = _safe_secure_rag_target_type(request.target_type)
     prepared_chunks = _chunks_for_indexing(chunks, document, auth)
     _require_approval_journal_records(repository, document_id=document_id, chunks=chunks, auth=auth)
+    timing_ms["load_validate"] = round((time.perf_counter() - step_started) * 1000, 3)
+    step_started = time.perf_counter()
     records, vector_summary = build_vector_records(prepared_chunks)
     validate_vector_record_tenant_scope(records, expected_tenant_id=auth.tenant_id)
     if not records and action not in {"reindex", "review_vector_sync"}:
         raise HTTPException(status_code=400, detail="No approved chunks are available for indexing.")
+    timing_ms["vector_record_build"] = round((time.perf_counter() - step_started) * 1000, 3)
 
+    step_started = time.perf_counter()
     embedded_records, embedding_summary = embed_vector_records(
         records,
         dimensions=request.embedding_dimensions,
         model=LOCAL_HASH_EMBEDDING_MODEL,
     )
+    timing_ms["embedding"] = round((time.perf_counter() - step_started) * 1000, 3)
+    step_started = time.perf_counter()
     target_path = _default_vector_target_path(settings, auth, target_type)
     validate_vector_target_tenant_scope(target_type, target_path, expected_tenant_id=auth.tenant_id)
     target = vector_upsert_target(target_type, target_path=target_path, collection_name=request.collection_name)
     upsert_summary = target.upsert(embedded_records, dry_run=request.dry_run, fail_on_leak=True, document_id=document_id)
+    timing_ms["shared_store_upsert"] = round((time.perf_counter() - step_started) * 1000, 3)
 
+    step_started = time.perf_counter()
     artifact_dir = _vector_artifact_dir(settings, document_id)
     records_jsonl = artifact_dir / "vector_records.jsonl"
     embedded_jsonl = artifact_dir / "embedded_records.jsonl"
     _write_jsonl(records_jsonl, records)
     _write_jsonl(embedded_jsonl, embedded_records)
+    timing_ms["artifact_write"] = round((time.perf_counter() - step_started) * 1000, 3)
+    timing_ms["total_before_journal"] = round((time.perf_counter() - indexing_started) * 1000, 3)
 
     timestamp = datetime.now(timezone.utc).isoformat()
     indexing_job = {
@@ -849,6 +872,7 @@ def _run_document_indexing(
         "embedding_dimensions": request.embedding_dimensions,
         "vector_summary": vector_summary,
         "embedding_summary": embedding_summary,
+        "timing_ms": timing_ms,
         "upsert_summary": _public_upsert_summary(upsert_summary),
         "artifacts": {
             "vector_records_jsonl": records_jsonl.name,
@@ -857,6 +881,387 @@ def _run_document_indexing(
     }
     repository.append_indexing_job(indexing_job)
     return indexing_job
+
+
+def index_documents_batch(
+    document_ids: Sequence[str],
+    request: IndexRequest | None,
+    auth_context: AuthContext,
+    *,
+    progress_callback: Callable[[int, str, int | None, int | None], None] | None = None,
+    vector_sync_batch_ids: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    batch_started = time.perf_counter()
+    batch_timing_ms: dict[str, float] = {}
+    settings = get_settings()
+    auth = coerce_auth_context(auth_context)
+    request_settings = settings_for_tenant(settings, auth.tenant_id)
+    repository = _repository(request_settings)
+    request = request or IndexRequest()
+    normalized_ids = list(
+        dict.fromkeys(str(document_id or "").strip() for document_id in document_ids if str(document_id or "").strip())
+    )
+    if not normalized_ids:
+        raise HTTPException(status_code=400, detail="At least one document_id is required for batch indexing.")
+    normalized_sync_batch_ids = {
+        document_id: str((vector_sync_batch_ids or {}).get(document_id) or "").strip()
+        for document_id in normalized_ids
+        if str((vector_sync_batch_ids or {}).get(document_id) or "").strip()
+    }
+
+    total_units = (2 * len(normalized_ids)) + 1
+
+    def report(current: int, message: str, *, percent: int | None = None) -> None:
+        if progress_callback is None:
+            return
+        computed = int(current * 99 / max(total_units, 1)) if percent is None else percent
+        progress_callback(max(0, min(100, computed)), message, current, total_units)
+
+    try:
+        require_api_role(auth, API_WRITE_ROLES)
+        target_type = _safe_secure_rag_target_type(request.target_type)
+        target_path = _default_vector_target_path(request_settings, auth, target_type)
+        validate_vector_target_tenant_scope(target_type, target_path, expected_tenant_id=auth.tenant_id)
+        target = vector_upsert_target(
+            target_type,
+            target_path=target_path,
+            collection_name=request.collection_name,
+        )
+        if not isinstance(target, LocalJsonlVectorTarget):
+            raise HTTPException(status_code=400, detail="Batch indexing currently supports local-jsonl only.")
+
+        preparation_started = time.perf_counter()
+        prepared_items: dict[str, dict[str, Any]] = {}
+        records_by_document: dict[str, list[dict[str, Any]]] = {}
+        report(0, "규정별 승인 데이터 준비")
+        for index, document_id in enumerate(normalized_ids, start=1):
+            _require_document_access(repository, document_id, auth)
+            document = repository.get_document(document_id)
+            if document is None:
+                raise HTTPException(status_code=404, detail=f"Document not found: {document_id}")
+            document_label = str(document.document_name or document.filename or "규정").strip()[:160]
+            chunks = _load_review_chunks(repository, document_id)
+            prepared_chunks = _chunks_for_indexing(chunks, document, auth)
+            _require_approval_journal_records(
+                repository,
+                document_id=document_id,
+                chunks=chunks,
+                auth=auth,
+            )
+            records, vector_summary = build_vector_records(prepared_chunks)
+            validate_vector_record_tenant_scope(records, expected_tenant_id=auth.tenant_id)
+            if not records:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No approved chunks are available for batch indexing: {document_id}",
+                )
+            embedded_records, embedding_summary = embed_vector_records(
+                records,
+                dimensions=request.embedding_dimensions,
+                model=LOCAL_HASH_EMBEDDING_MODEL,
+            )
+            prepared_items[document_id] = {
+                "records": records,
+                "embedded_records": embedded_records,
+                "vector_summary": vector_summary,
+                "embedding_summary": embedding_summary,
+                "document_label": document_label,
+            }
+            records_by_document[document_id] = embedded_records
+            report(
+                index,
+                f"규정 {index:,}/{len(normalized_ids):,} 색인 데이터 준비 완료 · {document_label}",
+            )
+        batch_timing_ms["document_preparation"] = round(
+            (time.perf_counter() - preparation_started) * 1000,
+            3,
+        )
+
+        report(len(normalized_ids), "공유 벡터·BM25 인덱스 일괄 저장")
+        upsert_started = time.perf_counter()
+        upsert_summary = target.upsert_documents(
+            records_by_document,
+            dry_run=request.dry_run,
+            fail_on_leak=True,
+        )
+        batch_timing_ms["shared_store_upsert"] = round(
+            (time.perf_counter() - upsert_started) * 1000,
+            3,
+        )
+        completed_units = len(normalized_ids) + 1
+        report(completed_units, "공유 벡터·BM25 인덱스 저장 완료")
+
+        public_upsert = _public_upsert_summary(upsert_summary)
+        document_summaries = public_upsert.pop("document_summaries", {})
+        timestamp = datetime.now(timezone.utc).isoformat()
+        jobs: list[dict[str, Any]] = []
+        artifact_journal_started = time.perf_counter()
+        for index, document_id in enumerate(normalized_ids, start=1):
+            item = prepared_items[document_id]
+            artifact_dir = _vector_artifact_dir(request_settings, document_id)
+            records_jsonl = artifact_dir / "vector_records.jsonl"
+            embedded_jsonl = artifact_dir / "embedded_records.jsonl"
+            _write_jsonl(records_jsonl, item["records"])
+            _write_jsonl(embedded_jsonl, item["embedded_records"])
+            indexing_job = {
+                "indexing_job_id": f"index_{uuid.uuid4().hex[:12]}",
+                "document_id": document_id,
+                "tenant_id": auth.tenant_id,
+                "action": "batch_index",
+                "status": "not_indexed" if request.dry_run else "indexed",
+                "created_at": timestamp,
+                "completed_at": timestamp,
+                "requested_by": auth.actor,
+                "target_type": target_type,
+                "collection_name": request.collection_name or "",
+                "dry_run": request.dry_run,
+                "record_count": len(item["records"]),
+                "embedding_model": LOCAL_HASH_EMBEDDING_MODEL,
+                "embedding_dimensions": request.embedding_dimensions,
+                "vector_sync_batch_id": normalized_sync_batch_ids.get(document_id, ""),
+                "vector_summary": item["vector_summary"],
+                "embedding_summary": item["embedding_summary"],
+                "timing_ms": {
+                    "batch_document_preparation_total": batch_timing_ms["document_preparation"],
+                    "batch_shared_store_upsert": batch_timing_ms["shared_store_upsert"],
+                },
+                "upsert_summary": {
+                    **public_upsert,
+                    "document_summary": dict(document_summaries.get(document_id) or {}),
+                },
+                "artifacts": {
+                    "vector_records_jsonl": records_jsonl.name,
+                    "embedded_records_jsonl": embedded_jsonl.name,
+                },
+            }
+            repository.append_indexing_job(indexing_job)
+            vector_sync_batch_id = normalized_sync_batch_ids.get(document_id, "")
+            if vector_sync_batch_id and not request.dry_run:
+                _complete_deferred_vector_sync_batch(
+                    repository=repository,
+                    document_id=document_id,
+                    auth=auth,
+                    batch_id=vector_sync_batch_id,
+                    indexing_job=indexing_job,
+                )
+            jobs.append(indexing_job)
+            audit_api_event(
+                request_settings,
+                auth,
+                action="document.batch_index",
+                outcome="success",
+                status_code=200,
+                resource_type="document",
+                document_id=document_id,
+                detail=f"status={indexing_job['status']} record_count={indexing_job['record_count']}",
+            )
+            completed_units += 1
+            report(
+                completed_units,
+                f"규정 {index:,}/{len(normalized_ids):,} 색인 기록 저장 완료",
+            )
+
+        batch_timing_ms["artifact_and_journal_write"] = round(
+            (time.perf_counter() - artifact_journal_started) * 1000,
+            3,
+        )
+        batch_timing_ms["total"] = round((time.perf_counter() - batch_started) * 1000, 3)
+        report(total_units, "규정 일괄 색인 완료", percent=100)
+        return {
+            "status": "not_indexed" if request.dry_run else "indexed",
+            "action": "batch_index",
+            "document_count": len(normalized_ids),
+            "record_count": sum(int(job["record_count"]) for job in jobs),
+            "timing_ms": batch_timing_ms,
+            "upsert_summary": {
+                **public_upsert,
+                "document_summaries": document_summaries,
+            },
+            "jobs": jobs,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        for document_id in normalized_ids:
+            audit_api_event(
+                request_settings,
+                auth,
+                action="document.batch_index",
+                outcome="failure",
+                status_code=500,
+                resource_type="document",
+                document_id=document_id,
+                detail=str(exc),
+            )
+        raise HTTPException(status_code=500, detail=_INDEXING_FAILURE_DETAIL) from exc
+
+
+def pending_deferred_vector_sync_batch_ids(
+    repository: JsonRepository,
+    document_id: str,
+    *,
+    maintenance_events: Sequence[Mapping[str, Any]] | None = None,
+) -> list[str]:
+    """Return durable approval batch IDs that still lack a completed sync event."""
+
+    events = (
+        list(maintenance_events)
+        if maintenance_events is not None
+        else repository.list_maintenance_events("approval_vector_sync_outcome")
+    )
+    completed = {
+        (
+            str(event.get("approval_record_id") or ""),
+            str((event.get("vector_sync") or {}).get("batch_id") or ""),
+        )
+        for event in events
+        if isinstance(event.get("vector_sync"), dict)
+        and str(event["vector_sync"].get("status") or "") == "indexed"
+    }
+    pending: list[str] = []
+    for event in events:
+        vector_sync = event.get("vector_sync")
+        if (
+            str(event.get("document_id") or "") != document_id
+            or not isinstance(vector_sync, dict)
+            or vector_sync.get("status") != "deferred"
+        ):
+            continue
+        approval_record_id = str(event.get("approval_record_id") or "").strip()
+        batch_id = str(vector_sync.get("batch_id") or "").strip()
+        if (
+            batch_id
+            and (approval_record_id, batch_id) not in completed
+            and batch_id not in pending
+        ):
+            pending.append(batch_id)
+    return pending
+
+
+def _complete_deferred_vector_sync_batch(
+    *,
+    repository: JsonRepository,
+    document_id: str,
+    auth: AuthContext,
+    batch_id: str,
+    indexing_job: Mapping[str, Any],
+) -> None:
+    events = repository.list_maintenance_events("approval_vector_sync_outcome")
+    completed_approval_ids = {
+        str(event.get("approval_record_id") or "")
+        for event in events
+        if isinstance(event.get("vector_sync"), dict)
+        and event["vector_sync"].get("status") == "indexed"
+        and str(event["vector_sync"].get("batch_id") or "").strip() == batch_id
+    }
+    deferred_approval_ids = {
+        str(event.get("approval_record_id") or "")
+        for event in events
+        if (
+            str(event.get("document_id") or "") == document_id
+            and isinstance(event.get("vector_sync"), dict)
+            and event["vector_sync"].get("status") == "deferred"
+            and str(event["vector_sync"].get("batch_id") or "").strip() == batch_id
+        )
+    }
+    for approval_record in repository.list_approval_journal_records(document_id):
+        approval_record_id = str(approval_record.get("approval_record_id") or "")
+        if (
+            approval_record_id not in deferred_approval_ids
+            or approval_record_id in completed_approval_ids
+        ):
+            continue
+        _append_approval_vector_sync_outcome(
+            repository=repository,
+            document_id=document_id,
+            auth=auth,
+            approval_record=approval_record,
+            vector_sync={
+                "status": "indexed",
+                "reason": "deferred_batch_index_completed",
+                "batch_id": batch_id,
+                "indexing_job_id": str(indexing_job.get("indexing_job_id") or ""),
+                "record_count": int(indexing_job.get("record_count") or 0),
+                "reindex_required": False,
+            },
+            outcome="completed",
+        )
+
+
+def _committed_revision_retry_context(
+    *,
+    repository: JsonRepository,
+    document: Document | None,
+    chunks: Sequence[Chunk],
+    requested_ids: set[str],
+    auth: AuthContext,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return durable approval/index evidence for a supersede-only retry."""
+
+    if (
+        document is None
+        or str(document.regulation_status or "").strip().casefold()
+        != "approved"
+        or not str(document.supersedes_document_id or "").strip()
+        or not requested_ids
+    ):
+        return None
+    selected_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.chunk_id in requested_ids
+    ]
+    if len(selected_chunks) != len(requested_ids) or any(
+        chunk.approval_status != APPROVED_CHUNK_STATUS
+        for chunk in selected_chunks
+    ):
+        return None
+    approval_records = repository.list_approval_journal_records(
+        document.document_id
+    )
+    approval_record = next(
+        (
+            record
+            for record in reversed(approval_records)
+            if set(str(item) for item in record.get("chunk_ids") or [])
+            == requested_ids
+            and str(record.get("tenant_id") or "").strip() == auth.tenant_id
+            and all(
+                str(chunk.approval_id or "").strip()
+                == str(record.get("approval_id") or "").strip()
+                for chunk in selected_chunks
+            )
+        ),
+        None,
+    )
+    if approval_record is None:
+        return None
+    approval_record_id = str(
+        approval_record.get("approval_record_id") or ""
+    ).strip()
+    vector_event = next(
+        (
+            event
+            for event in reversed(
+                repository.list_maintenance_events(
+                    "approval_vector_sync_outcome"
+                )
+            )
+            if str(event.get("document_id") or "").strip()
+            == document.document_id
+            and str(event.get("approval_record_id") or "").strip()
+            == approval_record_id
+            and str(event.get("outcome") or "").strip() == "completed"
+            and isinstance(event.get("vector_sync"), dict)
+            and str(event["vector_sync"].get("status") or "").strip()
+            == "indexed"
+            and not bool(event["vector_sync"].get("reindex_required"))
+        ),
+        None,
+    )
+    if vector_event is None:
+        return None
+    return dict(approval_record), dict(vector_event)
 
 
 def _automatically_supersede_prior_version(
@@ -891,7 +1296,7 @@ def _automatically_supersede_prior_version(
             settings,
             auth,
             action="document.regulation.auto_supersede",
-            outcome="deferred",
+            outcome="success",
             status_code=200,
             resource_type="document",
             document_id=prior_document_id,
@@ -933,31 +1338,98 @@ def _automatically_supersede_prior_version(
         prior_effective_from = date.fromisoformat(prior_effective_from_text)
     except ValueError as exc:
         raise ValueError("The prior regulation document has an invalid effective_from date.") from exc
-    if effective_from < prior_effective_from:
+    if effective_from <= prior_effective_from:
         return deferred_event(
             "deferred_nonsequential_effective_date",
             effective_from=effective_from.isoformat(),
         )
-    if str(prior_document.regulation_status or "").strip().casefold() == "superseded":
+    prior_effective_to = (effective_from - timedelta(days=1)).isoformat()
+    prior_already_superseded = (
+        str(prior_document.regulation_status or "").strip().casefold()
+        == "superseded"
+    )
+    transition_reason = (
+        f"Automatically superseded by approved revision {document.document_id}."
+    )
+    matching_events = [
+        event
+        for event in repository.list_maintenance_events()
+        if str(event.get("document_id") or "").strip() == prior_document_id
+        and (
+            str(event.get("new_document_id") or "").strip()
+            == document.document_id
+            or str(event.get("reason") or "").strip() == transition_reason
+        )
+        and str(event.get("event_type") or "").strip()
+        in {
+            "regulation_lifecycle_transition",
+            "regulation_auto_supersede_sync",
+        }
+    ]
+    completed_event = next(
+        (
+            event
+            for event in reversed(matching_events)
+            if str(event.get("outcome") or "").strip() == "completed"
+            and isinstance(event.get("vector_sync"), dict)
+            and str(event["vector_sync"].get("status") or "").strip()
+            in {"indexed", "skipped"}
+        ),
+        None,
+    )
+    if (
+        prior_already_superseded
+        and completed_event is not None
+        and str(prior_document.effective_to or "").strip() == prior_effective_to
+    ):
         return {
             "document_id": prior_document.document_id,
             "status": "already_superseded",
+            "outcome": "completed",
+            "vector_sync": dict(completed_event["vector_sync"]),
         }
     prior_for_transition = prior_document.model_copy(
-        update={"effective_from": prior_document.effective_from or prior_effective_from.isoformat()}
+        update={
+            "effective_from": (
+                prior_document.effective_from
+                or prior_effective_from.isoformat()
+            )
+        }
     )
-    updated_prior, event = apply_regulation_transition(
-        prior_for_transition,
-        "superseded",
-        reason=f"Automatically superseded by approved revision {document.document_id}.",
-        actor=auth.actor,
-    )
+    if prior_already_superseded:
+        updated_prior = prior_for_transition
+        event = {
+            "event_id": (
+                f"regulation_auto_supersede_sync_{prior_document_id}_"
+                f"{int(datetime.now(timezone.utc).timestamp() * 1000000)}"
+            ),
+            "event_type": "regulation_auto_supersede_sync",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "document_id": prior_document_id,
+            "tenant_id": prior_document.tenant_id,
+            "profile_id": prior_document.profile_id,
+            "regulation_id": prior_document.regulation_id,
+            "regulation_version": prior_document.regulation_version,
+            "from_status": "superseded",
+            "to_status": "superseded",
+            "reason": transition_reason,
+            "actor": auth.actor,
+            "retry": True,
+        }
+    else:
+        updated_prior, event = apply_regulation_transition(
+            prior_for_transition,
+            "superseded",
+            reason=transition_reason,
+            actor=auth.actor,
+        )
     updated_prior = updated_prior.model_copy(
         update={
             "effective_from": prior_for_transition.effective_from,
-            "effective_to": effective_from.isoformat(),
+            "effective_to": prior_effective_to,
         }
     )
+    event["new_document_id"] = document.document_id
     event["effective_to"] = updated_prior.effective_to
     prior_chunks = repository.get_chunks(prior_document_id)
     for chunk in prior_chunks:
@@ -1008,15 +1480,19 @@ def _sync_vector_index_after_review_change(
     auth: AuthContext,
     chunks: list[Chunk],
     action: str,
+    index_if_missing: bool = False,
 ) -> dict:
     latest_job = _latest_indexed_job(repository, document_id)
     if latest_job is None:
-        return {"status": "skipped", "reason": "no_prior_indexed_job"}
-    request = IndexRequest(
-        target_type=str(latest_job.get("target_type") or "local-jsonl"),
-        embedding_dimensions=_indexed_job_embedding_dimensions(latest_job),
-        collection_name=str(latest_job.get("collection_name") or "") or None,
-    )
+        if not index_if_missing:
+            return {"status": "skipped", "reason": "no_prior_indexed_job"}
+        request = IndexRequest(target_type="local-jsonl", embedding_dimensions=384)
+    else:
+        request = IndexRequest(
+            target_type=str(latest_job.get("target_type") or "local-jsonl"),
+            embedding_dimensions=_indexed_job_embedding_dimensions(latest_job),
+            collection_name=str(latest_job.get("collection_name") or "") or None,
+        )
     return _run_document_indexing(
         settings=settings,
         repository=repository,
@@ -1040,6 +1516,13 @@ def _append_approval_vector_sync_outcome(
     event_id = str(approval_record.get("vector_sync_event_id") or "").strip()
     if not event_id:
         event_id = f"approval_vector_sync_{uuid.uuid4().hex[:12]}"
+    if (
+        outcome == "completed"
+        and str(vector_sync.get("reason") or "") == "deferred_batch_index_completed"
+    ):
+        batch_id = str(vector_sync.get("batch_id") or "")
+        suffix = uuid.uuid5(uuid.NAMESPACE_URL, f"{event_id}\n{batch_id}").hex[:12]
+        event_id = f"{event_id}_batch_{suffix}"
     event = {
         "event_id": event_id,
         "event_type": "approval_vector_sync_outcome",
@@ -1166,12 +1649,13 @@ async def upload_document(
         supersedes_id = str(upload_metadata.get("supersedes_document_id") or "").strip()
         regulation_id_value = str(upload_metadata.get("regulation_id") or "").strip()
         regulation_version_value = str(upload_metadata.get("regulation_version") or "").strip()
+        upload_repository = JsonRepository(upload_settings)
         if regulation_id_value and not str(upload_metadata.get("profile_id") or "").strip():
             raise ValueError("A regulation family must be assigned to an institution profile.")
         if regulation_version_value and not regulation_id_value:
             raise ValueError("A regulation version requires a regulation family identifier.")
         if regulation_id_value and regulation_version_value:
-            existing_versions = JsonRepository(request_settings).find_documents_by_regulation(
+            existing_versions = upload_repository.find_documents_by_regulation(
                 regulation_id_value,
                 profile_id=upload_metadata.get("profile_id"),
                 tenant_id=auth.tenant_id,
@@ -1188,7 +1672,7 @@ async def upload_document(
         if supersedes_id:
             if not upload_metadata.get("profile_id") or not upload_metadata.get("regulation_id"):
                 raise ValueError("A revision upload requires profile_id and regulation_id.")
-            previous_document = JsonRepository(request_settings).get_document(supersedes_id)
+            previous_document = upload_repository.get_document(supersedes_id)
             if previous_document is None:
                 raise ValueError("The superseded document is not available for the current tenant.")
             if str(previous_document.tenant_id or "").strip() != str(auth.tenant_id or "").strip():
@@ -1200,7 +1684,8 @@ async def upload_document(
             if str(previous_document.regulation_status or "").strip().casefold() != "approved":
                 raise ValueError("A revision must supersede an approved prior regulation version.")
         await file.seek(0)
-        service = DocumentService(settings=upload_settings, repository=JsonRepository(upload_settings))
+        upload_repository.enforce_unique_regulation_version_admission()
+        service = DocumentService(settings=upload_settings, repository=upload_repository)
         document = service.upload_stream(
             file.filename or "document",
             file.file,
@@ -2076,11 +2561,82 @@ def approve_review_chunks(
     auth = coerce_auth_context(auth_context)
     request_settings = settings_for_tenant(settings, auth.tenant_id)
     repository = _repository(request_settings)
+    approval_baseline_chunks: list[Chunk] | None = None
+    approval_baseline_document = None
+    approval_state_committed = False
     try:
         require_api_role(auth, API_WRITE_ROLES)
         _require_document_access(repository, document_id, auth)
         chunks = _load_review_chunks(repository, document_id)
         requested_ids = _require_chunk_ids(chunks, request.chunk_ids)
+        document = repository.get_document(document_id)
+        retry_context = (
+            None
+            if request.defer_vector_sync
+            else _committed_revision_retry_context(
+                repository=repository,
+                document=document,
+                chunks=chunks,
+                requested_ids=requested_ids,
+                auth=auth,
+            )
+        )
+        if retry_context is not None and document is not None:
+            approval_state_committed = True
+            approval_record, revision_vector_event = retry_context
+            try:
+                automatic_supersede_event = (
+                    _automatically_supersede_prior_version(
+                        settings=request_settings,
+                        repository=repository,
+                        document=document,
+                        auth=auth,
+                    )
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": (
+                            "Revision approval was already committed, but "
+                            "automatic supersede synchronization retry failed."
+                        ),
+                        "approval_id": str(
+                            approval_record.get("approval_id") or ""
+                        ),
+                        "approval_record_id": str(
+                            approval_record.get("approval_record_id") or ""
+                        ),
+                        "reindex_required": True,
+                    },
+                ) from exc
+            response_record = dict(approval_record)
+            response_record["vector_sync"] = dict(
+                revision_vector_event["vector_sync"]
+            )
+            response_record["vector_sync_event_id"] = str(
+                revision_vector_event.get("event_id") or ""
+            )
+            response_record["automatic_supersede_event"] = (
+                automatic_supersede_event
+            )
+            response_record["recovery_retry"] = True
+            audit_api_event(
+                request_settings,
+                auth,
+                action="document.review.approve",
+                outcome="success",
+                status_code=200,
+                resource_type="document",
+                document_id=document_id,
+                detail=(
+                    "approval_recovery_retry=true "
+                    f"approval_record_id={approval_record.get('approval_record_id') or ''} "
+                    f"automatic_supersede_document_id="
+                    f"{(automatic_supersede_event or {}).get('document_id') or ''}"
+                ),
+            )
+            return response_record
         chunks, preapproval_scan = _run_security_scan_record(
             settings=request_settings,
             repository=repository,
@@ -2091,6 +2647,10 @@ def approve_review_chunks(
             chunk_ids=requested_ids,
             scan_reason="pre_approval",
         )
+        approval_baseline_chunks = [
+            chunk.model_copy(deep=True)
+            for chunk in chunks
+        ]
         approval_id = request.approval_id or f"approval_{uuid.uuid4().hex[:12]}"
         worklist_evidence = _approval_worklist_evidence(request)
         approved_at = datetime.now(timezone.utc).isoformat()
@@ -2117,20 +2677,40 @@ def approve_review_chunks(
         approval_update = approval_decision.approval_update
         updated_chunks = approval_update.updated_chunks
 
-        document = repository.get_document(document_id)
+        approval_baseline_document = (
+            document.model_copy(deep=True)
+            if document is not None
+            else None
+        )
+        staged_revision_activation = False
         if document is not None and document.regulation_id:
             current_regulation_status = str(document.regulation_status or "draft").strip().casefold()
             if current_regulation_status not in {"superseded", "repealed"}:
-                document.regulation_status = (
+                next_regulation_status = (
                     "approved"
                     if updated_chunks and all(chunk.approval_status == APPROVED_CHUNK_STATUS for chunk in updated_chunks)
                     else "pending_approval"
+                )
+                staged_revision_activation = bool(
+                    next_regulation_status == "approved"
+                    and str(document.supersedes_document_id or "").strip()
+                )
+                document.regulation_status = (
+                    "pending_approval" if staged_revision_activation else next_regulation_status
                 )
             for chunk in updated_chunks:
                 chunk.metadata = {
                     **dict(chunk.metadata or {}),
                     "regulation_status": document.regulation_status,
                 }
+        if request.defer_vector_sync and staged_revision_activation:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A newly approved regulation revision cannot defer vector synchronization; "
+                    "it must be indexed before activation."
+                ),
+            )
 
         repository.save_chunks(document_id, updated_chunks)
         if document is not None and document.regulation_id:
@@ -2191,42 +2771,79 @@ def approve_review_chunks(
             ]
         )
         repository.append_approval_record(approval_record)
-        try:
-            vector_sync = _sync_vector_index_after_review_change(
-                settings=request_settings,
-                repository=repository,
-                document_id=document_id,
-                auth=auth,
-                chunks=updated_chunks,
-                action="review_vector_sync",
-            )
-        except Exception as exc:
-            vector_sync = _failed_vector_sync_payload(exc)
-            vector_sync_event = _append_approval_vector_sync_outcome(
-                repository=repository,
-                document_id=document_id,
-                auth=auth,
-                approval_record=approval_record,
-                vector_sync=vector_sync,
-                outcome="failure",
-            )
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": "Approval was persisted, but vector index synchronization failed.",
-                    "approval_id": approval_id,
-                    "approval_record_id": approval_record_id,
-                    "vector_sync_event_id": vector_sync_event["event_id"],
-                    "reindex_required": True,
-                },
-            ) from exc
+        approval_state_committed = True
+        vector_sync_chunks = updated_chunks
+        if staged_revision_activation:
+            vector_sync_chunks = [
+                chunk.model_copy(
+                    update={
+                        "metadata": {
+                            **dict(chunk.metadata or {}),
+                            "regulation_status": "approved",
+                        }
+                    }
+                )
+                for chunk in updated_chunks
+            ]
+        if request.defer_vector_sync:
+            vector_sync = {
+                "status": "deferred",
+                "reason": "batch_index_pending",
+                "batch_id": str(request.vector_sync_batch_id or "").strip(),
+                "reindex_required": True,
+            }
+        else:
+            try:
+                vector_sync = _sync_vector_index_after_review_change(
+                    settings=request_settings,
+                    repository=repository,
+                    document_id=document_id,
+                    auth=auth,
+                    chunks=vector_sync_chunks,
+                    action="review_vector_sync",
+                    index_if_missing=staged_revision_activation,
+                )
+                if staged_revision_activation and (
+                    vector_sync.get("status") != "indexed"
+                    or int(vector_sync.get("record_count") or 0) <= 0
+                ):
+                    raise RuntimeError("The approved revision was not indexed before activation.")
+            except Exception as exc:
+                vector_sync = _failed_vector_sync_payload(exc)
+                vector_sync_event = _append_approval_vector_sync_outcome(
+                    repository=repository,
+                    document_id=document_id,
+                    auth=auth,
+                    approval_record=approval_record,
+                    vector_sync=vector_sync,
+                    outcome="failure",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Approval was persisted, but vector index synchronization failed.",
+                        "approval_id": approval_id,
+                        "approval_record_id": approval_record_id,
+                        "vector_sync_event_id": vector_sync_event["event_id"],
+                        "reindex_required": True,
+                    },
+                ) from exc
+        if staged_revision_activation and document is not None:
+            document.regulation_status = "approved"
+            for chunk in updated_chunks:
+                chunk.metadata = {
+                    **dict(chunk.metadata or {}),
+                    "regulation_status": document.regulation_status,
+                }
+            repository.save_chunks(document_id, updated_chunks)
+            repository.upsert_document(document)
         vector_sync_event = _append_approval_vector_sync_outcome(
             repository=repository,
             document_id=document_id,
             auth=auth,
             approval_record=approval_record,
             vector_sync=vector_sync,
-            outcome="completed",
+            outcome="deferred" if request.defer_vector_sync else "completed",
         )
         automatic_supersede_event = None
         if document is not None and str(document.regulation_status or "").strip().casefold() == "approved":
@@ -2307,6 +2924,50 @@ def approve_review_chunks(
             detail=str(exc.detail),
         )
         raise
+    except Exception as exc:
+        rollback_error: Exception | None = None
+        state_restored = False
+        if not approval_state_committed and approval_baseline_chunks is not None:
+            try:
+                repository.save_chunks(document_id, approval_baseline_chunks)
+                if approval_baseline_document is not None:
+                    repository.upsert_document(approval_baseline_document)
+                state_restored = True
+            except Exception as restore_exc:  # pragma: no cover - catastrophic storage failure
+                rollback_error = restore_exc
+        redacted_error = redact_sensitive_paths(str(exc).strip())[:1000]
+        redacted_rollback_error = (
+            redact_sensitive_paths(str(rollback_error).strip())[:1000]
+            if rollback_error is not None
+            else ""
+        )
+        audit_api_event(
+            request_settings,
+            auth,
+            action="document.review.approve",
+            outcome="failure",
+            status_code=500,
+            resource_type="document",
+            document_id=document_id,
+            detail=(
+                f"approval_persisted={approval_state_committed} "
+                f"state_restored={state_restored} error={redacted_error} "
+                f"rollback_error={redacted_rollback_error}"
+            ),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": (
+                    "Approval was not committed; the prior review state was restored."
+                    if state_restored
+                    else "Approval failed before the approval journal commit."
+                ),
+                "approval_persisted": approval_state_committed,
+                "state_restored": state_restored,
+                "recovery_required": bool(rollback_error),
+            },
+        ) from exc
 
 
 @router.post("/{document_id}/review/reject")

@@ -30,6 +30,15 @@ from scripts.report_metadata import current_repo_commit
 
 UTF8_BOM = b"\xef\xbb\xbf"
 DEFAULT_SEARCH_QUERY = "\uc81c1\uc870"
+EXTERNAL_CHATGPT_DATA_TOOLS = frozenset(
+    {
+        "list_regulations",
+        "get_regulation_toc",
+        "get_regulation_article",
+        "search",
+        "fetch",
+    }
+)
 _EXTERNAL_METADATA_DENY_KEYS = frozenset(
     {
         "source_record_id",
@@ -104,8 +113,8 @@ def run_mcp_client_config_smoke(
         for result in local_results
     )
     verification_prompt = (
-        f"{server_name} MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 "
-        "fetch 도구로 조회해 조문 원문과 출처를 보여줘."
+        f"{server_name} MCP의 list_regulations로 전체 규정 수를 확인하고 첫 규정의 목차와 "
+        "조문을 조회한 다음, search로 인사규정을 찾아 첫 번째 id를 fetch로 조회해 줘."
     )
     report = {
         "report_type": "mcp_client_config_smoke",
@@ -175,12 +184,14 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
         for result in results
         if isinstance(result, dict)
     )
+    catalog_tools_verified = EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
     return {
         "status": "verified" if verified else "not_verified",
         "mcp_initialized": bool(report.get("mcp_initialized")),
         "tools_discovered": bool(report.get("tools_discovered")),
         "get_index_status_verified": index_status_verified,
         "search_fetch_verified": search_fetch_verified,
+        "catalog_tools_verified": catalog_tools_verified,
         "verification_modes": verification_modes,
         "direct_stdio_verified": bool(report.get("direct_stdio_verified")),
         "desktop_tool_scan_verified": bool(report.get("desktop_tool_scan_verified")),
@@ -428,15 +439,24 @@ def _run_remote_client_smoke(
     try:
         if allow_unauthenticated_remote:
             remote_operation = (
-                _run_remote_entry(url=url, token=None, query=query)
+                _run_remote_entry(url=url, token=None, query=query, timeout_seconds=timeout_seconds)
                 if query
-                else _run_remote_entry(url=url, token=None)
+                else _run_remote_entry(url=url, token=None, timeout_seconds=timeout_seconds)
             )
         else:
             remote_operation = (
-                _run_remote_entry_with_auth_verification(url=url, token=token or None, query=query)
+                _run_remote_entry_with_auth_verification(
+                    url=url,
+                    token=token or None,
+                    query=query,
+                    timeout_seconds=timeout_seconds,
+                )
                 if query
-                else _run_remote_entry_with_auth_verification(url=url, token=token or None)
+                else _run_remote_entry_with_auth_verification(
+                    url=url,
+                    token=token or None,
+                    timeout_seconds=timeout_seconds,
+                )
             )
         result = asyncio.run(asyncio.wait_for(remote_operation, timeout=timeout_seconds))
         if allow_unauthenticated_remote:
@@ -469,12 +489,17 @@ async def _run_remote_entry_with_auth_verification(
     url: str,
     token: str | None,
     query: str | None = None,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
-    auth_challenge_observed = await _remote_unauthenticated_request_is_rejected(url=url) if token else False
+    auth_challenge_observed = (
+        await _remote_unauthenticated_request_is_rejected(url=url, timeout_seconds=timeout_seconds)
+        if token
+        else False
+    )
     result = (
-        await _run_remote_entry(url=url, token=token, query=query)
+        await _run_remote_entry(url=url, token=token, query=query, timeout_seconds=timeout_seconds)
         if query
-        else await _run_remote_entry(url=url, token=token)
+        else await _run_remote_entry(url=url, token=token, timeout_seconds=timeout_seconds)
     )
     result["auth_challenge_observed"] = auth_challenge_observed
     result["auth_wire_verified"] = bool(auth_challenge_observed)
@@ -491,7 +516,11 @@ async def _run_remote_entry_with_auth_verification(
     return result
 
 
-async def _remote_unauthenticated_request_is_rejected(*, url: str) -> bool:
+async def _remote_unauthenticated_request_is_rejected(
+    *,
+    url: str,
+    timeout_seconds: float = 20.0,
+) -> bool:
     initialize_request = {
         "jsonrpc": "2.0",
         "id": "auth-wire-probe",
@@ -507,7 +536,7 @@ async def _remote_unauthenticated_request_is_rejected(*, url: str) -> bool:
         **headers,
         "Authorization": f"Bearer invalid-{secrets.token_urlsafe(32)}",
     }
-    async with httpx.AsyncClient(follow_redirects=False) as http_client:
+    async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False) as http_client:
         unauthenticated = await http_client.post(url, json=initialize_request, headers=headers)
         invalid_bearer = await http_client.post(url, json=initialize_request, headers=invalid_headers)
     return all(response.status_code in {401, 403} for response in (unauthenticated, invalid_bearer))
@@ -518,15 +547,23 @@ async def _run_remote_entry(
     url: str,
     token: str | None,
     query: str | None = None,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx.AsyncClient(headers=headers, follow_redirects=False) as http_client:
+    async with httpx.AsyncClient(
+        headers=headers,
+        timeout=timeout_seconds,
+        follow_redirects=False,
+    ) as http_client:
         async with streamable_http_client(url, http_client=http_client) as (read, write, get_session_id):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tool_result = await session.list_tools()
                 tool_names = sorted(tool.name for tool in tool_result.tools)
-                if "get_index_status" not in tool_names and not {"search", "fetch"}.issubset(set(tool_names)):
+                if (
+                    "get_index_status" not in tool_names
+                    and not EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
+                ):
                     return {
                         "passed": False,
                         "process_started": True,
@@ -536,7 +573,10 @@ async def _run_remote_entry(
                         "end_to_end_verified": False,
                         "tool_names": tool_names,
                         "session_id_present": bool(get_session_id()),
-                        "error": "tools/list did not expose get_index_status or the external search/fetch contract.",
+                        "error": (
+                            "tools/list did not expose get_index_status or the complete external "
+                            "catalog/hierarchy/article/search/fetch contract."
+                        ),
                     }
                 verification_mode = "index_status"
                 index_summary: dict[str, Any] = {}
@@ -553,9 +593,9 @@ async def _run_remote_entry(
                     index_summary = index_payload.get("summary") if isinstance(index_payload.get("summary"), dict) else {}
                     verified = _valid_index_status_summary(index_summary)
                 else:
-                    # The privacy-reduced ChatGPT profile intentionally exposes
-                    # only search/fetch. Verify that content contract without
-                    # requiring internal index diagnostics to cross the boundary.
+                    # The privacy-reduced ChatGPT profile exposes only the
+                    # read-only catalog/hierarchy/article/search/fetch contract.
+                    # Verify content without requiring internal diagnostics.
                     verification_mode = "search_fetch"
                     search_query_used = query or DEFAULT_SEARCH_QUERY
                     search = await session.call_tool(
@@ -652,7 +692,30 @@ async def _run_client_entry(
             list_tools_elapsed_ms = _elapsed_ms(list_tools_started_at)
             tool_names = sorted(tool.name for tool in tool_result.tools)
 
-            if "get_index_status" not in tool_names and {"search", "fetch"}.issubset(set(tool_names)):
+            if (
+                "get_index_status" not in tool_names
+                and not EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
+            ):
+                return {
+                    "passed": False,
+                    "process_started": True,
+                    "mcp_initialized": True,
+                    "tools_discovered": bool(tool_names),
+                    "strict_stdio_wire_verified": True,
+                    "index_status_verified": False,
+                    "contract_verified": False,
+                    "end_to_end_verified": False,
+                    "verification_mode": "search_fetch",
+                    "tool_names": tool_names,
+                    "error": (
+                        "tools/list did not expose the complete external "
+                        "catalog/hierarchy/article/search/fetch contract."
+                    ),
+                    "list_tools_elapsed_ms": list_tools_elapsed_ms,
+                    "total_elapsed_ms": _elapsed_ms(started_at),
+                }
+
+            if "get_index_status" not in tool_names:
                 search_payload, results, search_query_used, search_queries_attempted, search_elapsed_ms = (
                     await _search_with_fallback(session, query=query)
                 )

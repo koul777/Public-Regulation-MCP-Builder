@@ -23,6 +23,7 @@ from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.schemas.structure import StructureNode
 from app.storage.repository import JsonRepository
+from scripts import generate_mcp_client_config as mcp_config_generator
 from scripts.generate_mcp_client_config import (
     RUNTIME_IDENTITY_MODULES,
     _install_local_package_script,
@@ -2351,6 +2352,29 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
 
         self.assertEqual([], missing)
 
+    def test_canonical_bundle_readmes_invoke_index_visibility_security_gate(self) -> None:
+        config = build_mcp_client_config(
+            server_name="readme-security-gate",
+            client_profile="bundle",
+            data_dir="data",
+            tenant_id="tenant-a",
+        )
+
+        for renderer in (
+            mcp_config_generator._setup_bundle_readme,
+            mcp_config_generator._setup_bundle_readme_ko,
+        ):
+            with self.subTest(renderer=renderer.__name__):
+                readme = renderer(
+                    config=config,
+                    files={},
+                    server_name="readme-security-gate",
+                )
+                self.assertIn("reg-rag-mcp-index-visibility", readme)
+                self.assertIn("--forbid-smoke-docs", readme)
+                self.assertIn("--require-indexed", readme)
+                self.assertIn(r"--data-dir .\data", readme)
+
     def test_builds_stdio_config_with_tenant_isolation(self) -> None:
         config = build_mcp_client_config(
             server_name="govreg-test",
@@ -2455,7 +2479,21 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("OAuth", connection_steps)
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
-        self.assertEqual(["search", "fetch"], config["compatible_tools"])
+        self.assertEqual(
+            [
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+                "search",
+                "fetch",
+            ],
+            config["compatible_tools"],
+        )
+        for tool_name in config["compatible_tools"]:
+            with self.subTest(tool_name=tool_name):
+                self.assertIn(tool_name, connection_steps)
         self.assertIn("search(query)", " ".join(config["notes"]))
         self.assertIn("fetch(id)", " ".join(config["notes"]))
         self.assertIn("user-openable HTTP(S)", " ".join(config["notes"]))
@@ -2583,7 +2621,19 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             "chatgpt-data",
             chatgpt_desktop_args[chatgpt_desktop_args.index("--tool-profile") + 1],
         )
-        self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["search", "fetch"])
+        expected_chatgpt_tools = [
+            "list_regulations",
+            "get_regulation_toc",
+            "get_regulation_article",
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
+            "search",
+            "fetch",
+        ]
+        self.assertEqual(
+            config["quickstart"]["chatgpt_remote"]["verification_tools"],
+            expected_chatgpt_tools,
+        )
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["requires_reachable_https"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
         self.assertEqual(
@@ -2602,7 +2652,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["tool_profile"], "chatgpt-data")
         self.assertEqual(
             config["quickstart"]["chatgpt_desktop_local"]["verification_tools"],
-            ["search", "fetch"],
+            expected_chatgpt_tools,
         )
         self.assertEqual(
             config["quickstart"]["chatgpt_desktop_local"]["connection_configuration_method"],
@@ -2643,7 +2693,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 "authorization_token_env": "MCP_AUTH_TOKEN",
             },
         )
-        self.assertEqual(["search", "fetch"], config["quickstart"]["chatgpt_remote"]["verification_tools"])
+        self.assertEqual(
+            expected_chatgpt_tools,
+            config["quickstart"]["chatgpt_remote"]["verification_tools"],
+        )
         serialized = json.dumps(config, ensure_ascii=False)
         for retired in (
             "openai_secure_tunnel",
@@ -5043,13 +5096,25 @@ $Result | ConvertTo-Json -Depth 6
             _runtime_export_record(
                 "doc-a",
                 "chunk-a",
-                metadata={"regulation_id": "reg-personnel", "hierarchy_path": "인사규정 > 제1조"},
+                metadata={
+                    "regulation_id": "reg-personnel",
+                    "regulation_no": "A-1",
+                    "regulation_title": "Rule A",
+                    "hierarchy_path": "인사규정 > 제1조",
+                    "internal_regulation_refs": ["Rule C"],
+                },
             ),
             _runtime_export_record("doc-b", "chunk-b"),
             _runtime_export_record(
                 "doc-c",
                 "chunk-c",
-                metadata={"regulation_id": "reg-service", "hierarchy_path": "복무규정 > 제1조"},
+                metadata={
+                    "regulation_id": "reg-service",
+                    "regulation_no": "C-1",
+                    "regulation_title": "Rule C",
+                    "hierarchy_path": "복무규정 > 제1조",
+                    "internal_regulation_refs": ["Rule A"],
+                },
             ),
         ]
         with tempfile.TemporaryDirectory() as tmp:
@@ -5076,9 +5141,40 @@ $Result | ConvertTo-Json -Depth 6
                 .splitlines()
                 if line.strip()
             ]
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=list(reversed(records)),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    side_effect=AssertionError("equivalent selected-document order must reuse"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    side_effect=AssertionError("equivalent selected-document order must reuse"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    side_effect=AssertionError("equivalent selected-document order must reuse"),
+                ),
+            ):
+                reordered_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=Path(tmp) / "source",
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    document_ids=["doc-c", "doc-a", "doc-a"],
+                    scope="selected_documents",
+                    require_kordoc_table_parser=False,
+                    require_source_metadata=False,
+                )
 
         self.assertEqual("selected_documents", runtime_manifest["scope"])
+        self.assertEqual(runtime_manifest, reordered_manifest)
         self.assertEqual(["doc-a", "doc-c"], runtime_manifest["document_ids"])
+        self.assertEqual(2, runtime_manifest["hierarchical_index"]["reference_edge_count"])
+        self.assertEqual(1, runtime_manifest["hierarchical_index"]["reference_cycle_count"])
         self.assertEqual({"doc-a", "doc-c"}, {record["document_id"] for record in exported_records})
         metadata_by_document = {record["document_id"]: record["metadata"] for record in exported_records}
         self.assertEqual("reg-personnel", metadata_by_document["doc-a"]["regulation_id"])
@@ -5107,6 +5203,226 @@ $Result | ConvertTo-Json -Depth 6
 
         self.assertIn("not all MCP-visible", str(raised.exception))
         self.assertIn("doc-missing", str(raised.exception))
+
+    def test_runtime_swap_recovery_restores_recorded_backup_and_auxiliary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "bundle"
+            runtime_data_dir = output_dir / "data"
+            staging_dir = output_dir / f".data-stage-{'a' * 32}"
+            backup_dir = output_dir / f".data-backup-{'b' * 32}"
+            output_dir.mkdir()
+            runtime_data_dir.mkdir()
+            (runtime_data_dir / "prior.txt").write_bytes(b"prior-runtime")
+            staging_dir.mkdir()
+            (staging_dir / "mcp_runtime_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_data_bundle",
+                        "document_ids": [],
+                        "generation": "next",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            status_path = output_dir / "bundle_status.json"
+            stale_report_path = output_dir / "mcp_transport_smoke.json"
+            status_before = b'{"state":"prior"}\r\n'
+            report_before = b'{"report":"prior"}\r\n'
+            status_path.write_bytes(status_before)
+            stale_report_path.write_bytes(report_before)
+            marker_path, marker = mcp_config_generator._create_runtime_data_swap_marker(
+                output_dir=output_dir,
+                runtime_data_dir=runtime_data_dir,
+                staging_dir=staging_dir,
+                backup_dir=backup_dir,
+            )
+
+            os.replace(runtime_data_dir, backup_dir)
+            marker = mcp_config_generator._update_runtime_data_swap_marker(
+                marker_path,
+                marker,
+                "backup_created",
+            )
+            status_path.write_bytes(b'{"state":"runtime_refresh_in_progress"}\n')
+            stale_report_path.write_bytes(b'{"report":"changed"}\n')
+            recovery = mcp_config_generator._recover_interrupted_runtime_data_swap(output_dir)
+
+            self.assertEqual("rolled_back_to_prior_data", recovery)
+            self.assertEqual(b"prior-runtime", (runtime_data_dir / "prior.txt").read_bytes())
+            self.assertEqual(status_before, status_path.read_bytes())
+            self.assertEqual(report_before, stale_report_path.read_bytes())
+            self.assertFalse(staging_dir.exists())
+            self.assertFalse(backup_dir.exists())
+            self.assertFalse(marker_path.exists())
+
+    def test_runtime_swap_recovery_promotes_only_recorded_first_runtime_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "bundle"
+            runtime_data_dir = output_dir / "data"
+            staging_dir = output_dir / f".data-stage-{'c' * 32}"
+            backup_dir = output_dir / f".data-backup-{'d' * 32}"
+            staging_dir.mkdir(parents=True)
+            staged_manifest = {
+                "report_type": "mcp_runtime_data_bundle",
+                "document_ids": [],
+                "generation": "first",
+            }
+            (staging_dir / "mcp_runtime_manifest.json").write_text(
+                json.dumps(staged_manifest) + "\n",
+                encoding="utf-8",
+            )
+            marker_path, marker = mcp_config_generator._create_runtime_data_swap_marker(
+                output_dir=output_dir,
+                runtime_data_dir=runtime_data_dir,
+                staging_dir=staging_dir,
+                backup_dir=backup_dir,
+            )
+
+            os.replace(staging_dir, runtime_data_dir)
+            mcp_config_generator._update_runtime_data_swap_marker(
+                marker_path,
+                marker,
+                "data_promoted",
+            )
+            recovery = mcp_config_generator._recover_interrupted_runtime_data_swap(output_dir)
+            recovered_manifest = json.loads(
+                (runtime_data_dir / "mcp_runtime_manifest.json").read_text(encoding="utf-8")
+            )
+            status = json.loads(
+                (output_dir / "bundle_status.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual("completed_first_runtime_swap", recovery)
+            self.assertEqual(staged_manifest, recovered_manifest)
+            self.assertTrue(status["runtime_data_ready"])
+            self.assertEqual(
+                mcp_config_generator._runtime_manifest_fingerprint(staged_manifest),
+                status["runtime_fingerprint"],
+            )
+            self.assertFalse(marker_path.exists())
+            self.assertFalse(backup_dir.exists())
+
+    def test_runtime_swap_recovery_rejects_ambiguous_legacy_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "bundle"
+            output_dir.mkdir()
+            backups = [
+                output_dir / f".data-backup-{'e' * 32}",
+                output_dir / f".data-backup-{'f' * 32}",
+            ]
+            for index, backup in enumerate(backups):
+                backup.mkdir()
+                (backup / "identity.txt").write_text(str(index), encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Ambiguous legacy MCP runtime backups"):
+                mcp_config_generator._recover_interrupted_runtime_data_swap(output_dir)
+
+            self.assertFalse((output_dir / "data").exists())
+            self.assertTrue(all(backup.is_dir() for backup in backups))
+
+    def test_runtime_swap_recovery_does_not_accept_promoted_data_when_recorded_backup_is_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "bundle"
+            runtime_data_dir = output_dir / "data"
+            staging_dir = output_dir / f".data-stage-{'4' * 32}"
+            backup_dir = output_dir / f".data-backup-{'5' * 32}"
+            runtime_data_dir.mkdir(parents=True)
+            (runtime_data_dir / "prior.txt").write_bytes(b"prior")
+            staging_dir.mkdir()
+            (staging_dir / "mcp_runtime_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_data_bundle",
+                        "document_ids": [],
+                        "generation": "promoted",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            marker_path, marker = mcp_config_generator._create_runtime_data_swap_marker(
+                output_dir=output_dir,
+                runtime_data_dir=runtime_data_dir,
+                staging_dir=staging_dir,
+                backup_dir=backup_dir,
+            )
+            os.replace(runtime_data_dir, backup_dir)
+            marker = mcp_config_generator._update_runtime_data_swap_marker(
+                marker_path,
+                marker,
+                "backup_created",
+            )
+            os.replace(staging_dir, runtime_data_dir)
+            mcp_config_generator._update_runtime_data_swap_marker(
+                marker_path,
+                marker,
+                "data_promoted",
+            )
+            shutil.rmtree(backup_dir)
+
+            with self.assertRaisesRegex(RuntimeError, "recorded backup is missing"):
+                mcp_config_generator._recover_interrupted_runtime_data_swap(output_dir)
+
+            self.assertTrue(runtime_data_dir.is_dir())
+            self.assertTrue(marker_path.is_file())
+            self.assertFalse(backup_dir.exists())
+
+    def test_runtime_swap_marker_paths_are_confined_to_bundle_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "bundle"
+            outside = root / "outside"
+            output_dir.mkdir()
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_bytes(b"outside")
+            marker = {
+                "schema_version": mcp_config_generator.RUNTIME_DATA_SWAP_SCHEMA_VERSION,
+                "transaction_id": "1" * 32,
+                "phase": "prepared",
+                "runtime_data_name": "data",
+                "staging_name": "../outside",
+                "backup_name": f".data-backup-{'2' * 32}",
+                "prior_data_exists": False,
+                "staged_manifest_sha256": "3" * 64,
+            }
+            (output_dir / mcp_config_generator.RUNTIME_DATA_SWAP_MARKER_FILENAME).write_text(
+                json.dumps(marker) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "unsafe path name"):
+                mcp_config_generator._recover_interrupted_runtime_data_swap(output_dir)
+
+            self.assertEqual(b"outside", sentinel.read_bytes())
+
+    def test_bundle_materialization_file_lock_serializes_same_output_cross_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "bundle"
+
+            def contend() -> None:
+                with mcp_config_generator._bundle_materialization_file_lock(
+                    output_dir,
+                    timeout_seconds=0.15,
+                ):
+                    return None
+
+            with mcp_config_generator._bundle_materialization_file_lock(output_dir) as lock_path:
+                self.assertEqual(output_dir.parent.resolve(), lock_path.parent)
+                self.assertFalse(lock_path.is_symlink())
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    contender = executor.submit(contend)
+                    with self.assertRaisesRegex(TimeoutError, "materialization lock"):
+                        contender.result(timeout=2)
+
+            with mcp_config_generator._bundle_materialization_file_lock(
+                output_dir,
+                timeout_seconds=0.5,
+            ) as reacquired_path:
+                self.assertEqual(lock_path, reacquired_path)
 
     def test_runtime_bundle_exports_kordoc_table_parser_summary(self) -> None:
         metadata = {
@@ -5156,6 +5472,965 @@ $Result | ConvertTo-Json -Depth 6
         self.assertTrue(runtime_progress)
         self.assertEqual(100, runtime_progress[-1][0])
         self.assertEqual(sorted(item[0] for item in runtime_progress), [item[0] for item in runtime_progress])
+
+    def test_runtime_bundle_reuses_exact_validated_input_without_rebuilding_indexes(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 2, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 2,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                first_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            data_before = {
+                path.relative_to(output_dir / "data").as_posix(): path.read_bytes()
+                for path in sorted((output_dir / "data").rglob("*"))
+                if path.is_file()
+            }
+            status_before = json.loads(
+                (output_dir / "bundle_status.json").read_text(encoding="utf-8")
+            )
+            status_before.update(
+                {
+                    "installation_attempt_id": "attempt-cache-reuse",
+                    "installation_state": "installed",
+                    "connection_state": "connected",
+                    "direct_config_registered": True,
+                    "installed_config_transport_verified": True,
+                    "installed_config_transport_runtime_fingerprint": status_before[
+                        "runtime_fingerprint"
+                    ],
+                    "end_to_end_verified": True,
+                }
+            )
+            (output_dir / "bundle_status.json").write_text(
+                json.dumps(status_before, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            for source_path in settings.data_dir.rglob("*"):
+                if source_path.is_file():
+                    os.utime(source_path, None)
+            for runtime_path in (output_dir / "data").rglob("*"):
+                if runtime_path.is_file():
+                    os.utime(runtime_path, None)
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ) as visible_reader,
+                patch(
+                    "scripts.generate_mcp_client_config._current_approved_chunks_for_runtime_export",
+                    wraps=mcp_config_generator._current_approved_chunks_for_runtime_export,
+                ) as approval_validator,
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    side_effect=AssertionError("vector rebuild must not run on an exact cache hit"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    side_effect=AssertionError("BM25 rebuild must not run on an exact cache hit"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    side_effect=AssertionError("hierarchy rebuild must not run on an exact cache hit"),
+                ),
+            ):
+                reused_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            data_after = {
+                path.relative_to(output_dir / "data").as_posix(): path.read_bytes()
+                for path in sorted((output_dir / "data").rglob("*"))
+                if path.is_file()
+            }
+            status_after = json.loads(
+                (output_dir / "bundle_status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(first_manifest, reused_manifest)
+        self.assertEqual(data_before, data_after)
+        self.assertEqual(status_before["runtime_fingerprint"], status_after["runtime_fingerprint"])
+        self.assertEqual("connected", status_after["connection_state"])
+        self.assertTrue(status_after["installed_config_transport_verified"])
+        self.assertTrue(status_after["end_to_end_verified"])
+        self.assertEqual(1, visible_reader.call_count)
+        self.assertEqual(1, approval_validator.call_count)
+        self.assertEqual(
+            "mcp-runtime-data-reuse-v1",
+            reused_manifest["runtime_data_reuse"]["schema_version"],
+        )
+        self.assertRegex(reused_manifest["runtime_data_reuse"]["input_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_runtime_bundle_reuses_after_mutable_operational_files_change(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            runtime_data_dir = output_dir / "data"
+            runtime_repository_dir = runtime_data_dir / "repository"
+            runtime_journal_dir = runtime_repository_dir / "journals"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                first_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            mutable_paths = [
+                runtime_repository_dir / "api_audit.jsonl",
+                runtime_repository_dir / ".api_audit.lock",
+                runtime_repository_dir / ".write.lock",
+                runtime_journal_dir / "rag_traces.jsonl",
+                runtime_journal_dir / "rag_feedback.jsonl",
+            ]
+            self.assertEqual(
+                mcp_config_generator.RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES,
+                {path.name for path in mutable_paths},
+            )
+            for index, path in enumerate(mutable_paths, start=1):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f'{{"runtime_event":{index}}}\n', encoding="utf-8")
+
+            immutable_digests = first_manifest["runtime_data_reuse"]["file_sha256"]
+            self.assertEqual(
+                immutable_digests,
+                mcp_config_generator._runtime_data_file_sha256(runtime_data_dir),
+            )
+            self.assertFalse(
+                {
+                    relative_path
+                    for relative_path in immutable_digests
+                    if Path(relative_path).name
+                    in mcp_config_generator.RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES
+                }
+            )
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    side_effect=AssertionError(
+                        "mutable operational files must not rebuild vectors"
+                    ),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    side_effect=AssertionError(
+                        "mutable operational files must not rebuild BM25"
+                    ),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    side_effect=AssertionError(
+                        "mutable operational files must not rebuild hierarchy"
+                    ),
+                ),
+            ):
+                created_files_reuse = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+                for index, path in enumerate(mutable_paths, start=1):
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(f'{{"runtime_event_update":{index}}}\n')
+                changed_files_reuse = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            mutable_contents = {
+                path.name: path.read_text(encoding="utf-8")
+                for path in mutable_paths
+            }
+
+        self.assertEqual(first_manifest, created_files_reuse)
+        self.assertEqual(first_manifest, changed_files_reuse)
+        self.assertTrue(
+            all("runtime_event_update" in contents for contents in mutable_contents.values())
+        )
+
+    def test_runtime_bundle_reuse_status_failure_rolls_back_auxiliary_files(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            stale_report = output_dir / "mcp_transport_smoke.json"
+            stale_report.write_bytes(b'{"stale":true}\r\n')
+            before = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in sorted(output_dir.rglob("*"))
+                if path.is_file()
+            }
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config._write_bundle_status",
+                    side_effect=RuntimeError("forced-reuse-status-failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced-reuse-status-failure"),
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            after = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in sorted(output_dir.rglob("*"))
+                if path.is_file()
+            }
+
+        self.assertEqual(before, after)
+
+    def test_runtime_bundle_swap_status_failure_restores_prior_data_and_status(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            original_records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=original_records,
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            stale_report = output_dir / "mcp_transport_smoke.json"
+            stale_report.write_bytes(b'{"prior_report":true}\r\n')
+            before = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in sorted(output_dir.rglob("*"))
+                if path.is_file()
+            }
+            changed_record = _runtime_export_record("doc-kordoc", "chunk-1")
+            changed_record["text"] = "replacement approved runtime text"
+            changed_record["content_hash"] = stable_content_hash(
+                changed_record["text"],
+                changed_record["metadata"],
+            )
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=[changed_record],
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config._write_bundle_status",
+                    side_effect=RuntimeError("forced-swap-status-failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced-swap-status-failure"),
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            after = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in sorted(output_dir.rglob("*"))
+                if path.is_file()
+            }
+            swap_artifacts = [
+                path.name
+                for path in output_dir.iterdir()
+                if path.name.startswith((".data-stage-", ".data-backup-"))
+                or path.name == mcp_config_generator.RUNTIME_DATA_SWAP_MARKER_FILENAME
+            ]
+
+        self.assertEqual(before, after)
+        self.assertEqual([], swap_artifacts)
+
+    def test_runtime_bundle_reuse_manifest_remains_valid_in_portable_zip(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            zip_path = Path(tmp) / "bundle.zip"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            config = build_mcp_client_config(
+                server_name="portable-cache",
+                client_profile="bundle",
+                tenant_id="tenant-a",
+                profile_id="public_portal-test-profile",
+            )
+            write_mcp_setup_bundle(
+                config,
+                output_dir,
+                server_name="portable-cache",
+            )
+            write_mcp_setup_bundle_zip(output_dir, zip_path)
+
+            with zipfile.ZipFile(zip_path) as archive:
+                portable_manifest = json.loads(
+                    archive.read("data/mcp_runtime_manifest.json").decode("utf-8")
+                )
+                archived_digests = {
+                    relative_path: hashlib.sha256(
+                        archive.read(f"data/{relative_path}")
+                    ).hexdigest()
+                    for relative_path in portable_manifest["runtime_data_reuse"][
+                        "file_sha256"
+                    ]
+                }
+
+        self.assertEqual(
+            str(Path("<BUNDLE_DIR>") / "data"),
+            portable_manifest["runtime_data_dir"],
+        )
+        self.assertEqual(
+            portable_manifest["runtime_data_reuse"]["manifest_sha256"],
+            mcp_config_generator._runtime_manifest_content_sha256(portable_manifest),
+        )
+        self.assertEqual(
+            portable_manifest["runtime_data_reuse"]["file_sha256"],
+            archived_digests,
+        )
+
+    def test_runtime_bundle_changed_approved_input_invalidates_reuse(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            original_records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=original_records,
+            ):
+                original_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            changed_record = _runtime_export_record("doc-kordoc", "chunk-1")
+            changed_record["text"] = "approved text with a material amendment"
+            changed_record["content_hash"] = stable_content_hash(
+                changed_record["text"],
+                changed_record["metadata"],
+            )
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=[changed_record],
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    wraps=mcp_config_generator.write_vector_records_with_offsets,
+                ) as vector_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    wraps=mcp_config_generator.write_bm25_index,
+                ) as bm25_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    wraps=mcp_config_generator.build_hierarchical_runtime_index,
+                ) as hierarchy_writer,
+            ):
+                changed_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            exported_record = json.loads(
+                (output_dir / "data" / "vector_db" / "tenant-a" / "approved_vectors.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+
+        self.assertEqual(1, vector_writer.call_count)
+        self.assertEqual(1, bm25_writer.call_count)
+        self.assertEqual(1, hierarchy_writer.call_count)
+        self.assertNotEqual(
+            original_manifest["runtime_data_reuse"]["input_sha256"],
+            changed_manifest["runtime_data_reuse"]["input_sha256"],
+        )
+        self.assertEqual("approved text with a material amendment", exported_record["text"])
+
+    def test_runtime_bundle_changed_indexing_journal_invalidates_reuse(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                original_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            JsonRepository(settings).append_indexing_job(
+                {
+                    "indexing_job_id": "job-after-first-export",
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "created_at": "2026-07-28T00:00:00+00:00",
+                }
+            )
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    wraps=mcp_config_generator.write_vector_records_with_offsets,
+                ) as vector_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    wraps=mcp_config_generator.write_bm25_index,
+                ) as bm25_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    wraps=mcp_config_generator.build_hierarchical_runtime_index,
+                ) as hierarchy_writer,
+            ):
+                changed_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+        self.assertEqual(1, vector_writer.call_count)
+        self.assertEqual(1, bm25_writer.call_count)
+        self.assertEqual(1, hierarchy_writer.call_count)
+        self.assertEqual(1, changed_manifest["indexing_job_count"])
+        self.assertNotEqual(
+            original_manifest["runtime_data_reuse"]["input_sha256"],
+            changed_manifest["runtime_data_reuse"]["input_sha256"],
+        )
+
+    def test_runtime_bundle_reuse_fingerprint_tracks_reference_graph_builder_source(self) -> None:
+        reference_graph_module = sys.modules["app.retrieval.regulation_reference_graph"]
+        reference_graph_path = Path(reference_graph_module.__file__).resolve()
+        hash_file = mcp_config_generator._sha256_file_content
+        baseline = mcp_config_generator._runtime_data_builder_implementation_sha256()
+
+        def changed_reference_graph_hash(path: Path) -> str:
+            digest = hash_file(path)
+            if path.resolve() == reference_graph_path:
+                return ("0" if digest[0] != "0" else "1") + digest[1:]
+            return digest
+
+        with patch(
+            "scripts.generate_mcp_client_config._sha256_file_content",
+            side_effect=changed_reference_graph_hash,
+        ):
+            changed = mcp_config_generator._runtime_data_builder_implementation_sha256()
+
+        self.assertNotEqual(baseline, changed)
+
+    def test_runtime_bundle_reuse_jsonl_comparison_is_strict(self) -> None:
+        expected = [{"id": "one", "value": 1}, {"id": "two", "value": 2}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.jsonl"
+            path.write_text(
+                "\n"
+                + "\n".join(json.dumps(record, separators=(",", ":")) for record in expected)
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                mcp_config_generator._strict_jsonl_matches_runtime_reuse(
+                    path,
+                    expected,
+                )
+            )
+            self.assertFalse(
+                mcp_config_generator._strict_jsonl_matches_runtime_reuse(
+                    path,
+                    expected[:1],
+                )
+            )
+            self.assertFalse(
+                mcp_config_generator._strict_jsonl_matches_runtime_reuse(
+                    path,
+                    [*expected, {"id": "three", "value": 3}],
+                )
+            )
+            self.assertFalse(
+                mcp_config_generator._strict_jsonl_matches_runtime_reuse(
+                    path,
+                    [{"id": "changed", "value": 1}, expected[1]],
+                )
+            )
+
+            invalid_payloads = {
+                "bom": b"\xef\xbb\xbf{\"id\":\"one\"}\n",
+                "invalid_utf8": b"{\"id\":\"\xff\"}\n",
+                "duplicate_key": b'{"id":"one","id":"two"}\n',
+                "non_object": b'["one"]\n',
+            }
+            for case, payload in invalid_payloads.items():
+                with self.subTest(case=case):
+                    path.write_bytes(payload)
+                    with self.assertRaises(ValueError):
+                        mcp_config_generator._strict_jsonl_matches_runtime_reuse(
+                            path,
+                            expected,
+                        )
+
+    def test_runtime_bundle_corrupt_reuse_candidate_is_rebuilt(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                first_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            bm25_path = output_dir / "data" / "vector_db" / "tenant-a" / "bm25_index.json"
+            bm25_path.write_bytes(b'{"corrupt":true}\n')
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    wraps=mcp_config_generator.write_vector_records_with_offsets,
+                ) as vector_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    wraps=mcp_config_generator.write_bm25_index,
+                ) as bm25_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    wraps=mcp_config_generator.build_hierarchical_runtime_index,
+                ) as hierarchy_writer,
+            ):
+                rebuilt_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            rebuilt_bm25 = json.loads(bm25_path.read_text(encoding="utf-8"))
+            expected_digest = rebuilt_manifest["runtime_data_reuse"]["file_sha256"][
+                "vector_db/tenant-a/bm25_index.json"
+            ]
+            actual_digest = hashlib.sha256(bm25_path.read_bytes()).hexdigest()
+
+        self.assertEqual(1, vector_writer.call_count)
+        self.assertEqual(1, bm25_writer.call_count)
+        self.assertEqual(1, hierarchy_writer.call_count)
+        self.assertEqual(
+            first_manifest["runtime_data_reuse"]["input_sha256"],
+            rebuilt_manifest["runtime_data_reuse"]["input_sha256"],
+        )
+        self.assertIn("documents", rebuilt_bm25)
+        self.assertEqual(expected_digest, actual_digest)
+
+    def test_runtime_bundle_failed_rebuild_preserves_corrupt_reuse_candidate(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            bm25_path = output_dir / "data" / "vector_db" / "tenant-a" / "bm25_index.json"
+            bm25_path.write_bytes(b'{"corrupt":true}\r\n')
+            stale_report = output_dir / "mcp_transport_smoke.json"
+            stale_report.write_bytes(b'{"stale":true}\r\n')
+            before = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in sorted(output_dir.rglob("*"))
+                if path.is_file()
+            }
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    side_effect=RuntimeError("forced-corrupt-cache-rebuild-failure"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "forced-corrupt-cache-rebuild-failure",
+                ),
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            after = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in sorted(output_dir.rglob("*"))
+                if path.is_file()
+            }
+
+        self.assertEqual(before, after)
+
+    def test_runtime_bundle_reuse_identity_scopes_tenant_profile_and_options(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            def generate(**overrides):
+                options = {
+                    "source_data_dir": settings.data_dir,
+                    "out_dir": output_dir,
+                    "tenant_id": "tenant-a",
+                    "profile_id": "profile-a",
+                    "scope": "institution_profile",
+                    "tenant_storage_isolation": False,
+                }
+                options.update(overrides)
+                with patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ):
+                    return write_mcp_runtime_data_bundle(**options)
+
+            baseline = generate()
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    wraps=mcp_config_generator.write_vector_records_with_offsets,
+                ) as vector_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    wraps=mcp_config_generator.write_bm25_index,
+                ) as bm25_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    wraps=mcp_config_generator.build_hierarchical_runtime_index,
+                ) as hierarchy_writer,
+            ):
+                tenant_changed = generate(tenant_id="tenant-b")
+                profile_changed = generate(tenant_id="tenant-b", profile_id="profile-b")
+                option_changed = generate(
+                    tenant_id="tenant-b",
+                    profile_id="profile-b",
+                    require_source_metadata=False,
+                )
+                parser_option_changed = generate(
+                    tenant_id="tenant-b",
+                    profile_id="profile-b",
+                    require_source_metadata=False,
+                    require_kordoc_table_parser=False,
+                )
+
+            fingerprints = {
+                manifest["runtime_data_reuse"]["input_sha256"]
+                for manifest in (
+                    baseline,
+                    tenant_changed,
+                    profile_changed,
+                    option_changed,
+                    parser_option_changed,
+                )
+            }
+
+        self.assertEqual(4, vector_writer.call_count)
+        self.assertEqual(4, bm25_writer.call_count)
+        self.assertEqual(4, hierarchy_writer.call_count)
+        self.assertEqual(5, len(fingerprints))
+        self.assertEqual("tenant-b", tenant_changed["tenant_id"])
+        self.assertEqual("profile-b", profile_changed["profile_id"])
+        self.assertFalse(option_changed["source_metadata_required"])
+        self.assertFalse(parser_option_changed["kordoc_table_parser_required"])
+
+    def test_runtime_bundle_groups_records_and_reads_each_journal_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            document_ids = ["doc-c", "doc-a", "doc-b"]
+            records = []
+            for index, document_id in enumerate(document_ids):
+                approval_id = f"approval-{document_id}"
+                chunk_id = f"chunk-{document_id}"
+                document = Document(
+                    document_id=document_id,
+                    filename=f"{document_id}.txt",
+                    document_name=f"Rules {document_id}",
+                    institution_name="Test Institution",
+                    source_system="PUBLIC_PORTAL",
+                    source_url=f"https://example.test/{document_id}",
+                    profile_id="profile-grouped",
+                    file_type="txt",
+                    file_hash=f"hash-{document_id}",
+                    tenant_id="tenant-a",
+                    status="completed",
+                    regulation_id=f"reg-{document_id}",
+                    regulation_version="v1",
+                    effective_from="2026-01-01",
+                    regulation_status="approved",
+                )
+                record = _runtime_export_record(
+                    document_id,
+                    chunk_id,
+                    metadata={
+                        "approval_id": approval_id,
+                        "profile_id": "profile-grouped",
+                        "regulation_id": f"reg-{document_id}",
+                    },
+                )
+                chunk = Chunk(
+                    chunk_id=chunk_id,
+                    document_id=document_id,
+                    chunk_type="article",
+                    text=record["text"],
+                    normalized_text=record["text"],
+                    retrieval_text=record["text"],
+                    metadata=record["metadata"],
+                    approval_status="approved",
+                    approval_id=approval_id,
+                    approved_content_hash="approved-hash",
+                    security_level="internal",
+                )
+                repository.upsert_document(document)
+                repository.save_processing_result(document_id, [], [chunk], [])
+                repository.append_approval_record(
+                    {
+                        "approval_record_id": f"approval-record-{document_id}",
+                        "approval_id": approval_id,
+                        "document_id": document_id,
+                        "tenant_id": "tenant-a",
+                        "chunk_ids": [chunk_id],
+                        "approved_content_hashes": {chunk_id: "approved-hash"},
+                        "approved_chunks": [
+                            {"chunk_id": chunk_id, "approved_content_hash": "approved-hash"}
+                        ],
+                        "approved_by": "operator",
+                        "approved_at": f"2026-07-{20 - index:02d}T00:00:00+00:00",
+                        "worklist_evidence": _approval_worklist_evidence(),
+                    }
+                )
+                repository.append_indexing_job(
+                    {
+                        "indexing_job_id": f"job-{document_id}",
+                        "document_id": document_id,
+                        "tenant_id": "tenant-a",
+                        "created_at": f"2026-07-{10 + index:02d}T00:00:00+00:00",
+                    }
+                )
+                records.append(record)
+
+            approval_reader = JsonRepository.list_approval_journal_records
+            indexing_reader = JsonRepository.list_indexing_jobs
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=list(reversed(records)),
+                ),
+                patch.object(
+                    JsonRepository,
+                    "list_approval_journal_records",
+                    autospec=True,
+                    side_effect=approval_reader,
+                ) as approval_calls,
+                patch.object(
+                    JsonRepository,
+                    "list_indexing_jobs",
+                    autospec=True,
+                    side_effect=indexing_reader,
+                ) as indexing_calls,
+                patch(
+                    "scripts.generate_mcp_client_config._current_approved_chunks_for_runtime_export",
+                    wraps=mcp_config_generator._current_approved_chunks_for_runtime_export,
+                ) as chunk_validator,
+            ):
+                runtime_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=Path(tmp) / "bundle",
+                    tenant_id="tenant-a",
+                    profile_id="profile-grouped",
+                    scope="institution_profile",
+                    tenant_storage_isolation=False,
+                    require_kordoc_table_parser=False,
+                )
+            runtime_repository = Path(tmp) / "bundle" / "data" / "repository"
+            exported_approvals = [
+                json.loads(line)
+                for line in (runtime_repository / "journals" / "approvals.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            exported_jobs = [
+                json.loads(line)
+                for line in (runtime_repository / "journals" / "indexing_jobs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            repository_manifest = json.loads(
+                (runtime_repository / "manifest.json").read_text(encoding="utf-8")
+            )
+            exported_repository = JsonRepository(
+                Settings(data_dir=Path(tmp) / "bundle" / "data")
+            )
+            listed_approvals = exported_repository.list_approval_records()
+            listed_jobs = exported_repository.list_indexing_jobs()
+
+        self.assertEqual(1, approval_calls.call_count)
+        self.assertEqual(1, indexing_calls.call_count)
+        self.assertEqual(3, chunk_validator.call_count)
+        self.assertTrue(all(len(call.args) == 1 for call in approval_calls.call_args_list))
+        self.assertTrue(all(len(call.args) == 1 for call in indexing_calls.call_args_list))
+        self.assertEqual(["doc-a", "doc-b", "doc-c"], runtime_manifest["document_ids"])
+        self.assertEqual({}, repository_manifest["approvals"])
+        self.assertEqual({}, repository_manifest["indexing_jobs"])
+        self.assertEqual(
+            ["approval-record-doc-a", "approval-record-doc-b", "approval-record-doc-c"],
+            [record["approval_record_id"] for record in exported_approvals],
+        )
+        self.assertEqual(
+            sorted(record["approval_record_id"] for record in exported_approvals),
+            sorted(record["approval_record_id"] for record in listed_approvals),
+        )
+        self.assertEqual(
+            ["job-doc-a", "job-doc-b", "job-doc-c"],
+            [record["indexing_job_id"] for record in exported_jobs],
+        )
+        self.assertEqual(
+            sorted(record["indexing_job_id"] for record in exported_jobs),
+            sorted(record["indexing_job_id"] for record in listed_jobs),
+        )
+        for call in chunk_validator.call_args_list:
+            current_document_id = call.kwargs["document_id"]
+            grouped_records = call.kwargs["records_by_chunk_id"].values()
+            self.assertEqual(
+                {current_document_id},
+                {record["document_id"] for record in grouped_records},
+            )
 
     def test_runtime_bundle_preserves_bulk_approval_review_events(self) -> None:
         metadata = {
@@ -5592,7 +6867,10 @@ $Result | ConvertTo-Json -Depth 6
             self.assertEqual(1, runtime_manifest["regulation_count"])
             self.assertEqual(1, runtime_manifest["regulation_version_count"])
             self.assertGreaterEqual(runtime_manifest["toc_node_count"], 1)
-            self.assertEqual("reg-rag-logical-corpus-v1", runtime_manifest["rebuild_fingerprint_schema_version"])
+            self.assertEqual(
+                mcp_config_generator.REBUILD_FINGERPRINT_SCHEMA_VERSION,
+                runtime_manifest["rebuild_fingerprint_schema_version"],
+            )
             self.assertRegex(runtime_manifest["logical_corpus_sha256"], r"^[0-9a-f]{64}$")
             self.assertTrue(runtime_manifest["rebuild_contract"]["input_order_independent"])
             hierarchy_path = output_dir / "data" / "hierarchy" / "regulation_hierarchy.sqlite3"

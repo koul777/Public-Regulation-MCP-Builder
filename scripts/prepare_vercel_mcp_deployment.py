@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import shutil
 from pathlib import Path
@@ -11,6 +12,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Leave room below Vercel's standard 500 MB uncompressed Python Function
 # bundle limit for application code and installed dependencies.
 DEFAULT_MAX_RUNTIME_BYTES = 400 * 1024 * 1024
+# Vercel rejects individual deployment files above 100 MB. Keep a safety
+# margin because the platform limit is enforced per uploaded file.
+MAX_RUNTIME_FILE_BYTES = 90 * 1024 * 1024
+# These files must remain directly readable or seekable by the runtime.
+RUNTIME_COMPRESSION_EXCLUSIONS = {
+    "mcp_runtime_manifest.json",
+    "manifest.json",
+    "approved_vectors.jsonl",
+    "approval_snapshot.json",
+}
 FORBIDDEN_RUNTIME_NAMES = {
     "uploads",
     "exports",
@@ -43,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_RUNTIME_BYTES,
         help="Reject runtime payloads larger than this many bytes (default: 400 MiB).",
     )
+    parser.add_argument(
+        "--compress-runtime-file-under-bytes",
+        type=int,
+        default=MAX_RUNTIME_FILE_BYTES,
+        help="Compress eligible JSON/JSONL runtime files larger than this size.",
+    )
     return parser.parse_args()
 
 
@@ -51,7 +68,10 @@ def prepare_vercel_mcp_deployment(
     runtime_data_dir: Path,
     out_dir: Path,
     max_runtime_bytes: int = DEFAULT_MAX_RUNTIME_BYTES,
+    compress_runtime_file_under_bytes: int | None = None,
 ) -> dict[str, Any]:
+    if compress_runtime_file_under_bytes is None:
+        compress_runtime_file_under_bytes = MAX_RUNTIME_FILE_BYTES
     source_runtime = runtime_data_dir.resolve()
     target = out_dir.resolve()
     _validate_target(source_runtime, target)
@@ -74,6 +94,12 @@ def prepare_vercel_mcp_deployment(
     (target / "api").mkdir()
     (target / "api" / "index.py").write_text(_vercel_entrypoint(), encoding="utf-8")
     shutil.copytree(source_runtime, target / "mcp_runtime")
+    compressed_runtime_files = _compress_oversized_runtime_files(
+        target / "mcp_runtime",
+        max_bytes=compress_runtime_file_under_bytes,
+    )
+    staged_runtime_files = _runtime_files(target / "mcp_runtime")
+    staged_runtime_bytes = sum(path.stat().st_size for path in staged_runtime_files)
     (target / "pyproject.toml").write_text(_deployment_pyproject(), encoding="utf-8")
     (target / "vercel.json").write_text(
         json.dumps(_vercel_config(), ensure_ascii=False, indent=2) + "\n",
@@ -86,8 +112,10 @@ def prepare_vercel_mcp_deployment(
     report = {
         "report_type": "vercel_mcp_deployment_stage",
         "out_dir": str(target),
-        "runtime_file_count": len(runtime_files),
-        "runtime_bytes": runtime_bytes,
+        "runtime_file_count": len(staged_runtime_files),
+        "runtime_bytes": staged_runtime_bytes,
+        "compressed_runtime_files": compressed_runtime_files,
+        "compression_threshold_bytes": compress_runtime_file_under_bytes,
         "tenant_id": manifest.get("tenant_id"),
         "profile_id": manifest.get("profile_id"),
         "tool_profile": "chatgpt-data",
@@ -140,6 +168,29 @@ def _runtime_files(runtime_data_dir: Path) -> list[Path]:
     return sorted(path for path in runtime_data_dir.rglob("*") if path.is_file())
 
 
+def _compress_oversized_runtime_files(runtime_data_dir: Path, *, max_bytes: int) -> list[str]:
+    compressed_files: list[str] = []
+    for path in _runtime_files(runtime_data_dir):
+        if path.suffix.casefold() not in {".json", ".jsonl"}:
+            continue
+        if path.name.casefold() in {name.casefold() for name in RUNTIME_COMPRESSION_EXCLUSIONS}:
+            continue
+        if path.stat().st_size <= max_bytes:
+            continue
+        compressed_path = Path(f"{path}.gz")
+        with path.open("rb") as source, gzip.open(compressed_path, "wb", compresslevel=9) as target:
+            shutil.copyfileobj(source, target)
+        if compressed_path.stat().st_size > MAX_RUNTIME_FILE_BYTES:
+            compressed_path.unlink(missing_ok=True)
+            raise ValueError(
+                "Runtime file remains too large after gzip compression for Vercel: "
+                f"{path.relative_to(runtime_data_dir).as_posix()}"
+            )
+        path.unlink()
+        compressed_files.append(compressed_path.relative_to(runtime_data_dir).as_posix())
+    return compressed_files
+
+
 def _validate_runtime_files(runtime_data_dir: Path, runtime_files: list[Path]) -> None:
     if not runtime_files:
         raise ValueError("Approved MCP runtime is empty.")
@@ -173,7 +224,6 @@ dependencies = [
   "uvicorn>=0.30",
   "pydantic>=2.0",
   "mcp>=1.26,<2",
-  "kiwipiepy>=0.21",
 ]
 
 [tool.vercel]
@@ -262,7 +312,7 @@ Runtime binding:
 
 - tenant_id: `{manifest.get("tenant_id") or ""}`
 - profile_id: `{manifest.get("profile_id") or ""}`
-- tools: `search`, `fetch`
+- tools: `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `search`, `fetch`
 
 The Vercel adapter is stateless and disables local trace/audit file writes because the
 function bundle is read-only. Use Vercel logs or an approved external audit sink for
@@ -276,6 +326,7 @@ def main() -> int:
         runtime_data_dir=args.runtime_data_dir,
         out_dir=args.out_dir,
         max_runtime_bytes=args.max_runtime_bytes,
+        compress_runtime_file_under_bytes=args.compress_runtime_file_under_bytes,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

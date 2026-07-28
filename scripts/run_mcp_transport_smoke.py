@@ -199,7 +199,16 @@ def _run_transport_smoke_with_data_dir(
             and full_profile.get("fetch_has_text")
             and full_profile.get("history_tool_available")
             and full_profile.get("history_passed")
-            and set(chatgpt_profile.get("tool_names") or []) == {"search", "fetch"}
+            and set(chatgpt_profile.get("tool_names") or [])
+            == {
+                "search",
+                "fetch",
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+            }
             and (
                 normalized_transport != "streamable-http"
                 or not http_bearer_token
@@ -525,6 +534,91 @@ async def _call_profile_tools(
     tool_result = await session.list_tools()
     list_tools_elapsed_ms = _elapsed_ms(list_tools_started_at)
     tool_names = sorted(tool.name for tool in tool_result.tools)
+    list_regulations_payload: dict[str, Any] = {}
+    list_regulations_elapsed_ms = 0.0
+    list_regulations_result_count = 0
+    list_regulations_total_count = 0
+    hierarchy_payload: dict[str, Any] = {}
+    hierarchy_elapsed_ms = 0.0
+    hierarchy_verified = False
+    exact_article_payload: dict[str, Any] = {}
+    exact_article_elapsed_ms = 0.0
+    exact_article_verified = False
+    if "list_regulations" in tool_names:
+        list_regulations_started_at = time.perf_counter()
+        list_regulations = await session.call_tool(
+            "list_regulations",
+            {"page": 1, "page_size": 100},
+        )
+        list_regulations_elapsed_ms = _elapsed_ms(list_regulations_started_at)
+        list_regulations_payload = _tool_payload(list_regulations)
+        catalog_rows = (
+            list_regulations_payload.get("regulations")
+            if isinstance(list_regulations_payload.get("regulations"), list)
+            else []
+        )
+        list_regulations_result_count = len(catalog_rows)
+        list_regulations_total_count = int(list_regulations_payload.get("total_count") or 0)
+        first_catalog_unit_id = str(
+            (catalog_rows[0] if catalog_rows and isinstance(catalog_rows[0], dict) else {}).get(
+                "regulation_unit_id"
+            )
+            or ""
+        )
+        if "get_regulation_toc" in tool_names and first_catalog_unit_id:
+            hierarchy_started_at = time.perf_counter()
+            hierarchy = await session.call_tool(
+                "get_regulation_toc",
+                {"regulation_unit_id": first_catalog_unit_id},
+            )
+            hierarchy_elapsed_ms = _elapsed_ms(hierarchy_started_at)
+            hierarchy_payload = _tool_payload(hierarchy)
+            hierarchy_verified = bool(
+                isinstance(hierarchy_payload.get("regulation"), dict)
+                and isinstance(hierarchy_payload.get("nodes"), list)
+            )
+            hierarchy_nodes = (
+                hierarchy_payload.get("nodes")
+                if isinstance(hierarchy_payload.get("nodes"), list)
+                else []
+            )
+            first_article_node = next(
+                (
+                    node
+                    for node in hierarchy_nodes
+                    if isinstance(node, dict)
+                    and (
+                        str(node.get("node_type") or "") == "article"
+                        or bool(str(node.get("number") or "").strip())
+                    )
+                ),
+                None,
+            )
+            first_article_no = str(
+                (first_article_node or {}).get("number")
+                or (first_article_node or {}).get("label")
+                or ""
+            ).strip()
+            if "get_regulation_article" in tool_names and first_article_no:
+                exact_article_started_at = time.perf_counter()
+                exact_article = await session.call_tool(
+                    "get_regulation_article",
+                    {
+                        "regulation_unit_id": first_catalog_unit_id,
+                        "article_no": first_article_no,
+                    },
+                )
+                exact_article_elapsed_ms = _elapsed_ms(exact_article_started_at)
+                exact_article_payload = _tool_payload(exact_article)
+                exact_articles = (
+                    exact_article_payload.get("articles")
+                    if isinstance(exact_article_payload.get("articles"), list)
+                    else []
+                )
+                exact_article_verified = any(
+                    isinstance(item, dict) and bool(str(item.get("text") or "").strip())
+                    for item in exact_articles
+                )
     index_status_payload: dict[str, Any] = {}
     index_status_elapsed_ms = 0.0
     index_status_verified = False
@@ -605,14 +699,36 @@ async def _call_profile_tools(
         else []
     )
     expected_tools = (
-        {"search", "fetch"}
+        {
+            "search",
+            "fetch",
+            "list_regulations",
+            "get_regulation_toc",
+            "get_regulation_article",
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
+        }
         if tool_profile == "chatgpt-data"
-        else {"search", "fetch", "list_documents", "get_index_status"}
+        else {
+            "search",
+            "fetch",
+            "list_documents",
+            "list_regulations",
+            "get_regulation_toc",
+            "get_regulation_article",
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
+            "get_index_status",
+        }
     )
+    catalog_verified = list_regulations_result_count > 0 and list_regulations_total_count >= list_regulations_result_count
     return {
         "passed": bool(
             expected_tools.issubset(set(tool_names))
             and (tool_profile == "chatgpt-data" or index_status_verified)
+            and catalog_verified
+            and hierarchy_verified
+            and exact_article_verified
             and results
             and fetch_payload.get("text")
         ),
@@ -623,11 +739,22 @@ async def _call_profile_tools(
         "end_to_end_verified": bool(
             expected_tools.issubset(set(tool_names))
             and (tool_profile == "chatgpt-data" or index_status_verified)
+            and catalog_verified
+            and hierarchy_verified
+            and exact_article_verified
             and results
             and fetch_payload.get("text")
         ),
         "tool_profile": tool_profile,
         "tool_names": tool_names,
+        "list_regulations_result_count": list_regulations_result_count,
+        "list_regulations_total_count": list_regulations_total_count,
+        "list_regulations_elapsed_ms": list_regulations_elapsed_ms,
+        "hierarchy_verified": hierarchy_verified,
+        "hierarchy_elapsed_ms": hierarchy_elapsed_ms,
+        "exact_article_verified": exact_article_verified,
+        "exact_article_elapsed_ms": exact_article_elapsed_ms,
+        "catalog_verified": catalog_verified,
         "query": query,
         "no_warm_cache": no_warm_cache,
         "search_result_count": len(results),

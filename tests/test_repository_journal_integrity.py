@@ -161,6 +161,47 @@ class JsonRepositoryJournalIntegrityTests(unittest.TestCase):
             self.assertEqual([record], repository.list_approval_journal_records())
             self.assertEqual([record], repository.list_approval_records())
 
+    def test_manifest_update_removes_only_exact_journal_mirrors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            exact = _approval_record()
+            legacy_only = dict(
+                _approval_record(approved_by="legacy-reviewer"),
+                approval_record_id="approval-record-legacy",
+                approval_id="approval-legacy",
+            )
+            repository.append_approval_record(exact)
+            manifest = json.loads(repository.manifest_path.read_text(encoding="utf-8"))
+            manifest["approvals"] = {
+                exact["approval_record_id"]: exact,
+                legacy_only["approval_record_id"]: legacy_only,
+            }
+            repository.manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            repository.upsert_document(
+                Document(
+                    document_id="document-1",
+                    filename="regulation.pdf",
+                    file_type="pdf",
+                    file_hash="hash-1",
+                    tenant_id="tenant-a",
+                )
+            )
+
+            compacted = json.loads(repository.manifest_path.read_text(encoding="utf-8"))
+            listed = repository.list_approval_records()
+
+        self.assertNotIn(exact["approval_record_id"], compacted["approvals"])
+        self.assertEqual(legacy_only, compacted["approvals"][legacy_only["approval_record_id"]])
+        self.assertEqual(
+            {exact["approval_record_id"], legacy_only["approval_record_id"]},
+            {record["approval_record_id"] for record in listed},
+        )
+
     def test_manifest_backed_security_journals_reject_conflicting_id_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repository = JsonRepository(Settings(data_dir=Path(tmp)))
@@ -309,7 +350,7 @@ class JsonRepositoryJournalIntegrityTests(unittest.TestCase):
             with patch.object(Path, "open", reject_lock_creation):
                 self.assertEqual([_approval_record()], repository.list_approval_journal_records())
 
-    def test_manifest_only_approval_after_append_failure_has_no_journal_evidence(self) -> None:
+    def test_failed_approval_append_leaves_no_manifest_or_journal_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
             repository = JsonRepository(settings)
@@ -329,7 +370,7 @@ class JsonRepositoryJournalIntegrityTests(unittest.TestCase):
                     repository.append_approval_record(record)
 
             fresh = JsonRepository(settings)
-            self.assertEqual([record], fresh.list_approval_records())
+            self.assertEqual([], fresh.list_approval_records())
             self.assertEqual([], fresh.list_approval_journal_records())
             self.assertEqual(
                 {},

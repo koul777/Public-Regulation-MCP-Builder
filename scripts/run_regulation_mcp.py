@@ -29,7 +29,10 @@ def parse_args() -> argparse.Namespace:
         "--tool-profile",
         choices=["full", "chatgpt-data"],
         default="full",
-        help="Tool exposure profile. Use chatgpt-data to expose only search/fetch for data connectors.",
+        help=(
+            "Tool exposure profile. Use chatgpt-data to expose the read-only regulation catalog, "
+            "hierarchy, exact-article, search, and fetch tools for data connectors."
+        ),
     )
     parser.add_argument(
         "--http-bearer-token",

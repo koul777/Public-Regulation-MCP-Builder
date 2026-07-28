@@ -6,8 +6,9 @@ import io
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from scripts.mcp_connection_diagnostic import diagnostic_from_bundle_status
 from scripts.mcp_client_status import begin_attempt, commit_success, create_bundle_status
@@ -17,6 +18,342 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class StreamlitOperatorModeTests(unittest.TestCase):
+    def test_reviewed_document_plan_reuses_index_created_during_revision_approval(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_reviewed_document_approval_plan"
+        )
+        index_calls: list[str] = []
+        progress: list[tuple[int, str, int | None, int | None]] = []
+
+        class Approval:
+            chunk_ids = ["chunk-1", "chunk-2"]
+
+            def model_copy(self, *, update):
+                raise AssertionError("revision activation must not defer its first index")
+
+        class RevisionDocument:
+            supersedes_document_id = "doc-prior"
+
+        def approve(document_id, request, auth):
+            return {
+                "vector_sync": {
+                    "status": "indexed",
+                    "record_count": 2,
+                }
+            }
+
+        def index(document_id, request, auth):
+            index_calls.append(document_id)
+            return {"record_count": 2}
+
+        namespace = {
+            "Callable": Callable,
+            "approve_review_chunks": approve,
+            "index_document": index,
+            "IndexRequest": object,
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<approval-plan>", "exec"),
+            namespace,
+        )
+        result = namespace["_execute_reviewed_document_approval_plan"](
+            {
+                "document_id": "doc-revision",
+                "document": RevisionDocument(),
+                "local_auth": object(),
+                "approval_requests": [Approval()],
+                "edited_chunk_count": 0,
+            },
+            progress_callback=lambda *values: progress.append(values),
+            defer_index=True,
+        )
+
+        self.assertEqual([], index_calls)
+        self.assertEqual(2, result["indexed_record_count"])
+        self.assertEqual((100, "승인·색인 완료", 1, 1), progress[-1])
+
+    def test_reviewed_document_plan_can_defer_first_index_for_batch_write(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_reviewed_document_approval_plan"
+        )
+        index_calls: list[str] = []
+        progress: list[tuple[int, str, int | None, int | None]] = []
+        approval_requests: list[object] = []
+
+        class Approval:
+            chunk_ids = ["chunk-1"]
+            review_batch_id = "review-batch-1"
+
+            def model_copy(self, *, update):
+                for key, value in update.items():
+                    setattr(self, key, value)
+                return self
+
+        def approve(document_id, request, auth):
+            approval_requests.append(request)
+            return {"vector_sync": {"status": "skipped", "reason": "no_prior_indexed_job"}}
+
+        def index(document_id, request, auth):
+            index_calls.append(document_id)
+            return {"record_count": 1}
+
+        namespace = {
+            "Callable": Callable,
+            "approve_review_chunks": approve,
+            "index_document": index,
+            "IndexRequest": object,
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<approval-plan>", "exec"),
+            namespace,
+        )
+        result = namespace["_execute_reviewed_document_approval_plan"](
+            {
+                "document_id": "doc-new",
+                "local_auth": object(),
+                "approval_requests": [Approval()],
+                "edited_chunk_count": 0,
+            },
+            progress_callback=lambda *values: progress.append(values),
+            defer_index=True,
+        )
+
+        self.assertEqual([], index_calls)
+        self.assertTrue(result["index_deferred"])
+        self.assertEqual(0, result["indexed_record_count"])
+        self.assertEqual(approval_requests[0].vector_sync_batch_id, result["vector_sync_batch_id"])
+        self.assertTrue(approval_requests[0].defer_vector_sync)
+        self.assertIn("review-batch-1", approval_requests[0].vector_sync_batch_id)
+        self.assertEqual((100, "승인 완료·일괄 색인 대기", 1, 1), progress[-1])
+
+    def test_reviewed_document_plan_resumes_a_durable_deferred_sync_batch(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_reviewed_document_approval_plan"
+        )
+        index_calls: list[str] = []
+        namespace = {
+            "Callable": Callable,
+            "approve_review_chunks": lambda *_args, **_kwargs: {},
+            "index_document": lambda document_id, *_args, **_kwargs: index_calls.append(document_id),
+            "IndexRequest": object,
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<approval-plan>", "exec"),
+            namespace,
+        )
+
+        result = namespace["_execute_reviewed_document_approval_plan"](
+            {
+                "document_id": "doc-recover",
+                "local_auth": object(),
+                "approval_requests": [],
+                "pending_vector_sync_batch_ids": ["durable-batch-1"],
+                "edited_chunk_count": 0,
+            },
+            defer_index=True,
+        )
+
+        self.assertEqual([], index_calls)
+        self.assertTrue(result["index_deferred"])
+        self.assertEqual("durable-batch-1", result["vector_sync_batch_id"])
+
+    def test_reviewed_document_plan_with_no_work_never_calls_single_document_index(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_reviewed_document_approval_plan"
+        )
+        index_calls: list[str] = []
+        progress: list[tuple[int, str, int | None, int | None]] = []
+        namespace = {
+            "Callable": Callable,
+            "approve_review_chunks": lambda *_args, **_kwargs: {},
+            "index_document": lambda document_id, *_args, **_kwargs: index_calls.append(document_id),
+            "IndexRequest": object,
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<approval-plan>", "exec"),
+            namespace,
+        )
+
+        result = namespace["_execute_reviewed_document_approval_plan"](
+            {
+                "document_id": "doc-unchanged",
+                "local_auth": object(),
+                "approval_requests": [],
+                "pending_vector_sync_batch_ids": [],
+                "edited_chunk_count": 0,
+            },
+            progress_callback=lambda *values: progress.append(values),
+            defer_index=True,
+        )
+
+        self.assertEqual([], index_calls)
+        self.assertTrue(result["index_skipped"])
+        self.assertFalse(result["index_deferred"])
+        self.assertEqual((100, "변경 없음·색인 생략", 0, 0), progress[-1])
+
+    def test_batch_plan_filter_keeps_only_changed_or_durable_recovery_documents(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_approval_plan_requires_work"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<approval-plan-filter>", "exec"),
+            namespace,
+        )
+        requires_work = namespace["_approval_plan_requires_work"]
+        plans = [
+            {
+                "document_id": f"doc-{index:02d}",
+                "approval_requests": [],
+                "pending_vector_sync_batch_ids": [],
+            }
+            for index in range(45)
+        ]
+        plans[17]["approval_requests"] = [object()]
+
+        actual_work = [plan for plan in plans if requires_work(plan)]
+
+        self.assertEqual(["doc-17"], [plan["document_id"] for plan in actual_work])
+        self.assertTrue(
+            requires_work(
+                {
+                    "approval_requests": [],
+                    "pending_vector_sync_batch_ids": ["durable-recovery-batch"],
+                }
+            )
+        )
+        self.assertFalse(
+            requires_work(
+                {
+                    "approval_requests": [],
+                    "pending_vector_sync_batch_ids": ["", "   "],
+                }
+            )
+        )
+        batch_start = source.index('batch_status = st.status("선택한 규정별 승인·색인 중…')
+        batch_end = source.index("if workflow_ready_count < workflow_pending_count:", batch_start)
+        batch_source = source[batch_start:batch_end]
+        self.assertIn("if _approval_plan_requires_work(plan)", batch_source)
+        self.assertIn("변경 없는 규정 {skipped_plan_count:,}개는 색인을 생략했습니다", batch_source)
+
+    def test_streamlit_batch_approval_and_metadata_patch_use_batch_indexing(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(source.count("index_documents_batch("), 2)
+        self.assertIn("defer_index=True", source)
+        self.assertIn('"defer_vector_sync": True', source)
+        self.assertIn("vector_sync_batch_ids=deferred_batch_ids", source)
+        self.assertIn("보상 색인을 완료했습니다", source)
+        self.assertIn("pending_deferred_vector_sync_batch_ids", source)
+        self.assertIn("색인 복구", source)
+        self.assertIn("patched_document_ids", source)
+
+    def test_all_long_operation_status_cards_leave_running_state_on_error(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_names = {
+            "_brief_long_operation_error",
+            "_long_operation_context_label",
+            "_update_long_operation_error",
+            "_long_operation_status",
+        }
+        helper_nodes = [
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+
+        class FakeStatus:
+            def __init__(self) -> None:
+                self.updates: list[dict[str, object]] = []
+                self.errors: list[str] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def update(self, **kwargs) -> None:
+                self.updates.append(dict(kwargs))
+
+            def error(self, message: str) -> None:
+                self.errors.append(message)
+
+        class FakeStreamlit:
+            def __init__(self) -> None:
+                self.card = FakeStatus()
+
+            def status(self, *_args, **_kwargs):
+                return self.card
+
+        fake_st = FakeStreamlit()
+        namespace = {
+            "Callable": Callable,
+            "Iterator": Iterator,
+            "contextmanager": contextmanager,
+            "redact_sensitive_paths": lambda value: value,
+            "st": fake_st,
+        }
+        exec(
+            compile(ast.Module(body=helper_nodes, type_ignores=[]), "<long-operation-status>", "exec"),
+            namespace,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "backend stopped"):
+            with namespace["_long_operation_status"](
+                "처리 중",
+                failure_stage="검색 인덱스 생성",
+                failure_regulation="인사규정",
+                failure_policy="전체 작업을 중단하고 복구 배치를 보존합니다.",
+            ):
+                raise RuntimeError("backend stopped\nwith details")
+
+        self.assertEqual("error", fake_st.card.updates[-1]["state"])
+        rendered_error = fake_st.card.errors[-1]
+        self.assertIn("실패 단계: 검색 인덱스 생성", rendered_error)
+        self.assertIn("실패 규정: 인사규정", rendered_error)
+        self.assertIn("오류: backend stopped with details", rendered_error)
+        self.assertIn("전체 작업을 중단하고 복구 배치를 보존합니다", rendered_error)
+
+        direct_status_calls = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "st"
+            and node.func.attr == "status"
+        ]
+        self.assertEqual(3, len(direct_status_calls))
+        self.assertGreaterEqual(source.count("_long_operation_status("), 11)
+        batch_start = source.index('batch_status = st.status("선택한 규정별 승인·색인 중…')
+        batch_end = source.index("if workflow_ready_count < workflow_pending_count:", batch_start)
+        self.assertIn("_update_long_operation_error(", source[batch_start:batch_end])
+        bundle_start = source.index('bundle_status = st.status("MCP 파일 묶음 생성 중…')
+        bundle_end = source.index("bundle_state = st.session_state.get", bundle_start)
+        self.assertIn('state="error"', source[bundle_start:bundle_end])
+
     def test_mcp_connection_diagnostic_reader_reloads_bundle_status_each_call(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
@@ -1462,6 +1799,34 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('"false_positive"', source)
         self.assertIn('"false_negative"', source)
         self.assertIn("Goldset review measures parser accuracy. It does not approve operational chunks", source)
+
+    def test_streamlit_progress_uses_real_callbacks_and_separate_bundle_stages(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        helper_start = source.index("def _run_background_operation_with_progress(")
+        helper_end = source.index("def _write_operator_mcp_bundle_zip(", helper_start)
+        helper_source = source[helper_start:helper_end]
+        self.assertIn("last_update_at", helper_source)
+        self.assertIn("status_box", helper_source)
+        self.assertIn("status_box.update(", helper_source)
+        self.assertNotIn("status_box.write(", helper_source)
+        self.assertIn("min(measured_percent, 99) if thread.is_alive()", helper_source)
+        self.assertNotIn("estimated_percent", helper_source)
+        self.assertNotIn("elapsed_fraction", helper_source)
+
+        bundle_start = source.index('"MCP로 쓸 파일 묶음 만들기"')
+        bundle_end = source.index("bundle_state = st.session_state.get", bundle_start)
+        bundle_source = source[bundle_start:bundle_end]
+        self.assertIn('start_percent=35', bundle_source)
+        self.assertIn('end_percent=78', bundle_source)
+        self.assertIn('label="MCP 데이터·검색 인덱스 생성"', bundle_source)
+        self.assertIn("current_bundle_regulation", bundle_source)
+        self.assertIn('bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")', bundle_source)
+        self.assertIn('state="error"', bundle_source)
+        self.assertIn("전체 작업을 중단했습니다", bundle_source)
+        self.assertNotIn("time.sleep(0.12)", bundle_source)
+
+        self.assertIn("progress_callback=report", source)
+        self.assertIn('progress_callback(50, "검색 인덱스 생성", 0, 1)', source)
 
 
 if __name__ == "__main__":

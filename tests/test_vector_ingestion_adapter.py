@@ -3,9 +3,13 @@ from __future__ import annotations
 import unittest
 
 from app.ingestion.vector_adapter import (
+    VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION,
     VECTOR_RECORD_SCHEMA_VERSION,
+    VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION,
     VECTOR_RECORD_VERIFICATION_VERSION,
     build_vector_records,
+    vector_metadata_semantic_fingerprint,
+    vector_record_semantic_fingerprint,
     vector_record_verification_hash,
     vector_record_from_chunk,
     vector_record_path_leaks,
@@ -13,6 +17,119 @@ from app.ingestion.vector_adapter import (
 
 
 class VectorIngestionAdapterTests(unittest.TestCase):
+    def test_semantic_fingerprints_cover_retrieval_lifecycle_acl_and_profile_metadata(self) -> None:
+        base = {
+            "chunk_id": "chunk-semantic",
+            "document_id": "doc-semantic",
+            "tenant_id": "tenant-a",
+            "retrieval_text": "제16조 임용 기준",
+            "profile_id": "profile-a",
+            "regulation_title": "인사규정",
+            "regulation_status": "approved",
+            "effective_to": None,
+            "hierarchy_path": "제2장 > 제16조",
+            "department_acl": ["hr"],
+            "approval_status": "approved",
+            "approval_id": "approval-semantic",
+            "approved_content_hash": "approved-hash-semantic",
+            "security_level": "internal",
+        }
+        first = vector_record_from_chunk(base)
+        reordered = vector_record_from_chunk(dict(reversed(list(base.items()))))
+        changed = vector_record_from_chunk(
+            {
+                **base,
+                "profile_id": "profile-b",
+                "regulation_title": "개정 인사규정",
+                "regulation_status": "superseded",
+                "effective_to": "2026-07-31",
+                "hierarchy_path": "제3장 > 제16조",
+                "department_acl": ["audit", "hr"],
+                "security_level": "sensitive",
+            }
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(reordered)
+        self.assertIsNotNone(changed)
+        assert first is not None and reordered is not None and changed is not None
+        self.assertEqual(
+            VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION,
+            first["metadata_semantic_fingerprint_version"],
+        )
+        self.assertEqual(
+            VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION,
+            first["record_semantic_fingerprint_version"],
+        )
+        self.assertEqual(
+            vector_metadata_semantic_fingerprint(first["metadata"]),
+            first["metadata_semantic_fingerprint"],
+        )
+        self.assertEqual(
+            vector_record_semantic_fingerprint(first),
+            first["record_semantic_fingerprint"],
+        )
+        self.assertEqual(
+            first["metadata_semantic_fingerprint"],
+            reordered["metadata_semantic_fingerprint"],
+        )
+        self.assertEqual(
+            first["record_semantic_fingerprint"],
+            reordered["record_semantic_fingerprint"],
+        )
+        self.assertNotEqual(
+            first["metadata_semantic_fingerprint"],
+            changed["metadata_semantic_fingerprint"],
+        )
+        self.assertNotEqual(
+            first["record_semantic_fingerprint"],
+            changed["record_semantic_fingerprint"],
+        )
+
+    def test_preserves_safe_structural_child_sample_for_exact_reference_resolution(self) -> None:
+        record = vector_record_from_chunk(
+            {
+                "chunk_id": "chunk-structure",
+                "document_id": "doc-structure",
+                "tenant_id": "tenant-a",
+                "retrieval_text": "제16조 구조화 본문",
+                "article_no": "제16조",
+                "paragraph_unit_count": 1,
+                "item_unit_count": 1,
+                "paragraph_item_unit_sample": [
+                    {
+                        "node_id": "private-node-1",
+                        "node_type": "paragraph",
+                        "number": "②",
+                        "text_preview": "민감할 수 있는 본문",
+                    },
+                    {
+                        "node_id": "private-node-2",
+                        "node_type": "item",
+                        "number": "1.",
+                    },
+                ],
+                "approval_status": "approved",
+                "approval_id": "approval-structure",
+                "approved_content_hash": "approved-hash-structure",
+                "security_level": "internal",
+            }
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(1, record["metadata"]["paragraph_unit_count"])
+        self.assertEqual(1, record["metadata"]["item_unit_count"])
+        self.assertEqual(
+            [
+                {"node_type": "paragraph", "number": "②"},
+                {"node_type": "item", "number": "1."},
+            ],
+            record["metadata"]["paragraph_item_unit_sample"],
+        )
+        self.assertNotIn("private-node-1", str(record["metadata"]))
+        self.assertNotIn("민감할 수 있는 본문", str(record["metadata"]))
+
     def test_builds_provider_neutral_record_with_public_metadata(self) -> None:
         record = vector_record_from_chunk(
             {

@@ -1984,6 +1984,38 @@ class RoutesRagTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(1, read_manifest.call_count)
 
+    def test_approval_journal_signature_reads_shared_journal_once_for_many_documents(self) -> None:
+        class CountingApprovalRepository:
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            def list_approval_journal_records(self):
+                self.call_count += 1
+                return [
+                    {
+                        "approval_record_id": f"record-{document_id}",
+                        "approval_id": f"approval-{document_id}",
+                        "document_id": document_id,
+                        "chunk_ids": [f"chunk-{document_id}"],
+                        "approved_content_hashes": {
+                            f"chunk-{document_id}": f"hash-{document_id}"
+                        },
+                        "worklist_evidence": {},
+                        "tenant_id": "tenant-a",
+                        "approved_at": "2026-07-28T00:00:00+00:00",
+                    }
+                    for document_id in ("doc-a", "doc-b", "doc-outside")
+                ]
+
+        repository = CountingApprovalRepository()
+        signature = routes_rag._approval_journal_signature(
+            repository,
+            ["doc-a", "doc-b"],
+        )
+
+        self.assertEqual(1, repository.call_count)
+        self.assertRegex(signature, r"^[0-9a-f]{64}$")
+
     def test_runtime_approval_snapshot_sidecar_avoids_live_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")

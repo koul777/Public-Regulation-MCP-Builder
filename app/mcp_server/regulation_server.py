@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from mcp.server.auth.provider import AccessToken
@@ -15,6 +15,8 @@ from app.core.input_limits import (
     McpDepartmentIds,
     McpIdentifier,
     McpOptionalIdentifier,
+    McpPage,
+    McpPageSize,
     McpQuery,
     McpResultId,
     McpSecurityLevels,
@@ -31,9 +33,11 @@ from app.mcp_server.regulation_tools import (
     get_index_status as get_index_status_result,
     get_regulation_article as get_regulation_article_result,
     get_regulation_history as get_regulation_history_result,
+    get_regulation_references as get_regulation_references_result,
     get_regulation_toc as get_regulation_toc_result,
     get_table as get_table_result,
     list_documents as list_document_results,
+    list_regulation_reference_cycles as list_regulation_reference_cycles_result,
     list_regulations as list_regulation_results,
     lookup_regulation,
     mcp_auth_context,
@@ -42,7 +46,12 @@ from app.mcp_server.regulation_tools import (
     start_background_tokenizer_warmup,
     warm_mcp_runtime,
 )
-from app.schemas.mcp import ChatGPTDataFetchOutput, ChatGPTDataSearchOutput
+from app.schemas.mcp import (
+    ChatGPTDataFetchOutput,
+    ChatGPTDataRegulationArticleOutput,
+    ChatGPTDataRegulationListOutput,
+    ChatGPTDataSearchOutput,
+)
 
 
 SERVER_INSTRUCTIONS = """Local public-institution regulation MCP server.
@@ -67,6 +76,8 @@ Tool flow:
 - Use list_regulations to inspect institution-local regulation families and their current/revision versions.
 - Use get_regulation_toc before broad exploration of a known regulation.
 - Use get_regulation_article for an exact article when regulation_unit_id is known.
+- Use get_regulation_references to follow resolved incoming/outgoing citations and inspect unresolved or ambiguous citations.
+- Use list_regulation_reference_cycles to inspect circular dependencies among current approved regulations.
 - Use lookup when a document ID is known: it performs exact approved document/article lookup first and falls back to RAG only on a miss.
 - Use fetch with a returned search id before drafting a final evidence-backed answer.
 - Use get_document when the user explicitly asks to load the whole approved document.
@@ -88,10 +99,13 @@ contain enough evidence instead of guessing."""
 
 CHATGPT_DATA_SERVER_INSTRUCTIONS = """Approved public-institution regulation data source for ChatGPT.
 
-Use search with only a query string, then use fetch with only a returned result id before answering.
+Use list_regulations for a complete approved regulation catalog, get_regulation_toc for the hierarchy of a
+listed regulation, get_regulation_article for an exact article, get_regulation_references for cross-regulation
+citations, and list_regulation_reference_cycles for circular dependencies. Use search with only a query string
+for regulation questions. Then use fetch with only a returned result id before answering.
 Use only fetched text and metadata as evidence. Do not infer definitions, conditions, or dates that the
 approved evidence does not contain. Citation URLs are either user-openable HTTP(S) source pages or empty.
-The server is read-only and exposes only the OpenAI-compatible search and fetch data-source contract."""
+The server is read-only and exposes the OpenAI-compatible search/fetch data-source contract plus catalog tools."""
 
 READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
@@ -216,6 +230,142 @@ def create_regulation_mcp_server(
         }
 
     if normalized_tool_profile == "chatgpt-data":
+        @server.tool(
+            name="list_regulations",
+            title="List approved regulations",
+            description=(
+                "Return the complete approved regulation catalog for this institution. "
+                "Each regulation title appears once even when it has many chunks or appendices. "
+                "Use page and page_size for large catalogs; use search separately for regulation text."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def list_regulations_tool(
+            query: McpOptionalIdentifier | None = None,
+            page: McpPage = 1,
+            page_size: McpPageSize = 50,
+        ) -> ChatGPTDataRegulationListOutput:
+            response = list_regulation_results(
+                settings=settings,
+                auth=auth,
+                profile_id=default_profile_id,
+                query=query,
+                page=page,
+                page_size=page_size,
+            )
+            return ChatGPTDataRegulationListOutput.model_validate(
+                {
+                    "regulations": response.get("regulations") or [],
+                    "total_count": int(response.get("total_count") or 0),
+                    "page": int(response.get("page") or page),
+                    "page_size": int(response.get("page_size") or page_size),
+                    "next_cursor": response.get("next_cursor"),
+                }
+            )
+
+        @server.tool(
+            name="get_regulation_toc",
+            title="Get regulation hierarchy",
+            description=(
+                "Return the chapter, section, article, appendix, and form hierarchy for a regulation_unit_id "
+                "returned by list_regulations. This is a read-only catalog operation, separate from search."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def get_regulation_toc_tool(regulation_unit_id: McpIdentifier) -> dict[str, Any]:
+            return get_regulation_toc_result(
+                settings=settings,
+                auth=auth,
+                regulation_unit_id=regulation_unit_id,
+                profile_id=default_profile_id,
+            )
+
+        @server.tool(
+            name="get_regulation_article",
+            title="Get exact regulation article",
+            description=(
+                "Return exact approved article evidence for a regulation_unit_id and article number, such as 제16조. "
+                "Use this to follow an internal citation after resolving the target regulation with list_regulations."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def get_regulation_article_tool(
+            regulation_unit_id: McpIdentifier,
+            article_no: McpArticleNo,
+        ) -> ChatGPTDataRegulationArticleOutput:
+            response = get_regulation_article_result(
+                settings=settings,
+                auth=auth,
+                regulation_unit_id=regulation_unit_id,
+                article_no=article_no,
+                profile_id=default_profile_id,
+            )
+            article_results = response.get("articles") if isinstance(response.get("articles"), list) else []
+            return ChatGPTDataRegulationArticleOutput(
+                regulation_unit_id=str(response.get("regulation_unit_id") or regulation_unit_id),
+                article_no=str(response.get("article_no") or article_no),
+                articles=[
+                    chatgpt_data_fetch_output(item)
+                    for item in article_results
+                    if isinstance(item, dict)
+                ],
+            )
+
+        @server.tool(
+            name="get_regulation_references",
+            title="Get cross-regulation references",
+            description=(
+                "Return current approved incoming or outgoing references for a regulation_unit_id, including "
+                "resolved exact articles, ambiguous targets, unresolved targets, and cycle membership."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def get_regulation_references_tool(
+            regulation_unit_id: McpIdentifier,
+            direction: Literal["outgoing", "incoming", "both"] = "both",
+            status: Literal["resolved", "unresolved", "ambiguous"] | None = None,
+            page: McpPage = 1,
+            page_size: McpPageSize = 50,
+        ) -> dict[str, Any]:
+            return get_regulation_references_result(
+                settings=settings,
+                auth=auth,
+                regulation_unit_id=regulation_unit_id,
+                profile_id=default_profile_id,
+                direction=direction,
+                status=status,
+                page=page,
+                page_size=page_size,
+            )
+
+        @server.tool(
+            name="list_regulation_reference_cycles",
+            title="List circular regulation references",
+            description=(
+                "List deterministic circular-reference groups among the institution's current approved regulations. "
+                "Optionally restrict the result to one regulation_unit_id."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def list_regulation_reference_cycles_tool(
+            regulation_unit_id: McpOptionalIdentifier | None = None,
+            page: McpPage = 1,
+            page_size: McpPageSize = 50,
+        ) -> dict[str, Any]:
+            return list_regulation_reference_cycles_result(
+                settings=settings,
+                auth=auth,
+                profile_id=default_profile_id,
+                regulation_unit_id=regulation_unit_id,
+                page=page,
+                page_size=page_size,
+            )
+
         @server.tool(
             name="search",
             title="Search approved regulations",
@@ -398,6 +548,8 @@ def create_regulation_mcp_server(
     def list_regulations_tool(
         query: McpOptionalIdentifier | None = None,
         include_history: bool = False,
+        page: McpPage = 1,
+        page_size: McpPageSize = 50,
         profile_id: McpOptionalIdentifier | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
@@ -407,6 +559,8 @@ def create_regulation_mcp_server(
             profile_id=effective_profile_id,
             query=query,
             include_history=include_history,
+            page=page,
+            page_size=page_size,
         )
 
     @server.tool(
@@ -431,6 +585,63 @@ def create_regulation_mcp_server(
             regulation_unit_id=regulation_unit_id,
             profile_id=effective_profile_id,
             as_of_date=as_of_date,
+        )
+
+    @server.tool(
+        name="get_regulation_references",
+        title="Get cross-regulation references",
+        description=(
+            "Return paginated incoming/outgoing current approved references for one regulation_unit_id. "
+            "Resolved references include the exact target article locator; unresolved and ambiguous references "
+            "include explicit reason codes. The response also reports circular-reference membership."
+        ),
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+        structured_output=True,
+    )
+    def get_regulation_references_tool(
+        regulation_unit_id: McpIdentifier,
+        direction: Literal["outgoing", "incoming", "both"] = "both",
+        status: Literal["resolved", "unresolved", "ambiguous"] | None = None,
+        page: McpPage = 1,
+        page_size: McpPageSize = 50,
+        profile_id: McpOptionalIdentifier | None = None,
+    ) -> dict[str, Any]:
+        effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
+        return get_regulation_references_result(
+            settings=settings,
+            auth=auth,
+            regulation_unit_id=regulation_unit_id,
+            profile_id=effective_profile_id,
+            direction=direction,
+            status=status,
+            page=page,
+            page_size=page_size,
+        )
+
+    @server.tool(
+        name="list_regulation_reference_cycles",
+        title="List circular regulation references",
+        description=(
+            "List deterministic Tarjan SCC circular-reference groups among current approved regulations. "
+            "Optionally restrict the result to cycles containing one regulation_unit_id."
+        ),
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+        structured_output=True,
+    )
+    def list_regulation_reference_cycles_tool(
+        regulation_unit_id: McpOptionalIdentifier | None = None,
+        page: McpPage = 1,
+        page_size: McpPageSize = 50,
+        profile_id: McpOptionalIdentifier | None = None,
+    ) -> dict[str, Any]:
+        effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
+        return list_regulation_reference_cycles_result(
+            settings=settings,
+            auth=auth,
+            profile_id=effective_profile_id,
+            regulation_unit_id=regulation_unit_id,
+            page=page,
+            page_size=page_size,
         )
 
     @server.tool(

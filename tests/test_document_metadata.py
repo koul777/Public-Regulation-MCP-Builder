@@ -69,6 +69,23 @@ class DocumentMetadataTests(unittest.TestCase):
             self.assertEqual(repo.get_document(document.document_id).profile_id, "default-public-institution")
             self.assertEqual(repo.get_document(document.document_id).tenant_id, "tenant-a")
 
+    def test_local_upload_gets_stable_non_path_source_url_at_ingestion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            service = DocumentService(settings=settings)
+
+            document = service.upload_stream(
+                "local-regulation.pdf",
+                io.BytesIO(b"%PDF-1.4\nlocal"),
+                source_system="LOCAL_UPLOAD",
+                profile_id="institution-a",
+                tenant_id="tenant-a",
+            )
+
+        self.assertEqual(f"local-upload://{document.document_id}", document.source_url)
+        self.assertNotIn("\\", document.source_url)
+        self.assertNotIn(str(settings.data_dir), document.source_url)
+
     def test_upload_stream_rejects_over_limit_and_removes_partial_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp), max_upload_mb=1)

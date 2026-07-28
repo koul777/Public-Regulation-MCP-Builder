@@ -221,7 +221,14 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                     "strict_stdio_wire_verified": True,
                     "index_status_verified": True,
                     "end_to_end_verified": True,
-                    "tool_names": ["fetch", "get_index_status", "list_regulations", "search"],
+                    "tool_names": [
+                        "fetch",
+                        "get_index_status",
+                        "get_regulation_article",
+                        "get_regulation_toc",
+                        "list_regulations",
+                        "search",
+                    ],
                     "index_status_summary": {"indexed_records": 7, "tenant_id": "tenant-a"},
                     "search_result_count": 1,
                     "fetch_has_text": True,
@@ -233,13 +240,14 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertTrue(report["direct_stdio_verified"])
         self.assertEqual(
-            "aksmcp MCP의 search 도구로 인사규정을 찾고, 반환된 첫 번째 id를 "
-            "fetch 도구로 조회해 조문 원문과 출처를 보여줘.",
+            "aksmcp MCP의 list_regulations로 전체 규정 수를 확인하고 첫 규정의 목차와 "
+            "조문을 조회한 다음, search로 인사규정을 찾아 첫 번째 id를 fetch로 조회해 줘.",
             report["verification_prompt"],
         )
         answer = report["verification_answer"]
         self.assertEqual("verified", answer["status"])
         self.assertTrue(answer["get_index_status_verified"])
+        self.assertTrue(answer["catalog_tools_verified"])
         self.assertIn("get_index_status", answer["available_regulation_tools"])
         self.assertEqual(7, answer["index_status_summaries"][0]["indexed_records"])
         self.assertTrue(answer["conversation_attachment_unverified"])
@@ -372,7 +380,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertIn("bearer-token environment variable", result["error"])
 
     def test_remote_allows_explicit_approved_public_read_only_probe(self) -> None:
-        async def fake_remote_entry(*, url, token, query):
+        async def fake_remote_entry(*, url, token, query, timeout_seconds):
             self.assertEqual("https://mcp.example.test/mcp", url)
             self.assertIsNone(token)
             self.assertEqual("제23조 승진임용", query)
@@ -384,7 +392,13 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 "contract_verified": True,
                 "end_to_end_verified": True,
                 "verification_mode": "search_fetch",
-                "tool_names": ["fetch", "search"],
+                "tool_names": [
+                    "fetch",
+                    "get_regulation_article",
+                    "get_regulation_toc",
+                    "list_regulations",
+                    "search",
+                ],
             }
 
         with patch(
@@ -495,7 +509,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["tool_scan_unverified"])
 
     def test_remote_initialize_tools_and_index_status_are_required_for_verification(self) -> None:
-        async def fake_remote_entry(*, url, token):
+        async def fake_remote_entry(*, url, token, timeout_seconds):
             self.assertEqual("https://mcp.example.test/mcp", url)
             self.assertEqual("secret", token)
             return {
@@ -505,7 +519,14 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 "tools_discovered": True,
                 "index_status_verified": True,
                 "end_to_end_verified": True,
-                "tool_names": ["get_index_status", "list_regulations", "search"],
+                "tool_names": [
+                    "fetch",
+                    "get_index_status",
+                    "get_regulation_article",
+                    "get_regulation_toc",
+                    "list_regulations",
+                    "search",
+                ],
                 "index_status_summary": {"indexed_records": 3},
                 "session_id_present": True,
             }
@@ -528,8 +549,8 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["tool_scan_unverified"])
         self.assertEqual("verified", report["verification_answer"]["status"])
 
-    def test_remote_external_profile_accepts_search_fetch_without_index_status(self) -> None:
-        async def fake_remote_entry(*, url, token):
+    def test_remote_external_profile_accepts_catalog_and_search_fetch_without_index_status(self) -> None:
+        async def fake_remote_entry(*, url, token, timeout_seconds):
             return {
                 "passed": True,
                 "process_started": True,
@@ -539,7 +560,13 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 "contract_verified": True,
                 "end_to_end_verified": True,
                 "verification_mode": "search_fetch",
-                "tool_names": ["fetch", "search"],
+                "tool_names": [
+                    "fetch",
+                    "get_regulation_article",
+                    "get_regulation_toc",
+                    "list_regulations",
+                    "search",
+                ],
                 "index_status_summary": {},
                 "session_id_present": True,
             }
@@ -561,10 +588,11 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["end_to_end_verified"])
         self.assertFalse(report["verification_answer"]["get_index_status_verified"])
         self.assertTrue(report["verification_answer"]["search_fetch_verified"])
+        self.assertTrue(report["verification_answer"]["catalog_tools_verified"])
         self.assertIn("search_fetch", report["verification_answer"]["verification_modes"])
 
     def test_remote_smoke_redacts_token_from_exception(self) -> None:
-        async def fake_remote_entry(*, url, token):
+        async def fake_remote_entry(*, url, token, timeout_seconds):
             raise RuntimeError(f"request failed with Authorization: Bearer {token}")
 
         with patch.dict(os.environ, {"MCP_TEST_TOKEN": "sentinel-secret"}, clear=False), patch(
@@ -585,7 +613,7 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertIn("[REDACTED]", serialized)
 
     def test_remote_rejects_server_that_does_not_enforce_bearer_auth(self) -> None:
-        async def fake_remote_entry(*, url, token):
+        async def fake_remote_entry(*, url, token, timeout_seconds):
             return {
                 "passed": True,
                 "process_started": True,
@@ -593,7 +621,13 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 "tools_discovered": True,
                 "contract_verified": True,
                 "end_to_end_verified": True,
-                "tool_names": ["fetch", "search"],
+                "tool_names": [
+                    "fetch",
+                    "get_regulation_article",
+                    "get_regulation_toc",
+                    "list_regulations",
+                    "search",
+                ],
             }
 
         with patch.dict(os.environ, {"MCP_TEST_TOKEN": "secret"}, clear=False), patch(

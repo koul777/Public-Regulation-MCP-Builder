@@ -85,6 +85,11 @@ class ProcessingService:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         started_at = datetime.now(timezone.utc)
         started_perf = time.perf_counter()
+        phase_timings_ms: dict[str, float] = {}
+
+        def record_phase(name: str, phase_started: float) -> None:
+            phase_timings_ms[name] = round((time.perf_counter() - phase_started) * 1000, 3)
+
         document = self.documents.get(document_id)
         job = ProcessingJob(
             job_id=f"job_{uuid.uuid4().hex[:12]}",
@@ -120,19 +125,24 @@ class ProcessingService:
             job.message = "원본 파일에서 텍스트를 추출하는 중"
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
+            phase_started = time.perf_counter()
             parser = get_parser(path, settings=self.settings)
             parsed = parser.parse(path, document_id)
+            record_phase("native_parse", phase_started)
             # Kordoc can take a while on large integrated HWP books; expose this
             # separately so the operator does not mistake the wait for a hang.
             job.progress = 22
             job.message = "대용량 문서 표 구조를 분석하는 중입니다 (Kordoc)…"
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
+            phase_started = time.perf_counter()
             kordoc_table_inventory = self.kordoc_table_parser.parse_file(path)
+            record_phase("kordoc_table_parse", phase_started)
             job.progress = 27
             job.message = "표 구조 분석 완료 · 규정 메타데이터를 확인하는 중입니다…"
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
+            phase_started = time.perf_counter()
             filename_detected = infer_regulation_metadata(
                 document.filename,
                 existing_documents=self.repository.list_documents(),
@@ -181,7 +191,7 @@ class ProcessingService:
                     old_regulation_version=old_regulation_version,
                     new_regulation_version=document.regulation_version,
                 )
-            self.repository.upsert_document(document)
+            self.repository.upsert_document_progress(document)
             # Keep the full Kordoc inventory at document level only.  Copying it
             # into every chunk multiplies a multi-megabyte table list thousands
             # of times and can produce multi-GB result files.
@@ -232,13 +242,16 @@ class ProcessingService:
                     },
                 }
             )
+            record_phase("metadata_inference_and_staging", phase_started)
             job.progress = 35
             job.message = "텍스트 추출 완료 · 통합 규정 구조를 분석하는 중"
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
 
+            phase_started = time.perf_counter()
             normalized = self.normalizer.normalize_document(parsed)
             nodes = self.detector.detect(normalized)
+            record_phase("normalize_and_structure_detect", phase_started)
             regulation_nodes = [node for node in nodes if node.node_type == "regulation"]
             regulation_total = len(regulation_nodes)
             job.progress = 60
@@ -261,6 +274,7 @@ class ProcessingService:
                 self.repository.upsert_job(job)
                 self._notify_progress(job, progress_callback)
 
+            phase_started = time.perf_counter()
             chunks = self.chunker.build_chunks(
                 nodes,
                 normalized,
@@ -278,6 +292,7 @@ class ProcessingService:
                 normalized.raw_text,
                 profile_id=document.profile_id,
             )
+            record_phase("chunk_validate_quality", phase_started)
             job.progress = 75
             job.message = (
                 f"통합 규정집 {regulation_total}/{regulation_total} 구조화 완료 · 품질 검사 완료"
@@ -287,6 +302,7 @@ class ProcessingService:
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
 
+            phase_started = time.perf_counter()
             agent_review_plan = self.agent_review_policy.plan(
                 chunks,
                 quality_report,
@@ -306,6 +322,7 @@ class ProcessingService:
                 plan=agent_review_plan,
                 chunks=chunks,
             )
+            record_phase("agent_review", phase_started)
             job.progress = 92
             job.message = "전처리 결과와 저장 파일을 작성하는 중"
             self.repository.upsert_job(job)
@@ -325,6 +342,7 @@ class ProcessingService:
                 job.message = f"{job.unit_label} 저장 {current}/{total} · 대용량 결과 저장 중 (잠시 기다려 주세요)"
                 self._notify_progress(job, progress_callback)
 
+            phase_started = time.perf_counter()
             self.repository.save_processing_result(
                 document_id,
                 nodes,
@@ -340,6 +358,7 @@ class ProcessingService:
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
             self.repository.save_quality_report(document_id, quality_report)
+            record_phase("processing_result_storage", phase_started)
 
             def _export_progress(
                 label: str,
@@ -358,6 +377,7 @@ class ProcessingService:
                 job.message = f"내보내기 · {label} {current}/{total}"
                 self._notify_progress(job, progress_callback)
 
+            phase_started = time.perf_counter()
             artifacts = self._write_exports(
                 document_id,
                 chunks,
@@ -366,12 +386,16 @@ class ProcessingService:
                 agent_review_plan,
                 progress_callback=_export_progress,
             )
+            record_phase("exports", phase_started)
+            phase_timings_ms["total_before_terminal_commit"] = round(
+                (time.perf_counter() - started_perf) * 1000,
+                3,
+            )
 
             document.page_count = normalized.page_count
             document.document_name = normalized.document_name
             document.status = "completed"
             document.processed_at = datetime.now(timezone.utc)
-            self.repository.upsert_document(document)
 
             job.status = "completed"
             job.progress = 100
@@ -385,61 +409,79 @@ class ProcessingService:
                 job.total_units = None
                 job.unit_label = None
             job.completed_at = datetime.now(timezone.utc)
-            self.repository.upsert_job(job)
-            self._notify_progress(job, progress_callback)
-            self.repository.upsert_run(
-                ProcessingRun(
-                    run_id=run_id,
-                    document_id=document_id,
-                    job_id=job.job_id,
-                    tenant_id=document.tenant_id,
-                    status="completed",
-                    started_at=started_at,
-                    completed_at=job.completed_at,
-                    elapsed_seconds=round(time.perf_counter() - started_perf, 3),
-                    options=processing_options_payload(
-                        options,
-                        settings=self.settings,
-                        quality_profiles_sha256=self.quality_profiles_sha256,
-                    ),
-                    stats=self._run_stats(quality_report, agent_review_plan),
-                    artifacts=artifacts,
-                )
+            run = ProcessingRun(
+                run_id=run_id,
+                document_id=document_id,
+                job_id=job.job_id,
+                tenant_id=document.tenant_id,
+                status="completed",
+                started_at=started_at,
+                completed_at=job.completed_at,
+                elapsed_seconds=round(time.perf_counter() - started_perf, 3),
+                options=processing_options_payload(
+                    options,
+                    settings=self.settings,
+                    quality_profiles_sha256=self.quality_profiles_sha256,
+                ),
+                stats=self._run_stats(
+                    quality_report,
+                    agent_review_plan,
+                    phase_timings_ms=phase_timings_ms,
+                ),
+                artifacts=artifacts,
             )
+            self.repository.commit_processing_outcome(document=document, job=job, run=run)
+            self._notify_progress(job, progress_callback)
             return job
         except Exception as exc:
+            phase_timings_ms["total_before_terminal_commit"] = round(
+                (time.perf_counter() - started_perf) * 1000,
+                3,
+            )
             failure = classify_processing_failure(exc, filename=document.filename)
             if failure.ocr_page_count:
                 document.page_count = failure.ocr_page_count
             document.status = "failed"
             document.error = str(exc)
-            self.repository.upsert_document(document)
             job.status = "failed"
             job.progress = 100
             job.message = "Processing failed"
             job.error = str(exc)
             job.completed_at = datetime.now(timezone.utc)
-            self.repository.upsert_job(job)
-            self._notify_progress(job, progress_callback)
-            self.repository.upsert_run(
-                ProcessingRun(
-                    run_id=run_id,
-                    document_id=document_id,
-                    job_id=job.job_id,
-                    tenant_id=document.tenant_id,
-                    status="failed",
-                    started_at=started_at,
-                    completed_at=job.completed_at,
-                    elapsed_seconds=round(time.perf_counter() - started_perf, 3),
-                    options=processing_options_payload(
-                        options,
-                        settings=self.settings,
-                        quality_profiles_sha256=self.quality_profiles_sha256,
-                    ),
-                    stats={"failure": failure.as_row_fields()},
-                    error=str(exc),
-                )
+            run = ProcessingRun(
+                run_id=run_id,
+                document_id=document_id,
+                job_id=job.job_id,
+                tenant_id=document.tenant_id,
+                status="failed",
+                started_at=started_at,
+                completed_at=job.completed_at,
+                elapsed_seconds=round(time.perf_counter() - started_perf, 3),
+                options=processing_options_payload(
+                    options,
+                    settings=self.settings,
+                    quality_profiles_sha256=self.quality_profiles_sha256,
+                ),
+                stats={
+                    "failure": failure.as_row_fields(),
+                    "phase_timings_ms": phase_timings_ms,
+                },
+                error=str(exc),
             )
+            try:
+                self.repository.commit_processing_outcome(
+                    document=document,
+                    job=job,
+                    run=run,
+                )
+            except Exception as terminal_commit_error:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(
+                        "Failed to persist the terminal failure outcome: "
+                        f"{terminal_commit_error}"
+                    )
+                raise exc from terminal_commit_error
+            self._notify_progress(job, progress_callback)
             raise
 
     def _notify_progress(
@@ -538,7 +580,20 @@ class ProcessingService:
             report(extension, completed, export_total, completed / export_total)
         return artifacts
 
-    def _run_stats(self, quality_report, agent_review_plan: dict | None = None) -> dict:
+    def _run_stats(
+        self,
+        quality_report,
+        agent_review_plan: dict | None = None,
+        *,
+        phase_timings_ms: dict[str, float] | None = None,
+    ) -> dict:
+        agent_review_summary = dict(agent_review_plan or {})
+        candidate_details = agent_review_summary.pop("candidates", None)
+        if isinstance(candidate_details, list):
+            # The complete plan is already written to agent_review_plan.json.
+            # Duplicating every candidate in the mutable repository manifest
+            # makes each progress/state write grow with the full corpus.
+            agent_review_summary["candidate_details_artifact"] = "agent_review_plan.json"
         return {
             "quality_passed": quality_report.passed,
             "quality_score": quality_report.score,
@@ -549,7 +604,8 @@ class ProcessingService:
             "metadata_coverage": quality_report.metadata_coverage,
             "structure_metrics": quality_report.structure_metrics,
             "coverage_metrics": quality_report.coverage_metrics,
-            "agent_review": agent_review_plan or {},
+            "agent_review": agent_review_summary,
+            "phase_timings_ms": dict(phase_timings_ms or {}),
         }
 
     def _agent_review_content_hash_cache(self, tenant_id: str | None, *, cache_scope_hash: str) -> set[str]:
