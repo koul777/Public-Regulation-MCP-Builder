@@ -940,9 +940,20 @@ def list_regulations(
     profile_id: str | None = None,
     query: str | None = None,
     include_history: bool = False,
-    limit: int = 200,
+    page: int = 1,
+    page_size: int = 50,
+    limit: int | None = None,
 ) -> dict[str, Any]:
-    """List institution-local regulations from the generated catalog."""
+    """List unique approved regulation titles from the generated catalog.
+
+    The hierarchy index stores one row per regulation version and many chunks
+    can point to the same row. This public operation deliberately collapses
+    those rows by ``regulation_title`` before applying pagination.
+    """
+    normalized_page = max(1, int(page))
+    normalized_page_size = max(1, min(int(page_size), 100))
+    if limit is not None:
+        normalized_page_size = max(1, min(int(limit), 100))
     resolved_profile = _require_unambiguous_profile_scope(
         settings=settings,
         auth=auth,
@@ -957,18 +968,60 @@ def list_regulations(
     if paths is None:
         return {
             "regulations": [],
+            "total_count": 0,
+            "page": normalized_page,
+            "page_size": normalized_page_size,
+            "next_cursor": None,
             "metadata": {
                 "hierarchical_index_ready": False,
                 "message": "Regenerate the institution MCP bundle to create the regulation catalog.",
             },
         }
-    regulations = list_indexed_regulations(
+    indexed_rows = list_indexed_regulations(
         paths[0],
         profile_id=resolved_profile,
         query=query,
         include_history=include_history,
-        limit=limit,
+        limit=100_000,
     )
+    unique_by_title: dict[str, dict[str, Any]] = {}
+    unique_ranks: dict[str, tuple[bool, str, str, str]] = {}
+    for row in indexed_rows:
+        if str(row.get("status") or "").strip().casefold() != "approved":
+            continue
+        title = str(row.get("regulation_title") or "").strip()
+        if not title:
+            continue
+        title_key = re.sub(r"\s+", " ", title).casefold()
+        candidate = {
+            "regulation_title": title,
+            "regulation_category": _regulation_category(title, row.get("regulation_category")),
+            "regulation_no": str(row.get("regulation_no") or ""),
+            "regulation_unit_id": str(row.get("regulation_unit_id") or ""),
+            "version": str(row.get("version") or ""),
+            "revision_date": str(row.get("revision_date") or ""),
+            "effective_from": str(row.get("effective_from") or ""),
+            "effective_to": str(row.get("effective_to") or ""),
+            "status": "approved",
+            "document_id": str(row.get("document_id") or ""),
+        }
+        candidate_rank = (
+            bool(row.get("is_current")),
+            candidate["revision_date"],
+            candidate["effective_from"],
+            candidate["version"],
+        )
+        if title_key not in unique_by_title or candidate_rank > unique_ranks[title_key]:
+            unique_ranks[title_key] = candidate_rank
+            unique_by_title[title_key] = candidate
+    regulations = sorted(
+        unique_by_title.values(),
+        key=lambda item: (str(item["regulation_title"]).casefold(), str(item["regulation_title"])),
+    )
+    total_count = len(regulations)
+    start = (normalized_page - 1) * normalized_page_size
+    page_items = regulations[start : start + normalized_page_size]
+    next_cursor = str(normalized_page + 1) if start + normalized_page_size < total_count else None
     audit_api_event(
         settings,
         auth,
@@ -976,16 +1029,37 @@ def list_regulations(
         outcome="success",
         status_code=200,
         resource_type="mcp",
-        detail=f"result_count={len(regulations)} include_history={include_history}",
+        detail=(
+            f"result_count={len(page_items)} total_count={total_count} "
+            f"page={normalized_page} page_size={normalized_page_size} include_history={include_history}"
+        ),
     )
     return {
-        "regulations": regulations,
+        "regulations": page_items,
+        "total_count": total_count,
+        "page": normalized_page,
+        "page_size": normalized_page_size,
+        "next_cursor": next_cursor,
         "metadata": {
             "hierarchical_index_ready": True,
             "profile_id": resolved_profile,
-            "result_count": len(regulations),
+            "result_count": len(page_items),
+            "total_count": total_count,
+            "approved_only": True,
+            "unique_by": "regulation_title",
         },
     }
+
+
+def _regulation_category(title: str, explicit_category: object = None) -> str:
+    category = str(explicit_category or "").strip()
+    if category:
+        return category
+    compact_title = re.sub(r"\s+", "", str(title or ""))
+    for suffix in ("운영세칙", "시행세칙", "규정", "세칙", "지침", "규칙", "요령", "기준", "내규"):
+        if compact_title.endswith(suffix):
+            return suffix
+    return "기타"
 
 
 def get_regulation_toc(

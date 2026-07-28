@@ -2455,7 +2455,16 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("OAuth", connection_steps)
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
-        self.assertEqual(["search", "fetch"], config["compatible_tools"])
+        self.assertEqual(
+            [
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "search",
+                "fetch",
+            ],
+            config["compatible_tools"],
+        )
         self.assertIn("search(query)", " ".join(config["notes"]))
         self.assertIn("fetch(id)", " ".join(config["notes"]))
         self.assertIn("user-openable HTTP(S)", " ".join(config["notes"]))
@@ -2583,7 +2592,17 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             "chatgpt-data",
             chatgpt_desktop_args[chatgpt_desktop_args.index("--tool-profile") + 1],
         )
-        self.assertEqual(config["quickstart"]["chatgpt_remote"]["verification_tools"], ["search", "fetch"])
+        expected_chatgpt_tools = [
+            "list_regulations",
+            "get_regulation_toc",
+            "get_regulation_article",
+            "search",
+            "fetch",
+        ]
+        self.assertEqual(
+            config["quickstart"]["chatgpt_remote"]["verification_tools"],
+            expected_chatgpt_tools,
+        )
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["requires_reachable_https"])
         self.assertTrue(config["quickstart"]["chatgpt_remote"]["https_endpoint_ready"])
         self.assertEqual(
@@ -2602,7 +2621,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["tool_profile"], "chatgpt-data")
         self.assertEqual(
             config["quickstart"]["chatgpt_desktop_local"]["verification_tools"],
-            ["search", "fetch"],
+            expected_chatgpt_tools,
         )
         self.assertEqual(
             config["quickstart"]["chatgpt_desktop_local"]["connection_configuration_method"],
@@ -2643,7 +2662,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 "authorization_token_env": "MCP_AUTH_TOKEN",
             },
         )
-        self.assertEqual(["search", "fetch"], config["quickstart"]["chatgpt_remote"]["verification_tools"])
+        self.assertEqual(
+            expected_chatgpt_tools,
+            config["quickstart"]["chatgpt_remote"]["verification_tools"],
+        )
         serialized = json.dumps(config, ensure_ascii=False)
         for retired in (
             "openai_secure_tunnel",

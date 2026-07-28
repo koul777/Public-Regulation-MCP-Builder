@@ -38,6 +38,8 @@ MAX_MCP_SECURITY_LEVELS = 4
 MAX_MCP_DEPARTMENT_IDS = 256
 MAX_MCP_SCOPE_VALUE_CHARS = 256
 MAX_MCP_TOP_K = 20
+MAX_MCP_PAGE = 100_000
+MAX_MCP_PAGE_SIZE = 100
 
 
 McpQuery: TypeAlias = Annotated[
@@ -73,6 +75,8 @@ McpDepartmentIds: TypeAlias = Annotated[
     Field(max_length=MAX_MCP_DEPARTMENT_IDS),
 ]
 McpTopK: TypeAlias = Annotated[int, Field(ge=1, le=MAX_MCP_TOP_K)]
+McpPage: TypeAlias = Annotated[int, Field(ge=1, le=MAX_MCP_PAGE)]
+McpPageSize: TypeAlias = Annotated[int, Field(ge=1, le=MAX_MCP_PAGE_SIZE)]
 
 
 def require_bounded_text(

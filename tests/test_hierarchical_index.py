@@ -4,7 +4,9 @@ import tempfile
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
+from app.mcp_server import regulation_tools
 from app.ingestion.vector_adapter import stable_content_hash
 from app.core.config import Settings
 from app.mcp_server.regulation_tools import (
@@ -27,6 +29,133 @@ from app.retrieval.hierarchical_index import (
 
 
 class HierarchicalIndexTests(unittest.TestCase):
+    def test_catalog_lists_140_unique_approved_regulations_with_hierarchy_pages(self) -> None:
+        records = [
+            _record(
+                f"doc-{index:03d}",
+                f"article-{index:03d}-1",
+                regulation_no=f"4-{index:03d}",
+                regulation_title=f"테스트규정 {index:03d}",
+                article_no="제1조",
+                article_title="목적",
+                text=f"테스트규정 {index:03d}의 목적을 정한다.",
+                revision_date="2026-07-01",
+            )
+            for index in range(1, 141)
+        ]
+        records.append(
+            _record(
+                "doc-001",
+                "article-001-2",
+                regulation_no="4-001",
+                regulation_title="테스트규정 001",
+                article_no="제2조",
+                article_title="적용범위",
+                text="테스트규정 001의 적용범위를 정한다.",
+                revision_date="2026-07-01",
+            )
+        )
+        records.append(
+            _record(
+                "doc-rejected",
+                "article-rejected-1",
+                regulation_no="9-999",
+                regulation_title="승인되지 않은 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="승인되지 않은 규정은 목록에 노출되지 않아야 한다.",
+                revision_date="2026-07-01",
+                regulation_status="rejected",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            vector_path = data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = data_dir / "hierarchy" / "regulation_hierarchy.sqlite3"
+            summary = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+            settings = Settings(data_dir=data_dir)
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_require_unambiguous_profile_scope",
+                    return_value="institution-a",
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(index_path, vector_path),
+                ),
+            ):
+                first_page = list_regulations(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="institution-a",
+                    page=1,
+                    page_size=100,
+                )
+                second_page = list_regulations(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="institution-a",
+                    page=2,
+                    page_size=100,
+                )
+                first_unit_id = first_page["regulations"][0]["regulation_unit_id"]
+                toc = get_regulation_toc(
+                    settings=settings,
+                    auth=auth,
+                    regulation_unit_id=first_unit_id,
+                    profile_id="institution-a",
+                )
+                article = get_regulation_article(
+                    settings=settings,
+                    auth=auth,
+                    regulation_unit_id=first_unit_id,
+                    article_no="제1조",
+                    profile_id="institution-a",
+                    security_levels=["internal"],
+                )
+
+        self.assertEqual(141, summary["regulation_count"])
+        self.assertEqual(140, first_page["total_count"])
+        self.assertEqual(100, len(first_page["regulations"]))
+        self.assertEqual("2", first_page["next_cursor"])
+        self.assertEqual(40, len(second_page["regulations"]))
+        self.assertIsNone(second_page["next_cursor"])
+        self.assertEqual(
+            140,
+            len(
+                {
+                    item["regulation_title"]
+                    for item in first_page["regulations"] + second_page["regulations"]
+                }
+            ),
+        )
+        self.assertTrue(all(item["status"] == "approved" for item in first_page["regulations"]))
+        self.assertTrue(
+            all(
+                {
+                    "regulation_title",
+                    "regulation_category",
+                    "revision_date",
+                    "effective_from",
+                    "status",
+                }.issubset(item)
+                for item in first_page["regulations"]
+            )
+        )
+        self.assertTrue(toc["nodes"])
+        self.assertEqual(1, len(article["articles"]))
+
     def test_as_of_uses_effective_date_not_inflated_revision_date(self) -> None:
         # A retroactive amendment is promulgated (revision_date) after it takes
         # effect (effective_from).  effective_from must stay the real effective
@@ -396,6 +525,7 @@ def _record(
     article_title: str,
     text: str,
     revision_date: str,
+    regulation_status: str = "approved",
 ) -> dict:
     metadata = {
         "document_id": document_id,
@@ -406,7 +536,7 @@ def _record(
         "document_name": "통합 규정집",
         "regulation_id": "reg-binder",
         "regulation_version": f"rev-{revision_date.replace('-', '')}",
-        "regulation_status": "approved",
+        "regulation_status": regulation_status,
         "regulation_no": regulation_no,
         "regulation_title": regulation_title,
         "revision_date": revision_date,

@@ -493,7 +493,7 @@ def list_indexed_regulations(
             ORDER BY v.regulation_no, v.title, v.revision_date DESC
             LIMIT ?
             """,
-            [*params, max(1, min(int(limit), 1000))],
+            [*params, max(1, min(int(limit), 100_000))],
         ).fetchall()
     items = [_public_regulation_row(row) for row in rows]
     if not str(query or "").strip():

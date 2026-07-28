@@ -175,6 +175,26 @@ class PrepareVercelMcpDeploymentTests(unittest.TestCase):
             self.assertEqual(".", deployment_report["out_dir"])
             self.assertEqual("vercel --prod --cwd .", deployment_report["production_deploy_command"])
 
+    def test_compresses_oversized_json_runtime_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime = root / "approved"
+            _write_manifest(runtime)
+            repository = runtime / "repository"
+            repository.mkdir()
+            large_result = repository / "doc_current_chunks.json"
+            large_result.write_text(json.dumps(["x" * 1000]) + "\n", encoding="utf-8")
+
+            with patch("scripts.prepare_vercel_mcp_deployment.MAX_RUNTIME_FILE_BYTES", 200):
+                report = prepare_vercel_mcp_deployment(
+                    runtime_data_dir=runtime,
+                    out_dir=root / "stage",
+                )
+
+            self.assertIn("repository/doc_current_chunks.json.gz", report["compressed_runtime_files"])
+            self.assertFalse((root / "stage" / "mcp_runtime" / "repository" / "doc_current_chunks.json").exists())
+            self.assertTrue((root / "stage" / "mcp_runtime" / "repository" / "doc_current_chunks.json.gz").is_file())
+
     def test_rejects_raw_preprocessing_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

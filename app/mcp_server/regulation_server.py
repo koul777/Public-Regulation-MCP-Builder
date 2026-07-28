@@ -15,6 +15,8 @@ from app.core.input_limits import (
     McpDepartmentIds,
     McpIdentifier,
     McpOptionalIdentifier,
+    McpPage,
+    McpPageSize,
     McpQuery,
     McpResultId,
     McpSecurityLevels,
@@ -42,7 +44,12 @@ from app.mcp_server.regulation_tools import (
     start_background_tokenizer_warmup,
     warm_mcp_runtime,
 )
-from app.schemas.mcp import ChatGPTDataFetchOutput, ChatGPTDataSearchOutput
+from app.schemas.mcp import (
+    ChatGPTDataFetchOutput,
+    ChatGPTDataRegulationArticleOutput,
+    ChatGPTDataRegulationListOutput,
+    ChatGPTDataSearchOutput,
+)
 
 
 SERVER_INSTRUCTIONS = """Local public-institution regulation MCP server.
@@ -88,10 +95,12 @@ contain enough evidence instead of guessing."""
 
 CHATGPT_DATA_SERVER_INSTRUCTIONS = """Approved public-institution regulation data source for ChatGPT.
 
-Use search with only a query string, then use fetch with only a returned result id before answering.
+Use list_regulations for a complete approved regulation catalog, get_regulation_toc for the hierarchy of a
+listed regulation, get_regulation_article for an exact article, and use search with only a query string for
+regulation questions. Then use fetch with only a returned result id before answering.
 Use only fetched text and metadata as evidence. Do not infer definitions, conditions, or dates that the
 approved evidence does not contain. Citation URLs are either user-openable HTTP(S) source pages or empty.
-The server is read-only and exposes only the OpenAI-compatible search and fetch data-source contract."""
+The server is read-only and exposes the OpenAI-compatible search/fetch data-source contract plus catalog tools."""
 
 READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
@@ -216,6 +225,90 @@ def create_regulation_mcp_server(
         }
 
     if normalized_tool_profile == "chatgpt-data":
+        @server.tool(
+            name="list_regulations",
+            title="List approved regulations",
+            description=(
+                "Return the complete approved regulation catalog for this institution. "
+                "Each regulation title appears once even when it has many chunks or appendices. "
+                "Use page and page_size for large catalogs; use search separately for regulation text."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def list_regulations_tool(
+            query: McpOptionalIdentifier | None = None,
+            page: McpPage = 1,
+            page_size: McpPageSize = 50,
+        ) -> ChatGPTDataRegulationListOutput:
+            response = list_regulation_results(
+                settings=settings,
+                auth=auth,
+                profile_id=default_profile_id,
+                query=query,
+                page=page,
+                page_size=page_size,
+            )
+            return ChatGPTDataRegulationListOutput.model_validate(
+                {
+                    "regulations": response.get("regulations") or [],
+                    "total_count": int(response.get("total_count") or 0),
+                    "page": int(response.get("page") or page),
+                    "page_size": int(response.get("page_size") or page_size),
+                    "next_cursor": response.get("next_cursor"),
+                }
+            )
+
+        @server.tool(
+            name="get_regulation_toc",
+            title="Get regulation hierarchy",
+            description=(
+                "Return the chapter, section, article, appendix, and form hierarchy for a regulation_unit_id "
+                "returned by list_regulations. This is a read-only catalog operation, separate from search."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def get_regulation_toc_tool(regulation_unit_id: McpIdentifier) -> dict[str, Any]:
+            return get_regulation_toc_result(
+                settings=settings,
+                auth=auth,
+                regulation_unit_id=regulation_unit_id,
+                profile_id=default_profile_id,
+            )
+
+        @server.tool(
+            name="get_regulation_article",
+            title="Get exact regulation article",
+            description=(
+                "Return exact approved article evidence for a regulation_unit_id and article number, such as 제16조. "
+                "Use this to follow an internal citation after resolving the target regulation with list_regulations."
+            ),
+            annotations=READ_ONLY_TOOL_ANNOTATIONS,
+            structured_output=True,
+        )
+        def get_regulation_article_tool(
+            regulation_unit_id: McpIdentifier,
+            article_no: McpArticleNo,
+        ) -> ChatGPTDataRegulationArticleOutput:
+            response = get_regulation_article_result(
+                settings=settings,
+                auth=auth,
+                regulation_unit_id=regulation_unit_id,
+                article_no=article_no,
+                profile_id=default_profile_id,
+            )
+            article_results = response.get("articles") if isinstance(response.get("articles"), list) else []
+            return ChatGPTDataRegulationArticleOutput(
+                regulation_unit_id=str(response.get("regulation_unit_id") or regulation_unit_id),
+                article_no=str(response.get("article_no") or article_no),
+                articles=[
+                    chatgpt_data_fetch_output(item)
+                    for item in article_results
+                    if isinstance(item, dict)
+                ],
+            )
+
         @server.tool(
             name="search",
             title="Search approved regulations",
@@ -398,6 +491,8 @@ def create_regulation_mcp_server(
     def list_regulations_tool(
         query: McpOptionalIdentifier | None = None,
         include_history: bool = False,
+        page: McpPage = 1,
+        page_size: McpPageSize = 50,
         profile_id: McpOptionalIdentifier | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
@@ -407,6 +502,8 @@ def create_regulation_mcp_server(
             profile_id=effective_profile_id,
             query=query,
             include_history=include_history,
+            page=page,
+            page_size=page_size,
         )
 
     @server.tool(

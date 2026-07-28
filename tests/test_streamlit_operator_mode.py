@@ -1463,6 +1463,31 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('"false_negative"', source)
         self.assertIn("Goldset review measures parser accuracy. It does not approve operational chunks", source)
 
+    def test_streamlit_progress_uses_real_callbacks_and_separate_bundle_stages(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        helper_start = source.index("def _run_background_operation_with_progress(")
+        helper_end = source.index("def _write_operator_mcp_bundle_zip(", helper_start)
+        helper_source = source[helper_start:helper_end]
+        self.assertIn("last_update_at", helper_source)
+        self.assertIn("status_box", helper_source)
+        self.assertNotIn("estimated_percent", helper_source)
+        self.assertNotIn("elapsed_fraction", helper_source)
+
+        bundle_start = source.index('"MCP로 쓸 파일 묶음 만들기"')
+        bundle_end = source.index("bundle_state = st.session_state.get", bundle_start)
+        bundle_source = source[bundle_start:bundle_end]
+        self.assertIn('start_percent=35', bundle_source)
+        self.assertIn('end_percent=78', bundle_source)
+        self.assertIn('label="MCP 데이터·검색 인덱스 생성"', bundle_source)
+        self.assertIn("current_bundle_regulation", bundle_source)
+        self.assertIn('bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")', bundle_source)
+        self.assertIn('state="error"', bundle_source)
+        self.assertIn("전체 작업을 중단했습니다", bundle_source)
+        self.assertNotIn("time.sleep(0.12)", bundle_source)
+
+        self.assertIn("progress_callback=report", source)
+        self.assertIn('progress_callback(50, "검색 인덱스 생성", 0, 1)', source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import multiprocessing
+import errno
+import gzip
 import json
 import os
 import tempfile
@@ -105,6 +107,42 @@ def _save_reusable_outputs(settings: Settings, repo: JsonRepository, document_id
 
 
 class JsonRepositoryTests(unittest.TestCase):
+    def test_reads_gzipped_processing_result_when_json_file_is_not_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            chunk = Chunk(
+                chunk_id="doc-compressed_chunk_1",
+                document_id="doc-compressed",
+                chunk_type="article",
+                text="Article 1 Purpose",
+            )
+            repo.save_chunks("doc-compressed", [chunk])
+            result_path = settings.data_dir / "repository" / "doc-compressed_chunks.json"
+            compressed_path = Path(f"{result_path}.gz")
+            with result_path.open("rb") as source, gzip.open(compressed_path, "wb") as target:
+                target.write(source.read())
+            result_path.unlink()
+
+            recovered = repo.get_chunks("doc-compressed")
+
+            self.assertEqual([chunk.chunk_id], [item.chunk_id for item in recovered])
+
+    def test_read_only_repository_can_read_without_creating_missing_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            lock_path = Path(tmp) / "repository" / ".write.lock"
+            lock_path.unlink()
+            original_open = Path.open
+
+            def readonly_open(path: Path, mode: str = "r", *args, **kwargs):
+                if path == lock_path and mode == "a+b":
+                    raise OSError(errno.EROFS, "Read-only file system")
+                return original_open(path, mode, *args, **kwargs)
+
+            with patch.object(Path, "open", new=readonly_open):
+                self.assertEqual(repo.list_approval_journal_records(), [])
+
     def test_large_processing_result_streams_json_without_full_document_dumps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))

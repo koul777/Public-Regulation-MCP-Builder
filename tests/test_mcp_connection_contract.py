@@ -19,7 +19,16 @@ class McpConnectionContractTests(unittest.TestCase):
             "https://mcp.example.go.kr/mcp",
             config["connector_url"],
         )
-        self.assertEqual(["search", "fetch"], config["compatible_tools"])
+        self.assertEqual(
+            [
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "search",
+                "fetch",
+            ],
+            config["compatible_tools"],
+        )
         self.assertEqual(
             "MCP_AUTH_TOKEN",
             config["config_toml"]["bearer_token_env_var"],

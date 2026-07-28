@@ -2550,12 +2550,17 @@ def _run_background_operation_with_progress(
     *,
     progress_bar: object,
     detail_box: object,
+    status_box: object | None = None,
     start_percent: int,
     end_percent: int,
     label: str,
     estimated_seconds: float,
 ) -> object:
-    """Run blocking work while rendering measured progress and a live heartbeat."""
+    """Run blocking work while rendering callback-measured progress and a live heartbeat.
+
+    ``estimated_seconds`` remains for call-site compatibility, but never advances
+    the progress bar. Only callback reports from the real operation may do so.
+    """
     events: queue.Queue[tuple[int, str, int | None, int | None]] = queue.Queue()
     result: dict[str, object] = {}
 
@@ -2575,6 +2580,7 @@ def _run_background_operation_with_progress(
     last_message = label
     last_current: int | None = None
     last_total: int | None = None
+    last_update_at = datetime.now().astimezone().strftime("%H:%M:%S")
     tick = 0
     while thread.is_alive() or not events.empty():
         while True:
@@ -2584,12 +2590,9 @@ def _run_background_operation_with_progress(
                 break
             mapped = start_percent + int((end_percent - start_percent) * measured_percent / 100)
             last_percent = max(last_percent, min(end_percent, mapped))
+            last_update_at = datetime.now().astimezone().strftime("%H:%M:%S")
 
         elapsed_seconds = time.monotonic() - started
-        if thread.is_alive():
-            elapsed_fraction = elapsed_seconds / max(float(estimated_seconds) + elapsed_seconds, 1.0)
-            estimated_percent = start_percent + int((end_percent - start_percent) * min(0.92, elapsed_fraction))
-            last_percent = max(last_percent, min(end_percent - 1, estimated_percent))
         count_text = ""
         if last_total is not None and int(last_total) > 0:
             count_text = f" · {int(last_current or 0):,}/{int(last_total):,}"
@@ -2597,7 +2600,11 @@ def _run_background_operation_with_progress(
         heartbeat = _heartbeat_label(tick)
         tick += 1
         progress_bar.progress(last_percent, text=f"{last_message}{count_text} · {last_percent}%")
-        detail_box.caption(f"{heartbeat} · 경과 {elapsed_text} · {last_message}{count_text}")
+        if status_box is not None:
+            status_box.write(f"{last_message}{count_text} · {last_percent}%")
+        detail_box.caption(
+            f"{heartbeat} · 경과 {elapsed_text} · 마지막 상태 갱신 {last_update_at} · {last_message}{count_text}"
+        )
         time.sleep(0.5)
 
     thread.join()
@@ -2605,7 +2612,12 @@ def _run_background_operation_with_progress(
     if isinstance(error, BaseException):
         raise error
     progress_bar.progress(end_percent, text=f"{label} 완료 · {end_percent}%")
-    detail_box.caption(f"완료 · 경과 {_format_elapsed_seconds(time.monotonic() - started)}")
+    completed_at = datetime.now().astimezone().strftime("%H:%M:%S")
+    if status_box is not None:
+        status_box.write(f"{label} complete · {end_percent}%")
+    detail_box.caption(
+        f"완료 · 경과 {_format_elapsed_seconds(time.monotonic() - started)} · 마지막 상태 갱신 {completed_at}"
+    )
     return result.get("value")
 
 
@@ -3269,18 +3281,42 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
     }
 
 
-def _execute_reviewed_document_approval_plan(plan: dict[str, object]) -> dict[str, object]:
+def _execute_reviewed_document_approval_plan(
+    plan: dict[str, object],
+    *,
+    progress_callback: Callable[[int, str, int | None, int | None], None] | None = None,
+) -> dict[str, object]:
     document_id = str(plan["document_id"])
     local_auth = plan["local_auth"]
     approved_chunk_count = 0
-    for approval_request in plan["approval_requests"]:
+    approval_requests = list(plan["approval_requests"])
+    total_approval_chunks = sum(len(request.chunk_ids) for request in approval_requests)
+    for request_index, approval_request in enumerate(approval_requests, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                int(((request_index - 1) / max(len(approval_requests), 1)) * 45),
+                "승인 데이터 저장",
+                approved_chunk_count,
+                total_approval_chunks,
+            )
         approve_review_chunks(document_id, approval_request, local_auth)
         approved_chunk_count += len(approval_request.chunk_ids)
+        if progress_callback is not None:
+            progress_callback(
+                int((request_index / max(len(approval_requests), 1)) * 45),
+                "승인 데이터 저장",
+                approved_chunk_count,
+                total_approval_chunks,
+            )
+    if progress_callback is not None:
+        progress_callback(50, "검색 인덱스 생성", 0, 1)
     index_result = index_document(
         document_id,
         IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
         local_auth,
     )
+    if progress_callback is not None:
+        progress_callback(100, "승인·색인 완료", 1, 1)
     return {
         "document_id": document_id,
         "approved_chunk_count": approved_chunk_count,
@@ -5643,9 +5679,13 @@ def _page_approval(ctx: dict | None) -> None:
                     document_label = _workflow_document_label(plan["document"])
                     batch_status.write(f"{plan_index:,}/{len(plans):,} · {document_label}")
                     result = _run_background_operation_with_progress(
-                        lambda _report, approval_plan=plan: _execute_reviewed_document_approval_plan(approval_plan),
+                        lambda report, approval_plan=plan: _execute_reviewed_document_approval_plan(
+                            approval_plan,
+                            progress_callback=report,
+                        ),
                         progress_bar=batch_progress,
                         detail_box=batch_detail,
+                        status_box=batch_status,
                         start_percent=segment_start,
                         end_percent=segment_end,
                         label=f"{document_label} 승인·색인",
@@ -7581,50 +7621,101 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 _ensure_mcp_output_directory_writable(mcp_bundle_output_dir)
                 bundle_progress = st.progress(0, text="MCP 묶음 생성 준비 0%")
                 bundle_status = st.status("MCP 파일 묶음 생성 중…", expanded=True)
+                bundle_detail = st.empty()
+                bundle_started = time.monotonic()
+                current_bundle_stage = "승인 데이터 확인"
+                current_bundle_regulation = ""
 
                 def _bundle_stage(percent: int, message: str) -> None:
+                    nonlocal current_bundle_stage
+                    current_bundle_stage = message
                     bundle_progress.progress(percent, text=f"{message} · {percent}%")
                     bundle_status.write(f"{percent}% · {message}")
-                    time.sleep(0.12)
+                    bundle_detail.caption(
+                        f"경과 {_format_elapsed_seconds(time.monotonic() - bundle_started)} · "
+                        f"마지막 상태 갱신 {datetime.now().astimezone().strftime('%H:%M:%S')} · {message}"
+                    )
 
                 _bundle_stage(10, "승인 데이터와 출처 정보 확인")
-                bundle_detail = st.empty()
                 source_metadata_patch = {}
                 if missing_mcp_source_metadata:
-                    _bundle_stage(18, "누락된 로컬 출처 정보 자동 보완")
+                    _bundle_stage(10, "누락된 로컬 출처 정보 자동 보완")
                     documents_to_patch = [
                         item for item in scope_documents if _missing_mcp_source_metadata(item)
                     ]
+                    patch_total = len(documents_to_patch)
                     for patch_index, scope_document in enumerate(documents_to_patch, start=1):
                         scope_document_id = str(getattr(scope_document, "document_id", "") or "")
-                        updated_document, current_patch = _ensure_mcp_source_metadata(
-                            scope_document,
-                            tenant_id=document_tenant_id,
-                            target_repository=repository,
+                        current_bundle_regulation = _workflow_document_label(scope_document)
+                        patch_start = 10 + int(((patch_index - 1) / max(patch_total, 1)) * 25)
+                        patch_end = 10 + int((patch_index / max(patch_total, 1)) * 25)
+
+                        def _patch_and_reindex(
+                            report: Callable[[int, str, int | None, int | None], None],
+                            *,
+                            target_document=scope_document,
+                            target_document_id=scope_document_id,
+                            target_index=patch_index,
+                        ) -> tuple[object, dict[str, str], object | None]:
+                            nonlocal current_bundle_stage, current_bundle_regulation
+                            target_label = _workflow_document_label(target_document)
+                            current_bundle_regulation = target_label
+                            current_bundle_stage = "출처 정보 확인"
+                            report(0, f"출처 정보 확인: {target_label}", target_index - 1, patch_total)
+                            updated, patch = _ensure_mcp_source_metadata(
+                                target_document,
+                                tenant_id=document_tenant_id,
+                                target_repository=repository,
+                            )
+                            if not patch:
+                                current_bundle_stage = "출처 정보 확인 완료"
+                                report(100, f"출처 정보 확인 완료: {target_label}", target_index, patch_total)
+                                return updated, patch, None
+                            current_bundle_stage = "승인 데이터 재색인"
+                            report(35, f"승인 데이터 재색인: {target_label}", target_index - 1, patch_total)
+                            indexing_result = index_document(
+                                target_document_id,
+                                IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                                local_auth,
+                            )
+                            current_bundle_stage = "규정 처리 완료"
+                            report(100, f"규정 처리 완료: {target_label}", target_index, patch_total)
+                            return updated, patch, indexing_result
+
+                        updated_document, current_patch, _ = _run_background_operation_with_progress(
+                            _patch_and_reindex,
+                            progress_bar=bundle_progress,
+                            detail_box=bundle_detail,
+                            status_box=bundle_status,
+                            start_percent=patch_start,
+                            end_percent=patch_end,
+                            label=f"출처 정보 처리 {patch_index}/{patch_total}",
+                            estimated_seconds=15.0,
                         )
                         if not current_patch:
                             continue
                         source_metadata_patch[scope_document_id] = current_patch
                         if scope_document_id == document_id:
                             document = updated_document
-                        patch_start = 20 + int(((patch_index - 1) / max(len(documents_to_patch), 1)) * 10)
-                        patch_end = 20 + int((patch_index / max(len(documents_to_patch), 1)) * 10)
-                        _run_background_operation_with_progress(
-                            lambda _report, target_document_id=scope_document_id: index_document(
-                                target_document_id,
-                                IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
-                                local_auth,
-                            ),
-                            progress_bar=bundle_progress,
-                            detail_box=bundle_detail,
-                            start_percent=patch_start,
-                            end_percent=patch_end,
-                            label=f"출처 정보 재색인 {patch_index}/{len(documents_to_patch)}",
-                            estimated_seconds=15.0,
-                        )
-                _bundle_stage(32, "기관별 규정·개정판·목차 고속 색인 생성")
-                runtime_data = _run_background_operation_with_progress(
-                    lambda report: write_mcp_runtime_data_bundle(
+                _bundle_stage(35, "기관별 규정·개정판·목차 색인 준비")
+                current_bundle_regulation = f"{len(scope_documents):,}개 규정 범위"
+
+                def _write_runtime_bundle(
+                    report: Callable[[int, str, int | None, int | None], None],
+                ) -> object:
+                    def _runtime_report(
+                        percent: int,
+                        message: str,
+                        current: int | None = None,
+                        total: int | None = None,
+                    ) -> None:
+                        nonlocal current_bundle_stage, current_bundle_regulation
+                        current_bundle_stage = message
+                        if current is not None and total is not None and total > 0:
+                            current_bundle_regulation = f"{int(current):,}/{int(total):,}개 작업"
+                        report(percent, message, current, total)
+
+                    return write_mcp_runtime_data_bundle(
                         source_data_dir=settings.data_dir,
                         out_dir=mcp_bundle_output_dir,
                         tenant_id=document_tenant_id,
@@ -7633,13 +7724,17 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         document_ids=mcp_export_document_ids,
                         scope="document" if mcp_scope == "current_document" else mcp_scope,
                         tenant_storage_isolation=settings.tenant_storage_isolation,
-                        progress_callback=report,
-                    ),
+                        progress_callback=_runtime_report,
+                    )
+
+                runtime_data = _run_background_operation_with_progress(
+                    _write_runtime_bundle,
                     progress_bar=bundle_progress,
                     detail_box=bundle_detail,
-                    start_percent=32,
-                    end_percent=74,
-                    label="기관 전체 규정 계층 색인",
+                    status_box=bundle_status,
+                    start_percent=35,
+                    end_percent=78,
+                    label="MCP 데이터·검색 인덱스 생성",
                     estimated_seconds=90.0 if mcp_scope != "current_document" else 20.0,
                 )
                 runtime_fingerprint = str(runtime_data.get("logical_corpus_sha256") or "")
@@ -7650,7 +7745,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     f"개정판 {runtime_data.get('regulation_version_count', 0)}개 · "
                     f"목차 노드 {runtime_data.get('toc_node_count', 0)}개를 색인했습니다."
                 )
-                _bundle_stage(77, "MCP 연결 설정 JSON 생성")
+                _bundle_stage(78, "MCP 연결 설정 JSON 생성")
                 bundle_config = _direct_python_mcp_config(
                     build_mcp_client_config(
                         server_name=mcp_server_name,
@@ -7678,13 +7773,22 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         connection_display_value = str(
                             (bundle_config.get("chatgpt_remote") or {}).get("connector_url") or ""
                         )
-                _bundle_stage(83, "클라이언트별 연결 파일 생성")
-                files = write_mcp_setup_bundle(
-                    bundle_config,
-                    mcp_bundle_output_dir,
-                    server_name=mcp_server_name,
-                    preferred_python=sys.executable,
-                    preferred_project_root=PROJECT_ROOT,
+                _bundle_stage(82, "클라이언트별 연결 파일 생성")
+                files = _run_background_operation_with_progress(
+                    lambda _report: write_mcp_setup_bundle(
+                        bundle_config,
+                        mcp_bundle_output_dir,
+                        server_name=mcp_server_name,
+                        preferred_python=sys.executable,
+                        preferred_project_root=PROJECT_ROOT,
+                    ),
+                    progress_bar=bundle_progress,
+                    detail_box=bundle_detail,
+                    status_box=bundle_status,
+                    start_percent=82,
+                    end_percent=90,
+                    label="클라이언트별 연결 파일 생성",
+                    estimated_seconds=10.0,
                 )
                 desktop_local_config_path = Path(
                     str(files["chatgpt_desktop_local"])
@@ -7725,11 +7829,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 zip_path = None
                 zip_fallback_used = False
                 if mcp_save_mode == "folder-and-zip":
-                    _bundle_stage(88, "최종 ZIP 파일 압축")
+                    _bundle_stage(90, "최종 ZIP 파일 압축")
 
                     def _zip_progress(current_bytes: int, total_bytes: int, current_name: str) -> None:
                         fraction = current_bytes / max(total_bytes, 1)
-                        percent = 88 + min(11, int(fraction * 11))
+                        percent = 90 + min(9, int(fraction * 9))
                         bundle_progress.progress(
                             percent,
                             text=(
@@ -7737,17 +7841,21 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                                 f"{total_bytes / (1024 * 1024):,.1f}MB · {percent}%"
                             ),
                         )
-                        bundle_detail.caption(f"압축 중 · {current_name}")
+                        bundle_status.write(f"ZIP 압축 중 · {current_name} · {percent}%")
+                        bundle_detail.caption(
+                            f"경과 {_format_elapsed_seconds(time.monotonic() - bundle_started)} · "
+                            f"마지막 상태 갱신 {datetime.now().astimezone().strftime('%H:%M:%S')} · "
+                            f"압축 중 · {current_name}"
+                        )
 
                     zip_path, zip_fallback_used = _write_operator_mcp_bundle_zip(
                         mcp_bundle_output_dir,
                         mcp_bundle_zip,
                         progress_callback=_zip_progress,
                     )
+                    _bundle_stage(99, "최종 ZIP 파일 압축 완료")
                 else:
-                    _bundle_stage(88, "최종 폴더 저장 확인")
-                _bundle_stage(100, "MCP 파일 묶음 생성 완료")
-                bundle_status.update(label="MCP 파일 묶음 생성 완료", state="complete")
+                    _bundle_stage(99, "최종 폴더 저장 확인")
                 if zip_fallback_used:
                     st.warning(
                         f"기존 ZIP 파일이 사용 중이어서 새 이름으로 저장했습니다: {Path(str(zip_path)).name}"
@@ -7786,6 +7894,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "install_script": files.get("install"),
                     "usage_guide": files.get("usage_guide"),
                 }
+                bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")
+                bundle_status.write("MCP 파일 묶음 생성 완료 · 100%")
+                bundle_status.update(label="MCP 파일 묶음 생성 완료", state="complete")
+                bundle_detail.caption(
+                    f"완료 · 경과 {_format_elapsed_seconds(time.monotonic() - bundle_started)} · "
+                    f"마지막 상태 갱신 {datetime.now().astimezone().strftime('%H:%M:%S')}"
+                )
                 if source_metadata_patch:
                     st.info(
                         f"누락된 로컬 출처 정보를 규정 {len(source_metadata_patch):,}개에 보완한 뒤 다시 색인했습니다."
@@ -7831,6 +7946,12 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             except Exception as exc:
                 if "bundle_status" in locals():
                     bundle_status.update(label="MCP 파일 묶음 생성 실패", state="error")
+                if "bundle_detail" in locals():
+                    failed_regulation = current_bundle_regulation or "해당 없음"
+                    bundle_detail.error(
+                        f"실패 단계: {current_bundle_stage} · 규정: {failed_regulation} · 오류: {exc} · "
+                        "처리 방침: 불완전한 MCP 묶음을 만들지 않도록 전체 작업을 중단했습니다."
+                    )
                 st.error(str(exc))
         bundle_state = st.session_state.get(_mcp_bundle_state_key(document_id, mcp_scope))
         if isinstance(bundle_state, dict) and bundle_state.get("connection_display_value"):

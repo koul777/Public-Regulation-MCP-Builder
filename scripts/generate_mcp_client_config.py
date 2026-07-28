@@ -108,6 +108,13 @@ BUNDLE_GENERATION_TRANSITIONAL_STATES = {
     "runtime_refresh_in_progress",
 }
 RUNTIME_PYTHON_MARKER_FILENAME = "runtime_python.json"
+CHATGPT_DATA_TOOL_NAMES = [
+    "list_regulations",
+    "get_regulation_toc",
+    "get_regulation_article",
+    "search",
+    "fetch",
+]
 RUNTIME_PYTHON_MARKER_SCHEMA_VERSION = 2
 RUNTIME_IDENTITY_SCOPE = "mcp-command-modules-v1"
 RUNTIME_IDENTITY_MODULES = (
@@ -1853,7 +1860,7 @@ def _chatgpt_desktop_local_config(
         "surface": "chatgpt_desktop_mcp_settings",
         "mode": "local_stdio",
         "tool_profile": "chatgpt-data",
-        "verification_tools": ["search", "fetch"],
+        "verification_tools": list(CHATGPT_DATA_TOOL_NAMES),
         "connection_configuration_method": "direct_config",
         "secret_input_policy": "environment_or_oauth_only",
         "chatgpt_direct_local_mcp_supported": True,
@@ -6403,7 +6410,8 @@ def _bundle_quickstart(
             "tool": "get_index_status",
             "note": (
                 "Run against the actual local/full-profile server after starting it; synthetic smoke does not validate "
-                "the real tenant DB. External ChatGPT connectors use chatgpt-data and should validate search and fetch."
+                "the real tenant DB. External ChatGPT connectors use chatgpt-data and should validate "
+                "the catalog, hierarchy, exact-article, search, and fetch tools."
             ),
         },
         "audit_index_visibility": {
@@ -6424,7 +6432,7 @@ def _bundle_quickstart(
             "secret_input_policy": "environment_or_oauth_only",
             "server": chatgpt_desktop_local,
             "conversation_attachment_unverified": True,
-            "verification_tools": ["search", "fetch"],
+            "verification_tools": list(CHATGPT_DATA_TOOL_NAMES),
         },
         "claude_desktop": {
             "paste_json_section": "claude_desktop.mcpServers",
@@ -6445,7 +6453,7 @@ def _bundle_quickstart(
             "https_endpoint_ready": chatgpt_remote["chatgpt_setup"]["https_endpoint_ready"],
             "oauth_ready": chatgpt_remote["chatgpt_setup"]["oauth_ready"],
             "configuration_ready": chatgpt_remote["configuration_ready"],
-            "verification_tools": ["search", "fetch"],
+            "verification_tools": list(CHATGPT_DATA_TOOL_NAMES),
             "tool_profile": "chatgpt-data",
             "authentication_modes": [
                 "bearer_token_env_var",
@@ -6579,23 +6587,22 @@ def _chatgpt_connector_config(
                 "Unauthenticated mode must be an explicit approved public read-only deployment."
             ),
         },
-        "compatible_tools": [
-            "search",
-            "fetch",
-        ],
+        "compatible_tools": list(CHATGPT_DATA_TOOL_NAMES),
         "connection_steps": [
             "Stage the approved runtime with reg-rag-mcp-vercel-stage and deploy it to Vercel.",
             "Open ChatGPT Desktop Settings > MCP servers > Add server.",
             "Choose Streamable HTTP and enter connector_url.",
             "For a private endpoint, configure bearer_token_env_var or complete MCP OAuth login.",
             "Save the server and select Restart.",
-            "Verify the discovered tool list includes search and fetch before using the app.",
-            "In a new chat, use /mcp and ask ChatGPT to search first and fetch returned result IDs for evidence.",
+            "Verify the discovered tool list includes list_regulations, get_regulation_toc, "
+            "get_regulation_article, search, and fetch before using the app.",
+            "In a new chat, list the catalog, inspect one regulation TOC and article, then search and fetch evidence.",
         ],
         "notes": [
             "ChatGPT Desktop, Codex CLI, and the IDE extension share the same Codex-host MCP configuration.",
             "Register only the deployed HTTPS /mcp URL for Streamable HTTP; do not enter a local folder.",
-            "The chatgpt-data profile uses the exact search(query) and fetch(id) input signatures required for data-source compatibility.",
+            "The chatgpt-data profile keeps the exact search(query) and fetch(id) input signatures required for "
+            "data-source compatibility and adds read-only catalog, TOC, and exact-article tools.",
             "Citation URLs are absolute user-openable HTTP(S) source URLs or empty when no such source exists.",
             "Do not expose streamable-http or SSE MCP without authentication or approved network controls.",
             "Use only public or separately approved data when routing MCP responses to an external cloud AI.",

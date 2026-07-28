@@ -31,3 +31,42 @@ class ChatGPTDataFetchOutput(BaseModel):
     text: str
     url: str
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class ChatGPTDataRegulation(BaseModel):
+    """One unique approved regulation entry for the ChatGPT data profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    regulation_title: str
+    regulation_category: str = ""
+    regulation_no: str = ""
+    regulation_unit_id: str = ""
+    version: str = ""
+    revision_date: str = ""
+    effective_from: str = ""
+    effective_to: str = ""
+    status: str
+    document_id: str = ""
+
+
+class ChatGPTDataRegulationListOutput(BaseModel):
+    """Paginated regulation catalog output for the ChatGPT data profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    regulations: list[ChatGPTDataRegulation]
+    total_count: int
+    page: int
+    page_size: int
+    next_cursor: str | None = None
+
+
+class ChatGPTDataRegulationArticleOutput(BaseModel):
+    """Exact approved article evidence for one catalog regulation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    regulation_unit_id: str
+    article_no: str
+    articles: list[ChatGPTDataFetchOutput]

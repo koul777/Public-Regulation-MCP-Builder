@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
 from contextlib import contextmanager
+import errno
+import gzip
 import json
 import os
 from pathlib import Path
@@ -658,6 +660,10 @@ class JsonRepository:
                 return list(self._iter_json_array(path))
             with path.open("r", encoding="utf-8") as handle:
                 return json.load(handle)
+        compressed_path = Path(f"{path}.gz")
+        if compressed_path.is_file():
+            with gzip.open(compressed_path, "rt", encoding="utf-8") as handle:
+                return json.load(handle)
         legacy = self._read_legacy()
         return legacy.get(result_type, {}).get(document_id, [])
 
@@ -680,10 +686,17 @@ class JsonRepository:
 
     def _read_journal_records(self, journal_name: str) -> list[dict]:
         path = self._journal_path(journal_name)
+        compressed_path = Path(f"{path}.gz")
+        if not path.is_file() and compressed_path.is_file():
+            path = compressed_path
         if not path.is_file():
             return []
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            if path.suffix.casefold() == ".gz":
+                with gzip.open(path, "rt", encoding="utf-8") as handle:
+                    lines = handle.read().splitlines()
+            else:
+                lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeError) as exc:
             raise JournalIntegrityError(f"Journal '{journal_name}' could not be read as UTF-8 JSONL.") from exc
         records: list[dict] = []
@@ -897,7 +910,9 @@ class JsonRepository:
         except FileNotFoundError:
             try:
                 handle = lock_path.open("a+b")
-            except PermissionError:
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                    raise
                 # A read-only repository without a lock file cannot be changed
                 # by this process. Strict parsing still fails closed if an
                 # external writer exposes an incomplete record.

@@ -1202,12 +1202,15 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertEqual("regulation_mcp_server", server._reg_rag_scope["server_component"])
         self.assertEqual("external_ai_or_institution_client", server._reg_rag_scope["client_component"])
 
-    def test_chatgpt_data_tool_profile_registers_only_search_and_fetch(self) -> None:
+    def test_chatgpt_data_tool_profile_registers_catalog_search_and_fetch(self) -> None:
         server = create_regulation_mcp_server(data_dir="data", tenant_id="tenant-a", tool_profile="chatgpt-data")
 
         tool_manager = getattr(server, "_tool_manager")
 
-        self.assertEqual({"search", "fetch"}, set(tool_manager._tools))
+        self.assertEqual(
+            {"list_regulations", "get_regulation_toc", "get_regulation_article", "search", "fetch"},
+            set(tool_manager._tools),
+        )
 
     def test_chatgpt_data_tool_profile_uses_exact_openai_data_source_schemas(self) -> None:
         server = create_regulation_mcp_server(
@@ -1222,6 +1225,22 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertEqual(["query"], tools["search"].parameters["required"])
         self.assertEqual({"id"}, set(tools["fetch"].parameters["properties"]))
         self.assertEqual(["id"], tools["fetch"].parameters["required"])
+
+        catalog_parameters = tools["list_regulations"].parameters
+        self.assertEqual({"query", "page", "page_size"}, set(catalog_parameters["properties"]))
+        self.assertEqual([], catalog_parameters.get("required", []))
+        catalog_output_schema = tools["list_regulations"].output_schema
+        self.assertFalse(catalog_output_schema["additionalProperties"])
+        self.assertEqual(
+            {"regulations", "total_count", "page", "page_size", "next_cursor"},
+            set(catalog_output_schema["properties"]),
+        )
+        article_parameters = tools["get_regulation_article"].parameters
+        self.assertEqual({"regulation_unit_id", "article_no"}, set(article_parameters["properties"]))
+        self.assertEqual(
+            {"regulation_unit_id", "article_no"},
+            set(article_parameters["required"]),
+        )
 
         search_output_schema = tools["search"].output_schema
         self.assertFalse(search_output_schema["additionalProperties"])

@@ -1223,8 +1223,8 @@ Dashboard에 프로젝트가 보인다고 배포가 끝난 것은 아닙니다. 
 
 #### 공개해도 되는 승인 규정의 read-only endpoint
 
-공개가 허용된 규정만 포함했고 누구나 `search`·`fetch`를 호출해도 되는 경우에만 다음
-값을 Production 환경에 넣습니다.
+공개가 허용된 규정만 포함했고 누구나 읽기 전용 목록·계층·조문·검색 도구를 호출해도 되는
+경우에만 다음 값을 Production 환경에 넣습니다.
 
 ```powershell
 $StageDir = Read-Host "V-2에서 만든 배포 전용 폴더 전체 경로"
@@ -1237,7 +1237,8 @@ vercel env add MCP_TOOL_PROFILE production `
   --cwd "$StageDir"
 ```
 
-이 모드는 쓰기 도구 없이 원격 공개 범위를 `search`, `fetch`로 제한하는 용도입니다.
+이 모드는 쓰기 도구 없이 원격 공개 범위를 `list_regulations`, `get_regulation_toc`,
+`get_regulation_article`, `search`, `fetch`로 제한하는 용도입니다.
 
 명령 실행 뒤 Vercel 홈페이지에서도 확인할 수 있습니다.
 
@@ -1319,7 +1320,7 @@ endpoint에는 설정한 인증을 사용합니다.
 - `mcp_initialized`: `true`
 - `tools_discovered`: `true`
 - `end_to_end_verified`: `true`
-- `tool_names`: `search`, `fetch` 포함
+- `tool_names`: `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `search`, `fetch` 포함
 
 이 네 값 중 하나라도 `false`이면 Claude나 ChatGPT에 등록하지 않습니다. Vercel Dashboard의
 **Logs**에서 가장 최근 Function 오류를 확인하고 [문제 해결표](#4-문제-해결표)의
@@ -1464,11 +1465,12 @@ Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입�
 
 ![Claude에서 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](docs/assets/readme-claude-mcp-03-verify.svg)
 
-다섯 항목을 모두 체크하면 연결 완료입니다.
+다음 항목을 모두 체크하면 연결 완료입니다.
 
 - [ ] 서버 또는 커넥터가 목록에 보인다.
 - [ ] Claude Desktop은 `running`이고, 다른 로컬 앱은 서버가 등록·활성화되어 있다.
-- [ ] 도구 목록에 `search`와 `fetch`가 보인다.
+- [ ] 도구 목록에 `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `search`, `fetch`가 보인다.
+- [ ] `list_regulations`의 `total_count`와 페이지별 고유 규정 수가 맞고, 첫 규정의 목차·조문 조회가 된다.
 - [ ] `search`가 한 개 이상의 결과를 반환한다.
 - [ ] 검색 결과의 `id`로 `fetch`가 본문과 출처를 반환한다.
 
