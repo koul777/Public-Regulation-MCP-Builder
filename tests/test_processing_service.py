@@ -78,6 +78,44 @@ def _save_reusable_outputs(settings: Settings, repo: JsonRepository, document_id
 
 
 class ProcessingServiceTests(unittest.TestCase):
+    def test_run_stats_keeps_candidate_details_in_export_artifact_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ProcessingService(settings=Settings(data_dir=Path(tmp)))
+            quality_report = QualityReport(
+                document_id="doc-summary",
+                passed=True,
+                score=100.0,
+                node_count=1,
+                chunk_count=1,
+                issue_count=0,
+                error_count=0,
+                warning_count=0,
+                duplicate_chunk_id_count=0,
+                empty_chunk_count=0,
+                missing_page_count=0,
+                missing_required_metadata_count=0,
+            )
+            stats = service._run_stats(
+                quality_report,
+                {
+                    "status": "planned",
+                    "candidate_count": 2,
+                    "candidates": [
+                        {"chunk_id": "chunk-1", "reasons": ["parser_uncertainty"]},
+                        {"chunk_id": "chunk-2", "reasons": ["table_review"]},
+                    ],
+                    "selected_candidates": [{"chunk_id": "chunk-1", "content_hash": "sha256:test"}],
+                },
+                phase_timings_ms={"native_parse": 12.5, "exports": 3.0},
+            )
+
+        agent_review = stats["agent_review"]
+        self.assertNotIn("candidates", agent_review)
+        self.assertEqual("agent_review_plan.json", agent_review["candidate_details_artifact"])
+        self.assertEqual(2, agent_review["candidate_count"])
+        self.assertEqual("chunk-1", agent_review["selected_candidates"][0]["chunk_id"])
+        self.assertEqual({"native_parse": 12.5, "exports": 3.0}, stats["phase_timings_ms"])
+
     def test_loads_quality_gate_profiles_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

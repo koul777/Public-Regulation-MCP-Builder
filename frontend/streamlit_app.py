@@ -12,7 +12,8 @@ import sys
 import threading
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -29,6 +30,8 @@ from app.api.routes_documents import (
     chunk_review_attention_reasons,
     get_index_status,
     index_document,
+    index_documents_batch,
+    pending_deferred_vector_sync_batch_ids,
     reindex_document,
     transition_regulation_status,
 )
@@ -1043,7 +1046,11 @@ def _render_operator_project_dialog(page: str) -> None:
         width="stretch",
     ):
         try:
-            with st.status("저장한 프로젝트 불러오는 중…", expanded=True) as load_status:
+            with _long_operation_status(
+                "저장한 프로젝트 불러오는 중…",
+                failure_stage="프로젝트 파일 읽기·화면 상태 복원",
+                failure_policy="불러오기를 중단하고 기존 화면 상태를 유지합니다.",
+            ) as load_status:
                 load_progress = st.progress(0, text="프로젝트 파일 읽기 0%")
                 load_progress.progress(30, text="프로젝트 파일 읽기 30%")
                 time.sleep(0.15)
@@ -2545,6 +2552,69 @@ def _ensure_mcp_output_directory_writable(bundle_dir: Path) -> None:
         ) from exc
 
 
+def _brief_long_operation_error(error: BaseException, *, limit: int = 320) -> str:
+    rendered = redact_sensitive_paths(str(error)).replace("\r", " ").replace("\n", " ").strip()
+    if not rendered:
+        rendered = error.__class__.__name__
+    if len(rendered) <= limit:
+        return rendered
+    return f"{rendered[: max(1, limit - 1)].rstrip()}…"
+
+
+def _long_operation_context_label(value: str | Callable[[], str], *, fallback: str) -> str:
+    rendered = value() if callable(value) else value
+    return str(rendered or "").strip() or fallback
+
+
+def _update_long_operation_error(
+    status_box: object,
+    *,
+    stage: str | Callable[[], str],
+    regulation: str | Callable[[], str] = "해당 없음",
+    error: BaseException,
+    failure_policy: str = "해당 항목을 건너뛰지 않고 전체 작업을 중단했습니다.",
+    detail_box: object | None = None,
+) -> None:
+    """Move a visible long-operation card out of ``running`` with actionable context."""
+    stage_label = _long_operation_context_label(stage, fallback="알 수 없는 단계")
+    regulation_label = _long_operation_context_label(regulation, fallback="해당 없음")
+    brief_error = _brief_long_operation_error(error)
+    status_box.update(label=f"{stage_label} 실패", state="error", expanded=True)
+    message = (
+        f"실패 단계: {stage_label} · 실패 규정: {regulation_label} · "
+        f"오류: {brief_error} · 처리 방침: {failure_policy}"
+    )
+    target = detail_box if detail_box is not None else status_box
+    if hasattr(target, "error"):
+        target.error(message)
+    elif hasattr(target, "write"):
+        target.write(message)
+
+
+@contextmanager
+def _long_operation_status(
+    label: str,
+    *,
+    expanded: bool = True,
+    failure_stage: str | Callable[[], str] | None = None,
+    failure_regulation: str | Callable[[], str] = "해당 없음",
+    failure_policy: str = "해당 항목을 건너뛰지 않고 전체 작업을 중단했습니다.",
+) -> Iterator[object]:
+    """Wrap ``st.status`` so exceptions can never leave its card visually running."""
+    with st.status(label, expanded=expanded) as status_box:
+        try:
+            yield status_box
+        except Exception as exc:
+            _update_long_operation_error(
+                status_box,
+                stage=failure_stage or label,
+                regulation=failure_regulation,
+                error=exc,
+                failure_policy=failure_policy,
+            )
+            raise
+
+
 def _run_background_operation_with_progress(
     operation: Callable[[Callable[[int, str, int | None, int | None], None]], object],
     *,
@@ -2588,7 +2658,8 @@ def _run_background_operation_with_progress(
                 measured_percent, last_message, last_current, last_total = events.get_nowait()
             except queue.Empty:
                 break
-            mapped = start_percent + int((end_percent - start_percent) * measured_percent / 100)
+            visible_percent = min(measured_percent, 99) if thread.is_alive() else measured_percent
+            mapped = start_percent + int((end_percent - start_percent) * visible_percent / 100)
             last_percent = max(last_percent, min(end_percent, mapped))
             last_update_at = datetime.now().astimezone().strftime("%H:%M:%S")
 
@@ -2601,7 +2672,10 @@ def _run_background_operation_with_progress(
         tick += 1
         progress_bar.progress(last_percent, text=f"{last_message}{count_text} · {last_percent}%")
         if status_box is not None:
-            status_box.write(f"{last_message}{count_text} · {last_percent}%")
+            status_box.update(
+                label=f"{last_message}{count_text} · {last_percent}%",
+                state="running",
+            )
         detail_box.caption(
             f"{heartbeat} · 경과 {elapsed_text} · 마지막 상태 갱신 {last_update_at} · {last_message}{count_text}"
         )
@@ -2610,11 +2684,22 @@ def _run_background_operation_with_progress(
     thread.join()
     error = result.get("error")
     if isinstance(error, BaseException):
+        if status_box is not None:
+            _update_long_operation_error(
+                status_box,
+                stage=label,
+                error=error,
+                failure_policy="오류가 난 작업 단위에서 전체 작업을 중단했습니다.",
+                detail_box=detail_box,
+            )
         raise error
     progress_bar.progress(end_percent, text=f"{label} 완료 · {end_percent}%")
     completed_at = datetime.now().astimezone().strftime("%H:%M:%S")
     if status_box is not None:
-        status_box.write(f"{label} complete · {end_percent}%")
+        status_box.update(
+            label=f"{label} 완료 · {end_percent}%",
+            state="running",
+        )
     detail_box.caption(
         f"완료 · 경과 {_format_elapsed_seconds(time.monotonic() - started)} · 마지막 상태 갱신 {completed_at}"
     )
@@ -3270,27 +3355,88 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
                     note="approval_screen_selected_regulations_batch",
                 )
             )
+    pending_vector_sync_batch_ids = (
+        list(ctx["pending_vector_sync_batch_ids"])
+        if "pending_vector_sync_batch_ids" in ctx
+        else pending_deferred_vector_sync_batch_ids(repository, document_id)
+    )
     return {
         "document_id": document_id,
         "document": ctx["document"],
         "local_auth": ctx["local_auth"],
         "approval_requests": approval_requests,
+        "pending_vector_sync_batch_ids": pending_vector_sync_batch_ids,
         "pending_chunk_count": len(pending_entries),
         "edited_chunk_count": edited_chunk_total,
         "evidence": evidence,
     }
 
 
+def _approval_plan_requires_work(plan: dict[str, object]) -> bool:
+    """Return whether approval or a durable deferred-sync recovery is actually pending."""
+    if plan.get("approval_requests"):
+        return True
+    return any(
+        str(batch_id or "").strip()
+        for batch_id in (plan.get("pending_vector_sync_batch_ids") or [])
+    )
+
+
 def _execute_reviewed_document_approval_plan(
     plan: dict[str, object],
     *,
     progress_callback: Callable[[int, str, int | None, int | None], None] | None = None,
+    defer_index: bool = False,
 ) -> dict[str, object]:
     document_id = str(plan["document_id"])
     local_auth = plan["local_auth"]
+    has_pending_work = bool(plan.get("approval_requests")) or any(
+        str(batch_id or "").strip()
+        for batch_id in (plan.get("pending_vector_sync_batch_ids") or [])
+    )
+    if not has_pending_work:
+        if progress_callback is not None:
+            progress_callback(100, "변경 없음·색인 생략", 0, 0)
+        return {
+            "document_id": document_id,
+            "approved_chunk_count": 0,
+            "edited_chunk_count": int(plan.get("edited_chunk_count") or 0),
+            "indexed_record_count": 0,
+            "index_deferred": False,
+            "index_skipped": True,
+            "vector_sync_batch_id": "",
+        }
+
     approved_chunk_count = 0
     approval_requests = list(plan["approval_requests"])
     total_approval_chunks = sum(len(request.chunk_ids) for request in approval_requests)
+    first_review_batch_id = next(
+        (
+            str(getattr(request, "review_batch_id", "") or "").strip()
+            for request in approval_requests
+            if str(getattr(request, "review_batch_id", "") or "").strip()
+        ),
+        "",
+    )
+    pending_vector_sync_batch_ids = [
+        str(value or "").strip()
+        for value in (plan.get("pending_vector_sync_batch_ids") or [])
+        if str(value or "").strip()
+    ]
+    vector_sync_batch_id = (
+        (
+            f"streamlit-{document_id}-{first_review_batch_id or 'approval-batch'}"
+            if approval_requests
+            else pending_vector_sync_batch_ids[0]
+            if pending_vector_sync_batch_ids
+            else f"streamlit-{document_id}-approval-batch"
+        )
+    )[:200]
+    document = plan.get("document")
+    can_defer_index = defer_index and not bool(
+        str(getattr(document, "supersedes_document_id", "") or "").strip()
+    )
+    approval_index_result: dict[str, object] | None = None
     for request_index, approval_request in enumerate(approval_requests, start=1):
         if progress_callback is not None:
             progress_callback(
@@ -3299,7 +3445,18 @@ def _execute_reviewed_document_approval_plan(
                 approved_chunk_count,
                 total_approval_chunks,
             )
-        approve_review_chunks(document_id, approval_request, local_auth)
+        request_for_approval = approval_request
+        if can_defer_index and hasattr(approval_request, "model_copy"):
+            request_for_approval = approval_request.model_copy(
+                update={
+                    "defer_vector_sync": True,
+                    "vector_sync_batch_id": vector_sync_batch_id,
+                }
+            )
+        approval_response = approve_review_chunks(document_id, request_for_approval, local_auth)
+        vector_sync = approval_response.get("vector_sync")
+        if isinstance(vector_sync, dict) and vector_sync.get("status") == "indexed":
+            approval_index_result = dict(vector_sync)
         approved_chunk_count += len(approval_request.chunk_ids)
         if progress_callback is not None:
             progress_callback(
@@ -3308,20 +3465,38 @@ def _execute_reviewed_document_approval_plan(
                 approved_chunk_count,
                 total_approval_chunks,
             )
-    if progress_callback is not None:
-        progress_callback(50, "검색 인덱스 생성", 0, 1)
-    index_result = index_document(
-        document_id,
-        IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
-        local_auth,
+    index_deferred = (
+        approval_index_result is None
+        and can_defer_index
+        and bool(approval_requests or pending_vector_sync_batch_ids)
     )
+    if approval_index_result is None and not index_deferred:
+        if progress_callback is not None:
+            progress_callback(50, "검색 인덱스 생성", 0, 1)
+        index_result = index_document(
+            document_id,
+            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+            local_auth,
+        )
+    elif approval_index_result is not None:
+        index_result = approval_index_result
+    else:
+        index_result = {"record_count": 0}
     if progress_callback is not None:
-        progress_callback(100, "승인·색인 완료", 1, 1)
+        progress_callback(
+            100,
+            "승인 완료·일괄 색인 대기" if index_deferred else "승인·색인 완료",
+            1,
+            1,
+        )
     return {
         "document_id": document_id,
         "approved_chunk_count": approved_chunk_count,
         "edited_chunk_count": int(plan.get("edited_chunk_count") or 0),
         "indexed_record_count": int(index_result.get("record_count") or 0),
+        "index_deferred": index_deferred,
+        "index_skipped": False,
+        "vector_sync_batch_id": vector_sync_batch_id if index_deferred else "",
     }
 
 
@@ -4824,6 +4999,8 @@ def _page_preprocess() -> None:
                 st.stop()
             if profile is not None and profile.max_upload_mb:
                 upload_settings = replace(settings, max_upload_mb=profile.max_upload_mb)
+        if not upload_metadata.get("source_system"):
+            upload_metadata["source_system"] = "LOCAL_UPLOAD"
 
         upload_repository = JsonRepository(upload_settings)
         upload_document_service = DocumentService(upload_settings, upload_repository)
@@ -4871,7 +5048,13 @@ def _page_preprocess() -> None:
 
         completed_documents = []
         total_files = len(upload_sources)
-        with st.status(f"{total_files}개 문서를 전처리하는 중입니다...", expanded=True) as status:
+        current_preprocess_regulation = "선택한 업로드 문서"
+        with _long_operation_status(
+            f"{total_files}개 문서를 전처리하는 중입니다...",
+            failure_stage="문서 업로드·전처리",
+            failure_regulation=lambda: current_preprocess_regulation,
+            failure_policy="실패한 규정을 건너뛰지 않고 일괄 전처리를 중단합니다. 완료된 규정은 그대로 보존됩니다.",
+        ) as status:
             progress_bar = st.progress(0, text="Saving uploaded file")
             progress_text = st.empty()
             regulation_progress_box = st.empty()
@@ -4937,6 +5120,7 @@ def _page_preprocess() -> None:
                 started = time.monotonic()
                 last_fraction = 0.2
                 last_message = "Preprocessing started"
+                last_update_at = datetime.now().astimezone().strftime("%H:%M:%S")
                 tick = 0
                 while thread.is_alive() or not progress_events.empty():
                     received_progress = False
@@ -4948,6 +5132,7 @@ def _page_preprocess() -> None:
                         if current is None:
                             continue
                         received_progress = True
+                        last_update_at = datetime.now().astimezone().strftime("%H:%M:%S")
                         last_fraction = 0.2 + (0.8 * max(0, min(100, current.progress)) / 100)
                         last_message = str(current.message or "Preprocessing")
                         current_unit = int(getattr(current, "current_unit", 0) or 0)
@@ -4979,7 +5164,7 @@ def _page_preprocess() -> None:
                         tick += 1
                         text = (
                             f"{file_index + 1}/{total_files} {filename}: {last_message} "
-                            f"· {heartbeat} · 경과 {elapsed}"
+                            f"· {heartbeat} · 경과 {elapsed} · 마지막 상태 갱신 {last_update_at}"
                         )
                         progress_bar.progress(safe_progress, text=text)
                         progress_text.caption(f"{safe_progress}% - {text}")
@@ -4993,6 +5178,7 @@ def _page_preprocess() -> None:
             for file_index, source in enumerate(upload_sources):
                 filename = str(source["filename"])
                 file_size = int(source["size"])
+                current_preprocess_regulation = filename
 
                 def _upload_progress(
                     bytes_written: int,
@@ -5460,8 +5646,23 @@ def _page_approval(ctx: dict | None) -> None:
         )
         workflow_review_entries: list[tuple[dict, list[dict[str, object]]]] = []
         workflow_review_rows: list[dict[str, object]] = []
+        workflow_deferred_sync_by_document: dict[str, list[str]] = {}
+        workflow_sync_events = repository.list_maintenance_events(
+            "approval_vector_sync_outcome"
+        )
         for approval_ctx in selected_approval_contexts:
             pending_entries = _approval_pending_entries(approval_ctx)
+            approval_ctx_document_id = str(approval_ctx["document_id"])
+            pending_sync_batch_ids = pending_deferred_vector_sync_batch_ids(
+                repository,
+                approval_ctx_document_id,
+                maintenance_events=workflow_sync_events,
+            )
+            approval_ctx["pending_vector_sync_batch_ids"] = pending_sync_batch_ids
+            if pending_sync_batch_ids:
+                workflow_deferred_sync_by_document[approval_ctx_document_id] = (
+                    pending_sync_batch_ids
+                )
             workflow_review_entries.append((approval_ctx, pending_entries))
             ai_complete = sum(bool(dict(entry["state"]).get("ai_confirmed")) for entry in pending_entries)
             human_complete = sum(bool(entry.get("human_confirmed")) for entry in pending_entries)
@@ -5477,11 +5678,15 @@ def _page_approval(ctx: dict | None) -> None:
                     "사람 확인": f"{human_complete}/{len(pending_entries)}",
                     "승인 청크": approved_chunks,
                     "상태": (
-                        "승인 완료"
-                        if approval_ctx_chunks and approved_chunks == len(approval_ctx_chunks)
-                        else "승인·색인 가능"
-                        if pending_entries and ready_count == len(pending_entries)
-                        else "검수 필요"
+                        "색인 복구 대기"
+                        if pending_sync_batch_ids
+                        else (
+                            "승인 완료"
+                            if approval_ctx_chunks and approved_chunks == len(approval_ctx_chunks)
+                            else "승인·색인 가능"
+                            if pending_entries and ready_count == len(pending_entries)
+                            else "검수 필요"
+                        )
                     ),
                 }
             )
@@ -5503,6 +5708,7 @@ def _page_approval(ctx: dict | None) -> None:
             for _, entries in workflow_review_entries
             for entry in entries
         )
+        workflow_deferred_sync_count = len(workflow_deferred_sync_by_document)
         workflow_contexts_complete = len(selected_approval_contexts) == len(selected_document_ids) and all(
             approval_ctx.get("chunks") for approval_ctx in selected_approval_contexts
         )
@@ -5651,56 +5857,184 @@ def _page_approval(ctx: dict | None) -> None:
             st.rerun()
 
         if st.button(
-            f"선택한 규정 {len(selected_document_ids):,}개 승인·색인",
+            (
+                f"색인 복구 {workflow_deferred_sync_count:,}개 실행"
+                if workflow_pending_count == 0 and workflow_deferred_sync_count
+                else f"선택한 규정 {len(selected_document_ids):,}개 승인·색인"
+            ),
             type="primary",
             key=f"workflow-approve-index-{document_id}",
             disabled=(
                 not workflow_contexts_complete
-                or workflow_pending_count == 0
-                or workflow_ready_count < workflow_pending_count
+                or (
+                    workflow_pending_count == 0
+                    and workflow_deferred_sync_count == 0
+                )
+                or (
+                    workflow_pending_count > 0
+                    and workflow_ready_count < workflow_pending_count
+                )
             ),
             width="stretch",
         ):
+            batch_results: list[dict[str, object]] = []
+            batch_status = st.status("선택한 규정별 승인·색인 중…", expanded=True)
+            batch_progress = st.progress(0, text="규정별 승인·색인 준비 0%")
+            batch_detail = st.empty()
+            failed_stage = "승인·색인 계획 생성"
+            failed_regulation = f"선택한 {len(selected_document_ids):,}개 규정"
             try:
-                plans = [
-                    _prepare_reviewed_document_approval_plan(
-                        approval_ctx,
-                        security_level=workflow_security_level,
+                prepared_plans: list[dict[str, object]] = []
+                for approval_ctx, _ in workflow_review_entries:
+                    failed_regulation = _workflow_document_label(approval_ctx["document"])
+                    prepared_plans.append(
+                        _prepare_reviewed_document_approval_plan(
+                            approval_ctx,
+                            security_level=workflow_security_level,
+                        )
                     )
-                    for approval_ctx, _ in workflow_review_entries
+                plans = [
+                    plan
+                    for plan in prepared_plans
+                    if _approval_plan_requires_work(plan)
                 ]
-                batch_status = st.status("선택한 규정별 승인·색인 중…", expanded=True)
-                batch_progress = st.progress(0, text="규정별 승인·색인 준비 0%")
-                batch_detail = st.empty()
-                batch_results: list[dict[str, object]] = []
+                skipped_plan_count = len(prepared_plans) - len(plans)
+                batch_detail.caption(
+                    f"실제 승인·복구 대상 {len(plans):,}개 · 변경 없는 색인 생략 {skipped_plan_count:,}개"
+                )
+                approval_end_percent = 60
                 for plan_index, plan in enumerate(plans, start=1):
-                    segment_start = int((plan_index - 1) * 100 / max(len(plans), 1))
-                    segment_end = int(plan_index * 100 / max(len(plans), 1))
+                    segment_start = int((plan_index - 1) * approval_end_percent / max(len(plans), 1))
+                    segment_end = int(plan_index * approval_end_percent / max(len(plans), 1))
                     document_label = _workflow_document_label(plan["document"])
-                    batch_status.write(f"{plan_index:,}/{len(plans):,} · {document_label}")
+                    failed_stage = "승인 데이터 저장"
+                    failed_regulation = document_label
+                    batch_status.update(
+                        label=f"{plan_index:,}/{len(plans):,} · {document_label} 승인",
+                        state="running",
+                    )
                     result = _run_background_operation_with_progress(
                         lambda report, approval_plan=plan: _execute_reviewed_document_approval_plan(
                             approval_plan,
                             progress_callback=report,
+                            defer_index=True,
                         ),
                         progress_bar=batch_progress,
                         detail_box=batch_detail,
                         status_box=batch_status,
                         start_percent=segment_start,
                         end_percent=segment_end,
-                        label=f"{document_label} 승인·색인",
+                        label=f"{document_label} 승인",
                         estimated_seconds=max(8.0, int(plan["pending_chunk_count"]) / 60.0),
                     )
                     batch_results.append(result)
                     _invalidate_document_context_cache(str(plan["document_id"]))
-                batch_status.update(label="선택한 모든 규정 승인·색인 완료", state="complete")
+                deferred_document_ids = [
+                    str(result["document_id"])
+                    for result in batch_results
+                    if bool(result.get("index_deferred"))
+                ]
+                if deferred_document_ids:
+                    deferred_batch_ids = {
+                        str(result["document_id"]): str(result.get("vector_sync_batch_id") or "")
+                        for result in batch_results
+                        if bool(result.get("index_deferred"))
+                        and str(result.get("vector_sync_batch_id") or "").strip()
+                    }
+                    failed_stage = "공유 검색 인덱스 일괄 생성"
+                    failed_regulation = f"승인·복구 대상 {len(deferred_document_ids):,}개 규정"
+                    batch_status.update(
+                        label=(
+                            f"승인 완료 · {len(deferred_document_ids):,}개 규정 "
+                            "공유 검색 인덱스 일괄 생성"
+                        ),
+                        state="running",
+                    )
+                    batch_index_result = _run_background_operation_with_progress(
+                        lambda report: index_documents_batch(
+                            deferred_document_ids,
+                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            local_auth,
+                            progress_callback=report,
+                            vector_sync_batch_ids=deferred_batch_ids,
+                        ),
+                        progress_bar=batch_progress,
+                        detail_box=batch_detail,
+                        status_box=batch_status,
+                        start_percent=approval_end_percent,
+                        end_percent=100,
+                        label=f"{len(deferred_document_ids):,}개 규정 일괄 색인",
+                        estimated_seconds=max(12.0, len(deferred_document_ids) * 2.0),
+                    )
+                    record_count_by_document = {
+                        str(job.get("document_id") or ""): int(job.get("record_count") or 0)
+                        for job in batch_index_result.get("jobs") or []
+                        if isinstance(job, dict)
+                    }
+                    for result in batch_results:
+                        result_document_id = str(result.get("document_id") or "")
+                        if result_document_id in record_count_by_document:
+                            result["indexed_record_count"] = record_count_by_document[result_document_id]
+                            result["index_deferred"] = False
+                else:
+                    batch_progress.progress(100, text="실제 변경·복구 대상 처리 완료 · 100%")
+                batch_status.update(label="선택한 규정 승인·색인 처리 완료", state="complete")
                 st.success(
-                    f"규정 {len(batch_results):,}개를 각각 승인·색인했습니다. "
-                    f"MCP에는 규정별 계층과 청크가 분리되어 포함됩니다."
+                    f"실제 승인·복구 대상 규정 {len(batch_results):,}개를 처리했습니다. "
+                    f"변경 없는 규정 {skipped_plan_count:,}개는 색인을 생략했습니다. "
+                    "MCP에는 규정별 계층과 청크가 분리되어 포함됩니다."
                 )
                 st.rerun()
             except Exception as exc:
-                st.error(str(exc))
+                _update_long_operation_error(
+                    batch_status,
+                    stage=failed_stage,
+                    regulation=failed_regulation,
+                    error=exc,
+                    failure_policy=(
+                        "실패 규정을 건너뛰지 않고 전체 일괄 작업을 중단했습니다. "
+                        "이미 승인된 규정은 보상 색인을 시도하고, 미완료 배치 ID는 복구용으로 보존합니다."
+                    ),
+                    detail_box=batch_detail,
+                )
+                deferred_results = [
+                    result
+                    for result in batch_results
+                    if bool(result.get("index_deferred"))
+                ]
+                if deferred_results:
+                    recovery_document_ids = [
+                        str(result["document_id"])
+                        for result in deferred_results
+                    ]
+                    recovery_batch_ids = {
+                        str(result["document_id"]): str(result.get("vector_sync_batch_id") or "")
+                        for result in deferred_results
+                        if str(result.get("vector_sync_batch_id") or "").strip()
+                    }
+                    try:
+                        recovery = index_documents_batch(
+                            recovery_document_ids,
+                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            local_auth,
+                            vector_sync_batch_ids=recovery_batch_ids,
+                        )
+                        for recovery_document_id in recovery_document_ids:
+                            _invalidate_document_context_cache(recovery_document_id)
+                        st.warning(
+                            "일괄 승인 도중 오류가 발생했지만, 그 전에 승인된 "
+                            f"{len(recovery_document_ids):,}개 규정은 보상 색인을 완료했습니다 "
+                            f"(AI 등록 {int(recovery.get('record_count') or 0):,}개). "
+                            "남은 규정은 원인을 확인한 뒤 같은 버튼을 다시 실행할 수 있습니다."
+                        )
+                    except Exception as recovery_exc:
+                        st.error(
+                            "일괄 승인 실패 후 보상 색인도 완료되지 않았습니다. "
+                            "승인 기록의 배치 ID가 보존되어 재실행할 수 있습니다. "
+                            f"대상 규정: {', '.join(recovery_document_ids)} · "
+                            f"보상 색인 오류: {_brief_long_operation_error(recovery_exc)}"
+                        )
+                st.error(_brief_long_operation_error(exc))
         if workflow_ready_count < workflow_pending_count:
             st.info("선택한 모든 규정의 AI 검수와 사람 확인을 완료하면 규정별 일괄 승인·색인 버튼이 활성화됩니다.")
 
@@ -5907,7 +6241,12 @@ def _page_approval(ctx: dict | None) -> None:
         disabled=not pending_review_states,
         width="stretch",
     ):
-        with st.status("전체 규정 AI 검수 완료 처리 중…", expanded=True) as bulk_status:
+        with _long_operation_status(
+            "전체 규정 AI 검수 완료 처리 중…",
+            failure_stage="AI 검수 결정 저장",
+            failure_regulation=_workflow_document_label(document),
+            failure_policy="현재 규정의 일괄 검수를 중단했습니다. 저장 상태를 확인한 뒤 다시 실행할 수 있습니다.",
+        ) as bulk_status:
             bulk_status.write(f"{len(chunks):,}개 청크를 순회하는 중입니다.")
             bulk_progress = st.progress(0, text="AI 검수 0%")
             summary = _approval_set_bulk_ai_decisions(
@@ -5934,7 +6273,12 @@ def _page_approval(ctx: dict | None) -> None:
         disabled=not pending_review_states,
         width="stretch",
     ):
-        with st.status("전체 규정 사람 확인 처리 중…", expanded=True) as bulk_status:
+        with _long_operation_status(
+            "전체 규정 사람 확인 처리 중…",
+            failure_stage="사람 확인 결정 저장",
+            failure_regulation=_workflow_document_label(document),
+            failure_policy="현재 규정의 일괄 확인을 중단했습니다. 저장 상태를 확인한 뒤 다시 실행할 수 있습니다.",
+        ) as bulk_status:
             bulk_status.write(f"{len(chunks):,}개 청크를 확인 완료로 표시하는 중입니다.")
             bulk_progress = st.progress(0, text="사람 확인 0%")
             summary = _approval_set_bulk_human_confirmations(
@@ -5961,7 +6305,12 @@ def _page_approval(ctx: dict | None) -> None:
         disabled=not pending_review_states or ai_complete_count >= len(pending_review_states),
         width="stretch",
     ):
-        with st.status("남은 AI 점검 처리 중…", expanded=True) as bulk_status:
+        with _long_operation_status(
+            "남은 AI 점검 처리 중…",
+            failure_stage="남은 AI 검수 결정 저장",
+            failure_regulation=_workflow_document_label(document),
+            failure_policy="현재 규정의 남은 항목 처리를 중단했습니다. 완료된 결정은 유지됩니다.",
+        ) as bulk_status:
             bulk_status.write("기존 반영·미반영 결정은 유지하고 미결정 제안만 확인 완료로 표시합니다.")
             bulk_progress = st.progress(0, text="남은 AI 점검 0%")
             summary = _approval_set_bulk_ai_decisions(
@@ -5988,7 +6337,12 @@ def _page_approval(ctx: dict | None) -> None:
         disabled=not pending_review_states or human_complete_count >= len(pending_review_states),
         width="stretch",
     ):
-        with st.status("남은 사람 점검 처리 중…", expanded=True) as bulk_status:
+        with _long_operation_status(
+            "남은 사람 점검 처리 중…",
+            failure_stage="남은 사람 확인 결정 저장",
+            failure_regulation=_workflow_document_label(document),
+            failure_policy="현재 규정의 남은 항목 처리를 중단했습니다. 완료된 확인은 유지됩니다.",
+        ) as bulk_status:
             bulk_status.write("이미 확인한 청크는 유지하고 미확인 청크만 확인 완료로 표시합니다.")
             bulk_progress = st.progress(0, text="남은 사람 점검 0%")
             summary = _approval_set_bulk_human_confirmations(
@@ -6294,6 +6648,13 @@ def _page_approval(ctx: dict | None) -> None:
                     )
                 )
             approved_chunk_total = 0
+            guided_vector_sync_batch_id = (
+                f"streamlit-{document_id}-guided-approval"
+            )[:200]
+            guided_defer_vector_sync = not bool(
+                str(getattr(document, "supersedes_document_id", "") or "").strip()
+            )
+            approval_index_result: dict[str, object] | None = None
             approval_progress = st.progress(0, text="승인 0%")
             approval_detail = st.empty()
             for template_index, template in enumerate(templates, start=1):
@@ -6325,8 +6686,14 @@ def _page_approval(ctx: dict | None) -> None:
                         review_decision_events=template_review_events,
                         approval_override_reason=str(override_reason or "").strip() or None,
                         note="approval_screen_tabs",
+                        defer_vector_sync=guided_defer_vector_sync,
+                        vector_sync_batch_id=(
+                            guided_vector_sync_batch_id
+                            if guided_defer_vector_sync
+                            else None
+                        ),
                 )
-                _run_background_operation_with_progress(
+                approval_response = _run_background_operation_with_progress(
                     lambda _report, request=approval_request: approve_review_chunks(
                         document_id,
                         request,
@@ -6339,20 +6706,32 @@ def _page_approval(ctx: dict | None) -> None:
                     label=f"승인 묶음 {template_index:,}/{len(templates):,}",
                     estimated_seconds=max(5.0, len(chunk_ids) / 70.0),
                 )
+                vector_sync = (
+                    approval_response.get("vector_sync")
+                    if isinstance(approval_response, dict)
+                    else None
+                )
+                if isinstance(vector_sync, dict) and vector_sync.get("status") == "indexed":
+                    approval_index_result = dict(vector_sync)
                 approved_chunk_total += len(chunk_ids)
-            result = _run_background_operation_with_progress(
-                lambda _report: index_document(
-                    document_id,
-                    IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
-                    local_auth,
-                ),
-                progress_bar=approval_progress,
-                detail_box=approval_detail,
-                start_percent=58,
-                end_percent=100,
-                label="승인 내용 검색 색인",
-                estimated_seconds=max(8.0, approved_chunk_total / 65.0),
-            )
+            if approval_index_result is None:
+                result = _run_background_operation_with_progress(
+                    lambda _report: index_document(
+                        document_id,
+                        IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                        local_auth,
+                    ),
+                    progress_bar=approval_progress,
+                    detail_box=approval_detail,
+                    start_percent=58,
+                    end_percent=100,
+                    label="승인 내용 검색 색인",
+                    estimated_seconds=max(8.0, approved_chunk_total / 65.0),
+                )
+            else:
+                result = approval_index_result
+                approval_progress.progress(100, text="승인 내용 검색 색인 완료 · 100%")
+                approval_detail.caption("개정 승인 전에 생성한 검증된 검색 색인을 재사용했습니다.")
             _invalidate_document_context_cache(document_id)
             st.success(
                 f"승인 {approved_chunk_total:,}개, 수정 저장 {edited_chunk_total:,}개, "
@@ -6368,7 +6747,12 @@ def _page_approval(ctx: dict | None) -> None:
         disabled=approved_count <= 0,
     ):
         try:
-            with st.status("승인된 내용 검색 색인 중…", expanded=True) as quick_index_status:
+            with _long_operation_status(
+                "승인된 내용 검색 색인 중…",
+                failure_stage="승인 내용 검색 인덱스 생성",
+                failure_regulation=_workflow_document_label(document),
+                failure_policy="현재 규정 색인을 중단했습니다. 승인 기록은 유지되므로 다시 실행할 수 있습니다.",
+            ) as quick_index_status:
                 quick_index_progress = st.progress(0, text="색인 준비 · 0%")
                 quick_index_detail = st.empty()
                 result = _run_background_operation_with_progress(
@@ -6621,7 +7005,12 @@ def _page_approval(ctx: dict | None) -> None:
             disabled=indexing_disabled,
         ):
             try:
-                with st.status("승인된 전체 규정 색인 중…", expanded=True) as index_status:
+                with _long_operation_status(
+                    "승인된 전체 규정 색인 중…",
+                    failure_stage="승인 규정 검색 인덱스 생성",
+                    failure_regulation=_workflow_document_label(document),
+                    failure_policy="현재 규정 색인을 중단했습니다. 승인 기록은 유지되므로 다시 실행할 수 있습니다.",
+                ) as index_status:
                     index_status.write(f"승인된 청크 {approved_count:,}개를 색인하는 중입니다.")
                     index_progress = st.progress(0, text="색인 준비 · 0%")
                     index_detail = st.empty()
@@ -6650,7 +7039,12 @@ def _page_approval(ctx: dict | None) -> None:
             disabled=indexing_disabled,
         ):
             try:
-                with st.status("승인된 전체 규정 재색인 중…", expanded=True) as index_status:
+                with _long_operation_status(
+                    "승인된 전체 규정 재색인 중…",
+                    failure_stage="승인 규정 검색 인덱스 재생성",
+                    failure_regulation=_workflow_document_label(document),
+                    failure_policy="현재 규정 재색인을 중단했습니다. 기존 승인 기록은 유지됩니다.",
+                ) as index_status:
                     index_status.write(f"승인된 청크 {approved_count:,}개를 다시 색인하는 중입니다.")
                     index_progress = st.progress(0, text="재색인 준비 · 0%")
                     index_detail = st.empty()
@@ -7254,7 +7648,16 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         if retry_trigger and attempt_key:
                             st.session_state[attempt_key] = True
                         try:
-                            with st.status("Kordoc 안전 재전처리 중…", expanded=True) as reprocess_status:
+                            with _long_operation_status(
+                                "Kordoc 안전 재전처리 중…",
+                                failure_stage="Kordoc 재전처리·증거 검증",
+                                failure_regulation=(
+                                    _workflow_document_label(scope_documents[0])
+                                    if len(scope_documents) == 1
+                                    else f"선택한 {len(missing_document_ids):,}개 규정"
+                                ),
+                                failure_policy="실패한 규정을 건너뛰지 않고 재전처리를 중단합니다. 기존 승인본은 유지됩니다.",
+                            ) as reprocess_status:
                                 reprocess_progress = st.progress(0, text="새 초안 준비 · 0%")
                                 reprocess_detail = st.empty()
                                 reprocess_results = _run_background_operation_with_progress(
@@ -7630,7 +8033,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     nonlocal current_bundle_stage
                     current_bundle_stage = message
                     bundle_progress.progress(percent, text=f"{message} · {percent}%")
-                    bundle_status.write(f"{percent}% · {message}")
+                    bundle_status.update(
+                        label=f"{percent}% · {message}",
+                        state="running",
+                    )
                     bundle_detail.caption(
                         f"경과 {_format_elapsed_seconds(time.monotonic() - bundle_started)} · "
                         f"마지막 상태 갱신 {datetime.now().astimezone().strftime('%H:%M:%S')} · {message}"
@@ -7644,19 +8050,20 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         item for item in scope_documents if _missing_mcp_source_metadata(item)
                     ]
                     patch_total = len(documents_to_patch)
+                    patched_document_ids: list[str] = []
                     for patch_index, scope_document in enumerate(documents_to_patch, start=1):
                         scope_document_id = str(getattr(scope_document, "document_id", "") or "")
                         current_bundle_regulation = _workflow_document_label(scope_document)
-                        patch_start = 10 + int(((patch_index - 1) / max(patch_total, 1)) * 25)
-                        patch_end = 10 + int((patch_index / max(patch_total, 1)) * 25)
+                        patch_start = 10 + int(((patch_index - 1) / max(patch_total, 1)) * 15)
+                        patch_end = 10 + int((patch_index / max(patch_total, 1)) * 15)
 
-                        def _patch_and_reindex(
+                        def _patch_source_metadata(
                             report: Callable[[int, str, int | None, int | None], None],
                             *,
                             target_document=scope_document,
                             target_document_id=scope_document_id,
                             target_index=patch_index,
-                        ) -> tuple[object, dict[str, str], object | None]:
+                        ) -> tuple[object, dict[str, str]]:
                             nonlocal current_bundle_stage, current_bundle_regulation
                             target_label = _workflow_document_label(target_document)
                             current_bundle_regulation = target_label
@@ -7670,20 +8077,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                             if not patch:
                                 current_bundle_stage = "출처 정보 확인 완료"
                                 report(100, f"출처 정보 확인 완료: {target_label}", target_index, patch_total)
-                                return updated, patch, None
-                            current_bundle_stage = "승인 데이터 재색인"
-                            report(35, f"승인 데이터 재색인: {target_label}", target_index - 1, patch_total)
-                            indexing_result = index_document(
-                                target_document_id,
-                                IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
-                                local_auth,
-                            )
-                            current_bundle_stage = "규정 처리 완료"
-                            report(100, f"규정 처리 완료: {target_label}", target_index, patch_total)
-                            return updated, patch, indexing_result
+                                return updated, patch
+                            current_bundle_stage = "출처 정보 보완 완료"
+                            report(100, f"출처 정보 보완 완료: {target_label}", target_index, patch_total)
+                            return updated, patch
 
-                        updated_document, current_patch, _ = _run_background_operation_with_progress(
-                            _patch_and_reindex,
+                        updated_document, current_patch = _run_background_operation_with_progress(
+                            _patch_source_metadata,
                             progress_bar=bundle_progress,
                             detail_box=bundle_detail,
                             status_box=bundle_status,
@@ -7695,8 +8095,27 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         if not current_patch:
                             continue
                         source_metadata_patch[scope_document_id] = current_patch
+                        patched_document_ids.append(scope_document_id)
                         if scope_document_id == document_id:
                             document = updated_document
+                    if patched_document_ids:
+                        current_bundle_stage = "승인 데이터 일괄 재색인"
+                        current_bundle_regulation = f"{len(patched_document_ids):,}개 규정"
+                        _run_background_operation_with_progress(
+                            lambda report: index_documents_batch(
+                                patched_document_ids,
+                                IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                                local_auth,
+                                progress_callback=report,
+                            ),
+                            progress_bar=bundle_progress,
+                            detail_box=bundle_detail,
+                            status_box=bundle_status,
+                            start_percent=25,
+                            end_percent=35,
+                            label=f"{len(patched_document_ids):,}개 규정 출처 메타데이터 일괄 재색인",
+                            estimated_seconds=max(12.0, len(patched_document_ids) * 2.0),
+                        )
                 _bundle_stage(35, "기관별 규정·개정판·목차 색인 준비")
                 current_bundle_regulation = f"{len(scope_documents):,}개 규정 범위"
 
@@ -7841,7 +8260,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                                 f"{total_bytes / (1024 * 1024):,.1f}MB · {percent}%"
                             ),
                         )
-                        bundle_status.write(f"ZIP 압축 중 · {current_name} · {percent}%")
+                        bundle_status.update(
+                            label=f"ZIP 압축 중 · {current_name} · {percent}%",
+                            state="running",
+                        )
                         bundle_detail.caption(
                             f"경과 {_format_elapsed_seconds(time.monotonic() - bundle_started)} · "
                             f"마지막 상태 갱신 {datetime.now().astimezone().strftime('%H:%M:%S')} · "
@@ -7895,7 +8317,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "usage_guide": files.get("usage_guide"),
                 }
                 bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")
-                bundle_status.write("MCP 파일 묶음 생성 완료 · 100%")
                 bundle_status.update(label="MCP 파일 묶음 생성 완료", state="complete")
                 bundle_detail.caption(
                     f"완료 · 경과 {_format_elapsed_seconds(time.monotonic() - bundle_started)} · "

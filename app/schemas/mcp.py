@@ -47,7 +47,6 @@ class ChatGPTDataRegulation(BaseModel):
     effective_from: str = ""
     effective_to: str = ""
     status: str
-    document_id: str = ""
 
 
 class ChatGPTDataRegulationListOutput(BaseModel):

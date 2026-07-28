@@ -195,6 +195,87 @@ def default_bm25_index_path(vector_path: Path) -> Path:
 
 def write_bm25_index(path: Path, records: Iterable[dict[str, Any]]) -> Bm25Index:
     index = Bm25Index.build(records)
+    _write_bm25_index(path, index)
+    return index
+
+
+def update_bm25_index_for_documents(
+    path: Path,
+    *,
+    previous_records: Iterable[dict[str, Any]],
+    final_records: Iterable[dict[str, Any]],
+    changed_document_ids: Iterable[str],
+) -> tuple[Bm25Index, bool]:
+    """Update BM25 terms for changed documents without retokenizing the corpus.
+
+    Returns ``(index, incremental)``. Any stale, incompatible, or ambiguous
+    prior state falls back to a deterministic full rebuild.
+    """
+
+    previous = list(previous_records)
+    final = list(final_records)
+    changed_ids = {str(value or "").strip() for value in changed_document_ids if str(value or "").strip()}
+    current = load_bm25_index(path)
+    if (
+        current is None
+        or not changed_ids
+        or current.structured_metadata_version != BM25_STRUCTURED_METADATA_VERSION
+        or current.tokenizer != tokenizer_name()
+        or current.is_stale_for(previous)
+        or not _only_documents_changed(previous, final, changed_ids)
+    ):
+        rebuilt = Bm25Index.build(final)
+        _write_bm25_index(path, rebuilt)
+        return rebuilt, False
+
+    final_ids = {str(record.get("id") or "") for record in final if str(record.get("id") or "")}
+    retained_documents = [
+        document
+        for document in current.documents
+        if str(document.get("id") or "") in final_ids
+        and str(document.get("document_id") or "") not in changed_ids
+    ]
+    changed_index = Bm25Index.build(
+        [
+            record
+            for record in final
+            if _record_document_id(record) in changed_ids
+        ],
+        k1=current.k1,
+        b=current.b,
+    )
+    documents = sorted(
+        [*retained_documents, *changed_index.documents],
+        key=lambda document: str(document.get("id") or ""),
+    )
+    document_frequencies: Counter[str] = Counter()
+    total_length = 0
+    for document in documents:
+        terms = document.get("term_frequencies")
+        if not isinstance(terms, dict):
+            rebuilt = Bm25Index.build(final, k1=current.k1, b=current.b)
+            _write_bm25_index(path, rebuilt)
+            return rebuilt, False
+        document_frequencies.update(str(term) for term in terms)
+        total_length += int(document.get("document_length") or 0)
+    updated = Bm25Index(
+        index_version=BM25_INDEX_VERSION,
+        structured_metadata_version=BM25_STRUCTURED_METADATA_VERSION,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        tokenizer=current.tokenizer,
+        k1=current.k1,
+        b=current.b,
+        source_content_hashes=source_content_hashes(final),
+        document_count=len(documents),
+        average_document_length=round(total_length / len(documents), 6) if documents else 0.0,
+        document_frequencies=dict(sorted(document_frequencies.items())),
+        documents=documents,
+    )
+    _write_bm25_index(path, updated)
+    return updated, True
+
+
+def _write_bm25_index(path: Path, index: Bm25Index) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{hashlib.sha256(index.generated_at.encode('utf-8')).hexdigest()[:12]}.tmp")
     try:
@@ -203,7 +284,29 @@ def write_bm25_index(path: Path, records: Iterable[dict[str, Any]]) -> Bm25Index
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
-    return index
+
+
+def _only_documents_changed(
+    previous_records: list[dict[str, Any]],
+    final_records: list[dict[str, Any]],
+    changed_document_ids: set[str],
+) -> bool:
+    previous_unchanged = {
+        str(record.get("id") or ""): str(record.get("content_hash") or "")
+        for record in previous_records
+        if _record_document_id(record) not in changed_document_ids
+    }
+    final_unchanged = {
+        str(record.get("id") or ""): str(record.get("content_hash") or "")
+        for record in final_records
+        if _record_document_id(record) not in changed_document_ids
+    }
+    return previous_unchanged == final_unchanged
+
+
+def _record_document_id(record: dict[str, Any]) -> str:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    return str(record.get("document_id") or metadata.get("document_id") or "")
 
 
 def load_bm25_index(path: Path) -> Bm25Index | None:

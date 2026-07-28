@@ -33,7 +33,15 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         self.assertTrue(report["full_profile"]["fetch_has_text"])
         self.assertEqual(
             set(report["chatgpt_data_profile"]["tool_names"]),
-            {"search", "fetch", "list_regulations", "get_regulation_toc", "get_regulation_article"},
+            {
+                "search",
+                "fetch",
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+            },
         )
         self.assertTrue(report["chatgpt_data_profile"]["catalog_verified"])
         self.assertTrue(report["chatgpt_data_profile"]["hierarchy_verified"])
@@ -71,7 +79,15 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         self.assertTrue(report["full_profile"]["session_id_present"])
         self.assertEqual(
             set(report["chatgpt_data_profile"]["tool_names"]),
-            {"search", "fetch", "list_regulations", "get_regulation_toc", "get_regulation_article"},
+            {
+                "search",
+                "fetch",
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+            },
         )
         self.assertTrue(report["chatgpt_data_profile"]["catalog_verified"])
         self.assertTrue(report["chatgpt_data_profile"]["hierarchy_verified"])

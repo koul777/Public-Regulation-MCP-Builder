@@ -71,7 +71,7 @@ vercel env add MCP_TOOL_PROFILE production --value "chatgpt-data" --yes --cwd .\
 - `MCP_ALLOWED_HTTP_HOSTS`: 사용자 도메인을 쓸 때 `mcp.example.go.kr`
 - `MCP_ALLOWED_HTTP_ORIGINS`: 신뢰하는 Origin이 실제 전송될 때만 쉼표로 구분해 등록
 - `MCP_TENANT_ID`, `MCP_PROFILE_ID`: 생략하면 runtime manifest 값을 사용
-- `MCP_TOOL_PROFILE`: 기본값 `chatgpt-data`; 원격 공개 범위는 읽기 전용 `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `search`, `fetch`
+- `MCP_TOOL_PROFILE`: 기본값 `chatgpt-data`; 원격 공개 범위는 읽기 전용 `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch`
 
 현재 adapter의 `MCP_AUTH_TOKEN`은 bearer 인증을 지원하는 ChatGPT Desktop·Codex와 일반 MCP
 클라이언트에서 사용할 수 있다. 토큰 값은 Vercel Secret과 로컬 환경변수에만 두고
@@ -131,7 +131,10 @@ python scripts\run_mcp_client_config_smoke.py `
 ```
 
 결과에서 `mcp_initialized`, `tools_discovered`, `end_to_end_verified`가 모두 `true`이고
-`tool_names`에 `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `search`, `fetch`가 있어야 한다. 이어서 목록 1페이지, 첫 규정의 목차와 조문, 검색 결과의 `fetch` 원문까지 실제 호출로 확인한다.
+`tool_names`에 `list_regulations`, `get_regulation_toc`, `get_regulation_article`,
+`get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch`가 있어야 한다.
+이어서 목록 1페이지, 첫 규정의 목차·조문·참조, 순환참조 목록, 검색 결과의 `fetch`
+원문까지 실제 호출로 확인한다.
 
 공개 read-only 주소가 정해진 뒤 Claude용 복사 파일을 만들려면 다음처럼 명시적으로 공개
 모드를 선택한다.

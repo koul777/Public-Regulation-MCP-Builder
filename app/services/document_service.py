@@ -79,7 +79,11 @@ class DocumentService:
             institution_name=institution_name,
             apba_id=apba_id,
             source_system=source_system,
-            source_url=source_url,
+            source_url=_resolved_upload_source_url(
+                source_url=source_url,
+                source_system=source_system,
+                document_id=document_id,
+            ),
             source_record_id=source_record_id,
             source_file_id=source_file_id,
             source_disclosure_date=source_disclosure_date,
@@ -165,7 +169,11 @@ class DocumentService:
             institution_name=institution_name,
             apba_id=apba_id,
             source_system=source_system,
-            source_url=source_url,
+            source_url=_resolved_upload_source_url(
+                source_url=source_url,
+                source_system=source_system,
+                document_id=document_id,
+            ),
             source_record_id=source_record_id,
             source_file_id=source_file_id,
             source_disclosure_date=source_disclosure_date,
@@ -266,3 +274,17 @@ class DocumentService:
             profile_id=document.profile_id,
             regulation_version=document.regulation_version,
         )
+
+
+def _resolved_upload_source_url(
+    *,
+    source_url: str | None,
+    source_system: str | None,
+    document_id: str,
+) -> str | None:
+    normalized_url = str(source_url or "").strip()
+    if normalized_url:
+        return normalized_url
+    if str(source_system or "").strip().casefold() == "local_upload":
+        return f"local-upload://{document_id}"
+    return None

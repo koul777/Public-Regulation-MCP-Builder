@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -956,10 +956,14 @@ def _approval_snapshot_signature(repository: JsonRepository, document_ids: list[
 
 def _approval_journal_signature(repository: JsonRepository, document_ids: list[str]) -> str:
     try:
+        records_by_document = _approval_journal_records_by_document(
+            repository,
+            document_ids,
+        )
         records = [
             record
             for document_id in document_ids
-            for record in repository.list_approval_journal_records(document_id)
+            for record in records_by_document.get(document_id, ())
         ]
     except Exception:
         records = []
@@ -1020,11 +1024,19 @@ def _build_approval_snapshot(
     auth: AuthContext,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     snapshot: dict[tuple[str, str], dict[str, Any]] = {}
+    approval_records_by_document = _approval_journal_records_by_document(
+        repository,
+        document_ids,
+    )
+    approval_match_index = _approval_journal_match_index(
+        record
+        for document_id in document_ids
+        for record in approval_records_by_document.get(document_id, ())
+    )
     for document_id in document_ids:
         document = repository.get_document(document_id)
         if document is None or not resource_visible_to_tenant(document, auth.tenant_id):
             continue
-        approval_journal_records = repository.list_approval_journal_records(document_id)
         for chunk in repository.get_chunks(document_id):
             if chunk.approval_status != APPROVED_CHUNK_STATUS or not chunk.approval_id:
                 continue
@@ -1038,14 +1050,14 @@ def _build_approval_snapshot(
             security_level = str(expected_metadata.get("security_level") or "").strip().lower()
             if not chunk_id or security_level not in SECURITY_LEVEL_ORDER:
                 continue
-            if not _has_matching_approval_journal_record(
-                approval_journal_records,
-                chunk=chunk,
+            if _approval_journal_match_key(
                 chunk_id=chunk_id,
                 document_id=document_id,
                 tenant_id=auth.tenant_id,
+                approval_id=str(chunk.approval_id or ""),
+                approved_content_hash=str(chunk.approved_content_hash or ""),
                 expected_metadata=expected_metadata,
-            ):
+            ) not in approval_match_index:
                 continue
             snapshot[(document_id, chunk_id)] = {
                 "approval_id": expected_metadata.get("approval_id"),
@@ -1055,6 +1067,96 @@ def _build_approval_snapshot(
                 "content_hash": str(expected_record.get("content_hash") or ""),
             }
     return snapshot
+
+
+def _approval_journal_records_by_document(
+    repository: JsonRepository,
+    document_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    selected_document_ids = set(document_ids)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in repository.list_approval_journal_records():
+        if not isinstance(record, dict):
+            continue
+        document_id = str(record.get("document_id") or "")
+        if document_id in selected_document_ids:
+            grouped[document_id].append(record)
+    return grouped
+
+
+def _approval_journal_match_index(
+    records: Iterable[dict[str, Any]],
+) -> set[tuple[Any, ...]]:
+    index: set[tuple[Any, ...]] = set()
+    expected_worklist_keys = set(APPROVAL_WORKLIST_METADATA_KEYS)
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        document_id = str(record.get("document_id") or "")
+        tenant_id = str(record.get("tenant_id") or "")
+        approval_id = str(record.get("approval_id") or "")
+        if not document_id or not tenant_id or not approval_id:
+            continue
+        worklist_evidence = record.get("worklist_evidence") or {}
+        if not isinstance(worklist_evidence, dict):
+            continue
+        worklist_metadata = approval_worklist_metadata(worklist_evidence)
+        if set(worklist_metadata) != expected_worklist_keys:
+            continue
+        chunk_ids = {
+            str(value)
+            for value in (record.get("chunk_ids") or [])
+            if str(value or "")
+        }
+        approved_hashes = {
+            str(chunk_id): str(value)
+            for chunk_id, value in (record.get("approved_content_hashes") or {}).items()
+            if str(chunk_id or "") and str(value or "")
+        } if isinstance(record.get("approved_content_hashes"), dict) else {}
+        for item in record.get("approved_chunks") or []:
+            if not isinstance(item, dict):
+                continue
+            chunk_id = str(item.get("chunk_id") or "")
+            approved_hash = str(item.get("approved_content_hash") or "")
+            if chunk_id and approved_hash and chunk_id not in approved_hashes:
+                approved_hashes[chunk_id] = approved_hash
+        for chunk_id in chunk_ids:
+            approved_content_hash = approved_hashes.get(chunk_id, "")
+            if not approved_content_hash:
+                continue
+            index.add(
+                _approval_journal_match_key(
+                    chunk_id=chunk_id,
+                    document_id=document_id,
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    approved_content_hash=approved_content_hash,
+                    expected_metadata=worklist_metadata,
+                )
+            )
+    return index
+
+
+def _approval_journal_match_key(
+    *,
+    chunk_id: str,
+    document_id: str,
+    tenant_id: str,
+    approval_id: str,
+    approved_content_hash: str,
+    expected_metadata: dict[str, Any],
+) -> tuple[Any, ...]:
+    return (
+        str(document_id),
+        str(tenant_id),
+        str(approval_id),
+        str(chunk_id),
+        str(approved_content_hash),
+        tuple(
+            (key, str(expected_metadata.get(key) or ""))
+            for key in sorted(APPROVAL_WORKLIST_METADATA_KEYS)
+        ),
+    )
 
 
 def _has_matching_approval_journal_record(

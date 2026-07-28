@@ -200,6 +200,58 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("requires fields: source_record_id", raised.exception.detail)
 
+    def test_upload_document_enforces_atomic_version_admission_after_precheck(self) -> None:
+        class FakeUploadFile:
+            filename = "personnel.pdf"
+
+            def __init__(self) -> None:
+                self.file = io.BytesIO(b"%PDF-1.4 atomic admission")
+
+            async def seek(self, offset: int) -> None:
+                self.file.seek(offset)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            with patch.object(
+                routes_documents,
+                "get_settings",
+                return_value=settings,
+            ), patch.object(
+                JsonRepository,
+                "find_documents_by_regulation",
+                return_value=[],
+            ):
+                first = asyncio.run(
+                    routes_documents.upload_document(
+                        FakeUploadFile(),
+                        profile_id="institution-a",
+                        regulation_id="reg-personnel-atomic",
+                        regulation_version="v1",
+                        auth_context=_auth_context(),
+                    )
+                )
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(
+                        routes_documents.upload_document(
+                            FakeUploadFile(),
+                            profile_id="institution-a",
+                            regulation_id="reg-personnel-atomic",
+                            regulation_version="V1",
+                            auth_context=_auth_context(),
+                        )
+                    )
+
+            stored = JsonRepository(settings).find_documents_by_regulation(
+                "reg-personnel-atomic",
+                profile_id="institution-a",
+                tenant_id="tenant-a",
+            )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertIn("same regulation version already exists", raised.exception.detail)
+        self.assertEqual(first["document_id"], stored[0].document_id)
+        self.assertEqual(1, len(stored))
+
     def test_process_document_omitted_request_passes_none_options_to_service(self) -> None:
         captured: list[ChunkOptions | None] = []
 
@@ -570,6 +622,274 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(approval_records[0]["approved_content_hashes"], sync_events[0]["approved_content_hashes"])
         self.assertEqual(response["vector_sync"], sync_events[0]["vector_sync"])
 
+    def test_approve_review_chunks_can_defer_sync_for_one_audited_batch_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_deferred_sync",
+                    filename="deferred.pdf",
+                    document_name="Deferred Sync",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc_deferred_sync",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-1",
+                        document_id="doc_deferred_sync",
+                        chunk_type="article",
+                        text="deferred approved evidence",
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id="doc_deferred_sync",
+                chunks=repository.get_chunks("doc_deferred_sync"),
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings), patch.object(
+                routes_documents,
+                "_sync_vector_index_after_review_change",
+                side_effect=AssertionError("per-document vector sync must be deferred"),
+            ):
+                response = routes_documents.approve_review_chunks(
+                    "doc_deferred_sync",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-1"],
+                        approval_id="approval-deferred",
+                        security_level="internal",
+                        defer_vector_sync=True,
+                        vector_sync_batch_id="batch-index-45-regulations",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+            stored = JsonRepository(settings)
+            pending_before = routes_documents.pending_deferred_vector_sync_batch_ids(
+                stored,
+                "doc_deferred_sync",
+            )
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                dry_run_response = routes_documents.index_documents_batch(
+                    ["doc_deferred_sync"],
+                    routes_documents.IndexRequest(
+                        target_type="local-jsonl",
+                        embedding_dimensions=8,
+                        dry_run=True,
+                    ),
+                    _auth_context(),
+                    vector_sync_batch_ids={
+                        "doc_deferred_sync": "batch-index-45-regulations",
+                    },
+                )
+                pending_after_dry_run = (
+                    routes_documents.pending_deferred_vector_sync_batch_ids(
+                        stored,
+                        "doc_deferred_sync",
+                    )
+                )
+                batch_response = routes_documents.index_documents_batch(
+                    ["doc_deferred_sync"],
+                    routes_documents.IndexRequest(
+                        target_type="local-jsonl",
+                        embedding_dimensions=8,
+                    ),
+                    _auth_context(),
+                    vector_sync_batch_ids={
+                        "doc_deferred_sync": "batch-index-45-regulations",
+                    },
+                )
+                repeated_batch_response = routes_documents.index_documents_batch(
+                    ["doc_deferred_sync"],
+                    routes_documents.IndexRequest(
+                        target_type="local-jsonl",
+                        embedding_dimensions=8,
+                    ),
+                    _auth_context(),
+                    vector_sync_batch_ids={
+                        "doc_deferred_sync": "batch-index-45-regulations",
+                    },
+                )
+            sync_events = stored.list_maintenance_events("approval_vector_sync_outcome")
+            indexing_jobs = stored.list_indexing_jobs("doc_deferred_sync")
+            pending_after = routes_documents.pending_deferred_vector_sync_batch_ids(
+                stored,
+                "doc_deferred_sync",
+            )
+
+        self.assertEqual("deferred", response["vector_sync"]["status"])
+        self.assertEqual("batch_index_pending", response["vector_sync"]["reason"])
+        self.assertEqual("batch-index-45-regulations", response["vector_sync"]["batch_id"])
+        self.assertTrue(response["vector_sync"]["reindex_required"])
+        self.assertEqual(["batch-index-45-regulations"], pending_before)
+        self.assertEqual("not_indexed", dry_run_response["status"])
+        self.assertEqual(["batch-index-45-regulations"], pending_after_dry_run)
+        self.assertEqual("indexed", batch_response["status"])
+        self.assertEqual("indexed", repeated_batch_response["status"])
+        self.assertEqual(3, len(indexing_jobs))
+        self.assertEqual(
+            "batch-index-45-regulations",
+            indexing_jobs[-1]["vector_sync_batch_id"],
+        )
+        deferred_event = next(event for event in sync_events if event["outcome"] == "deferred")
+        completed_event = next(event for event in sync_events if event["outcome"] == "completed")
+        self.assertEqual(2, len(sync_events))
+        self.assertEqual(response["vector_sync"], deferred_event["vector_sync"])
+        self.assertEqual("indexed", completed_event["vector_sync"]["status"])
+        self.assertEqual("deferred_batch_index_completed", completed_event["vector_sync"]["reason"])
+        self.assertEqual([], pending_after)
+
+    def test_approve_review_chunks_restores_review_state_when_approval_journal_commit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc-approval-rollback",
+                    filename="approval-rollback.pdf",
+                    document_name="Approval Rollback",
+                    file_type="pdf",
+                    file_hash="hash-approval-rollback",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc-approval-rollback",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-rollback",
+                        document_id="doc-approval-rollback",
+                        chunk_type="article",
+                        text="승인 저널 실패 전 원문",
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id="doc-approval-rollback",
+                chunks=repository.get_chunks("doc-approval-rollback"),
+            )
+
+            with (
+                patch.object(routes_documents, "get_settings", return_value=settings),
+                patch.object(
+                    JsonRepository,
+                    "append_approval_record",
+                    side_effect=OSError(r"simulated journal failure at C:\private\approvals.jsonl"),
+                ),
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    routes_documents.approve_review_chunks(
+                        "doc-approval-rollback",
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-rollback"],
+                            approval_id="approval-rollback",
+                            security_level="internal",
+                            **evidence,
+                        ),
+                        _auth_context(),
+                    )
+
+            stored = JsonRepository(settings)
+            restored_chunk = stored.get_chunks("doc-approval-rollback")[0]
+            approval_records = stored.list_approval_journal_records("doc-approval-rollback")
+            audit_records = [
+                json.loads(line)
+                for line in api_audit_path(settings).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertFalse(raised.exception.detail["approval_persisted"])
+        self.assertTrue(raised.exception.detail["state_restored"])
+        self.assertFalse(raised.exception.detail["recovery_required"])
+        self.assertNotEqual("approved", restored_chunk.approval_status)
+        self.assertIsNone(restored_chunk.approval_id)
+        self.assertEqual([], approval_records)
+        self.assertIn("state_restored=True", audit_records[-1]["detail"])
+        self.assertNotIn(r"C:\private", audit_records[-1]["detail"])
+
+    def test_revision_activation_rejects_deferred_vector_sync_before_approval_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_revision_deferred",
+                    filename="revision.pdf",
+                    document_name="인사규정",
+                    file_type="pdf",
+                    file_hash="hash-revision",
+                    profile_id="institution-a",
+                    regulation_id="reg-personnel",
+                    regulation_version="v2",
+                    revision_date="2026-01-01",
+                    effective_from="2026-01-01",
+                    regulation_status="pending_approval",
+                    supersedes_document_id="doc-prior",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc_revision_deferred",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-1",
+                        document_id="doc_revision_deferred",
+                        chunk_type="article",
+                        text="revision evidence",
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id="doc_revision_deferred",
+                chunks=repository.get_chunks("doc_revision_deferred"),
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                with self.assertRaises(HTTPException) as raised:
+                    routes_documents.approve_review_chunks(
+                        "doc_revision_deferred",
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-1"],
+                            approval_id="approval-revision-deferred",
+                            security_level="internal",
+                            defer_vector_sync=True,
+                            vector_sync_batch_id="unsafe-revision-batch",
+                            **evidence,
+                        ),
+                        _auth_context(),
+                    )
+            stored = JsonRepository(settings)
+            approval_records = stored.list_approval_records("doc_revision_deferred")
+            stored_chunks = stored.get_chunks("doc_revision_deferred")
+
+        self.assertEqual(409, raised.exception.status_code)
+        self.assertEqual([], approval_records)
+        self.assertNotEqual("approved", stored_chunks[0].approval_status)
+
     def test_approve_review_chunks_persists_failed_sync_and_hides_stale_vector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -698,6 +1018,898 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail["vector_sync_event_id"], failure_events[0]["event_id"])
         self.assertIn(failure_events[0]["event_id"], failure_audit["detail"])
         self.assertNotIn("approved evidence alpha", json.dumps(failure_events[0], ensure_ascii=False))
+
+    def test_revision_approval_indexes_before_automatic_supersede(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc-prior",
+                    filename="prior.pdf",
+                    document_name="인사규정",
+                    file_type="pdf",
+                    file_hash="hash-prior",
+                    profile_id="institution-a",
+                    regulation_id="reg-personnel",
+                    regulation_version="v1",
+                    revision_date="2025-01-01",
+                    effective_from="2025-01-01",
+                    regulation_status="approved",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            repository.upsert_document(
+                Document(
+                    document_id="doc-revision",
+                    filename="revision.pdf",
+                    document_name="인사규정",
+                    file_type="pdf",
+                    file_hash="hash-revision",
+                    profile_id="institution-a",
+                    regulation_id="reg-personnel",
+                    regulation_version="v2",
+                    revision_date="2026-01-01",
+                    effective_from="2026-01-01",
+                    regulation_status="pending_approval",
+                    supersedes_document_id="doc-prior",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc-revision",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-revision",
+                        document_id="doc-revision",
+                        chunk_type="article",
+                        text="개정 인사규정 제16조",
+                        retrieval_text="개정 인사규정 제16조",
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id="doc-revision",
+                chunks=repository.get_chunks("doc-revision"),
+            )
+            call_order: list[str] = []
+
+            def sync_revision(**kwargs):
+                call_order.append("index")
+                self.assertTrue(kwargs["index_if_missing"])
+                self.assertEqual(
+                    "pending_approval",
+                    kwargs["repository"].get_document("doc-revision").regulation_status,
+                )
+                self.assertEqual(
+                    {"approved"},
+                    {
+                        chunk.metadata.get("regulation_status")
+                        for chunk in kwargs["chunks"]
+                    },
+                )
+                return {"status": "indexed", "record_count": 1}
+
+            def supersede_prior(**kwargs):
+                call_order.append("supersede")
+                self.assertEqual(
+                    "approved",
+                    kwargs["repository"].get_document("doc-revision").regulation_status,
+                )
+                return {
+                    "document_id": "doc-prior",
+                    "status": "superseded",
+                    "outcome": "completed",
+                }
+
+            with patch.object(routes_documents, "get_settings", return_value=settings), patch.object(
+                routes_documents,
+                "_sync_vector_index_after_review_change",
+                side_effect=sync_revision,
+            ), patch.object(
+                routes_documents,
+                "_automatically_supersede_prior_version",
+                side_effect=supersede_prior,
+            ):
+                response = routes_documents.approve_review_chunks(
+                    "doc-revision",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-revision"],
+                        approval_id="approval-revision",
+                        security_level="internal",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+
+            stored_revision = repository.get_document("doc-revision")
+            stored_chunks = repository.get_chunks("doc-revision")
+
+        self.assertEqual(["index", "supersede"], call_order)
+        self.assertEqual("indexed", response["vector_sync"]["status"])
+        self.assertEqual("approved", stored_revision.regulation_status)
+        self.assertEqual({"approved"}, {chunk.metadata.get("regulation_status") for chunk in stored_chunks})
+
+    def test_failed_revision_first_index_does_not_supersede_prior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior",
+                filename="prior.pdf",
+                document_name="인사규정",
+                file_type="pdf",
+                file_hash="hash-prior",
+                profile_id="institution-a",
+                regulation_id="reg-personnel",
+                regulation_version="v1",
+                revision_date="2025-01-01",
+                effective_from="2025-01-01",
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            revision = Document(
+                document_id="doc-revision",
+                filename="revision.pdf",
+                document_name="인사규정",
+                file_type="pdf",
+                file_hash="hash-revision",
+                profile_id="institution-a",
+                regulation_id="reg-personnel",
+                regulation_version="v2",
+                revision_date="2026-01-01",
+                effective_from="2026-01-01",
+                regulation_status="pending_approval",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+            repository.upsert_document(revision)
+            repository.save_processing_result(
+                revision.document_id,
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-revision",
+                        document_id=revision.document_id,
+                        chunk_type="article",
+                        text="개정 인사규정 제16조",
+                        retrieval_text="개정 인사규정 제16조",
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id=revision.document_id,
+                chunks=repository.get_chunks(revision.document_id),
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings), patch.object(
+                routes_documents,
+                "_run_document_indexing",
+                side_effect=RuntimeError("simulated revision indexing failure"),
+            ), patch.object(
+                routes_documents,
+                "_automatically_supersede_prior_version",
+            ) as supersede_mock:
+                with self.assertRaises(HTTPException) as raised:
+                    routes_documents.approve_review_chunks(
+                        revision.document_id,
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-revision"],
+                            approval_id="approval-revision",
+                            security_level="internal",
+                            **evidence,
+                        ),
+                        _auth_context(),
+                    )
+
+            stored_prior = repository.get_document(prior.document_id)
+            stored_revision = repository.get_document(revision.document_id)
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("approved", stored_prior.regulation_status)
+        self.assertEqual("pending_approval", stored_revision.regulation_status)
+        supersede_mock.assert_not_called()
+
+    def test_automatic_supersede_retries_failed_vector_sync_and_repairs_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior-retry",
+                filename="prior.pdf",
+                document_name="Personnel Regulation",
+                file_type="pdf",
+                file_hash="hash-prior-retry",
+                profile_id="institution-a",
+                regulation_id="reg-personnel-retry",
+                regulation_version="v1",
+                revision_date="2025-01-01",
+                effective_from="2025-01-01",
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            revision = Document(
+                document_id="doc-revision-retry",
+                filename="revision.pdf",
+                document_name="Personnel Regulation",
+                file_type="pdf",
+                file_hash="hash-revision-retry",
+                profile_id="institution-a",
+                regulation_id="reg-personnel-retry",
+                regulation_version="v2",
+                revision_date="2026-01-01",
+                effective_from="2026-01-01",
+                regulation_status="approved",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+            repository.upsert_document(revision)
+            repository.save_processing_result(
+                prior.document_id,
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-prior-retry",
+                        document_id=prior.document_id,
+                        chunk_type="article",
+                        text="Prior regulation article",
+                        retrieval_text="Prior regulation article",
+                        metadata={"regulation_status": "approved"},
+                    )
+                ],
+                [],
+            )
+
+            sync_results = [
+                RuntimeError("simulated prior vector failure"),
+                {"status": "indexed", "record_count": 1},
+            ]
+            with patch.object(
+                routes_documents,
+                "_sync_vector_index_after_review_change",
+                side_effect=sync_results,
+            ) as sync_mock:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Prior regulation vector synchronization failed",
+                ):
+                    routes_documents._automatically_supersede_prior_version(
+                        settings=settings,
+                        repository=repository,
+                        document=revision,
+                        auth=_auth_context(),
+                    )
+
+                after_failure = repository.get_document(prior.document_id)
+                self.assertEqual("superseded", after_failure.regulation_status)
+                self.assertEqual("2025-12-31", after_failure.effective_to)
+
+                # Reproduce data written by the former inclusive-boundary bug.
+                repository.upsert_document(
+                    after_failure.model_copy(update={"effective_to": "2026-01-01"})
+                )
+                overlapped_chunks = repository.get_chunks(prior.document_id)
+                for chunk in overlapped_chunks:
+                    chunk.metadata["effective_to"] = "2026-01-01"
+                repository.save_chunks(prior.document_id, overlapped_chunks)
+
+                retry_event = (
+                    routes_documents._automatically_supersede_prior_version(
+                        settings=settings,
+                        repository=repository,
+                        document=revision,
+                        auth=_auth_context(),
+                    )
+                )
+                already_complete = (
+                    routes_documents._automatically_supersede_prior_version(
+                        settings=settings,
+                        repository=repository,
+                        document=revision,
+                        auth=_auth_context(),
+                    )
+                )
+
+            stored_prior = repository.get_document(prior.document_id)
+            stored_chunks = repository.get_chunks(prior.document_id)
+            events = [
+                event
+                for event in repository.list_maintenance_events()
+                if event.get("document_id") == prior.document_id
+                and event.get("new_document_id") == revision.document_id
+            ]
+
+        self.assertEqual(2, sync_mock.call_count)
+        self.assertTrue(retry_event["retry"])
+        self.assertEqual("completed", retry_event["outcome"])
+        self.assertEqual("already_superseded", already_complete["status"])
+        self.assertEqual("2025-12-31", stored_prior.effective_to)
+        self.assertEqual(
+            {"2025-12-31"},
+            {chunk.metadata.get("effective_to") for chunk in stored_chunks},
+        )
+        self.assertEqual(
+            ["failed_reindex_required", "completed"],
+            [event["outcome"] for event in events],
+        )
+
+    def test_automatic_supersede_retries_when_completion_evidence_was_not_written(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior-missing-evidence",
+                filename="prior.pdf",
+                file_type="pdf",
+                file_hash="hash-prior-missing-evidence",
+                profile_id="institution-a",
+                regulation_id="reg-missing-evidence",
+                regulation_version="v1",
+                effective_from="2025-01-01",
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            revision = Document(
+                document_id="doc-revision-missing-evidence",
+                filename="revision.pdf",
+                file_type="pdf",
+                file_hash="hash-revision-missing-evidence",
+                profile_id="institution-a",
+                regulation_id="reg-missing-evidence",
+                regulation_version="v2",
+                effective_from="2026-01-01",
+                regulation_status="approved",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+            original_append = repository.append_maintenance_event
+            append_attempts = 0
+
+            def fail_first_completion_event(event):
+                nonlocal append_attempts
+                append_attempts += 1
+                if append_attempts == 1:
+                    raise OSError("simulated completion evidence interruption")
+                return original_append(event)
+
+            with patch.object(
+                routes_documents,
+                "_sync_vector_index_after_review_change",
+                return_value={"status": "indexed", "record_count": 1},
+            ) as sync_mock, patch.object(
+                repository,
+                "append_maintenance_event",
+                side_effect=fail_first_completion_event,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "completion evidence interruption",
+                ):
+                    routes_documents._automatically_supersede_prior_version(
+                        settings=settings,
+                        repository=repository,
+                        document=revision,
+                        auth=_auth_context(),
+                    )
+                self.assertEqual(
+                    "superseded",
+                    repository.get_document(prior.document_id).regulation_status,
+                )
+                retry_event = (
+                    routes_documents._automatically_supersede_prior_version(
+                        settings=settings,
+                        repository=repository,
+                        document=revision,
+                        auth=_auth_context(),
+                    )
+                )
+
+            events = [
+                event
+                for event in repository.list_maintenance_events()
+                if event.get("new_document_id") == revision.document_id
+            ]
+
+        self.assertEqual(2, sync_mock.call_count)
+        self.assertTrue(retry_event["retry"])
+        self.assertEqual("completed", retry_event["outcome"])
+        self.assertEqual(1, len(events))
+        self.assertEqual("completed", events[0]["outcome"])
+
+    def test_revision_approval_endpoint_retries_prior_sync_after_partial_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior-endpoint-retry",
+                filename="prior.pdf",
+                file_type="pdf",
+                file_hash="hash-prior-endpoint-retry",
+                profile_id="institution-a",
+                regulation_id="reg-endpoint-retry",
+                regulation_version="v1",
+                effective_from="2025-01-01",
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            revision = Document(
+                document_id="doc-revision-endpoint-retry",
+                filename="revision.pdf",
+                file_type="pdf",
+                file_hash="hash-revision-endpoint-retry",
+                profile_id="institution-a",
+                regulation_id="reg-endpoint-retry",
+                regulation_version="v2",
+                effective_from="2026-01-01",
+                regulation_status="pending_approval",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+            repository.upsert_document(revision)
+            repository.save_processing_result(
+                revision.document_id,
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-revision-endpoint-retry",
+                        document_id=revision.document_id,
+                        chunk_type="article",
+                        text="Revision article",
+                        retrieval_text="Revision article",
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id=revision.document_id,
+                chunks=repository.get_chunks(revision.document_id),
+            )
+            sync_calls: list[str] = []
+            prior_sync_attempts = 0
+
+            def sync_with_one_prior_failure(**kwargs):
+                nonlocal prior_sync_attempts
+                sync_document_id = str(kwargs["document_id"])
+                sync_calls.append(sync_document_id)
+                if sync_document_id == prior.document_id:
+                    prior_sync_attempts += 1
+                    if prior_sync_attempts == 1:
+                        raise RuntimeError("simulated prior endpoint sync failure")
+                return {"status": "indexed", "record_count": 1}
+
+            with patch.object(
+                routes_documents,
+                "get_settings",
+                return_value=settings,
+            ), patch.object(
+                routes_documents,
+                "_sync_vector_index_after_review_change",
+                side_effect=sync_with_one_prior_failure,
+            ):
+                with self.assertRaises(HTTPException) as first_failure:
+                    routes_documents.approve_review_chunks(
+                        revision.document_id,
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-revision-endpoint-retry"],
+                            approval_id="approval-endpoint-retry-1",
+                            security_level="internal",
+                            **evidence,
+                        ),
+                        _auth_context(),
+                    )
+                response = routes_documents.approve_review_chunks(
+                    revision.document_id,
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-revision-endpoint-retry"],
+                        approval_id="approval-endpoint-retry-2",
+                        security_level="internal",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+
+            stored_prior = repository.get_document(prior.document_id)
+            approval_records = repository.list_approval_records(
+                revision.document_id
+            )
+
+        self.assertEqual(500, first_failure.exception.status_code)
+        self.assertEqual(
+            [
+                revision.document_id,
+                prior.document_id,
+                prior.document_id,
+            ],
+            sync_calls,
+        )
+        self.assertEqual("superseded", stored_prior.regulation_status)
+        self.assertEqual("2025-12-31", stored_prior.effective_to)
+        self.assertEqual(1, len(approval_records))
+        self.assertTrue(response["recovery_retry"])
+        self.assertTrue(response["automatic_supersede_event"]["retry"])
+        self.assertEqual(
+            "completed",
+            response["automatic_supersede_event"]["outcome"],
+        )
+
+    def test_committed_revision_retry_requires_completed_revision_vector_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            revision = Document(
+                document_id="doc-revision-retry-gate",
+                filename="revision.pdf",
+                file_type="pdf",
+                file_hash="hash-revision-retry-gate",
+                profile_id="institution-a",
+                regulation_id="reg-retry-gate",
+                regulation_version="v2",
+                effective_from="2026-01-01",
+                regulation_status="approved",
+                supersedes_document_id="doc-prior-retry-gate",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            chunk = Chunk(
+                chunk_id="chunk-revision-retry-gate",
+                document_id=revision.document_id,
+                chunk_type="article",
+                text="Approved revision",
+                approval_status="approved",
+                approval_id="approval-retry-gate",
+            )
+            repository.upsert_document(revision)
+            repository.save_processing_result(
+                revision.document_id,
+                [],
+                [chunk],
+                [],
+            )
+            approval_record = {
+                "approval_record_id": "approval-record-retry-gate",
+                "approval_id": "approval-retry-gate",
+                "document_id": revision.document_id,
+                "chunk_ids": [chunk.chunk_id],
+                "tenant_id": "tenant-a",
+                "approved_at": "2026-01-01T00:00:00Z",
+            }
+            repository.append_approval_record(approval_record)
+
+            missing = routes_documents._committed_revision_retry_context(
+                repository=repository,
+                document=revision,
+                chunks=[chunk],
+                requested_ids={chunk.chunk_id},
+                auth=_auth_context(),
+            )
+            repository.append_maintenance_event(
+                {
+                    "event_id": "revision-vector-retry-gate",
+                    "event_type": "approval_vector_sync_outcome",
+                    "created_at": "2026-01-01T00:00:01Z",
+                    "document_id": revision.document_id,
+                    "approval_record_id": "approval-record-retry-gate",
+                    "outcome": "completed",
+                    "vector_sync": {
+                        "status": "indexed",
+                        "reindex_required": False,
+                    },
+                }
+            )
+            ready = routes_documents._committed_revision_retry_context(
+                repository=repository,
+                document=revision,
+                chunks=[chunk],
+                requested_ids={chunk.chunk_id},
+                auth=_auth_context(),
+            )
+
+        self.assertIsNone(missing)
+        self.assertIsNotNone(ready)
+        self.assertEqual(
+            "approval-record-retry-gate",
+            ready[0]["approval_record_id"],
+        )
+
+    def test_automatic_supersede_defers_when_versions_start_on_same_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior-same-day",
+                filename="prior.pdf",
+                file_type="pdf",
+                file_hash="hash-prior-same-day",
+                profile_id="institution-a",
+                regulation_id="reg-same-day",
+                regulation_version="v1",
+                effective_from="2026-01-01",
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            revision = Document(
+                document_id="doc-revision-same-day",
+                filename="revision.pdf",
+                file_type="pdf",
+                file_hash="hash-revision-same-day",
+                profile_id="institution-a",
+                regulation_id="reg-same-day",
+                regulation_version="v2",
+                effective_from="2026-01-01",
+                regulation_status="approved",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+            event = routes_documents._automatically_supersede_prior_version(
+                settings=settings,
+                repository=repository,
+                document=revision,
+                auth=_auth_context(),
+            )
+
+            stored_prior = repository.get_document(prior.document_id)
+
+        self.assertEqual("deferred_nonsequential_effective_date", event["status"])
+        self.assertEqual("approved", stored_prior.regulation_status)
+        self.assertIsNone(stored_prior.effective_to)
+
+    def test_automatic_supersede_uses_safe_fallback_for_missing_prior_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior-missing-date",
+                filename="prior.pdf",
+                file_type="pdf",
+                file_hash="hash-prior-missing-date",
+                profile_id="institution-a",
+                regulation_id="reg-missing-date",
+                regulation_version="v1",
+                effective_from=None,
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+                created_at="2025-01-01T00:00:00Z",
+            )
+            revision = Document(
+                document_id="doc-revision-missing-date",
+                filename="revision.pdf",
+                file_type="pdf",
+                file_hash="hash-revision-missing-date",
+                profile_id="institution-a",
+                regulation_id="reg-missing-date",
+                regulation_version="v2",
+                effective_from="2026-01-01",
+                regulation_status="approved",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+            event = routes_documents._automatically_supersede_prior_version(
+                settings=settings,
+                repository=repository,
+                document=revision,
+                auth=_auth_context(),
+            )
+
+            stored_prior = repository.get_document(prior.document_id)
+
+        self.assertEqual("completed", event["outcome"])
+        self.assertEqual("2025-01-01", stored_prior.effective_from)
+        self.assertEqual("2025-12-31", stored_prior.effective_to)
+
+    def test_automatic_supersede_uses_non_overlapping_calendar_boundaries(self) -> None:
+        for effective_from, expected_prior_end in (
+            ("2024-03-01", "2024-02-29"),
+            ("2026-01-01", "2025-12-31"),
+        ):
+            with self.subTest(effective_from=effective_from), tempfile.TemporaryDirectory() as tmp:
+                settings = Settings(data_dir=Path(tmp))
+                repository = JsonRepository(settings)
+                prior = Document(
+                    document_id="doc-prior-calendar",
+                    filename="prior.pdf",
+                    file_type="pdf",
+                    file_hash="hash-prior-calendar",
+                    profile_id="institution-a",
+                    regulation_id="reg-calendar",
+                    regulation_version="v1",
+                    effective_from="2020-01-01",
+                    regulation_status="approved",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+                revision = Document(
+                    document_id="doc-revision-calendar",
+                    filename="revision.pdf",
+                    file_type="pdf",
+                    file_hash="hash-revision-calendar",
+                    profile_id="institution-a",
+                    regulation_id="reg-calendar",
+                    regulation_version="v2",
+                    effective_from=effective_from,
+                    regulation_status="approved",
+                    supersedes_document_id=prior.document_id,
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+                repository.upsert_document(prior)
+                event = routes_documents._automatically_supersede_prior_version(
+                    settings=settings,
+                    repository=repository,
+                    document=revision,
+                    auth=_auth_context(),
+                )
+                stored_prior = repository.get_document(prior.document_id)
+
+                self.assertEqual("completed", event["outcome"])
+                self.assertEqual(expected_prior_end, stored_prior.effective_to)
+                self.assertLess(stored_prior.effective_to, revision.effective_from)
+
+    def test_automatic_supersede_rejects_invalid_date_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            prior = Document(
+                document_id="doc-prior-invalid-date",
+                filename="prior.pdf",
+                file_type="pdf",
+                file_hash="hash-prior-invalid-date",
+                profile_id="institution-a",
+                regulation_id="reg-invalid-date",
+                regulation_version="v1",
+                effective_from="2025-01-01",
+                regulation_status="approved",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            revision = Document(
+                document_id="doc-revision-invalid-date",
+                filename="revision.pdf",
+                file_type="pdf",
+                file_hash="hash-revision-invalid-date",
+                profile_id="institution-a",
+                regulation_id="reg-invalid-date",
+                regulation_version="v2",
+                effective_from="not-a-date",
+                regulation_status="approved",
+                supersedes_document_id=prior.document_id,
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            repository.upsert_document(prior)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "valid effective_from",
+            ):
+                routes_documents._automatically_supersede_prior_version(
+                    settings=settings,
+                    repository=repository,
+                    document=revision,
+                    auth=_auth_context(),
+                )
+
+            stored_prior = repository.get_document(prior.document_id)
+
+        self.assertEqual("approved", stored_prior.regulation_status)
+        self.assertIsNone(stored_prior.effective_to)
+
+    def test_index_documents_batch_writes_shared_store_once_and_records_each_document(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            auth = _auth_context()
+            document_ids = ["doc-batch-a", "doc-batch-b"]
+            for document_id in document_ids:
+                repository.upsert_document(
+                    Document(
+                        document_id=document_id,
+                        filename=f"{document_id}.pdf",
+                        document_name=document_id,
+                        file_type="pdf",
+                        file_hash=f"hash-{document_id}",
+                        tenant_id="tenant-a",
+                        status="completed",
+                    )
+                )
+                repository.save_processing_result(
+                    document_id,
+                    [],
+                    [
+                        Chunk(
+                            chunk_id=f"chunk-{document_id}",
+                            document_id=document_id,
+                            chunk_type="article",
+                            text=f"{document_id} 승인 조문",
+                            retrieval_text=f"{document_id} 승인 조문",
+                        )
+                    ],
+                    [],
+                )
+                evidence = _write_approval_evidence(
+                    root,
+                    settings=settings,
+                    document_id=document_id,
+                    chunks=repository.get_chunks(document_id),
+                )
+                with patch.object(routes_documents, "get_settings", return_value=settings):
+                    routes_documents.approve_review_chunks(
+                        document_id,
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=[f"chunk-{document_id}"],
+                            approval_id=f"approval-{document_id}",
+                            security_level="internal",
+                            **evidence,
+                        ),
+                        auth,
+                    )
+
+            progress: list[tuple[int, str, int | None, int | None]] = []
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                response = routes_documents.index_documents_batch(
+                    document_ids,
+                    routes_documents.IndexRequest(
+                        target_type="local-jsonl",
+                        embedding_dimensions=8,
+                    ),
+                    auth,
+                    progress_callback=lambda *values: progress.append(values),
+                )
+
+            vector_path = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            stored = [
+                json.loads(line)
+                for line in vector_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            jobs = {
+                document_id: repository.list_indexing_jobs(document_id)
+                for document_id in document_ids
+            }
+
+        self.assertEqual("indexed", response["status"])
+        self.assertEqual(2, response["document_count"])
+        self.assertEqual(2, response["record_count"])
+        self.assertEqual(1, response["upsert_summary"]["full_store_write_count"])
+        self.assertEqual(2, len(stored))
+        self.assertEqual({document_id for document_id in document_ids}, {row["document_id"] for row in stored})
+        self.assertEqual({"batch_index"}, {rows[-1]["action"] for rows in jobs.values()})
+        self.assertEqual((100, "규정 일괄 색인 완료", 5, 5), progress[-1])
+        self.assertNotIn("target_path", response["upsert_summary"])
+        self.assertNotIn("bm25_index_path", response["upsert_summary"])
 
     def test_approve_review_chunks_persists_approval_screen_review_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

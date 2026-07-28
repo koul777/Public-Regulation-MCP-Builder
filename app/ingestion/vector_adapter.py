@@ -9,7 +9,14 @@ from typing import Any, Iterable
 
 
 VECTOR_RECORD_SCHEMA_VERSION = "reg-rag-vector-record-v1"
-VECTOR_RECORD_VERIFICATION_VERSION = "reg-rag-vector-verification-v1"
+VECTOR_RECORD_VERIFICATION_VERSION_V1 = "reg-rag-vector-verification-v1"
+VECTOR_RECORD_VERIFICATION_VERSION = "reg-rag-vector-verification-v2"
+SUPPORTED_VECTOR_RECORD_VERIFICATION_VERSIONS = {
+    VECTOR_RECORD_VERIFICATION_VERSION_V1,
+    VECTOR_RECORD_VERIFICATION_VERSION,
+}
+VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION = "reg-rag-vector-metadata-semantic-v1"
+VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION = "reg-rag-vector-record-semantic-v1"
 APPROVED_CHUNK_STATUS = "approved"
 ALLOWED_SECURITY_LEVELS = {"public", "internal", "sensitive", "confidential"}
 APPROVAL_PROVENANCE_METADATA_FIELDS = (
@@ -67,6 +74,14 @@ VECTOR_METADATA_FIELDS = (
     "paragraph_no",
     "paragraph_label",
     "item_no",
+    "subitem_no",
+    "structural_child_count_source",
+    "paragraph_unit_count",
+    "item_unit_count",
+    "subitem_unit_count",
+    "paragraph_item_unit_count",
+    "paragraph_item_traceable_unit_count",
+    "paragraph_item_unit_sample",
     "references",
     "article_refs",
     "internal_regulation_refs",
@@ -285,6 +300,8 @@ def public_vector_metadata(
     metadata: dict[str, Any] = {}
     for field in metadata_fields:
         value = _chunk_value(chunk, field)
+        if field == "paragraph_item_unit_sample":
+            value = _public_structural_child_sample(value)
         preserve_optional_lifecycle_field = field in {"effective_to", "repealed_at"}
         if value is None and not preserve_optional_lifecycle_field:
             continue
@@ -293,6 +310,23 @@ def public_vector_metadata(
             continue
         metadata[field] = value
     return _normalize_public_lifecycle_metadata(chunk, metadata)
+
+
+def _public_structural_child_sample(value: Any) -> list[dict[str, str]]:
+    """Keep only the structural fields needed for exact child-locator resolution."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        node_type = str(item.get("node_type") or "").strip().casefold()
+        number = str(item.get("number") or "").strip()
+        if node_type not in {"paragraph", "item", "subitem"} or not number:
+            continue
+        result.append({"node_type": node_type, "number": number})
+    return result
 
 
 def build_vector_records(
@@ -458,13 +492,77 @@ def approval_provenance_issue_fields(chunk: dict[str, Any]) -> list[str]:
 
 def with_vector_record_verification(record: dict[str, Any], *, verified_at: str | None = None) -> dict[str, Any]:
     stamped = dict(record)
+    metadata = stamped.get("metadata") if isinstance(stamped.get("metadata"), dict) else {}
+    stamped["content_hash"] = stable_content_hash(str(stamped.get("text") or ""), metadata)
+    stamped["metadata_semantic_fingerprint_version"] = VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION
+    stamped["metadata_semantic_fingerprint"] = vector_metadata_semantic_fingerprint(metadata)
+    stamped["record_semantic_fingerprint_version"] = VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION
+    stamped["record_semantic_fingerprint"] = vector_record_semantic_fingerprint(stamped)
     stamped["verification_version"] = VECTOR_RECORD_VERIFICATION_VERSION
-    stamped["verification_hash"] = vector_record_verification_hash(record)
+    stamped["verification_hash"] = vector_record_verification_hash(stamped)
     stamped["verified_at"] = verified_at or datetime.now(timezone.utc).isoformat()
     return stamped
 
 
 def vector_record_verification_hash(record: dict[str, Any]) -> str:
+    verification_version = str(record.get("verification_version") or VECTOR_RECORD_VERIFICATION_VERSION)
+    if verification_version == VECTOR_RECORD_VERIFICATION_VERSION_V1:
+        return _legacy_vector_record_verification_hash(record)
+    if verification_version != VECTOR_RECORD_VERIFICATION_VERSION:
+        raise ValueError(f"Unsupported vector verification version: {verification_version}")
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    payload = {
+        "verification_version": VECTOR_RECORD_VERIFICATION_VERSION,
+        "id": str(record.get("id") or ""),
+        "document_id": str(record.get("document_id") or metadata.get("document_id") or ""),
+        "chunk_id": str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
+        "tenant_id": str(record.get("tenant_id") or metadata.get("tenant_id") or ""),
+        "content_hash": str(record.get("content_hash") or ""),
+        "metadata_semantic_fingerprint_version": str(
+            record.get("metadata_semantic_fingerprint_version") or ""
+        ),
+        "metadata_semantic_fingerprint": str(record.get("metadata_semantic_fingerprint") or ""),
+        "record_semantic_fingerprint_version": str(
+            record.get("record_semantic_fingerprint_version") or ""
+        ),
+        "record_semantic_fingerprint": str(record.get("record_semantic_fingerprint") or ""),
+    }
+    return _stable_payload_hash(payload)
+
+
+def vector_metadata_semantic_fingerprint(metadata: dict[str, Any]) -> str:
+    """Hash every public metadata field used by retrieval, lifecycle, and authorization."""
+
+    payload = {
+        "version": VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION,
+        "metadata": metadata,
+    }
+    return _stable_payload_hash(payload)
+
+
+def vector_record_semantic_fingerprint(record: dict[str, Any]) -> str:
+    """Hash retrieval-visible record identity, text, and the complete metadata payload.
+
+    Embedding model/vector semantics are intentionally tracked separately by the
+    vector target so embedding an already verified provider-neutral record does
+    not invalidate this source-record fingerprint.
+    """
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    payload = {
+        "version": VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION,
+        "id": str(record.get("id") or ""),
+        "document_id": str(record.get("document_id") or ""),
+        "chunk_id": str(record.get("chunk_id") or ""),
+        "tenant_id": str(record.get("tenant_id") or ""),
+        "text": str(record.get("text") or ""),
+        "metadata_semantic_fingerprint": vector_metadata_semantic_fingerprint(metadata),
+    }
+    return _stable_payload_hash(payload)
+
+
+def _legacy_vector_record_verification_hash(record: dict[str, Any]) -> str:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     payload = {
         "id": str(record.get("id") or ""),
@@ -478,7 +576,17 @@ def vector_record_verification_hash(record: dict[str, Any]) -> str:
         "security_level": str(metadata.get("security_level") or "").strip().lower(),
         "department_acl": _stable_list(metadata.get("department_acl")),
     }
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return _stable_payload_hash(payload)
+
+
+def _stable_payload_hash(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def chunk_approval_status(chunk: dict[str, Any]) -> str:

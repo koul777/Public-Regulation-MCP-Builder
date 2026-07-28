@@ -38,11 +38,16 @@ from app.services.regulation_catalog_service import (
 )
 from app.retrieval.tokenizer import tokenize
 from app.retrieval.hierarchical_index import (
+    HIERARCHICAL_INDEX_SCHEMA_VERSION,
+    fully_visible_regulation_unit_ids,
     hierarchical_index_path,
     index_summary as hierarchical_index_summary,
     list_indexed_regulations,
     load_article_records as load_hierarchical_article_records,
     load_record_by_chunk as load_hierarchical_record_by_chunk,
+    page_indexed_regulations,
+    page_reference_cycles,
+    regulation_references as load_regulation_references,
     regulation_toc as load_regulation_toc,
     search_hierarchical_records,
 )
@@ -376,6 +381,11 @@ def search_regulations(
         if str(result.get("profile_id") or "").strip()
     }
     resolved_profile_id = profile_id or (next(iter(result_profiles)) if len(result_profiles) == 1 else None)
+    candidate_regulations = [
+        public
+        for candidate in (trace.get("candidate_regulations") or [])
+        if (public := _public_search_candidate_regulation(candidate)) is not None
+    ]
     metadata = {
         "trace_id": trace["trace_id"],
         "tenant_id": auth.tenant_id,
@@ -386,7 +396,7 @@ def search_regulations(
         "timing_ms": trace.get("timing_ms") or {},
         "lifecycle_selection": trace.get("lifecycle_selection") or {},
         "retrieval_strategy": trace.get("retrieval_strategy") or "flat_rag",
-        "candidate_regulations": trace.get("candidate_regulations") or [],
+        "candidate_regulations": candidate_regulations,
         "answer_guidance": MCP_ANSWER_GROUNDING_GUIDANCE,
     }
     if relevance_guard["refused"]:
@@ -564,6 +574,14 @@ def _search_hierarchical_runtime(
     if paths is None:
         return None
     started_at = time.perf_counter()
+    allowed_unit_ids = _fully_visible_regulation_units(
+        settings=settings,
+        auth=auth,
+        profile_id=str(query.profile_id or "").strip() or None,
+        index_path=paths[0],
+        security_levels=query.security_levels,
+        department_ids=query.department_ids,
+    )
     scored, retrieval = search_hierarchical_records(
         paths[0],
         paths[1],
@@ -572,6 +590,7 @@ def _search_hierarchical_runtime(
         profile_id=str(query.profile_id or "").strip() or None,
         document_id=str(query.document_id or "").strip() or None,
         as_of_date=str(query.as_of_date or "").strip() or None,
+        allowed_unit_ids=allowed_unit_ids,
     )
     visible_scored = [
         (score, record)
@@ -654,7 +673,7 @@ def _verified_hierarchical_runtime_paths(
         summary = hierarchical_index_summary(index_path)
         valid = bool(
             summary
-            and str(summary.get("schema_version") or "") == "reg-rag-hierarchical-index-v1"
+            and str(summary.get("schema_version") or "") == HIERARCHICAL_INDEX_SCHEMA_VERSION
             and str(summary.get("tenant_id") or "") == str(auth.tenant_id or "")
             and (not manifest_profile or str(summary.get("profile_id") or "").casefold() == manifest_profile.casefold())
         )
@@ -727,6 +746,11 @@ def warm_mcp_runtime(*, settings: Settings, auth: AuthContext) -> dict[str, Any]
             "regulation_count": summary.get("regulation_count"),
             "regulation_version_count": summary.get("regulation_version_count"),
             "toc_node_count": summary.get("toc_node_count"),
+            "reference_edge_count": summary.get("reference_edge_count"),
+            "resolved_reference_edge_count": summary.get("resolved_reference_edge_count"),
+            "unresolved_reference_edge_count": summary.get("unresolved_reference_edge_count"),
+            "ambiguous_reference_edge_count": summary.get("ambiguous_reference_edge_count"),
+            "reference_cycle_count": summary.get("reference_cycle_count"),
             "hierarchical_index_ready": True,
             # Hierarchical runtime search is the active retrieval path. Keep
             # BM25 readiness visible for diagnostics when the bundle also
@@ -944,12 +968,7 @@ def list_regulations(
     page_size: int = 50,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """List unique approved regulation titles from the generated catalog.
-
-    The hierarchy index stores one row per regulation version and many chunks
-    can point to the same row. This public operation deliberately collapses
-    those rows by ``regulation_title`` before applying pagination.
-    """
+    """List unique approved regulations from the generated catalog."""
     normalized_page = max(1, int(page))
     normalized_page_size = max(1, min(int(page_size), 100))
     if limit is not None:
@@ -977,51 +996,52 @@ def list_regulations(
                 "message": "Regenerate the institution MCP bundle to create the regulation catalog.",
             },
         }
-    indexed_rows = list_indexed_regulations(
+    allowed_unit_ids = _fully_visible_regulation_units(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+        index_path=paths[0],
+    )
+    indexed_rows, total_count = page_indexed_regulations(
         paths[0],
         profile_id=resolved_profile,
         query=query,
         include_history=include_history,
-        limit=100_000,
+        page=normalized_page,
+        page_size=normalized_page_size,
+        allowed_unit_ids=allowed_unit_ids,
     )
-    unique_by_title: dict[str, dict[str, Any]] = {}
-    unique_ranks: dict[str, tuple[bool, str, str, str]] = {}
+    regulations: list[dict[str, Any]] = []
     for row in indexed_rows:
-        if str(row.get("status") or "").strip().casefold() != "approved":
+        lifecycle_status = str(row.get("status") or "").strip().casefold()
+        allowed_statuses = (
+            {"approved", "superseded", "repealed"}
+            if include_history
+            else {"approved", "superseded"}
+        )
+        if lifecycle_status not in allowed_statuses:
             continue
         title = str(row.get("regulation_title") or "").strip()
         if not title:
             continue
-        title_key = re.sub(r"\s+", " ", title).casefold()
-        candidate = {
-            "regulation_title": title,
-            "regulation_category": _regulation_category(title, row.get("regulation_category")),
-            "regulation_no": str(row.get("regulation_no") or ""),
-            "regulation_unit_id": str(row.get("regulation_unit_id") or ""),
-            "version": str(row.get("version") or ""),
-            "revision_date": str(row.get("revision_date") or ""),
-            "effective_from": str(row.get("effective_from") or ""),
-            "effective_to": str(row.get("effective_to") or ""),
-            "status": "approved",
-            "document_id": str(row.get("document_id") or ""),
-        }
-        candidate_rank = (
-            bool(row.get("is_current")),
-            candidate["revision_date"],
-            candidate["effective_from"],
-            candidate["version"],
+        regulations.append(
+            {
+                "regulation_title": title,
+                "regulation_category": _regulation_category(title, row.get("regulation_category")),
+                "regulation_no": str(row.get("regulation_no") or ""),
+                # Opaque catalog identifier used only to request hierarchy or
+                # an exact article. It does not expose tenant/profile/document
+                # storage identities.
+                "regulation_unit_id": str(row.get("regulation_unit_id") or ""),
+                "version": str(row.get("version") or ""),
+                "revision_date": str(row.get("revision_date") or ""),
+                "effective_from": str(row.get("effective_from") or ""),
+                "effective_to": str(row.get("effective_to") or ""),
+                "status": lifecycle_status,
+            }
         )
-        if title_key not in unique_by_title or candidate_rank > unique_ranks[title_key]:
-            unique_ranks[title_key] = candidate_rank
-            unique_by_title[title_key] = candidate
-    regulations = sorted(
-        unique_by_title.values(),
-        key=lambda item: (str(item["regulation_title"]).casefold(), str(item["regulation_title"])),
-    )
-    total_count = len(regulations)
     start = (normalized_page - 1) * normalized_page_size
-    page_items = regulations[start : start + normalized_page_size]
-    next_cursor = str(normalized_page + 1) if start + normalized_page_size < total_count else None
+    next_cursor = str(normalized_page + 1) if start + len(regulations) < total_count else None
     audit_api_event(
         settings,
         auth,
@@ -1030,23 +1050,26 @@ def list_regulations(
         status_code=200,
         resource_type="mcp",
         detail=(
-            f"result_count={len(page_items)} total_count={total_count} "
+            f"result_count={len(regulations)} total_count={total_count} "
             f"page={normalized_page} page_size={normalized_page_size} include_history={include_history}"
         ),
     )
     return {
-        "regulations": page_items,
+        "regulations": regulations,
         "total_count": total_count,
         "page": normalized_page,
         "page_size": normalized_page_size,
         "next_cursor": next_cursor,
         "metadata": {
             "hierarchical_index_ready": True,
-            "profile_id": resolved_profile,
-            "result_count": len(page_items),
+            "result_count": len(regulations),
             "total_count": total_count,
-            "approved_only": True,
-            "unique_by": "regulation_title",
+            "approved_sources_only": True,
+            "unique_by": (
+                "regulation_version"
+                if include_history
+                else "regulation_identity_with_title_display"
+            ),
         },
     }
 
@@ -1091,6 +1114,14 @@ def get_regulation_toc(
     )
     if paths is None:
         raise ValueError("The hierarchical regulation index is not available. Regenerate the MCP bundle.")
+    allowed_unit_ids = _fully_visible_regulation_units(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+        index_path=paths[0],
+    )
+    if requested_unit_id not in allowed_unit_ids:
+        raise ValueError("The requested regulation is not available in the caller's security scope.")
     result = load_regulation_toc(
         paths[0],
         regulation_unit_id=requested_unit_id,
@@ -1100,6 +1131,45 @@ def get_regulation_toc(
     regulation = result.get("regulation") if isinstance(result.get("regulation"), dict) else None
     if regulation and resolved_profile and str(regulation.get("profile_id") or "").casefold() != resolved_profile.casefold():
         raise ValueError("The requested regulation is outside the selected institution profile.")
+    public_regulation = (
+        {
+            key: regulation.get(key)
+            for key in (
+                "regulation_unit_id",
+                "institution_name",
+                "regulation_no",
+                "regulation_title",
+                "version",
+                "revision_date",
+                "effective_from",
+                "effective_to",
+                "status",
+                "is_current",
+                "chunk_count",
+                "version_count",
+            )
+        }
+        if regulation
+        else None
+    )
+    public_nodes = [
+        {
+            key: node.get(key)
+            for key in (
+                "node_id",
+                "parent_id",
+                "node_type",
+                "label",
+                "number",
+                "title",
+                "depth",
+                "order_index",
+                "hierarchy_path",
+            )
+        }
+        for node in (result.get("nodes") or [])
+        if isinstance(node, dict)
+    ]
     audit_api_event(
         settings,
         auth,
@@ -1107,14 +1177,320 @@ def get_regulation_toc(
         outcome="success",
         status_code=200,
         resource_type="mcp",
-        detail=f"regulation_unit_id={requested_unit_id} node_count={len(result.get('nodes') or [])}",
+        detail=f"regulation_unit_id={requested_unit_id} node_count={len(public_nodes)}",
     )
-    result["metadata"] = {
-        "hierarchical_index_ready": True,
-        "as_of_date": normalized_as_of,
-        "node_count": len(result.get("nodes") or []),
+    return {
+        "regulation": public_regulation,
+        "nodes": public_nodes,
+        "metadata": {
+            "hierarchical_index_ready": True,
+            "as_of_date": normalized_as_of,
+            "node_count": len(public_nodes),
+        },
     }
-    return result
+
+
+def get_regulation_references(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    regulation_unit_id: str,
+    profile_id: str | None = None,
+    direction: str = "both",
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    """Return outgoing/incoming current-corpus regulation references."""
+
+    requested_unit_id = require_bounded_text(
+        regulation_unit_id,
+        field_name="regulation_unit_id",
+        max_chars=MAX_MCP_IDENTIFIER_CHARS,
+    )
+    resolved_profile = _require_unambiguous_profile_scope(
+        settings=settings,
+        auth=auth,
+        profile_id=profile_id,
+        inspect_vector_records=False,
+    )
+    paths = _verified_hierarchical_runtime_paths(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+    )
+    if paths is None:
+        raise ValueError("The hierarchical regulation index is not available. Regenerate the MCP bundle.")
+    allowed_unit_ids = _fully_visible_regulation_units(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+        index_path=paths[0],
+    )
+    if requested_unit_id not in allowed_unit_ids:
+        raise ValueError("The requested regulation is not available in the caller's security scope.")
+    result = load_regulation_references(
+        paths[0],
+        regulation_unit_id=requested_unit_id,
+        direction=direction,
+        status=status,
+        page=page,
+        page_size=page_size,
+        allowed_unit_ids=allowed_unit_ids,
+    )
+    regulation = result.get("regulation") if isinstance(result.get("regulation"), dict) else None
+    if (
+        regulation
+        and resolved_profile
+        and str(regulation.get("profile_id") or "").casefold() != resolved_profile.casefold()
+    ):
+        raise ValueError("The requested regulation is outside the selected institution profile.")
+    public_references = [
+        _public_regulation_reference(edge)
+        for edge in (result.get("references") or [])
+        if isinstance(edge, dict)
+    ]
+    public_cycles = [
+        _public_reference_cycle(cycle)
+        for cycle in (result.get("cycles") or [])
+        if isinstance(cycle, dict)
+    ]
+    total_count = int(result.get("total_count") or 0)
+    normalized_page = int(result.get("page") or max(1, int(page)))
+    normalized_page_size = int(result.get("page_size") or max(1, min(int(page_size), 100)))
+    next_cursor = (
+        str(normalized_page + 1)
+        if normalized_page * normalized_page_size < total_count
+        else None
+    )
+    audit_api_event(
+        settings,
+        auth,
+        action="mcp.get_regulation_references",
+        outcome="success",
+        status_code=200,
+        resource_type="mcp",
+        detail=(
+            f"regulation_unit_id={requested_unit_id} direction={direction} "
+            f"status={status or 'all'} result_count={len(public_references)} "
+            f"total_count={total_count}"
+        ),
+    )
+    return {
+        "regulation": _public_reference_regulation(regulation),
+        "references": public_references,
+        "cycles": public_cycles,
+        "total_count": total_count,
+        "page": normalized_page,
+        "page_size": normalized_page_size,
+        "next_cursor": next_cursor,
+        "metadata": {
+            "hierarchical_index_ready": True,
+            "approved_current_corpus_only": True,
+            "direction": str(direction or "both").strip().casefold(),
+            "status": str(status or "").strip().casefold() or None,
+            "cycle_count_for_regulation": len(public_cycles),
+        },
+    }
+
+
+def list_regulation_reference_cycles(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    profile_id: str | None = None,
+    regulation_unit_id: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    """List circular references in the approved current regulation graph."""
+
+    requested_unit_id = (
+        require_bounded_text(
+            regulation_unit_id,
+            field_name="regulation_unit_id",
+            max_chars=MAX_MCP_IDENTIFIER_CHARS,
+        )
+        if regulation_unit_id
+        else None
+    )
+    resolved_profile = _require_unambiguous_profile_scope(
+        settings=settings,
+        auth=auth,
+        profile_id=profile_id,
+        inspect_vector_records=False,
+    )
+    paths = _verified_hierarchical_runtime_paths(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+    )
+    normalized_page = max(1, int(page))
+    normalized_page_size = max(1, min(int(page_size), 100))
+    if paths is None:
+        return {
+            "cycles": [],
+            "total_count": 0,
+            "page": normalized_page,
+            "page_size": normalized_page_size,
+            "next_cursor": None,
+            "metadata": {
+                "hierarchical_index_ready": False,
+                "message": "Regenerate the institution MCP bundle to create the regulation reference graph.",
+            },
+        }
+    allowed_unit_ids = _fully_visible_regulation_units(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+        index_path=paths[0],
+    )
+    cycles, total_count = page_reference_cycles(
+        paths[0],
+        profile_id=resolved_profile,
+        regulation_unit_id=requested_unit_id,
+        page=normalized_page,
+        page_size=normalized_page_size,
+        allowed_unit_ids=allowed_unit_ids,
+    )
+    public_cycles = [
+        _public_reference_cycle(cycle)
+        for cycle in cycles
+        if isinstance(cycle, dict)
+    ]
+    next_cursor = (
+        str(normalized_page + 1)
+        if normalized_page * normalized_page_size < total_count
+        else None
+    )
+    audit_api_event(
+        settings,
+        auth,
+        action="mcp.list_regulation_reference_cycles",
+        outcome="success",
+        status_code=200,
+        resource_type="mcp",
+        detail=(
+            f"regulation_unit_id={requested_unit_id or 'all'} "
+            f"result_count={len(public_cycles)} total_count={total_count}"
+        ),
+    )
+    return {
+        "cycles": public_cycles,
+        "total_count": total_count,
+        "page": normalized_page,
+        "page_size": normalized_page_size,
+        "next_cursor": next_cursor,
+        "metadata": {
+            "hierarchical_index_ready": True,
+            "approved_current_corpus_only": True,
+            "cycle_algorithm": "deterministic_tarjan_scc",
+        },
+    }
+
+
+def _public_reference_regulation(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "regulation_unit_id": str(value.get("regulation_unit_id") or value.get("unit_id") or ""),
+        "regulation_no": str(value.get("regulation_no") or ""),
+        "regulation_title": str(value.get("regulation_title") or value.get("title") or ""),
+        "version": str(value.get("version") or value.get("source_version") or ""),
+        "revision_date": str(value.get("revision_date") or ""),
+        "effective_from": str(value.get("effective_from") or ""),
+        "effective_to": str(value.get("effective_to") or ""),
+        "status": str(value.get("status") or "approved"),
+    }
+
+
+def _public_reference_article(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: value.get(key)
+        for key in ("locator", "article", "paragraph", "item", "subitem")
+    }
+
+
+def _public_search_candidate_regulation(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: value.get(key)
+        for key in (
+            "regulation_unit_id",
+            "regulation_no",
+            "regulation_title",
+            "version",
+            "revision_date",
+            "effective_from",
+            "effective_to",
+            "status",
+            "catalog_score",
+        )
+        if value.get(key) is not None
+    }
+
+
+def _public_regulation_reference(edge: dict[str, Any]) -> dict[str, Any]:
+    candidates = edge.get("candidate_units") if isinstance(edge.get("candidate_units"), list) else []
+    target_regulation = _public_reference_regulation(edge.get("target_unit"))
+    if (
+        target_regulation is None
+        and str(edge.get("status") or "").strip().casefold() == "unresolved"
+        and not candidates
+    ):
+        requested_target_title = " ".join(
+            "".join(
+                character
+                for character in str(edge.get("requested_target_title") or "")
+                if ord(character) >= 32 and ord(character) != 127
+            ).split()
+        )[:300]
+        if requested_target_title:
+            target_regulation = {
+                "regulation_title": requested_target_title,
+            }
+    return {
+        "reference_id": str(edge.get("edge_id") or ""),
+        "reference_type": str(edge.get("edge_type") or ""),
+        "status": str(edge.get("status") or ""),
+        "relationship": str(edge.get("relationship") or ""),
+        "reason_codes": [
+            str(item) for item in (edge.get("reason_codes") or []) if str(item).strip()
+        ],
+        "match_types": [
+            str(item) for item in (edge.get("match_types") or []) if str(item).strip()
+        ],
+        "source_regulation": _public_reference_regulation(edge.get("source_unit")),
+        "source_article": _public_reference_article(edge.get("source_article")),
+        "target_regulation": target_regulation,
+        "requested_article": _public_reference_article(edge.get("requested_article")),
+        "target_article": _public_reference_article(edge.get("target_article")),
+        "candidate_regulations": [
+            public
+            for item in candidates
+            if (public := _public_reference_regulation(item)) is not None
+        ],
+        "mention_count": int(edge.get("mention_count") or 0),
+        "evidence_count": int(edge.get("evidence_count") or 0),
+    }
+
+
+def _public_reference_cycle(cycle: dict[str, Any]) -> dict[str, Any]:
+    units = cycle.get("units") if isinstance(cycle.get("units"), list) else []
+    return {
+        "cycle_id": str(cycle.get("cycle_id") or ""),
+        "size": int(cycle.get("size") or 0),
+        "self_loop": bool(cycle.get("self_loop")),
+        "internal_reference_count": int(cycle.get("internal_unit_edge_count") or 0),
+        "regulations": [
+            public
+            for item in units
+            if (public := _public_reference_regulation(item)) is not None
+        ],
+    }
 
 
 def get_regulation_article(
@@ -1161,6 +1537,16 @@ def get_regulation_article(
     )
     if paths is None:
         raise ValueError("The hierarchical regulation index is not available. Regenerate the MCP bundle.")
+    allowed_unit_ids = _fully_visible_regulation_units(
+        settings=settings,
+        auth=auth,
+        profile_id=resolved_profile,
+        index_path=paths[0],
+        security_levels=security_levels,
+        department_ids=department_ids,
+    )
+    if requested_unit_id not in allowed_unit_ids:
+        raise ValueError("The requested regulation is not available in the caller's security scope.")
     records = load_hierarchical_article_records(
         paths[0],
         paths[1],
@@ -2104,6 +2490,11 @@ def get_index_status(
                 "regulation_version_count": hierarchy.get("regulation_version_count"),
                 "toc_node_count": hierarchy.get("toc_node_count"),
                 "record_count": hierarchy.get("record_count"),
+                "reference_edge_count": hierarchy.get("reference_edge_count"),
+                "resolved_reference_edge_count": hierarchy.get("resolved_reference_edge_count"),
+                "unresolved_reference_edge_count": hierarchy.get("unresolved_reference_edge_count"),
+                "ambiguous_reference_edge_count": hierarchy.get("ambiguous_reference_edge_count"),
+                "reference_cycle_count": hierarchy.get("reference_cycle_count"),
             },
         }
     repository = JsonRepository(settings)
@@ -2492,6 +2883,47 @@ def _visible_records(
         repository=repository,
         use_cached_approval_snapshot=use_cached_approval_snapshot,
         latest_only=latest_only,
+    )
+
+
+def _fully_visible_regulation_units(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    profile_id: str | None,
+    index_path: Path,
+    security_levels: list[str] | None = None,
+    department_ids: list[str] | None = None,
+) -> set[str]:
+    """Fail closed when any indexed chunk in a regulation is outside caller scope."""
+
+    visible_records = _visible_records(
+        settings=settings,
+        auth=auth,
+        security_levels=security_levels,
+        department_ids=department_ids,
+        profile_id=profile_id,
+        use_cached_approval_snapshot=True,
+        latest_only=False,
+    )
+    visible_record_keys = {
+        (
+            str(record.get("document_id") or metadata.get("document_id") or ""),
+            str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
+        )
+        for record in visible_records
+        for metadata in [
+            record.get("metadata")
+            if isinstance(record.get("metadata"), dict)
+            else {}
+        ]
+        if str(record.get("document_id") or metadata.get("document_id") or "")
+        and str(record.get("chunk_id") or metadata.get("chunk_id") or "")
+    }
+    return fully_visible_regulation_unit_ids(
+        index_path,
+        visible_record_keys=visible_record_keys,
+        profile_id=profile_id,
     )
 
 

@@ -24,6 +24,8 @@ class McpConnectionContractTests(unittest.TestCase):
                 "list_regulations",
                 "get_regulation_toc",
                 "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
                 "search",
                 "fetch",
             ],

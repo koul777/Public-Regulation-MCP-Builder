@@ -1187,6 +1187,8 @@ class RegulationMcpToolsTests(unittest.TestCase):
                 "list_regulations",
                 "get_regulation_toc",
                 "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
             },
             tool_names,
         )
@@ -1208,7 +1210,15 @@ class RegulationMcpToolsTests(unittest.TestCase):
         tool_manager = getattr(server, "_tool_manager")
 
         self.assertEqual(
-            {"list_regulations", "get_regulation_toc", "get_regulation_article", "search", "fetch"},
+            {
+                "list_regulations",
+                "get_regulation_toc",
+                "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
+                "search",
+                "fetch",
+            },
             set(tool_manager._tools),
         )
 
@@ -1241,6 +1251,21 @@ class RegulationMcpToolsTests(unittest.TestCase):
             {"regulation_unit_id", "article_no"},
             set(article_parameters["required"]),
         )
+        reference_parameters = tools["get_regulation_references"].parameters
+        self.assertEqual(
+            {"regulation_unit_id", "direction", "status", "page", "page_size"},
+            set(reference_parameters["properties"]),
+        )
+        self.assertEqual(
+            ["regulation_unit_id"],
+            reference_parameters["required"],
+        )
+        cycle_parameters = tools["list_regulation_reference_cycles"].parameters
+        self.assertEqual(
+            {"regulation_unit_id", "page", "page_size"},
+            set(cycle_parameters["properties"]),
+        )
+        self.assertEqual([], cycle_parameters.get("required", []))
 
         search_output_schema = tools["search"].output_schema
         self.assertFalse(search_output_schema["additionalProperties"])
@@ -1306,6 +1331,66 @@ class RegulationMcpToolsTests(unittest.TestCase):
 
         invalid_url = dict(rich_result, url="govreg://documents/internal")
         self.assertEqual("", chatgpt_data_fetch_output(invalid_url).url)
+
+    def test_public_candidate_and_unresolved_reference_payloads_hide_storage_ids(self) -> None:
+        candidate = regulation_tools._public_search_candidate_regulation(
+            {
+                "regulation_unit_id": "regunit-public",
+                "regulation_title": "공개규정",
+                "regulation_no": "4-1",
+                "version": "rev-20260729",
+                "document_id": "doc-secret",
+                "chunk_id": "chunk-secret",
+                "profile_id": "profile-secret",
+                "version_id": "regver-secret",
+            }
+        )
+        unresolved = regulation_tools._public_regulation_reference(
+            {
+                "edge_id": "edge-public",
+                "edge_type": "regulation_article_reference",
+                "status": "unresolved",
+                "source_unit": {"title": "공개규정", "unit_id": "regunit-public"},
+                "target_unit": None,
+                "candidate_units": [],
+                "requested_target_title": "재무규정",
+                "requested_article": {"locator": "제16조", "article": "제16조"},
+                "document_id": "doc-secret",
+                "chunk_id": "chunk-secret",
+                "profile_id": "profile-secret",
+                "version_id": "regver-secret",
+            }
+        )
+        stripped_resolved = regulation_tools._public_regulation_reference(
+            {
+                "edge_id": "edge-denied",
+                "edge_type": "regulation_article_reference",
+                "status": "resolved",
+                "target_unit": None,
+                "candidate_units": [],
+                "requested_target_title": "권한밖 비밀규정",
+                "requested_article": {"locator": "제1조", "article": "제1조"},
+            }
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(
+            {"regulation_title": "재무규정"},
+            unresolved["target_regulation"],
+        )
+        self.assertEqual("제16조", unresolved["requested_article"]["locator"])
+        self.assertIsNone(stripped_resolved["target_regulation"])
+        public_json = json.dumps(
+            {
+                "candidate": candidate,
+                "unresolved": unresolved,
+                "stripped_resolved": stripped_resolved,
+            },
+            ensure_ascii=False,
+        )
+        self.assertNotIn("권한밖 비밀규정", public_json)
+        for forbidden_key in ("document_id", "chunk_id", "profile_id", "version_id"):
+            self.assertNotIn(f'"{forbidden_key}"', public_json)
 
     def test_historical_lookup_contract_rejects_invalid_as_of_date_for_all_content_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

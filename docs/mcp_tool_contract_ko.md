@@ -6,8 +6,8 @@
 
 | Profile | Intended client | Exposed tools |
 | --- | --- | --- |
-| `full` | Claude Desktop, Claude Code, 내부 운영자용 생성형 AI | `search`, `fetch`, `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `list_documents`, `get_article`, `get_table`, `compare_versions`, `get_citation`, `get_index_status` |
-| `chatgpt-data` | ChatGPT Desktop, Codex, Claude의 원격 HTTPS MCP | `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `search`, `fetch` |
+| `full` | Claude Desktop, Claude Code, 내부 운영자용 생성형 AI | `search`, `fetch`, `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `list_documents`, `get_article`, `get_table`, `compare_versions`, `get_citation`, `get_index_status` |
+| `chatgpt-data` | ChatGPT Desktop, Codex, Claude의 원격 HTTPS MCP | `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch` |
 
 서버 CLI 기본값은 `full`이다. 생성 번들은 ChatGPT Desktop·Codex·외부 모델 연결에 `--tool-profile chatgpt-data`를 명시해 내부 진단·식별자 노출을 줄인다.
 
@@ -30,11 +30,13 @@ reg-rag-mcp-server `
 - `list_regulations(query?, page?, page_size?)`는 `approved` 규정만 `regulation_title` 기준으로 중복 제거해 반환합니다. 응답에는 규정명·규정 구분·규정 번호·개정일·시행일·상태, `total_count`, 다음 페이지 정보가 포함됩니다.
 - `get_regulation_toc(regulation_unit_id)`는 해당 규정의 장·절·조·별표·서식 계층을 반환합니다.
 - `get_regulation_article(regulation_unit_id, article_no)`는 `제16조`와 같은 정확 조문을 승인 원문 근거로 반환합니다.
+- `get_regulation_references(regulation_unit_id, direction?, status?, page?, page_size?)`는 다른 규정·조문으로 향하는 참조와 해당 규정으로 들어오는 참조를 반환합니다.
+- `list_regulation_reference_cycles(regulation_unit_id?, page?, page_size?)`는 승인된 현행 규정 그래프에서 확인된 순환참조 묶음을 반환합니다.
 - `search(query)`는 입력을 검색어 하나로 제한하며 결과 항목은 `id`, `title`, `url`만 반환합니다.
 - `fetch(id)`는 입력을 검색 결과 ID 하나로 제한하며 `id`, `title`, `text`, `url`, 문자열 metadata를 반환합니다.
 - `url`은 사용자가 열 수 있는 절대 HTTP(S) 원문 주소이거나 빈 문자열입니다.
 - 로컬 전용 `govreg://` URI, tenant/profile/approval 내부 식별자와 운영 증적 경로는 공개 응답에 넣지 않습니다.
-- 다섯 도구는 모두 `readOnlyHint: true`입니다. 로컬 ChatGPT Desktop·Codex는 stdio, 원격 앱은 Streamable HTTP `/mcp`로 같은 축약 계약을 노출합니다.
+- 일곱 도구는 모두 `readOnlyHint: true`입니다. 로컬 ChatGPT Desktop·Codex는 stdio, 원격 앱은 Streamable HTTP `/mcp`로 같은 축약 계약을 노출합니다.
 
 연결 구성은 Settings, 공식 CLI 또는 설정 파일에 직접 적용합니다. 연결 설정·로컬 경로·토큰·API 키·tunnel ID를 대화에 넣지 않습니다. 연결 후의 일반 `search`·`fetch` 질의에는 이러한 비밀값이 없어야 합니다.
 
@@ -61,6 +63,8 @@ reg-rag-mcp-server `
 - `list_regulations`: 통합 규정집 내부의 승인된 고유 규정 목록 확인(`chatgpt-data`, `full`)
 - `get_regulation_toc`: 규정 단위 ID 기준 장·절·조·별표 목차 조회(`chatgpt-data`, `full`)
 - `get_regulation_article`: 규정 단위 ID와 조문 번호로 정확 조문 즉시 조회(`chatgpt-data`, `full`)
+- `get_regulation_references`: 규정·조문 간 outgoing/incoming 참조와 해결 상태 조회(`chatgpt-data`, `full`)
+- `list_regulation_reference_cycles`: 규정 그래프의 순환참조 묶음 조회(`chatgpt-data`, `full`)
 - `list_documents`: MCP-visible 승인 문서 목록 확인
 - `get_article`: 문서 ID와 조문 번호 기준 근거 조회
 - `get_table`: 표/별표 chunk 조회
@@ -70,7 +74,8 @@ reg-rag-mcp-server `
 
 ## Response Rules
 
-- 미승인 chunk, rejected/superseded/security-blocked chunk는 반환하지 않는다.
+- 미승인·rejected·security-blocked chunk는 반환하지 않는다.
+- superseded/repealed 개정 이력은 승인 증거와 효력 구간이 모두 확인되고 명시적 과거 기준일 조회에 해당할 때만 반환한다.
 - 로컬 원본 파일 경로와 내부 artifact 경로는 응답하지 않는다.
 - 모든 도구는 read-only annotation을 가진다.
 - `confidential` 등급은 기본 `operator` role에서 요청할 수 없다.

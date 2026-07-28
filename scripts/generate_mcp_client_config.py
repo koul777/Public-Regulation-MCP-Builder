@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import ctypes
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+import errno
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -14,11 +16,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import zipfile
 from functools import wraps
 from uuid import uuid4
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,13 +41,22 @@ from app.api import routes_rag
 from app.core.tenant_access import tenant_storage_key
 from app.ingestion.vector_adapter import stable_content_hash
 from app.mcp_server.regulation_tools import mcp_auth_context, settings_for_mcp_project
-from app.retrieval.bm25_index import write_bm25_index
+from app.retrieval.bm25_index import (
+    BM25_INDEX_VERSION,
+    BM25_STRUCTURED_METADATA_VERSION,
+    load_bm25_index,
+    write_bm25_index,
+)
 from app.retrieval.hierarchical_index import (
+    HIERARCHICAL_INDEX_SCHEMA_VERSION,
+    REBUILD_FINGERPRINT_SCHEMA_VERSION,
     build_hierarchical_runtime_index,
     canonicalize_runtime_records,
     hierarchical_index_path,
+    index_summary as hierarchical_index_summary,
     write_vector_records_with_offsets,
 )
+from app.retrieval.tokenizer import tokenizer_name
 from app.services.regulation_catalog_service import filter_to_latest_active_versions
 from app.storage.repository import JsonRepository
 
@@ -108,15 +120,23 @@ BUNDLE_GENERATION_TRANSITIONAL_STATES = {
     "runtime_refresh_in_progress",
 }
 RUNTIME_PYTHON_MARKER_FILENAME = "runtime_python.json"
-CHATGPT_DATA_TOOL_NAMES = [
+CHATGPT_DATA_TOOL_NAMES = (
     "list_regulations",
     "get_regulation_toc",
     "get_regulation_article",
+    "get_regulation_references",
+    "list_regulation_reference_cycles",
     "search",
     "fetch",
-]
+)
 RUNTIME_PYTHON_MARKER_SCHEMA_VERSION = 2
 RUNTIME_IDENTITY_SCOPE = "mcp-command-modules-v1"
+RUNTIME_DATA_REUSE_SCHEMA_VERSION = "mcp-runtime-data-reuse-v1"
+RUNTIME_DATA_SWAP_SCHEMA_VERSION = "mcp-runtime-data-swap-v1"
+RUNTIME_DATA_SWAP_MARKER_FILENAME = ".data-swap-transaction.json"
+RUNTIME_DATA_STAGE_NAME = re.compile(r"\.data-stage-[a-f0-9]{32}")
+RUNTIME_DATA_BACKUP_NAME = re.compile(r"\.data-backup-[a-f0-9]{32}")
+MCP_MATERIALIZATION_LOCK_SUFFIX = ".mcp-materialization.lock"
 RUNTIME_IDENTITY_MODULES = (
     "scripts.run_regulation_mcp",
     "scripts.check_mcp_connection_readiness",
@@ -521,11 +541,105 @@ def _bundle_status_write_guard() -> Any:
         yield
 
 
+def _bundle_materialization_lock_path(output_dir: str | Path) -> Path:
+    """Return a stable sibling lock path without allowing a root-wide lock."""
+
+    resolved_output = Path(output_dir).expanduser().resolve()
+    if resolved_output == Path(resolved_output.anchor):
+        raise ValueError("MCP bundle materialization cannot lock a filesystem root.")
+    lock_path = resolved_output.parent / f".{resolved_output.name}{MCP_MATERIALIZATION_LOCK_SUFFIX}"
+    if lock_path.parent != resolved_output.parent or lock_path.name in {"", ".", ".."}:
+        raise ValueError("MCP bundle materialization lock escaped the output directory parent.")
+    return lock_path
+
+
+@contextmanager
+def _bundle_materialization_file_lock(
+    output_dir: str | Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Any:
+    """Serialize bundle mutations on Windows and POSIX using an OS file lock."""
+
+    lock_path = _bundle_materialization_lock_path(output_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.is_symlink():
+        raise RuntimeError(f"Refusing a symbolic-link MCP materialization lock: {lock_path}")
+    open_flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_BINARY"):
+        open_flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    file_descriptor = os.open(lock_path, open_flags, 0o600)
+    handle = os.fdopen(file_descriptor, "r+b", buffering=0)
+    acquired = False
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting for MCP bundle materialization lock: {lock_path}"
+                        ) from exc
+                    time.sleep(0.05)
+        elif os.name == "posix":
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting for MCP bundle materialization lock: {lock_path}"
+                        ) from exc
+                    time.sleep(0.05)
+        else:
+            raise RuntimeError(f"Unsupported platform for MCP bundle materialization lock: {os.name}")
+        yield lock_path
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            elif os.name == "posix":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def _guard_local_mcp_materialization(function: Callable[..., Any]) -> Callable[..., Any]:
+    signature = inspect.signature(function)
+
     @wraps(function)
     def guarded(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind_partial(*args, **kwargs)
+        output_dir = bound.arguments.get("out_dir")
         with _windows_named_mutex("Local\\PRMCPBuilder-LocalMcpInstallation", timeout_ms=30_000):
-            return function(*args, **kwargs)
+            if output_dir is None:
+                return function(*args, **kwargs)
+            with _bundle_materialization_file_lock(output_dir):
+                return function(*args, **kwargs)
 
     return guarded
 
@@ -1434,7 +1548,7 @@ def _read_runtime_manifest(runtime_data_dir: Path) -> dict[str, Any]:
     manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -2008,31 +2122,66 @@ def _replace_runtime_path_prefixes(value: Any, *, source_root: Path, target_root
     return value
 
 
-def _write_mcp_runtime_data_bundle_uncommitted(
+def _canonical_content_sha256(value: Any) -> str:
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    for chunk in encoder.iterencode(value):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _runtime_data_builder_implementation_sha256() -> str:
+    """Fingerprint loaded source modules that define runtime export semantics."""
+
+    module_names = {
+        "app.api.routes_rag",
+        "app.core.tenant_access",
+        "app.ingestion.vector_adapter",
+        "app.mcp_server.regulation_tools",
+        "app.retrieval.bm25_index",
+        "app.retrieval.hierarchical_index",
+        "app.retrieval.regulation_reference_graph",
+        "app.retrieval.tokenizer",
+        "app.services.regulation_catalog_service",
+        "app.storage.repository",
+    }
+    source_sha256 = {
+        "scripts.generate_mcp_client_config": _sha256_file_content(Path(__file__)),
+    }
+    for module_name in sorted(module_names):
+        module = sys.modules.get(module_name)
+        source_path_value = getattr(module, "__file__", None) if module is not None else None
+        source_path = Path(source_path_value) if source_path_value else None
+        source_sha256[module_name] = (
+            _sha256_file_content(source_path)
+            if source_path is not None and source_path.is_file()
+            else None
+        )
+    return _canonical_content_sha256(source_sha256)
+
+
+def _prepare_mcp_runtime_data_bundle_inputs(
     *,
     source_data_dir: str | Path,
-    out_dir: str | Path,
-    tenant_id: str = "default",
-    profile_id: str | None = None,
-    document_id: str | None = None,
-    document_ids: list[str] | None = None,
-    scope: str | None = None,
-    tenant_storage_isolation: bool | None = None,
-    actor: str | None = None,
-    role: str | None = None,
-    department_ids: list[str] | None = None,
-    require_kordoc_table_parser: bool = True,
-    require_source_metadata: bool = True,
-    progress_callback: Callable[[int, str, int | None, int | None], None] | None = None,
-    _runtime_data_dir: Path | None = None,
-    _write_status: bool = True,
+    tenant_id: str,
+    profile_id: str | None,
+    document_id: str | None,
+    document_ids: list[str] | None,
+    scope: str | None,
+    tenant_storage_isolation: bool | None,
+    actor: str | None,
+    role: str | None,
+    department_ids: list[str] | None,
+    require_kordoc_table_parser: bool,
+    require_source_metadata: bool,
+    progress_callback: Callable[[int, str, int | None, int | None], None] | None,
 ) -> dict[str, Any]:
-    """Write approved MCP-visible runtime data under ``out_dir/data``.
+    """Validate and snapshot every source value that can affect a runtime export."""
 
-    The generated setup JSON is not enough for a working local MCP handoff. The
-    MCP server also needs the approved vector records, the repository manifest,
-    approved chunks, and the approval journal used by the visibility gate.
-    """
     requested_document_ids = list(
         dict.fromkeys(
             str(value or "").strip()
@@ -2061,7 +2210,10 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         raise ValueError("document_ids can be used only with selected_documents scope.")
     if normalized_scope == "selected_institution" and str(document_id or "").strip():
         raise ValueError("selected_institution scope must not include document_id.")
-    if normalized_scope in {"selected_documents", "selected_institution", "institution_profile"} and not str(profile_id or "").strip():
+    if (
+        normalized_scope in {"selected_documents", "selected_institution", "institution_profile"}
+        and not str(profile_id or "").strip()
+    ):
         raise ValueError("Institution-scoped MCP bundles require profile_id.")
     if not str(document_id or "").strip() and not requested_document_ids and not str(profile_id or "").strip():
         raise ValueError("MCP runtime export requires document_id or profile_id; tenant-wide export is not allowed.")
@@ -2069,9 +2221,6 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         "document" if document_id else "selected_documents" if requested_document_ids else "institution_profile"
     )
 
-    output_dir = Path(out_dir)
-    final_runtime_data_dir = output_dir / "data"
-    runtime_data_dir = _runtime_data_dir or final_runtime_data_dir
     source_settings = settings_for_mcp_project(
         data_dir=source_data_dir,
         tenant_id=tenant_id,
@@ -2119,7 +2268,7 @@ def _write_mcp_runtime_data_bundle_uncommitted(
     records = canonicalize_runtime_records(records)
     _report_runtime_progress(progress_callback, 5, "승인된 규정 레코드 확인", len(records), len(records))
 
-    document_ids = sorted(
+    exported_document_ids = sorted(
         {
             str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "")
             for record in records
@@ -2127,13 +2276,213 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         }
     )
     source_repository = JsonRepository(source_settings)
-    source_metadata_summary = _runtime_source_metadata_summary(records, source_repository, document_ids)
+    source_metadata_summary = _runtime_source_metadata_summary(
+        records,
+        source_repository,
+        exported_document_ids,
+    )
     if require_source_metadata:
         _require_runtime_source_metadata(source_metadata_summary)
     if require_kordoc_table_parser:
-        kordoc_table_parser_summary = _require_kordoc_table_parser_evidence(source_repository, document_ids)
+        kordoc_table_parser_summary = _require_kordoc_table_parser_evidence(
+            source_repository,
+            exported_document_ids,
+        )
     else:
-        kordoc_table_parser_summary = _kordoc_table_parser_evidence_summary(source_repository, document_ids)
+        kordoc_table_parser_summary = _kordoc_table_parser_evidence_summary(
+            source_repository,
+            exported_document_ids,
+        )
+    _report_runtime_progress(
+        progress_callback,
+        12,
+        "출처 및 파서 증빙 확인",
+        len(exported_document_ids),
+        len(exported_document_ids),
+    )
+
+    repository_manifest = _empty_runtime_repository_manifest()
+    chunks_by_document: dict[str, list[dict[str, Any]]] = {}
+    records_by_document: dict[str, dict[str, dict[str, Any]]] = {}
+    for record in records:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        current_document_id = str(record.get("document_id") or metadata.get("document_id") or "")
+        current_chunk_id = str(record.get("chunk_id") or metadata.get("chunk_id") or "")
+        records_by_document.setdefault(current_document_id, {})[current_chunk_id] = record
+
+    selected_document_id_set = set(exported_document_ids)
+    approval_records_by_document: dict[str, list[dict[str, Any]]] = {}
+    for record in source_repository.list_approval_journal_records():
+        current_document_id = record.get("document_id")
+        if isinstance(current_document_id, str) and current_document_id in selected_document_id_set:
+            approval_records_by_document.setdefault(current_document_id, []).append(record)
+    indexing_jobs_by_document: dict[str, list[dict[str, Any]]] = {}
+    for record in source_repository.list_indexing_jobs():
+        current_document_id = record.get("document_id")
+        if isinstance(current_document_id, str) and current_document_id in selected_document_id_set:
+            indexing_jobs_by_document.setdefault(current_document_id, []).append(record)
+
+    approval_records: list[dict[str, Any]] = []
+    indexing_jobs: list[dict[str, Any]] = []
+    for current_document_id in exported_document_ids:
+        document = source_repository.get_document(current_document_id)
+        if document is None:
+            continue
+        repository_manifest["documents"][current_document_id] = document.model_dump(mode="json")
+        records_by_chunk_id = records_by_document.get(current_document_id, {})
+        chunks = _current_approved_chunks_for_runtime_export(
+            repository=source_repository,
+            document_id=current_document_id,
+            visible_chunk_ids=set(records_by_chunk_id),
+            records_by_chunk_id=records_by_chunk_id,
+        )
+        chunks_by_document[current_document_id] = [
+            chunk.model_dump(mode="json")
+            for chunk in chunks
+        ]
+        approval_records.extend(approval_records_by_document.get(current_document_id, ()))
+        indexing_jobs.extend(indexing_jobs_by_document.get(current_document_id, ()))
+
+    # Approval and indexing history is authoritative in append-only journals.
+    # Keep the manifest keys for JsonRepository schema compatibility without
+    # duplicating large journal payloads into repository/manifest.json.
+    repository_manifest["approvals"] = {}
+    repository_manifest["indexing_jobs"] = {}
+
+    effective_department_ids = sorted(
+        {
+            str(value or "").strip()
+            for value in getattr(auth, "department_ids", ())
+            if str(value or "").strip()
+        }
+    )
+    recommended_smoke_query = _recommended_runtime_smoke_query(records)
+    fingerprint_payload = {
+        "schema_version": RUNTIME_DATA_REUSE_SCHEMA_VERSION,
+        "builder_contract": {
+            "bm25_index_version": BM25_INDEX_VERSION,
+            "bm25_structured_metadata_version": BM25_STRUCTURED_METADATA_VERSION,
+            "bm25_tokenizer": tokenizer_name(),
+            "hierarchical_index_schema_version": HIERARCHICAL_INDEX_SCHEMA_VERSION,
+            "rebuild_fingerprint_schema_version": REBUILD_FINGERPRINT_SCHEMA_VERSION,
+            # Static deployment bundles must be regenerated when a
+            # future-effective revision crosses into force, even if no source
+            # bytes changed.
+            "lifecycle_as_of_date": date.today().isoformat(),
+            "implementation_sha256": _runtime_data_builder_implementation_sha256(),
+        },
+        "request": {
+            "tenant_id": tenant_id,
+            "profile_id": profile_id,
+            "document_id": document_id,
+            "requested_document_ids": sorted(requested_document_ids),
+            "scope": resolved_scope,
+            "tenant_storage_isolation": tenant_storage_isolation,
+            "effective_tenant_storage_isolation": bool(
+                getattr(source_settings, "tenant_storage_isolation", False)
+            ),
+            "actor": str(getattr(auth, "actor", "") or ""),
+            "role": str(getattr(auth, "role", "") or ""),
+            "department_ids": effective_department_ids,
+            "require_kordoc_table_parser": bool(require_kordoc_table_parser),
+            "require_source_metadata": bool(require_source_metadata),
+        },
+        "document_ids": exported_document_ids,
+        "records": records,
+        "repository_manifest": repository_manifest,
+        "chunks_by_document": chunks_by_document,
+        "approval_records": approval_records,
+        "indexing_jobs": indexing_jobs,
+        "recommended_smoke_query": recommended_smoke_query,
+        "source_metadata_summary": source_metadata_summary,
+        "kordoc_table_parser_summary": kordoc_table_parser_summary,
+    }
+    return {
+        "requested_document_ids": requested_document_ids,
+        "resolved_scope": resolved_scope,
+        "source_settings": source_settings,
+        "auth": auth,
+        "records": records,
+        "document_ids": exported_document_ids,
+        "repository_manifest": repository_manifest,
+        "chunks_by_document": chunks_by_document,
+        "approval_records": approval_records,
+        "indexing_jobs": indexing_jobs,
+        "total_chunks": sum(len(chunks) for chunks in chunks_by_document.values()),
+        "recommended_smoke_query": recommended_smoke_query,
+        "source_metadata_summary": source_metadata_summary,
+        "kordoc_table_parser_summary": kordoc_table_parser_summary,
+        "manifest_identity": {
+            "tenant_id": tenant_id,
+            "profile_id": profile_id,
+            "scope": resolved_scope,
+            "tenant_storage_isolation": bool(
+                getattr(source_settings, "tenant_storage_isolation", False)
+            ),
+            "document_id": document_id,
+            "document_ids": exported_document_ids,
+            "kordoc_table_parser_required": bool(require_kordoc_table_parser),
+            "source_metadata_required": bool(require_source_metadata),
+        },
+        "input_sha256": _canonical_content_sha256(fingerprint_payload),
+    }
+
+
+def _write_mcp_runtime_data_bundle_uncommitted(
+    *,
+    source_data_dir: str | Path,
+    out_dir: str | Path,
+    tenant_id: str = "default",
+    profile_id: str | None = None,
+    document_id: str | None = None,
+    document_ids: list[str] | None = None,
+    scope: str | None = None,
+    tenant_storage_isolation: bool | None = None,
+    actor: str | None = None,
+    role: str | None = None,
+    department_ids: list[str] | None = None,
+    require_kordoc_table_parser: bool = True,
+    require_source_metadata: bool = True,
+    progress_callback: Callable[[int, str, int | None, int | None], None] | None = None,
+    _runtime_data_dir: Path | None = None,
+    _write_status: bool = True,
+    _prepared_runtime_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write approved MCP-visible runtime data under ``out_dir/data``.
+
+    The generated setup JSON is not enough for a working local MCP handoff. The
+    MCP server also needs the approved vector records, the repository manifest,
+    approved chunks, and the approval journal used by the visibility gate.
+    """
+    prepared = _prepared_runtime_inputs or _prepare_mcp_runtime_data_bundle_inputs(
+        source_data_dir=source_data_dir,
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        document_id=document_id,
+        document_ids=document_ids,
+        scope=scope,
+        tenant_storage_isolation=tenant_storage_isolation,
+        actor=actor,
+        role=role,
+        department_ids=department_ids,
+        require_kordoc_table_parser=require_kordoc_table_parser,
+        require_source_metadata=require_source_metadata,
+        progress_callback=None,
+    )
+
+    output_dir = Path(out_dir)
+    final_runtime_data_dir = output_dir / "data"
+    runtime_data_dir = _runtime_data_dir or final_runtime_data_dir
+    source_settings = prepared["source_settings"]
+    auth = prepared["auth"]
+    records = prepared["records"]
+    _report_runtime_progress(progress_callback, 5, "승인된 규정 레코드 확인", len(records), len(records))
+
+    exported_document_ids = prepared["document_ids"]
+    document_ids = exported_document_ids
+    source_metadata_summary = prepared["source_metadata_summary"]
+    kordoc_table_parser_summary = prepared["kordoc_table_parser_summary"]
+    resolved_scope = str(prepared["resolved_scope"])
     _report_runtime_progress(progress_callback, 12, "출처·표 파서 증빙 확인", len(document_ids), len(document_ids))
     _prepare_runtime_data_export_dir(runtime_data_dir, source_settings.data_dir)
     runtime_repository_dir = runtime_data_dir / "repository"
@@ -2173,45 +2522,24 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         ),
     )
 
-    manifest = _empty_runtime_repository_manifest()
-    total_chunks = 0
-    approval_records: list[dict[str, Any]] = []
-    indexing_jobs: list[dict[str, Any]] = []
+    manifest = copy.deepcopy(prepared["repository_manifest"])
+    total_chunks = int(prepared["total_chunks"])
+    approval_records = prepared["approval_records"]
+    indexing_jobs = prepared["indexing_jobs"]
+    chunks_by_document = prepared["chunks_by_document"]
     exported_result_files: list[str] = []
     document_total = len(document_ids)
     for document_index, current_document_id in enumerate(document_ids, start=1):
-        document = source_repository.get_document(current_document_id)
-        if document is None:
+        chunks = chunks_by_document.get(current_document_id)
+        if chunks is None:
             continue
-        manifest["documents"][current_document_id] = document.model_dump(mode="json")
-
-        visible_chunk_ids = {
-            str(record.get("chunk_id") or (record.get("metadata") or {}).get("chunk_id") or "")
-            for record in records
-            if str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "") == current_document_id
-        }
-        records_by_chunk_id = {
-            str(record.get("chunk_id") or (record.get("metadata") or {}).get("chunk_id") or ""): record
-            for record in records
-            if str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "") == current_document_id
-        }
-        chunks = _current_approved_chunks_for_runtime_export(
-            repository=source_repository,
-            document_id=current_document_id,
-            visible_chunk_ids=visible_chunk_ids,
-            records_by_chunk_id=records_by_chunk_id,
-        )
-        total_chunks += len(chunks)
         _write_runtime_result_json(
             runtime_repository_dir,
             current_document_id,
             "chunks",
-            [chunk.model_dump(mode="json") for chunk in chunks],
+            chunks,
             exported_result_files,
         )
-
-        approval_records.extend(source_repository.list_approval_journal_records(current_document_id))
-        indexing_jobs.extend(source_repository.list_indexing_jobs(current_document_id))
         _report_runtime_progress(
             progress_callback,
             80 + int((document_index / max(document_total, 1)) * 14),
@@ -2219,13 +2547,6 @@ def _write_mcp_runtime_data_bundle_uncommitted(
             document_index,
             document_total,
         )
-
-    for index, record in enumerate(approval_records, start=1):
-        key = str(record.get("approval_record_id") or record.get("approval_id") or f"approval_{index}")
-        manifest["approvals"][key] = record
-    for index, record in enumerate(indexing_jobs, start=1):
-        key = str(record.get("indexing_job_id") or f"indexing_job_{index}")
-        manifest["indexing_jobs"][key] = record
 
     manifest_path = runtime_repository_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -2243,6 +2564,10 @@ def _write_mcp_runtime_data_bundle_uncommitted(
     runtime_manifest = {
         "report_type": "mcp_runtime_data_bundle",
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "runtime_data_reuse": {
+            "schema_version": RUNTIME_DATA_REUSE_SCHEMA_VERSION,
+            "input_sha256": prepared["input_sha256"],
+        },
         "tenant_id": tenant_id,
         "profile_id": profile_id,
         "scope": resolved_scope,
@@ -2259,7 +2584,7 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         "document_ids": document_ids,
         "record_count": len(records),
         "chunk_count": total_chunks,
-        "recommended_smoke_query": _recommended_runtime_smoke_query(records),
+        "recommended_smoke_query": prepared["recommended_smoke_query"],
         "approval_record_count": len(approval_records),
         "indexing_job_count": len(indexing_jobs),
         "kordoc_table_parser_required": bool(require_kordoc_table_parser),
@@ -2301,10 +2626,769 @@ def _write_mcp_runtime_data_bundle_uncommitted(
     )
     runtime_manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
     runtime_manifest["files"]["runtime_manifest"] = str(final_runtime_data_dir / "mcp_runtime_manifest.json")
+    runtime_manifest["runtime_data_reuse"]["file_sha256"] = _runtime_data_file_sha256(runtime_data_dir)
+    runtime_manifest["runtime_data_reuse"]["manifest_sha256"] = _runtime_manifest_content_sha256(
+        runtime_manifest
+    )
     runtime_manifest_path.write_text(json.dumps(runtime_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if _write_status:
         _write_bundle_status(output_dir, runtime_manifest=runtime_manifest)
     return runtime_manifest
+
+
+def _sha256_file_content(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _is_mutable_runtime_generated_file(path: Path) -> bool:
+    """Return whether *path* is operational state, not immutable bundle data."""
+
+    return path.name in RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES
+
+
+def _runtime_data_file_sha256(runtime_data_dir: Path) -> dict[str, str]:
+    """Hash immutable reusable data, excluding the manifest and operational state."""
+
+    manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+    digests: dict[str, str] = {}
+    for path in sorted(runtime_data_dir.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(
+                "Runtime data bundles cannot contain symbolic links: "
+                + path.relative_to(runtime_data_dir).as_posix()
+            )
+        if (
+            not path.is_file()
+            or path == manifest_path
+            or _is_mutable_runtime_generated_file(path)
+        ):
+            continue
+        digests[path.relative_to(runtime_data_dir).as_posix()] = _sha256_file_content(path)
+    return digests
+
+
+def _runtime_manifest_content_sha256(manifest: dict[str, Any]) -> str:
+    payload = copy.deepcopy(manifest)
+    reuse = payload.get("runtime_data_reuse")
+    if isinstance(reuse, dict):
+        reuse.pop("manifest_sha256", None)
+    return _canonical_content_sha256(payload)
+
+
+def _runtime_manifest_reuse_input_sha256(manifest: dict[str, Any]) -> str | None:
+    reuse = manifest.get("runtime_data_reuse")
+    if not isinstance(reuse, dict):
+        return None
+    if reuse.get("schema_version") != RUNTIME_DATA_REUSE_SCHEMA_VERSION:
+        return None
+    value = str(reuse.get("input_sha256") or "").strip().lower()
+    return value if re.fullmatch(r"[a-f0-9]{64}", value) else None
+
+
+def _iter_strict_jsonl_for_runtime_reuse(path: Path) -> Iterator[dict[str, Any]]:
+    with path.open("rb") as handle:
+        if handle.read(len(UTF8_BOM)) == UTF8_BOM:
+            raise ValueError(f"Generated runtime JSONL must be UTF-8 without BOM: {path}")
+        handle.seek(0)
+        for line_number, raw_line in enumerate(handle, start=1):
+            try:
+                line = raw_line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"Generated runtime JSONL must be strict UTF-8: {path}:{line_number}"
+                ) from exc
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(
+                    line,
+                    object_pairs_hook=_reject_duplicate_bundle_json_keys,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"Generated runtime JSONL is invalid at {path}:{line_number}: {exc}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"Generated runtime JSONL must contain objects: {path}:{line_number}"
+                )
+            yield value
+
+
+def _strict_jsonl_matches_runtime_reuse(
+    path: Path,
+    expected_records: list[dict[str, Any]],
+) -> bool:
+    with closing(_iter_strict_jsonl_for_runtime_reuse(path)) as actual_records:
+        for expected in expected_records:
+            try:
+                actual = next(actual_records)
+            except StopIteration:
+                return False
+            if actual != expected:
+                return False
+        try:
+            next(actual_records)
+        except StopIteration:
+            return True
+        return False
+
+
+def _validate_reusable_runtime_data_bundle(
+    runtime_data_dir: Path,
+    *,
+    final_runtime_data_dir: Path,
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a reusable manifest only after content and security projection checks."""
+
+    manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+    if manifest_path.is_symlink():
+        raise ValueError("Reusable MCP runtime manifest cannot be a symbolic link.")
+    manifest = _load_strict_utf8_json_for_bundle(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ValueError("Reusable MCP runtime manifest must contain a JSON object.")
+
+    expected_input_sha256 = str(prepared["input_sha256"])
+    if _runtime_manifest_reuse_input_sha256(manifest) != expected_input_sha256:
+        raise ValueError("MCP runtime reuse input fingerprint does not match approved source inputs.")
+    reuse = manifest.get("runtime_data_reuse")
+    assert isinstance(reuse, dict)
+    expected_manifest_sha256 = str(reuse.get("manifest_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_manifest_sha256):
+        raise ValueError("MCP runtime reuse manifest fingerprint is missing or invalid.")
+    if _runtime_manifest_content_sha256(manifest) != expected_manifest_sha256:
+        raise ValueError("MCP runtime manifest content does not match its reuse fingerprint.")
+
+    identity = prepared["manifest_identity"]
+    for field, expected in identity.items():
+        if manifest.get(field) != expected:
+            raise ValueError(f"MCP runtime manifest field {field} does not match the requested source scope.")
+    if manifest.get("report_type") != "mcp_runtime_data_bundle":
+        raise ValueError("Reusable MCP runtime manifest has the wrong report_type.")
+    if manifest.get("synthetic_runtime") is not False:
+        raise ValueError("Synthetic runtime data cannot satisfy an approved-source reuse request.")
+    if manifest.get("provenance") != "approved_runtime_bundle_export":
+        raise ValueError("Reusable MCP runtime data has invalid provenance.")
+    if manifest.get("source_data_dir") is not None:
+        raise ValueError("Reusable MCP runtime data leaks a source data path.")
+    if manifest.get("runtime_data_dir") != str(final_runtime_data_dir):
+        raise ValueError("Reusable MCP runtime data paths no longer match the output directory.")
+    expected_source_projection = {
+        "source_data_provenance": "approved_local_export",
+        "record_count": len(prepared["records"]),
+        "chunk_count": int(prepared["total_chunks"]),
+        "recommended_smoke_query": prepared["recommended_smoke_query"],
+        "approval_record_count": len(prepared["approval_records"]),
+        "indexing_job_count": len(prepared["indexing_jobs"]),
+        "kordoc_table_parser_summary": prepared["kordoc_table_parser_summary"],
+        "source_metadata_summary": prepared["source_metadata_summary"],
+        "bm25_index_status": "ready",
+        "hierarchical_index_status": "ready",
+        "rebuild_fingerprint_schema_version": REBUILD_FINGERPRINT_SCHEMA_VERSION,
+    }
+    for field, expected in expected_source_projection.items():
+        if manifest.get(field) != expected:
+            raise ValueError(f"Reusable MCP runtime manifest source field {field} is stale.")
+
+    expected_file_sha256 = reuse.get("file_sha256")
+    if not isinstance(expected_file_sha256, dict) or not expected_file_sha256:
+        raise ValueError("MCP runtime reuse file digests are missing.")
+    normalized_file_sha256 = {
+        str(relative_path): str(digest).strip().lower()
+        for relative_path, digest in expected_file_sha256.items()
+    }
+    if any(not re.fullmatch(r"[a-f0-9]{64}", digest) for digest in normalized_file_sha256.values()):
+        raise ValueError("MCP runtime reuse file digests are invalid.")
+    if _runtime_data_file_sha256(runtime_data_dir) != normalized_file_sha256:
+        raise ValueError("MCP runtime data files do not match the validated reuse manifest.")
+    _validate_runtime_data_bundle_consistency(runtime_data_dir)
+
+    tenant_id = str(identity["tenant_id"])
+    vector_dir = runtime_data_dir / "vector_db" / tenant_storage_key(tenant_id)
+    vector_path = vector_dir / "approved_vectors.jsonl"
+    if not _strict_jsonl_matches_runtime_reuse(vector_path, prepared["records"]):
+        raise ValueError("Reusable approved vector records no longer match the approved source projection.")
+
+    repository_dir = runtime_data_dir / "repository"
+    repository_manifest = _load_strict_utf8_json_for_bundle(repository_dir / "manifest.json")
+    if repository_manifest != prepared["repository_manifest"]:
+        raise ValueError("Reusable repository manifest no longer matches the approved source projection.")
+    for current_document_id, chunks in prepared["chunks_by_document"].items():
+        chunk_path = repository_dir / f"{current_document_id}_chunks.json"
+        if _load_strict_utf8_json_for_bundle(chunk_path) != chunks:
+            raise ValueError(
+                f"Reusable approved chunks no longer match the source projection: {current_document_id}"
+            )
+    if not _strict_jsonl_matches_runtime_reuse(
+        repository_dir / "journals" / "approvals.jsonl",
+        prepared["approval_records"],
+    ):
+        raise ValueError("Reusable approval journal no longer matches the approved source projection.")
+    if not _strict_jsonl_matches_runtime_reuse(
+        repository_dir / "journals" / "indexing_jobs.jsonl",
+        prepared["indexing_jobs"],
+    ):
+        raise ValueError("Reusable indexing journal no longer matches the approved source projection.")
+
+    approval_snapshot = _load_strict_utf8_json_for_bundle(repository_dir / "approval_snapshot.json")
+    if not isinstance(approval_snapshot, dict):
+        raise ValueError("Reusable approval snapshot must contain a JSON object.")
+    expected_snapshot_entries = _runtime_approval_snapshot_entries(prepared["records"])
+    expected_snapshot_projection = {
+        "report_type": "mcp_runtime_approval_snapshot",
+        "schema_version": "mcp-runtime-approval-snapshot-v1",
+        "tenant_id": tenant_id,
+        "document_ids": prepared["document_ids"],
+        "record_count": len(prepared["records"]),
+        "snapshot_count": len(expected_snapshot_entries),
+        "entries": expected_snapshot_entries,
+    }
+    for field, expected in expected_snapshot_projection.items():
+        if approval_snapshot.get(field) != expected:
+            raise ValueError(f"Reusable approval snapshot field {field} is invalid.")
+    runtime_settings = settings_for_mcp_project(
+        data_dir=runtime_data_dir,
+        tenant_id=tenant_id,
+        tenant_storage_isolation=False,
+    )
+    runtime_repository = JsonRepository(runtime_settings)
+    current_file_signatures = {
+        key: (list(value) if value is not None else None)
+        for key, value in routes_rag._runtime_approval_snapshot_file_signatures(runtime_repository).items()
+    }
+    if approval_snapshot.get("file_signatures") != current_file_signatures:
+        raise ValueError("Reusable approval snapshot source signatures are stale.")
+
+    bm25_index = load_bm25_index(vector_dir / "bm25_index.json")
+    if (
+        bm25_index is None
+        or bm25_index.tokenizer != tokenizer_name()
+        or bm25_index.is_stale_for(prepared["records"])
+    ):
+        raise ValueError("Reusable BM25 index is missing, incompatible, or stale.")
+    if bm25_index.document_count != len(bm25_index.documents):
+        raise ValueError("Reusable BM25 index document counts are inconsistent.")
+    if int(manifest.get("bm25_document_count") or 0) != bm25_index.document_count:
+        raise ValueError("Reusable BM25 index count does not match the runtime manifest.")
+    source_records_by_id = {
+        str(record.get("id") or ""): record
+        for record in prepared["records"]
+        if str(record.get("id") or "")
+    }
+    seen_bm25_ids: set[str] = set()
+    for document in bm25_index.documents:
+        record_id = str(document.get("id") or "")
+        source_record = source_records_by_id.get(record_id)
+        source_metadata = (
+            source_record.get("metadata")
+            if isinstance(source_record, dict) and isinstance(source_record.get("metadata"), dict)
+            else {}
+        )
+        if (
+            not record_id
+            or record_id in seen_bm25_ids
+            or source_record is None
+            or str(document.get("document_id") or "")
+            != str(source_record.get("document_id") or source_metadata.get("document_id") or "")
+            or str(document.get("chunk_id") or "")
+            != str(source_record.get("chunk_id") or source_metadata.get("chunk_id") or "")
+            or str(document.get("content_hash") or "") != str(source_record.get("content_hash") or "")
+        ):
+            raise ValueError("Reusable BM25 index contains records outside the approved source projection.")
+        seen_bm25_ids.add(record_id)
+
+    hierarchy_path = hierarchical_index_path(runtime_data_dir)
+    try:
+        hierarchy = hierarchical_index_summary(hierarchy_path)
+    except Exception as exc:
+        raise ValueError("Reusable hierarchy index could not be read.") from exc
+    manifest_hierarchy = manifest.get("hierarchical_index")
+    if not isinstance(manifest_hierarchy, dict):
+        raise ValueError("Reusable hierarchy manifest summary is missing.")
+    logical_corpus_sha256 = str(manifest.get("logical_corpus_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", logical_corpus_sha256):
+        raise ValueError("Reusable hierarchy logical-corpus fingerprint is missing or invalid.")
+    expected_hierarchy = {
+        "schema_version": HIERARCHICAL_INDEX_SCHEMA_VERSION,
+        "tenant_id": tenant_id,
+        "profile_id": str(identity["profile_id"] or ""),
+        "record_count": len(prepared["records"]),
+        "regulation_count": int(manifest.get("regulation_count") or 0),
+        "current_regulation_count": int(
+            manifest_hierarchy.get("current_regulation_count") or 0
+        ),
+        "regulation_version_count": int(manifest.get("regulation_version_count") or 0),
+        "toc_node_count": int(manifest.get("toc_node_count") or 0),
+        "reference_edge_count": int(manifest_hierarchy.get("reference_edge_count") or 0),
+        "resolved_reference_edge_count": int(
+            manifest_hierarchy.get("resolved_reference_edge_count") or 0
+        ),
+        "unresolved_reference_edge_count": int(
+            manifest_hierarchy.get("unresolved_reference_edge_count") or 0
+        ),
+        "ambiguous_reference_edge_count": int(
+            manifest_hierarchy.get("ambiguous_reference_edge_count") or 0
+        ),
+        "reference_cycle_count": int(manifest_hierarchy.get("reference_cycle_count") or 0),
+        "path": str(hierarchy_path),
+    }
+    if not isinstance(hierarchy, dict) or any(
+        hierarchy.get(field) != expected
+        for field, expected in expected_hierarchy.items()
+    ):
+        raise ValueError("Reusable hierarchy index does not match the requested tenant/profile corpus.")
+    if expected_hierarchy["reference_edge_count"] != sum(
+        expected_hierarchy[field]
+        for field in (
+            "resolved_reference_edge_count",
+            "unresolved_reference_edge_count",
+            "ambiguous_reference_edge_count",
+        )
+    ):
+        raise ValueError("Reusable hierarchy reference-edge counts are inconsistent.")
+    expected_manifest_hierarchy = {
+        "schema_version": HIERARCHICAL_INDEX_SCHEMA_VERSION,
+        "rebuild_fingerprint_schema_version": REBUILD_FINGERPRINT_SCHEMA_VERSION,
+        "logical_corpus_sha256": logical_corpus_sha256,
+        **{
+            field: expected_hierarchy[field]
+            for field in (
+                "record_count",
+                "regulation_count",
+                "current_regulation_count",
+                "regulation_version_count",
+                "toc_node_count",
+                "reference_edge_count",
+                "resolved_reference_edge_count",
+                "unresolved_reference_edge_count",
+                "ambiguous_reference_edge_count",
+                "reference_cycle_count",
+                "path",
+            )
+        },
+    }
+    if any(
+        manifest_hierarchy.get(field) != expected
+        for field, expected in expected_manifest_hierarchy.items()
+    ):
+        raise ValueError("Reusable hierarchy manifest summary is inconsistent.")
+
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("Reusable MCP runtime manifest is missing file paths.")
+    if manifest_hierarchy.get("sha256") != files.get("hierarchical_index_sha256"):
+        raise ValueError("Reusable hierarchy fingerprints are inconsistent.")
+    expected_result_files = [
+        str(final_runtime_data_dir / "repository" / f"{current_document_id}_chunks.json")
+        for current_document_id in prepared["document_ids"]
+        if current_document_id in prepared["chunks_by_document"]
+    ]
+    expected_paths = {
+        "vector_jsonl": str(
+            final_runtime_data_dir
+            / "vector_db"
+            / tenant_storage_key(tenant_id)
+            / "approved_vectors.jsonl"
+        ),
+        "bm25_index": str(
+            final_runtime_data_dir
+            / "vector_db"
+            / tenant_storage_key(tenant_id)
+            / "bm25_index.json"
+        ),
+        "hierarchical_index": str(hierarchical_index_path(final_runtime_data_dir)),
+        "repository_manifest": str(final_runtime_data_dir / "repository" / "manifest.json"),
+        "approval_journal": str(
+            final_runtime_data_dir / "repository" / "journals" / "approvals.jsonl"
+        ),
+        "approval_snapshot": str(final_runtime_data_dir / "repository" / "approval_snapshot.json"),
+        "result_files": expected_result_files,
+        "runtime_manifest": str(final_runtime_data_dir / "mcp_runtime_manifest.json"),
+    }
+    for field, expected in expected_paths.items():
+        if files.get(field) != expected:
+            raise ValueError(f"Reusable MCP runtime file path {field} is stale.")
+    return manifest
+
+
+def _runtime_swap_file_snapshot(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing a symbolic-link runtime swap snapshot: {path}")
+    if not path.exists():
+        return {"exists": False}
+    if not path.is_file():
+        raise RuntimeError(f"Runtime swap snapshot target is not a file: {path}")
+    payload = path.read_bytes()
+    return {
+        "exists": True,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "base64": base64.b64encode(payload).decode("ascii"),
+    }
+
+
+def _restore_runtime_swap_file_snapshot(path: Path, snapshot: Any) -> None:
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("exists"), bool):
+        raise RuntimeError(f"Runtime swap snapshot is invalid for {path.name}.")
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError(f"Refusing an unsafe runtime swap snapshot target: {path}")
+    if not snapshot["exists"]:
+        path.unlink(missing_ok=True)
+        return
+    encoded = snapshot.get("base64")
+    expected_sha256 = str(snapshot.get("sha256") or "").strip().lower()
+    if not isinstance(encoded, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+        raise RuntimeError(f"Runtime swap snapshot payload is invalid for {path.name}.")
+    try:
+        payload = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise RuntimeError(f"Runtime swap snapshot payload is invalid for {path.name}.") from exc
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise RuntimeError(f"Runtime swap snapshot hash mismatch for {path.name}.")
+    _replace_file_bytes_atomically(path, payload)
+
+
+def _runtime_swap_child_path(output_dir: Path, name: Any, pattern: re.Pattern[str]) -> Path:
+    if not isinstance(name, str) or not pattern.fullmatch(name) or Path(name).name != name:
+        raise RuntimeError(f"Runtime data swap contains an unsafe path name: {name!r}")
+    child = output_dir / name
+    if child.parent.resolve() != output_dir.resolve():
+        raise RuntimeError(f"Runtime data swap path escaped the bundle directory: {name}")
+    if child.is_symlink():
+        raise RuntimeError(f"Refusing a symbolic-link runtime data swap path: {child}")
+    return child
+
+
+def _runtime_swap_artifacts(output_dir: Path, prefix: str, pattern: re.Pattern[str]) -> list[Path]:
+    artifacts: list[Path] = []
+    for path in output_dir.iterdir():
+        if not path.name.startswith(prefix):
+            continue
+        if not pattern.fullmatch(path.name):
+            raise RuntimeError(f"Unrecognized runtime data swap artifact requires review: {path.name}")
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing a symbolic-link runtime data swap artifact: {path}")
+        artifacts.append(path)
+    return sorted(artifacts, key=lambda item: item.name)
+
+
+def _remove_runtime_swap_artifact(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to remove a symbolic-link runtime data swap artifact: {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _runtime_swap_candidate_manifest(
+    runtime_data_dir: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    if runtime_data_dir.is_symlink() or not runtime_data_dir.is_dir():
+        raise RuntimeError(f"Recovered runtime data candidate is not a safe directory: {runtime_data_dir}")
+    manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError(f"Recovered runtime data candidate has no safe manifest: {runtime_data_dir}")
+    if (
+        expected_manifest_sha256 is not None
+        and _sha256_file_content(manifest_path) != expected_manifest_sha256
+    ):
+        raise RuntimeError("Recovered runtime data candidate does not match the staged manifest.")
+    manifest = _load_strict_utf8_json_for_bundle(manifest_path)
+    if not isinstance(manifest, dict) or manifest.get("report_type") != "mcp_runtime_data_bundle":
+        raise RuntimeError("Recovered runtime data candidate has an invalid manifest.")
+    _validate_runtime_data_bundle_consistency(runtime_data_dir)
+    return manifest
+
+
+def _runtime_swap_candidate_has_manifest(
+    runtime_data_dir: Path,
+    expected_manifest_sha256: str,
+) -> bool:
+    if runtime_data_dir.is_symlink():
+        raise RuntimeError("Refusing a symbolic-link runtime data candidate during recovery.")
+    manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+    if manifest_path.is_symlink():
+        raise RuntimeError("Refusing a symbolic-link runtime manifest during recovery.")
+    return (
+        runtime_data_dir.is_dir()
+        and manifest_path.is_file()
+        and _sha256_file_content(manifest_path) == expected_manifest_sha256
+    )
+
+
+def _runtime_manifest_fingerprint(manifest: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _runtime_swap_status_matches_manifest(output_dir: Path, manifest: dict[str, Any]) -> bool:
+    status_path = output_dir / SETUP_BUNDLE_FILES["bundle_status"]
+    if status_path.is_symlink() or not status_path.is_file():
+        return False
+    try:
+        status = _load_strict_utf8_json_for_bundle(status_path)
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(status, dict)
+        and status.get("runtime_data_ready") is True
+        and str(status.get("runtime_fingerprint") or "") == _runtime_manifest_fingerprint(manifest)
+    )
+
+
+def _create_runtime_data_swap_marker(
+    *,
+    output_dir: Path,
+    runtime_data_dir: Path,
+    staging_dir: Path,
+    backup_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
+    if runtime_data_dir.is_symlink():
+        raise RuntimeError("Runtime data directory cannot be a symbolic link.")
+    staging_dir = _runtime_swap_child_path(output_dir, staging_dir.name, RUNTIME_DATA_STAGE_NAME)
+    backup_dir = _runtime_swap_child_path(output_dir, backup_dir.name, RUNTIME_DATA_BACKUP_NAME)
+    staged_manifest_path = staging_dir / "mcp_runtime_manifest.json"
+    if staged_manifest_path.is_symlink() or not staged_manifest_path.is_file():
+        raise RuntimeError("Staged MCP runtime data has no safe manifest for swap recovery.")
+    marker_path = output_dir / RUNTIME_DATA_SWAP_MARKER_FILENAME
+    if marker_path.is_symlink() or marker_path.exists():
+        raise RuntimeError("An unresolved MCP runtime data swap marker already exists.")
+    payload = {
+        "schema_version": RUNTIME_DATA_SWAP_SCHEMA_VERSION,
+        "transaction_id": uuid4().hex,
+        "phase": "prepared",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "runtime_data_name": "data",
+        "staging_name": staging_dir.name,
+        "backup_name": backup_dir.name,
+        "prior_data_exists": runtime_data_dir.exists(),
+        "staged_manifest_sha256": _sha256_file_content(staged_manifest_path),
+        "status_snapshot": _runtime_swap_file_snapshot(
+            output_dir / SETUP_BUNDLE_FILES["bundle_status"]
+        ),
+        "stale_report_snapshots": {
+            filename: _runtime_swap_file_snapshot(output_dir / filename)
+            for filename in STALE_BUNDLE_STATUS_REPORT_FILENAMES
+        },
+    }
+    _write_json_utf8_no_bom(marker_path, payload)
+    return marker_path, payload
+
+
+def _update_runtime_data_swap_marker(
+    marker_path: Path,
+    marker: dict[str, Any],
+    phase: str,
+) -> dict[str, Any]:
+    if phase not in {"prepared", "backup_created", "data_promoted", "committed"}:
+        raise ValueError(f"Unsupported runtime data swap phase: {phase}")
+    updated = {**marker, "phase": phase, "updated_at": datetime.now(timezone.utc).isoformat()}
+    _write_json_utf8_no_bom(marker_path, updated)
+    return updated
+
+
+def _load_runtime_data_swap_marker(output_dir: Path) -> tuple[Path, dict[str, Any]] | None:
+    marker_path = output_dir / RUNTIME_DATA_SWAP_MARKER_FILENAME
+    if marker_path.is_symlink():
+        raise RuntimeError("Refusing a symbolic-link MCP runtime data swap marker.")
+    if not marker_path.exists():
+        return None
+    if not marker_path.is_file():
+        raise RuntimeError("MCP runtime data swap marker is not a file.")
+    marker = _load_strict_utf8_json_for_bundle(marker_path)
+    if not isinstance(marker, dict):
+        raise RuntimeError("MCP runtime data swap marker must contain an object.")
+    if marker.get("schema_version") != RUNTIME_DATA_SWAP_SCHEMA_VERSION:
+        raise RuntimeError("MCP runtime data swap marker has an unsupported schema.")
+    if not re.fullmatch(r"[a-f0-9]{32}", str(marker.get("transaction_id") or "")):
+        raise RuntimeError("MCP runtime data swap marker has an invalid transaction id.")
+    if marker.get("phase") not in {"prepared", "backup_created", "data_promoted", "committed"}:
+        raise RuntimeError("MCP runtime data swap marker has an invalid phase.")
+    if marker.get("runtime_data_name") != "data":
+        raise RuntimeError("MCP runtime data swap marker targets an unexpected directory.")
+    if not isinstance(marker.get("prior_data_exists"), bool):
+        raise RuntimeError("MCP runtime data swap marker has invalid prior-data state.")
+    if not re.fullmatch(r"[a-f0-9]{64}", str(marker.get("staged_manifest_sha256") or "")):
+        raise RuntimeError("MCP runtime data swap marker has an invalid staged manifest hash.")
+    _runtime_swap_child_path(output_dir, marker.get("staging_name"), RUNTIME_DATA_STAGE_NAME)
+    _runtime_swap_child_path(output_dir, marker.get("backup_name"), RUNTIME_DATA_BACKUP_NAME)
+    return marker_path, marker
+
+
+def _restore_runtime_swap_auxiliary_files(output_dir: Path, marker: dict[str, Any]) -> None:
+    snapshots = marker.get("stale_report_snapshots")
+    if not isinstance(snapshots, dict) or set(snapshots) != set(STALE_BUNDLE_STATUS_REPORT_FILENAMES):
+        raise RuntimeError("MCP runtime data swap report snapshots are incomplete.")
+    for filename in STALE_BUNDLE_STATUS_REPORT_FILENAMES:
+        _restore_runtime_swap_file_snapshot(output_dir / filename, snapshots[filename])
+    _restore_runtime_swap_file_snapshot(
+        output_dir / SETUP_BUNDLE_FILES["bundle_status"],
+        marker.get("status_snapshot"),
+    )
+
+
+def _recover_marked_runtime_data_swap(
+    output_dir: Path,
+    marker_path: Path,
+    marker: dict[str, Any],
+) -> str:
+    runtime_data_dir = output_dir / "data"
+    if runtime_data_dir.is_symlink():
+        raise RuntimeError("Refusing a symbolic-link runtime data directory during recovery.")
+    staging_dir = _runtime_swap_child_path(
+        output_dir,
+        marker["staging_name"],
+        RUNTIME_DATA_STAGE_NAME,
+    )
+    backup_dir = _runtime_swap_child_path(
+        output_dir,
+        marker["backup_name"],
+        RUNTIME_DATA_BACKUP_NAME,
+    )
+    stages = _runtime_swap_artifacts(output_dir, ".data-stage-", RUNTIME_DATA_STAGE_NAME)
+    backups = _runtime_swap_artifacts(output_dir, ".data-backup-", RUNTIME_DATA_BACKUP_NAME)
+    unexpected = [
+        path.name
+        for path in [*stages, *backups]
+        if path not in {staging_dir, backup_dir}
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "Ambiguous MCP runtime data swap artifacts require manual review: "
+            + ", ".join(sorted(unexpected))
+        )
+
+    expected_manifest_sha256 = str(marker["staged_manifest_sha256"])
+    phase = str(marker["phase"])
+    prior_data_exists = bool(marker["prior_data_exists"])
+    if phase == "committed":
+        _runtime_swap_candidate_manifest(
+            runtime_data_dir,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+        _remove_runtime_swap_artifact(staging_dir)
+        _remove_runtime_swap_artifact(backup_dir)
+        marker_path.unlink()
+        return "completed_committed_swap"
+
+    if prior_data_exists:
+        if backup_dir.exists():
+            _remove_runtime_swap_artifact(runtime_data_dir)
+            os.replace(backup_dir, runtime_data_dir)
+        elif not runtime_data_dir.exists():
+            raise RuntimeError(
+                "Interrupted MCP runtime swap lost both the final data directory and its recorded backup."
+            )
+        elif phase != "prepared" and _runtime_swap_candidate_has_manifest(
+            runtime_data_dir,
+            expected_manifest_sha256,
+        ):
+            raise RuntimeError(
+                "Interrupted MCP runtime swap cannot roll back because its recorded backup is missing; "
+                "the promoted data was preserved for manual review."
+            )
+        _restore_runtime_swap_auxiliary_files(output_dir, marker)
+        _remove_runtime_swap_artifact(staging_dir)
+        marker_path.unlink()
+        return "rolled_back_to_prior_data"
+
+    if runtime_data_dir.exists() and staging_dir.exists():
+        raise RuntimeError(
+            "Interrupted first-time MCP runtime swap has both staged and promoted data; recovery is ambiguous."
+        )
+    candidate = runtime_data_dir if runtime_data_dir.exists() else staging_dir
+    manifest = _runtime_swap_candidate_manifest(
+        candidate,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+    if candidate == staging_dir:
+        os.replace(staging_dir, runtime_data_dir)
+    _clear_stale_bundle_status_reports(output_dir)
+    _write_bundle_status(output_dir, runtime_manifest=manifest)
+    _remove_runtime_swap_artifact(backup_dir)
+    marker_path.unlink()
+    return "completed_first_runtime_swap"
+
+
+def _recover_legacy_runtime_data_swap(output_dir: Path) -> str | None:
+    """Recover pre-marker swap artifacts without guessing among backups."""
+
+    runtime_data_dir = output_dir / "data"
+    if runtime_data_dir.is_symlink():
+        raise RuntimeError("Refusing a symbolic-link runtime data directory during recovery.")
+    stages = _runtime_swap_artifacts(output_dir, ".data-stage-", RUNTIME_DATA_STAGE_NAME)
+    backups = _runtime_swap_artifacts(output_dir, ".data-backup-", RUNTIME_DATA_BACKUP_NAME)
+    if len(backups) > 1:
+        raise RuntimeError(
+            "Ambiguous legacy MCP runtime backups require manual review: "
+            + ", ".join(path.name for path in backups)
+        )
+    if backups:
+        backup_dir = backups[0]
+        if not runtime_data_dir.exists():
+            os.replace(backup_dir, runtime_data_dir)
+            for stage in stages:
+                _remove_runtime_swap_artifact(stage)
+            return "restored_unique_legacy_backup"
+        manifest = _runtime_swap_candidate_manifest(runtime_data_dir)
+        if not _runtime_swap_status_matches_manifest(output_dir, manifest):
+            raise RuntimeError(
+                "Legacy MCP runtime backup is ambiguous because bundle status does not identify "
+                "the current data directory."
+            )
+        _remove_runtime_swap_artifact(backup_dir)
+        for stage in stages:
+            _remove_runtime_swap_artifact(stage)
+        return "accepted_status_verified_legacy_data"
+    if not stages:
+        return None
+    if runtime_data_dir.exists():
+        for stage in stages:
+            _remove_runtime_swap_artifact(stage)
+        return "removed_abandoned_legacy_staging"
+
+    valid_stages: list[tuple[Path, dict[str, Any]]] = []
+    for stage in stages:
+        try:
+            manifest = _runtime_swap_candidate_manifest(stage)
+        except (OSError, RuntimeError, ValueError):
+            _remove_runtime_swap_artifact(stage)
+        else:
+            valid_stages.append((stage, manifest))
+    if len(valid_stages) > 1:
+        raise RuntimeError(
+            "Ambiguous legacy MCP runtime staging directories require manual review: "
+            + ", ".join(path.name for path, _manifest in valid_stages)
+        )
+    if not valid_stages:
+        return "removed_incomplete_legacy_staging"
+    stage, manifest = valid_stages[0]
+    os.replace(stage, runtime_data_dir)
+    _clear_stale_bundle_status_reports(output_dir)
+    _write_bundle_status(output_dir, runtime_manifest=manifest)
+    return "promoted_unique_legacy_staging"
+
+
+def _recover_interrupted_runtime_data_swap(output_dir: Path) -> str | None:
+    """Resolve one interrupted swap or fail closed when backups are ambiguous."""
+
+    output_dir = output_dir.resolve()
+    if output_dir == Path(output_dir.anchor):
+        raise ValueError("MCP runtime swap recovery cannot target a filesystem root.")
+    marker_state = _load_runtime_data_swap_marker(output_dir)
+    if marker_state is not None:
+        marker_path, marker = marker_state
+        return _recover_marked_runtime_data_swap(output_dir, marker_path, marker)
+    return _recover_legacy_runtime_data_swap(output_dir)
 
 
 @_guard_local_mcp_materialization
@@ -2329,12 +3413,14 @@ def write_mcp_runtime_data_bundle(
 
     output_dir = Path(out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _assert_no_active_bundle_installation(output_dir)
     runtime_data_dir = output_dir / "data"
     if runtime_data_dir.resolve() == Path(source_data_dir).resolve():
         raise ValueError("Runtime bundle output data dir must not be the same as the source data dir.")
+    _recover_interrupted_runtime_data_swap(output_dir)
+    _assert_no_active_bundle_installation(output_dir)
     staging_dir = output_dir / f".data-stage-{uuid4().hex}"
     backup_dir = output_dir / f".data-backup-{uuid4().hex}"
+    swap_marker_path = output_dir / RUNTIME_DATA_SWAP_MARKER_FILENAME
     status_path = output_dir / SETUP_BUNDLE_FILES["bundle_status"]
     prior_status_exists = status_path.is_file()
     prior_status_bytes = status_path.read_bytes() if prior_status_exists else None
@@ -2343,7 +3429,68 @@ def write_mcp_runtime_data_bundle(
         for filename in STALE_BUNDLE_STATUS_REPORT_FILENAMES
         if (output_dir / filename).is_file()
     }
+    prepared_runtime_inputs: dict[str, Any] | None = None
+    existing_manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+    existing_manifest = (
+        {}
+        if runtime_data_dir.is_symlink() or existing_manifest_path.is_symlink()
+        else _read_runtime_manifest(runtime_data_dir)
+    )
+    existing_input_sha256 = _runtime_manifest_reuse_input_sha256(existing_manifest)
+    if existing_input_sha256:
+        prepared_runtime_inputs = _prepare_mcp_runtime_data_bundle_inputs(
+            source_data_dir=source_data_dir,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            document_id=document_id,
+            document_ids=document_ids,
+            scope=scope,
+            tenant_storage_isolation=tenant_storage_isolation,
+            actor=actor,
+            role=role,
+            department_ids=department_ids,
+            require_kordoc_table_parser=require_kordoc_table_parser,
+            require_source_metadata=require_source_metadata,
+            progress_callback=None,
+        )
+        if existing_input_sha256 == prepared_runtime_inputs["input_sha256"]:
+            try:
+                reused_manifest = _validate_reusable_runtime_data_bundle(
+                    runtime_data_dir,
+                    final_runtime_data_dir=runtime_data_dir,
+                    prepared=prepared_runtime_inputs,
+                )
+            except Exception:
+                # Reuse is only an optimization. Any candidate-read or
+                # validation failure falls back to the normal staged rebuild;
+                # current-source approval validation already completed above
+                # and is deliberately outside this exception boundary.
+                pass
+            else:
+                try:
+                    _clear_stale_bundle_status_reports(output_dir)
+                    _write_bundle_status(output_dir, runtime_manifest=reused_manifest)
+                except BaseException:
+                    for filename in STALE_BUNDLE_STATUS_REPORT_FILENAMES:
+                        (output_dir / filename).unlink(missing_ok=True)
+                    for report_path, report_bytes in stale_report_snapshots.items():
+                        _replace_file_bytes_atomically(report_path, report_bytes)
+                    if prior_status_exists and prior_status_bytes is not None:
+                        _replace_file_bytes_atomically(status_path, prior_status_bytes)
+                    elif status_path.exists():
+                        status_path.unlink()
+                    raise
+                _report_runtime_progress(
+                    progress_callback,
+                    100,
+                    "기존 MCP 런타임 데이터 검증 및 재사용 완료",
+                    int(reused_manifest.get("record_count") or 0),
+                    int(reused_manifest.get("record_count") or 0),
+                )
+                return reused_manifest
+
     manifest: dict[str, Any] | None = None
+    swap_marker: dict[str, Any] | None = None
     data_swapped = False
     transaction_complete = False
     try:
@@ -2364,10 +3511,17 @@ def write_mcp_runtime_data_bundle(
             progress_callback=progress_callback,
             _runtime_data_dir=staging_dir,
             _write_status=False,
+            _prepared_runtime_inputs=prepared_runtime_inputs,
         )
         staged_manifest = _read_runtime_manifest(staging_dir)
         if not staged_manifest or staged_manifest != manifest:
             raise RuntimeError("Staged MCP runtime manifest did not pass commit validation.")
+        swap_marker_path, swap_marker = _create_runtime_data_swap_marker(
+            output_dir=output_dir,
+            runtime_data_dir=runtime_data_dir,
+            staging_dir=staging_dir,
+            backup_dir=backup_dir,
+        )
 
         if prior_status_exists:
             try:
@@ -2414,39 +3568,55 @@ def write_mcp_runtime_data_bundle(
 
         if runtime_data_dir.exists():
             os.replace(runtime_data_dir, backup_dir)
+            swap_marker = _update_runtime_data_swap_marker(
+                swap_marker_path,
+                swap_marker,
+                "backup_created",
+            )
         os.replace(staging_dir, runtime_data_dir)
         data_swapped = True
+        swap_marker = _update_runtime_data_swap_marker(
+            swap_marker_path,
+            swap_marker,
+            "data_promoted",
+        )
         _clear_stale_bundle_status_reports(output_dir)
         _write_bundle_status(output_dir, runtime_manifest=manifest)
+        swap_marker = _update_runtime_data_swap_marker(
+            swap_marker_path,
+            swap_marker,
+            "committed",
+        )
         transaction_complete = True
-    except BaseException:
-        if data_swapped and runtime_data_dir.exists():
-            if runtime_data_dir.is_dir():
-                shutil.rmtree(runtime_data_dir)
+    except BaseException as exc:
+        try:
+            if swap_marker_path.exists():
+                _recover_interrupted_runtime_data_swap(output_dir)
             else:
-                runtime_data_dir.unlink()
-        if backup_dir.exists():
-            os.replace(backup_dir, runtime_data_dir)
-        for filename in STALE_BUNDLE_STATUS_REPORT_FILENAMES:
-            report_path = output_dir / filename
-            report_path.unlink(missing_ok=True)
-        for report_path, report_bytes in stale_report_snapshots.items():
-            _replace_file_bytes_atomically(report_path, report_bytes)
-        if prior_status_exists and prior_status_bytes is not None:
-            _replace_file_bytes_atomically(status_path, prior_status_bytes)
-        elif status_path.exists():
-            status_path.unlink()
+                if data_swapped and runtime_data_dir.exists():
+                    _remove_runtime_swap_artifact(runtime_data_dir)
+                if backup_dir.exists():
+                    os.replace(backup_dir, runtime_data_dir)
+                for filename in STALE_BUNDLE_STATUS_REPORT_FILENAMES:
+                    report_path = output_dir / filename
+                    report_path.unlink(missing_ok=True)
+                for report_path, report_bytes in stale_report_snapshots.items():
+                    _replace_file_bytes_atomically(report_path, report_bytes)
+                if prior_status_exists and prior_status_bytes is not None:
+                    _replace_file_bytes_atomically(status_path, prior_status_bytes)
+                elif status_path.exists():
+                    status_path.unlink()
+        except BaseException as recovery_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"MCP runtime data swap recovery also failed: {recovery_exc}")
         raise
     finally:
-        if staging_dir.is_dir():
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        elif staging_dir.exists():
-            staging_dir.unlink(missing_ok=True)
         if transaction_complete:
-            if backup_dir.is_dir():
-                shutil.rmtree(backup_dir, ignore_errors=True)
-            elif backup_dir.exists():
-                backup_dir.unlink(missing_ok=True)
+            _remove_runtime_swap_artifact(staging_dir)
+            _remove_runtime_swap_artifact(backup_dir)
+            swap_marker_path.unlink()
+        elif not swap_marker_path.exists():
+            _remove_runtime_swap_artifact(staging_dir)
 
     assert manifest is not None
     _report_runtime_progress(
@@ -2470,22 +3640,15 @@ def _report_runtime_progress(
         callback(max(0, min(100, int(percent))), message, current, total)
 
 
-def _write_runtime_approval_snapshot_sidecar(
-    *,
-    runtime_data_dir: Path,
-    tenant_id: str,
-    document_ids: list[str],
-    records: list[dict[str, Any]],
-    auth: Any,
-) -> Path:
-    runtime_settings = settings_for_mcp_project(
-        data_dir=runtime_data_dir,
-        tenant_id=tenant_id,
-        tenant_storage_isolation=False,
-    )
-    runtime_repository = JsonRepository(runtime_settings)
-    entries = []
-    for record in sorted(records, key=lambda item: (str(item.get("document_id") or ""), str(item.get("chunk_id") or ""))):
+def _runtime_approval_snapshot_entries(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for record in sorted(
+        records,
+        key=lambda item: (
+            str(item.get("document_id") or ""),
+            str(item.get("chunk_id") or ""),
+        ),
+    ):
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         document_id = str(record.get("document_id") or metadata.get("document_id") or "")
         chunk_id = str(record.get("chunk_id") or metadata.get("chunk_id") or "")
@@ -2502,6 +3665,24 @@ def _write_runtime_approval_snapshot_sidecar(
                 "content_hash": str(record.get("content_hash") or ""),
             }
         )
+    return entries
+
+
+def _write_runtime_approval_snapshot_sidecar(
+    *,
+    runtime_data_dir: Path,
+    tenant_id: str,
+    document_ids: list[str],
+    records: list[dict[str, Any]],
+    auth: Any,
+) -> Path:
+    runtime_settings = settings_for_mcp_project(
+        data_dir=runtime_data_dir,
+        tenant_id=tenant_id,
+        tenant_storage_isolation=False,
+    )
+    runtime_repository = JsonRepository(runtime_settings)
+    entries = _runtime_approval_snapshot_entries(records)
     sidecar_path = runtime_repository.root / "approval_snapshot.json"
     payload = {
         "report_type": "mcp_runtime_approval_snapshot",
@@ -3119,6 +4300,10 @@ def _portable_handoff_payload(path: Path, *, arcname: str, source_dir: Path) -> 
             else "regulation_mcp",
         )
         portable = _replace_bundle_path_with_placeholder(portable_source, source_dir=source_dir)
+        if normalized_arcname == "data/mcp_runtime_manifest.json" and isinstance(portable, dict):
+            reuse = portable.get("runtime_data_reuse")
+            if isinstance(reuse, dict) and reuse.get("schema_version") == RUNTIME_DATA_REUSE_SCHEMA_VERSION:
+                reuse["manifest_sha256"] = _runtime_manifest_content_sha256(portable)
         return (json.dumps(portable, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if normalized_arcname == SETUP_BUNDLE_FILES["codex_config"]:
         text = path.read_text(encoding="utf-8-sig")
@@ -3396,7 +4581,7 @@ def _include_runtime_data_file_in_zip(path: Path, *, runtime_data_dir: Path) -> 
     relative_parts = path.relative_to(runtime_data_dir).parts
     if any(part.casefold() in BUNDLE_ZIP_EXCLUDED_DIR_NAMES for part in relative_parts[:-1]):
         return False
-    if path.name.startswith(".") or path.name in RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES:
+    if path.name.startswith(".") or _is_mutable_runtime_generated_file(path):
         return False
     if path.name == "mcp_runtime_manifest.json":
         return True
@@ -6411,7 +7596,7 @@ def _bundle_quickstart(
             "note": (
                 "Run against the actual local/full-profile server after starting it; synthetic smoke does not validate "
                 "the real tenant DB. External ChatGPT connectors use chatgpt-data and should validate "
-                "the catalog, hierarchy, exact-article, search, and fetch tools."
+                "the catalog, hierarchy, exact-article, reference, reference-cycle, search, and fetch tools."
             ),
         },
         "audit_index_visibility": {
@@ -6594,15 +7779,17 @@ def _chatgpt_connector_config(
             "Choose Streamable HTTP and enter connector_url.",
             "For a private endpoint, configure bearer_token_env_var or complete MCP OAuth login.",
             "Save the server and select Restart.",
-            "Verify the discovered tool list includes list_regulations, get_regulation_toc, "
-            "get_regulation_article, search, and fetch before using the app.",
-            "In a new chat, list the catalog, inspect one regulation TOC and article, then search and fetch evidence.",
+            "Verify the discovered tool list includes "
+            f"{', '.join(CHATGPT_DATA_TOOL_NAMES)} before using the app.",
+            "In a new chat, list the catalog, inspect one regulation TOC, article, and reference graph, "
+            "review any reported reference cycles, then search and fetch evidence.",
         ],
         "notes": [
             "ChatGPT Desktop, Codex CLI, and the IDE extension share the same Codex-host MCP configuration.",
             "Register only the deployed HTTPS /mcp URL for Streamable HTTP; do not enter a local folder.",
             "The chatgpt-data profile keeps the exact search(query) and fetch(id) input signatures required for "
-            "data-source compatibility and adds read-only catalog, TOC, and exact-article tools.",
+            "data-source compatibility and adds read-only catalog, TOC, exact-article, reference, and "
+            "reference-cycle tools.",
             "Citation URLs are absolute user-openable HTTP(S) source URLs or empty when no such source exists.",
             "Do not expose streamable-http or SSE MCP without authentication or approved network controls.",
             "Use only public or separately approved data when routing MCP responses to an external cloud AI.",
@@ -6751,12 +7938,36 @@ def _remote_auth_summary(remote_auth_token_env: str | None) -> dict[str, Any]:
     }
 
 
+def _canonical_readme_index_visibility_command(config: dict[str, Any]) -> str:
+    quickstart = config.get("quickstart") if isinstance(config.get("quickstart"), dict) else {}
+    audit = (
+        quickstart.get("audit_index_visibility")
+        if isinstance(quickstart.get("audit_index_visibility"), dict)
+        else {}
+    )
+    command = str(audit.get("command") or "reg-rag-mcp-index-visibility")
+    args = [str(value) for value in audit.get("args") or []]
+    if "--data-dir" in args:
+        data_index = args.index("--data-dir")
+        if data_index + 1 < len(args):
+            args[data_index + 1] = r".\data"
+        else:
+            args.append(r".\data")
+    else:
+        args[0:0] = ["--data-dir", r".\data"]
+    for required_flag in ("--forbid-smoke-docs", "--require-indexed"):
+        if required_flag not in args:
+            args.append(required_flag)
+    return _powershell_command(command, args)
+
+
 def _setup_bundle_readme(*, config: dict[str, Any], files: dict[str, str], server_name: str) -> str:
     """Return the canonical direct-connection guide shipped in new bundles."""
     connection_rows = "\n".join(
         f"| {item['client']} | {item['mode']} | `{item['primary_file']}` | {item['operator_action']} |"
         for item in _setup_bundle_connections(config)
     )
+    index_visibility_command = _canonical_readme_index_visibility_command(config)
     return f"""# {server_name} MCP bundle
 
 This bundle uses direct MCP configuration only. It does not contain BAT launchers or agent prompts.
@@ -6801,6 +8012,12 @@ The same deployment and `/mcp` endpoint serve ChatGPT Desktop, Codex, and Claude
 - Only approved runtime records belong in `data/`.
 - Do not deploy raw uploads, traces, exports, secrets, or the full local data directory.
 - Keep tokens in environment variables or a secret manager.
+- Verify indexed visibility from the bundle root before deployment:
+
+```powershell
+{index_visibility_command}
+```
+
 - Run `{files.get('validate', SETUP_BUNDLE_FILES['validate'])}` and an actual `search`/`fetch` call before declaring the connection ready.
 """
 
@@ -6811,6 +8028,7 @@ def _setup_bundle_readme_ko(*, config: dict[str, Any], files: dict[str, str], se
         f"| {item['client']} | {item['mode']} | `{item['primary_file']}` | {item['operator_action']} |"
         for item in _setup_bundle_connections(config)
     )
+    index_visibility_command = _canonical_readme_index_visibility_command(config)
     return f"""# {server_name} MCP 번들
 
 이 번들은 MCP 정식 직접 연결만 사용합니다. BAT 실행 파일과 에이전트 연결 프롬프트는 포함하지 않습니다.
@@ -6855,6 +8073,12 @@ https://<deployment>/mcp
 - `data/`에는 승인된 runtime record만 포함합니다.
 - 원본 업로드, trace, export, 비밀값, 로컬 전체 data 디렉터리를 배포하지 않습니다.
 - 토큰은 환경변수 또는 secret manager에만 둡니다.
+- 배포 전에 번들 루트에서 색인 가시성을 검증합니다.
+
+```powershell
+{index_visibility_command}
+```
+
 - `{files.get('validate', SETUP_BUNDLE_FILES['validate'])}`와 실제 `search`·`fetch` 호출을 통과해야 연결 완료로 판단합니다.
 """
 

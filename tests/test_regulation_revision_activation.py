@@ -13,7 +13,7 @@ from app.storage.repository import JsonRepository
 
 
 class RegulationRevisionActivationTests(unittest.TestCase):
-    def test_approved_revision_supersedes_legacy_prior_version_with_same_effective_day(self) -> None:
+    def test_approved_revision_defers_legacy_prior_version_with_same_effective_day(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp))
             repository = JsonRepository(settings)
@@ -68,10 +68,11 @@ class RegulationRevisionActivationTests(unittest.TestCase):
             updated_prior = repository.get_document(prior.document_id)
 
         self.assertIsNotNone(event)
-        self.assertEqual("completed", event["outcome"])
-        self.assertEqual("superseded", updated_prior.regulation_status)
-        self.assertEqual("2025-07-01", updated_prior.effective_from)
-        self.assertEqual("2025-07-01", updated_prior.effective_to)
+        self.assertEqual("deferred", event["outcome"])
+        self.assertEqual("deferred_nonsequential_effective_date", event["status"])
+        self.assertEqual("approved", updated_prior.regulation_status)
+        self.assertIsNone(updated_prior.effective_from)
+        self.assertIsNone(updated_prior.effective_to)
 
 
 if __name__ == "__main__":

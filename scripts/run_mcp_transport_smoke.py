@@ -206,6 +206,8 @@ def _run_transport_smoke_with_data_dir(
                 "list_regulations",
                 "get_regulation_toc",
                 "get_regulation_article",
+                "get_regulation_references",
+                "list_regulation_reference_cycles",
             }
             and (
                 normalized_transport != "streamable-http"
@@ -697,7 +699,15 @@ async def _call_profile_tools(
         else []
     )
     expected_tools = (
-        {"search", "fetch", "list_regulations", "get_regulation_toc", "get_regulation_article"}
+        {
+            "search",
+            "fetch",
+            "list_regulations",
+            "get_regulation_toc",
+            "get_regulation_article",
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
+        }
         if tool_profile == "chatgpt-data"
         else {
             "search",
@@ -706,6 +716,8 @@ async def _call_profile_tools(
             "list_regulations",
             "get_regulation_toc",
             "get_regulation_article",
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
             "get_index_status",
         }
     )
