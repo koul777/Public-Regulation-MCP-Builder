@@ -538,12 +538,25 @@ async def _call_profile_tools(
     list_regulations_elapsed_ms = 0.0
     list_regulations_result_count = 0
     list_regulations_total_count = 0
+    first_catalog_unit_id = ""
     hierarchy_payload: dict[str, Any] = {}
     hierarchy_elapsed_ms = 0.0
     hierarchy_verified = False
     exact_article_payload: dict[str, Any] = {}
     exact_article_elapsed_ms = 0.0
     exact_article_verified = False
+    first_article_no = ""
+    reference_lookup_payload: dict[str, Any] = {}
+    reference_lookup_elapsed_ms = 0.0
+    reference_lookup_verified = False
+    reference_lookup_attempted = False
+    reference_lookup_result_count = 0
+    reference_lookup_cycle_count = 0
+    reference_cycle_lookup_payload: dict[str, Any] = {}
+    reference_cycle_lookup_elapsed_ms = 0.0
+    reference_cycle_lookup_verified = False
+    reference_cycle_lookup_attempted = False
+    reference_cycle_result_count = 0
     if "list_regulations" in tool_names:
         list_regulations_started_at = time.perf_counter()
         list_regulations = await session.call_tool(
@@ -619,6 +632,32 @@ async def _call_profile_tools(
                     isinstance(item, dict) and bool(str(item.get("text") or "").strip())
                     for item in exact_articles
                 )
+        if "get_regulation_references" in tool_names and first_catalog_unit_id:
+            reference_lookup_attempted = True
+            reference_lookup_started_at = time.perf_counter()
+            reference_lookup = await session.call_tool(
+                "get_regulation_references",
+                {"regulation_unit_id": first_catalog_unit_id, "page": 1, "page_size": 50},
+            )
+            reference_lookup_elapsed_ms = _elapsed_ms(reference_lookup_started_at)
+            reference_lookup_payload = _tool_payload(reference_lookup)
+            reference_lookup_verified = _valid_reference_lookup_payload(reference_lookup_payload)
+            reference_lookup_result_count = len(_payload_list(reference_lookup_payload, "references"))
+            reference_lookup_cycle_count = len(_payload_list(reference_lookup_payload, "cycles"))
+        if "list_regulation_reference_cycles" in tool_names:
+            reference_cycle_lookup_attempted = True
+            reference_cycle_lookup_started_at = time.perf_counter()
+            reference_cycle_args: dict[str, Any] = {"page": 1, "page_size": 50}
+            if first_catalog_unit_id:
+                reference_cycle_args["regulation_unit_id"] = first_catalog_unit_id
+            reference_cycle_lookup = await session.call_tool(
+                "list_regulation_reference_cycles",
+                reference_cycle_args,
+            )
+            reference_cycle_lookup_elapsed_ms = _elapsed_ms(reference_cycle_lookup_started_at)
+            reference_cycle_lookup_payload = _tool_payload(reference_cycle_lookup)
+            reference_cycle_lookup_verified = _valid_reference_cycle_payload(reference_cycle_lookup_payload)
+            reference_cycle_result_count = len(_payload_list(reference_cycle_lookup_payload, "cycles"))
     index_status_payload: dict[str, Any] = {}
     index_status_elapsed_ms = 0.0
     index_status_verified = False
@@ -729,6 +768,8 @@ async def _call_profile_tools(
             and catalog_verified
             and hierarchy_verified
             and exact_article_verified
+            and reference_lookup_verified
+            and reference_cycle_lookup_verified
             and results
             and fetch_payload.get("text")
         ),
@@ -742,6 +783,8 @@ async def _call_profile_tools(
             and catalog_verified
             and hierarchy_verified
             and exact_article_verified
+            and reference_lookup_verified
+            and reference_cycle_lookup_verified
             and results
             and fetch_payload.get("text")
         ),
@@ -754,6 +797,15 @@ async def _call_profile_tools(
         "hierarchy_elapsed_ms": hierarchy_elapsed_ms,
         "exact_article_verified": exact_article_verified,
         "exact_article_elapsed_ms": exact_article_elapsed_ms,
+        "reference_lookup_attempted": reference_lookup_attempted,
+        "reference_lookup_verified": reference_lookup_verified,
+        "reference_lookup_result_count": reference_lookup_result_count,
+        "reference_lookup_cycle_count": reference_lookup_cycle_count,
+        "reference_lookup_elapsed_ms": reference_lookup_elapsed_ms,
+        "reference_cycle_lookup_attempted": reference_cycle_lookup_attempted,
+        "reference_cycle_lookup_verified": reference_cycle_lookup_verified,
+        "reference_cycle_result_count": reference_cycle_result_count,
+        "reference_cycle_lookup_elapsed_ms": reference_cycle_lookup_elapsed_ms,
         "catalog_verified": catalog_verified,
         "query": query,
         "no_warm_cache": no_warm_cache,
@@ -768,6 +820,8 @@ async def _call_profile_tools(
         "history_current_match": history_current_match,
         "history_has_superseded": history_has_superseded,
         "history_error": history_error,
+        "reference_lookup_metadata": reference_lookup_payload.get("metadata") or {},
+        "reference_cycle_lookup_metadata": reference_cycle_lookup_payload.get("metadata") or {},
         "first_result_metadata": first_result_metadata,
         "search_metadata": search_metadata,
         "list_tools_elapsed_ms": list_tools_elapsed_ms,
@@ -796,6 +850,106 @@ def _tool_payload(result: Any) -> dict[str, Any]:
             if isinstance(decoded, dict):
                 return decoded
     return {}
+
+
+def _payload_list(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized >= 1 else None
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
+def _valid_reference_lookup_payload(payload: dict[str, Any]) -> bool:
+    references = _payload_list(payload, "references")
+    cycles = _payload_list(payload, "cycles")
+    regulation = payload.get("regulation")
+    metadata = payload.get("metadata")
+    total_count = _non_negative_int(payload.get("total_count"))
+    page = _positive_int(payload.get("page"))
+    page_size = _positive_int(payload.get("page_size"))
+    if (
+        not isinstance(regulation, dict)
+        or not str(regulation.get("regulation_unit_id") or "").strip()
+        or not isinstance(payload.get("references"), list)
+        or not isinstance(payload.get("cycles"), list)
+        or not isinstance(metadata, dict)
+        or total_count is None
+        or page is None
+        or page_size is None
+        or total_count < len(references)
+        or payload.get("next_cursor") is not None
+        and not isinstance(payload.get("next_cursor"), str)
+        or metadata.get("hierarchical_index_ready") is not True
+        or str(metadata.get("direction") or "").strip().casefold() not in {"incoming", "outgoing", "both"}
+    ):
+        return False
+    if references:
+        first_reference = references[0]
+        if (
+            not str(first_reference.get("reference_id") or "").strip()
+            or not isinstance(first_reference.get("candidate_regulations"), list)
+            or not isinstance(first_reference.get("reason_codes"), list)
+            or not isinstance(first_reference.get("match_types"), list)
+        ):
+            return False
+    if cycles:
+        first_cycle = cycles[0]
+        if (
+            not str(first_cycle.get("cycle_id") or "").strip()
+            or _non_negative_int(first_cycle.get("size")) is None
+            or not isinstance(first_cycle.get("regulations"), list)
+        ):
+            return False
+    return True
+
+
+def _valid_reference_cycle_payload(payload: dict[str, Any]) -> bool:
+    cycles = _payload_list(payload, "cycles")
+    metadata = payload.get("metadata")
+    total_count = _non_negative_int(payload.get("total_count"))
+    page = _positive_int(payload.get("page"))
+    page_size = _positive_int(payload.get("page_size"))
+    if (
+        not isinstance(payload.get("cycles"), list)
+        or not isinstance(metadata, dict)
+        or total_count is None
+        or page is None
+        or page_size is None
+        or total_count < len(cycles)
+        or payload.get("next_cursor") is not None
+        and not isinstance(payload.get("next_cursor"), str)
+        or metadata.get("hierarchical_index_ready") is not True
+    ):
+        return False
+    if cycles:
+        first_cycle = cycles[0]
+        if (
+            not str(first_cycle.get("cycle_id") or "").strip()
+            or _non_negative_int(first_cycle.get("size")) is None
+            or not isinstance(first_cycle.get("regulations"), list)
+        ):
+            return False
+    return True
 
 
 def _find_free_tcp_port(host: str) -> int:
