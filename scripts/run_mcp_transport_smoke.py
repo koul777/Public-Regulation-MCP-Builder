@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -28,6 +29,27 @@ from scripts.report_metadata import current_repo_commit
 
 
 DEFAULT_SEARCH_QUERY = "Article"
+TEMPORAL_REGULATION_TITLE = "MCP Smoke Regulation"
+TEMPORAL_REGULATION_ID = "reg_mcp_smoke"
+TEMPORAL_CURRENT_DOCUMENT_ID = "doc_mcp_smoke_v2"
+TEMPORAL_AS_OF_CASES: tuple[dict[str, str | None], ...] = (
+    {
+        "label": "v1",
+        "as_of_date": "2025-06-01",
+        "expected_document_id": "doc_mcp_smoke_v1",
+        "expected_regulation_version": "1.0",
+        "expected_effective_from": "2025-01-01",
+        "expected_effective_to": "2025-12-31",
+    },
+    {
+        "label": "v2",
+        "as_of_date": "2026-06-01",
+        "expected_document_id": "doc_mcp_smoke_v2",
+        "expected_regulation_version": "2.0",
+        "expected_effective_from": "2026-01-01",
+        "expected_effective_to": None,
+    },
+)
 
 
 def run_mcp_transport_smoke(
@@ -199,6 +221,7 @@ def _run_transport_smoke_with_data_dir(
             and full_profile.get("fetch_has_text")
             and full_profile.get("history_tool_available")
             and full_profile.get("history_passed")
+            and (not prepare or full_profile.get("as_of_date_verification_passed"))
             and set(chatgpt_profile.get("tool_names") or [])
             == {
                 "search",
@@ -219,6 +242,7 @@ def _run_transport_smoke_with_data_dir(
         "mcp_initialized": bool(full_profile.get("mcp_initialized")),
         "tools_discovered": bool(full_profile.get("tools_discovered")),
         "end_to_end_verified": bool(full_profile.get("end_to_end_verified")),
+        "as_of_date_verification_passed": full_profile.get("as_of_date_verification_passed"),
         "preparation": {
             "passed": bool(preparation.get("passed")),
             "search_result_count": preparation.get("search_result_count"),
@@ -470,55 +494,62 @@ async def _call_streamable_http_profile(
     if http_bearer_token:
         process_env["MCP_TRANSPORT_SMOKE_TOKEN"] = http_bearer_token
         server_args.extend(["--http-bearer-token-env", "MCP_TRANSPORT_SMOKE_TOKEN"])
-    process = subprocess.Popen(
-        [sys.executable, *server_args],
-        cwd=str(PROJECT_ROOT),
-        env=process_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    try:
-        _wait_for_tcp_port(host, selected_port, process, timeout_seconds=startup_timeout_seconds)
-        auth_wire_verified = True
-        if http_bearer_token:
-            async with httpx.AsyncClient(timeout=startup_timeout_seconds) as unauthenticated_client:
-                unauthorized = await unauthenticated_client.get(
-                    endpoint_url,
-                    headers={"Accept": "application/json, text/event-stream"},
-                )
-            auth_wire_verified = unauthorized.status_code == 401
-            http_client = httpx.AsyncClient(
-                headers={"Authorization": f"Bearer {http_bearer_token}"},
-                timeout=startup_timeout_seconds,
-            )
-        else:
-            http_client = None
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as process_output:
+        process = subprocess.Popen(
+            [sys.executable, *server_args],
+            cwd=str(PROJECT_ROOT),
+            env=process_env,
+            stdout=process_output,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         try:
-            client_kwargs = {"http_client": http_client} if http_client is not None else {}
-            async with streamable_http_client(endpoint_url, **client_kwargs) as (read, write, get_session_id):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    profile = await _call_profile_tools(
-                        session,
-                        tool_profile=tool_profile,
-                        profile_id=profile_id,
-                        query=query,
-                        no_warm_cache=no_warm_cache,
-                        profile_started_at=profile_started_at,
+            _wait_for_tcp_port(
+                host,
+                selected_port,
+                process,
+                timeout_seconds=startup_timeout_seconds,
+                process_output=process_output,
+            )
+            auth_wire_verified = True
+            if http_bearer_token:
+                async with httpx.AsyncClient(timeout=startup_timeout_seconds) as unauthenticated_client:
+                    unauthorized = await unauthenticated_client.get(
+                        endpoint_url,
+                        headers={"Accept": "application/json, text/event-stream"},
                     )
-                    profile["server_url"] = endpoint_url
-                    profile["server_port"] = selected_port
-                    profile["session_id_present"] = bool(get_session_id())
-                    profile["auth_wire_verified"] = auth_wire_verified
-                    return profile
+                auth_wire_verified = unauthorized.status_code == 401
+                http_client = httpx.AsyncClient(
+                    headers={"Authorization": f"Bearer {http_bearer_token}"},
+                    timeout=startup_timeout_seconds,
+                )
+            else:
+                http_client = None
+            try:
+                client_kwargs = {"http_client": http_client} if http_client is not None else {}
+                async with streamable_http_client(endpoint_url, **client_kwargs) as (read, write, get_session_id):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        profile = await _call_profile_tools(
+                            session,
+                            tool_profile=tool_profile,
+                            profile_id=profile_id,
+                            query=query,
+                            no_warm_cache=no_warm_cache,
+                            profile_started_at=profile_started_at,
+                        )
+                        profile["server_url"] = endpoint_url
+                        profile["server_port"] = selected_port
+                        profile["session_id_present"] = bool(get_session_id())
+                        profile["auth_wire_verified"] = auth_wire_verified
+                        return profile
+            finally:
+                if http_client is not None:
+                    await http_client.aclose()
         finally:
-            if http_client is not None:
-                await http_client.aclose()
-    finally:
-        _terminate_process(process)
+            _terminate_process(process)
 
 
 async def _call_profile_tools(
@@ -545,6 +576,8 @@ async def _call_profile_tools(
     exact_article_payload: dict[str, Any] = {}
     exact_article_elapsed_ms = 0.0
     exact_article_verified = False
+    exact_article_regulation_id = ""
+    exact_article_document_id = ""
     first_article_no = ""
     reference_lookup_payload: dict[str, Any] = {}
     reference_lookup_elapsed_ms = 0.0
@@ -557,6 +590,7 @@ async def _call_profile_tools(
     reference_cycle_lookup_verified = False
     reference_cycle_lookup_attempted = False
     reference_cycle_result_count = 0
+    catalog_rows: list[Any] = []
     if "list_regulations" in tool_names:
         list_regulations_started_at = time.perf_counter()
         list_regulations = await session.call_tool(
@@ -572,12 +606,21 @@ async def _call_profile_tools(
         )
         list_regulations_result_count = len(catalog_rows)
         list_regulations_total_count = int(list_regulations_payload.get("total_count") or 0)
-        first_catalog_unit_id = str(
-            (catalog_rows[0] if catalog_rows and isinstance(catalog_rows[0], dict) else {}).get(
-                "regulation_unit_id"
-            )
-            or ""
+        first_catalog_row = next(
+            (
+                row
+                for row in catalog_rows
+                if tool_profile == "full"
+                and isinstance(row, dict)
+                and str(row.get("regulation_title") or "").strip() == TEMPORAL_REGULATION_TITLE
+            ),
+            catalog_rows[0] if catalog_rows else {},
         )
+        first_catalog_unit_id = str(
+            first_catalog_row.get("regulation_unit_id")
+            if isinstance(first_catalog_row, dict)
+            else ""
+        ).strip()
         if "get_regulation_toc" in tool_names and first_catalog_unit_id:
             hierarchy_started_at = time.perf_counter()
             hierarchy = await session.call_tool(
@@ -632,6 +675,30 @@ async def _call_profile_tools(
                     isinstance(item, dict) and bool(str(item.get("text") or "").strip())
                     for item in exact_articles
                 )
+                first_exact_article = next(
+                    (item for item in exact_articles if isinstance(item, dict)),
+                    {},
+                )
+                first_exact_article_metadata = (
+                    first_exact_article.get("metadata")
+                    if isinstance(first_exact_article.get("metadata"), dict)
+                    else {}
+                )
+                first_exact_article_verbatim = (
+                    first_exact_article.get("verbatim")
+                    if isinstance(first_exact_article.get("verbatim"), dict)
+                    else {}
+                )
+                exact_article_regulation_id = str(
+                    first_exact_article_metadata.get("regulation_id")
+                    or first_exact_article_verbatim.get("regulation_id")
+                    or ""
+                ).strip()
+                exact_article_document_id = str(
+                    first_exact_article_metadata.get("document_id")
+                    or first_exact_article_verbatim.get("document_id")
+                    or ""
+                ).strip()
         if "get_regulation_references" in tool_names and first_catalog_unit_id:
             reference_lookup_attempted = True
             reference_lookup_started_at = time.perf_counter()
@@ -694,31 +761,48 @@ async def _call_profile_tools(
     history_error = ""
     history_attempted = False
     history_tool_available = "get_regulation_history" in tool_names
-    regulation_id = str(
-        ((results[0] if results else {}).get("metadata") or {}).get("regulation_id") or ""
-    ).strip()
-    if tool_profile == "full" and history_tool_available and regulation_id:
-        history_attempted = True
-        try:
-            history = await session.call_tool(
-                "get_regulation_history",
-                {
-                    "regulation_id": regulation_id,
-                    **({"profile_id": profile_id} if profile_id else {}),
-                },
+    as_of_date_verification = _unavailable_as_of_date_verification(tool_profile=tool_profile)
+    if tool_profile == "full":
+        temporal_fixture_available = bool(
+            history_tool_available
+            and exact_article_regulation_id == TEMPORAL_REGULATION_ID
+            and exact_article_document_id == TEMPORAL_CURRENT_DOCUMENT_ID
+            and first_catalog_unit_id
+            and first_article_no
+        )
+        if temporal_fixture_available:
+            as_of_date_verification, history_payload = await _run_as_of_date_verification(
+                session,
+                regulation_id=exact_article_regulation_id,
+                regulation_unit_id=first_catalog_unit_id,
+                article_no=first_article_no,
+                profile_id=profile_id,
             )
-            history_payload = _tool_payload(history)
-        except Exception as exc:
-            history_error = str(exc)
+            history_attempted = bool(as_of_date_verification.get("attempted"))
+            history_error = str(as_of_date_verification.get("error") or "")
+        elif history_tool_available and exact_article_regulation_id:
+            history_attempted = True
+            try:
+                history = await session.call_tool(
+                    "get_regulation_history",
+                    {
+                        "regulation_id": exact_article_regulation_id,
+                        **({"profile_id": profile_id} if profile_id else {}),
+                    },
+                )
+                history_payload = _tool_payload(history)
+            except Exception as exc:
+                history_error = str(exc)
     first_result_metadata = (results[0] if results else {}).get("metadata") or {}
     history_versions = history_payload.get("versions") if isinstance(history_payload.get("versions"), list) else []
     history_current_document_id = str(history_payload.get("current_document_id") or "").strip()
     first_result_document_id = str(first_result_metadata.get("document_id") or "").strip()
+    history_current_match_target = exact_article_document_id or first_result_document_id
     history_current_match = bool(
         history_attempted
         and history_current_document_id
-        and first_result_document_id
-        and history_current_document_id == first_result_document_id
+        and history_current_match_target
+        and history_current_document_id == history_current_match_target
     )
     history_has_superseded = any(
         str(version.get("regulation_status") or "").strip().casefold() == "superseded"
@@ -765,6 +849,11 @@ async def _call_profile_tools(
         "passed": bool(
             expected_tools.issubset(set(tool_names))
             and (tool_profile == "chatgpt-data" or index_status_verified)
+            and (
+                tool_profile == "chatgpt-data"
+                or not as_of_date_verification.get("applicable")
+                or as_of_date_verification.get("passed")
+            )
             and catalog_verified
             and hierarchy_verified
             and exact_article_verified
@@ -780,6 +869,11 @@ async def _call_profile_tools(
         "end_to_end_verified": bool(
             expected_tools.issubset(set(tool_names))
             and (tool_profile == "chatgpt-data" or index_status_verified)
+            and (
+                tool_profile == "chatgpt-data"
+                or not as_of_date_verification.get("applicable")
+                or as_of_date_verification.get("passed")
+            )
             and catalog_verified
             and hierarchy_verified
             and exact_article_verified
@@ -814,12 +908,23 @@ async def _call_profile_tools(
         "fetch_has_text": bool(fetch_payload.get("text")),
         "history_tool_available": history_tool_available,
         "history_attempted": history_attempted,
-        "history_passed": bool(history_versions) and history_current_match if history_attempted else False,
+        "history_passed": bool(
+            history_attempted
+            and history_versions
+            and history_current_match
+            and (
+                not as_of_date_verification.get("applicable")
+                or as_of_date_verification.get("passed")
+            )
+        ),
         "history_version_count": len(history_versions),
         "history_current_document_id": history_current_document_id,
         "history_current_match": history_current_match,
+        "history_current_match_target_document_id": history_current_match_target,
         "history_has_superseded": history_has_superseded,
         "history_error": history_error,
+        "as_of_date_verification_passed": as_of_date_verification.get("passed"),
+        "as_of_date_verification": as_of_date_verification,
         "reference_lookup_metadata": reference_lookup_payload.get("metadata") or {},
         "reference_cycle_lookup_metadata": reference_cycle_lookup_payload.get("metadata") or {},
         "first_result_metadata": first_result_metadata,
@@ -832,6 +937,325 @@ async def _call_profile_tools(
         "warm_search_elapsed_ms": warm_search_elapsed_ms,
         "total_elapsed_ms": _elapsed_ms(profile_started_at),
     }
+
+
+def _unavailable_as_of_date_verification(*, tool_profile: str) -> dict[str, Any]:
+    return {
+        "applicable": False,
+        "attempted": False,
+        "passed": None,
+        "skipped_reason": (
+            "The deterministic synthetic temporal fixture is not available."
+            if tool_profile == "full"
+            else "The chatgpt-data profile intentionally has no temporal verification extension."
+        ),
+        "regulation_id": "",
+        "regulation_unit_id": "",
+        "article_no": "",
+        "as_of_dates": [str(case["as_of_date"]) for case in TEMPORAL_AS_OF_CASES],
+        "cases": [],
+        "selected_document_ids_differ": False,
+        "history_versions_differ": False,
+        "toc_versions_differ": False,
+        "article_document_ids_differ": False,
+        "article_versions_differ": False,
+        "article_texts_differ": False,
+        "history_total_elapsed_ms": 0.0,
+        "toc_total_elapsed_ms": 0.0,
+        "article_total_elapsed_ms": 0.0,
+        "total_elapsed_ms": 0.0,
+        "error": "",
+    }
+
+
+async def _run_as_of_date_verification(
+    session: ClientSession,
+    *,
+    regulation_id: str,
+    regulation_unit_id: str,
+    article_no: str,
+    profile_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    started_at = time.perf_counter()
+    cases: list[dict[str, Any]] = []
+    latest_history_payload: dict[str, Any] = {}
+    profile_arguments = {"profile_id": profile_id} if profile_id else {}
+    for case_spec in TEMPORAL_AS_OF_CASES:
+        as_of_date = str(case_spec["as_of_date"])
+        common_unit_arguments = {
+            "regulation_unit_id": regulation_unit_id,
+            "as_of_date": as_of_date,
+            **profile_arguments,
+        }
+        tool_calls = (
+            (
+                "history",
+                "get_regulation_history",
+                {"regulation_id": regulation_id, "as_of_date": as_of_date, **profile_arguments},
+            ),
+            ("toc", "get_regulation_toc", common_unit_arguments),
+            (
+                "article",
+                "get_regulation_article",
+                {**common_unit_arguments, "article_no": article_no},
+            ),
+        )
+        payloads: dict[str, dict[str, Any]] = {}
+        timings: dict[str, float] = {}
+        call_errors: list[str] = []
+        for key, tool_name, arguments in tool_calls:
+            payloads[key], timings[key], call_error = await _timed_tool_call(session, tool_name, arguments)
+            if call_error:
+                call_errors.append(f"{tool_name}: {call_error}")
+        case_result = _validate_temporal_case_payloads(
+            case_spec=case_spec,
+            regulation_id=regulation_id,
+            regulation_unit_id=regulation_unit_id,
+            article_no=article_no,
+            history_payload=payloads["history"],
+            toc_payload=payloads["toc"],
+            article_payload=payloads["article"],
+        )
+        if call_errors:
+            case_result["errors"] = [*case_result["errors"], *call_errors]
+            case_result["passed"] = False
+        case_result.update(
+            {
+                "history_elapsed_ms": timings["history"],
+                "toc_elapsed_ms": timings["toc"],
+                "article_elapsed_ms": timings["article"],
+            }
+        )
+        cases.append(case_result)
+        if case_spec["label"] == "v2":
+            latest_history_payload = payloads["history"]
+
+    selected_document_ids = [str(case.get("history_current_document_id") or "") for case in cases]
+    history_versions = [str(case.get("history_regulation_version") or "") for case in cases]
+    toc_versions = [str(case.get("toc_version") or "") for case in cases]
+    article_document_ids = [str(case.get("article_document_id") or "") for case in cases]
+    article_versions = [str(case.get("article_regulation_version") or "") for case in cases]
+    article_text_hashes = [str(case.get("article_text_sha256") or "") for case in cases]
+    comparison_checks = {
+        "selected_document_ids_differ": _two_nonempty_values_differ(selected_document_ids),
+        "history_versions_differ": _two_nonempty_values_differ(history_versions),
+        "toc_versions_differ": _two_nonempty_values_differ(toc_versions),
+        "article_document_ids_differ": _two_nonempty_values_differ(article_document_ids),
+        "article_versions_differ": _two_nonempty_values_differ(article_versions),
+        "article_texts_differ": _two_nonempty_values_differ(article_text_hashes),
+    }
+    errors = [
+        f"{case.get('label')} ({case.get('as_of_date')}): {', '.join(case.get('errors') or [])}"
+        for case in cases
+        if case.get("errors")
+    ]
+    failed_comparisons = [name for name, passed in comparison_checks.items() if not passed]
+    if failed_comparisons:
+        errors.append("Temporal comparison checks failed: " + ", ".join(failed_comparisons))
+    report = {
+        "applicable": True,
+        "attempted": True,
+        "skipped_reason": "",
+        "passed": bool(
+            len(cases) == len(TEMPORAL_AS_OF_CASES)
+            and all(case.get("passed") for case in cases)
+            and all(comparison_checks.values())
+        ),
+        "regulation_id": regulation_id,
+        "regulation_unit_id": regulation_unit_id,
+        "article_no": article_no,
+        "as_of_dates": [str(case["as_of_date"]) for case in TEMPORAL_AS_OF_CASES],
+        "cases": cases,
+        **comparison_checks,
+        "history_total_elapsed_ms": round(sum(float(case["history_elapsed_ms"]) for case in cases), 3),
+        "toc_total_elapsed_ms": round(sum(float(case["toc_elapsed_ms"]) for case in cases), 3),
+        "article_total_elapsed_ms": round(sum(float(case["article_elapsed_ms"]) for case in cases), 3),
+        "total_elapsed_ms": _elapsed_ms(started_at),
+        "error": "; ".join(errors),
+    }
+    return report, latest_history_payload
+
+
+async def _timed_tool_call(
+    session: ClientSession,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], float, str]:
+    started_at = time.perf_counter()
+    try:
+        result = await session.call_tool(tool_name, arguments)
+        return _tool_payload(result), _elapsed_ms(started_at), ""
+    except Exception as exc:
+        return {}, _elapsed_ms(started_at), str(exc)
+
+
+def _validate_temporal_case_payloads(
+    *,
+    case_spec: dict[str, str | None],
+    regulation_id: str,
+    regulation_unit_id: str,
+    article_no: str,
+    history_payload: dict[str, Any],
+    toc_payload: dict[str, Any],
+    article_payload: dict[str, Any],
+) -> dict[str, Any]:
+    label = str(case_spec.get("label") or "")
+    as_of_date = str(case_spec.get("as_of_date") or "")
+    expected_document_id = str(case_spec.get("expected_document_id") or "")
+    expected_regulation_version = str(case_spec.get("expected_regulation_version") or "")
+    expected_effective_from = str(case_spec.get("expected_effective_from") or "")
+    expected_effective_to = case_spec.get("expected_effective_to")
+    errors: list[str] = []
+
+    raw_history_versions = history_payload.get("versions")
+    history_versions = _payload_list(history_payload, "versions")
+    history_current_document_id = str(history_payload.get("current_document_id") or "").strip()
+    effective_history_versions = [
+        version for version in history_versions if version.get("is_effective_on_as_of") is True
+    ]
+    current_history_versions = [version for version in history_versions if version.get("is_current") is True]
+    selected_history_version = next(
+        (
+            version
+            for version in history_versions
+            if str(version.get("document_id") or "").strip() == history_current_document_id
+        ),
+        {},
+    )
+    history_regulation_version = str(selected_history_version.get("regulation_version") or "").strip()
+    history_verified = bool(
+        isinstance(history_payload, dict)
+        and str(history_payload.get("regulation_id") or "").strip() == regulation_id
+        and str(history_payload.get("as_of_date") or "").strip() == as_of_date
+        and isinstance(raw_history_versions, list)
+        and bool(raw_history_versions)
+        and len(history_versions) == len(raw_history_versions)
+        and history_current_document_id == expected_document_id
+        and len(effective_history_versions) == 1
+        and str(effective_history_versions[0].get("document_id") or "").strip() == expected_document_id
+        and len(current_history_versions) == 1
+        and str(current_history_versions[0].get("document_id") or "").strip() == expected_document_id
+        and history_regulation_version == expected_regulation_version
+        and str(selected_history_version.get("effective_from") or "").strip() == expected_effective_from
+        and _optional_temporal_value_matches(
+            selected_history_version.get("effective_to"),
+            expected_effective_to,
+        )
+    )
+    if not history_verified:
+        errors.append("history payload did not select the expected effective version")
+
+    toc_regulation = toc_payload.get("regulation")
+    toc_metadata = toc_payload.get("metadata")
+    raw_toc_nodes = toc_payload.get("nodes")
+    toc_version = (
+        str(toc_regulation.get("version") or "").strip() if isinstance(toc_regulation, dict) else ""
+    )
+    toc_verified = bool(
+        isinstance(toc_regulation, dict)
+        and str(toc_regulation.get("regulation_unit_id") or "").strip() == regulation_unit_id
+        and toc_version
+        and str(toc_regulation.get("effective_from") or "").strip() == expected_effective_from
+        and _optional_temporal_value_matches(toc_regulation.get("effective_to"), expected_effective_to)
+        and isinstance(raw_toc_nodes, list)
+        and bool(raw_toc_nodes)
+        and all(isinstance(node, dict) for node in raw_toc_nodes)
+        and isinstance(toc_metadata, dict)
+        and toc_metadata.get("hierarchical_index_ready") is True
+        and str(toc_metadata.get("as_of_date") or "").strip() == as_of_date
+    )
+    if not toc_verified:
+        errors.append("TOC payload did not resolve the expected dated regulation unit")
+
+    raw_articles = article_payload.get("articles")
+    articles = _payload_list(article_payload, "articles")
+    matching_articles = []
+    for article in articles:
+        metadata = article.get("metadata") if isinstance(article.get("metadata"), dict) else {}
+        verbatim = article.get("verbatim") if isinstance(article.get("verbatim"), dict) else {}
+        text = str(article.get("text") or "").strip()
+        if (
+            text
+            and str(article.get("verbatim_text") or "").strip() == text
+            and str(verbatim.get("document_id") or "").strip() == expected_document_id
+            and str(verbatim.get("text") or "").strip() == text
+            and str(metadata.get("document_id") or "").strip() == expected_document_id
+            and str(metadata.get("regulation_version") or "").strip() == expected_regulation_version
+            and str(metadata.get("effective_from") or "").strip() == expected_effective_from
+            and _optional_temporal_value_matches(metadata.get("effective_to"), expected_effective_to)
+        ):
+            matching_articles.append(article)
+    selected_article = matching_articles[0] if matching_articles else {}
+    article_metadata = (
+        selected_article.get("metadata") if isinstance(selected_article.get("metadata"), dict) else {}
+    )
+    article_text = "\n".join(
+        str(article.get("text") or "").strip()
+        for article in matching_articles
+        if str(article.get("text") or "").strip()
+    )
+    article_document_id = str(article_metadata.get("document_id") or "").strip()
+    article_regulation_version = str(article_metadata.get("regulation_version") or "").strip()
+    article_verified = bool(
+        str(article_payload.get("regulation_unit_id") or "").strip() == regulation_unit_id
+        and str(article_payload.get("article_no") or "").strip() == article_no
+        and str(article_payload.get("as_of_date") or "").strip() == as_of_date
+        and isinstance(raw_articles, list)
+        and bool(raw_articles)
+        and len(articles) == len(raw_articles)
+        and len(matching_articles) == len(articles)
+    )
+    if not article_verified:
+        errors.append("article payload did not return the expected dated document and text")
+
+    return {
+        "label": label,
+        "as_of_date": as_of_date,
+        "expected_document_id": expected_document_id,
+        "expected_regulation_version": expected_regulation_version,
+        "expected_effective_from": expected_effective_from,
+        "expected_effective_to": expected_effective_to,
+        "history_verified": history_verified,
+        "history_current_document_id": history_current_document_id,
+        "history_effective_document_ids": [
+            str(version.get("document_id") or "").strip() for version in effective_history_versions
+        ],
+        "history_regulation_version": history_regulation_version,
+        "toc_verified": toc_verified,
+        "toc_regulation_unit_id": (
+            str(toc_regulation.get("regulation_unit_id") or "").strip()
+            if isinstance(toc_regulation, dict)
+            else ""
+        ),
+        "toc_version": toc_version,
+        "toc_effective_from": (
+            str(toc_regulation.get("effective_from") or "").strip()
+            if isinstance(toc_regulation, dict)
+            else ""
+        ),
+        "toc_effective_to": (
+            toc_regulation.get("effective_to") if isinstance(toc_regulation, dict) else None
+        ),
+        "article_verified": article_verified,
+        "article_regulation_unit_id": str(article_payload.get("regulation_unit_id") or "").strip(),
+        "article_document_id": article_document_id,
+        "article_regulation_version": article_regulation_version,
+        "article_text_length": len(article_text),
+        "article_text_sha256": (
+            hashlib.sha256(article_text.encode("utf-8")).hexdigest() if article_text else ""
+        ),
+        "passed": bool(history_verified and toc_verified and article_verified),
+        "errors": errors,
+    }
+
+
+def _optional_temporal_value_matches(value: Any, expected: str | None) -> bool:
+    normalized = str(value or "").strip()
+    return normalized == (expected or "")
+
+
+def _two_nonempty_values_differ(values: list[str]) -> bool:
+    return len(values) == 2 and all(values) and values[0] != values[1]
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -964,11 +1388,12 @@ def _wait_for_tcp_port(
     process: subprocess.Popen[str],
     *,
     timeout_seconds: float,
+    process_output: TextIO | None = None,
 ) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         if process.poll() is not None:
-            output = _read_process_output(process)
+            output = _read_process_output(process, process_output=process_output)
             raise RuntimeError(f"MCP streamable-http server exited with code {process.returncode}: {output}")
         try:
             with socket.create_connection((host, port), timeout=0.25):
@@ -990,11 +1415,18 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         process.stdout.close()
 
 
-def _read_process_output(process: subprocess.Popen[str]) -> str:
-    if process.stdout is None:
+def _read_process_output(
+    process: subprocess.Popen[str],
+    *,
+    process_output: TextIO | None = None,
+) -> str:
+    output = process_output or process.stdout
+    if output is None:
         return ""
     try:
-        return process.stdout.read()[-4000:]
+        output.flush()
+        output.seek(0)
+        return output.read()[-4000:]
     except OSError:
         return ""
 
