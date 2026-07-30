@@ -53,6 +53,7 @@ from app.retrieval.bm25_index import (
 from app.retrieval.searcher import search as search_retrieval_records
 from app.services.review_decision_service import APPROVAL_WORKLIST_METADATA_KEYS, approval_worklist_metadata
 from app.services.regulation_catalog_service import filter_to_latest_active_versions, read_regulation_metadata
+from app.services import regulation_rag_runtime as rag_runtime
 from app.storage.repository import JsonRepository
 
 
@@ -80,10 +81,20 @@ _RAG_REPOSITORY_DOCUMENT_SIGNATURE_CACHE: dict[
     tuple[Path, tuple[str, ...]],
     tuple[tuple[Any, Any], str],
 ] = {}
+_RAG_APPROVAL_JOURNAL_CACHE: OrderedDict[
+    Path,
+    tuple[_FileIdentitySignature | None, dict[str, tuple[dict[str, Any], ...]]],
+] = OrderedDict()
+_RAG_APPROVAL_JOURNAL_CACHE_MAX_ENTRIES = 128
 _RAG_APPROVAL_SNAPSHOT_CACHE: dict[
     tuple[Path, str, tuple[str, ...]],
     tuple[tuple[Any, ...], dict[tuple[str, str], dict[str, Any]]],
 ] = {}
+_RAG_RUNTIME_APPROVAL_IDENTITY_CACHE: OrderedDict[
+    tuple[Path, str, tuple[str, ...]],
+    tuple[tuple[Any, ...], dict[tuple[str, str], dict[str, Any]]],
+] = OrderedDict()
+_RAG_RUNTIME_APPROVAL_IDENTITY_CACHE_MAX_ENTRIES = 128
 _RUNTIME_CONTENT_SIGNATURE_LOCK = threading.Lock()
 _RUNTIME_CONTENT_SIGNATURE_CACHE: dict[
     Path, tuple[_FileIdentitySignature, tuple[int, str]]
@@ -755,19 +766,15 @@ def _load_cached_approval_snapshot(
             if str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "").strip()
         }
     )
-    sidecar_signature = _runtime_approval_snapshot_signature(repository, document_ids)
-    cache_key = (repository.root, auth.tenant_id, tuple(document_ids))
-    with _RAG_VECTOR_CACHE_LOCK:
-        cached = _RAG_APPROVAL_SNAPSHOT_CACHE.get(cache_key)
-        if sidecar_signature is not None and cached and cached[0] == sidecar_signature:
-            return cached[1]
-    if sidecar_signature is not None:
-        sidecar_snapshot = _load_runtime_approval_snapshot_sidecar(repository, document_ids, auth)
-        if sidecar_snapshot is not None:
-            with _RAG_VECTOR_CACHE_LOCK:
-                _RAG_APPROVAL_SNAPSHOT_CACHE[cache_key] = (sidecar_signature, sidecar_snapshot)
-            return sidecar_snapshot
+    sidecar_snapshot = _load_cached_runtime_approval_snapshot(
+        repository,
+        document_ids,
+        auth,
+    )
+    if sidecar_snapshot is not None:
+        return sidecar_snapshot
 
+    cache_key = (repository.root, auth.tenant_id, tuple(document_ids))
     signature = _approval_snapshot_signature(repository, document_ids)
     with _RAG_VECTOR_CACHE_LOCK:
         cached = _RAG_APPROVAL_SNAPSHOT_CACHE.get(cache_key)
@@ -777,6 +784,264 @@ def _load_cached_approval_snapshot(
     with _RAG_VECTOR_CACHE_LOCK:
         _RAG_APPROVAL_SNAPSHOT_CACHE[cache_key] = (signature, snapshot)
     return snapshot
+
+
+def _load_cached_runtime_approval_snapshot(
+    repository: JsonRepository,
+    document_ids: list[str],
+    auth: AuthContext,
+) -> dict[tuple[str, str], dict[str, Any]] | None:
+    """Load a verified runtime sidecar without requiring vector records.
+
+    Hierarchical runtime indexes already carry the document identities needed
+    to scope this sidecar. Keeping this path independent from the large vector
+    JSONL lets callers authorize indexed chunk identities before fetching a
+    small number of offset records. A missing, stale, or concurrently changing
+    sidecar never falls back to live repository state here.
+    """
+
+    normalized_document_ids = sorted(
+        {
+            str(document_id or "").strip()
+            for document_id in document_ids
+            if str(document_id or "").strip()
+        }
+    )
+    cache_key = (
+        repository.root,
+        auth.tenant_id,
+        tuple(normalized_document_ids),
+    )
+    source_identity = _runtime_approval_snapshot_identity(
+        repository,
+        normalized_document_ids,
+    )
+    if source_identity is None:
+        return None
+    with _RAG_VECTOR_CACHE_LOCK:
+        identity_cached = _RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.get(cache_key)
+        if identity_cached and identity_cached[0] == source_identity:
+            _RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.move_to_end(cache_key)
+            cached_snapshot = identity_cached[1]
+        else:
+            cached_snapshot = None
+    if cached_snapshot is not None:
+        if (
+            _runtime_approval_snapshot_identity(
+                repository,
+                normalized_document_ids,
+            )
+            != source_identity
+        ):
+            return None
+        return cached_snapshot
+
+    requested_document_ids = frozenset(normalized_document_ids)
+    derived_snapshot: dict[tuple[str, str], dict[str, Any]] | None = None
+    with _RAG_VECTOR_CACHE_LOCK:
+        for superset_key, (
+            superset_identity,
+            superset_snapshot,
+        ) in reversed(list(_RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.items())):
+            if (
+                superset_key[0] != repository.root
+                or superset_key[1] != auth.tenant_id
+                or not requested_document_ids.issubset(superset_key[2])
+                or not _runtime_approval_identity_covers_scope(
+                    superset_identity,
+                    source_identity,
+                )
+            ):
+                continue
+            derived_snapshot = {
+                key: value
+                for key, value in superset_snapshot.items()
+                if key[0] in requested_document_ids
+            }
+            _store_runtime_approval_identity_cache(
+                cache_key,
+                source_identity,
+                derived_snapshot,
+            )
+            break
+    if derived_snapshot is not None:
+        if (
+            _runtime_approval_snapshot_identity(
+                repository,
+                normalized_document_ids,
+            )
+            != source_identity
+        ):
+            return None
+        return derived_snapshot
+
+    signature = _runtime_approval_snapshot_signature(
+        repository,
+        normalized_document_ids,
+    )
+    if signature is None:
+        return None
+    with _RAG_VECTOR_CACHE_LOCK:
+        cached = _RAG_APPROVAL_SNAPSHOT_CACHE.get(cache_key)
+        if cached and cached[0] == signature:
+            _store_runtime_approval_identity_cache(
+                cache_key,
+                source_identity,
+                cached[1],
+            )
+            return cached[1]
+
+    snapshot = _load_runtime_approval_snapshot_sidecar(
+        repository,
+        normalized_document_ids,
+        auth,
+    )
+    if snapshot is None:
+        return None
+    final_identity = _runtime_approval_snapshot_identity(
+        repository,
+        normalized_document_ids,
+    )
+    if final_identity != source_identity:
+        return None
+    final_signature = _runtime_approval_snapshot_signature(
+        repository,
+        normalized_document_ids,
+    )
+    if final_signature != signature:
+        return None
+    with _RAG_VECTOR_CACHE_LOCK:
+        _RAG_APPROVAL_SNAPSHOT_CACHE[cache_key] = (signature, snapshot)
+        _store_runtime_approval_identity_cache(
+            cache_key,
+            source_identity,
+            snapshot,
+        )
+    return snapshot
+
+
+def _runtime_approval_snapshot_identity(
+    repository: JsonRepository,
+    document_ids: Iterable[str] | None = None,
+) -> tuple[Any, ...] | None:
+    """Return a cheap identity for files covered by the verified sidecar.
+
+    A document-scoped caller only needs to invalidate authorization derived
+    from those documents. Avoiding a scan of every unrelated chunk file keeps
+    targeted fetches inexpensive while still detecting approval or ACL changes
+    to every chunk file that can influence the requested snapshot. Callers
+    that omit ``document_ids`` retain the repository-wide search semantics.
+    """
+
+    runtime_manifest_path = repository.root.parent / "mcp_runtime_manifest.json"
+    sidecar_path = _runtime_approval_snapshot_path(repository)
+    runtime_manifest_signature = _path_signature(runtime_manifest_path)
+    sidecar_signature = _path_signature(sidecar_path)
+    if runtime_manifest_signature is None or sidecar_signature is None:
+        return None
+    chunk_paths = _runtime_approval_identity_chunk_paths(
+        repository,
+        document_ids=document_ids,
+    )
+    if chunk_paths is None:
+        return None
+    chunk_signatures: list[tuple[str, Any]] = []
+    for path in chunk_paths:
+        signature = _path_signature(path)
+        if signature is None:
+            if document_ids is None:
+                return None
+            # Retain the expected filename in scoped identities. Omitting a
+            # deleted file would produce an empty subset and could let an
+            # older verified superset authorize the document vacuously.
+            chunk_signatures.append((path.name, ("missing",)))
+            continue
+        chunk_signatures.append((path.name, signature))
+    return (
+        runtime_manifest_signature,
+        sidecar_signature,
+        _path_signature(repository.manifest_path),
+        _path_signature(repository.legacy_path),
+        _path_signature(repository.root / "journals" / "approvals.jsonl"),
+        tuple(chunk_signatures),
+    )
+
+
+def _runtime_approval_identity_chunk_paths(
+    repository: JsonRepository,
+    *,
+    document_ids: Iterable[str] | None,
+) -> list[Path] | None:
+    if document_ids is None:
+        try:
+            return sorted(
+                repository.root.glob("*_chunks.json"),
+                key=lambda candidate: candidate.name,
+            )
+        except OSError:
+            return None
+
+    try:
+        repository_root = repository.root.resolve()
+    except OSError:
+        return None
+    chunk_paths: list[Path] = []
+    for document_id in sorted(
+        {
+            str(value or "").strip()
+            for value in document_ids
+            if str(value or "").strip()
+        }
+    ):
+        path = repository.root / f"{document_id}_chunks.json"
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            return None
+        if resolved_path.parent != repository_root:
+            return None
+        chunk_paths.append(path)
+    return chunk_paths
+
+
+def _runtime_approval_identity_covers_scope(
+    cached_identity: tuple[Any, ...],
+    scoped_identity: tuple[Any, ...],
+) -> bool:
+    """Return whether a verified superset identity still covers one scope."""
+
+    if len(cached_identity) != 6 or len(scoped_identity) != 6:
+        return cached_identity == scoped_identity
+    if cached_identity[:5] != scoped_identity[:5]:
+        return False
+    try:
+        cached_chunk_signatures = dict(cached_identity[5])
+        scoped_chunk_signatures = dict(scoped_identity[5])
+    except (TypeError, ValueError):
+        return False
+    return all(
+        cached_chunk_signatures.get(name) == signature
+        for name, signature in scoped_chunk_signatures.items()
+    )
+
+
+def _store_runtime_approval_identity_cache(
+    cache_key: tuple[Path, str, tuple[str, ...]],
+    source_identity: tuple[Any, ...],
+    snapshot: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    """Store one verified runtime snapshot while holding the vector cache lock."""
+
+    _RAG_RUNTIME_APPROVAL_IDENTITY_CACHE[cache_key] = (
+        source_identity,
+        snapshot,
+    )
+    _RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.move_to_end(cache_key)
+    while (
+        len(_RAG_RUNTIME_APPROVAL_IDENTITY_CACHE)
+        > _RAG_RUNTIME_APPROVAL_IDENTITY_CACHE_MAX_ENTRIES
+    ):
+        _RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.popitem(last=False)
 
 
 def _runtime_approval_snapshot_signature(
@@ -891,6 +1156,32 @@ def _load_runtime_approval_snapshot_sidecar(
         return None
     if not isinstance(payload, dict) or payload.get("report_type") != "mcp_runtime_approval_snapshot":
         return None
+    if payload.get("schema_version") != "mcp-runtime-approval-snapshot-v1":
+        return None
+    runtime_reuse = runtime_manifest.get("runtime_data_reuse")
+    runtime_file_hashes = (
+        runtime_reuse.get("file_sha256")
+        if isinstance(runtime_reuse, dict)
+        else None
+    )
+    if not isinstance(runtime_file_hashes, dict):
+        return None
+    try:
+        sidecar_relative_path = sidecar_path.relative_to(
+            repository.root.parent
+        ).as_posix()
+    except ValueError:
+        return None
+    expected_sidecar_hash = str(
+        runtime_file_hashes.get(sidecar_relative_path) or ""
+    ).strip().lower()
+    sidecar_content_signature = _portable_file_signature(sidecar_path)
+    if (
+        not re.fullmatch(r"[a-f0-9]{64}", expected_sidecar_hash)
+        or sidecar_content_signature is None
+        or sidecar_content_signature[1] != expected_sidecar_hash
+    ):
+        return None
     tenant_id = str(payload.get("tenant_id") or runtime_manifest.get("tenant_id") or "")
     if tenant_id and tenant_id != auth.tenant_id:
         return None
@@ -919,6 +1210,11 @@ def _load_runtime_approval_snapshot_sidecar(
 
     entries = payload.get("entries")
     if not isinstance(entries, list):
+        return None
+    if (
+        payload.get("record_count") != len(entries)
+        or payload.get("snapshot_count") != len(entries)
+    ):
         return None
     snapshot: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in entries:
@@ -1074,14 +1370,51 @@ def _approval_journal_records_by_document(
     document_ids: list[str],
 ) -> dict[str, list[dict[str, Any]]]:
     selected_document_ids = set(document_ids)
+    journal_path = _approval_journal_cache_path(repository)
+    journal_signature = _path_signature(journal_path) if journal_path is not None else None
+    if journal_path is not None:
+        with _RAG_VECTOR_CACHE_LOCK:
+            cached = _RAG_APPROVAL_JOURNAL_CACHE.get(journal_path)
+            if cached and cached[0] == journal_signature:
+                _RAG_APPROVAL_JOURNAL_CACHE.move_to_end(journal_path)
+                return {
+                    document_id: list(cached[1].get(document_id, ()))
+                    for document_id in document_ids
+                }
+
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in repository.list_approval_journal_records():
         if not isinstance(record, dict):
             continue
         document_id = str(record.get("document_id") or "")
-        if document_id in selected_document_ids:
+        if document_id:
             grouped[document_id].append(record)
-    return grouped
+
+    if journal_path is not None and _path_signature(journal_path) == journal_signature:
+        immutable_grouped = {
+            document_id: tuple(records)
+            for document_id, records in grouped.items()
+        }
+        with _RAG_VECTOR_CACHE_LOCK:
+            _RAG_APPROVAL_JOURNAL_CACHE[journal_path] = (
+                journal_signature,
+                immutable_grouped,
+            )
+            _RAG_APPROVAL_JOURNAL_CACHE.move_to_end(journal_path)
+            while len(_RAG_APPROVAL_JOURNAL_CACHE) > _RAG_APPROVAL_JOURNAL_CACHE_MAX_ENTRIES:
+                _RAG_APPROVAL_JOURNAL_CACHE.popitem(last=False)
+
+    return {
+        document_id: list(grouped.get(document_id, ()))
+        for document_id in selected_document_ids
+    }
+
+
+def _approval_journal_cache_path(repository: Any) -> Path | None:
+    root = getattr(repository, "root", None)
+    if root is None:
+        return None
+    return Path(root) / "journals" / "approvals.jsonl"
 
 
 def _approval_journal_match_index(
@@ -1777,3 +2110,227 @@ def _rag_trace(
         ],
         **extra,
     }
+
+
+# FastAPI owns request/response models and endpoint wiring. These helpers and
+# their caches live in the route-free runtime backend so MCP hierarchy calls
+# and API calls enforce one authorization and invalidation implementation.
+BLOCKED_QUERY_PATTERNS = rag_runtime.BLOCKED_QUERY_PATTERNS
+_RAG_VECTOR_CACHE_LOCK = rag_runtime._RAG_VECTOR_CACHE_LOCK
+_RAG_VECTOR_RECORD_CACHE = rag_runtime._RAG_VECTOR_RECORD_CACHE
+_RAG_BM25_INDEX_CACHE = rag_runtime._RAG_BM25_INDEX_CACHE
+_RAG_VISIBLE_RECORDS_CACHE_LOCK = (
+    rag_runtime._RAG_VISIBLE_RECORDS_CACHE_LOCK
+)
+_RAG_VISIBLE_RECORDS_CACHE = rag_runtime._RAG_VISIBLE_RECORDS_CACHE
+_RAG_VISIBLE_RECORDS_MAX_ENTRIES = (
+    rag_runtime._RAG_VISIBLE_RECORDS_MAX_ENTRIES
+)
+_RAG_REPOSITORY_DOCUMENT_SIGNATURE_CACHE = (
+    rag_runtime._RAG_REPOSITORY_DOCUMENT_SIGNATURE_CACHE
+)
+_RAG_APPROVAL_JOURNAL_CACHE = rag_runtime._RAG_APPROVAL_JOURNAL_CACHE
+_RAG_APPROVAL_JOURNAL_CACHE_MAX_ENTRIES = (
+    rag_runtime._RAG_APPROVAL_JOURNAL_CACHE_MAX_ENTRIES
+)
+_RAG_APPROVAL_SNAPSHOT_CACHE = rag_runtime._RAG_APPROVAL_SNAPSHOT_CACHE
+_RAG_RUNTIME_APPROVAL_IDENTITY_CACHE = (
+    rag_runtime._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE
+)
+_RAG_RUNTIME_APPROVAL_IDENTITY_CACHE_MAX_ENTRIES = (
+    rag_runtime._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE_MAX_ENTRIES
+)
+_RUNTIME_CONTENT_SIGNATURE_LOCK = (
+    rag_runtime._RUNTIME_CONTENT_SIGNATURE_LOCK
+)
+_RUNTIME_CONTENT_SIGNATURE_CACHE = rag_runtime._RUNTIME_CONTENT_SIGNATURE_CACHE
+
+_local_vector_path = rag_runtime.local_vector_path
+_RagRequestRepositoryCache = rag_runtime.RagRequestRepositoryCache
+load_visible_records = rag_runtime.load_visible_records
+_load_local_vector_records = rag_runtime.load_local_vector_records
+_read_local_vector_records = rag_runtime.read_local_vector_records
+_load_local_vector_record_by_chunk = (
+    rag_runtime.load_local_vector_record_by_chunk
+)
+_iter_local_vector_lines = rag_runtime.iter_local_vector_lines
+_validated_local_vector_record = rag_runtime.validated_local_vector_record
+_local_vector_record_matches_chunk = (
+    rag_runtime.local_vector_record_matches_chunk
+)
+_record_visible_to_request = rag_runtime.record_visible_to_request
+_expected_vector_record_for_chunk = (
+    rag_runtime.expected_vector_record_for_chunk
+)
+_current_repository_chunk = rag_runtime.current_repository_chunk
+_path_signature = rag_runtime.path_signature
+_validate_query_policy = rag_runtime.validate_query_policy
+_validate_security_scope = rag_runtime.validate_security_scope
+_requested_security_levels = rag_runtime.requested_security_levels
+_requested_department_ids = rag_runtime.requested_department_ids
+_department_acl_set = rag_runtime.department_acl_set
+_load_cached_bm25_index = rag_runtime.load_cached_bm25_index
+_store_cached_bm25_index = rag_runtime.store_cached_bm25_index
+_runtime_approval_snapshot_identity = (
+    rag_runtime.runtime_approval_snapshot_identity
+)
+_runtime_approval_identity_chunk_paths = (
+    rag_runtime.runtime_approval_identity_chunk_paths
+)
+_runtime_approval_identity_covers_scope = (
+    rag_runtime.runtime_approval_identity_covers_scope
+)
+_store_runtime_approval_identity_cache = (
+    rag_runtime.store_runtime_approval_identity_cache
+)
+_runtime_approval_snapshot_signature = (
+    rag_runtime.runtime_approval_snapshot_signature
+)
+_runtime_approval_snapshot_path = rag_runtime.runtime_approval_snapshot_path
+_runtime_approval_snapshot_file_signatures = (
+    rag_runtime.runtime_approval_snapshot_file_signatures
+)
+_portable_file_signature = rag_runtime.portable_file_signature
+_repository_chunk_files_signature = (
+    rag_runtime.repository_chunk_files_signature
+)
+_chunk_path_identity_signature = rag_runtime.chunk_path_identity_signature
+_load_runtime_approval_snapshot_sidecar = (
+    rag_runtime.load_runtime_approval_snapshot_sidecar
+)
+_approval_snapshot_signature = rag_runtime.approval_snapshot_signature
+_approval_journal_signature = rag_runtime.approval_journal_signature
+_repository_documents_signature = rag_runtime.repository_documents_signature
+_approval_journal_records_by_document = (
+    rag_runtime.approval_journal_records_by_document
+)
+_approval_journal_cache_path = rag_runtime.approval_journal_cache_path
+_build_approval_snapshot = rag_runtime.build_approval_snapshot
+_approval_journal_match_index = rag_runtime.approval_journal_match_index
+_approval_journal_match_key = rag_runtime.approval_journal_match_key
+_public_search_result = rag_runtime.public_search_result
+_governing_article_for_reference_chunk = (
+    rag_runtime.governing_article_for_reference_chunk
+)
+_same_reference_context = rag_runtime.same_reference_context
+_reference_context_values = rag_runtime.reference_context_values
+_normalize_reference_context = rag_runtime.normalize_reference_context
+_candidate_references_any_label = (
+    rag_runtime.candidate_references_any_label
+)
+_normalized_reference_labels = rag_runtime.normalized_reference_labels
+_normalize_reference_label = rag_runtime.normalize_reference_label
+
+
+def _load_cached_runtime_approval_snapshot(
+    repository: JsonRepository,
+    document_ids: list[str],
+    auth: AuthContext,
+) -> dict[tuple[str, str], dict[str, Any]] | None:
+    """Delegate through route globals to retain focused monkeypatch hooks."""
+
+    return rag_runtime.load_cached_runtime_approval_snapshot(
+        repository,
+        document_ids,
+        auth,
+        identity_loader=_runtime_approval_snapshot_identity,
+        signature_loader=_runtime_approval_snapshot_signature,
+        sidecar_loader=_load_runtime_approval_snapshot_sidecar,
+    )
+
+
+def _load_cached_approval_snapshot(
+    repository: JsonRepository,
+    records: list[dict[str, Any]],
+    auth: AuthContext,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    return rag_runtime.load_cached_approval_snapshot(
+        repository,
+        records,
+        auth,
+        runtime_snapshot_loader=_load_cached_runtime_approval_snapshot,
+        signature_loader=_approval_snapshot_signature,
+        snapshot_builder=_build_approval_snapshot,
+    )
+
+
+def load_visible_records(**kwargs):
+    """Delegate through the route visibility hook for focused route tests."""
+
+    return rag_runtime.load_visible_records(
+        **kwargs,
+        visibility_checker=_record_visible_to_request,
+        lifecycle_filter=filter_to_latest_active_versions,
+    )
+
+
+def _raise_fastapi_http_exception(exc: Exception) -> None:
+    if isinstance(exc, rag_runtime.HTTPException):
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=exc.headers,
+        ) from exc
+    raise exc
+
+
+def _validate_query_policy(query: str) -> None:
+    try:
+        rag_runtime.validate_query_policy(query)
+    except rag_runtime.HTTPException as exc:
+        _raise_fastapi_http_exception(exc)
+
+
+def _validate_security_scope(
+    request: RagSearchRequest,
+    auth: AuthContext,
+) -> None:
+    try:
+        rag_runtime.validate_security_scope(request, auth)
+    except rag_runtime.HTTPException as exc:
+        _raise_fastapi_http_exception(exc)
+
+
+def _requested_department_ids(
+    request: RagSearchRequest,
+    auth: AuthContext,
+) -> frozenset[str]:
+    try:
+        return rag_runtime.requested_department_ids(request, auth)
+    except rag_runtime.HTTPException as exc:
+        _raise_fastapi_http_exception(exc)
+    return frozenset()
+
+
+def _read_local_vector_records(path: Path) -> list[dict[str, Any]]:
+    return rag_runtime.read_local_vector_records(
+        path,
+        line_iterator=_iter_local_vector_lines,
+    )
+
+
+def _load_local_vector_records(
+    settings: Settings,
+    auth: AuthContext,
+) -> list[dict[str, Any]]:
+    return rag_runtime.load_local_vector_records(
+        settings,
+        auth,
+        record_reader=_read_local_vector_records,
+    )
+
+
+def _load_local_vector_record_by_chunk(
+    settings: Settings,
+    auth: AuthContext,
+    *,
+    document_id: str,
+    chunk_id: str,
+) -> dict[str, Any] | None:
+    return rag_runtime.load_local_vector_record_by_chunk(
+        settings,
+        auth,
+        document_id=document_id,
+        chunk_id=chunk_id,
+        line_iterator=_iter_local_vector_lines,
+    )

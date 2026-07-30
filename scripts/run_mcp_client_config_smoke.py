@@ -35,10 +35,13 @@ EXTERNAL_CHATGPT_DATA_TOOLS = frozenset(
         "list_regulations",
         "get_regulation_toc",
         "get_regulation_article",
+        "get_regulation_references",
+        "list_regulation_reference_cycles",
         "search",
         "fetch",
     }
 )
+_INDEX_STATUS_REQUIRED_TOOLS = frozenset(EXTERNAL_CHATGPT_DATA_TOOLS | {"get_index_status"})
 _EXTERNAL_METADATA_DENY_KEYS = frozenset(
     {
         "source_record_id",
@@ -114,7 +117,8 @@ def run_mcp_client_config_smoke(
     )
     verification_prompt = (
         f"{server_name} MCP의 list_regulations로 전체 규정 수를 확인하고 첫 규정의 목차와 "
-        "조문을 조회한 다음, search로 인사규정을 찾아 첫 번째 id를 fetch로 조회해 줘."
+        "조문을 조회한 다음, get_regulation_references와 list_regulation_reference_cycles로 "
+        "참조 관계를 확인하고 search로 인사규정을 찾아 첫 번째 id를 fetch로 조회해 줘."
     )
     report = {
         "report_type": "mcp_client_config_smoke",
@@ -205,6 +209,10 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
             else "MCP connection verification is incomplete; do not report this connection as connected."
         ),
     }
+
+
+def _has_external_tool_contract(tool_names: Sequence[str]) -> bool:
+    return EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
 
 
 def _run_single_client_config_smoke(
@@ -560,10 +568,7 @@ async def _run_remote_entry(
                 await session.initialize()
                 tool_result = await session.list_tools()
                 tool_names = sorted(tool.name for tool in tool_result.tools)
-                if (
-                    "get_index_status" not in tool_names
-                    and not EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
-                ):
+                if not _has_external_tool_contract(tool_names):
                     return {
                         "passed": False,
                         "process_started": True,
@@ -574,8 +579,8 @@ async def _run_remote_entry(
                         "tool_names": tool_names,
                         "session_id_present": bool(get_session_id()),
                         "error": (
-                            "tools/list did not expose get_index_status or the complete external "
-                            "catalog/hierarchy/article/search/fetch contract."
+                            "tools/list did not expose the complete external "
+                            "catalog/hierarchy/article/references/cycles/search/fetch contract."
                         ),
                     }
                 verification_mode = "index_status"
@@ -590,11 +595,18 @@ async def _run_remote_entry(
                         {"security_levels": ["internal"]},
                     )
                     index_payload = _successful_tool_payload(index_status, tool_name="get_index_status")
-                    index_summary = index_payload.get("summary") if isinstance(index_payload.get("summary"), dict) else {}
-                    verified = _valid_index_status_summary(index_summary)
+                    index_summary = (
+                        index_payload.get("summary")
+                        if isinstance(index_payload.get("summary"), dict)
+                        else {}
+                    )
+                    verified = bool(
+                        _INDEX_STATUS_REQUIRED_TOOLS.issubset(set(tool_names))
+                        and _valid_index_status_summary(index_summary)
+                    )
                 else:
                     # The privacy-reduced ChatGPT profile exposes only the
-                    # read-only catalog/hierarchy/article/search/fetch contract.
+                    # read-only catalog/hierarchy/article/references/cycles/search/fetch contract.
                     # Verify content without requiring internal diagnostics.
                     verification_mode = "search_fetch"
                     search_query_used = query or DEFAULT_SEARCH_QUERY
@@ -617,7 +629,8 @@ async def _run_remote_entry(
                     metadata_candidates.append(fetch_payload.get("metadata") or {})
                     metadata_violations = _external_metadata_violations(metadata_candidates)
                     verified = bool(
-                        _valid_search_results(results)
+                        _has_external_tool_contract(tool_names)
+                        and _valid_search_results(results)
                         and _valid_fetch_payload(fetch_payload)
                         and not metadata_violations
                     )
@@ -692,10 +705,7 @@ async def _run_client_entry(
             list_tools_elapsed_ms = _elapsed_ms(list_tools_started_at)
             tool_names = sorted(tool.name for tool in tool_result.tools)
 
-            if (
-                "get_index_status" not in tool_names
-                and not EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
-            ):
+            if not _has_external_tool_contract(tool_names):
                 return {
                     "passed": False,
                     "process_started": True,
@@ -709,7 +719,7 @@ async def _run_client_entry(
                     "tool_names": tool_names,
                     "error": (
                         "tools/list did not expose the complete external "
-                        "catalog/hierarchy/article/search/fetch contract."
+                        "catalog/hierarchy/article/references/cycles/search/fetch contract."
                     ),
                     "list_tools_elapsed_ms": list_tools_elapsed_ms,
                     "total_elapsed_ms": _elapsed_ms(started_at),
@@ -732,7 +742,12 @@ async def _run_client_entry(
                     metadata_candidates.append(results[0].get("metadata") or {})
                 metadata_candidates.append(fetch_payload.get("metadata") or {})
                 metadata_violations = _external_metadata_violations(metadata_candidates)
-                verified = bool(results and fetch_payload.get("text") and not metadata_violations)
+                verified = bool(
+                    _has_external_tool_contract(tool_names)
+                    and results
+                    and fetch_payload.get("text")
+                    and not metadata_violations
+                )
                 return {
                     "passed": verified,
                     "process_started": True,
@@ -795,7 +810,7 @@ async def _run_client_entry(
 
             return {
                 "passed": bool(
-                    {"search", "fetch", "get_index_status"}.issubset(set(tool_names))
+                    _INDEX_STATUS_REQUIRED_TOOLS.issubset(set(tool_names))
                     and index_status_verified
                     and results
                     and fetch_payload.get("text")
@@ -806,13 +821,13 @@ async def _run_client_entry(
                 "strict_stdio_wire_verified": True,
                 "index_status_verified": index_status_verified,
                 "contract_verified": bool(
-                    {"search", "fetch", "get_index_status"}.issubset(set(tool_names))
+                    _INDEX_STATUS_REQUIRED_TOOLS.issubset(set(tool_names))
                     and index_status_verified
                     and results
                     and fetch_payload.get("text")
                 ),
                 "end_to_end_verified": bool(
-                    {"search", "fetch", "get_index_status"}.issubset(set(tool_names))
+                    _INDEX_STATUS_REQUIRED_TOOLS.issubset(set(tool_names))
                     and index_status_verified
                     and results
                     and fetch_payload.get("text")

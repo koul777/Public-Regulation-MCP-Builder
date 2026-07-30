@@ -117,9 +117,11 @@ reg-rag-mcp-answer-evidence-bundle = "scripts.build_mcp_answer_evidence_bundle:m
 reg-rag-mcp-answer-blocker-map = "scripts.build_answer_blocker_review_map:main"
 reg-rag-mcp-performance-load-evidence = "scripts.build_mcp_performance_load_evidence:main"
 reg-rag-mcp-cold-start-benchmark = "scripts.benchmark_mcp_cold_start:main"
+reg-rag-mcp-first-query-benchmark = "scripts.benchmark_mcp_first_query:main"
 reg-rag-mcp-concurrent-benchmark = "scripts.benchmark_mcp_concurrent_queries:main"
 reg-rag-mcp-index-visibility = "scripts.audit_mcp_index_visibility:main"
 reg-rag-mcp-query-benchmark = "scripts.benchmark_mcp_queries:main"
+reg-rag-mcp-retrieval-quality = "scripts.evaluate_mcp_retrieval_quality:main"
 reg-rag-revision-impact = "scripts.build_revision_impact_report:main"
 reg-rag-real-parser-fixtures = "scripts.verify_real_parser_regression_fixtures:main"
 

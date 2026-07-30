@@ -1,44 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import replace
 from datetime import date, datetime
+import importlib
 import re
 import time
 from collections.abc import Iterable
+from typing import Any
 
-from app.api import routes_rag
 from app.services.regulation_catalog_service import (
     filter_to_latest_active_versions,
     read_regulation_metadata,
 )
+from app.services import regulation_rag_runtime as _runtime
 
 
 # Step-1 service facade for MCP consumers.
 # This module preserves current behavior while removing the direct MCP import
 # dependency on the FastAPI route module. Subsequent refactors can move logic
 # here incrementally without forcing large MCP-side edits.
-
-RagSearchRequest = routes_rag.RagSearchRequest
-_RagRequestRepositoryCache = routes_rag._RagRequestRepositoryCache
-_JsonRepository = routes_rag.JsonRepository
-default_bm25_index_path = routes_rag.default_bm25_index_path
-_local_vector_path = routes_rag._local_vector_path
-_path_signature = routes_rag._path_signature
-_load_local_vector_records = routes_rag._load_local_vector_records
-_load_local_vector_record_by_chunk = routes_rag._load_local_vector_record_by_chunk
-_load_cached_approval_snapshot = routes_rag._load_cached_approval_snapshot
-_load_cached_bm25_index = routes_rag._load_cached_bm25_index
-_score_records = routes_rag._score_records
-_public_search_result = routes_rag._public_search_result
-_current_repository_chunk = routes_rag._current_repository_chunk
-_expected_vector_record_for_chunk = routes_rag._expected_vector_record_for_chunk
-_department_acl_set = routes_rag._department_acl_set
-_requested_department_ids = routes_rag._requested_department_ids
-_record_visible_to_request = routes_rag._record_visible_to_request
-_validate_security_scope = routes_rag._validate_security_scope
-_validate_query_policy = routes_rag._validate_query_policy
-_rag_trace = routes_rag._rag_trace
-_perf_elapsed_ms = routes_rag._perf_elapsed_ms
 _REGULATION_LIFECYCLE_FIELDS = (
     "regulation_id",
     "regulation_version",
@@ -47,20 +27,23 @@ _REGULATION_LIFECYCLE_FIELDS = (
     "effective_to",
     "repealed_at",
 )
-ROLE_SECURITY_LEVELS = routes_rag.ROLE_SECURITY_LEVELS
+
+_ROUTES_RAG_MODULE: Any | None = None
+RegulationQuery = _runtime.RegulationQuery
+ROLE_SECURITY_LEVELS = _runtime.ROLE_SECURITY_LEVELS
 
 
+def _load_routes_rag():
+    global _ROUTES_RAG_MODULE
+    if _ROUTES_RAG_MODULE is None:
+        _ROUTES_RAG_MODULE = importlib.import_module("app.api.routes_rag")
+    return _ROUTES_RAG_MODULE
 
-@dataclass(frozen=True)
-class RegulationQuery:
-    query: str
-    top_k: int = 5
-    security_levels: list[str] | None = None
-    department_ids: list[str] = field(default_factory=list)
-    document_id: str | None = None
-    profile_id: str | None = None
-    as_of: date | datetime | str | None = None
-    as_of_date: str | None = None
+
+def __getattr__(name: str) -> Any:
+    if name.startswith("__"):
+        raise AttributeError(name)
+    return getattr(_load_routes_rag(), name)
 
 
 def filter_latest_active_records(
@@ -86,11 +69,18 @@ def filter_latest_active_records(
     )
 
 
-def search_rag_records(*args, **kwargs):
-    return routes_rag.search_rag_records(*args, **kwargs)
+def search_rag_records(request, auth, settings):
+    validate_query_security_scope(query=request, auth=auth)
+    runtime_request = (
+        _query_with_runtime_as_of_date(request)
+        if isinstance(request, RegulationQuery)
+        else request
+    )
+    return _load_routes_rag().search_rag_records(runtime_request, auth, settings)
 
 
-def to_rag_search_request(query: RegulationQuery) -> routes_rag.RagSearchRequest:
+def to_rag_search_request(query: RegulationQuery) -> Any:
+    routes_rag = _load_routes_rag()
     return routes_rag.RagSearchRequest(
         query=query.query,
         top_k=query.top_k,
@@ -98,22 +88,24 @@ def to_rag_search_request(query: RegulationQuery) -> routes_rag.RagSearchRequest
         department_ids=query.department_ids,
         document_id=query.document_id,
         profile_id=query.profile_id,
-        as_of_date=query.as_of_date,
+        as_of_date=_query_as_of_date(query),
     )
 
 
 def search_records(*, query: RegulationQuery, auth, settings):
+    validate_query_security_scope(query=query, auth=auth)
+    routes_rag = _load_routes_rag()
     request = to_rag_search_request(query)
     total_started_at = time.perf_counter()
     timing_ms: dict[str, float] = {}
-    _validate_query_policy(request.query)
+    routes_rag._validate_query_policy(request.query)
     requested_department_ids_value = requested_department_ids(request, auth)
-    repository = _JsonRepository(settings)
+    repository = routes_rag.JsonRepository(settings)
     repository_cache_obj = repository_cache(repository)
 
     step_started_at = time.perf_counter()
     records = load_local_vector_records(settings, auth)
-    timing_ms["load_vector_records_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    timing_ms["load_vector_records_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
     approval_snapshot = approval_snapshot_for_records(
         repository,
@@ -121,7 +113,7 @@ def search_records(*, query: RegulationQuery, auth, settings):
         auth,
         enabled=True,
     )
-    timing_ms["approval_snapshot_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    timing_ms["approval_snapshot_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
     visible_records = routes_rag.load_visible_records(
         request=request,
@@ -133,13 +125,13 @@ def search_records(*, query: RegulationQuery, auth, settings):
         approval_snapshot=approval_snapshot,
         requested_department_ids=requested_department_ids_value,
     )
-    lifecycle_as_of = _normalized_lifecycle_as_of(query.as_of if query.as_of is not None else query.as_of_date)
+    lifecycle_as_of = _normalized_lifecycle_as_of(request.as_of_date)
     lifecycle_complete = sum(
         1
         for record in visible_records
         if _has_complete_lifecycle_metadata(record)
     )
-    timing_ms["visibility_filter_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    timing_ms["visibility_filter_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
     scored, retrieval = score_records(
         request.query,
@@ -148,15 +140,15 @@ def search_records(*, query: RegulationQuery, auth, settings):
         auth=auth,
         all_records=records,
     )
-    timing_ms["scoring_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    timing_ms["scoring_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
     results = [
         public_search_result(record, score, related_records=visible_records)
         for score, record in scored[: request.top_k]
     ]
-    timing_ms["public_results_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
-    timing_ms["total_before_trace_write_elapsed_ms"] = _perf_elapsed_ms(total_started_at)
-    trace = _rag_trace(
+    timing_ms["public_results_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
+    timing_ms["total_before_trace_write_elapsed_ms"] = routes_rag._perf_elapsed_ms(total_started_at)
+    trace = routes_rag._rag_trace(
         action="search",
         request=request,
         auth=auth,
@@ -180,12 +172,15 @@ def search_records(*, query: RegulationQuery, auth, settings):
     step_started_at = time.perf_counter()
     if settings.rag_trace_enabled:
         repository.append_rag_trace(trace)
-    timing_ms["trace_write_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
-    timing_ms["total_elapsed_ms"] = _perf_elapsed_ms(total_started_at)
+    timing_ms["trace_write_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
+    timing_ms["total_elapsed_ms"] = routes_rag._perf_elapsed_ms(total_started_at)
     return results, trace
+
+
 def validate_query_security_scope(*, query: RegulationQuery, auth) -> None:
-    request = to_rag_search_request(query)
-    return routes_rag._validate_security_scope(request, auth)
+    _runtime.validate_query_policy(query.query)
+    _runtime.validate_security_scope(query, auth)
+    _runtime.requested_department_ids(query, auth)
 
 
 def get_visible_records(
@@ -197,9 +192,10 @@ def get_visible_records(
     use_cached_approval_snapshot: bool = True,
     latest_only: bool = True,
 ):
-    request = to_rag_search_request(query)
+    validate_query_security_scope(query=query, auth=auth)
+    runtime_query = _query_with_runtime_as_of_date(query)
     repository_cache_obj = repository_cache(repository)
-    requested_department_ids_value = requested_department_ids(request, auth)
+    requested_department_ids_value = requested_department_ids(runtime_query, auth)
     records = load_local_vector_records(settings, auth)
     approval_snapshot = approval_snapshot_for_records(
         repository,
@@ -207,8 +203,8 @@ def get_visible_records(
         auth,
         enabled=use_cached_approval_snapshot,
     )
-    visible_records = routes_rag.load_visible_records(
-        request=request,
+    visible_records = _runtime.load_visible_records(
+        request=runtime_query,
         auth=auth,
         settings=settings,
         repository=repository,
@@ -231,9 +227,11 @@ def get_visible_record_by_chunk(
     repository,
     candidate: dict | None,
 ):
+    validate_query_security_scope(query=query, auth=auth)
+    runtime_query = _query_with_runtime_as_of_date(query)
     if candidate is None:
         return None
-    requested_department_ids_value = requested_department_ids(query, auth)
+    requested_department_ids_value = requested_department_ids(runtime_query, auth)
     repository_cache_obj = repository_cache(repository)
     approval_snapshot = approval_snapshot_for_records(
         repository,
@@ -243,7 +241,7 @@ def get_visible_record_by_chunk(
     )
     if not is_record_visible(
         candidate,
-        request=query,
+        request=runtime_query,
         auth=auth,
         repository=repository,
         repository_cache=repository_cache_obj,
@@ -323,6 +321,26 @@ def _normalized_lifecycle_as_of(value: date | datetime | str | None) -> str:
         except ValueError:
             return "invalid"
     return date.today().isoformat()
+
+
+def _query_as_of_date(query: RegulationQuery) -> str | None:
+    """Return the runtime lifecycle date with explicit as_of_date precedence."""
+    value = query.as_of_date if query.as_of_date is not None else query.as_of
+    if value is None:
+        return None
+    parsed = _parse_lifecycle_date(value)
+    if parsed is not None:
+        return parsed.isoformat()
+    if isinstance(value, str):
+        return value.strip() or None
+    return str(value)
+
+
+def _query_with_runtime_as_of_date(query: RegulationQuery) -> RegulationQuery:
+    as_of_date = _query_as_of_date(query)
+    if query.as_of_date == as_of_date:
+        return query
+    return replace(query, as_of_date=as_of_date)
 
 
 def _approval_visible_records(
@@ -435,8 +453,9 @@ def _regulation_version_sort_key(version: str) -> tuple[tuple[int, object], ...]
         for token in re.findall(r"\d+|[a-z]+", version.casefold())
     )
 
+
 def repository_cache(repository):
-    return routes_rag._RagRequestRepositoryCache(repository)
+    return _runtime.RagRequestRepositoryCache(repository)
 
 
 def repository_document(repository_cache_obj, document_id: str):
@@ -454,7 +473,7 @@ def is_record_visible(*args, **kwargs):
 
 
 def local_vector_path(*args, **kwargs):
-    return routes_rag._local_vector_path(*args, **kwargs)
+    return _runtime.local_vector_path(*args, **kwargs)
 
 
 def local_vector_signature(*, settings, auth):
@@ -462,56 +481,68 @@ def local_vector_signature(*, settings, auth):
 
 
 def bm25_index_path(*, settings, auth):
-    return default_bm25_index_path(local_vector_path(settings, auth))
+    return _runtime.bm25_index_path(settings, auth)
 
 
 def path_signature(*args, **kwargs):
-    return routes_rag._path_signature(*args, **kwargs)
+    return _runtime.path_signature(*args, **kwargs)
 
 
 def load_local_vector_records(*args, **kwargs):
-    return routes_rag._load_local_vector_records(*args, **kwargs)
+    return _runtime.load_local_vector_records(*args, **kwargs)
 
 
 def load_local_vector_record_by_chunk(*args, **kwargs):
-    return routes_rag._load_local_vector_record_by_chunk(*args, **kwargs)
+    return _runtime.load_local_vector_record_by_chunk(*args, **kwargs)
 
 
 def load_cached_approval_snapshot(*args, **kwargs):
-    return routes_rag._load_cached_approval_snapshot(*args, **kwargs)
+    return _runtime.load_cached_approval_snapshot(*args, **kwargs)
+
+
+def load_cached_runtime_approval_snapshot(*args, **kwargs):
+    return _runtime.load_cached_runtime_approval_snapshot(*args, **kwargs)
+
+
+def runtime_approval_snapshot_identity(*args, **kwargs):
+    return _runtime.runtime_approval_snapshot_identity(*args, **kwargs)
+
+
+def approval_snapshot_signature(*args, **kwargs):
+    return _runtime.approval_snapshot_signature(*args, **kwargs)
 
 
 def load_cached_bm25_index(*args, **kwargs):
-    return routes_rag._load_cached_bm25_index(*args, **kwargs)
+    return _runtime.load_cached_bm25_index(*args, **kwargs)
 
 
 def score_records(*args, **kwargs):
-    return routes_rag._score_records(*args, **kwargs)
+    return _load_routes_rag()._score_records(*args, **kwargs)
 
 
 def public_search_result(*args, **kwargs):
-    return routes_rag._public_search_result(*args, **kwargs)
+    return _runtime.public_search_result(*args, **kwargs)
 
 
 def current_repository_chunk(*args, **kwargs):
-    return routes_rag._current_repository_chunk(*args, **kwargs)
+    return _runtime.current_repository_chunk(*args, **kwargs)
 
 
 def expected_vector_record_for_chunk(*args, **kwargs):
-    return routes_rag._expected_vector_record_for_chunk(*args, **kwargs)
+    return _runtime.expected_vector_record_for_chunk(*args, **kwargs)
 
 
 def department_acl_set(*args, **kwargs):
-    return routes_rag._department_acl_set(*args, **kwargs)
+    return _runtime.department_acl_set(*args, **kwargs)
 
 
 def requested_department_ids(*args, **kwargs):
-    return routes_rag._requested_department_ids(*args, **kwargs)
+    return _runtime.requested_department_ids(*args, **kwargs)
 
 
 def record_visible_to_request(*args, **kwargs):
-    return routes_rag._record_visible_to_request(*args, **kwargs)
+    return _runtime.record_visible_to_request(*args, **kwargs)
 
 
 def validate_security_scope(*args, **kwargs):
-    return routes_rag._validate_security_scope(*args, **kwargs)
+    return _runtime.validate_security_scope(*args, **kwargs)

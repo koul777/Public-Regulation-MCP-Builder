@@ -11,6 +11,16 @@ from unittest.mock import DEFAULT, patch
 from scripts.benchmark_mcp_concurrent_queries import benchmark_mcp_concurrent_queries, run
 
 
+TEST_SOURCE_STATE = {
+    "scope": "mcp-performance-python-source-v1",
+    "status": "available",
+    "sha256": "b" * 64,
+    "file_count": 3,
+    "byte_count": 101,
+    "stable": True,
+}
+
+
 class BenchmarkMcpConcurrentQueriesTests(unittest.TestCase):
     def test_runs_concurrent_query_tasks_and_writes_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -35,12 +45,47 @@ class BenchmarkMcpConcurrentQueriesTests(unittest.TestCase):
             json_written = out_json.is_file()
 
         self.assertTrue(report["passed"])
+        self.assertEqual(1, report["schema_version"])
+        self.assertEqual(TEST_SOURCE_STATE, report["source_state"])
         self.assertEqual("profile-demo", report["profile_id"])
         self.assertEqual(4, report["task_count"])
         self.assertEqual(4, report["summary"]["successful_count"])
         self.assertEqual(1, report["summary"]["search_result_count_min"])
+        self.assertEqual(4, report["summary"]["single_fetch_elapsed_ms"]["count"])
+        self.assertTrue(
+            all(
+                len(item["fetch_measurements"]) == 1
+                for item in report["measurements"]
+            )
+        )
         self.assertIn("MCP Concurrent Query Benchmark", markdown)
         self.assertTrue(json_written)
+        mocks["settings_for_mcp_project"].assert_called_once_with(
+            data_dir=root / "data",
+            tenant_id="tenant-demo",
+            tenant_storage_isolation=None,
+            api_audit_enabled=False,
+            rag_trace_enabled=False,
+        )
+        self.assertEqual(
+            {
+                "api_audit_enabled": False,
+                "rag_trace_enabled": False,
+            },
+            report["settings_overrides"],
+        )
+        self.assertEqual(
+            {
+                "min_warm_records": 3,
+                "max_task_total_ms": 1000.0,
+                "max_batch_elapsed_ms": 2000.0,
+            },
+            report["thresholds"],
+        )
+        self.assertEqual(4, report["summary"]["answerable_measurement_count"])
+        self.assertEqual(0, report["summary"]["no_evidence_measurement_count"])
+        mocks["capture_mcp_performance_source_state"].assert_called_once()
+        mocks["finalize_mcp_performance_source_state"].assert_called_once()
         self.assertTrue(all(call.kwargs["profile_id"] == "profile-demo" for call in mocks["search_regulations"].call_args_list))
         self.assertTrue(all(call.kwargs["profile_id"] == "profile-demo" for call in mocks["fetch_regulation"].call_args_list))
 
@@ -168,8 +213,36 @@ class BenchmarkMcpConcurrentQueriesTests(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertIn("concurrent-warm-record-count-below-minimum", stdout.getvalue())
 
+    def test_rejects_non_finite_or_negative_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, kwargs in (
+                ("max_task_total_ms", {"max_task_total_ms": float("nan")}),
+                (
+                    "max_batch_elapsed_ms",
+                    {"max_batch_elapsed_ms": float("inf")},
+                ),
+                ("min_warm_records", {"min_warm_records": -1}),
+            ):
+                with self.subTest(name=name), _patched_runtime():
+                    with self.assertRaises(ValueError):
+                        benchmark_mcp_concurrent_queries(
+                            data_dir=root / "data",
+                            tenant_id="tenant-demo",
+                            queries=["childcare"],
+                            rounds=1,
+                            concurrency=1,
+                            **kwargs,
+                        )
+
 
 def _configure_patches(mocks: dict, *, warm_record_count: int) -> None:
+    mocks["capture_mcp_performance_source_state"].return_value = dict(
+        TEST_SOURCE_STATE
+    )
+    mocks["finalize_mcp_performance_source_state"].return_value = dict(
+        TEST_SOURCE_STATE
+    )
     mocks["settings_for_mcp_project"].return_value = object()
     mocks["mcp_auth_context"].return_value = object()
     mocks["warm_mcp_runtime"].return_value = {
@@ -203,6 +276,8 @@ class _PatchedRuntime:
             warm_mcp_runtime=DEFAULT,
             search_regulations=DEFAULT,
             fetch_regulation=DEFAULT,
+            capture_mcp_performance_source_state=DEFAULT,
+            finalize_mcp_performance_source_state=DEFAULT,
         )
         self.mocks = self.patcher.__enter__()
         _configure_patches(self.mocks, warm_record_count=self.warm_record_count)

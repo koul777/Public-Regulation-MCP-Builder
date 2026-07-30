@@ -5,17 +5,16 @@ from contextlib import contextmanager
 from datetime import date, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 import unicodedata
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
 from app.ingestion.vector_adapter import stable_content_hash
-from app.retrieval.regulation_reference_graph import (
-    build_regulation_reference_graph,
-    canonicalize_article_locator,
-)
+from app.retrieval.bm25_index import Bm25Index, source_content_hashes
+from app.retrieval.searcher import rerank_bm25_candidates
 
 
 HIERARCHICAL_INDEX_SCHEMA_VERSION = "reg-rag-hierarchical-index-v2"
@@ -24,6 +23,9 @@ HIERARCHICAL_INDEX_RELATIVE_PATH = Path("hierarchy") / "regulation_hierarchy.sql
 _DATE_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})[-./](\d{1,2})[-./](\d{1,2})(?!\d)")
 _QUERY_TOKEN_RE = re.compile(r"[0-9A-Za-z\uac00-\ud7a3]+")
 _ARTICLE_RE = re.compile(r"^\s*(\uc81c\s*\d+\s*\uc870(?:\uc758\s*\d+)?)")
+_FTS_PREFIX_ARTICLE_LOCATOR_RE = re.compile(
+    r"^\uc81c[1-9]\d*\uc870(?:\uc758[1-9]\d*)?$"
+)
 _HISTORICAL_LIFECYCLE_STATUSES = ("approved", "superseded", "repealed")
 _CURRENT_LIFECYCLE_STATUSES = ("approved", "superseded")
 _KOREAN_QUERY_SUFFIXES = (
@@ -103,6 +105,37 @@ def regulation_unit_id_for(
 def canonicalize_runtime_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return records in a stable logical order independent of upload order."""
     return sorted(records, key=_runtime_record_sort_key)
+
+
+def logical_corpus_sha256_for_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    tenant_id: str,
+    profile_id: str | None,
+) -> str:
+    """Recompute the logical hierarchy fingerprint from scoped runtime records."""
+
+    record_list = records if isinstance(records, list) else list(records)
+    _, scoped_profile_id = _validated_runtime_record_scope(
+        record_list,
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+    )
+    canonical_records = canonicalize_runtime_records(record_list)
+    record_identities = _canonical_record_regulation_identities(
+        canonical_records,
+        fallback_profile_id=scoped_profile_id,
+    )
+    version_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in canonical_records:
+        document_id, chunk_id = _record_identity(record)
+        _add_runtime_record_to_version_groups(
+            version_groups,
+            record=record,
+            identity=record_identities.get((document_id, chunk_id), {}),
+            scoped_profile_id=scoped_profile_id,
+        )
+    return _logical_corpus_hash(_finalize_versions(version_groups))
 
 
 def _canonical_record_regulation_identities(
@@ -691,7 +724,7 @@ def write_vector_records_with_offsets(
 
 def build_hierarchical_runtime_index(
     path: str | Path,
-    records: list[dict[str, Any]],
+    records: Iterable[dict[str, Any]],
     *,
     tenant_id: str,
     profile_id: str | None,
@@ -699,11 +732,18 @@ def build_hierarchical_runtime_index(
     progress_callback: Callable[[int, str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Build a regulation catalog, TOC, version, and body-search index."""
-    records = canonicalize_runtime_records(records)
+    record_list = records if isinstance(records, list) else list(records)
+    scoped_tenant_id, scoped_profile_id = _validated_runtime_record_scope(
+        record_list,
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+    )
+    records = canonicalize_runtime_records(record_list)
+    corpus_source_content_hashes = source_content_hashes(records)
     total_records = len(records)
     record_identities = _canonical_record_regulation_identities(
         records,
-        fallback_profile_id=profile_id,
+        fallback_profile_id=scoped_profile_id,
     )
     progress_step = max(1, total_records // 100)
     reference_graph: dict[str, Any] = {
@@ -727,9 +767,10 @@ def build_hierarchical_runtime_index(
             "INSERT INTO index_metadata(key, value) VALUES(?, ?)",
             [
                 ("schema_version", HIERARCHICAL_INDEX_SCHEMA_VERSION),
-                ("tenant_id", str(tenant_id)),
-                ("profile_id", str(profile_id or "")),
+                ("tenant_id", scoped_tenant_id),
+                ("profile_id", scoped_profile_id),
                 ("record_count", str(len(records))),
+                ("source_content_hashes", corpus_source_content_hashes),
             ],
         )
 
@@ -739,83 +780,11 @@ def build_hierarchical_runtime_index(
             metadata = _metadata(record)
             document_id, chunk_id = _record_identity(record)
             identity = record_identities.get((document_id, chunk_id), {})
-            title = str(
-                identity.get("title")
-                or metadata.get("regulation_title")
-                or metadata.get("document_name")
-                or ""
-            ).strip()
-            regulation_no = str(
-                identity["regulation_no"]
-                if identity
-                else metadata.get("regulation_no") or ""
-            ).strip()
-            record_profile = str(
-                identity.get("profile_id")
-                or metadata.get("profile_id")
-                or profile_id
-                or ""
-            ).strip()
-            unit_id = str(
-                identity.get("unit_id")
-                or regulation_unit_id_for(
-                    profile_id=record_profile,
-                    regulation_title=title,
-                    regulation_no=regulation_no,
-                )
-            )
-            version_id = _version_id(unit_id, document_id)
-            revision_date = _latest_date(
-                metadata.get("revision_date"),
-                metadata.get("effective_date"),
-                metadata.get("valid_from"),
-            )
-            effective_from = _first_date(metadata.get("effective_from"), metadata.get("valid_from"))
-            effective_to = _first_date(metadata.get("effective_to"), metadata.get("valid_to"))
-            group = version_groups.setdefault(
-                (unit_id, document_id),
-                {
-                    "version_id": version_id,
-                    "unit_id": unit_id,
-                    "document_id": document_id,
-                    "profile_id": record_profile,
-                    "institution_name": str(metadata.get("institution_name") or ""),
-                    "regulation_no": regulation_no,
-                    "title": title,
-                    "source_version": str(metadata.get("regulation_version") or ""),
-                    "revision_dates": [],
-                    "effective_dates": [],
-                    "effective_to_dates": [],
-                    "status": str(metadata.get("regulation_status") or "approved"),
-                    "content_hashes": [],
-                    "logical_chunk_hashes": [],
-                    "search_values": [],
-                    "chunk_count": 0,
-                    "is_navigation": int(_is_navigation_unit(title, regulation_no)),
-                },
-            )
-            if revision_date:
-                group["revision_dates"].append(revision_date)
-            if effective_from:
-                group["effective_dates"].append(effective_from)
-            if effective_to:
-                group["effective_to_dates"].append(effective_to)
-            group["chunk_count"] += 1
-            group["content_hashes"].append(str(record.get("content_hash") or ""))
-            group["logical_chunk_hashes"].append(_logical_record_hash(record))
-            group["search_values"].extend(
-                str(value or "")
-                for value in (
-                    metadata.get("regulation_title"),
-                    metadata.get("regulation_no"),
-                    metadata.get("part_title"),
-                    metadata.get("chapter_title"),
-                    metadata.get("section_title"),
-                    metadata.get("article_no"),
-                    metadata.get("article_title"),
-                    metadata.get("hierarchy_path"),
-                )
-                if str(value or "").strip()
+            unit_id, version_id = _add_runtime_record_to_version_groups(
+                version_groups,
+                record=record,
+                identity=identity,
+                scoped_profile_id=scoped_profile_id,
             )
             offset, length = (vector_offsets or {}).get((document_id, chunk_id), (-1, -1))
             prepared_records.append(
@@ -839,6 +808,11 @@ def build_hierarchical_runtime_index(
                 )
 
         finalized_versions = _finalize_versions(version_groups)
+        logical_corpus_sha256 = _logical_corpus_hash(finalized_versions)
+        connection.execute(
+            "INSERT INTO index_metadata(key, value) VALUES(?, ?)",
+            ("logical_corpus_sha256", logical_corpus_sha256),
+        )
         _report_hierarchy_progress(
             progress_callback,
             30,
@@ -851,9 +825,9 @@ def build_hierarchical_runtime_index(
             INSERT INTO regulation_versions(
                 version_id, unit_id, document_id, profile_id, institution_name,
                 regulation_no, title, source_version, revision_date, effective_from,
-                effective_to, status, is_current, is_navigation, chunk_count,
+                effective_to, repealed_at, status, is_current, is_navigation, chunk_count,
                 content_hash, search_text
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -868,6 +842,7 @@ def build_hierarchical_runtime_index(
                     item["revision_date"],
                     item["effective_from"],
                     item["effective_to"],
+                    item["repealed_at"],
                     item["status"],
                     item["is_current"],
                     item["is_navigation"],
@@ -965,11 +940,15 @@ def build_hierarchical_runtime_index(
             0,
             len(finalized_versions),
         )
+        from app.retrieval.regulation_reference_graph import (
+            build_regulation_reference_graph,
+        )
+
         reference_graph = build_regulation_reference_graph(
             _current_reference_graph_records(
                 prepared_records,
                 finalized_versions,
-                tenant_id=tenant_id,
+                tenant_id=scoped_tenant_id,
             )
         )
         _store_reference_graph(connection, reference_graph)
@@ -1009,7 +988,8 @@ def build_hierarchical_runtime_index(
     return {
         "schema_version": HIERARCHICAL_INDEX_SCHEMA_VERSION,
         "rebuild_fingerprint_schema_version": REBUILD_FINGERPRINT_SCHEMA_VERSION,
-        "logical_corpus_sha256": _logical_corpus_hash(finalized_versions),
+        "logical_corpus_sha256": logical_corpus_sha256,
+        "source_content_hashes": corpus_source_content_hashes,
         "path": str(output_path),
         "sha256": _sha256_file(output_path),
         "record_count": len(records),
@@ -1062,11 +1042,19 @@ def index_summary(path: str | Path) -> dict[str, Any] | None:
         reference_cycle_count = connection.execute(
             "SELECT COUNT(*) FROM regulation_reference_cycles"
         ).fetchone()[0]
+    logical_corpus_sha256 = metadata.get("logical_corpus_sha256")
+    if (
+        not isinstance(logical_corpus_sha256, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", logical_corpus_sha256)
+    ):
+        logical_corpus_sha256 = None
     return {
         "schema_version": metadata.get("schema_version"),
         "tenant_id": metadata.get("tenant_id"),
         "profile_id": metadata.get("profile_id"),
         "record_count": _integer(metadata.get("record_count"), 0),
+        "source_content_hashes": metadata.get("source_content_hashes"),
+        "logical_corpus_sha256": logical_corpus_sha256,
         "regulation_count": int(regulation_count),
         "current_regulation_count": int(current_count),
         "regulation_version_count": int(version_count),
@@ -1090,6 +1078,7 @@ def search_hierarchical_records(
     document_id: str | None = None,
     as_of_date: str | None = None,
     allowed_unit_ids: set[str] | None = None,
+    rerank_index: Bm25Index | None = None,
 ) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
     """Search allowed catalog units first, then retrieve body evidence by offset."""
     path = Path(index_path)
@@ -1115,10 +1104,10 @@ def search_hierarchical_records(
         )
 
     version_scores = {str(row["version_id"]): float(score) for score, row in selected}
+    records = _read_vector_records_at(vector_path, rows)
     results: list[tuple[float, dict[str, Any]]] = []
     seen: set[tuple[str, str]] = set()
-    for row in rows:
-        record = _read_vector_record_at(vector_path, row)
+    for row, record in zip(rows, records):
         if record is None:
             continue
         identity = _record_identity(record)
@@ -1128,6 +1117,8 @@ def search_hierarchical_records(
         lexical_score = float(row["retrieval_score"])
         catalog_score = min(version_scores.get(str(row["version_id"]), 0.0), 100.0) / 100.0
         results.append((round(lexical_score + catalog_score, 8), record))
+    if rerank_index is not None:
+        results = rerank_bm25_candidates(query, results, rerank_index)
     results.sort(
         key=lambda item: (
             item[0],
@@ -1147,6 +1138,11 @@ def search_hierarchical_records(
             "revision_date": str(row["revision_date"] or ""),
             "effective_from": str(row["effective_from"] or ""),
             "effective_to": str(row["effective_to"] or ""),
+            "repealed_at": (
+                str(row["repealed_at"] or "")
+                if "repealed_at" in row.keys()
+                else ""
+            ),
             "status": str(row["status"] or ""),
             "catalog_score": round(float(score), 4),
         }
@@ -1156,6 +1152,11 @@ def search_hierarchical_records(
         "retrieval_model": "institution-hierarchical-sqlite-fts-v1",
         "retrieval_strategy": "catalog_toc_body",
         "retrieval_fallback": False,
+        "candidate_reranker": (
+            "verified_bm25_fast_query"
+            if rerank_index is not None
+            else None
+        ),
         "candidate_regulation_count": len(candidate_regulations),
         "candidate_regulations": candidate_regulations,
         "query_terms": terms,
@@ -1291,25 +1292,31 @@ def page_indexed_regulations(
             params.append(f"%{escaped.casefold()}%")
         clauses.append("(" + " OR ".join(term_clauses) + ")")
 
-    common_sql = f"""
-        WITH filtered AS (
-            SELECT v.*
-            FROM regulation_versions v
-            WHERE {' AND '.join(clauses)}
-        ),
-        ranked AS (
-            SELECT filtered.*,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY {"version_id" if include_history else "unit_id"}
-                       ORDER BY COALESCE(NULLIF(effective_from, ''), revision_date) DESC,
-                                CASE lower(status) WHEN 'approved' THEN 1 ELSE 0 END DESC,
-                                revision_date DESC, source_version DESC, version_id DESC
-                   ) AS unit_rank
-            FROM filtered
-        )
-    """
     offset = (normalized_page - 1) * normalized_page_size
     with _connect_readonly(Path(path)) as connection:
+        if (
+            not include_history
+            and _regulation_versions_has_repealed_at(connection)
+        ):
+            clauses.append("(v.repealed_at='' OR ?<v.repealed_at)")
+            params.append(selection_date)
+        common_sql = f"""
+            WITH filtered AS (
+                SELECT v.*
+                FROM regulation_versions v
+                WHERE {' AND '.join(clauses)}
+            ),
+            ranked AS (
+                SELECT filtered.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {"version_id" if include_history else "unit_id"}
+                           ORDER BY COALESCE(NULLIF(effective_from, ''), revision_date) DESC,
+                                    CASE lower(status) WHEN 'approved' THEN 1 ELSE 0 END DESC,
+                                    revision_date DESC, source_version DESC, version_id DESC
+                       ) AS unit_rank
+                FROM filtered
+            )
+        """
         total_row = connection.execute(
             common_sql + " SELECT COUNT(*) AS total_count FROM ranked WHERE unit_rank=1",
             params,
@@ -1345,13 +1352,12 @@ def page_indexed_regulations(
     ], total_count
 
 
-def fully_visible_regulation_unit_ids(
+def indexed_document_ids(
     path: str | Path,
     *,
-    visible_record_keys: set[tuple[str, str]],
     profile_id: str | None = None,
 ) -> set[str]:
-    """Return units whose indexed chunks are all visible to the current caller."""
+    """Return distinct non-empty document IDs represented by indexed chunks."""
 
     clauses: list[str] = []
     params: list[Any] = []
@@ -1362,13 +1368,84 @@ def fully_visible_regulation_unit_ids(
     with _connect_readonly(Path(path)) as connection:
         rows = connection.execute(
             f"""
-            SELECT c.unit_id, c.document_id, c.chunk_id
+            SELECT DISTINCT c.document_id
             FROM chunks c
             JOIN regulation_versions v ON v.version_id=c.version_id
             {where_sql}
             """,
             params,
         ).fetchall()
+    return {
+        document_id
+        for row in rows
+        if (document_id := str(row["document_id"] or ""))
+    }
+
+
+def fully_visible_regulation_unit_ids(
+    path: str | Path,
+    *,
+    visible_record_keys: set[tuple[str, str]] | None = None,
+    visible_record_signatures: set[tuple[str, str, str]] | None = None,
+    profile_id: str | None = None,
+) -> set[str]:
+    """Return units whose indexed chunks are all visible to the current caller.
+
+    Callers must provide exactly one visibility representation. Signature mode
+    additionally requires every indexed chunk to have non-empty identity fields
+    and an exact ``content_hash`` match.
+    """
+
+    if (visible_record_keys is None) == (visible_record_signatures is None):
+        raise ValueError(
+            "provide exactly one of visible_record_keys or visible_record_signatures"
+        )
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if profile_id:
+        clauses.append("lower(v.profile_id)=lower(?)")
+        params.append(profile_id)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _connect_readonly(Path(path)) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT c.unit_id, c.document_id, c.chunk_id, c.content_hash
+            FROM chunks c
+            JOIN regulation_versions v ON v.version_id=c.version_id
+            {where_sql}
+            """,
+            params,
+        ).fetchall()
+    if visible_record_signatures is not None:
+        indexed_signatures_by_unit: dict[
+            str, set[tuple[str, str, str]]
+        ] = defaultdict(set)
+        invalid_signature_units: set[str] = set()
+        for row in rows:
+            unit_id = str(row["unit_id"] or "")
+            document_id = str(row["document_id"] or "")
+            chunk_id = str(row["chunk_id"] or "")
+            content_hash = str(row["content_hash"] or "")
+            if not unit_id:
+                continue
+            if not document_id or not chunk_id or not content_hash:
+                invalid_signature_units.add(unit_id)
+                continue
+            indexed_signatures_by_unit[unit_id].add(
+                (document_id, chunk_id, content_hash)
+            )
+        return {
+            unit_id
+            for unit_id, indexed_signatures in indexed_signatures_by_unit.items()
+            if (
+                unit_id not in invalid_signature_units
+                and indexed_signatures
+                and indexed_signatures.issubset(visible_record_signatures)
+            )
+        }
+
+    assert visible_record_keys is not None
     indexed_keys_by_unit: dict[str, set[tuple[str, str]]] = defaultdict(set)
     for row in rows:
         indexed_keys_by_unit[str(row["unit_id"] or "")].add(
@@ -1685,6 +1762,61 @@ def load_record_by_chunk(
     return _read_vector_record_at(vector_path, row) if row is not None else None
 
 
+def load_document_records(
+    index_path: str | Path,
+    vector_path: str | Path,
+    *,
+    document_id: str,
+) -> list[dict[str, Any]]:
+    with _connect_readonly(Path(index_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT c.*, 1.0 AS retrieval_score
+            FROM chunks c
+            WHERE c.document_id=?
+            ORDER BY c.order_index
+            """,
+            (document_id,),
+        ).fetchall()
+    return [
+        record
+        for record in _read_vector_records_at(vector_path, rows)
+        if record is not None
+    ]
+
+
+def load_document_article_records(
+    index_path: str | Path,
+    vector_path: str | Path,
+    *,
+    document_id: str,
+) -> list[dict[str, Any]]:
+    """Load only records eligible to govern appendix/form references.
+
+    Governing-article resolution ignores records without both an article
+    number and title. Selecting that exhaustive candidate set in SQLite avoids
+    reading unrelated forms, tables, appendices, and navigation chunks.
+    """
+
+    with _connect_readonly(Path(index_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT c.*, 1.0 AS retrieval_score
+            FROM chunks c
+            WHERE c.document_id=?
+              AND trim(c.article_no)<>''
+              AND trim(c.article_title)<>''
+            ORDER BY c.order_index
+            """,
+            (document_id,),
+        ).fetchall()
+    return [
+        record
+        for record in _read_vector_records_at(vector_path, rows)
+        if record is not None
+    ]
+
+
 def load_article_records(
     index_path: str | Path,
     vector_path: str | Path,
@@ -1706,7 +1838,11 @@ def load_article_records(
             """,
             (version["version_id"], article_no),
         ).fetchall()
-    return [record for row in rows if (record := _read_vector_record_at(vector_path, row)) is not None]
+    return [
+        record
+        for record in _read_vector_records_at(vector_path, rows)
+        if record is not None
+    ]
 
 
 def query_terms(query: str) -> list[str]:
@@ -1741,6 +1877,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             revision_date TEXT NOT NULL,
             effective_from TEXT NOT NULL,
             effective_to TEXT NOT NULL,
+            repealed_at TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
             is_current INTEGER NOT NULL,
             is_navigation INTEGER NOT NULL,
@@ -1873,6 +2010,7 @@ def _current_reference_graph_records(
                 "version": str(version.get("version_label") or ""),
                 "effective_from": str(version.get("effective_from") or ""),
                 "effective_to": str(version.get("effective_to") or ""),
+                "repealed_at": str(version.get("repealed_at") or ""),
                 "approval_status": "approved",
                 "article_locator": article_locators[0] if article_locators else "",
                 "article_locators": article_locators,
@@ -1884,6 +2022,10 @@ def _current_reference_graph_records(
 
 def _materialized_article_locators(metadata: Mapping[str, Any]) -> list[str]:
     """Return article/paragraph/item locators actually represented by a record."""
+
+    from app.retrieval.regulation_reference_graph import (
+        canonicalize_article_locator,
+    )
 
     base = canonicalize_article_locator(metadata.get("article_no"))
     if not isinstance(base, Mapping):
@@ -2073,6 +2215,106 @@ def _store_reference_graph(
     )
 
 
+def _add_runtime_record_to_version_groups(
+    groups: dict[tuple[str, str], dict[str, Any]],
+    *,
+    record: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    scoped_profile_id: str,
+) -> tuple[str, str]:
+    metadata = _metadata(record)
+    document_id, _ = _record_identity(record)
+    title = str(
+        identity.get("title")
+        or metadata.get("regulation_title")
+        or metadata.get("document_name")
+        or ""
+    ).strip()
+    regulation_no = str(
+        identity["regulation_no"]
+        if identity
+        else metadata.get("regulation_no") or ""
+    ).strip()
+    record_profile = str(
+        identity.get("profile_id")
+        or metadata.get("profile_id")
+        or scoped_profile_id
+        or ""
+    ).strip()
+    unit_id = str(
+        identity.get("unit_id")
+        or regulation_unit_id_for(
+            profile_id=record_profile,
+            regulation_title=title,
+            regulation_no=regulation_no,
+        )
+    )
+    version_id = _version_id(unit_id, document_id)
+    revision_date = _latest_date(
+        metadata.get("revision_date"),
+        metadata.get("effective_date"),
+        metadata.get("valid_from"),
+    )
+    effective_from = _first_date(
+        metadata.get("effective_from"),
+        metadata.get("valid_from"),
+    )
+    effective_to = _first_date(
+        metadata.get("effective_to"),
+        metadata.get("valid_to"),
+    )
+    repealed_at = _first_date(metadata.get("repealed_at"))
+    group = groups.setdefault(
+        (unit_id, document_id),
+        {
+            "version_id": version_id,
+            "unit_id": unit_id,
+            "document_id": document_id,
+            "profile_id": record_profile,
+            "institution_name": str(metadata.get("institution_name") or ""),
+            "regulation_no": regulation_no,
+            "title": title,
+            "source_version": str(metadata.get("regulation_version") or ""),
+            "revision_dates": [],
+            "effective_dates": [],
+            "effective_to_dates": [],
+            "repealed_at_dates": [],
+            "status": str(metadata.get("regulation_status") or "approved"),
+            "content_hashes": [],
+            "logical_chunk_hashes": [],
+            "search_values": [],
+            "chunk_count": 0,
+            "is_navigation": int(_is_navigation_unit(title, regulation_no)),
+        },
+    )
+    if revision_date:
+        group["revision_dates"].append(revision_date)
+    if effective_from:
+        group["effective_dates"].append(effective_from)
+    if effective_to:
+        group["effective_to_dates"].append(effective_to)
+    if repealed_at:
+        group["repealed_at_dates"].append(repealed_at)
+    group["chunk_count"] += 1
+    group["content_hashes"].append(str(record.get("content_hash") or ""))
+    group["logical_chunk_hashes"].append(_logical_record_hash(record))
+    group["search_values"].extend(
+        str(value or "")
+        for value in (
+            metadata.get("regulation_title"),
+            metadata.get("regulation_no"),
+            metadata.get("part_title"),
+            metadata.get("chapter_title"),
+            metadata.get("section_title"),
+            metadata.get("article_no"),
+            metadata.get("article_title"),
+            metadata.get("hierarchy_path"),
+        )
+        if str(value or "").strip()
+    )
+    return unit_id, version_id
+
+
 def _finalize_versions(groups: dict[tuple[str, str], dict[str, Any]]) -> dict[str, dict[str, Any]]:
     finalized: dict[str, dict[str, Any]] = {}
     by_unit: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2092,6 +2334,7 @@ def _finalize_versions(groups: dict[tuple[str, str], dict[str, Any]]) -> dict[st
             "revision_date": revision_date,
             "effective_from": effective_from,
             "effective_to": min(group.get("effective_to_dates") or (), default=""),
+            "repealed_at": min(group.get("repealed_at_dates") or (), default=""),
             "version_label": version_label,
             "is_current": 0,
             "content_hash": _aggregate_hash(group["content_hashes"]),
@@ -2161,6 +2404,9 @@ def _selected_version_rows(
         "(v.effective_to='' OR v.effective_to>=?)",
     ]
     params: list[Any] = [*lifecycle_statuses, selection_date, selection_date]
+    if _regulation_versions_has_repealed_at(connection):
+        clauses.append("(v.repealed_at='' OR ?<v.repealed_at)")
+        params.append(selection_date)
     if not as_of_date:
         clauses.append(
             "NOT (lower(v.status)='superseded' AND v.effective_to='')"
@@ -2273,9 +2519,18 @@ def _search_chunk_rows(
     if not version_ids:
         return []
     placeholders = ",".join("?" for _ in version_ids)
-    fts_terms = [term.replace('"', '""') for term in terms if term]
+    fts_terms: list[str] = []
+    for term in terms:
+        normalized_term = unicodedata.normalize("NFKC", str(term or "")).casefold()
+        if not normalized_term:
+            continue
+        escaped_term = normalized_term.replace('"', '""')
+        if _FTS_PREFIX_ARTICLE_LOCATOR_RE.fullmatch(normalized_term):
+            fts_terms.append(f'"{escaped_term}"*')
+        else:
+            fts_terms.append(f'"{escaped_term}"')
     if fts_terms:
-        match_query = " OR ".join(f'"{term}"' for term in fts_terms)
+        match_query = " OR ".join(fts_terms)
         rows = connection.execute(
             f"""
             SELECT c.*, (1.0 - (1.0 / (1.0 + abs(bm25(chunks_fts, 8.0, 4.0, 6.0, 1.0))))) AS retrieval_score
@@ -2340,6 +2595,9 @@ def _version_for_unit(
         selection_date,
         selection_date,
     ]
+    if _regulation_versions_has_repealed_at(connection):
+        clauses.append("(repealed_at='' OR ?<repealed_at)")
+        params.append(selection_date)
     if not as_of_date:
         clauses.append(
             "NOT (lower(status)='superseded' AND effective_to='')"
@@ -2357,26 +2615,85 @@ def _version_for_unit(
     ).fetchone()
 
 
-def _read_vector_record_at(vector_path: str | Path, row: Mapping[str, Any] | sqlite3.Row) -> dict[str, Any] | None:
-    offset = int(row["vector_offset"])
-    length = int(row["vector_length"])
-    if offset < 0 or length <= 0:
-        return None
+def _read_vector_record_at(
+    vector_path: str | Path,
+    row: Mapping[str, Any] | sqlite3.Row,
+) -> dict[str, Any] | None:
+    """Load one verified vector record while preserving the public helper contract."""
+
+    records = _read_vector_records_at(vector_path, [row])
+    return records[0] if records else None
+
+
+def _read_vector_records_at(
+    vector_path: str | Path,
+    rows: Iterable[Mapping[str, Any] | sqlite3.Row],
+) -> list[dict[str, Any] | None]:
+    """Load offset-addressed records through one binary handle.
+
+    The result list stays aligned with ``rows``. Any invalid row is rejected
+    independently so one corrupt offset or payload cannot suppress valid
+    neighbors.
+    """
+
+    row_list = list(rows)
+    if not row_list:
+        return []
     try:
         with Path(vector_path).open("rb") as handle:
-            handle.seek(offset)
-            payload = handle.read(length)
+            handle.seek(0, os.SEEK_END)
+            vector_size = handle.tell()
+            return [
+                _read_vector_record_from_handle(handle, row, vector_size=vector_size)
+                for row in row_list
+            ]
+    except OSError:
+        return [None] * len(row_list)
+
+
+def _read_vector_record_from_handle(
+    handle: BinaryIO,
+    row: Mapping[str, Any] | sqlite3.Row,
+    *,
+    vector_size: int,
+) -> dict[str, Any] | None:
+    try:
+        offset = int(row["vector_offset"])
+        length = int(row["vector_length"])
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    if offset < 0 or length <= 0:
+        return None
+    if offset > vector_size or length > vector_size - offset:
+        return None
+    try:
+        handle.seek(offset)
+        payload = handle.read(length)
+        if len(payload) != length:
+            return None
         record = json.loads(payload.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (
+        OSError,
+        ValueError,
+        OverflowError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
         return None
     if not isinstance(record, dict):
         return None
     document_id, chunk_id = _record_identity(record)
-    if document_id != str(row["document_id"]) or chunk_id != str(row["chunk_id"]):
+    try:
+        expected_document_id = str(row["document_id"])
+        expected_chunk_id = str(row["chunk_id"])
+        expected_content_hash = str(row["content_hash"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if document_id != expected_document_id or chunk_id != expected_chunk_id:
         return None
     metadata = _metadata(record)
     content_hash = str(record.get("content_hash") or "")
-    if content_hash != str(row["content_hash"]):
+    if content_hash != expected_content_hash:
         return None
     if stable_content_hash(str(record.get("text") or ""), metadata) != content_hash:
         return None
@@ -2543,6 +2860,11 @@ def _public_regulation_row(
         "revision_date": str(row["revision_date"]),
         "effective_from": str(row["effective_from"]),
         "effective_to": str(row["effective_to"]),
+        "repealed_at": (
+            str(row["repealed_at"] or "")
+            if "repealed_at" in keys
+            else ""
+        ),
         "status": str(row["status"]),
         "is_current": bool(row["is_current"]) if is_current is None else is_current,
         "chunk_count": int(row["chunk_count"]),
@@ -2560,6 +2882,15 @@ def _connect_readonly(path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def _regulation_versions_has_repealed_at(connection: sqlite3.Connection) -> bool:
+    """Detect the additive lifecycle column without migrating legacy indexes."""
+
+    return any(
+        str(row[1]) == "repealed_at"
+        for row in connection.execute("PRAGMA table_info(regulation_versions)")
+    )
+
+
 def _metadata(record: Mapping[str, Any]) -> dict[str, Any]:
     value = record.get("metadata")
     return value if isinstance(value, dict) else {}
@@ -2571,6 +2902,77 @@ def _record_identity(record: Mapping[str, Any]) -> tuple[str, str]:
         str(record.get("document_id") or metadata.get("document_id") or ""),
         str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
     )
+
+
+def _validated_runtime_record_scope(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    tenant_id: object,
+    profile_id: object,
+) -> tuple[str, str]:
+    """Bind every build input to one exact tenant and profile scope."""
+
+    expected_tenant_id = str(tenant_id or "").strip()
+    expected_profile_id = str(profile_id or "").strip()
+    if not expected_tenant_id:
+        raise ValueError("tenant_id must be a non-empty build scope")
+
+    observed_profile_ids: set[str] = set()
+    record_count = 0
+    for record_index, record in enumerate(records, start=1):
+        record_count += 1
+        if not isinstance(record, Mapping):
+            raise ValueError(f"record {record_index} must be a mapping")
+        record_tenant_id = _record_scope_identifier(
+            record,
+            field="tenant_id",
+            record_index=record_index,
+        )
+        if not record_tenant_id:
+            raise ValueError(f"record {record_index} tenant_id is required")
+        if record_tenant_id != expected_tenant_id:
+            raise ValueError(
+                f"record {record_index} tenant_id does not match build tenant_id"
+            )
+
+        record_profile_id = _record_scope_identifier(
+            record,
+            field="profile_id",
+            record_index=record_index,
+        )
+        if not record_profile_id:
+            raise ValueError(f"record {record_index} profile_id is required")
+        if expected_profile_id and record_profile_id != expected_profile_id:
+            raise ValueError(
+                f"record {record_index} profile_id does not match build profile_id"
+            )
+        observed_profile_ids.add(record_profile_id)
+
+    if expected_profile_id:
+        return expected_tenant_id, expected_profile_id
+    if record_count == 0 or len(observed_profile_ids) != 1:
+        raise ValueError(
+            "records must belong to exactly one non-empty profile_id "
+            "when build profile_id is omitted"
+        )
+    return expected_tenant_id, next(iter(observed_profile_ids))
+
+
+def _record_scope_identifier(
+    record: Mapping[str, Any],
+    *,
+    field: str,
+    record_index: int,
+) -> str:
+    metadata = _metadata(record)
+    values = {
+        normalized
+        for candidate in (record.get(field), metadata.get(field))
+        if (normalized := str(candidate or "").strip())
+    }
+    if len(values) > 1:
+        raise ValueError(f"record {record_index} has conflicting {field} values")
+    return next(iter(values), "")
 
 
 def _version_id(unit_id: str, document_id: str) -> str:
@@ -2643,9 +3045,11 @@ def _lifecycle_version_sort_key(item: Mapping[str, Any]) -> tuple[str, int, str,
 def _version_is_effective_on(item: Mapping[str, Any], reference_date: date) -> bool:
     effective_from = _parse_date(item.get("effective_from"))
     effective_to = _parse_date(item.get("effective_to"))
+    repealed_at = _parse_date(item.get("repealed_at"))
     return (
         (effective_from is None or effective_from <= reference_date)
         and (effective_to is None or reference_date <= effective_to)
+        and (repealed_at is None or reference_date < repealed_at)
     )
 
 
@@ -2677,6 +3081,7 @@ def _logical_record_hash(record: Mapping[str, Any]) -> str:
         "revision_date",
         "effective_from",
         "effective_to",
+        "repealed_at",
         "valid_from",
         "valid_to",
         "chunk_type",
@@ -2723,6 +3128,7 @@ def _logical_corpus_hash(versions: Mapping[str, Mapping[str, Any]]) -> str:
             "revision_date": str(item.get("revision_date") or ""),
             "effective_from": str(item.get("effective_from") or ""),
             "effective_to": str(item.get("effective_to") or ""),
+            "repealed_at": str(item.get("repealed_at") or ""),
             "status": _compact(item.get("status")),
             "chunk_count": int(item.get("chunk_count") or 0),
             "logical_content_sha256": str(item.get("logical_content_hash") or ""),

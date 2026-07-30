@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
@@ -15,6 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.mcp_server.regulation_tools import (
+    _verified_hierarchical_runtime_paths,
+    _verified_hierarchical_runtime_token,
     fetch_regulation,
     mcp_auth_context,
     search_regulations,
@@ -22,8 +25,17 @@ from app.mcp_server.regulation_tools import (
     warm_mcp_runtime,
 )
 from app.rag.extractive_answer import build_structured_extractive_answer
+from app.retrieval.hierarchical_index import (
+    _connect_readonly,
+    _selected_version_rows,
+    load_record_by_chunk,
+)
 from scripts.export_mcp_demo_answers import normalize_query_specs, query_spec_fingerprint
-from scripts.report_metadata import current_repo_commit
+from scripts.report_metadata import (
+    capture_mcp_performance_source_state,
+    current_repo_commit,
+    finalize_mcp_performance_source_state,
+)
 
 
 def benchmark_mcp_queries(
@@ -45,14 +57,24 @@ def benchmark_mcp_queries(
     out_json: Path | None = None,
     out_md: Path | None = None,
 ) -> dict[str, Any]:
+    started_source_state = capture_mcp_performance_source_state(PROJECT_ROOT)
     settings = settings_for_mcp_project(
         data_dir=data_dir,
         tenant_id=tenant_id,
         tenant_storage_isolation=tenant_storage_isolation,
+        api_audit_enabled=False,
+        rag_trace_enabled=False,
     )
     auth = mcp_auth_context(tenant_id=tenant_id)
     levels = security_levels or ["internal"]
     selected_queries = normalize_query_specs(queries=queries, query_specs=query_specs)
+    runtime_target_validations = _runtime_target_validations(
+        settings=settings,
+        auth=auth,
+        tenant_id=tenant_id,
+        raw_query_specs=query_specs,
+        profile_id=profile_id,
+    )
 
     warmup_summary = None
     if warm_runtime:
@@ -60,19 +82,27 @@ def benchmark_mcp_queries(
         warmup_summary = warm_mcp_runtime(settings=settings, auth=auth)
         warmup_summary["external_elapsed_ms"] = _elapsed_ms(warmup_started_at)
 
-    items = [
-        _benchmark_query(
-            settings=settings,
-            auth=auth,
-            query=str(spec["query"]),
-            expect_no_evidence=bool(spec.get("expect_no_evidence") or spec.get("expected_no_evidence")),
-            top_k=top_k,
-            iterations=max(1, int(iterations or 1)),
-            security_levels=levels,
-            profile_id=profile_id,
+    items = []
+    for index, spec in enumerate(selected_queries):
+        validation = runtime_target_validations[index] if index < len(runtime_target_validations) else None
+        if validation and not validation["valid"]:
+            items.append(_invalid_runtime_target_item(spec=spec, validation=validation))
+            continue
+        items.append(
+            _benchmark_query(
+                settings=settings,
+                auth=auth,
+                query=str(spec["query"]),
+                expect_no_evidence=bool(spec.get("expect_no_evidence") or spec.get("expected_no_evidence")),
+                top_k=top_k,
+                iterations=max(1, int(iterations or 1)),
+                security_levels=levels,
+                profile_id=profile_id,
+                query_spec_id=(validation or {}).get("id"),
+                target_chunk_ids=list((validation or {}).get("target_chunk_ids") or []),
+                target_document_ids=list((validation or {}).get("target_document_ids") or []),
+            )
         )
-        for spec in selected_queries
-    ]
     summary = _summarize_items(items)
     threshold_findings = _threshold_findings(
         items,
@@ -80,12 +110,18 @@ def benchmark_mcp_queries(
         max_warm_search_ms=max_warm_search_ms,
     )
     warmup_findings = _warmup_findings(warmup_summary, min_warm_records=min_warm_records)
+    runtime_target_findings = _runtime_target_findings(items)
     result_failures = _result_findings(items)
-    findings = warmup_findings + result_failures + threshold_findings
+    findings = warmup_findings + runtime_target_findings + result_failures + threshold_findings
+    source_state = finalize_mcp_performance_source_state(
+        started_source_state,
+        PROJECT_ROOT,
+    )
     report = {
         "report_type": "mcp_query_benchmark",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_commit": current_repo_commit(PROJECT_ROOT),
+        "source_state": source_state,
         "data_dir": str(data_dir),
         "tenant_id": tenant_id,
         "profile_id": profile_id,
@@ -94,6 +130,23 @@ def benchmark_mcp_queries(
         "top_k": top_k,
         "iterations": max(1, int(iterations or 1)),
         "min_warm_records": min_warm_records,
+        "thresholds": {
+            "max_total_ms": max_total_ms,
+            "max_warm_search_ms": max_warm_search_ms,
+            "min_warm_records": min_warm_records,
+        },
+        "thresholds_configured": any(
+            value is not None
+            for value in (
+                max_total_ms,
+                max_warm_search_ms,
+                min_warm_records,
+            )
+        ),
+        "settings_overrides": {
+            "api_audit_enabled": False,
+            "rag_trace_enabled": False,
+        },
         "query_count": len(items),
         "warmup": warmup_summary,
         "summary": summary,
@@ -124,6 +177,9 @@ def _benchmark_query(
     iterations: int,
     security_levels: list[str],
     profile_id: str | None,
+    query_spec_id: str | None,
+    target_chunk_ids: list[str],
+    target_document_ids: list[str],
 ) -> dict[str, Any]:
     measurements: list[dict[str, Any]] = []
     for index in range(iterations):
@@ -173,13 +229,43 @@ def _benchmark_query(
             }
         )
     return {
+        "query_spec_id": query_spec_id,
         "query": query,
         "expect_no_evidence": expect_no_evidence,
+        "query_spec_valid": True,
+        "runtime_target_available": True,
+        "target_chunk_ids": target_chunk_ids,
+        "target_document_ids": target_document_ids,
+        "missing_target_chunk_ids": [],
+        "missing_target_document_ids": [],
         "iteration_count": len(measurements),
         "search_result_counts": [item["search_result_count"] for item in measurements],
         "fetch_result_counts": [item["fetch_result_count"] for item in measurements],
         "summary": _summarize_measurements(measurements),
         "measurements": measurements,
+    }
+
+
+def _invalid_runtime_target_item(
+    *,
+    spec: dict[str, Any],
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "query_spec_id": validation.get("id"),
+        "query": str(spec.get("query") or ""),
+        "expect_no_evidence": bool(spec.get("expect_no_evidence") or spec.get("expected_no_evidence")),
+        "query_spec_valid": False,
+        "runtime_target_available": False,
+        "target_chunk_ids": list(validation.get("target_chunk_ids") or []),
+        "target_document_ids": list(validation.get("target_document_ids") or []),
+        "missing_target_chunk_ids": list(validation.get("missing_target_chunk_ids") or []),
+        "missing_target_document_ids": list(validation.get("missing_target_document_ids") or []),
+        "iteration_count": 0,
+        "search_result_counts": [],
+        "fetch_result_counts": [],
+        "summary": _summarize_measurements([]),
+        "measurements": [],
     }
 
 
@@ -207,6 +293,9 @@ def _summarize_measurements(measurements: list[dict[str, Any]]) -> dict[str, Any
         "fetch_elapsed_ms": _stats([item["fetch_elapsed_ms"] for item in measurements]),
         "answer_elapsed_ms": _stats([item["answer_elapsed_ms"] for item in measurements]),
         "total_elapsed_ms": _stats([item["total_elapsed_ms"] for item in measurements]),
+        "warm_total_elapsed_ms": _stats(
+            [item["total_elapsed_ms"] for item in measurements if int(item.get("iteration") or 0) > 1]
+        ),
         "warm_search_elapsed_ms": _stats(
             [item["search_elapsed_ms"] for item in measurements if int(item.get("iteration") or 0) > 1]
         ),
@@ -264,6 +353,8 @@ def _threshold_findings(
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for item in items:
+        if not item.get("query_spec_valid", True):
+            continue
         total_max = ((item.get("summary") or {}).get("total_elapsed_ms") or {}).get("max")
         if max_total_ms and total_max is not None and float(total_max) > max_total_ms:
             findings.append(
@@ -290,6 +381,8 @@ def _threshold_findings(
 def _result_findings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for item in items:
+        if not item.get("query_spec_valid", True):
+            continue
         search_result_counts = item.get("search_result_counts") or [0]
         if item.get("expect_no_evidence"):
             max_result_count = max(search_result_counts)
@@ -311,6 +404,24 @@ def _result_findings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "detail": "At least one benchmark iteration returned no search results.",
                 }
             )
+    return findings
+
+
+def _runtime_target_findings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("query_spec_valid", True):
+            continue
+        findings.append(
+            {
+                "code": "benchmark-query-spec-target-missing-from-runtime",
+                "query_spec_id": item.get("query_spec_id"),
+                "query": item.get("query"),
+                "missing_target_chunk_ids": item.get("missing_target_chunk_ids") or [],
+                "missing_target_document_ids": item.get("missing_target_document_ids") or [],
+                "detail": "Query specification targets are absent from the current approved runtime bundle.",
+            }
+        )
     return findings
 
 
@@ -359,8 +470,10 @@ def _elapsed_ms(started_at: float) -> float:
 def _to_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") or {}
     total = summary.get("total_elapsed_ms") or {}
+    warm_total = summary.get("warm_total_elapsed_ms") or {}
     warm_search = summary.get("warm_search_elapsed_ms") or {}
     warmup = report.get("warmup") or {}
+    thresholds = report.get("thresholds") or {}
     search_timing = summary.get("mcp_search_timing_summary") or {}
     lines = [
         "# MCP Query Benchmark",
@@ -371,7 +484,10 @@ def _to_markdown(report: dict[str, Any]) -> str:
         f"- Queries: {report.get('query_count')}",
         f"- Iterations per query: {report.get('iterations')}",
         f"- Warm runtime records: {warmup.get('record_count')} / minimum {report.get('min_warm_records') or ''}",
+        f"- Total max threshold ms: {thresholds.get('max_total_ms') if thresholds.get('max_total_ms') is not None else ''}",
+        f"- Warm search max threshold ms: {thresholds.get('max_warm_search_ms') if thresholds.get('max_warm_search_ms') is not None else ''}",
         f"- Total p50/p95/max ms: {total.get('p50')} / {total.get('p95')} / {total.get('max')}",
+        f"- Warm total p50/p95/max ms: {warm_total.get('p50')} / {warm_total.get('p95')} / {warm_total.get('max')}",
         f"- Warm search p50/p95/max ms: {warm_search.get('p50')} / {warm_search.get('p95')} / {warm_search.get('max')}",
         f"- API calls: {report.get('api_call_count')}",
         "",
@@ -403,13 +519,14 @@ def _to_markdown(report: dict[str, Any]) -> str:
         lines.append("")
     lines.extend(
         [
-        "| Query | Expected no evidence | Results | Fetches | Total max ms | Warm search max ms |",
-        "| --- | --- | ---: | ---: | ---: | ---: |",
+        "| Query | Expected no evidence | Results | Fetches | Total max ms | Warm total max ms | Warm search max ms |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for item in report.get("items") or []:
         item_summary = item.get("summary") or {}
         item_total = item_summary.get("total_elapsed_ms") or {}
+        item_warm_total = item_summary.get("warm_total_elapsed_ms") or {}
         item_warm_search = item_summary.get("warm_search_elapsed_ms") or {}
         lines.append(
             "| "
@@ -420,6 +537,7 @@ def _to_markdown(report: dict[str, Any]) -> str:
                     _md_cell(max(item.get("search_result_counts") or [0])),
                     _md_cell(max(item.get("fetch_result_counts") or [0])),
                     _md_cell(item_total.get("max")),
+                    _md_cell(item_warm_total.get("max")),
                     _md_cell(item_warm_search.get("max")),
                 ]
             )
@@ -434,6 +552,354 @@ def _to_markdown(report: dict[str, Any]) -> str:
 
 def _md_cell(value: Any) -> str:
     return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def _runtime_target_validations(
+    *,
+    settings: Any,
+    auth: Any | None = None,
+    tenant_id: str,
+    raw_query_specs: list[dict[str, Any]] | None,
+    profile_id: str | None,
+) -> list[dict[str, Any]]:
+    if not raw_query_specs:
+        return []
+    prepared_specs: list[dict[str, Any]] = []
+    requested_chunk_ids: set[str] = set()
+    requested_document_ids: set[str] = set()
+    for index, raw_spec in enumerate(raw_query_specs, start=1):
+        if not isinstance(raw_spec, dict):
+            continue
+        query = str(raw_spec.get("query") or raw_spec.get("question") or "").strip()
+        if not query:
+            continue
+        target_chunk_ids = _target_ids(raw_spec, "target_chunk_id", "target_chunk_ids")
+        target_document_ids = _target_ids(raw_spec, "target_document_id", "target_document_ids")
+        prepared = {
+            "id": str(raw_spec.get("id") or f"query_{index:03d}").strip(),
+            "query": query,
+            "target_chunk_ids": target_chunk_ids,
+            "target_document_ids": target_document_ids,
+        }
+        prepared_specs.append(prepared)
+        requested_chunk_ids.update(target_chunk_ids)
+        requested_document_ids.update(target_document_ids)
+    if not prepared_specs or (not requested_chunk_ids and not requested_document_ids):
+        return [
+            {
+                **spec,
+                "valid": True,
+                "missing_target_chunk_ids": [],
+                "missing_target_document_ids": [],
+            }
+            for spec in prepared_specs
+        ]
+
+    runtime_targets = _verified_runtime_target_ids(
+        settings=settings,
+        auth=auth or mcp_auth_context(tenant_id=tenant_id),
+        profile_id=profile_id,
+        requested_chunk_ids=requested_chunk_ids,
+        requested_document_ids=requested_document_ids,
+        as_of_dates={None},
+    )
+    found_chunk_ids, found_document_ids = (
+        runtime_targets.get(None, (set(), set()))
+        if runtime_targets is not None
+        else (set(), set())
+    )
+    validations: list[dict[str, Any]] = []
+    for spec in prepared_specs:
+        missing_chunk_ids = [
+            identifier for identifier in spec["target_chunk_ids"] if identifier not in found_chunk_ids
+        ]
+        missing_document_ids = [
+            identifier for identifier in spec["target_document_ids"] if identifier not in found_document_ids
+        ]
+        validations.append(
+            {
+                **spec,
+                "valid": not missing_chunk_ids and not missing_document_ids,
+                "missing_target_chunk_ids": missing_chunk_ids,
+                "missing_target_document_ids": missing_document_ids,
+            }
+        )
+    return validations
+
+
+def _verified_runtime_target_ids(
+    *,
+    settings: Any,
+    auth: Any,
+    profile_id: str | None,
+    requested_chunk_ids: set[str],
+    requested_document_ids: set[str],
+    as_of_dates: set[str | None],
+) -> dict[str | None, tuple[set[str], set[str]]] | None:
+    """Read target membership from the manifest-verified hierarchy runtime.
+
+    The hierarchy index determines which regulation version is searchable for
+    each lifecycle date. Target records are then read through the index's
+    vector offsets so a standalone or mismatched approved_vectors.jsonl file
+    cannot establish runtime presence.
+    """
+
+    if not requested_chunk_ids and not requested_document_ids:
+        return {
+            as_of_date: (set(), set())
+            for as_of_date in as_of_dates
+        }
+    if not str(getattr(auth, "tenant_id", "") or "").strip():
+        return None
+    try:
+        paths = _verified_hierarchical_runtime_paths(
+            settings=settings,
+            auth=auth,
+            profile_id=profile_id,
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if paths is None:
+        return None
+    runtime_token = _verified_hierarchical_runtime_token(paths)
+    if runtime_token is None:
+        return None
+    expected_tenant_id = str(runtime_token.tenant_id or "").strip()
+    expected_profile_id = str(runtime_token.profile_id or "").strip()
+    if (
+        not expected_tenant_id
+        or not expected_profile_id
+        or expected_tenant_id
+        != str(getattr(auth, "tenant_id", "") or "").strip()
+    ):
+        return None
+
+    try:
+        with _connect_readonly(paths[0]) as connection:
+            candidate_rows = _runtime_target_index_rows(
+                connection,
+                requested_chunk_ids=requested_chunk_ids,
+                requested_document_ids=requested_document_ids,
+            )
+            selected_version_ids_by_as_of = {
+                as_of_date: (
+                    {
+                        str(row["version_id"])
+                        for row in _selected_version_rows(
+                            connection,
+                            profile_id=expected_profile_id,
+                            document_id=None,
+                            as_of_date=as_of_date,
+                            allowed_unit_ids=None,
+                        )
+                    }
+                    if _valid_runtime_as_of_date(as_of_date)
+                    else set()
+                )
+                for as_of_date in as_of_dates
+            }
+    except (OSError, sqlite3.Error, UnicodeError, ValueError):
+        return None
+
+    verified_records: dict[tuple[str, str, str], bool] = {}
+    found_by_as_of: dict[str | None, tuple[set[str], set[str]]] = {}
+    for as_of_date, selected_version_ids in selected_version_ids_by_as_of.items():
+        found_chunk_ids: set[str] = set()
+        found_document_ids: set[str] = set()
+        for document_id, chunk_id, version_id, content_hash in candidate_rows:
+            if version_id not in selected_version_ids:
+                continue
+            if (
+                chunk_id not in requested_chunk_ids
+                and document_id not in requested_document_ids
+            ):
+                continue
+            cache_key = (document_id, chunk_id, content_hash)
+            record_is_verified = verified_records.get(cache_key)
+            if record_is_verified is None:
+                try:
+                    record = load_record_by_chunk(
+                        paths[0],
+                        paths[1],
+                        document_id=document_id,
+                        chunk_id=chunk_id,
+                    )
+                except (OSError, sqlite3.Error, UnicodeError, ValueError):
+                    record = None
+                record_is_verified = _runtime_record_matches_index(
+                    record,
+                    document_id=document_id,
+                    chunk_id=chunk_id,
+                    content_hash=content_hash,
+                    expected_tenant_id=expected_tenant_id,
+                    expected_profile_id=expected_profile_id,
+                )
+                verified_records[cache_key] = record_is_verified
+            if not record_is_verified:
+                continue
+            if chunk_id in requested_chunk_ids:
+                found_chunk_ids.add(chunk_id)
+            if document_id in requested_document_ids:
+                found_document_ids.add(document_id)
+            if (
+                found_chunk_ids == requested_chunk_ids
+                and found_document_ids == requested_document_ids
+            ):
+                break
+        found_by_as_of[as_of_date] = (found_chunk_ids, found_document_ids)
+
+    if _verified_hierarchical_runtime_token(paths) != runtime_token:
+        return None
+    return found_by_as_of
+
+
+def _runtime_target_index_rows(
+    connection: Any,
+    *,
+    requested_chunk_ids: set[str],
+    requested_document_ids: set[str],
+) -> list[tuple[str, str, str, str]]:
+    target_count = len(requested_chunk_ids) + len(requested_document_ids)
+    if target_count <= 800:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if requested_chunk_ids:
+            chunk_ids = sorted(requested_chunk_ids)
+            clauses.append(
+                "c.chunk_id IN (" + ",".join("?" for _ in chunk_ids) + ")"
+            )
+            parameters.extend(chunk_ids)
+        if requested_document_ids:
+            document_ids = sorted(requested_document_ids)
+            clauses.append(
+                "c.document_id IN ("
+                + ",".join("?" for _ in document_ids)
+                + ")"
+            )
+            parameters.extend(document_ids)
+        rows = connection.execute(
+            """
+            SELECT c.document_id, c.chunk_id, c.version_id, c.content_hash
+            FROM chunks c
+            WHERE """
+            + " OR ".join(clauses),
+            parameters,
+        )
+    else:
+        # Avoid SQLite builds with the historical 999-variable ceiling while
+        # still scanning only the compact hierarchy table, not JSONL payloads.
+        rows = connection.execute(
+            """
+            SELECT c.document_id, c.chunk_id, c.version_id, c.content_hash
+            FROM chunks c
+            """
+        )
+    return [
+        (
+            str(row["document_id"] or ""),
+            str(row["chunk_id"] or ""),
+            str(row["version_id"] or ""),
+            str(row["content_hash"] or ""),
+        )
+        for row in rows
+        if (
+            str(row["chunk_id"] or "") in requested_chunk_ids
+            or str(row["document_id"] or "") in requested_document_ids
+        )
+    ]
+
+
+def _runtime_record_matches_index(
+    record: Any,
+    *,
+    document_id: str,
+    chunk_id: str,
+    content_hash: str,
+    expected_tenant_id: str,
+    expected_profile_id: str,
+) -> bool:
+    if not isinstance(record, dict):
+        return False
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), dict)
+        else {}
+    )
+    record_document_id = str(
+        record.get("document_id") or metadata.get("document_id") or ""
+    )
+    record_chunk_id = str(
+        record.get("chunk_id") or metadata.get("chunk_id") or ""
+    )
+    if (
+        record_document_id != document_id
+        or record_chunk_id != chunk_id
+        or str(record.get("content_hash") or "") != content_hash
+    ):
+        return False
+    record_tenant_id = _runtime_record_scope_identifier(
+        record,
+        metadata=metadata,
+        field_name="tenant_id",
+    )
+    if record_tenant_id != expected_tenant_id:
+        return False
+    record_profile_id = _runtime_record_scope_identifier(
+        record,
+        metadata=metadata,
+        field_name="profile_id",
+    )
+    return bool(
+        record_profile_id
+        and expected_profile_id
+        and record_profile_id.casefold() == expected_profile_id.casefold()
+    )
+
+
+def _runtime_record_scope_identifier(
+    record: dict[str, Any],
+    *,
+    metadata: dict[str, Any],
+    field_name: str,
+) -> str | None:
+    values = {
+        normalized
+        for source in (record, metadata)
+        if (normalized := str(source.get(field_name) or "").strip())
+    }
+    if len(values) != 1:
+        return None
+    return next(iter(values))
+
+
+def _valid_runtime_as_of_date(value: str | None) -> bool:
+    if value is None:
+        return True
+    try:
+        date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _target_ids(spec: dict[str, Any], singular_key: str, plural_key: str) -> list[str]:
+    values: list[Any] = []
+    for key in (singular_key, plural_key):
+        value = spec.get(key)
+        if isinstance(value, set):
+            values.extend(sorted(value, key=lambda item: str(item)))
+        elif isinstance(value, (list, tuple)):
+            values.extend(value)
+        elif value is not None:
+            values.append(value)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        identifier = str(value or "").strip()
+        if identifier and identifier not in seen:
+            normalized.append(identifier)
+            seen.add(identifier)
+    return normalized
 
 
 def load_query_specs(path: Path) -> list[dict[str, Any]]:

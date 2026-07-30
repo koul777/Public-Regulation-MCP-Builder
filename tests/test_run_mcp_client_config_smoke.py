@@ -13,6 +13,7 @@ from unittest.mock import patch
 from scripts.run_mcp_client_config_smoke import (
     _external_metadata_violations,
     _exception_message,
+    _has_external_tool_contract,
     _remote_unauthenticated_request_is_rejected,
     _search_with_fallback,
     _successful_tool_payload,
@@ -225,7 +226,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                         "fetch",
                         "get_index_status",
                         "get_regulation_article",
+                        "get_regulation_references",
                         "get_regulation_toc",
+                        "list_regulation_reference_cycles",
                         "list_regulations",
                         "search",
                     ],
@@ -241,7 +244,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(report["direct_stdio_verified"])
         self.assertEqual(
             "aksmcp MCP의 list_regulations로 전체 규정 수를 확인하고 첫 규정의 목차와 "
-            "조문을 조회한 다음, search로 인사규정을 찾아 첫 번째 id를 fetch로 조회해 줘.",
+            "조문을 조회한 다음, get_regulation_references와 "
+            "list_regulation_reference_cycles로 참조 관계를 확인하고 search로 인사규정을 "
+            "찾아 첫 번째 id를 fetch로 조회해 줘.",
             report["verification_prompt"],
         )
         answer = report["verification_answer"]
@@ -395,7 +400,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 "tool_names": [
                     "fetch",
                     "get_regulation_article",
+                    "get_regulation_references",
                     "get_regulation_toc",
+                    "list_regulation_reference_cycles",
                     "list_regulations",
                     "search",
                 ],
@@ -563,7 +570,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
                 "tool_names": [
                     "fetch",
                     "get_regulation_article",
+                    "get_regulation_references",
                     "get_regulation_toc",
+                    "list_regulation_reference_cycles",
                     "list_regulations",
                     "search",
                 ],
@@ -661,6 +670,27 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertTrue(_valid_search_results([{"id": "result-1"}]))
         self.assertFalse(_valid_fetch_payload({"text": "   "}))
         self.assertTrue(_valid_fetch_payload({"text": "approved text"}))
+
+    def test_external_tool_contract_requires_reference_and_cycle_tools(self) -> None:
+        complete_tools = {
+            "fetch",
+            "get_regulation_article",
+            "get_regulation_references",
+            "get_regulation_toc",
+            "list_regulation_reference_cycles",
+            "list_regulations",
+            "search",
+        }
+
+        self.assertTrue(_has_external_tool_contract(sorted(complete_tools)))
+        for missing_tool in (
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
+        ):
+            with self.subTest(missing_tool=missing_tool):
+                self.assertFalse(
+                    _has_external_tool_contract(sorted(complete_tools - {missing_tool}))
+                )
 
     def test_external_metadata_deny_list_detects_internal_fields(self) -> None:
         self.assertEqual(

@@ -17,7 +17,28 @@ from app.storage.repository import JsonRepository
 from scripts.audit_mcp_index_visibility import audit_mcp_index_visibility
 
 
+TEST_SOURCE_STATE = {
+    "scope": "mcp-performance-python-source-v1",
+    "status": "available",
+    "sha256": "b" * 64,
+    "file_count": 3,
+    "byte_count": 101,
+    "stable": True,
+}
+
+
 class AuditMcpIndexVisibilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.capture_source_state = patch(
+            "scripts.audit_mcp_index_visibility.capture_mcp_performance_source_state",
+            return_value=dict(TEST_SOURCE_STATE),
+        ).start()
+        self.finalize_source_state = patch(
+            "scripts.audit_mcp_index_visibility.finalize_mcp_performance_source_state",
+            return_value=dict(TEST_SOURCE_STATE),
+        ).start()
+        self.addCleanup(patch.stopall)
+
     def test_report_passes_for_indexed_approved_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp), tenant_storage_isolation=True)
@@ -33,12 +54,23 @@ class AuditMcpIndexVisibilityTests(unittest.TestCase):
             )
 
         self.assertTrue(report["passed"])
+        self.assertEqual(TEST_SOURCE_STATE, report["source_state"])
+        self.capture_source_state.assert_called_once()
+        self.finalize_source_state.assert_called_once()
         self.assertEqual(report["document_count"], 1)
         self.assertEqual(report["approval_status_totals"], {"approved": 1})
         self.assertEqual(report["total_approved_chunks"], 1)
         self.assertEqual(report["total_indexable_record_count"], 1)
         self.assertEqual(report["total_mcp_visible_records"], 1)
         self.assertEqual(report["auth_scope"], {"role": "operator", "department_ids": []})
+        self.assertEqual(
+            report["requirements"],
+            {
+                "min_visible_records": 1,
+                "forbid_smoke_docs": True,
+                "require_indexed": True,
+            },
+        )
         self.assertEqual(report["preapproval_visibility_guard"]["status"], "approved_runtime")
         self.assertEqual(report["status_counts"], {"indexed": 1})
         self.assertEqual(report["smoke_like_document_count"], 0)
@@ -61,6 +93,7 @@ class AuditMcpIndexVisibilityTests(unittest.TestCase):
             )
 
         self.assertTrue(report["passed"])
+        self.assertFalse(report["requirements"]["require_indexed"])
         self.assertEqual(report["approval_status_totals"], {"draft": 1})
         self.assertEqual(0, report["total_approved_chunks"])
         self.assertEqual(0, report["total_mcp_visible_records"])

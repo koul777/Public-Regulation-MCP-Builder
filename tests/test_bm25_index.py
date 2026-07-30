@@ -7,11 +7,84 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.retrieval.bm25_index import Bm25Index, load_bm25_index, write_bm25_index
-from app.retrieval.searcher import search
+from app.retrieval.bm25_index import (
+    Bm25Index,
+    _fast_query_terms,
+    load_bm25_index,
+    write_bm25_index,
+)
+from app.retrieval import searcher as searcher_module
+from app.retrieval.searcher import (
+    _structured_query_boost,
+    rerank_bm25_candidates,
+    search,
+)
+from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL, tokenize
 
 
 class Bm25IndexTests(unittest.TestCase):
+    def test_search_reuses_full_candidate_structured_context_for_boosts(
+        self,
+    ) -> None:
+        records = [
+            _record(
+                "doc:target",
+                "target policy article",
+                regulation_title="target policy",
+            ),
+            _record(
+                "doc:other",
+                "other policy article",
+                regulation_title="other policy",
+            ),
+        ]
+        index = Bm25Index.build(records)
+
+        with patch(
+            "app.retrieval.searcher._build_structured_query_context",
+            wraps=searcher_module._build_structured_query_context,
+        ) as build_context:
+            scored, _metadata = search(
+                "target policy article",
+                records,
+                index,
+                top_k=2,
+            )
+
+        self.assertTrue(scored)
+        self.assertEqual(1, build_context.call_count)
+
+    def test_structured_context_regex_scans_only_matching_unique_titles(
+        self,
+    ) -> None:
+        records = [
+            _record(
+                f"doc:other-{index}",
+                "other policy article",
+                regulation_title="other policy",
+            )
+            for index in range(100)
+        ]
+        records.append(
+            _record(
+                "doc:target",
+                "target policy article",
+                regulation_title="target policy",
+            )
+        )
+
+        with patch(
+            "app.retrieval.searcher._query_named_title_spans",
+            wraps=searcher_module._query_named_title_spans,
+        ) as title_spans:
+            context = searcher_module._build_structured_query_context(
+                "target policy article",
+                [(0.0, record) for record in records],
+            )
+
+        self.assertEqual(frozenset({"targetpolicy"}), context.matching_titles)
+        self.assertEqual(1, title_spans.call_count)
+
     def test_nfd_query_matches_nfc_indexed_document(self) -> None:
         # A document indexed in NFC must still be found by an NFD query; Unicode
         # composition differences must not silently drop an obvious match.
@@ -91,6 +164,47 @@ class Bm25IndexTests(unittest.TestCase):
             tokenizer_model=index.tokenizer,
         )
 
+    def test_score_terms_preserves_normal_score_semantics(self) -> None:
+        records = [
+            _record("doc:travel", "approved overseas travel regulation"),
+            _record("doc:leave", "approved leave regulation"),
+        ]
+        index = Bm25Index.build(records)
+        query = "overseas travel regulation"
+        query_terms = tokenize(
+            query,
+            dedupe=False,
+            tokenizer_model=index.tokenizer,
+        )
+
+        self.assertEqual(index.score(query), index.score_terms(query_terms))
+
+    def test_fast_query_terms_bridge_korean_compounds_without_kiwi(self) -> None:
+        document_frequencies = {
+            "공무": 2,
+            "국외": 3,
+            "여행": 4,
+            "규정": 5,
+            "무기": 1,
+            "정의": 1,
+        }
+        query = "공무국외여행규정 규정의"
+
+        with patch(
+            "app.retrieval.bm25_index.tokenize",
+            return_value=["공무국외여행규정", "규정의"],
+        ) as tokenizer:
+            terms = _fast_query_terms(query, document_frequencies)
+
+        tokenizer.assert_called_once_with(
+            query,
+            dedupe=False,
+            tokenizer_model=FALLBACK_TOKENIZER_MODEL,
+        )
+        self.assertTrue({"공무", "국외", "여행", "규정"}.issubset(terms))
+        self.assertNotIn("무기", terms)
+        self.assertNotIn("정의", terms)
+
     def test_serialized_index_does_not_store_full_text(self) -> None:
         records = [_record("doc:병가", "원문 전문은 인덱스에 저장하지 않는다.")]
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +278,19 @@ class Bm25IndexTests(unittest.TestCase):
         scores = index.score("hidden confidential", allowed_ids={"doc:visible"})
 
         self.assertEqual({}, scores)
+
+    def test_candidate_reranker_never_expands_pre_authorized_records(self) -> None:
+        visible = _record("doc:visible", "approved travel policy")
+        hidden = _record("doc:hidden", "confidential hiring policy exact target")
+        index = Bm25Index.build([visible, hidden])
+
+        reranked = rerank_bm25_candidates(
+            "confidential hiring policy exact target",
+            [(0.25, visible)],
+            index,
+        )
+
+        self.assertEqual(["doc:visible"], [record["id"] for _, record in reranked])
 
     def test_ready_bm25_empty_scores_use_literal_substring_fallback(self) -> None:
         records = [
@@ -457,6 +584,420 @@ class Bm25IndexTests(unittest.TestCase):
         self.assertFalse(metadata["query_expanded"])
         self.assertEqual("doc:research-qualification", scored[0][1]["id"])
 
+    def test_numbered_named_appendix_query_is_not_expanded_as_generic_authoring_question(self) -> None:
+        target = _record(
+            "doc:target-appendix",
+            "[별표 5] 조문별 개정 서식과 작성 항목",
+            regulation_title="원규관리규정 시행세칙",
+        )
+        target["metadata"]["appendix_refs"] = ["별표5"]
+        generic_rule = _record(
+            "doc:generic-authoring-rule",
+            (
+                "제18조(별표와 별지 서식) 내용이 길거나 복잡한 표, 그림, 계산식은 별표로 "
+                "구분하고 별지 서식은 일정한 형식으로 작성한다. 본칙에 부수되는 별표와 "
+                "별지 서식의 작성방식, 일부개정 및 전부개정을 정한다."
+            ),
+            article_title="별표와 별지 서식",
+            regulation_title="원규관리규정",
+        )
+        generic_rule["metadata"]["article_no"] = "제18조"
+        records = [generic_rule, target]
+        index = Bm25Index.build(records)
+
+        scored, metadata = search(
+            "원규관리규정 시행세칙 별표 5의 작성 항목",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertFalse(metadata["query_expanded"])
+        self.assertEqual("doc:target-appendix", scored[0][1]["id"])
+
+    def test_numbered_appendix_without_regulation_name_is_not_generically_expanded(self) -> None:
+        records = [_record("doc:appendix-five", "[별표 5] 작성 항목")]
+        records[0]["metadata"]["appendix_refs"] = ["별표5"]
+        index = Bm25Index.build(records)
+
+        _scored, metadata = search("별표 5 작성 항목", records, index, top_k=1)
+
+        self.assertFalse(metadata["query_expanded"])
+
+    def test_named_regulation_without_appendix_number_is_not_generically_expanded(self) -> None:
+        records = [
+            _record(
+                "doc:document-rule",
+                "별표 작성 방식",
+                regulation_title="문서관리규정",
+            )
+        ]
+        index = Bm25Index.build(records)
+
+        _scored, metadata = search(
+            "문서관리규정의 별표 작성 방식",
+            records,
+            index,
+            top_k=1,
+        )
+
+        self.assertFalse(metadata["query_expanded"])
+
+    def test_structured_locator_boost_allows_particle_but_rejects_number_collision(self) -> None:
+        query = "별표 5의 작성 항목"
+
+        exact = _structured_query_boost(query, {"appendix_refs": ["별표5"]})
+        longer_number = _structured_query_boost(query, {"appendix_refs": ["별표50"]})
+        child_locator = _structured_query_boost("별표 5-1 작성 항목", {"appendix_refs": ["별표5"]})
+
+        self.assertGreater(exact, 0.0)
+        self.assertEqual(0.0, longer_number)
+        self.assertEqual(0.0, child_locator)
+
+    def test_nfd_named_appendix_query_preserves_specific_query_behavior(self) -> None:
+        target = _record(
+            "doc:nfd-target",
+            "[별표 5] 작성 항목",
+            regulation_title="원규관리규정 시행세칙",
+        )
+        target["metadata"]["appendix_refs"] = ["별표5"]
+        records = [target]
+        index = Bm25Index.build(records)
+        query = unicodedata.normalize("NFD", "원규관리규정 시행세칙 별표 5 작성 항목")
+
+        scored, metadata = search(query, records, index, top_k=1)
+
+        self.assertFalse(metadata["query_expanded"])
+        self.assertEqual("doc:nfd-target", scored[0][1]["id"])
+
+    def test_reference_locator_query_prefers_exact_form_chunk_over_same_article_number(self) -> None:
+        article = _record(
+            "doc:staff-rule-article",
+            "제1조 목적",
+            regulation_title="직원 채용 세칙",
+        )
+        article["metadata"]["article_no"] = "제1조"
+        form = _record(
+            "doc:staff-rule-form",
+            "별지 제1호서식 계약당사자",
+            regulation_title="직원 채용 세칙",
+        )
+        form["metadata"]["article_no"] = "제1조"
+        form["metadata"]["form_refs"] = ["별지제1호서식"]
+        form["metadata"]["chunk_type"] = "form"
+        records = [article, form]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "직원 채용 세칙 별지 제1호서식 (제1조 관련)에는 어떤 항목이 있는가?",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertEqual("doc:staff-rule-form", scored[0][1]["id"])
+
+    def test_structured_form_locator_allows_trailing_revision_dates(self) -> None:
+        boost = _structured_query_boost(
+            "직원 채용 세칙의 별지 제1호서식] <2022.12.14., 2024.9.27.> (제1조 관련)에는 어떤 기준이나 항목이 정리되어 있는가?",
+            {
+                "regulation_title": "직원 채용 세칙",
+                "chunk_type": "form",
+                "form_refs": ["별지제1호서식"],
+            },
+        )
+
+        self.assertGreater(boost, 0.0)
+
+    def test_named_regulation_query_prefers_exact_article_title_with_same_article_number(self) -> None:
+        target = _record(
+            "doc:rule-amendment",
+            "제3조 다른 규정의 개정",
+            regulation_title="강사임용 등에 관한 규정",
+        )
+        target["metadata"]["article_no"] = "제3조"
+        target["metadata"]["article_title"] = "다른 규정의 개정"
+        sibling = _record(
+            "doc:rule-qualification",
+            "제3조 자격",
+            regulation_title="강사임용 등에 관한 규정",
+        )
+        sibling["metadata"]["article_no"] = "제3조"
+        sibling["metadata"]["article_title"] = "자격"
+        records = [sibling, target]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "강사임용 등에 관한 규정 제3조(다른 규정의 개정)의 핵심 내용과 적용 조건은 무엇인가?",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertEqual("doc:rule-amendment", scored[0][1]["id"])
+
+    def test_exact_article_title_overcomes_small_sibling_lexical_lead(self) -> None:
+        target = _record(
+            "doc:rule-amendment",
+            "제3조 다른 규정의 개정",
+            regulation_title="강사 채용 규정",
+        )
+        target["metadata"]["article_no"] = "제3조"
+        target["metadata"]["article_title"] = "다른 규정의 개정"
+        sibling = _record(
+            "doc:rule-purpose",
+            "제3조 목적",
+            regulation_title="강사 채용 규정",
+        )
+        sibling["metadata"]["article_no"] = "제3조"
+        sibling["metadata"]["article_title"] = "목적"
+
+        class SiblingFavoredIndex:
+            def score_fast_query(
+                self,
+                _query: str,
+                *,
+                allowed_ids: set[str] | None = None,
+            ) -> dict[str, float]:
+                return {
+                    "doc:rule-purpose": 10.0,
+                    "doc:rule-amendment": 0.0,
+                }
+
+        reranked = rerank_bm25_candidates(
+            "강사 채용 규정 제3조(다른 규정의 개정)의 적용 내용",
+            [(0.0, sibling), (0.0, target)],
+            SiblingFavoredIndex(),  # type: ignore[arg-type]
+        )
+
+        self.assertEqual("doc:rule-amendment", reranked[0][1]["id"])
+
+    def test_candidate_named_regulation_signal_recognizes_spaced_title(self) -> None:
+        target = _record(
+            "doc:spaced-title",
+            "적용 범위",
+            regulation_title="직원 채용 세칙",
+        )
+        competitor = _record(
+            "doc:lexical-competitor",
+            "직원 채용 세칙 적용 범위",
+            regulation_title="일반 운영 규정",
+        )
+
+        class CompetitorIndex:
+            def score_fast_query(
+                self,
+                _query: str,
+                *,
+                allowed_ids: set[str] | None = None,
+            ) -> dict[str, float]:
+                self.allowed_ids = allowed_ids
+                return {"doc:lexical-competitor": 10.0}
+
+        index = CompetitorIndex()
+        reranked = rerank_bm25_candidates(
+            "직원 채용 세칙의 적용 범위",
+            [(0.0, competitor), (0.0, target)],
+            index,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual("doc:spaced-title", reranked[0][1]["id"])
+        self.assertEqual(
+            {"doc:spaced-title", "doc:lexical-competitor"},
+            index.allowed_ids,
+        )
+
+    def test_named_unnumbered_appendix_intent_promotes_appendix_without_expansion(self) -> None:
+        appendix = _record(
+            "doc:staff-appendix",
+            "[별표] 평가 항목",
+            regulation_title="직원 채용 세칙",
+        )
+        appendix["metadata"]["chunk_type"] = "appendix"
+        appendix["metadata"]["appendix_refs"] = ["별표"]
+        governing_article = _record(
+            "doc:staff-governing-article",
+            (
+                "제9조 별표의 적용 기준과 평가 항목을 정한다. "
+                "직원 채용 세칙의 별표 항목과 적용 기준을 설명한다."
+            ),
+            article_title="별표의 적용 기준",
+            regulation_title="직원 채용 세칙",
+        )
+        governing_article["metadata"]["article_no"] = "제9조"
+        records = [governing_article, appendix]
+        index = Bm25Index.build(records)
+
+        scored, metadata = search(
+            "직원 채용 세칙의 별표에는 어떤 항목이 있는가?",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertFalse(metadata["query_expanded"])
+        self.assertEqual("doc:staff-appendix", scored[0][1]["id"])
+
+    def test_unnumbered_attachment_boost_excludes_governing_article_reference(self) -> None:
+        query = "직원 채용 세칙의 별표에는 어떤 항목이 있는가?"
+        appendix_metadata = {
+            "regulation_title": "직원 채용 세칙",
+            "chunk_type": "appendix",
+            "appendix_refs": ["별표"],
+        }
+        governing_article_metadata = {
+            "regulation_title": "직원 채용 세칙",
+            "chunk_type": "article",
+            "appendix_refs": ["별표"],
+        }
+
+        appendix_boost = _structured_query_boost(query, appendix_metadata)
+        governing_article_boost = _structured_query_boost(
+            query,
+            governing_article_metadata,
+        )
+
+        self.assertGreater(appendix_boost, governing_article_boost)
+
+    def test_exact_named_regulation_and_article_locator_outrank_suffix_title_collision(self) -> None:
+        target = _record(
+            "doc:faculty-article",
+            "제7조 적용 대상과 심의 기준",
+            regulation_title="교원인사규정",
+        )
+        target["metadata"]["article_no"] = "제7조"
+        suffix_collision = _record(
+            "doc:generic-personnel",
+            "제7조 적용 대상과 심의 기준을 정하고 심의 기준을 반복하여 설명한다.",
+            regulation_title="인사규정",
+        )
+        suffix_collision["metadata"]["article_no"] = "제7조"
+        records = [suffix_collision, target]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "교원 인사규정 제7조의 적용 대상은?",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertEqual("doc:faculty-article", scored[0][1]["id"])
+
+    def test_named_form_query_prefers_exact_form_chunk_over_same_document_articles(self) -> None:
+        target = _record(
+            "doc:staff-form",
+            "[별지 제1호서식] 계약당사자",
+            regulation_title="직원 채용 세칙",
+        )
+        target["metadata"]["chunk_type"] = "form"
+        target["metadata"]["form_refs"] = ["별지제1호서식"]
+        target["metadata"]["article_no"] = "제1조"
+        article_purpose = _record(
+            "doc:staff-purpose",
+            "제1조 목적",
+            regulation_title="직원 채용 세칙",
+        )
+        article_purpose["metadata"]["article_no"] = "제1조"
+        article_effective = _record(
+            "doc:staff-effective",
+            "제1조 시행일",
+            regulation_title="직원 채용 세칙",
+        )
+        article_effective["metadata"]["article_no"] = "제1조"
+        records = [article_purpose, article_effective, target]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "직원 채용 세칙 별지 제1호서식 제1조 관련 항목",
+            records,
+            index,
+            top_k=3,
+        )
+
+        self.assertEqual("doc:staff-form", scored[0][1]["id"])
+
+    def test_named_form_query_with_trailing_revision_dates_prefers_form_chunk(self) -> None:
+        target = _record(
+            "doc:staff-form-dated",
+            "[별지 제1호서식] 응시원서",
+            regulation_title="직원 채용 세칙",
+        )
+        target["metadata"]["chunk_type"] = "form"
+        target["metadata"]["form_refs"] = ["별지제1호서식"]
+        target["metadata"]["article_no"] = "제1조"
+        article_effective = _record(
+            "doc:staff-effective-dated",
+            "제1조 시행일",
+            regulation_title="직원 채용 세칙",
+        )
+        article_effective["metadata"]["article_no"] = "제1조"
+        records = [article_effective, target]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "직원 채용 세칙의 별지 제1호서식] <2022.12.14., 2024.9.27.> (제1조 관련)에는 어떤 기준이나 항목이 정리되어 있는가?",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertEqual("doc:staff-form-dated", scored[0][1]["id"])
+
+    def test_named_appendix_query_prefers_exact_appendix_chunk_over_same_document_article(self) -> None:
+        target = _record(
+            "doc:rule-appendix",
+            "[별표 5] 작성 항목",
+            regulation_title="원규관리규정 시행세칙",
+        )
+        target["metadata"]["chunk_type"] = "appendix"
+        target["metadata"]["appendix_refs"] = ["별표5"]
+        target["metadata"]["article_no"] = "제20조"
+        article = _record(
+            "doc:rule-article",
+            "제20조 별표 기준",
+            regulation_title="원규관리규정 시행세칙",
+        )
+        article["metadata"]["article_no"] = "제20조"
+        records = [article, target]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "원규관리규정 시행세칙 별표 5 제20조 관련 작성 항목",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertEqual("doc:rule-appendix", scored[0][1]["id"])
+
+    def test_named_appendix_query_prefers_exact_table_chunk_over_related_article(self) -> None:
+        target = _record(
+            "doc:rule-table",
+            "별표 5 세부 작성 항목",
+            regulation_title="문서관리규정",
+        )
+        target["metadata"]["chunk_type"] = "table"
+        target["metadata"]["table_appendix_no"] = "별표5"
+        target["metadata"]["article_no"] = "제20조"
+        article = _record(
+            "doc:rule-article",
+            "제20조 별표 기준과 작성 항목",
+            regulation_title="문서관리규정",
+        )
+        article["metadata"]["article_no"] = "제20조"
+        records = [article, target]
+        index = Bm25Index.build(records)
+
+        scored, _metadata = search(
+            "문서관리규정 별표 5 제20조 관련 작성 항목",
+            records,
+            index,
+            top_k=2,
+        )
+
+        self.assertEqual("doc:rule-table", scored[0][1]["id"])
+
     def test_regulation_query_expansion_ranks_full_time_faculty_hiring_process(self) -> None:
         records = [
             _record(
@@ -562,7 +1103,14 @@ class Bm25IndexTests(unittest.TestCase):
         self.assertLess(top_ids.index("doc:governing-article"), top_ids.index("doc:gift-form"))
 
 
-def _record(record_id: str, text: str, *, article_title: str = "", include_embedding: bool = True) -> dict:
+def _record(
+    record_id: str,
+    text: str,
+    *,
+    article_title: str = "",
+    regulation_title: str = "복무규정",
+    include_embedding: bool = True,
+) -> dict:
     chunk_id = record_id.rsplit(":", 1)[-1]
     metadata = {
         "tenant_id": "tenant-a",
@@ -571,7 +1119,7 @@ def _record(record_id: str, text: str, *, article_title: str = "", include_embed
         "approval_status": "approved",
         "approval_id": f"approval-{chunk_id}",
         "security_level": "internal",
-        "regulation_title": "복무규정",
+        "regulation_title": regulation_title,
         "article_title": article_title,
     }
     return {
