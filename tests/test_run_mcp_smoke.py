@@ -8,7 +8,11 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.run_mcp_smoke import main, run_mcp_smoke
+from scripts.run_mcp_smoke import (
+    SYNTHETIC_SMOKE_PROFILE_ID,
+    main,
+    run_mcp_smoke,
+)
 
 
 class RunMcpSmokeTests(unittest.TestCase):
@@ -21,6 +25,7 @@ class RunMcpSmokeTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual("temporary", report["data_dir_mode"])
         self.assertTrue(report["synthetic_runtime"])
+        self.assertEqual(SYNTHETIC_SMOKE_PROFILE_ID, report["profile_id"])
         self.assertFalse(report["handoff_evidence"])
         self.assertFalse(report["persistent_smoke_data_opt_in"])
         self.assertGreaterEqual(report["search_result_count"], 1)

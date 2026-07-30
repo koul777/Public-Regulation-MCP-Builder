@@ -6133,6 +6133,118 @@ $Result | ConvertTo-Json -Depth 6
         self.assertIn("documents", rebuilt_bm25)
         self.assertEqual(expected_digest, actual_digest)
 
+    def test_runtime_bundle_rejects_forged_logical_corpus_reuse_claims(
+        self,
+    ) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(
+                Path(tmp),
+                file_type="hwp",
+                metadata=metadata,
+            )
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                original_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            manifest_path = output_dir / "data" / "mcp_runtime_manifest.json"
+            forged_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            forged_hash = (
+                "f" * 64
+                if original_manifest["logical_corpus_sha256"] != "f" * 64
+                else "e" * 64
+            )
+            forged_manifest["logical_corpus_sha256"] = forged_hash
+            forged_manifest["hierarchical_index"][
+                "logical_corpus_sha256"
+            ] = forged_hash
+            forged_manifest["runtime_data_reuse"]["manifest_sha256"] = (
+                mcp_config_generator._runtime_manifest_content_sha256(
+                    forged_manifest
+                )
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    forged_manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            forged_bundle_issue = (
+                mcp_config_generator._runtime_hierarchy_index_issue(
+                    output_dir / "data"
+                )
+            )
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    wraps=mcp_config_generator.write_vector_records_with_offsets,
+                ) as vector_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    wraps=mcp_config_generator.write_bm25_index,
+                ) as bm25_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    wraps=mcp_config_generator.build_hierarchical_runtime_index,
+                ) as hierarchy_writer,
+            ):
+                rebuilt_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+        self.assertEqual(1, vector_writer.call_count)
+        self.assertEqual(1, bm25_writer.call_count)
+        self.assertEqual(1, hierarchy_writer.call_count)
+        self.assertIn(
+            "logical-corpus fingerprints",
+            forged_bundle_issue or "",
+        )
+        self.assertEqual(
+            original_manifest["logical_corpus_sha256"],
+            rebuilt_manifest["logical_corpus_sha256"],
+        )
+        self.assertEqual(
+            original_manifest["logical_corpus_sha256"],
+            rebuilt_manifest["hierarchical_index"][
+                "logical_corpus_sha256"
+            ],
+        )
+        self.assertNotEqual(
+            forged_hash,
+            rebuilt_manifest["logical_corpus_sha256"],
+        )
+
     def test_runtime_bundle_failed_rebuild_preserves_corrupt_reuse_candidate(self) -> None:
         metadata = {
             "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
@@ -6200,7 +6312,6 @@ $Result | ConvertTo-Json -Depth 6
         with tempfile.TemporaryDirectory() as tmp:
             settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
             output_dir = Path(tmp) / "bundle"
-            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
 
             def generate(**overrides):
                 options = {
@@ -6212,9 +6323,19 @@ $Result | ConvertTo-Json -Depth 6
                     "tenant_storage_isolation": False,
                 }
                 options.update(overrides)
+                scoped_records = [
+                    _runtime_export_record(
+                        "doc-kordoc",
+                        "chunk-1",
+                        metadata={
+                            "tenant_id": options["tenant_id"],
+                            "profile_id": options["profile_id"],
+                        },
+                    )
+                ]
                 with patch(
                     "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
-                    return_value=records,
+                    return_value=scoped_records,
                 ):
                     return write_mcp_runtime_data_bundle(**options)
 
@@ -6875,6 +6996,40 @@ $Result | ConvertTo-Json -Depth 6
             self.assertTrue(runtime_manifest["rebuild_contract"]["input_order_independent"])
             hierarchy_path = output_dir / "data" / "hierarchy" / "regulation_hierarchy.sqlite3"
             self.assertTrue(hierarchy_path.exists())
+            bm25_payload = json.loads(
+                (
+                    output_dir
+                    / "data"
+                    / "vector_db"
+                    / "tenant-a"
+                    / "bm25_index.json"
+                ).read_text(encoding="utf-8")
+            )
+            hierarchy_summary = mcp_config_generator.hierarchical_index_summary(
+                hierarchy_path
+            )
+            source_content_binding = runtime_manifest["hierarchical_index"][
+                "source_content_hashes"
+            ]
+            self.assertRegex(source_content_binding, r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                source_content_binding,
+                bm25_payload["source_content_hashes"],
+            )
+            self.assertEqual(
+                source_content_binding,
+                hierarchy_summary["source_content_hashes"],
+            )
+            self.assertEqual(
+                runtime_manifest["logical_corpus_sha256"],
+                runtime_manifest["hierarchical_index"][
+                    "logical_corpus_sha256"
+                ],
+            )
+            self.assertEqual(
+                runtime_manifest["logical_corpus_sha256"],
+                hierarchy_summary["logical_corpus_sha256"],
+            )
             self.assertEqual(
                 runtime_manifest["files"]["hierarchical_index_sha256"],
                 hashlib.sha256(hierarchy_path.read_bytes()).hexdigest(),

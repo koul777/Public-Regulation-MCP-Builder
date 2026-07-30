@@ -33,7 +33,9 @@ class RoutesRagTests(unittest.TestCase):
         routes_rag._RAG_REBUILT_BM25_INDEX_CACHE.clear()
         routes_rag._RAG_VECTOR_SOURCE_HASH_CACHE.clear()
         routes_rag._RAG_REPOSITORY_DOCUMENT_SIGNATURE_CACHE.clear()
+        routes_rag._RAG_APPROVAL_JOURNAL_CACHE.clear()
         routes_rag._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
+        routes_rag._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.clear()
         routes_rag._RAG_VISIBLE_RECORDS_CACHE.clear()
 
     def test_candidate_reference_label_does_not_match_longer_numbered_appendix(self) -> None:
@@ -2016,6 +2018,54 @@ class RoutesRagTests(unittest.TestCase):
         self.assertEqual(1, repository.call_count)
         self.assertRegex(signature, r"^[0-9a-f]{64}$")
 
+    def test_approval_journal_cache_reuses_unchanged_file_and_invalidates_on_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            journal_path = repository.root / "journals" / "approvals.jsonl"
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            first_record = {
+                "approval_record_id": "record-1",
+                "approval_id": "approval-1",
+                "document_id": "doc-a",
+                "chunk_ids": ["chunk-a"],
+                "approved_content_hashes": {"chunk-a": "hash-a"},
+                "worklist_evidence": {},
+                "tenant_id": "tenant-a",
+                "approved_at": "2026-07-28T00:00:00+00:00",
+            }
+            journal_path.write_text(
+                json.dumps(first_record, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                repository,
+                "list_approval_journal_records",
+                wraps=repository.list_approval_journal_records,
+            ) as list_records:
+                first = routes_rag._approval_journal_signature(repository, ["doc-a"])
+                second = routes_rag._approval_journal_signature(repository, ["doc-a"])
+                time.sleep(0.01)
+                with journal_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                **first_record,
+                                "approval_record_id": "record-2",
+                                "approval_id": "approval-2",
+                                "approved_at": "2026-07-29T00:00:00+00:00",
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                third = routes_rag._approval_journal_signature(repository, ["doc-a"])
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, third)
+        self.assertEqual(2, list_records.call_count)
+
     def test_runtime_approval_snapshot_sidecar_avoids_live_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
@@ -2029,6 +2079,284 @@ class RoutesRagTests(unittest.TestCase):
 
         self.assertIn(("doc", "chunk-1"), snapshot)
         self.assertEqual("approval-chunk-1", snapshot[("doc", "chunk-1")]["approval_id"])
+
+    def test_runtime_approval_snapshot_sidecar_loads_from_document_ids_and_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="mcp_internal", role="operator")
+            record = _vector_record("doc:chunk-1", "approved text")
+            _write_runtime_approval_snapshot_sidecar_fixture(
+                settings.data_dir,
+                [record],
+                tenant_id="tenant-a",
+            )
+
+            with patch.object(
+                routes_rag,
+                "_load_runtime_approval_snapshot_sidecar",
+                wraps=routes_rag._load_runtime_approval_snapshot_sidecar,
+            ) as load_sidecar, patch.object(
+                routes_rag,
+                "_runtime_approval_snapshot_signature",
+                wraps=routes_rag._runtime_approval_snapshot_signature,
+            ) as load_signature:
+                first = routes_rag._load_cached_runtime_approval_snapshot(repository, ["doc"], auth)
+                second = routes_rag._load_cached_runtime_approval_snapshot(repository, ["doc"], auth)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual(1, load_sidecar.call_count)
+        self.assertEqual(2, load_signature.call_count)
+
+    def test_runtime_approval_snapshot_cache_hit_revalidates_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="mcp_internal",
+                role="operator",
+            )
+            record = _vector_record("doc:chunk-1", "approved text")
+            _write_runtime_approval_snapshot_sidecar_fixture(
+                settings.data_dir,
+                [record],
+                tenant_id="tenant-a",
+            )
+            first = routes_rag._load_cached_runtime_approval_snapshot(
+                repository,
+                ["doc"],
+                auth,
+            )
+            stable_identity = routes_rag._runtime_approval_snapshot_identity(repository)
+            changed_identity = (*stable_identity, ("changed",))
+
+            with patch.object(
+                routes_rag,
+                "_runtime_approval_snapshot_identity",
+                side_effect=[stable_identity, changed_identity],
+            ):
+                second = routes_rag._load_cached_runtime_approval_snapshot(
+                    repository,
+                    ["doc"],
+                    auth,
+                )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_runtime_approval_snapshot_identity_scopes_chunk_files_to_requested_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            repository.root.mkdir(parents=True, exist_ok=True)
+            (settings.data_dir / "mcp_runtime_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_data_bundle",
+                        "tenant_id": "tenant-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repository.manifest_path.write_text(
+                json.dumps({"documents": {}}),
+                encoding="utf-8",
+            )
+            sidecar_path = repository.root / "approval_snapshot.json"
+            sidecar_path.write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_approval_snapshot",
+                        "tenant_id": "tenant-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            approvals_path = repository.root / "journals" / "approvals.jsonl"
+            approvals_path.parent.mkdir(parents=True, exist_ok=True)
+            approvals_path.write_text("", encoding="utf-8")
+            document_a_path = repository.root / "doc-a_chunks.json"
+            document_b_path = repository.root / "doc-b_chunks.json"
+            document_a_path.write_text("[]", encoding="utf-8")
+            document_b_path.write_text("[]", encoding="utf-8")
+
+            first = routes_rag._runtime_approval_snapshot_identity(
+                repository,
+                ["doc-a"],
+            )
+            global_before_unrelated_change = (
+                routes_rag._runtime_approval_snapshot_identity(repository)
+            )
+            document_b_path.write_text("[{}]", encoding="utf-8")
+            after_unrelated_change = routes_rag._runtime_approval_snapshot_identity(
+                repository,
+                ["doc-a"],
+            )
+            global_after_unrelated_change = (
+                routes_rag._runtime_approval_snapshot_identity(repository)
+            )
+            document_a_path.write_text("[{}]", encoding="utf-8")
+            after_requested_change = routes_rag._runtime_approval_snapshot_identity(
+                repository,
+                ["doc-a"],
+            )
+
+        self.assertEqual(first, after_unrelated_change)
+        self.assertNotEqual(
+            global_before_unrelated_change,
+            global_after_unrelated_change,
+        )
+        self.assertNotEqual(after_unrelated_change, after_requested_change)
+
+    def test_runtime_approval_snapshot_reuses_verified_superset_for_document_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="mcp_internal",
+                role="operator",
+            )
+            records = []
+            for document_id in ("doc-a", "doc-b"):
+                record = _vector_record(
+                    f"{document_id}:chunk-1",
+                    f"approved text for {document_id}",
+                )
+                record["document_id"] = document_id
+                record["chunk_id"] = "chunk-1"
+                record["metadata"] = {
+                    **record["metadata"],
+                    "document_id": document_id,
+                    "chunk_id": "chunk-1",
+                }
+                record["content_hash"] = stable_content_hash(
+                    record["text"],
+                    record["metadata"],
+                )
+                records.append(record)
+            repository.root.mkdir(parents=True, exist_ok=True)
+            document_a_path = repository.root / "doc-a_chunks.json"
+            document_a_path.write_text("[]", encoding="utf-8")
+            (repository.root / "doc-b_chunks.json").write_text(
+                "[]",
+                encoding="utf-8",
+            )
+            _write_runtime_approval_snapshot_sidecar_fixture(
+                settings.data_dir,
+                records,
+                tenant_id="tenant-a",
+            )
+
+            with patch.object(
+                routes_rag,
+                "_load_runtime_approval_snapshot_sidecar",
+                wraps=routes_rag._load_runtime_approval_snapshot_sidecar,
+            ) as load_sidecar:
+                full_snapshot = routes_rag._load_cached_runtime_approval_snapshot(
+                    repository,
+                    ["doc-a", "doc-b"],
+                    auth,
+                )
+                scoped_snapshot = routes_rag._load_cached_runtime_approval_snapshot(
+                    repository,
+                    ["doc-a"],
+                    auth,
+                )
+                document_a_path.write_text("[{}]", encoding="utf-8")
+                stale_scoped_snapshot = (
+                    routes_rag._load_cached_runtime_approval_snapshot(
+                        repository,
+                        ["doc-a"],
+                        auth,
+                    )
+                )
+                document_a_path.unlink()
+                deleted_scoped_snapshot = (
+                    routes_rag._load_cached_runtime_approval_snapshot(
+                        repository,
+                        ["doc-a"],
+                        auth,
+                    )
+                )
+
+        self.assertEqual(2, len(full_snapshot or {}))
+        self.assertEqual({("doc-a", "chunk-1")}, set(scoped_snapshot or {}))
+        self.assertIsNone(stale_scoped_snapshot)
+        self.assertIsNone(deleted_scoped_snapshot)
+        self.assertEqual(3, load_sidecar.call_count)
+
+    def test_runtime_approval_snapshot_document_id_loader_fails_closed_when_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="mcp_internal", role="operator")
+            record = _vector_record("doc:chunk-1", "approved text")
+            _write_runtime_approval_snapshot_sidecar_fixture(
+                settings.data_dir,
+                [record],
+                tenant_id="tenant-a",
+            )
+            journal_path = (
+                settings.data_dir
+                / "repository"
+                / "journals"
+                / "approvals.jsonl"
+            )
+            with journal_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {"approval_record_id": "stale-sidecar"},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            snapshot = routes_rag._load_cached_runtime_approval_snapshot(
+                repository,
+                ["doc"],
+                auth,
+            )
+
+        self.assertIsNone(snapshot)
+
+    def test_runtime_approval_snapshot_document_id_loader_rejects_tampered_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="mcp_internal",
+                role="operator",
+            )
+            record = _vector_record("doc:chunk-1", "approved text")
+            _write_runtime_approval_snapshot_sidecar_fixture(
+                settings.data_dir,
+                [record],
+                tenant_id="tenant-a",
+            )
+            sidecar_path = (
+                settings.data_dir / "repository" / "approval_snapshot.json"
+            )
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["entries"][0]["approval_id"] = "tampered-approval"
+            sidecar_path.write_text(
+                json.dumps(sidecar, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = routes_rag._load_cached_runtime_approval_snapshot(
+                repository,
+                ["doc"],
+                auth,
+            )
+
+        self.assertIsNone(snapshot)
 
     def test_runtime_approval_snapshot_sidecar_survives_bundle_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2234,8 +2562,11 @@ def _write_runtime_approval_snapshot_sidecar_fixture(
         json.dumps(
             {
                 "report_type": "mcp_runtime_approval_snapshot",
+                "schema_version": "mcp-runtime-approval-snapshot-v1",
                 "tenant_id": tenant_id,
                 "document_ids": document_ids,
+                "record_count": len(entries),
+                "snapshot_count": len(entries),
                 "file_signatures": {
                     key: (list(value) if value is not None else None)
                     for key, value in routes_rag._runtime_approval_snapshot_file_signatures(repository).items()
@@ -2245,6 +2576,20 @@ def _write_runtime_approval_snapshot_sidecar_fixture(
             ensure_ascii=False,
         )
         + "\n",
+        encoding="utf-8",
+    )
+    sidecar_path = repository_dir / "approval_snapshot.json"
+    runtime_manifest_path = data_dir / "mcp_runtime_manifest.json"
+    runtime_manifest = json.loads(runtime_manifest_path.read_text(encoding="utf-8"))
+    runtime_manifest["runtime_data_reuse"] = {
+        "file_sha256": {
+            "repository/approval_snapshot.json": hashlib.sha256(
+                sidecar_path.read_bytes()
+            ).hexdigest()
+        }
+    }
+    runtime_manifest_path.write_text(
+        json.dumps(runtime_manifest, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 

@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
+import os
+import sqlite3
+import stat
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.api import routes_documents, routes_rag
 from app.core.api_audit import api_audit_path
 from app.core.config import Settings
 from app.core.security import AuthContext
+from app.ingestion.vector_adapter import stable_content_hash
 from app.mcp_server import regulation_tools
 from app.mcp_server.regulation_server import create_regulation_mcp_server
 from app.mcp_server.regulation_tools import (
@@ -25,6 +34,7 @@ from app.mcp_server.regulation_tools import (
     get_citation,
     get_document,
     get_index_status,
+    list_regulations,
     get_regulation_history,
     get_table,
     list_documents,
@@ -34,13 +44,2899 @@ from app.mcp_server.regulation_tools import (
     settings_for_mcp_project,
     warm_mcp_runtime,
 )
+from app.retrieval.hierarchical_index import (
+    build_hierarchical_runtime_index,
+    hierarchical_index_path,
+    write_vector_records_with_offsets,
+)
+from app.retrieval.bm25_index import (
+    BM25_INDEX_VERSION,
+    BM25_STRUCTURED_METADATA_VERSION,
+    Bm25Index,
+)
+from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL
 from app.retrieval.tokenizer import tokenize
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
+from app.services import regulation_rag_runtime
 from app.storage.repository import JsonRepository
 
 
+@unittest.skipUnless(
+    os.name == "nt",
+    "Windows directory ChangeTime enumeration is required",
+)
+class WindowsBulkChunkEnumerationTests(unittest.TestCase):
+    @staticmethod
+    def _descriptor(repository_root: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            root=repository_root,
+            manifest_path=repository_root / "manifest.json",
+            legacy_path=repository_root.parent / "repository.json",
+        )
+
+    def test_repository_wide_bulk_matches_scoped_signatures_and_call_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            paths = []
+            scoped_signatures = {}
+            for index in range(4):
+                document_id = f"doc_{index}"
+                path = repository_root / f"{document_id}_chunks.json"
+                path.write_text(f"[{index}]", encoding="utf-8")
+                paths.append(path)
+                scoped = (
+                    regulation_rag_runtime
+                    ._runtime_approval_identity_chunk_entries(
+                        self._descriptor(repository_root),
+                        document_ids=[document_id],
+                    )
+                )
+                self.assertIsNotNone(scoped)
+                assert scoped is not None
+                scoped_signatures[path.name] = scoped[0][1]
+            (repository_root / "not-a-chunk.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+
+            original_lstat = Path.lstat
+            chunk_lstat_count = 0
+
+            def track_chunk_lstat(candidate: Path) -> object:
+                nonlocal chunk_lstat_count
+                if candidate in paths:
+                    chunk_lstat_count += 1
+                return original_lstat(candidate)
+
+            with (
+                patch.object(Path, "lstat", track_chunk_lstat),
+                patch.object(
+                    regulation_rag_runtime,
+                    "_windows_file_change_time_ns",
+                    side_effect=AssertionError(
+                        "unscoped chunks must not open per-file handles"
+                    ),
+                ),
+                patch.object(
+                    regulation_rag_runtime,
+                    "_WINDOWS_GET_FILE_INFORMATION_BY_HANDLE_EX",
+                    wraps=(
+                        regulation_rag_runtime
+                        ._WINDOWS_GET_FILE_INFORMATION_BY_HANDLE_EX
+                    ),
+                ) as directory_information,
+            ):
+                bulk = (
+                    regulation_rag_runtime
+                    ._runtime_approval_identity_chunk_entries(
+                        self._descriptor(repository_root),
+                        document_ids=None,
+                    )
+                )
+
+        self.assertIsNotNone(bulk)
+        assert bulk is not None
+        self.assertEqual(
+            scoped_signatures,
+            {path.name: signature for path, signature in bulk},
+        )
+        self.assertEqual(4, chunk_lstat_count)
+        # One successful 64 KiB batch followed by ERROR_NO_MORE_FILES.
+        self.assertEqual(2, directory_information.call_count)
+
+    def test_document_scoped_identity_keeps_per_file_change_time_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            chunk_path = repository_root / "doc_chunks.json"
+            chunk_path.write_text("[]", encoding="utf-8")
+            with (
+                patch.object(
+                    regulation_rag_runtime,
+                    "_windows_enumerate_directory_identities",
+                    side_effect=AssertionError(
+                        "a scoped identity must not enumerate the directory"
+                    ),
+                ),
+                patch.object(
+                    regulation_rag_runtime,
+                    "_windows_file_change_time_ns",
+                    wraps=(
+                        regulation_rag_runtime
+                        ._windows_file_change_time_ns
+                    ),
+                ) as per_file_change_time,
+            ):
+                entries = (
+                    regulation_rag_runtime
+                    ._runtime_approval_identity_chunk_entries(
+                        self._descriptor(repository_root),
+                        document_ids=["doc"],
+                    )
+                )
+
+        self.assertIsNotNone(entries)
+        self.assertEqual(1, per_file_change_time.call_count)
+
+    def test_bulk_open_and_non_eof_errors_return_no_partial_data(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            with patch.object(
+                regulation_rag_runtime,
+                "_WINDOWS_CREATE_FILE",
+                return_value=(
+                    regulation_rag_runtime
+                    ._WINDOWS_INVALID_HANDLE_VALUE
+                ),
+            ):
+                self.assertIsNone(
+                    regulation_rag_runtime
+                    ._windows_enumerate_directory_identities(
+                        repository_root
+                    )
+                )
+
+            sample = (
+                regulation_rag_runtime._WindowsDirectoryIdentity(
+                    name="doc_chunks.json",
+                    last_write_time_ns=1,
+                    size=2,
+                    change_time_ns=3,
+                    attributes=0x20,
+                    file_id=4,
+                )
+            )
+            information_call_count = 0
+
+            def one_batch_then_access_denied(
+                *_args: object,
+            ) -> bool:
+                nonlocal information_call_count
+                information_call_count += 1
+                if information_call_count == 1:
+                    return True
+                ctypes.set_last_error(5)
+                return False
+
+            with (
+                patch.object(
+                    regulation_rag_runtime,
+                    "_WINDOWS_CREATE_FILE",
+                    return_value=123,
+                ),
+                patch.object(
+                    regulation_rag_runtime,
+                    "_WINDOWS_CLOSE_HANDLE",
+                    return_value=True,
+                ) as close_handle,
+                patch.object(
+                    regulation_rag_runtime,
+                    "_WINDOWS_GET_FILE_INFORMATION_BY_HANDLE_EX",
+                    side_effect=one_batch_then_access_denied,
+                ),
+                patch.object(
+                    regulation_rag_runtime,
+                    "_windows_parse_directory_identity_buffer",
+                    return_value=[sample],
+                ),
+            ):
+                partial = (
+                    regulation_rag_runtime
+                    ._windows_enumerate_directory_identities(
+                        repository_root
+                    )
+                )
+
+        self.assertIsNone(partial)
+        self.assertEqual(2, information_call_count)
+        close_handle.assert_called_once_with(123)
+
+    def test_bulk_parser_rejects_malformed_lengths_and_offsets(
+        self,
+    ) -> None:
+        buffer_size = 256
+        buffer = ctypes.create_string_buffer(buffer_size)
+        record = (
+            regulation_rag_runtime
+            ._WindowsFileIdBothDirectoryInfo
+            .from_buffer(buffer)
+        )
+        record.LastWriteTime = 1
+        record.ChangeTime = 1
+        record.EndOfFile = 0
+        record.FileNameLength = 3
+        self.assertIsNone(
+            regulation_rag_runtime
+            ._windows_parse_directory_identity_buffer(
+                buffer,
+                buffer_size,
+            )
+        )
+
+        ctypes.memset(buffer, 0, buffer_size)
+        record = (
+            regulation_rag_runtime
+            ._WindowsFileIdBothDirectoryInfo
+            .from_buffer(buffer)
+        )
+        record.LastWriteTime = 1
+        record.ChangeTime = 1
+        record.EndOfFile = 0
+        record.FileNameLength = 2
+        record.NextEntryOffset = 106
+        ctypes.memmove(
+            ctypes.addressof(buffer)
+            + regulation_rag_runtime
+            ._WINDOWS_DIRECTORY_FILE_NAME_OFFSET,
+            "a".encode("utf-16-le"),
+            2,
+        )
+        self.assertIsNone(
+            regulation_rag_runtime
+            ._windows_parse_directory_identity_buffer(
+                buffer,
+                buffer_size,
+            )
+        )
+
+    def test_bulk_rejects_missing_and_duplicate_names(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            path = repository_root / "doc_chunks.json"
+            path.write_text("[]", encoding="utf-8")
+            repository_root_resolved = repository_root.resolve(
+                strict=True
+            )
+
+            with patch.object(
+                regulation_rag_runtime,
+                "_windows_enumerate_directory_identities",
+                side_effect=AssertionError(
+                    "duplicate requests must fail before enumeration"
+                ),
+            ):
+                duplicate_requested = (
+                    regulation_rag_runtime
+                    ._windows_repository_chunk_entries(
+                        repository_directory=repository_root,
+                        repository_root=repository_root_resolved,
+                        chunk_paths=[path, path],
+                    )
+                )
+
+            with patch.object(
+                regulation_rag_runtime,
+                "_windows_enumerate_directory_identities",
+                return_value={},
+            ):
+                missing_enumerated = (
+                    regulation_rag_runtime
+                    ._windows_repository_chunk_entries(
+                        repository_directory=repository_root,
+                        repository_root=repository_root_resolved,
+                        chunk_paths=[path],
+                    )
+                )
+
+            entry = regulation_rag_runtime._WindowsDirectoryIdentity(
+                name=path.name,
+                last_write_time_ns=1,
+                size=2,
+                change_time_ns=3,
+                attributes=0x20,
+                file_id=4,
+            )
+            duplicate_enumerated = (
+                regulation_rag_runtime
+                ._windows_index_directory_identities(
+                    [
+                        entry,
+                        replace(entry, name=path.name.upper()),
+                    ]
+                )
+            )
+
+        self.assertIsNone(duplicate_requested)
+        self.assertIsNone(missing_enumerated)
+        self.assertIsNone(duplicate_enumerated)
+
+    def test_bulk_lstat_metadata_mismatch_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            chunk_path = repository_root / "doc_chunks.json"
+            chunk_path.write_text("[]", encoding="utf-8")
+            actual = chunk_path.lstat()
+            original_lstat = Path.lstat
+
+            def mismatched_file_id(candidate: Path) -> object:
+                if candidate == chunk_path:
+                    return SimpleNamespace(
+                        st_mode=actual.st_mode,
+                        st_file_attributes=(
+                            actual.st_file_attributes
+                        ),
+                        st_mtime_ns=actual.st_mtime_ns,
+                        st_size=actual.st_size,
+                        st_ino=actual.st_ino + 1,
+                    )
+                return original_lstat(candidate)
+
+            with patch.object(
+                Path,
+                "lstat",
+                mismatched_file_id,
+            ):
+                entries = (
+                    regulation_rag_runtime
+                    ._runtime_approval_identity_chunk_entries(
+                        self._descriptor(repository_root),
+                        document_ids=None,
+                    )
+                )
+
+        self.assertIsNone(entries)
+
+    def test_bulk_change_time_detects_same_size_restored_mtime_rewrite(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            chunk_path = repository_root / "doc_chunks.json"
+            chunk_path.write_bytes(b"AAAA")
+            original_stat = chunk_path.stat()
+            descriptor = self._descriptor(repository_root)
+            before = (
+                regulation_rag_runtime
+                ._runtime_approval_identity_chunk_entries(
+                    descriptor,
+                    document_ids=None,
+                )
+            )
+
+            time.sleep(0.02)
+            chunk_path.write_bytes(b"BBBB")
+            os.utime(
+                chunk_path,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns,
+                ),
+            )
+            after_stat = chunk_path.stat()
+            after = (
+                regulation_rag_runtime
+                ._runtime_approval_identity_chunk_entries(
+                    descriptor,
+                    document_ids=None,
+                )
+            )
+
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        assert before is not None
+        assert after is not None
+        self.assertEqual(original_stat.st_size, after_stat.st_size)
+        self.assertEqual(
+            original_stat.st_mtime_ns,
+            after_stat.st_mtime_ns,
+        )
+        self.assertEqual(before[0][1][:2], after[0][1][:2])
+        self.assertNotEqual(before[0][1][2], after[0][1][2])
+
+    def test_two_snapshot_checks_perform_two_independent_bulk_scans(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            repository_root = data_dir / "repository"
+            repository_root.mkdir(parents=True)
+            (data_dir / "mcp_runtime_manifest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (repository_root / "approval_snapshot.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (repository_root / "doc_chunks.json").write_text(
+                "[]",
+                encoding="utf-8",
+            )
+            descriptor = self._descriptor(repository_root)
+            with patch.object(
+                regulation_rag_runtime,
+                "_windows_enumerate_directory_identities",
+                wraps=(
+                    regulation_rag_runtime
+                    ._windows_enumerate_directory_identities
+                ),
+            ) as enumerate_directory:
+                before = (
+                    regulation_rag_runtime
+                    .runtime_approval_snapshot_identity(descriptor)
+                )
+                after = (
+                    regulation_rag_runtime
+                    .runtime_approval_snapshot_identity(descriptor)
+                )
+
+        self.assertIsNotNone(before)
+        self.assertEqual(before, after)
+        self.assertEqual(2, enumerate_directory.call_count)
+
+
 class RegulationMcpToolsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        regulation_tools._HIERARCHICAL_INDEX_VERIFICATION_CACHE.clear()
+        regulation_tools._HIERARCHICAL_VERIFIED_RUNTIME_TOKENS.clear()
+        regulation_tools._HIERARCHICAL_BM25_VERIFICATION_CACHE.clear()
+        regulation_tools._HIERARCHICAL_PROFILE_VERIFICATION_CACHE.clear()
+        regulation_tools._HIERARCHICAL_VISIBILITY_CACHE.clear()
+        regulation_tools._HIERARCHICAL_FETCH_RECORD_CACHE.clear()
+        regulation_tools._VISIBLE_DOCUMENT_RECORD_CACHE.clear()
+
+    def test_hierarchy_visibility_uses_runtime_sidecar_without_vector_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(
+                tenant_id="tenant-a",
+                role="operator",
+                department_ids=["hr"],
+            )
+            snapshot = {
+                ("doc-a", "chunk-visible"): {
+                    "approval_id": "approval-visible",
+                    "approved_content_hash": "approved-hash-visible",
+                    "content_hash": "content-hash-visible",
+                    "security_level": "internal",
+                    "department_acl": {"hr"},
+                },
+                ("doc-a", "chunk-denied"): {
+                    "approval_id": "approval-denied",
+                    "approved_content_hash": "approved-hash-denied",
+                    "content_hash": "content-hash-denied",
+                    "security_level": "internal",
+                    "department_acl": {"legal"},
+                },
+            }
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("index-identity",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-identity",),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ) as indexed_documents,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=snapshot,
+                ) as load_snapshot,
+                patch.object(
+                    regulation_tools,
+                    "fully_visible_regulation_unit_ids",
+                    return_value={"unit-a"},
+                ) as visible_units,
+                patch.object(
+                    regulation_tools,
+                    "_visible_records",
+                    side_effect=AssertionError("vector scan must not run"),
+                ),
+            ):
+                result = regulation_tools._fully_visible_regulation_units(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                    security_levels=["internal"],
+                    department_ids=["hr"],
+                )
+                cached_result = regulation_tools._fully_visible_regulation_units(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                    security_levels=["internal"],
+                    department_ids=["hr"],
+                )
+
+        self.assertEqual({"unit-a"}, result)
+        self.assertEqual(result, cached_result)
+        indexed_documents.assert_called_once()
+        load_snapshot.assert_called_once()
+        visible_units.assert_called_once()
+        self.assertEqual(
+            {("doc-a", "chunk-visible", "content-hash-visible")},
+            visible_units.call_args.kwargs["visible_record_signatures"],
+        )
+        self.assertEqual(
+            "profile-a",
+            visible_units.call_args.kwargs["profile_id"],
+        )
+
+    def test_hierarchy_visibility_falls_back_when_runtime_sidecar_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            records = [
+                {
+                    "document_id": "doc-a",
+                    "chunk_id": "chunk-a",
+                    "metadata": {},
+                }
+            ]
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("index-identity",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-identity",),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_visible_records",
+                    return_value=records,
+                ) as visible_records,
+                patch.object(
+                    regulation_tools,
+                    "fully_visible_regulation_unit_ids",
+                    return_value={"unit-a"},
+                ) as visible_units,
+            ):
+                result = regulation_tools._fully_visible_regulation_units(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                )
+
+        self.assertEqual({"unit-a"}, result)
+        visible_records.assert_called_once()
+        self.assertEqual(
+            {("doc-a", "chunk-a")},
+            visible_units.call_args.kwargs["visible_record_keys"],
+        )
+
+    def test_hierarchy_authorization_lazily_opens_live_repository_only_for_fallback(
+        self,
+    ) -> None:
+        settings = Settings(data_dir=Path("synthetic-runtime"))
+        descriptor = regulation_tools.repository_path_descriptor(settings)
+        live_repository = object()
+        with (
+            patch.object(
+                regulation_tools.routes_rag,
+                "runtime_approval_snapshot_identity",
+                side_effect=[("sidecar-identity",), None],
+            ),
+            patch.object(
+                regulation_tools,
+                "indexed_document_ids",
+                return_value={"doc-a"},
+            ),
+            patch.object(
+                regulation_tools,
+                "_json_repository",
+                return_value=live_repository,
+            ) as open_repository,
+            patch.object(
+                regulation_tools.routes_rag,
+                "approval_snapshot_signature",
+                return_value=("live-identity",),
+            ) as live_signature,
+        ):
+            sidecar_identity = (
+                regulation_tools._hierarchical_authorization_source_identity(
+                    settings=settings,
+                    repository_paths=descriptor,
+                    index_path=Path("hierarchy.sqlite3"),
+                    profile_id="profile-a",
+                )
+            )
+            open_repository.assert_not_called()
+            live_identity = (
+                regulation_tools._hierarchical_authorization_source_identity(
+                    settings=settings,
+                    repository_paths=descriptor,
+                    index_path=Path("hierarchy.sqlite3"),
+                    profile_id="profile-a",
+                )
+            )
+
+        self.assertEqual(
+            ("runtime_sidecar", ("sidecar-identity",)),
+            sidecar_identity,
+        )
+        self.assertEqual(
+            ("live_repository", ("live-identity",)),
+            live_identity,
+        )
+        open_repository.assert_called_once_with(settings)
+        live_signature.assert_called_once_with(live_repository, ["doc-a"])
+
+    def test_runtime_sidecar_visibility_rejects_unauthorized_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(
+                tenant_id="tenant-a",
+                role="operator",
+                department_ids=["hr"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "department"):
+                regulation_tools._runtime_sidecar_visible_regulation_units(
+                    settings=settings,
+                    auth=auth,
+                    profile_id=None,
+                    index_path=Path("synthetic.sqlite3"),
+                    security_levels=["internal"],
+                    department_ids=["legal"],
+                )
+
+    def test_runtime_sidecar_empty_security_levels_use_role_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(
+                tenant_id="tenant-a",
+                role="operator",
+                department_ids=["hr"],
+            )
+            snapshot = {
+                ("doc-a", "chunk-a"): {
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "content_hash": "content-hash-a",
+                    "security_level": "internal",
+                    "department_acl": {"hr"},
+                }
+            }
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("index-identity",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-identity",),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "fully_visible_regulation_unit_ids",
+                    return_value={"unit-a"},
+                ) as visible_units,
+            ):
+                omitted_levels = (
+                    regulation_tools._runtime_sidecar_visible_regulation_units(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                        index_path=Path("synthetic.sqlite3"),
+                        security_levels=None,
+                        department_ids=["hr"],
+                    )
+                )
+                regulation_tools._HIERARCHICAL_VISIBILITY_CACHE.clear()
+                empty_levels = (
+                    regulation_tools._runtime_sidecar_visible_regulation_units(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                        index_path=Path("synthetic.sqlite3"),
+                        security_levels=[],
+                        department_ids=["hr"],
+                    )
+                )
+
+        self.assertEqual({"unit-a"}, omitted_levels)
+        self.assertEqual(omitted_levels, empty_levels)
+        self.assertEqual(2, visible_units.call_count)
+        self.assertEqual(
+            visible_units.call_args_list[0].kwargs["visible_record_signatures"],
+            visible_units.call_args_list[1].kwargs["visible_record_signatures"],
+        )
+
+    def test_hierarchy_visibility_cache_isolated_by_authorized_departments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            snapshot = {
+                ("doc-a", "chunk-hr"): {
+                    "approval_id": "approval-hr",
+                    "approved_content_hash": "approved-hash-hr",
+                    "content_hash": "content-hash-hr",
+                    "security_level": "internal",
+                    "department_acl": {"hr"},
+                },
+                ("doc-a", "chunk-legal"): {
+                    "approval_id": "approval-legal",
+                    "approved_content_hash": "approved-hash-legal",
+                    "content_hash": "content-hash-legal",
+                    "security_level": "internal",
+                    "department_acl": {"legal"},
+                },
+            }
+
+            def units_for_scope(*_args, **kwargs):
+                signatures = kwargs["visible_record_signatures"]
+                return {
+                    "unit-hr"
+                    if any(item[1] == "chunk-hr" for item in signatures)
+                    else "unit-legal"
+                }
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("index-identity",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-identity",),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "fully_visible_regulation_unit_ids",
+                    side_effect=units_for_scope,
+                ) as visible_units,
+            ):
+                hr_units = regulation_tools._runtime_sidecar_visible_regulation_units(
+                    settings=settings,
+                    auth=mcp_auth_context(
+                        tenant_id="tenant-a",
+                        role="operator",
+                        department_ids=["hr"],
+                    ),
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                    department_ids=["hr"],
+                )
+                legal_units = regulation_tools._runtime_sidecar_visible_regulation_units(
+                    settings=settings,
+                    auth=mcp_auth_context(
+                        tenant_id="tenant-a",
+                        role="operator",
+                        department_ids=["legal"],
+                    ),
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                    department_ids=["legal"],
+                )
+
+        self.assertEqual({"unit-hr"}, hr_units)
+        self.assertEqual({"unit-legal"}, legal_units)
+        self.assertEqual(2, visible_units.call_count)
+
+    def test_hierarchy_visibility_does_not_cache_files_changed_during_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            snapshot = {
+                ("doc-a", "chunk-a"): {
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "content_hash": "content-hash-a",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                }
+            }
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("index-identity",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    side_effect=[
+                        ("approval-before",),
+                        ("approval-after",),
+                    ],
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "fully_visible_regulation_unit_ids",
+                    return_value={"unit-a"},
+                ),
+            ):
+                result = regulation_tools._runtime_sidecar_visible_regulation_units(
+                    settings=settings,
+                    auth=mcp_auth_context(tenant_id="tenant-a"),
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(0, len(regulation_tools._HIERARCHICAL_VISIBILITY_CACHE))
+
+    def test_hierarchy_visibility_cache_hit_revalidates_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            snapshot = {
+                ("doc-a", "chunk-a"): {
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "content_hash": "content-hash-a",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                }
+            }
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("index-identity",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    side_effect=[
+                        ("approval-stable",),
+                        ("approval-stable",),
+                        ("approval-stable",),
+                        ("approval-changed",),
+                    ],
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=snapshot,
+                ) as load_snapshot,
+                patch.object(
+                    regulation_tools,
+                    "fully_visible_regulation_unit_ids",
+                    return_value={"unit-a"},
+                ),
+            ):
+                first = regulation_tools._runtime_sidecar_visible_regulation_units(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                )
+                second = regulation_tools._runtime_sidecar_visible_regulation_units(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    index_path=Path("synthetic.sqlite3"),
+                )
+
+        self.assertEqual({"unit-a"}, first)
+        self.assertIsNone(second)
+        load_snapshot.assert_called_once()
+
+    def test_verified_hierarchy_search_uses_sidecar_without_full_vector_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            _prepare_mcp_indexed_document(settings)
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            vector_path = routes_rag._local_vector_path(settings, auth)
+            records = [
+                json.loads(line)
+                for line in vector_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = hierarchical_index_path(settings.data_dir)
+            hierarchy = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="public_portal-test-profile",
+                vector_offsets=offsets,
+            )
+            _write_runtime_approval_snapshot_sidecar(
+                settings.data_dir,
+                records,
+                tenant_id="tenant-a",
+            )
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "profile_id": "public_portal-test-profile",
+                    "hierarchical_index_status": "ready",
+                    "files": {
+                        "hierarchical_index_sha256": hierarchy["sha256"],
+                    },
+                }
+            )
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            routes_rag._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_local_vector_records",
+                    side_effect=AssertionError("full vector load must not run"),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "search_records",
+                    side_effect=AssertionError("flat search must not run"),
+                ),
+                patch.object(
+                    JsonRepository,
+                    "list_documents",
+                    side_effect=AssertionError(
+                        "repository profile scan must not run"
+                    ),
+                ),
+            ):
+                response = search_regulations(
+                    settings=settings,
+                    auth=auth,
+                    query=str(records[0]["text"]),
+                    top_k=1,
+                    profile_id=None,
+                    security_levels=["internal"],
+                )
+
+        self.assertEqual(1, len(response["results"]))
+        self.assertEqual(
+            "public_portal-test-profile",
+            response["metadata"]["profile_id"],
+        )
+        self.assertEqual(
+            "catalog_toc_body",
+            response["metadata"]["retrieval_strategy"],
+        )
+
+    def test_external_chunk_symlink_invalidates_sidecar_and_verified_search(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data")
+            _prepare_mcp_indexed_document(settings)
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            vector_path = routes_rag._local_vector_path(settings, auth)
+            records = [
+                json.loads(line)
+                for line in vector_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = hierarchical_index_path(settings.data_dir)
+            hierarchy = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="public_portal-test-profile",
+                vector_offsets=offsets,
+            )
+            _write_runtime_approval_snapshot_sidecar(
+                settings.data_dir,
+                records,
+                tenant_id="tenant-a",
+            )
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "profile_id": "public_portal-test-profile",
+                    "hierarchical_index_status": "ready",
+                    "files": {
+                        "hierarchical_index_sha256": hierarchy["sha256"],
+                    },
+                }
+            )
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            chunk_path = (
+                settings.data_dir
+                / "repository"
+                / "doc_mcp_chunks.json"
+            )
+            external_chunk_path = root / "external_doc_mcp_chunks.json"
+            chunk_path.replace(external_chunk_path)
+            simulate_symlink_metadata = False
+            try:
+                chunk_path.symlink_to(external_chunk_path)
+            except (NotImplementedError, OSError):
+                # Windows without Developer Mode cannot create file symlinks.
+                # Restore the fixture and simulate only the link metadata so
+                # the fail-closed search regression still executes there.
+                external_chunk_path.replace(chunk_path)
+                simulate_symlink_metadata = True
+            original_lstat = Path.lstat
+
+            def reports_external_chunk_symlink(candidate: Path) -> object:
+                if simulate_symlink_metadata and candidate == chunk_path:
+                    return SimpleNamespace(
+                        st_mode=stat.S_IFLNK,
+                        st_file_attributes=0,
+                    )
+                return original_lstat(candidate)
+
+            with patch.object(
+                Path,
+                "lstat",
+                reports_external_chunk_symlink,
+            ):
+                descriptor = regulation_tools.repository_path_descriptor(
+                    settings
+                )
+                regulation_rag_runtime._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
+                regulation_rag_runtime._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.clear()
+
+                self.assertIsNone(
+                    regulation_rag_runtime.runtime_approval_snapshot_identity(
+                        descriptor
+                    )
+                )
+                self.assertIsNone(
+                    regulation_rag_runtime.repository_chunk_files_signature(
+                        descriptor
+                    )
+                )
+                self.assertIsNone(
+                    regulation_rag_runtime.load_runtime_approval_snapshot_sidecar(
+                        descriptor,
+                        ["doc_mcp"],
+                        auth,
+                    )
+                )
+                self.assertIsNone(
+                    regulation_rag_runtime.load_cached_runtime_approval_snapshot(
+                        descriptor,
+                        ["doc_mcp"],
+                        auth,
+                    )
+                )
+                with patch.object(
+                    regulation_tools.routes_rag,
+                    "search_records",
+                    side_effect=AssertionError(
+                        "unsafe hierarchy authorization must not fall back open"
+                    ),
+                ):
+                    response = search_regulations(
+                        settings=settings,
+                        auth=auth,
+                        query=str(records[0]["text"]),
+                        top_k=1,
+                        profile_id="public_portal-test-profile",
+                        security_levels=["internal"],
+                    )
+
+        self.assertEqual([], response["results"])
+
+    def test_runtime_approval_chunk_paths_reject_escaped_and_non_file_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            repository_root = data_dir / "repository"
+            repository_root.mkdir(parents=True)
+            escaped_path = data_dir / "escaped_chunks.json"
+            escaped_path.write_text("[]", encoding="utf-8")
+            (repository_root / "directory_chunks.json").mkdir()
+            descriptor = SimpleNamespace(
+                root=repository_root,
+                manifest_path=repository_root / "manifest.json",
+                legacy_path=data_dir / "repository.json",
+            )
+
+            escaped = (
+                regulation_rag_runtime.runtime_approval_identity_chunk_paths(
+                    descriptor,
+                    document_ids=["../escaped"],
+                )
+            )
+            non_file_scoped = (
+                regulation_rag_runtime.runtime_approval_identity_chunk_paths(
+                    descriptor,
+                    document_ids=["directory"],
+                )
+            )
+            non_file_unscoped = (
+                regulation_rag_runtime.runtime_approval_identity_chunk_paths(
+                    descriptor,
+                    document_ids=None,
+                )
+            )
+
+        self.assertIsNone(escaped)
+        self.assertIsNone(non_file_scoped)
+        self.assertIsNone(non_file_unscoped)
+
+    def test_runtime_approval_identity_keeps_missing_scoped_chunk_sentinel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            repository_root = data_dir / "repository"
+            repository_root.mkdir(parents=True)
+            (data_dir / "mcp_runtime_manifest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (repository_root / "approval_snapshot.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            descriptor = SimpleNamespace(
+                root=repository_root,
+                manifest_path=repository_root / "manifest.json",
+                legacy_path=data_dir / "repository.json",
+            )
+
+            identity = (
+                regulation_rag_runtime.runtime_approval_snapshot_identity(
+                    descriptor,
+                    document_ids=["missing-document"],
+                )
+            )
+
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(
+            (
+                (
+                    "missing-document_chunks.json",
+                    ("missing",),
+                ),
+            ),
+            identity[5],
+        )
+
+    def test_runtime_approval_identity_reuses_normal_chunk_lstat(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            repository_root = data_dir / "repository"
+            repository_root.mkdir(parents=True)
+            manifest_path = data_dir / "mcp_runtime_manifest.json"
+            sidecar_path = repository_root / "approval_snapshot.json"
+            chunk_path = repository_root / "doc_chunks.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            sidecar_path.write_text("{}", encoding="utf-8")
+            chunk_path.write_text("[]", encoding="utf-8")
+            descriptor = SimpleNamespace(
+                root=repository_root,
+                manifest_path=repository_root / "manifest.json",
+                legacy_path=data_dir / "repository.json",
+            )
+            original_lstat = Path.lstat
+            chunk_lstat_calls = 0
+
+            def track_chunk_lstat(candidate: Path) -> object:
+                nonlocal chunk_lstat_calls
+                if candidate == chunk_path:
+                    chunk_lstat_calls += 1
+                return original_lstat(candidate)
+
+            with (
+                patch.object(Path, "lstat", track_chunk_lstat),
+                patch.object(
+                    regulation_rag_runtime,
+                    "path_signature",
+                    wraps=regulation_rag_runtime.path_signature,
+                ) as path_signatures,
+            ):
+                identity = (
+                    regulation_rag_runtime.runtime_approval_snapshot_identity(
+                        descriptor,
+                        document_ids=["doc"],
+                    )
+                )
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(1, chunk_lstat_calls)
+        self.assertNotIn(
+            chunk_path,
+            [
+                call.args[0]
+                for call in path_signatures.call_args_list
+            ],
+        )
+
+    def test_same_size_rewrite_with_restored_mtime_invalidates_approval_caches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            repository_root = data_dir / "repository"
+            repository_root.mkdir(parents=True)
+            (data_dir / "mcp_runtime_manifest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (repository_root / "approval_snapshot.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            chunk_path = repository_root / "doc_chunks.json"
+            chunk_path.write_bytes(b"AAAA")
+            original_stat = chunk_path.stat()
+            descriptor = SimpleNamespace(
+                root=repository_root,
+                manifest_path=repository_root / "manifest.json",
+                legacy_path=data_dir / "repository.json",
+            )
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            snapshots = [
+                {
+                    ("doc", "chunk"): {
+                        "content_hash": "before",
+                    }
+                },
+                {
+                    ("doc", "chunk"): {
+                        "content_hash": "after",
+                    }
+                },
+            ]
+            sidecar_load_count = 0
+
+            def load_current_snapshot(
+                _repository: object,
+                _document_ids: list[str],
+                _auth: AuthContext,
+            ) -> dict[tuple[str, str], dict[str, str]]:
+                nonlocal sidecar_load_count
+                snapshot = snapshots[sidecar_load_count]
+                sidecar_load_count += 1
+                return snapshot
+
+            regulation_rag_runtime._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
+            regulation_rag_runtime._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.clear()
+            regulation_rag_runtime._RUNTIME_CONTENT_SIGNATURE_CACHE.clear()
+            before_signature = regulation_rag_runtime.path_signature(
+                chunk_path
+            )
+            before_portable = (
+                regulation_rag_runtime.portable_file_signature(chunk_path)
+            )
+            before_snapshot = (
+                regulation_rag_runtime.load_cached_runtime_approval_snapshot(
+                    descriptor,
+                    ["doc"],
+                    auth,
+                    sidecar_loader=load_current_snapshot,
+                )
+            )
+
+            time.sleep(0.01)
+            chunk_path.write_bytes(b"BBBB")
+            os.utime(
+                chunk_path,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns,
+                ),
+            )
+
+            after_signature = regulation_rag_runtime.path_signature(
+                chunk_path
+            )
+            after_portable = (
+                regulation_rag_runtime.portable_file_signature(chunk_path)
+            )
+            after_snapshot = (
+                regulation_rag_runtime.load_cached_runtime_approval_snapshot(
+                    descriptor,
+                    ["doc"],
+                    auth,
+                    sidecar_loader=load_current_snapshot,
+                )
+            )
+            regulation_rag_runtime._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
+            regulation_rag_runtime._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.clear()
+            regulation_rag_runtime._RUNTIME_CONTENT_SIGNATURE_CACHE.clear()
+
+        self.assertIsNotNone(before_signature)
+        self.assertIsNotNone(after_signature)
+        assert before_signature is not None
+        assert after_signature is not None
+        self.assertEqual(before_signature[:2], after_signature[:2])
+        self.assertNotEqual(before_signature, after_signature)
+        self.assertIsNotNone(before_portable)
+        self.assertIsNotNone(after_portable)
+        assert before_portable is not None
+        assert after_portable is not None
+        self.assertEqual(before_portable[0], after_portable[0])
+        self.assertNotEqual(before_portable[1], after_portable[1])
+        self.assertEqual(snapshots[0], before_snapshot)
+        self.assertEqual(snapshots[1], after_snapshot)
+        self.assertEqual(2, sidecar_load_count)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ChangeTime is required")
+    def test_windows_change_time_failure_fails_closed_for_chunk_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            chunk_path = repository_root / "doc_chunks.json"
+            chunk_path.write_text("[]", encoding="utf-8")
+            descriptor = SimpleNamespace(
+                root=repository_root,
+                manifest_path=repository_root / "manifest.json",
+                legacy_path=repository_root.parent / "repository.json",
+            )
+
+            with patch.object(
+                regulation_rag_runtime,
+                "_windows_file_change_time_ns",
+                return_value=None,
+            ):
+                signature = regulation_rag_runtime.path_signature(chunk_path)
+                chunk_paths = (
+                    regulation_rag_runtime.runtime_approval_identity_chunk_paths(
+                        descriptor,
+                        document_ids=["doc"],
+                    )
+                )
+
+        self.assertIsNone(signature)
+        self.assertIsNone(chunk_paths)
+
+    def test_runtime_approval_chunk_paths_reject_reparse_file_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository_root = Path(tmp) / "repository"
+            repository_root.mkdir()
+            chunk_path = repository_root / "doc_chunks.json"
+            chunk_path.write_text("[]", encoding="utf-8")
+            descriptor = SimpleNamespace(
+                root=repository_root,
+                manifest_path=repository_root / "manifest.json",
+                legacy_path=repository_root.parent / "repository.json",
+            )
+            original_lstat = Path.lstat
+
+            def reports_reparse_file(candidate: Path) -> object:
+                if candidate == chunk_path:
+                    return SimpleNamespace(
+                        st_mode=stat.S_IFREG,
+                        st_file_attributes=0x400,
+                    )
+                return original_lstat(candidate)
+
+            with patch.object(Path, "lstat", reports_reparse_file):
+                chunk_paths = (
+                    regulation_rag_runtime.runtime_approval_identity_chunk_paths(
+                        descriptor,
+                        document_ids=["doc"],
+                    )
+                )
+
+        self.assertIsNone(chunk_paths)
+
+    def test_fresh_hierarchy_search_avoids_repository_and_fastapi_routes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            _prepare_mcp_indexed_document(settings)
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            vector_path = routes_rag._local_vector_path(settings, auth)
+            records = [
+                json.loads(line)
+                for line in vector_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = hierarchical_index_path(settings.data_dir)
+            hierarchy = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="public_portal-test-profile",
+                vector_offsets=offsets,
+            )
+            _write_runtime_approval_snapshot_sidecar(
+                settings.data_dir,
+                records,
+                tenant_id="tenant-a",
+            )
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "profile_id": "public_portal-test-profile",
+                    "hierarchical_index_status": "ready",
+                    "files": {
+                        "hierarchical_index_sha256": hierarchy["sha256"],
+                    },
+                }
+            )
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            child_source = """
+import json
+from pathlib import Path
+import sys
+from app.core.config import Settings
+from app.mcp_server.regulation_tools import (
+    mcp_auth_context,
+    search_regulations,
+)
+from app.services.regulation_rag_service import local_vector_path
+from app.services import regulation_rag_service
+
+settings = Settings(data_dir=Path(sys.argv[1]), api_audit_enabled=False)
+auth = mcp_auth_context(tenant_id="tenant-a")
+def reject_route_import():
+    raise AssertionError("hierarchy search attempted to import routes_rag")
+regulation_rag_service._load_routes_rag = reject_route_import
+class RejectRoutesRagImport:
+    def find_spec(self, fullname, path, target=None):
+        if fullname in {"app.api.routes_rag", "app.storage.repository"}:
+            raise AssertionError(f"forbidden cold-path import: {fullname}")
+        return None
+sys.meta_path.insert(0, RejectRoutesRagImport())
+vector_path = local_vector_path(settings, auth)
+first_record = json.loads(
+    next(
+        line
+        for line in vector_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+)
+repository_root = settings.data_dir / "repository"
+repository_state_before = {
+    str(path.relative_to(repository_root)): (
+        path.stat().st_mtime_ns,
+        path.stat().st_size,
+    )
+    for path in repository_root.rglob("*")
+    if path.is_file()
+}
+response = search_regulations(
+    settings=settings,
+    auth=auth,
+    query=str(first_record["text"]),
+    top_k=1,
+    security_levels=["internal"],
+)
+repository_state_after = {
+    str(path.relative_to(repository_root)): (
+        path.stat().st_mtime_ns,
+        path.stat().st_size,
+    )
+    for path in repository_root.rglob("*")
+    if path.is_file()
+}
+print(json.dumps({
+    "result_count": len(response["results"]),
+    "retrieval_strategy": response["metadata"]["retrieval_strategy"],
+    "routes_rag_loaded": "app.api.routes_rag" in sys.modules,
+    "repository_loaded": "app.storage.repository" in sys.modules,
+    "repository_state_unchanged": repository_state_before == repository_state_after,
+}))
+"""
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    child_source,
+                    str(settings.data_dir),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        child_result = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(1, child_result["result_count"])
+        self.assertEqual(
+            "catalog_toc_body",
+            child_result["retrieval_strategy"],
+        )
+        self.assertFalse(child_result["routes_rag_loaded"])
+        self.assertFalse(child_result["repository_loaded"])
+        self.assertTrue(child_result["repository_state_unchanged"])
+
+    def test_cached_hierarchy_verifier_rejects_index_replaced_before_return(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            _prepare_mcp_indexed_document(settings)
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            vector_path = routes_rag._local_vector_path(settings, auth)
+            records = [
+                json.loads(line)
+                for line in vector_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = hierarchical_index_path(settings.data_dir)
+            hierarchy = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="public_portal-test-profile",
+                vector_offsets=offsets,
+            )
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest = {
+                "report_type": "mcp_runtime_data_bundle",
+                "tenant_id": "tenant-a",
+                "profile_id": "public_portal-test-profile",
+                "files": {
+                    "hierarchical_index_sha256": hierarchy["sha256"],
+                },
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            first = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="public_portal-test-profile",
+            )
+            original_signature = regulation_tools.routes_rag.path_signature
+            index_signature_calls = 0
+
+            def replace_before_cached_return(path: Path):
+                nonlocal index_signature_calls
+                if Path(path) == index_path:
+                    index_signature_calls += 1
+                    if index_signature_calls == 2:
+                        index_path.write_bytes(b"replaced-index")
+                return original_signature(path)
+
+            with patch.object(
+                regulation_tools.routes_rag,
+                "path_signature",
+                side_effect=replace_before_cached_return,
+            ):
+                second = (
+                    regulation_tools._verified_hierarchical_runtime_paths(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="public_portal-test-profile",
+                    )
+                )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_get_regulation_article_rejects_mid_request_approval_change(
+        self,
+    ) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        settings = Settings(
+            data_dir=Path(temporary_directory.name) / "data",
+            api_audit_enabled=False,
+        )
+        auth = mcp_auth_context(tenant_id="tenant-a")
+        paths = (
+            Path("synthetic-index.sqlite3"),
+            Path("synthetic-vectors.jsonl"),
+        )
+        token = SimpleNamespace(is_current=lambda: True)
+        record = {
+            "document_id": "doc-a",
+            "chunk_id": "chunk-a",
+            "text": "approved article",
+            "content_hash": "content-hash-a",
+            "metadata": {
+                "document_id": "doc-a",
+                "chunk_id": "chunk-a",
+                "approval_status": "approved",
+                "approval_id": "approval-a",
+                "approved_content_hash": "approved-hash-a",
+                "security_level": "internal",
+                "regulation_unit_id": "unit-a",
+                "article_no": "1",
+                "article_title": "Article",
+            },
+        }
+        with (
+            patch.object(
+                regulation_tools,
+                "_resolve_mcp_profile_scope",
+                return_value=None,
+            ),
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_paths",
+                return_value=paths,
+            ),
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_token",
+                return_value=token,
+            ),
+            patch.object(
+                regulation_tools,
+                "_hierarchical_authorization_source_identity",
+                side_effect=[
+                    ("runtime_sidecar", "before"),
+                    ("runtime_sidecar", "after"),
+                ],
+            ),
+            patch.object(
+                regulation_tools,
+                "_fully_visible_regulation_units",
+                return_value={"unit-a"},
+            ),
+            patch.object(
+                regulation_tools,
+                "load_hierarchical_article_records",
+                return_value=[record],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "authorization source changed",
+            ):
+                regulation_tools.get_regulation_article(
+                    settings=settings,
+                    auth=auth,
+                    regulation_unit_id="unit-a",
+                    article_no="1",
+                    security_levels=["internal"],
+                )
+
+    def test_get_regulation_article_rejects_paths_without_verification_token(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                regulation_tools,
+                "_resolve_mcp_profile_scope",
+                return_value=None,
+            ),
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_paths",
+                return_value=(
+                    Path("index.sqlite3"),
+                    Path("vector.jsonl"),
+                ),
+            ),
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_token",
+                return_value=None,
+            ),
+            patch.object(
+                regulation_tools,
+                "_fully_visible_regulation_units",
+                side_effect=AssertionError(
+                    "unverified article index must not be authorized"
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "index verification changed",
+            ):
+                regulation_tools.get_regulation_article(
+                    settings=Settings(
+                        data_dir=Path("synthetic-runtime"),
+                        api_audit_enabled=False,
+                    ),
+                    auth=mcp_auth_context(tenant_id="tenant-a"),
+                    regulation_unit_id="unit-a",
+                    article_no="1",
+                    security_levels=["internal"],
+                )
+
+    def test_hierarchy_search_fails_closed_when_runtime_files_change_mid_query(self) -> None:
+        query = SimpleNamespace(
+            profile_id="profile-a",
+            query="test query",
+            top_k=1,
+            document_id=None,
+            as_of_date=None,
+            security_levels=["internal"],
+            department_ids=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            token_is_current_calls = 0
+
+            def final_token_is_stale() -> bool:
+                nonlocal token_is_current_calls
+                token_is_current_calls += 1
+                return False
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token_for_scope",
+                    return_value=SimpleNamespace(
+                        index_path=Path("index.sqlite3"),
+                        vector_path=Path("vector.jsonl"),
+                        index_identity=("index-stable",),
+                        vector_identity=("vector-stable",),
+                        is_current=final_token_is_stale,
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_bm25",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-stable",),
+                ) as approval_identity,
+                patch.object(
+                    regulation_tools,
+                    "_fully_visible_regulation_units",
+                    return_value={"unit-a"},
+                ),
+                patch.object(
+                    regulation_tools,
+                    "search_hierarchical_records",
+                    return_value=([], {"retrieval_model": "hier", "retrieval_strategy": "catalog_toc_body"}),
+                ),
+            ):
+                result = regulation_tools._search_hierarchical_runtime(
+                    settings=settings,
+                    auth=auth,
+                    query=query,
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(1, token_is_current_calls)
+        self.assertEqual(2, approval_identity.call_count)
+
+    def test_hierarchy_search_rejects_paths_without_verification_token(
+        self,
+    ) -> None:
+        query = SimpleNamespace(
+            profile_id=None,
+            query="test query",
+            top_k=1,
+            document_id=None,
+            as_of_date=None,
+            security_levels=["internal"],
+            department_ids=[],
+        )
+        with (
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_token_for_scope",
+                return_value=None,
+            ),
+            patch.object(
+                regulation_tools,
+                "search_hierarchical_records",
+                side_effect=AssertionError(
+                    "unverified hierarchy must not be searched"
+                ),
+            ),
+        ):
+            result = regulation_tools._search_hierarchical_runtime(
+                settings=Settings(data_dir=Path("synthetic-runtime")),
+                auth=mcp_auth_context(tenant_id="tenant-a"),
+                query=query,
+            )
+
+        self.assertIsNone(result)
+
+    def test_hierarchy_search_reuses_prevalidated_visibility_identity(self) -> None:
+        query = SimpleNamespace(
+            profile_id="profile-a",
+            query="test query",
+            top_k=1,
+            document_id=None,
+            as_of_date=None,
+            security_levels=["internal"],
+            department_ids=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token_for_scope",
+                    return_value=SimpleNamespace(
+                        index_path=Path("index.sqlite3"),
+                        vector_path=Path("vector.jsonl"),
+                        index_identity=("index-stable",),
+                        vector_identity=("vector-stable",),
+                        is_current=lambda: True,
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_bm25",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    side_effect=[
+                        ("approval-stable",),
+                        ("approval-stable",),
+                    ],
+                ) as approval_identity,
+                patch.object(
+                    regulation_tools,
+                    "_fully_visible_regulation_units",
+                    return_value={"unit-a"},
+                ) as visible_units,
+                patch.object(
+                    regulation_tools,
+                    "search_hierarchical_records",
+                    return_value=(
+                        [],
+                        {
+                            "retrieval_model": "hier",
+                            "retrieval_strategy": "catalog_toc_body",
+                        },
+                    ),
+                ),
+            ):
+                result = regulation_tools._search_hierarchical_runtime(
+                    settings=settings,
+                    auth=auth,
+                    query=query,
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(2, approval_identity.call_count)
+        self.assertEqual(
+            ("index-stable",),
+            visible_units.call_args.kwargs["prevalidated_index_signature"],
+        )
+        self.assertEqual(
+            ("approval-stable",),
+            visible_units.call_args.kwargs["prevalidated_source_identity"],
+        )
+
+    def test_hierarchy_search_rejects_bm25_changed_after_scoring(self) -> None:
+        query = SimpleNamespace(
+            profile_id="profile-a",
+            query="test query",
+            top_k=1,
+            document_id=None,
+            as_of_date=None,
+            security_levels=["internal"],
+            department_ids=[],
+        )
+        token = SimpleNamespace(
+            index_path=Path("index.sqlite3"),
+            vector_path=Path("vector.jsonl"),
+            index_identity=("index-stable",),
+            vector_identity=("vector-stable",),
+            is_current=lambda: True,
+        )
+        bm25_index = object()
+        bm25_path = Path("bm25.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token_for_scope",
+                    return_value=token,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_bm25",
+                    return_value=(
+                        bm25_index,
+                        bm25_path,
+                        ("bm25-before",),
+                    ),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-stable",),
+                ) as approval_identity,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("bm25-after",),
+                ) as path_signature,
+                patch.object(
+                    regulation_tools,
+                    "_fully_visible_regulation_units",
+                    return_value={"unit-a"},
+                ),
+                patch.object(
+                    regulation_tools,
+                    "search_hierarchical_records",
+                    return_value=(
+                        [],
+                        {
+                            "retrieval_model": "hier",
+                            "retrieval_strategy": "catalog_toc_body",
+                        },
+                    ),
+                ) as search_records,
+            ):
+                result = regulation_tools._search_hierarchical_runtime(
+                    settings=settings,
+                    auth=auth,
+                    query=query,
+                )
+
+        self.assertIsNone(result)
+        self.assertIs(
+            bm25_index,
+            search_records.call_args.kwargs["rerank_index"],
+        )
+        self.assertEqual(2, approval_identity.call_count)
+        path_signature.assert_called_once_with(bm25_path)
+
+    def test_verified_runtime_profile_requires_matching_stable_manifest_and_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_data_bundle",
+                        "tenant_id": "tenant-a",
+                        "profile_id": "profile-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            index_path = hierarchical_index_path(settings.data_dir)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            index_path.write_bytes(b"synthetic-index")
+            summary = {
+                "schema_version": regulation_tools.HIERARCHICAL_INDEX_SCHEMA_VERSION,
+                "tenant_id": "tenant-a",
+                "profile_id": "profile-a",
+            }
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(index_path, Path("synthetic-vector")),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value=summary,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("stable",),
+                ),
+            ):
+                resolved = (
+                    regulation_tools._verified_hierarchical_runtime_profile_id(
+                        settings=settings,
+                        auth=auth,
+                    )
+                )
+
+            regulation_tools._HIERARCHICAL_PROFILE_VERIFICATION_CACHE.clear()
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(index_path, Path("synthetic-vector")),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value={**summary, "profile_id": "profile-b"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("stable",),
+                ),
+            ):
+                mismatched = (
+                    regulation_tools._verified_hierarchical_runtime_profile_id(
+                        settings=settings,
+                        auth=auth,
+                    )
+                )
+
+            regulation_tools._HIERARCHICAL_PROFILE_VERIFICATION_CACHE.clear()
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(index_path, Path("synthetic-vector")),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value=summary,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    side_effect=[
+                        ("manifest-before",),
+                        ("index-stable",),
+                        ("vector-stable",),
+                        ("manifest-after",),
+                        ("index-stable",),
+                        ("vector-stable",),
+                    ],
+                ),
+            ):
+                unstable = (
+                    regulation_tools._verified_hierarchical_runtime_profile_id(
+                        settings=settings,
+                        auth=auth,
+                    )
+                )
+
+        self.assertEqual("profile-a", resolved)
+        self.assertIsNone(mismatched)
+        self.assertIsNone(unstable)
+
+    def test_verified_runtime_profile_reuses_stable_positive_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_data_bundle",
+                        "tenant_id": "tenant-a",
+                        "profile_id": "profile-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            index_path = hierarchical_index_path(settings.data_dir)
+            vector_path = routes_rag._local_vector_path(settings, auth)
+            summary = {
+                "schema_version": regulation_tools.HIERARCHICAL_INDEX_SCHEMA_VERSION,
+                "tenant_id": "tenant-a",
+                "profile_id": "profile-a",
+            }
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(index_path, vector_path),
+                ) as verified_paths,
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value=summary,
+                ) as load_summary,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("stable",),
+                ),
+            ):
+                first = (
+                    regulation_tools._verified_hierarchical_runtime_profile_id(
+                        settings=settings,
+                        auth=auth,
+                    )
+                )
+                second = (
+                    regulation_tools._verified_hierarchical_runtime_profile_id(
+                        settings=settings,
+                        auth=auth,
+                    )
+                )
+
+        self.assertEqual("profile-a", first)
+        self.assertEqual(first, second)
+        verified_paths.assert_called_once()
+        load_summary.assert_called_once()
+
+    def test_list_regulations_uses_verified_runtime_profile_without_scope_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_profile_id",
+                    return_value="profile-a",
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=None,
+                ) as runtime_paths,
+                patch.object(
+                    JsonRepository,
+                    "list_documents",
+                    side_effect=AssertionError("repository scope scan must not run"),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_local_vector_records",
+                    side_effect=AssertionError("vector scope scan must not run"),
+                ),
+            ):
+                result = list_regulations(
+                    settings=settings,
+                    auth=auth,
+                    profile_id=None,
+                )
+
+        self.assertFalse(result["metadata"]["hierarchical_index_ready"])
+        self.assertEqual("profile-a", runtime_paths.call_args.kwargs["profile_id"])
+
+    def test_visible_records_uses_verified_runtime_profile_without_scope_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_profile_id",
+                    return_value="profile-a",
+                ),
+                patch.object(
+                    JsonRepository,
+                    "list_documents",
+                    side_effect=AssertionError("repository scope scan must not run"),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_local_vector_records",
+                    side_effect=AssertionError("vector scope scan must not run"),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "get_visible_records",
+                    return_value=[],
+                ) as get_visible_records,
+            ):
+                result = regulation_tools._visible_records(
+                    settings=settings,
+                    auth=auth,
+                    profile_id=None,
+                    security_levels=["internal"],
+                )
+
+        self.assertEqual([], result)
+        query_request = get_visible_records.call_args.kwargs["query"]
+        self.assertEqual("profile-a", query_request.profile_id)
+
+    def test_hierarchy_verification_cache_is_scoped_to_manifest_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            index_path = hierarchical_index_path(settings.data_dir)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            index_path.write_bytes(b"stable-hierarchy-index")
+            vector_path = routes_rag._local_vector_path(settings, auth)
+            vector_path.parent.mkdir(parents=True, exist_ok=True)
+            vector_path.write_text("", encoding="utf-8")
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest = {
+                "report_type": "mcp_runtime_data_bundle",
+                "tenant_id": "tenant-a",
+                "profile_id": "profile-a",
+                "files": {
+                    "hierarchical_index_sha256": hashlib.sha256(
+                        index_path.read_bytes()
+                    ).hexdigest(),
+                },
+            }
+            manifest_path.write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            summary = {
+                "schema_version": regulation_tools.HIERARCHICAL_INDEX_SCHEMA_VERSION,
+                "tenant_id": "tenant-a",
+                "profile_id": "profile-a",
+            }
+
+            with patch.object(
+                regulation_tools,
+                "hierarchical_index_summary",
+                return_value=summary,
+            ):
+                accepted = regulation_tools._verified_hierarchical_runtime_paths(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+                manifest["profile_id"] = "profile-b"
+                manifest_path.write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+                rejected = regulation_tools._verified_hierarchical_runtime_paths(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-b",
+                )
+
+        self.assertIsNotNone(accepted)
+        self.assertIsNone(rejected)
+
+    def test_verified_hierarchy_warm_token_skips_manifest_and_summary_reads(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            first = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+
+            with (
+                patch.object(
+                    Path,
+                    "read_text",
+                    side_effect=AssertionError(
+                        "warm verification must not reread the manifest"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    side_effect=AssertionError(
+                        "warm verification must not reopen SQLite"
+                    ),
+                ),
+            ):
+                second = (
+                    regulation_tools._verified_hierarchical_runtime_paths(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                    )
+                )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+
+    def test_search_scope_token_uses_three_fresh_identities_before_final_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            paths = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            self.assertIsNotNone(paths)
+            token = regulation_tools._verified_hierarchical_runtime_token(
+                paths,
+            )
+            self.assertIsNotNone(token)
+            original_path_signature = (
+                regulation_tools.routes_rag.path_signature
+            )
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    wraps=original_path_signature,
+                ) as path_signature,
+                patch.object(
+                    regulation_tools._VerifiedHierarchicalRuntimeToken,
+                    "is_current",
+                    side_effect=AssertionError(
+                        "the search-only warm helper defers the final token check"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    side_effect=AssertionError(
+                        "matching warm identities must not rerun path verification"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token",
+                    side_effect=AssertionError(
+                        "matching warm identities must reuse the cached token"
+                    ),
+                ),
+            ):
+                reused = (
+                    regulation_tools._verified_hierarchical_runtime_token_for_scope(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                    )
+                )
+
+        self.assertIs(token, reused)
+        self.assertEqual(3, path_signature.call_count)
+
+    def test_verified_hierarchy_rejects_replaced_manifest_from_warm_token(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path, _, _ = _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            first = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"]["hierarchical_index_sha256"] = "f" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            replaced = (
+                regulation_tools._verified_hierarchical_runtime_paths(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+            )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(replaced)
+
+    def test_verified_hierarchy_warm_token_is_scope_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            first = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            vector_path = routes_rag._local_vector_path(settings, auth)
+
+            wrong_profile = (
+                regulation_tools._verified_hierarchical_runtime_paths(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-b",
+                )
+            )
+            with patch.object(
+                regulation_tools.routes_rag,
+                "local_vector_path",
+                return_value=vector_path,
+            ):
+                wrong_tenant = (
+                    regulation_tools._verified_hierarchical_runtime_paths(
+                        settings=settings,
+                        auth=mcp_auth_context(tenant_id="tenant-b"),
+                        profile_id="profile-a",
+                    )
+                )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(wrong_profile)
+        self.assertIsNone(wrong_tenant)
+
+    def test_hierarchy_bm25_warm_token_reuses_manifest_and_summary_payload(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            first = regulation_tools._verified_hierarchical_runtime_bm25(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+
+            with (
+                patch.object(
+                    Path,
+                    "read_text",
+                    side_effect=AssertionError(
+                        "warm BM25 verification must not reread the manifest"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    side_effect=AssertionError(
+                        "warm BM25 verification must reuse the corpus binding"
+                    ),
+                ),
+            ):
+                second = (
+                    regulation_tools._verified_hierarchical_runtime_bm25(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                    )
+                )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(first[1:], second[1:])
+
+    def test_hierarchy_bm25_reuses_injected_paths_and_checks_token_pre_post(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            paths = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            self.assertIsNotNone(paths)
+            token = regulation_tools._verified_hierarchical_runtime_token(
+                paths,
+            )
+            self.assertIsNotNone(token)
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    side_effect=AssertionError(
+                        "injected verified paths must be reused"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token",
+                    side_effect=AssertionError(
+                        "the injected verified token must be reused"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools._VerifiedHierarchicalRuntimeToken,
+                    "is_current",
+                    side_effect=[True, True],
+                ) as token_is_current,
+            ):
+                verified = regulation_tools._verified_hierarchical_runtime_bm25(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    hierarchy_paths=paths,
+                    runtime_token=token,
+                )
+
+        self.assertIsNotNone(verified)
+        self.assertEqual(2, token_is_current.call_count)
+
+    def test_hierarchy_bm25_rejects_final_runtime_token_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            paths = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            self.assertIsNotNone(paths)
+            token = regulation_tools._verified_hierarchical_runtime_token(
+                paths,
+            )
+            self.assertIsNotNone(token)
+
+            with patch.object(
+                regulation_tools._VerifiedHierarchicalRuntimeToken,
+                "is_current",
+                side_effect=[True, False],
+            ) as token_is_current:
+                rejected = regulation_tools._verified_hierarchical_runtime_bm25(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                    hierarchy_paths=paths,
+                    runtime_token=token,
+                )
+
+        self.assertIsNone(rejected)
+        self.assertEqual(2, token_is_current.call_count)
+
+    def test_hierarchy_bm25_rejects_injected_scope_and_path_mismatches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            paths = regulation_tools._verified_hierarchical_runtime_paths(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            self.assertIsNotNone(paths)
+            token = regulation_tools._verified_hierarchical_runtime_token(
+                paths,
+            )
+            self.assertIsNotNone(token)
+            mismatches = (
+                (
+                    paths,
+                    replace(token, tenant_id="tenant-b"),
+                ),
+                (
+                    paths,
+                    replace(token, profile_id="profile-b"),
+                ),
+                (
+                    (Path("other-index.sqlite3"), paths[1]),
+                    token,
+                ),
+                (
+                    paths,
+                    replace(
+                        token,
+                        manifest_path=Path("other-manifest.json"),
+                    ),
+                ),
+            )
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    side_effect=AssertionError(
+                        "invalid injected values must fail closed"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token",
+                    side_effect=AssertionError(
+                        "invalid injected values must not select another token"
+                    ),
+                ),
+            ):
+                rejected = [
+                    regulation_tools._verified_hierarchical_runtime_bm25(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                        hierarchy_paths=injected_paths,
+                        runtime_token=injected_token,
+                    )
+                    for injected_paths, injected_token in mismatches
+                ]
+
+        self.assertEqual([None] * len(mismatches), rejected)
+
+    def test_hierarchy_candidate_reranker_requires_manifest_pinned_bm25(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            _, _, bm25_path = _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+
+            accepted = regulation_tools._verified_hierarchical_runtime_bm25(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+            bm25_path.write_text(
+                bm25_path.read_text(encoding="utf-8") + " ",
+                encoding="utf-8",
+            )
+            tampered = regulation_tools._verified_hierarchical_runtime_bm25(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+
+        self.assertIsNotNone(accepted)
+        self.assertIsNone(tampered)
+
+    def test_hierarchy_candidate_reranker_rejects_same_count_stale_source_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path, _, bm25_path = _write_bound_hierarchy_bm25_fixture(
+                settings,
+                profile_id="profile-a",
+            )
+            bm25_payload = json.loads(bm25_path.read_text(encoding="utf-8"))
+            bm25_payload["source_content_hashes"] = "f" * 64
+            bm25_path.write_text(
+                json.dumps(bm25_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            relative_path = bm25_path.relative_to(settings.data_dir).as_posix()
+            manifest["runtime_data_reuse"]["file_sha256"][relative_path] = (
+                hashlib.sha256(bm25_path.read_bytes()).hexdigest()
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            rejected = regulation_tools._verified_hierarchical_runtime_bm25(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+
+        self.assertIsNone(rejected)
+
+    def test_hierarchy_candidate_reranker_rejects_legacy_missing_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path, hierarchy_path, _ = (
+                _write_bound_hierarchy_bm25_fixture(
+                    settings,
+                    profile_id="profile-a",
+                )
+            )
+            connection = sqlite3.connect(hierarchy_path)
+            try:
+                connection.execute(
+                    "DELETE FROM index_metadata WHERE key='source_content_hashes'"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"]["hierarchical_index_sha256"] = hashlib.sha256(
+                hierarchy_path.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            rejected = regulation_tools._verified_hierarchical_runtime_bm25(
+                settings=settings,
+                auth=auth,
+                profile_id="profile-a",
+            )
+
+        self.assertIsNone(rejected)
+
+    def test_hierarchy_candidate_reranker_rejects_scope_or_count_mismatch(self) -> None:
+        settings = Settings(data_dir=Path("synthetic-data"))
+        auth = mcp_auth_context(tenant_id="tenant-a")
+        manifest = {
+            "report_type": "mcp_runtime_data_bundle",
+            "tenant_id": "tenant-a",
+            "profile_id": "profile-a",
+            "record_count": 2,
+            "runtime_data_reuse": {
+                "file_sha256": {
+                    "vector_db/tenant-a/bm25_index.json": "a" * 64,
+                }
+            },
+        }
+        index = Bm25Index(
+            index_version=BM25_INDEX_VERSION,
+            structured_metadata_version=BM25_STRUCTURED_METADATA_VERSION,
+            generated_at="2026-07-30T00:00:00+00:00",
+            tokenizer=FALLBACK_TOKENIZER_MODEL,
+            k1=1.5,
+            b=0.75,
+            source_content_hashes="b" * 64,
+            document_count=1,
+            average_document_length=1.0,
+            document_frequencies={"policy": 1},
+            documents=[],
+        )
+        with (
+            patch.object(
+                Path,
+                "read_text",
+                return_value=json.dumps(manifest),
+            ),
+            patch.object(
+                regulation_tools.routes_rag,
+                "bm25_index_path",
+                return_value=(
+                    settings.data_dir
+                    / "vector_db"
+                    / "tenant-a"
+                    / "bm25_index.json"
+                ),
+            ),
+            patch.object(
+                regulation_tools.routes_rag,
+                "path_signature",
+                return_value=("stable",),
+            ),
+            patch.object(
+                regulation_tools,
+                "_file_sha256",
+                return_value="a" * 64,
+            ),
+            patch.object(
+                regulation_tools.routes_rag,
+                "load_cached_bm25_index",
+                return_value=index,
+            ),
+        ):
+            wrong_profile = (
+                regulation_tools._verified_hierarchical_runtime_bm25(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-b",
+                )
+            )
+            wrong_count = (
+                regulation_tools._verified_hierarchical_runtime_bm25(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+            )
+
+        self.assertIsNone(wrong_profile)
+        self.assertIsNone(wrong_count)
+
     def test_mcp_citation_uses_governing_article_for_form_chunk_without_rewriting_chunk_identity(self) -> None:
         form_result = {
             "document_id": "doc-forms",
@@ -821,9 +3717,9 @@ class RegulationMcpToolsTests(unittest.TestCase):
             )
 
             with patch.object(
-                routes_rag,
-                "_record_visible_to_request",
-                wraps=routes_rag._record_visible_to_request,
+                regulation_tools.routes_rag,
+                "record_visible_to_request",
+                wraps=regulation_tools.routes_rag.record_visible_to_request,
             ) as visible_check:
                 fetched = fetch_regulation(
                     settings=settings,
@@ -834,6 +3730,271 @@ class RegulationMcpToolsTests(unittest.TestCase):
 
         self.assertEqual(fetched["metadata"]["chunk_id"], "approved-1")
         self.assertEqual(visible_check.call_count, 1)
+
+    def test_fetch_limits_governing_enrichment_to_article_candidates(
+        self,
+    ) -> None:
+        record = {
+            "document_id": "doc-a",
+            "chunk_id": "form-a",
+            "text": "별지 제1호서식",
+            "content_hash": "hash-a",
+            "metadata": {
+                "document_id": "doc-a",
+                "chunk_id": "form-a",
+                "approval_status": "approved",
+                "approval_id": "approval-a",
+                "approved_content_hash": "approved-hash-a",
+                "security_level": "internal",
+                "profile_id": "profile-a",
+                "form_refs": ["별지제1호서식"],
+            },
+        }
+        result_id = search_regulations.__globals__["_encode_result_id"](
+            document_id="doc-a",
+            chunk_id="form-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(
+                Settings(data_dir=Path(tmp) / "data"),
+                api_audit_enabled=False,
+            )
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_visible_record_by_chunk",
+                    return_value=record,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_visible_records",
+                    return_value=[],
+                ) as visible_records,
+            ):
+                fetched = fetch_regulation(
+                    settings=settings,
+                    auth=auth,
+                    result_id=result_id,
+                    security_levels=["internal"],
+                )
+
+        self.assertEqual("form-a", fetched["metadata"]["chunk_id"])
+        self.assertTrue(
+            visible_records.call_args.kwargs["article_candidates_only"]
+        )
+
+    def test_fetch_governing_enrichment_fails_closed_on_approval_revocation_during_fast_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(
+                Settings(data_dir=Path(tmp) / "data"),
+                api_audit_enabled=False,
+            )
+            auth = mcp_auth_context(
+                tenant_id="tenant-a",
+                role="operator",
+                department_ids=["hr"],
+            )
+            target_record = {
+                "document_id": "doc_governing",
+                "chunk_id": "form-15",
+                "text": "[별지제15호서식] 휴직원",
+                "content_hash": "hash-form",
+                "metadata": {
+                    "document_id": "doc_governing",
+                    "chunk_id": "form-15",
+                    "approval_status": "approved",
+                    "approval_id": "approval-governing",
+                    "approved_content_hash": "approved-form",
+                    "security_level": "internal",
+                    "department_acl": [],
+                    "profile_id": "profile-a",
+                    "article_no": "",
+                    "article_title": "",
+                    "form_refs": ["별지제15호서식"],
+                    "regulation_title": "휴직 규정",
+                },
+            }
+            article_record = {
+                "document_id": "doc_governing",
+                "chunk_id": "article-31",
+                "text": "제31조 휴직의 운영은 별지제15호서식에 따른다.",
+                "content_hash": "hash-article",
+                "metadata": {
+                    "document_id": "doc_governing",
+                    "chunk_id": "article-31",
+                    "approval_status": "approved",
+                    "approval_id": "approval-governing",
+                    "approved_content_hash": "approved-article",
+                    "security_level": "internal",
+                    "department_acl": [],
+                    "profile_id": "profile-a",
+                    "article_no": "제31조",
+                    "article_title": "휴직의 운영",
+                    "form_refs": ["별지제15호서식"],
+                    "regulation_title": "휴직 규정",
+                },
+            }
+            approval_snapshot = {
+                ("doc_governing", "form-15"): {
+                    "approval_id": "approval-governing",
+                    "approved_content_hash": "approved-form",
+                    "content_hash": "hash-form",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                },
+                ("doc_governing", "article-31"): {
+                    "approval_id": "approval-governing",
+                    "approved_content_hash": "approved-article",
+                    "content_hash": "hash-article",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                },
+            }
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_resolve_mcp_profile_scope",
+                    return_value="profile-a",
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(Path("hierarchy.sqlite"), Path("vectors.jsonl")),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    side_effect=lambda path: ("sig", str(path)),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_load_cached_hierarchical_record_by_chunk",
+                    return_value=target_record,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "load_hierarchical_document_article_records",
+                    return_value=[article_record],
+                ) as related_loader,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    side_effect=[("approval-source-before",), ("approval-source-after",)],
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=approval_snapshot,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "repository_cache",
+                    return_value=object(),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "is_record_visible",
+                    return_value=True,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "filter_to_latest_active_versions",
+                    side_effect=lambda records, **_kwargs: list(records),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_visible_record_by_chunk",
+                    return_value=None,
+                ) as fallback_lookup,
+                patch.object(
+                    regulation_tools,
+                    "_visible_records",
+                    side_effect=AssertionError(
+                        "no related records should be returned after TOCTOU fail-closed"
+                    ),
+                ),
+            ):
+                record, related_records = (
+                    regulation_tools._visible_record_with_related_by_chunk(
+                        settings=settings,
+                        auth=auth,
+                        document_id="doc_governing",
+                        chunk_id="form-15",
+                        security_levels=["internal"],
+                        department_ids=["hr"],
+                        profile_id="profile-a",
+                        as_of_date="2026-07-01",
+                    )
+                )
+
+        self.assertEqual(1, related_loader.call_count)
+        self.assertIsNone(record)
+        self.assertEqual([], related_records)
+        self.assertEqual(1, fallback_lookup.call_count)
+
+    def test_fetch_governing_enrichment_fast_path_matches_fallback_semantics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, auth, result_id = _prepare_mcp_governing_article_document(root)
+
+            fast = fetch_regulation(
+                settings=settings,
+                auth=auth,
+                result_id=result_id,
+                security_levels=["internal"],
+                department_ids=["hr"],
+                profile_id="profile-a",
+                as_of_date="2026-07-01",
+            )
+            with patch.object(
+                regulation_tools.routes_rag,
+                "runtime_approval_snapshot_identity",
+                return_value=None,
+            ):
+                fallback = fetch_regulation(
+                    settings=settings,
+                    auth=auth,
+                    result_id=result_id,
+                    security_levels=["internal"],
+                    department_ids=["hr"],
+                    profile_id="profile-a",
+                    as_of_date="2026-07-01",
+                )
+
+        self.assertEqual(fast["id"], fallback["id"])
+        self.assertEqual(fast["title"], fallback["title"])
+        self.assertEqual(fast["text"], fallback["text"])
+        self.assertEqual(fast["metadata"]["chunk_id"], "form-15")
+        self.assertEqual("article-31", fast["metadata"]["governing_article_chunk_id"])
+        self.assertEqual("제31조", fast["metadata"]["governing_article_no"])
+        self.assertEqual("휴직의 운영", fast["metadata"]["governing_article_title"])
+        self.assertEqual("별지제15호서식", fast["metadata"]["governing_article_match_ref"])
+        self.assertEqual(
+            fast["metadata"]["governing_article_chunk_id"],
+            fallback["metadata"]["governing_article_chunk_id"],
+        )
+        self.assertEqual(
+            fast["metadata"]["governing_article_no"],
+            fallback["metadata"]["governing_article_no"],
+        )
+        self.assertEqual(
+            fast["metadata"]["governing_article_title"],
+            fallback["metadata"]["governing_article_title"],
+        )
+        self.assertEqual(
+            fast["metadata"]["governing_article_match_ref"],
+            fallback["metadata"]["governing_article_match_ref"],
+        )
+        self.assertEqual(
+            fast["metadata"]["form_refs"],
+            fallback["metadata"]["form_refs"],
+        )
 
     def test_fetch_reuses_chunk_index_for_repeated_result_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -870,6 +4031,71 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertEqual(first["metadata"]["chunk_id"], "approved-1")
         self.assertEqual(second["metadata"]["chunk_id"], "approved-1")
         self.assertEqual(0, load_records.call_count)
+
+    def test_hierarchical_fetch_record_cache_tracks_runtime_file_signatures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            index_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            vector_path = (
+                settings.data_dir
+                / "vector_db"
+                / "tenant-a"
+                / "approved_vectors.jsonl"
+            )
+            record = {
+                "document_id": "doc-a",
+                "chunk_id": "chunk-a",
+                "content_hash": "hash-a",
+            }
+            signature_generation = {"value": 1}
+
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(index_path, vector_path),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    side_effect=lambda path: (
+                        signature_generation["value"],
+                        str(path),
+                    ),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "load_hierarchical_record_by_chunk",
+                    return_value=record,
+                ) as load_record,
+            ):
+                first = regulation_tools._indexed_vector_record_by_chunk(
+                    settings=settings,
+                    auth=auth,
+                    document_id="doc-a",
+                    chunk_id="chunk-a",
+                )
+                cached = regulation_tools._indexed_vector_record_by_chunk(
+                    settings=settings,
+                    auth=auth,
+                    document_id="doc-a",
+                    chunk_id="chunk-a",
+                )
+                signature_generation["value"] = 2
+                changed = regulation_tools._indexed_vector_record_by_chunk(
+                    settings=settings,
+                    auth=auth,
+                    document_id="doc-a",
+                    chunk_id="chunk-a",
+                )
+
+        self.assertEqual(record, first)
+        self.assertEqual(record, cached)
+        self.assertEqual(record, changed)
+        self.assertEqual(2, load_record.call_count)
 
     def test_fetch_finds_requested_vector_record_without_full_vector_load(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1561,6 +4787,27 @@ class RegulationMcpToolsTests(unittest.TestCase):
             with (
                 patch.object(regulation_tools, "_verified_hierarchical_runtime_paths", return_value=(hierarchy_path, None)),
                 patch.object(regulation_tools, "hierarchical_index_summary", return_value={"record_count": 3}),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value={
+                        ("doc-a", "chunk-a"): {
+                            "approval_id": "approval-a"
+                        }
+                    },
+                ) as load_snapshot,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_local_vector_records",
+                    side_effect=AssertionError(
+                        "hierarchy warmup must not load the full vector"
+                    ),
+                ),
                 patch.object(regulation_tools.routes_rag, "bm25_index_path", return_value=bm25_path),
                 patch.object(regulation_tools.routes_rag, "path_signature", return_value=None),
             ):
@@ -1571,6 +4818,519 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertTrue(status["retrieval_index_ready"])
         self.assertEqual("hierarchical_sqlite", status["retrieval_index_mode"])
         self.assertFalse(status["bm25_index_ready"])
+        self.assertTrue(status["approval_snapshot_ready"])
+        self.assertEqual(1, status["approval_snapshot_document_count"])
+        self.assertEqual(1, status["approval_snapshot_entry_count"])
+        load_snapshot.assert_called_once()
+
+    def test_warm_mcp_runtime_primes_verified_candidate_reranker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            bm25_path = settings.data_dir / "vector_db" / "tenant-a" / "bm25.json"
+            verified_runtime = (
+                SimpleNamespace(document_count=3),
+                bm25_path,
+                ("bm25-signature",),
+            )
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(hierarchy_path, Path("vector.jsonl")),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value={
+                        "record_count": 3,
+                        "profile_id": "profile-a",
+                    },
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value={
+                        ("doc-a", "chunk-a"): {
+                            "approval_id": "approval-a"
+                        }
+                    },
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_bm25",
+                    return_value=verified_runtime,
+                ) as verify_bm25,
+            ):
+                status = warm_mcp_runtime(settings=settings, auth=auth)
+
+        self.assertTrue(status["bm25_index_ready"])
+        self.assertTrue(status["candidate_reranker_ready"])
+        self.assertEqual(
+            "verified_bm25_fast_query",
+            status["candidate_reranker_mode"],
+        )
+        verify_bm25.assert_called_once_with(
+            settings=settings,
+            auth=auth,
+            profile_id="profile-a",
+        )
+
+    def test_warm_mcp_runtime_primes_search_and_fetch_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            vector_path = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(hierarchy_path, vector_path),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value={
+                        "record_count": 3,
+                        "profile_id": "profile-a",
+                    },
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value={("doc-a", "chunk-a"): {"approval_id": "approval-a"}},
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_bm25",
+                    return_value=("bm25-index", Path("bm25.json"), ("bm25-signature",)),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "local_vector_signature",
+                    return_value=("vector-signature", 123, 456),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    side_effect=lambda path: ("sig", str(path)),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "list_indexed_regulations",
+                    return_value=[{"regulation_title": "직원 채용 세칙", "regulation_no": ""}],
+                ),
+                patch.object(
+                    regulation_tools,
+                    "search_regulations",
+                    return_value={"results": [{"id": "result-1"}]},
+                ) as search_mock,
+                patch.object(
+                    regulation_tools,
+                    "fetch_regulation",
+                    return_value={"id": "result-1"},
+                ) as fetch_mock,
+            ):
+                status = warm_mcp_runtime(settings=settings, auth=auth)
+
+        self.assertTrue(status["search_probe_ready"])
+        self.assertTrue(status["fetch_probe_ready"])
+        self.assertIn("probe_query_select_elapsed_ms", status["timing_ms"])
+        self.assertIn("search_probe_elapsed_ms", status["timing_ms"])
+        self.assertIn("fetch_probe_elapsed_ms", status["timing_ms"])
+        self.assertEqual("profile-a", search_mock.call_args.kwargs["profile_id"])
+        self.assertEqual(["internal"], search_mock.call_args.kwargs["security_levels"])
+        self.assertFalse(search_mock.call_args.kwargs["settings"].api_audit_enabled)
+        self.assertFalse(search_mock.call_args.kwargs["settings"].rag_trace_enabled)
+        self.assertEqual("result-1", fetch_mock.call_args.kwargs["result_id"])
+        self.assertFalse(fetch_mock.call_args.kwargs["settings"].api_audit_enabled)
+        self.assertFalse(fetch_mock.call_args.kwargs["settings"].rag_trace_enabled)
+
+    def test_hierarchy_warmup_probe_failure_is_nonfatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(hierarchy_path, Path("vector.jsonl")),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value={
+                        "record_count": 3,
+                        "profile_id": "profile-a",
+                    },
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value={("doc-a", "chunk-a"): {"approval_id": "approval-a"}},
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_bm25",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "local_vector_signature",
+                    return_value=("vector-signature", 123, 456),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("hierarchy-signature",),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "list_indexed_regulations",
+                    return_value=[{"regulation_title": "직원 채용 세칙"}],
+                ),
+                patch.object(
+                    regulation_tools,
+                    "search_regulations",
+                    side_effect=RuntimeError("probe failure"),
+                ),
+            ):
+                status = warm_mcp_runtime(settings=settings, auth=auth)
+
+        self.assertTrue(status["warmed"])
+        self.assertFalse(status["search_probe_ready"])
+        self.assertFalse(status["fetch_probe_ready"])
+
+    def test_visible_records_uses_hierarchical_document_fast_path_for_document_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            vector_path = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            record = {
+                "document_id": "doc-a",
+                "chunk_id": "chunk-a",
+                "text": "approved text",
+                "content_hash": "hash-a",
+                "metadata": {
+                    "document_id": "doc-a",
+                    "chunk_id": "chunk-a",
+                    "approval_status": "approved",
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "security_level": "internal",
+                    "department_acl": [],
+                    "profile_id": "profile-a",
+                },
+            }
+            snapshot = {
+                ("doc-a", "chunk-a"): {
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "content_hash": "hash-a",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                }
+            }
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_profile_id",
+                    return_value="profile-a",
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(hierarchy_path, vector_path),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "load_hierarchical_document_records",
+                    return_value=[record],
+                ) as load_document_records,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=("stable-signature",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-source",),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "get_visible_records",
+                    side_effect=AssertionError("document-scoped hierarchy fetch must not scan all visible records"),
+                ),
+            ):
+                result = regulation_tools._visible_records(
+                    settings=settings,
+                    auth=auth,
+                    document_id="doc-a",
+                    security_levels=["internal"],
+                )
+
+        self.assertEqual([record], result)
+        self.assertEqual("doc-a", load_document_records.call_args.kwargs["document_id"])
+
+    def test_visible_records_reuses_hierarchical_document_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            vector_path = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            record = {
+                "document_id": "doc-a",
+                "chunk_id": "chunk-a",
+                "text": "approved text",
+                "content_hash": "hash-a",
+                "metadata": {
+                    "document_id": "doc-a",
+                    "chunk_id": "chunk-a",
+                    "approval_status": "approved",
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "security_level": "internal",
+                    "department_acl": [],
+                    "profile_id": "profile-a",
+                },
+            }
+            snapshot = {
+                ("doc-a", "chunk-a"): {
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "content_hash": "hash-a",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                }
+            }
+            regulation_tools._VISIBLE_DOCUMENT_RECORD_CACHE.clear()
+            try:
+                with (
+                    patch.object(
+                        regulation_tools,
+                        "_verified_hierarchical_runtime_profile_id",
+                        return_value="profile-a",
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        "_verified_hierarchical_runtime_paths",
+                        return_value=(hierarchy_path, vector_path),
+                    ),
+                    patch.object(
+                        regulation_tools.routes_rag,
+                        "path_signature",
+                        side_effect=lambda path: ("sig", str(path)),
+                    ),
+                    patch.object(
+                        regulation_tools.routes_rag,
+                        "runtime_approval_snapshot_identity",
+                        return_value=("approval-source",),
+                    ),
+                    patch.object(
+                        regulation_tools.routes_rag,
+                        "load_cached_runtime_approval_snapshot",
+                        return_value=snapshot,
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        "load_hierarchical_document_records",
+                        return_value=[record],
+                    ) as load_document_records,
+                ):
+                    first = regulation_tools._visible_records(
+                        settings=settings,
+                        auth=auth,
+                        document_id="doc-a",
+                        security_levels=["internal"],
+                    )
+                    second = regulation_tools._visible_records(
+                        settings=settings,
+                        auth=auth,
+                        document_id="doc-a",
+                        security_levels=["internal"],
+                    )
+            finally:
+                regulation_tools._VISIBLE_DOCUMENT_RECORD_CACHE.clear()
+
+        self.assertEqual([record], first)
+        self.assertEqual([record], second)
+        self.assertEqual(1, load_document_records.call_count)
+
+    def test_visible_records_rechecks_approval_after_runtime_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            vector_path = (
+                settings.data_dir
+                / "vector_db"
+                / "tenant-a"
+                / "approved_vectors.jsonl"
+            )
+            record = {
+                "document_id": "doc-a",
+                "chunk_id": "chunk-a",
+                "text": "approved text",
+                "content_hash": "hash-a",
+                "metadata": {
+                    "document_id": "doc-a",
+                    "chunk_id": "chunk-a",
+                    "approval_status": "approved",
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "security_level": "internal",
+                    "department_acl": [],
+                    "profile_id": "profile-a",
+                },
+            }
+            approved_snapshot = {
+                ("doc-a", "chunk-a"): {
+                    "approval_id": "approval-a",
+                    "approved_content_hash": "approved-hash-a",
+                    "content_hash": "hash-a",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                }
+            }
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_profile_id",
+                    return_value="profile-a",
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(hierarchy_path, vector_path),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    side_effect=lambda path: ("sig", str(path)),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    side_effect=[
+                        ("approval-source-before",),
+                        ("approval-source-before",),
+                        ("approval-source-after",),
+                        ("approval-source-after",),
+                    ],
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    side_effect=[approved_snapshot, {}],
+                ),
+                patch.object(
+                    regulation_tools,
+                    "load_hierarchical_document_records",
+                    return_value=[record],
+                ) as load_document_records,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "get_visible_records",
+                    side_effect=AssertionError(
+                        "a verified revoked snapshot must fail closed in the fast path"
+                    ),
+                ),
+            ):
+                before_revocation = regulation_tools._visible_records(
+                    settings=settings,
+                    auth=auth,
+                    document_id="doc-a",
+                    security_levels=["internal"],
+                )
+                after_revocation = regulation_tools._visible_records(
+                    settings=settings,
+                    auth=auth,
+                    document_id="doc-a",
+                    security_levels=["internal"],
+                )
+
+        self.assertEqual([record], before_revocation)
+        self.assertEqual([], after_revocation)
+        self.assertEqual(2, load_document_records.call_count)
+
+    def test_hierarchy_warmup_reports_stale_approval_sidecar_without_vector_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_paths",
+                    return_value=(hierarchy_path, Path("vector.jsonl")),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "hierarchical_index_summary",
+                    return_value={
+                        "record_count": 3,
+                        "profile_id": "profile-a",
+                    },
+                ),
+                patch.object(
+                    regulation_tools,
+                    "indexed_document_ids",
+                    return_value={"doc-a"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_local_vector_records",
+                    side_effect=AssertionError(
+                        "stale sidecar warmup must not scan the vector"
+                    ),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "bm25_index_path",
+                    return_value=Path("bm25.json"),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    return_value=None,
+                ),
+            ):
+                status = warm_mcp_runtime(settings=settings, auth=auth)
+
+        self.assertTrue(status["warmed"])
+        self.assertFalse(status["approval_snapshot_ready"])
+        self.assertEqual(1, status["approval_snapshot_document_count"])
+        self.assertEqual(0, status["approval_snapshot_entry_count"])
 
     def test_get_index_status_reports_mcp_visible_vector_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2683,6 +6443,91 @@ class RegulationMcpToolsTests(unittest.TestCase):
         self.assertIn("article opening new", comparison["changed"][0]["target"]["text_preview"])
 
 
+def _write_bound_hierarchy_bm25_fixture(
+    settings: Settings,
+    *,
+    profile_id: str,
+) -> tuple[Path, Path, Path]:
+    auth = mcp_auth_context(tenant_id="tenant-a")
+    metadata = {
+        "document_id": "doc-binding",
+        "chunk_id": "chunk-binding",
+        "tenant_id": "tenant-a",
+        "profile_id": profile_id,
+        "institution_name": "Test Institution",
+        "document_name": "Binding Regulation",
+        "regulation_no": "1-1",
+        "regulation_title": "Binding Regulation",
+        "regulation_status": "approved",
+        "regulation_version": "v1",
+        "revision_date": "2026-07-01",
+        "effective_from": "2026-07-01",
+        "chunk_type": "article",
+        "hierarchy_path": "Binding Regulation > Article 1",
+        "article_no": "Article 1",
+        "article_title": "Purpose",
+        "approval_status": "approved",
+        "approval_id": "approval-binding",
+        "approved_content_hash": "approved-binding",
+        "security_level": "internal",
+        "department_acl": [],
+    }
+    text = "approved policy binding evidence"
+    record = {
+        "schema_version": "reg-rag-vector-record-v1",
+        "id": "doc-binding:chunk-binding",
+        "document_id": "doc-binding",
+        "chunk_id": "chunk-binding",
+        "text": text,
+        "metadata": metadata,
+        "content_hash": stable_content_hash(text, metadata),
+    }
+    vector_path = regulation_tools.routes_rag.local_vector_path(settings, auth)
+    offsets = write_vector_records_with_offsets(vector_path, [record])
+    hierarchy_path = hierarchical_index_path(settings.data_dir)
+    hierarchy = build_hierarchical_runtime_index(
+        hierarchy_path,
+        [record],
+        tenant_id="tenant-a",
+        profile_id=profile_id,
+        vector_offsets=offsets,
+    )
+    bm25_path = regulation_tools.routes_rag.bm25_index_path(
+        settings=settings,
+        auth=auth,
+    )
+    bm25_path.parent.mkdir(parents=True, exist_ok=True)
+    bm25_index = Bm25Index.build([record])
+    bm25_path.write_text(
+        json.dumps(bm25_index.to_dict(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    relative_bm25_path = bm25_path.relative_to(settings.data_dir).as_posix()
+    manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "report_type": "mcp_runtime_data_bundle",
+                "tenant_id": "tenant-a",
+                "profile_id": profile_id,
+                "record_count": 1,
+                "files": {
+                    "hierarchical_index_sha256": hierarchy["sha256"],
+                },
+                "runtime_data_reuse": {
+                    "file_sha256": {
+                        relative_bm25_path: hashlib.sha256(
+                            bm25_path.read_bytes()
+                        ).hexdigest(),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path, hierarchy_path, bm25_path
+
+
 def _prepare_mcp_indexed_document(settings: Settings) -> AuthContext:
     repository = JsonRepository(settings)
     repository.upsert_document(
@@ -2918,6 +6763,103 @@ def _approve_and_index_test_chunks(
         )
 
 
+def _prepare_mcp_governing_article_document(
+    root: Path,
+) -> tuple[Settings, AuthContext, str]:
+    settings = Settings(data_dir=root / "data", artifact_root=root)
+    repository = JsonRepository(settings)
+    document_id = "doc_governing"
+    repository.upsert_document(
+        Document(
+            document_id=document_id,
+            filename="governing.pdf",
+            document_name="Governing Regulation",
+            file_type="pdf",
+            file_hash="governing-hash",
+            tenant_id="tenant-a",
+            profile_id="profile-a",
+            regulation_id="reg-governing",
+            regulation_version="v1",
+            regulation_status="approved",
+            effective_from="2026-01-01",
+            status="completed",
+        )
+    )
+    chunks = [
+        Chunk(
+            chunk_id="article-31",
+            document_id=document_id,
+            chunk_type="article",
+            text="제31조 휴직의 운영은 별지제15호서식에 따른다.",
+            retrieval_text="제31조 휴직의 운영은 별지제15호서식에 따른다.",
+            metadata={
+                "article_no": "제31조",
+                "article_title": "휴직의 운영",
+                "form_refs": ["별지제15호서식"],
+                "regulation_title": "휴직 규정",
+                "profile_id": "profile-a",
+                "regulation_id": "reg-governing",
+                "regulation_version": "v1",
+                "regulation_status": "approved",
+                "effective_from": "2026-01-01",
+            },
+            security_level="internal",
+        ),
+        Chunk(
+            chunk_id="form-15",
+            document_id=document_id,
+            chunk_type="form",
+            text="[별지제15호서식] 휴직원",
+            retrieval_text="[별지제15호서식] 휴직원",
+            metadata={
+                "article_no": "",
+                "article_title": "",
+                "form_refs": ["별지제15호서식"],
+                "regulation_title": "휴직 규정",
+                "profile_id": "profile-a",
+                "regulation_id": "reg-governing",
+                "regulation_version": "v1",
+                "regulation_status": "approved",
+                "effective_from": "2026-01-01",
+            },
+            security_level="internal",
+        ),
+    ]
+    repository.save_processing_result(document_id, [], chunks, [])
+    admin_auth = AuthContext(
+        actor="reviewer",
+        tenant_id="tenant-a",
+        auth_mode="api_token",
+        role="admin",
+        department_ids=["hr"],
+    )
+    _approve_and_index_test_chunks(
+        root,
+        settings=settings,
+        repository=repository,
+        document_id=document_id,
+        chunks=chunks,
+        auth=admin_auth,
+        approval_id="approval-governing",
+    )
+    fetch_auth = mcp_auth_context(
+        tenant_id="tenant-a",
+        role="operator",
+        department_ids=["hr"],
+    )
+    records = routes_rag._load_local_vector_records(settings, fetch_auth)
+    _write_runtime_approval_snapshot_sidecar(
+        settings.data_dir,
+        records,
+        tenant_id="tenant-a",
+    )
+    result_id = search_regulations.__globals__["_encode_result_id"](
+        document_id=document_id,
+        chunk_id="form-15",
+    )
+    return settings, fetch_auth, result_id
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     digest.update(path.read_bytes())
@@ -3029,8 +6971,10 @@ def _write_runtime_approval_snapshot_sidecar(data_dir: Path, records: list[dict]
         json.dumps(
             {
                 "report_type": "mcp_runtime_approval_snapshot",
+                "schema_version": "mcp-runtime-approval-snapshot-v1",
                 "tenant_id": tenant_id,
                 "document_ids": document_ids,
+                "record_count": len(entries),
                 "snapshot_count": len(entries),
                 "file_signatures": {
                     key: (list(value) if value is not None else None)
@@ -3041,6 +6985,20 @@ def _write_runtime_approval_snapshot_sidecar(data_dir: Path, records: list[dict]
             ensure_ascii=False,
         )
         + "\n",
+        encoding="utf-8",
+    )
+    sidecar_path = repository_dir / "approval_snapshot.json"
+    manifest_path = data_dir / "mcp_runtime_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["runtime_data_reuse"] = {
+        "file_sha256": {
+            "repository/approval_snapshot.json": hashlib.sha256(
+                sidecar_path.read_bytes()
+            ).hexdigest()
+        }
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 

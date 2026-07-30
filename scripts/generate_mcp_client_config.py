@@ -8,6 +8,7 @@ import ctypes
 from datetime import date, datetime, timezone
 import errno
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -45,6 +46,7 @@ from app.retrieval.bm25_index import (
     BM25_INDEX_VERSION,
     BM25_STRUCTURED_METADATA_VERSION,
     load_bm25_index,
+    source_content_hashes,
     write_bm25_index,
 )
 from app.retrieval.hierarchical_index import (
@@ -54,6 +56,7 @@ from app.retrieval.hierarchical_index import (
     canonicalize_runtime_records,
     hierarchical_index_path,
     index_summary as hierarchical_index_summary,
+    logical_corpus_sha256_for_records,
     write_vector_records_with_offsets,
 )
 from app.retrieval.tokenizer import tokenizer_name
@@ -2154,7 +2157,11 @@ def _runtime_data_builder_implementation_sha256() -> str:
     }
     for module_name in sorted(module_names):
         module = sys.modules.get(module_name)
-        source_path_value = getattr(module, "__file__", None) if module is not None else None
+        source_path_value = (
+            getattr(module, "__file__", None)
+            if module is not None
+            else getattr(importlib.util.find_spec(module_name), "origin", None)
+        )
         source_path = Path(source_path_value) if source_path_value else None
         source_sha256[module_name] = (
             _sha256_file_content(source_path)
@@ -2521,6 +2528,22 @@ def _write_mcp_runtime_data_bundle_uncommitted(
             total,
         ),
     )
+    expected_source_content_hashes = source_content_hashes(records)
+    expected_logical_corpus_sha256 = logical_corpus_sha256_for_records(
+        records,
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+    )
+    if (
+        bm25_index.source_content_hashes != expected_source_content_hashes
+        or hierarchy_summary.get("source_content_hashes")
+        != expected_source_content_hashes
+        or hierarchy_summary.get("logical_corpus_sha256")
+        != expected_logical_corpus_sha256
+    ):
+        raise RuntimeError(
+            "Generated runtime indexes are not bound to the same approved corpus."
+        )
 
     manifest = copy.deepcopy(prepared["repository_manifest"])
     total_chunks = int(prepared["total_chunks"])
@@ -2865,10 +2888,12 @@ def _validate_reusable_runtime_data_bundle(
         raise ValueError("Reusable approval snapshot source signatures are stale.")
 
     bm25_index = load_bm25_index(vector_dir / "bm25_index.json")
+    expected_source_content_hashes = source_content_hashes(prepared["records"])
     if (
         bm25_index is None
         or bm25_index.tokenizer != tokenizer_name()
         or bm25_index.is_stale_for(prepared["records"])
+        or bm25_index.source_content_hashes != expected_source_content_hashes
     ):
         raise ValueError("Reusable BM25 index is missing, incompatible, or stale.")
     if bm25_index.document_count != len(bm25_index.documents):
@@ -2910,14 +2935,71 @@ def _validate_reusable_runtime_data_bundle(
     manifest_hierarchy = manifest.get("hierarchical_index")
     if not isinstance(manifest_hierarchy, dict):
         raise ValueError("Reusable hierarchy manifest summary is missing.")
-    logical_corpus_sha256 = str(manifest.get("logical_corpus_sha256") or "").strip().lower()
-    if not re.fullmatch(r"[a-f0-9]{64}", logical_corpus_sha256):
-        raise ValueError("Reusable hierarchy logical-corpus fingerprint is missing or invalid.")
+    try:
+        expected_logical_corpus_sha256 = logical_corpus_sha256_for_records(
+            prepared["records"],
+            tenant_id=tenant_id,
+            profile_id=(
+                str(identity["profile_id"]).strip()
+                if identity["profile_id"]
+                else None
+            ),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Reusable hierarchy logical-corpus source projection is invalid."
+        ) from exc
+    manifest_logical_corpus_sha256 = manifest.get("logical_corpus_sha256")
+    if (
+        not isinstance(manifest_logical_corpus_sha256, str)
+        or not re.fullmatch(
+            r"[a-f0-9]{64}",
+            manifest_logical_corpus_sha256,
+        )
+        or manifest_logical_corpus_sha256
+        != expected_logical_corpus_sha256
+    ):
+        raise ValueError(
+            "Reusable hierarchy logical-corpus fingerprint does not match "
+            "the approved source projection."
+        )
+    record_profile_ids: set[str] = set()
+    for record in prepared["records"]:
+        metadata = (
+            record.get("metadata")
+            if isinstance(record.get("metadata"), dict)
+            else {}
+        )
+        scoped_values = {
+            str(value or "").strip()
+            for value in (record.get("profile_id"), metadata.get("profile_id"))
+            if str(value or "").strip()
+        }
+        if len(scoped_values) != 1:
+            raise ValueError(
+                "Reusable hierarchy source records have a missing or conflicting profile scope."
+            )
+        record_profile_ids.update(scoped_values)
+    if len(record_profile_ids) != 1:
+        raise ValueError(
+            "Reusable hierarchy source records do not share one profile scope."
+        )
+    expected_hierarchy_profile_id = next(iter(record_profile_ids))
+    requested_profile_id = str(identity["profile_id"] or "").strip()
+    if (
+        requested_profile_id
+        and expected_hierarchy_profile_id != requested_profile_id
+    ):
+        raise ValueError(
+            "Reusable hierarchy source records do not match the requested profile scope."
+        )
     expected_hierarchy = {
         "schema_version": HIERARCHICAL_INDEX_SCHEMA_VERSION,
         "tenant_id": tenant_id,
-        "profile_id": str(identity["profile_id"] or ""),
+        "profile_id": expected_hierarchy_profile_id,
         "record_count": len(prepared["records"]),
+        "source_content_hashes": expected_source_content_hashes,
+        "logical_corpus_sha256": expected_logical_corpus_sha256,
         "regulation_count": int(manifest.get("regulation_count") or 0),
         "current_regulation_count": int(
             manifest_hierarchy.get("current_regulation_count") or 0
@@ -2954,11 +3036,12 @@ def _validate_reusable_runtime_data_bundle(
     expected_manifest_hierarchy = {
         "schema_version": HIERARCHICAL_INDEX_SCHEMA_VERSION,
         "rebuild_fingerprint_schema_version": REBUILD_FINGERPRINT_SCHEMA_VERSION,
-        "logical_corpus_sha256": logical_corpus_sha256,
+        "logical_corpus_sha256": expected_logical_corpus_sha256,
         **{
             field: expected_hierarchy[field]
             for field in (
                 "record_count",
+                "source_content_hashes",
                 "regulation_count",
                 "current_regulation_count",
                 "regulation_version_count",
@@ -4452,6 +4535,113 @@ def _runtime_hierarchy_index_issue(runtime_data_dir: Path) -> str | None:
             digest.update(block)
     if digest.hexdigest() != expected_hash:
         return "hierarchical index SHA-256 does not match the runtime manifest"
+
+    try:
+        hierarchy = hierarchical_index_summary(index_path)
+    except Exception:
+        return "hierarchical index metadata could not be read"
+    if not isinstance(hierarchy, dict):
+        return "hierarchical index metadata is missing"
+    hierarchy_source_content_hashes = hierarchy.get("source_content_hashes")
+    if (
+        not isinstance(hierarchy_source_content_hashes, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", hierarchy_source_content_hashes)
+    ):
+        return "hierarchical index source-content binding is missing or invalid"
+    manifest_hierarchy = payload.get("hierarchical_index")
+    if (
+        not isinstance(manifest_hierarchy, dict)
+        or manifest_hierarchy.get("source_content_hashes")
+        != hierarchy_source_content_hashes
+    ):
+        return "hierarchical index source-content binding does not match the runtime manifest"
+    hierarchy_logical_corpus_sha256 = hierarchy.get("logical_corpus_sha256")
+    manifest_logical_corpus_sha256 = payload.get("logical_corpus_sha256")
+    nested_logical_corpus_sha256 = manifest_hierarchy.get(
+        "logical_corpus_sha256"
+    )
+    if (
+        not isinstance(hierarchy_logical_corpus_sha256, str)
+        or not re.fullmatch(
+            r"[a-f0-9]{64}",
+            hierarchy_logical_corpus_sha256,
+        )
+    ):
+        return "hierarchical index logical-corpus fingerprint is missing or invalid"
+    if (
+        not isinstance(manifest_logical_corpus_sha256, str)
+        or not re.fullmatch(
+            r"[a-f0-9]{64}",
+            manifest_logical_corpus_sha256,
+        )
+        or not isinstance(nested_logical_corpus_sha256, str)
+        or not re.fullmatch(
+            r"[a-f0-9]{64}",
+            nested_logical_corpus_sha256,
+        )
+        or manifest_logical_corpus_sha256
+        != hierarchy_logical_corpus_sha256
+        or nested_logical_corpus_sha256
+        != hierarchy_logical_corpus_sha256
+    ):
+        return "logical-corpus fingerprints do not match the hierarchical index"
+
+    tenant_id = str(payload.get("tenant_id") or "").strip()
+    if not tenant_id:
+        return "runtime manifest tenant_id is missing"
+    vector_path = (
+        runtime_data_dir
+        / "vector_db"
+        / tenant_storage_key(tenant_id)
+        / "approved_vectors.jsonl"
+    )
+    if not vector_path.is_file():
+        return f"missing {vector_path.relative_to(runtime_data_dir).as_posix()}"
+    try:
+        vector_records = list(_iter_strict_jsonl_for_runtime_reuse(vector_path))
+        projected_source_content_hashes = source_content_hashes(vector_records)
+        projected_logical_corpus_sha256 = logical_corpus_sha256_for_records(
+            vector_records,
+            tenant_id=tenant_id,
+            profile_id=(
+                str(payload["profile_id"]).strip()
+                if payload.get("profile_id")
+                else None
+            ),
+        )
+    except (OSError, ValueError):
+        return "approved vector source projection is invalid"
+    if projected_source_content_hashes != hierarchy_source_content_hashes:
+        return "approved vector source-content binding does not match the hierarchical index"
+    if projected_logical_corpus_sha256 != hierarchy_logical_corpus_sha256:
+        return "approved vector logical-corpus fingerprint does not match the hierarchical index"
+
+    bm25_path = (
+        runtime_data_dir
+        / "vector_db"
+        / tenant_storage_key(tenant_id)
+        / "bm25_index.json"
+    )
+    bm25_declared = bool(
+        payload.get("bm25_index_status")
+        or files.get("bm25_index")
+        or bm25_path.exists()
+    )
+    if bm25_declared:
+        if payload.get("bm25_index_status") != "ready":
+            return "mcp_runtime_manifest.json does not mark the BM25 index ready"
+        bm25_index = load_bm25_index(bm25_path)
+        if bm25_index is None:
+            return f"missing or invalid {bm25_path.relative_to(runtime_data_dir).as_posix()}"
+        if (
+            not re.fullmatch(
+                r"[a-f0-9]{64}",
+                bm25_index.source_content_hashes,
+            )
+            or bm25_index.source_content_hashes
+            != hierarchy_source_content_hashes
+        ):
+            return "BM25 source-content binding does not match the hierarchical index"
     return None
 
 

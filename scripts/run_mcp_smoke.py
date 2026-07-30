@@ -42,6 +42,9 @@ from app.storage.repository import JsonRepository
 from scripts.build_rag_security_evidence import build_rag_security_evidence
 
 
+SYNTHETIC_SMOKE_PROFILE_ID = "synthetic-mcp-smoke-profile"
+
+
 def run_mcp_smoke(
     *,
     data_dir: Path | None = None,
@@ -95,6 +98,7 @@ def _run_smoke_with_data_dir(
     data_dir_mode: str,
     persistent_smoke_data_opt_in: bool,
 ) -> dict[str, Any]:
+    profile_id = str(profile_id or "").strip() or SYNTHETIC_SMOKE_PROFILE_ID
     base_settings = Settings(
         data_dir=data_dir,
         artifact_root=data_dir.parent,

@@ -10,35 +10,25 @@ from fastapi import Depends, Header, HTTPException
 
 from app.core.api_audit import append_api_audit_record, redact_sensitive_paths
 from app.core.config import Settings, get_settings
+from app.core.security_primitives import (
+    API_READ_ROLES,
+    API_ROLE_ADMIN,
+    API_ROLE_OPERATOR,
+    API_ROLES,
+    API_ROLE_VIEWER,
+    API_WRITE_ROLES,
+    ROLE_SECURITY_LEVELS,
+    SECURITY_LEVEL_ORDER,
+    AuthContext,
+)
 
 
-API_ROLE_ADMIN = "admin"
-API_ROLE_OPERATOR = "operator"
-API_ROLE_VIEWER = "viewer"
-API_ROLES = {API_ROLE_ADMIN, API_ROLE_OPERATOR, API_ROLE_VIEWER}
-API_READ_ROLES = frozenset(API_ROLES)
-API_WRITE_ROLES = frozenset({API_ROLE_ADMIN, API_ROLE_OPERATOR})
 MAX_ACTOR_HEADER_CHARS = 200
 MAX_TENANT_HEADER_CHARS = 128
 
 # Security-level clearance policy — the single source of truth shared by every
 # endpoint that returns approved chunk content (RAG search and the documents
 # chunks route).
-SECURITY_LEVEL_ORDER = ("public", "internal", "sensitive", "confidential")
-ROLE_SECURITY_LEVELS = {
-    API_ROLE_ADMIN: frozenset(SECURITY_LEVEL_ORDER),
-    API_ROLE_OPERATOR: frozenset({"public", "internal", "sensitive"}),
-    API_ROLE_VIEWER: frozenset({"public"}),
-}
-
-
-@dataclass(frozen=True)
-class AuthContext:
-    actor: str
-    tenant_id: str
-    auth_mode: str
-    role: str = API_ROLE_ADMIN
-    department_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -25,7 +25,11 @@ from app.mcp_server.regulation_tools import (
 from app.rag.extractive_answer import build_structured_extractive_answer
 from scripts.benchmark_mcp_queries import _stats, load_query_specs
 from scripts.export_mcp_demo_answers import normalize_query_specs, query_spec_fingerprint
-from scripts.report_metadata import current_repo_commit
+from scripts.report_metadata import (
+    capture_mcp_performance_source_state,
+    current_repo_commit,
+    finalize_mcp_performance_source_state,
+)
 
 
 def benchmark_mcp_concurrent_queries(
@@ -47,10 +51,30 @@ def benchmark_mcp_concurrent_queries(
     out_json: Path | None = None,
     out_md: Path | None = None,
 ) -> dict[str, Any]:
+    started_source_state = capture_mcp_performance_source_state(PROJECT_ROOT)
+    for name, value in (
+        ("max_task_total_ms", max_task_total_ms),
+        ("max_batch_elapsed_ms", max_batch_elapsed_ms),
+    ):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(f"{name} must be a finite non-negative number.")
+    if min_warm_records is not None and (
+        isinstance(min_warm_records, bool)
+        or not isinstance(min_warm_records, int)
+        or min_warm_records < 0
+    ):
+        raise ValueError("min_warm_records must be a non-negative integer.")
     settings = settings_for_mcp_project(
         data_dir=data_dir,
         tenant_id=tenant_id,
         tenant_storage_isolation=tenant_storage_isolation,
+        api_audit_enabled=False,
+        rag_trace_enabled=False,
     )
     auth = mcp_auth_context(tenant_id=tenant_id)
     levels = security_levels or ["internal"]
@@ -116,10 +140,16 @@ def benchmark_mcp_concurrent_queries(
         max_task_total_ms=max_task_total_ms,
         max_batch_elapsed_ms=max_batch_elapsed_ms,
     )
+    source_state = finalize_mcp_performance_source_state(
+        started_source_state,
+        PROJECT_ROOT,
+    )
     report = {
         "report_type": "mcp_concurrent_query_benchmark",
+        "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_commit": current_repo_commit(PROJECT_ROOT),
+        "source_state": source_state,
         "data_dir": str(data_dir),
         "tenant_id": tenant_id,
         "profile_id": profile_id,
@@ -133,6 +163,23 @@ def benchmark_mcp_concurrent_queries(
         "min_warm_records": min_warm_records,
         "max_task_total_ms": max_task_total_ms,
         "max_batch_elapsed_ms": max_batch_elapsed_ms,
+        "thresholds": {
+            "min_warm_records": min_warm_records,
+            "max_task_total_ms": max_task_total_ms,
+            "max_batch_elapsed_ms": max_batch_elapsed_ms,
+        },
+        "thresholds_configured": any(
+            value is not None
+            for value in (
+                min_warm_records,
+                max_task_total_ms,
+                max_batch_elapsed_ms,
+            )
+        ),
+        "settings_overrides": {
+            "api_audit_enabled": False,
+            "rag_trace_enabled": False,
+        },
         "warmup": warmup,
         "summary": summary,
         "finding_count": len(findings),
@@ -178,17 +225,37 @@ def _run_query_task(
     results = search.get("results") if isinstance(search.get("results"), list) else []
 
     fetch_started_at = time.perf_counter()
-    fetched = [
-        fetch_regulation(
+    fetched: list[dict[str, Any]] = []
+    fetch_measurements: list[dict[str, Any]] = []
+    for fetch_index, result in enumerate(results, start=1):
+        if not result.get("id"):
+            continue
+        item_started_at = time.perf_counter()
+        fetched_item = fetch_regulation(
             settings=settings,
             auth=auth,
-                result_id=str(result.get("id") or ""),
-                security_levels=security_levels,
-                profile_id=profile_id,
+            result_id=str(result.get("id") or ""),
+            security_levels=security_levels,
+            profile_id=profile_id,
         )
-        for result in results
-        if result.get("id")
-    ]
+        fetched.append(fetched_item)
+        fetched_metadata = (
+            fetched_item.get("metadata")
+            if isinstance(fetched_item.get("metadata"), dict)
+            else {}
+        )
+        fetch_measurements.append(
+            {
+                "fetch_index": fetch_index,
+                "elapsed_ms": _elapsed_ms(item_started_at),
+                "title": str(result.get("title") or ""),
+                "chunk_type": str(fetched_metadata.get("chunk_type") or ""),
+                "governing_article_enriched": bool(
+                    fetched_metadata.get("governing_article_no")
+                    and fetched_metadata.get("governing_article_title")
+                ),
+            }
+        )
     fetch_elapsed_ms = _elapsed_ms(fetch_started_at)
 
     answer_started_at = time.perf_counter()
@@ -204,6 +271,7 @@ def _run_query_task(
         "answer_char_count": len(answer),
         "search_elapsed_ms": search_elapsed_ms,
         "fetch_elapsed_ms": fetch_elapsed_ms,
+        "fetch_measurements": fetch_measurements,
         "answer_elapsed_ms": answer_elapsed_ms,
         "total_elapsed_ms": _elapsed_ms(total_started_at),
         "mcp_search_timing_ms": (search.get("metadata") or {}).get("timing_ms") or {},
@@ -222,13 +290,60 @@ def _flatten_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _summarize_measurements(measurements: list[dict[str, Any]], *, batch_elapsed_ms: float) -> dict[str, Any]:
+    answerable_measurements = [
+        item
+        for item in measurements
+        if not item.get("error") and not bool(item.get("expect_no_evidence"))
+    ]
+    no_evidence_measurements = [
+        item
+        for item in measurements
+        if not item.get("error") and bool(item.get("expect_no_evidence"))
+    ]
     return {
         "batch_elapsed_ms": batch_elapsed_ms,
         "measurement_count": len(measurements),
         "successful_count": sum(1 for item in measurements if not item.get("error")),
         "error_count": sum(1 for item in measurements if item.get("error")),
+        "answerable_measurement_count": len(answerable_measurements),
+        "no_evidence_measurement_count": len(no_evidence_measurements),
+        "answerable_zero_result_count": sum(
+            1
+            for item in answerable_measurements
+            if int(item.get("search_result_count") or 0) == 0
+        ),
+        "no_evidence_nonzero_result_count": sum(
+            1
+            for item in no_evidence_measurements
+            if int(item.get("search_result_count") or 0) > 0
+        ),
+        "answerable_result_count": _stats(
+            [
+                float(item.get("search_result_count") or 0)
+                for item in answerable_measurements
+            ]
+        ),
+        "no_evidence_result_count": _stats(
+            [
+                float(item.get("search_result_count") or 0)
+                for item in no_evidence_measurements
+            ]
+        ),
         "search_elapsed_ms": _stats(_numeric_values(measurements, "search_elapsed_ms")),
         "fetch_elapsed_ms": _stats(_numeric_values(measurements, "fetch_elapsed_ms")),
+        "single_fetch_elapsed_ms": _stats(
+            [
+                float(fetch_item["elapsed_ms"])
+                for item in measurements
+                for fetch_item in (
+                    item.get("fetch_measurements")
+                    if isinstance(item.get("fetch_measurements"), list)
+                    else []
+                )
+                if isinstance(fetch_item, dict)
+                and isinstance(fetch_item.get("elapsed_ms"), (int, float))
+            ]
+        ),
         "answer_elapsed_ms": _stats(_numeric_values(measurements, "answer_elapsed_ms")),
         "total_elapsed_ms": _stats(_numeric_values(measurements, "total_elapsed_ms")),
         "search_result_count_min": min([int(item.get("search_result_count") or 0) for item in measurements] or [0]),

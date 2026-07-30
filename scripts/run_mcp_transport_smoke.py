@@ -25,7 +25,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.run_mcp_smoke import run_mcp_smoke
-from scripts.report_metadata import current_repo_commit
+from scripts.report_metadata import (
+    capture_mcp_performance_source_state,
+    current_repo_commit,
+    finalize_mcp_performance_source_state,
+)
 
 
 DEFAULT_SEARCH_QUERY = "Article"
@@ -125,6 +129,7 @@ def _run_transport_smoke_with_data_dir(
     http_bearer_token: str | None,
     disposable_data_dir: bool,
 ) -> dict[str, Any]:
+    started_source_state = capture_mcp_performance_source_state(PROJECT_ROOT)
     normalized_transport = transport.strip().lower()
     if normalized_transport not in {"stdio", "streamable-http"}:
         raise ValueError("transport must be stdio or streamable-http.")
@@ -141,6 +146,10 @@ def _run_transport_smoke_with_data_dir(
                 disposable_data_dir=disposable_data_dir,
             )
         except ValueError as exc:
+            source_state = finalize_mcp_performance_source_state(
+                started_source_state,
+                PROJECT_ROOT,
+            )
             report = _preparation_failure_report(
                 tenant_id=tenant_id,
                 profile_id=profile_id,
@@ -150,6 +159,7 @@ def _run_transport_smoke_with_data_dir(
                 transport=normalized_transport,
                 persistent_smoke_data_opt_in=allow_persistent_smoke_data,
                 http_bearer_token=http_bearer_token,
+                source_state=source_state,
             )
             if out_json:
                 out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -203,10 +213,15 @@ def _run_transport_smoke_with_data_dir(
     chatgpt_profile = (
         transport.get("chatgpt_data_profile") if isinstance(transport.get("chatgpt_data_profile"), dict) else {}
     )
+    source_state = finalize_mcp_performance_source_state(
+        started_source_state,
+        PROJECT_ROOT,
+    )
     report = {
         "report_type": "mcp_transport_smoke",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_commit": current_repo_commit(PROJECT_ROOT),
+        "source_state": source_state,
         "tenant_id": tenant_id,
         "profile_id": profile_id,
         "tenant_storage_isolation": tenant_storage_isolation,
@@ -281,11 +296,13 @@ def _preparation_failure_report(
     transport: str,
     persistent_smoke_data_opt_in: bool,
     http_bearer_token: str | None,
+    source_state: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "report_type": "mcp_transport_smoke",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_commit": current_repo_commit(PROJECT_ROOT),
+        "source_state": source_state,
         "tenant_id": tenant_id,
         "profile_id": profile_id,
         "tenant_storage_isolation": tenant_storage_isolation,
@@ -424,13 +441,7 @@ async def _call_stdio_profile(
         server_args.append("--flat-storage")
     if no_warm_cache:
         server_args.append("--no-warm-cache")
-    stdio_env = get_default_environment()
-    configured_python_path = os.environ.get("PYTHONPATH")
-    if configured_python_path:
-        # mcp's safe default environment intentionally excludes PYTHONPATH. Keep
-        # that default, but preserve an explicitly configured interpreter path so
-        # smoke subprocesses use the same isolated dependency set as the caller.
-        stdio_env["PYTHONPATH"] = configured_python_path
+    stdio_env = _transport_smoke_server_env(get_default_environment())
     params = StdioServerParameters(
         command=sys.executable,
         args=server_args,
@@ -490,7 +501,7 @@ async def _call_streamable_http_profile(
         server_args.append("--flat-storage")
     if no_warm_cache:
         server_args.append("--no-warm-cache")
-    process_env = os.environ.copy()
+    process_env = _transport_smoke_server_env(os.environ.copy())
     if http_bearer_token:
         process_env["MCP_TRANSPORT_SMOKE_TOKEN"] = http_bearer_token
         server_args.extend(["--http-bearer-token-env", "MCP_TRANSPORT_SMOKE_TOKEN"])
@@ -638,67 +649,56 @@ async def _call_profile_tools(
                 if isinstance(hierarchy_payload.get("nodes"), list)
                 else []
             )
-            first_article_node = next(
-                (
-                    node
-                    for node in hierarchy_nodes
-                    if isinstance(node, dict)
-                    and (
-                        str(node.get("node_type") or "") == "article"
-                        or bool(str(node.get("number") or "").strip())
-                    )
-                ),
-                None,
-            )
-            first_article_no = str(
-                (first_article_node or {}).get("number")
-                or (first_article_node or {}).get("label")
-                or ""
-            ).strip()
-            if "get_regulation_article" in tool_names and first_article_no:
+            article_number_candidates = _article_number_candidates(hierarchy_nodes)
+            if article_number_candidates:
+                first_article_no = article_number_candidates[0]
+            if "get_regulation_article" in tool_names and article_number_candidates:
                 exact_article_started_at = time.perf_counter()
-                exact_article = await session.call_tool(
-                    "get_regulation_article",
-                    {
-                        "regulation_unit_id": first_catalog_unit_id,
-                        "article_no": first_article_no,
-                    },
-                )
+                for article_no in article_number_candidates:
+                    exact_article = await session.call_tool(
+                        "get_regulation_article",
+                        {
+                            "regulation_unit_id": first_catalog_unit_id,
+                            "article_no": article_no,
+                        },
+                    )
+                    exact_article_payload = _tool_payload(exact_article)
+                    exact_articles = (
+                        exact_article_payload.get("articles")
+                        if isinstance(exact_article_payload.get("articles"), list)
+                        else []
+                    )
+                    first_exact_article = _first_textual_article(exact_articles) or next(
+                        (item for item in exact_articles if isinstance(item, dict)),
+                        {},
+                    )
+                    first_exact_article_metadata = (
+                        first_exact_article.get("metadata")
+                        if isinstance(first_exact_article.get("metadata"), dict)
+                        else {}
+                    )
+                    first_exact_article_verbatim = (
+                        first_exact_article.get("verbatim")
+                        if isinstance(first_exact_article.get("verbatim"), dict)
+                        else {}
+                    )
+                    exact_article_verified = bool(
+                        str(first_exact_article.get("text") or "").strip()
+                    )
+                    exact_article_regulation_id = str(
+                        first_exact_article_metadata.get("regulation_id")
+                        or first_exact_article_verbatim.get("regulation_id")
+                        or ""
+                    ).strip()
+                    exact_article_document_id = str(
+                        first_exact_article_metadata.get("document_id")
+                        or first_exact_article_verbatim.get("document_id")
+                        or ""
+                    ).strip()
+                    if exact_article_verified:
+                        first_article_no = article_no
+                        break
                 exact_article_elapsed_ms = _elapsed_ms(exact_article_started_at)
-                exact_article_payload = _tool_payload(exact_article)
-                exact_articles = (
-                    exact_article_payload.get("articles")
-                    if isinstance(exact_article_payload.get("articles"), list)
-                    else []
-                )
-                exact_article_verified = any(
-                    isinstance(item, dict) and bool(str(item.get("text") or "").strip())
-                    for item in exact_articles
-                )
-                first_exact_article = next(
-                    (item for item in exact_articles if isinstance(item, dict)),
-                    {},
-                )
-                first_exact_article_metadata = (
-                    first_exact_article.get("metadata")
-                    if isinstance(first_exact_article.get("metadata"), dict)
-                    else {}
-                )
-                first_exact_article_verbatim = (
-                    first_exact_article.get("verbatim")
-                    if isinstance(first_exact_article.get("verbatim"), dict)
-                    else {}
-                )
-                exact_article_regulation_id = str(
-                    first_exact_article_metadata.get("regulation_id")
-                    or first_exact_article_verbatim.get("regulation_id")
-                    or ""
-                ).strip()
-                exact_article_document_id = str(
-                    first_exact_article_metadata.get("document_id")
-                    or first_exact_article_verbatim.get("document_id")
-                    or ""
-                ).strip()
         if "get_regulation_references" in tool_names and first_catalog_unit_id:
             reference_lookup_attempted = True
             reference_lookup_started_at = time.perf_counter()
@@ -762,6 +762,8 @@ async def _call_profile_tools(
     history_attempted = False
     history_tool_available = "get_regulation_history" in tool_names
     as_of_date_verification = _unavailable_as_of_date_verification(tool_profile=tool_profile)
+    first_result_metadata = (results[0] if results else {}).get("metadata") or {}
+    history_regulation_id = exact_article_regulation_id or str(first_result_metadata.get("regulation_id") or "").strip()
     if tool_profile == "full":
         temporal_fixture_available = bool(
             history_tool_available
@@ -780,20 +782,19 @@ async def _call_profile_tools(
             )
             history_attempted = bool(as_of_date_verification.get("attempted"))
             history_error = str(as_of_date_verification.get("error") or "")
-        elif history_tool_available and exact_article_regulation_id:
+        elif history_tool_available and history_regulation_id:
             history_attempted = True
             try:
                 history = await session.call_tool(
                     "get_regulation_history",
                     {
-                        "regulation_id": exact_article_regulation_id,
+                        "regulation_id": history_regulation_id,
                         **({"profile_id": profile_id} if profile_id else {}),
                     },
                 )
                 history_payload = _tool_payload(history)
             except Exception as exc:
                 history_error = str(exc)
-    first_result_metadata = (results[0] if results else {}).get("metadata") or {}
     history_versions = history_payload.get("versions") if isinstance(history_payload.get("versions"), list) else []
     history_current_document_id = str(history_payload.get("current_document_id") or "").strip()
     first_result_document_id = str(first_result_metadata.get("document_id") or "").strip()
@@ -1283,6 +1284,31 @@ def _payload_list(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _article_number_candidates(nodes: list[Any]) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        article_no = str(node.get("number") or node.get("label") or "").strip()
+        if not article_no:
+            continue
+        if str(node.get("node_type") or "") != "article" and "조" not in article_no:
+            continue
+        if article_no in seen:
+            continue
+        seen.add(article_no)
+        candidates.append(article_no)
+    return candidates
+
+
+def _first_textual_article(articles: list[Any]) -> dict[str, Any]:
+    for article in articles:
+        if isinstance(article, dict) and str(article.get("text") or "").strip():
+            return article
+    return {}
+
+
 def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -1429,6 +1455,21 @@ def _read_process_output(
         return output.read()[-4000:]
     except OSError:
         return ""
+
+
+def _transport_smoke_server_env(base_env: dict[str, str]) -> dict[str, str]:
+    env = dict(base_env)
+    configured_python_path = os.environ.get("PYTHONPATH")
+    if configured_python_path:
+        # mcp's safe default environment intentionally excludes PYTHONPATH. Keep
+        # that default, but preserve an explicitly configured interpreter path so
+        # smoke subprocesses use the same isolated dependency set as the caller.
+        env["PYTHONPATH"] = configured_python_path
+    # Persistent runtime-bundle smoke runs against read-only evidence data.
+    # Disable write-on-read diagnostics so tool calls stay compatible.
+    env["API_AUDIT_ENABLED"] = "false"
+    env["RAG_TRACE_ENABLED"] = "false"
+    return env
 
 
 def _url_host(host: str) -> str:

@@ -5,11 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts.run_mcp_smoke import run_mcp_smoke
 from scripts.run_mcp_transport_smoke import (
     TEMPORAL_AS_OF_CASES,
     _call_profile_tools,
+    _transport_smoke_server_env,
     _validate_temporal_case_payloads,
     _valid_reference_cycle_payload,
     _valid_reference_lookup_payload,
@@ -18,7 +20,35 @@ from scripts.run_mcp_transport_smoke import (
 )
 
 
+TEST_SOURCE_STATE = {
+    "scope": "mcp-performance-python-source-v1",
+    "status": "available",
+    "sha256": "b" * 64,
+    "file_count": 3,
+    "byte_count": 101,
+    "stable": True,
+}
+
+
 class RunMcpTransportSmokeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.capture_source_state = patch(
+            "scripts.run_mcp_transport_smoke.capture_mcp_performance_source_state",
+            return_value=dict(TEST_SOURCE_STATE),
+        ).start()
+        self.finalize_source_state = patch(
+            "scripts.run_mcp_transport_smoke.finalize_mcp_performance_source_state",
+            return_value=dict(TEST_SOURCE_STATE),
+        ).start()
+        self.addCleanup(patch.stopall)
+
+    def test_transport_smoke_server_env_disables_write_on_read_diagnostics(self) -> None:
+        env = _transport_smoke_server_env({"PATH": "test-path"})
+
+        self.assertEqual("false", env["API_AUDIT_ENABLED"])
+        self.assertEqual("false", env["RAG_TRACE_ENABLED"])
+        self.assertEqual("test-path", env["PATH"])
+
     def test_cli_accepts_bearer_token_environment_selector(self) -> None:
         args = build_parser().parse_args(["--transport", "streamable-http", "--http-bearer-token-env", "MCP_TOKEN"])
 
@@ -32,6 +62,9 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         )
 
         self.assertTrue(report["passed"])
+        self.assertEqual(TEST_SOURCE_STATE, report["source_state"])
+        self.capture_source_state.assert_called_once()
+        self.finalize_source_state.assert_called_once()
         self.assertEqual(report["transport"], "stdio")
         self.assertEqual("Article", report["query"])
         self.assertTrue(report["no_warm_cache"])
@@ -209,6 +242,9 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
             )
 
         self.assertFalse(report["passed"])
+        self.assertEqual(TEST_SOURCE_STATE, report["source_state"])
+        self.capture_source_state.assert_called_once()
+        self.finalize_source_state.assert_called_once()
         self.assertEqual("Article", report["query"])
         self.assertEqual("explicit_refused", report["preparation"]["data_dir_mode"])
         self.assertFalse(report["preparation"]["handoff_evidence"])
@@ -337,6 +373,247 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
             session.calls,
         )
         self.assertTrue(all("as_of_date" not in arguments for _, arguments in session.calls))
+
+    def test_profile_tools_try_multiple_article_candidates_until_text_is_found(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def list_tools(self):
+                return SimpleNamespace(
+                    tools=[
+                        SimpleNamespace(name="fetch"),
+                        SimpleNamespace(name="get_regulation_article"),
+                        SimpleNamespace(name="get_regulation_references"),
+                        SimpleNamespace(name="get_regulation_toc"),
+                        SimpleNamespace(name="list_regulation_reference_cycles"),
+                        SimpleNamespace(name="list_regulations"),
+                        SimpleNamespace(name="search"),
+                    ]
+                )
+
+            async def call_tool(self, name, arguments):
+                self.calls.append((name, dict(arguments)))
+                if name == "list_regulations":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulations": [{"regulation_unit_id": "unit-1"}],
+                            "total_count": 1,
+                        }
+                    )
+                if name == "get_regulation_toc":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulation": {"regulation_unit_id": "unit-1"},
+                            "nodes": [
+                                {"node_type": "article", "number": "제0조"},
+                                {"node_type": "article", "number": "제1조"},
+                            ],
+                        }
+                    )
+                if name == "get_regulation_article":
+                    article_no = arguments["article_no"]
+                    articles = [] if article_no == "제0조" else [{"text": "approved article"}]
+                    return SimpleNamespace(structuredContent={"articles": articles})
+                if name == "get_regulation_references":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulation": {"regulation_unit_id": "unit-1"},
+                            "references": [],
+                            "cycles": [],
+                            "total_count": 0,
+                            "page": 1,
+                            "page_size": 50,
+                            "next_cursor": None,
+                            "metadata": {
+                                "hierarchical_index_ready": True,
+                                "direction": "both",
+                                "cycle_count_for_regulation": 0,
+                            },
+                        }
+                    )
+                if name == "list_regulation_reference_cycles":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "cycles": [],
+                            "total_count": 0,
+                            "page": 1,
+                            "page_size": 50,
+                            "next_cursor": None,
+                            "metadata": {
+                                "hierarchical_index_ready": True,
+                                "approved_current_corpus_only": True,
+                                "cycle_algorithm": "deterministic_tarjan_scc",
+                            },
+                        }
+                    )
+                if name == "search":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "results": [{"id": "result-1"}],
+                            "metadata": {},
+                        }
+                    )
+                if name == "fetch":
+                    return SimpleNamespace(structuredContent={"text": "approved text"})
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        session = FakeSession()
+
+        profile = asyncio.run(
+            _call_profile_tools(
+                session,
+                tool_profile="chatgpt-data",
+                profile_id=None,
+                query="Article",
+                no_warm_cache=True,
+                profile_started_at=0.0,
+            )
+        )
+
+        article_calls = [arguments for tool_name, arguments in session.calls if tool_name == "get_regulation_article"]
+
+        self.assertTrue(profile["passed"])
+        self.assertTrue(profile["exact_article_verified"])
+        self.assertEqual(
+            [
+                {"regulation_unit_id": "unit-1", "article_no": "제0조"},
+                {"regulation_unit_id": "unit-1", "article_no": "제1조"},
+            ],
+            article_calls,
+        )
+
+    def test_full_profile_history_uses_search_result_regulation_id_fallback(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def list_tools(self):
+                names = [
+                    "fetch",
+                    "get_index_status",
+                    "get_regulation_article",
+                    "get_regulation_history",
+                    "get_regulation_references",
+                    "get_regulation_toc",
+                    "list_documents",
+                    "list_regulation_reference_cycles",
+                    "list_regulations",
+                    "search",
+                ]
+                return SimpleNamespace(tools=[SimpleNamespace(name=name) for name in names])
+
+            async def call_tool(self, name, arguments):
+                self.calls.append((name, dict(arguments)))
+                if name == "list_regulations":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulations": [{"regulation_unit_id": "unit-live"}],
+                            "total_count": 1,
+                        }
+                    )
+                if name == "get_regulation_toc":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulation": {"regulation_unit_id": "unit-live"},
+                            "nodes": [{"node_type": "article", "number": "제1조"}],
+                        }
+                    )
+                if name == "get_regulation_article":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulation_unit_id": "unit-live",
+                            "article_no": "제1조",
+                            "articles": [
+                                {
+                                    "text": "live article text",
+                                    "metadata": {"document_id": "doc-live"},
+                                    "verbatim": {"document_id": "doc-live"},
+                                }
+                            ],
+                        }
+                    )
+                if name == "get_regulation_history":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulation_id": arguments["regulation_id"],
+                            "current_document_id": "doc-live",
+                            "versions": [{"document_id": "doc-live", "regulation_status": "approved"}],
+                        }
+                    )
+                if name == "get_regulation_references":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "regulation": {"regulation_unit_id": "unit-live"},
+                            "references": [],
+                            "cycles": [],
+                            "total_count": 0,
+                            "page": 1,
+                            "page_size": 50,
+                            "next_cursor": None,
+                            "metadata": {
+                                "hierarchical_index_ready": True,
+                                "direction": "both",
+                                "cycle_count_for_regulation": 0,
+                            },
+                        }
+                    )
+                if name == "list_regulation_reference_cycles":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "cycles": [],
+                            "total_count": 0,
+                            "page": 1,
+                            "page_size": 50,
+                            "next_cursor": None,
+                            "metadata": {
+                                "hierarchical_index_ready": True,
+                                "approved_current_corpus_only": True,
+                                "cycle_algorithm": "deterministic_tarjan_scc",
+                            },
+                        }
+                    )
+                if name == "get_index_status":
+                    return SimpleNamespace(structuredContent={"summary": {"approved_record_count": 1}})
+                if name == "search":
+                    return SimpleNamespace(
+                        structuredContent={
+                            "results": [
+                                {
+                                    "id": "result-1",
+                                    "metadata": {
+                                        "regulation_id": "reg-live",
+                                        "document_id": "doc-live",
+                                    },
+                                }
+                            ],
+                            "metadata": {},
+                        }
+                    )
+                if name == "fetch":
+                    return SimpleNamespace(structuredContent={"text": "approved text"})
+                raise AssertionError(f"Unexpected tool call: {name}")
+
+        session = FakeSession()
+
+        profile = asyncio.run(
+            _call_profile_tools(
+                session,
+                tool_profile="full",
+                profile_id=None,
+                query="Article",
+                no_warm_cache=True,
+                profile_started_at=0.0,
+            )
+        )
+
+        history_calls = [arguments for tool_name, arguments in session.calls if tool_name == "get_regulation_history"]
+
+        self.assertTrue(profile["passed"], profile["history_error"])
+        self.assertTrue(profile["exact_article_verified"])
+        self.assertTrue(profile["history_attempted"])
+        self.assertTrue(profile["history_passed"])
+        self.assertEqual([{"regulation_id": "reg-live"}], history_calls)
 
     def test_full_profile_temporal_verification_uses_exact_article_identity(self) -> None:
         class FakeSession:

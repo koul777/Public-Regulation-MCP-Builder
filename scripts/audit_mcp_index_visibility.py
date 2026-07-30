@@ -20,7 +20,11 @@ from app.core.security import AuthContext
 from app.core.tenant_access import settings_for_tenant
 from app.ingestion.vector_adapter import build_vector_records
 from app.storage.repository import JsonRepository
-from scripts.report_metadata import current_repo_commit
+from scripts.report_metadata import (
+    capture_mcp_performance_source_state,
+    current_repo_commit,
+    finalize_mcp_performance_source_state,
+)
 
 
 APPROVAL_PROVENANCE_FIELDS = (
@@ -70,6 +74,7 @@ def audit_mcp_index_visibility(
     role: str = "operator",
     department_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    started_source_state = capture_mcp_performance_source_state(PROJECT_ROOT)
     settings = Settings(data_dir=Path(data_dir), tenant_storage_isolation=tenant_storage_isolation)
     tenant_settings = settings_for_tenant(settings, tenant_id)
     repository = JsonRepository(tenant_settings)
@@ -318,10 +323,15 @@ def audit_mcp_index_visibility(
         "apba_id_counts": dict(sorted(apba_id_counts.items())),
         "public_portal_missing_apba_id_count": public_portal_missing_apba_id_count,
     }
+    source_state = finalize_mcp_performance_source_state(
+        started_source_state,
+        PROJECT_ROOT,
+    )
     return {
         "report_type": "mcp_index_visibility_audit",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_commit": current_repo_commit(PROJECT_ROOT),
+        "source_state": source_state,
         "data_dir": str(Path(data_dir)),
         "effective_data_dir": str(tenant_settings.data_dir),
         "tenant_id": tenant_id,
@@ -331,6 +341,11 @@ def audit_mcp_index_visibility(
         "auth_scope": {
             "role": normalized_role,
             "department_ids": list(normalized_department_ids),
+        },
+        "requirements": {
+            "min_visible_records": int(min_visible_records),
+            "forbid_smoke_docs": bool(forbid_smoke_docs),
+            "require_indexed": bool(require_indexed),
         },
         "document_count": len(documents),
         "approval_status_totals": dict(sorted(approval_status_totals.items())),
@@ -433,6 +448,7 @@ def write_markdown_report(report: dict[str, Any], path: Path) -> None:
         f"- Tenant: `{report.get('tenant_id')}`",
         f"- Filters: `{report.get('filters') or {}}`",
         f"- Auth scope: `{report.get('auth_scope') or {}}`",
+        f"- Requirements: `{report.get('requirements') or {}}`",
         f"- Documents: `{report.get('document_count')}`",
         f"- Approval status totals: `{report.get('approval_status_totals')}`",
         f"- Approved/indexable records: `{report.get('total_indexable_record_count')}`",

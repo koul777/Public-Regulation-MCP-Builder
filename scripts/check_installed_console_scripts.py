@@ -103,9 +103,11 @@ DEFAULT_COMMANDS = (
     "reg-rag-mcp-answer-blocker-map",
     "reg-rag-mcp-performance-load-evidence",
     "reg-rag-mcp-cold-start-benchmark",
+    "reg-rag-mcp-first-query-benchmark",
     "reg-rag-mcp-concurrent-benchmark",
     "reg-rag-mcp-index-visibility",
     "reg-rag-mcp-query-benchmark",
+    "reg-rag-mcp-retrieval-quality",
     "reg-rag-revision-impact",
     "reg-rag-real-parser-fixtures",
 )

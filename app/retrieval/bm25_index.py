@@ -7,15 +7,25 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Iterable
+import unicodedata
 
-from app.retrieval.tokenizer import tokenize, tokenizer_name
+from app.retrieval.tokenizer import (
+    FALLBACK_TOKENIZER_MODEL,
+    tokenize,
+    tokenizer_name,
+)
 
 
 BM25_INDEX_VERSION = "reg-rag-bm25-index-v2"
 BM25_RETRIEVAL_MODEL = "kiwi-bm25-v1"
 DEFAULT_BM25_FILENAME = "bm25_index.json"
 BM25_STRUCTURED_METADATA_VERSION = 2
+_FAST_QUERY_TOKEN_RE = re.compile(r"[0-9A-Za-z\uac00-\ud7a3]+", re.UNICODE)
+_FAST_QUERY_MAX_RAW_TOKENS = 64
+_FAST_QUERY_MAX_TOKEN_LENGTH = 64
+_FAST_QUERY_MAX_SUBTERM_LENGTH = 32
 
 _STRUCTURED_METADATA_FIELD_WEIGHTS: tuple[tuple[str, int], ...] = (
     ("article_no", 8),
@@ -150,8 +160,47 @@ class Bm25Index:
         return self.source_content_hashes != source_content_hashes(records)
 
     def score(self, query: str, *, allowed_ids: set[str] | None = None) -> dict[str, float]:
+        return self.score_terms(
+            tokenize(query, dedupe=False, tokenizer_model=self.tokenizer),
+            allowed_ids=allowed_ids,
+        )
+
+    def score_fast_query(
+        self,
+        query: str,
+        *,
+        allowed_ids: set[str] | None = None,
+    ) -> dict[str, float]:
+        """Score a bounded candidate query without initializing Kiwi.
+
+        Serialized BM25 vocabulary terms recover useful Korean compound
+        segments that the regex tokenizer cannot split on its own. This path
+        is intended for a pre-authorized hierarchy candidate set; it never
+        adds document identifiers outside ``allowed_ids``.
+        """
+
+        return self.score_terms(
+            _fast_query_terms(query, self.document_frequencies),
+            allowed_ids=allowed_ids,
+        )
+
+    def score_terms(
+        self,
+        query_terms: Iterable[str],
+        *,
+        allowed_ids: set[str] | None = None,
+    ) -> dict[str, float]:
+        """Score already-tokenized terms using the serialized BM25 weights."""
+
         query_term_counts = Counter(
-            tokenize(query, dedupe=False, tokenizer_model=self.tokenizer)
+            normalized
+            for term in query_terms
+            if (
+                normalized := unicodedata.normalize(
+                    "NFC",
+                    str(term or "").strip().lower(),
+                )
+            )
         )
         if not query_term_counts or not self.documents:
             return {}
@@ -187,6 +236,97 @@ class Bm25Index:
             if score > 0.0:
                 scores[record_id] = round(score, 8)
         return scores
+
+
+def _fast_query_terms(
+    query: str,
+    document_frequencies: dict[str, int],
+) -> list[str]:
+    """Build cold-start-safe query terms from regex and indexed vocabulary."""
+
+    normalized_query = unicodedata.normalize("NFC", str(query or "")).lower()
+    terms = tokenize(
+        normalized_query,
+        dedupe=False,
+        tokenizer_model=FALLBACK_TOKENIZER_MODEL,
+    )
+    seen = set(terms)
+    raw_tokens = _FAST_QUERY_TOKEN_RE.findall(normalized_query)
+    for raw_token in raw_tokens[:_FAST_QUERY_MAX_RAW_TOKENS]:
+        if len(raw_token) > _FAST_QUERY_MAX_TOKEN_LENGTH:
+            continue
+        for derived in _indexed_subterms(raw_token, document_frequencies):
+            if derived in seen:
+                continue
+            seen.add(derived)
+            terms.append(derived)
+    return terms
+
+
+def _indexed_subterms(
+    raw_token: str,
+    document_frequencies: dict[str, int],
+) -> tuple[str, ...]:
+    """Choose a deterministic, high-coverage segmentation from index terms."""
+
+    token = str(raw_token or "").strip().lower()
+    token_length = len(token)
+    if token_length < 3:
+        return ()
+
+    # State: covered characters, skipped characters, first match offset, terms.
+    states: list[tuple[int, int, int, tuple[str, ...]]] = [
+        (0, 0, token_length, ()) for _ in range(token_length + 1)
+    ]
+    states[token_length] = (0, 0, token_length, ())
+    for position in range(token_length - 1, -1, -1):
+        suffix = states[position + 1]
+        best = (
+            suffix[0],
+            suffix[1] + 1,
+            min(token_length, suffix[2] + 1),
+            suffix[3],
+        )
+        maximum_end = min(
+            token_length,
+            position + _FAST_QUERY_MAX_SUBTERM_LENGTH,
+        )
+        for end in range(maximum_end, position + 1, -1):
+            if end - position < 2:
+                break
+            # The whole regex token is already emitted by the fallback
+            # tokenizer. Proper substrings are the useful cold-start bridge.
+            if position == 0 and end == token_length:
+                continue
+            candidate_term = token[position:end]
+            if (
+                not any(character.isalpha() for character in candidate_term)
+                or int(document_frequencies.get(candidate_term) or 0) <= 0
+            ):
+                continue
+            tail = states[end]
+            candidate = (
+                tail[0] + len(candidate_term),
+                tail[1],
+                0,
+                (candidate_term, *tail[3]),
+            )
+            candidate_key = (
+                candidate[0],
+                -candidate[1],
+                -candidate[2],
+                len(candidate[3]),
+            )
+            best_key = (
+                best[0],
+                -best[1],
+                -best[2],
+                len(best[3]),
+            )
+            if candidate_key > best_key:
+                best = candidate
+        states[position] = best
+    return states[0][3]
 
 
 def default_bm25_index_path(vector_path: Path) -> Path:

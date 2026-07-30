@@ -3,7 +3,11 @@ from __future__ import annotations
 import tempfile
 import json
 from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.mcp_server import regulation_tools
@@ -18,12 +22,18 @@ from app.mcp_server.regulation_tools import (
     mcp_auth_context,
     search_regulations,
 )
+from app.retrieval.bm25_index import source_content_hashes
 from app.retrieval.hierarchical_index import (
     build_hierarchical_runtime_index,
+    canonicalize_runtime_records,
     fully_visible_regulation_unit_ids,
     index_summary,
+    indexed_document_ids,
     list_indexed_regulations,
     load_article_records,
+    load_document_article_records,
+    load_record_by_chunk,
+    logical_corpus_sha256_for_records,
     page_indexed_regulations,
     page_reference_cycles,
     regulation_references,
@@ -35,6 +45,289 @@ from app.retrieval.hierarchical_index import (
 
 
 class HierarchicalIndexTests(unittest.TestCase):
+    def test_module_import_defers_reference_graph_builder(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "import app.retrieval.hierarchical_index; "
+                    "raise SystemExit("
+                    "int('app.retrieval.regulation_reference_graph' in sys.modules)"
+                    ")"
+                ),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_index_summary_stores_private_source_content_binding(self) -> None:
+        records = [
+            _record(
+                "doc-binding",
+                "binding-a",
+                regulation_no="1-1",
+                regulation_title="Binding Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="first approved binding record",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-binding",
+                "binding-b",
+                regulation_no="1-1",
+                regulation_title="Binding Regulation",
+                article_no="Article 2",
+                article_title="Scope",
+                text="second approved binding record",
+                revision_date="2026-07-01",
+            ),
+        ]
+        expected = source_content_hashes(records)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            built = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            summary = index_summary(index_path)
+            connection = sqlite3.connect(index_path)
+            try:
+                stored = dict(
+                    connection.execute(
+                        """
+                        SELECT key, value
+                        FROM index_metadata
+                        WHERE key IN (
+                            'source_content_hashes',
+                            'logical_corpus_sha256'
+                        )
+                        """
+                    )
+                )
+                connection.execute(
+                    """
+                    UPDATE index_metadata
+                    SET value=upper(value)
+                    WHERE key='logical_corpus_sha256'
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            invalid_summary = index_summary(index_path)
+
+        self.assertRegex(expected, r"^[0-9a-f]{64}$")
+        self.assertEqual(expected, built["source_content_hashes"])
+        self.assertEqual(expected, summary["source_content_hashes"])
+        self.assertEqual(expected, stored["source_content_hashes"])
+        self.assertRegex(built["logical_corpus_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            built["logical_corpus_sha256"],
+            stored["logical_corpus_sha256"],
+        )
+        self.assertEqual(
+            built["logical_corpus_sha256"],
+            summary["logical_corpus_sha256"],
+        )
+        self.assertIsNone(invalid_summary["logical_corpus_sha256"])
+
+    def test_build_one_shot_generator_matches_list_input(self) -> None:
+        records = [
+            _record(
+                "doc-generator",
+                "generator-a",
+                regulation_no="1-2",
+                regulation_title="Generator Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="first generator-backed record",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-generator",
+                "generator-b",
+                regulation_no="1-2",
+                regulation_title="Generator Regulation",
+                article_no="Article 2",
+                article_title="Scope",
+                text="second generator-backed record",
+                revision_date="2026-07-01",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            list_path = root / "list.sqlite3"
+            generator_path = root / "generator.sqlite3"
+            list_result = build_hierarchical_runtime_index(
+                list_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            generator_result = build_hierarchical_runtime_index(
+                generator_path,
+                (record for record in records),
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            list_summary = index_summary(list_path)
+            generator_summary = index_summary(generator_path)
+
+        self.assertEqual(len(records), generator_result["record_count"])
+        self.assertEqual(
+            {key: value for key, value in list_result.items() if key != "path"},
+            {
+                key: value
+                for key, value in generator_result.items()
+                if key != "path"
+            },
+        )
+        self.assertEqual(
+            {key: value for key, value in list_summary.items() if key != "path"},
+            {
+                key: value
+                for key, value in generator_summary.items()
+                if key != "path"
+            },
+        )
+
+    def test_logical_corpus_hash_accepts_one_shot_generator(self) -> None:
+        records = [
+            _record(
+                "doc-logical-generator",
+                "logical-generator-a",
+                regulation_no="1-3",
+                regulation_title="Logical Generator Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="first logical generator record",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-logical-generator",
+                "logical-generator-b",
+                regulation_no="1-3",
+                regulation_title="Logical Generator Regulation",
+                article_no="Article 2",
+                article_title="Scope",
+                text="second logical generator record",
+                revision_date="2026-07-01",
+            ),
+        ]
+
+        list_hash = logical_corpus_sha256_for_records(
+            records,
+            tenant_id="tenant-a",
+            profile_id="institution-a",
+        )
+        generator_hash = logical_corpus_sha256_for_records(
+            (record for record in records),
+            tenant_id="tenant-a",
+            profile_id="institution-a",
+        )
+
+        self.assertRegex(generator_hash, r"^[0-9a-f]{64}$")
+        self.assertEqual(list_hash, generator_hash)
+
+    def test_logical_corpus_hash_does_not_precopy_list_input(self) -> None:
+        records = [
+            _record(
+                "doc-logical-list",
+                "logical-list-a",
+                regulation_no="1-4",
+                regulation_title="Logical List Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="logical list record",
+                revision_date="2026-07-01",
+            )
+        ]
+
+        with patch(
+            "app.retrieval.hierarchical_index.canonicalize_runtime_records",
+            wraps=canonicalize_runtime_records,
+        ) as canonicalize_mock:
+            logical_corpus_sha256_for_records(
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+
+        self.assertIs(records, canonicalize_mock.call_args.args[0])
+
+    def test_document_article_loader_excludes_non_governing_record_types(
+        self,
+    ) -> None:
+        article = _record(
+            "doc-a",
+            "article-a",
+            regulation_no="1-1",
+            regulation_title="테스트 규정",
+            article_no="제1조",
+            article_title="목적",
+            text="제1조 목적과 별지 제1호서식을 설명한다.",
+            revision_date="2026-01-01",
+        )
+        form = _record(
+            "doc-a",
+            "form-a",
+            regulation_no="1-1",
+            regulation_title="테스트 규정",
+            article_no="",
+            article_title="",
+            text="별지 제1호서식",
+            revision_date="2026-01-01",
+            chunk_type="form",
+        )
+        untitled_article = _record(
+            "doc-a",
+            "article-untitled",
+            regulation_no="1-1",
+            regulation_title="테스트 규정",
+            article_no="제2조",
+            article_title="",
+            text="제목이 없는 조문",
+            revision_date="2026-01-01",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            vector_path = (
+                data_dir
+                / "vector_db"
+                / "tenant-a"
+                / "approved_vectors.jsonl"
+            )
+            records = [article, form, untitled_article]
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = data_dir / "hierarchy" / "regulations.sqlite"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            loaded = load_document_article_records(
+                index_path,
+                vector_path,
+                document_id="doc-a",
+            )
+
+        self.assertEqual(["article-a"], [record["chunk_id"] for record in loaded])
+
     def test_search_applies_allowed_units_before_ranking_and_sanitizes_candidates(self) -> None:
         denied_records = [
             _record(
@@ -94,11 +387,22 @@ class HierarchicalIndexTests(unittest.TestCase):
                 role="operator",
                 department_ids=["hr"],
             )
+            verified_token = SimpleNamespace(
+                index_path=index_path,
+                vector_path=vector_path,
+                index_identity=regulation_tools.routes_rag.path_signature(
+                    index_path
+                ),
+                vector_identity=regulation_tools.routes_rag.path_signature(
+                    vector_path
+                ),
+                is_current=lambda: True,
+            )
             with (
                 patch.object(
                     regulation_tools,
-                    "_verified_hierarchical_runtime_paths",
-                    return_value=(index_path, vector_path),
+                    "_verified_hierarchical_runtime_token_for_scope",
+                    return_value=verified_token,
                 ),
                 patch.object(
                     regulation_tools,
@@ -461,6 +765,289 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual([], references["references"])
         self.assertEqual(0, cycle_count)
         self.assertEqual([], cycles)
+
+    def test_signature_visibility_includes_unit_when_every_hash_matches(self) -> None:
+        records = [
+            _record(
+                "doc-signature",
+                "chunk-signature-1",
+                regulation_no="2-1",
+                regulation_title="서명 검증 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="첫 번째 승인 본문이다.",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-signature",
+                "chunk-signature-2",
+                regulation_no="2-1",
+                regulation_title="서명 검증 규정",
+                article_no="제2조",
+                article_title="범위",
+                text="두 번째 승인 본문이다.",
+                revision_date="2026-07-01",
+            ),
+        ]
+        expected_unit_id = regulation_unit_id_for(
+            profile_id="institution-a",
+            regulation_title="서명 검증 규정",
+            regulation_no="2-1",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            visible_unit_ids = fully_visible_regulation_unit_ids(
+                index_path,
+                visible_record_signatures={
+                    (
+                        str(record["document_id"]),
+                        str(record["chunk_id"]),
+                        str(record["content_hash"]),
+                    )
+                    for record in records
+                },
+                profile_id="institution-a",
+            )
+
+        self.assertEqual({expected_unit_id}, visible_unit_ids)
+
+    def test_signature_visibility_excludes_unit_when_one_hash_mismatches(self) -> None:
+        records = [
+            _record(
+                "doc-signature",
+                "chunk-signature-1",
+                regulation_no="2-1",
+                regulation_title="서명 검증 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="첫 번째 승인 본문이다.",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-signature",
+                "chunk-signature-2",
+                regulation_no="2-1",
+                regulation_title="서명 검증 규정",
+                article_no="제2조",
+                article_title="범위",
+                text="두 번째 승인 본문이다.",
+                revision_date="2026-07-01",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            visible_unit_ids = fully_visible_regulation_unit_ids(
+                index_path,
+                visible_record_signatures={
+                    (
+                        str(record["document_id"]),
+                        str(record["chunk_id"]),
+                        (
+                            "mismatched-content-hash"
+                            if record["chunk_id"] == "chunk-signature-2"
+                            else str(record["content_hash"])
+                        ),
+                    )
+                    for record in records
+                },
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(set(), visible_unit_ids)
+
+    def test_indexed_document_ids_respects_profile_scope(self) -> None:
+        records = [
+            _record(
+                "doc-profile-a",
+                "chunk-profile-a",
+                regulation_no="3-1",
+                regulation_title="기관 A 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="기관 A 본문이다.",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-profile-b",
+                "chunk-profile-b",
+                regulation_no="3-2",
+                regulation_title="기관 B 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="기관 B 본문이다.",
+                revision_date="2026-07-01",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id=None,
+            )
+            all_document_ids = indexed_document_ids(index_path)
+            profile_document_ids = indexed_document_ids(
+                index_path,
+                profile_id="INSTITUTION-A",
+            )
+            other_profile_document_ids = indexed_document_ids(
+                index_path,
+                profile_id="institution-b",
+            )
+            summary = index_summary(index_path)
+
+        self.assertEqual({"doc-profile-a", "doc-profile-b"}, all_document_ids)
+        self.assertEqual({"doc-profile-a", "doc-profile-b"}, profile_document_ids)
+        self.assertEqual(set(), other_profile_document_ids)
+        self.assertEqual("institution-a", summary["profile_id"])
+
+    def test_build_rejects_mixed_tenant_records(self) -> None:
+        records = [
+            _record(
+                "doc-tenant-a",
+                "chunk-tenant-a",
+                regulation_no="3-1",
+                regulation_title="기관 A 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="tenant-a 본문이다.",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-tenant-b",
+                "chunk-tenant-b",
+                regulation_no="3-2",
+                regulation_title="기관 B 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="tenant-b 본문이다.",
+                revision_date="2026-07-01",
+                metadata_updates={"tenant_id": "tenant-b"},
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "tenant_id does not match"):
+                build_hierarchical_runtime_index(
+                    Path(tmp) / "regulation_hierarchy.sqlite3",
+                    records,
+                    tenant_id="tenant-a",
+                    profile_id="institution-a",
+                )
+
+    def test_build_rejects_mixed_profiles_when_global_profile_is_omitted(self) -> None:
+        records = [
+            _record(
+                "doc-profile-a",
+                "chunk-profile-a",
+                regulation_no="3-1",
+                regulation_title="기관 A 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="기관 A 본문이다.",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-profile-b",
+                "chunk-profile-b",
+                regulation_no="3-2",
+                regulation_title="기관 B 규정",
+                article_no="제1조",
+                article_title="목적",
+                text="기관 B 본문이다.",
+                revision_date="2026-07-01",
+                metadata_updates={"profile_id": "institution-b"},
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "exactly one non-empty profile_id"):
+                build_hierarchical_runtime_index(
+                    Path(tmp) / "regulation_hierarchy.sqlite3",
+                    records,
+                    tenant_id="tenant-a",
+                    profile_id=None,
+                )
+
+    def test_build_rejects_missing_record_scope_and_requires_exact_profile(self) -> None:
+        cases = (
+            ("tenant_id", "", "tenant_id is required"),
+            ("tenant_id", "TENANT-A", "tenant_id does not match"),
+            ("profile_id", "", "profile_id is required"),
+            (
+                "profile_id",
+                "INSTITUTION-A",
+                "profile_id does not match",
+            ),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                record = _record(
+                    f"doc-{field}-{value or 'missing'}",
+                    f"chunk-{field}-{value or 'missing'}",
+                    regulation_no="3-3",
+                    regulation_title="범위 검증 규정",
+                    article_no="제1조",
+                    article_title="목적",
+                    text="범위 검증 본문이다.",
+                    revision_date="2026-07-01",
+                    metadata_updates={field: value},
+                )
+                with tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaisesRegex(ValueError, message):
+                        build_hierarchical_runtime_index(
+                            Path(tmp) / "regulation_hierarchy.sqlite3",
+                            [record],
+                            tenant_id="tenant-a",
+                            profile_id="institution-a",
+                        )
+
+    def test_fully_visible_unit_ids_preserves_legacy_key_mode(self) -> None:
+        record = _record(
+            "doc-key-mode",
+            "chunk-key-mode",
+            regulation_no="4-1",
+            regulation_title="기존 키 규정",
+            article_no="제1조",
+            article_title="목적",
+            text="기존 키 기반 가시성 본문이다.",
+            revision_date="2026-07-01",
+        )
+        expected_unit_id = regulation_unit_id_for(
+            profile_id="institution-a",
+            regulation_title="기존 키 규정",
+            regulation_no="4-1",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            visible_unit_ids = fully_visible_regulation_unit_ids(
+                index_path,
+                visible_record_keys={
+                    (str(record["document_id"]), str(record["chunk_id"]))
+                },
+                profile_id="institution-a",
+            )
+
+        self.assertEqual({expected_unit_id}, visible_unit_ids)
 
     def test_document_identity_reconciles_chunk_metadata_without_number_collisions(self) -> None:
         self.assertNotEqual(
@@ -1029,6 +1616,7 @@ class HierarchicalIndexTests(unittest.TestCase):
             )
             settings = Settings(data_dir=data_dir)
             auth = mcp_auth_context(tenant_id="tenant-a")
+            verified_token = SimpleNamespace(is_current=lambda: True)
             with (
                 patch.object(
                     regulation_tools,
@@ -1039,6 +1627,11 @@ class HierarchicalIndexTests(unittest.TestCase):
                     regulation_tools,
                     "_verified_hierarchical_runtime_paths",
                     return_value=(index_path, vector_path),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_verified_hierarchical_runtime_token",
+                    return_value=verified_token,
                 ),
                 patch.object(
                     regulation_tools,
@@ -1152,6 +1745,198 @@ class HierarchicalIndexTests(unittest.TestCase):
             )
 
         self.assertEqual(1, len(in_force))
+
+    def test_repealed_at_is_exclusive_for_approved_version(self) -> None:
+        record = _record(
+            "doc-approved-repealed",
+            "approved-repealed-article",
+            regulation_no="4-4-2",
+            regulation_title="폐지 경계 규정",
+            article_no="제10조",
+            article_title="휴직",
+            text="폐지경계 승인 본문",
+            revision_date="2024-01-01",
+            regulation_status="approved",
+            metadata_updates={"repealed_at": "2025-06-15"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, [record])
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="폐지 경계 규정",
+                regulation_no="4-4-2",
+            )
+            day_before = load_article_records(
+                index_path,
+                vector_path,
+                regulation_unit_id=unit_id,
+                article_no="제10조",
+                as_of_date="2025-06-14",
+            )
+            repeal_day = load_article_records(
+                index_path,
+                vector_path,
+                regulation_unit_id=unit_id,
+                article_no="제10조",
+                as_of_date="2025-06-15",
+            )
+            day_after = load_article_records(
+                index_path,
+                vector_path,
+                regulation_unit_id=unit_id,
+                article_no="제10조",
+                as_of_date="2025-06-16",
+            )
+            before_search, _ = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="폐지경계",
+                top_k=5,
+                profile_id="institution-a",
+                as_of_date="2025-06-14",
+            )
+            repeal_day_search, _ = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="폐지경계",
+                top_k=5,
+                profile_id="institution-a",
+                as_of_date="2025-06-15",
+            )
+            day_after_search, _ = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="폐지경계",
+                top_k=5,
+                profile_id="institution-a",
+                as_of_date="2025-06-16",
+            )
+            current_catalog, current_count = page_indexed_regulations(
+                index_path,
+                profile_id="institution-a",
+            )
+            history_catalog = list_indexed_regulations(
+                index_path,
+                profile_id="institution-a",
+                include_history=True,
+            )
+            connection = sqlite3.connect(index_path)
+            try:
+                stored_repealed_at, stored_is_current = connection.execute(
+                    "SELECT repealed_at, is_current FROM regulation_versions"
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(
+            ["approved-repealed-article"],
+            [item["chunk_id"] for item in day_before],
+        )
+        self.assertEqual([], repeal_day)
+        self.assertEqual([], day_after)
+        self.assertEqual(
+            ["approved-repealed-article"],
+            [item["chunk_id"] for _score, item in before_search],
+        )
+        self.assertEqual([], repeal_day_search)
+        self.assertEqual([], day_after_search)
+        self.assertEqual(0, current_count)
+        self.assertEqual([], current_catalog)
+        self.assertEqual("approved", history_catalog[0]["status"])
+        self.assertEqual("2025-06-15", history_catalog[0]["repealed_at"])
+        self.assertFalse(history_catalog[0]["is_current"])
+        self.assertEqual("2025-06-15", stored_repealed_at)
+        self.assertEqual(0, stored_is_current)
+
+    def test_legacy_index_without_repealed_at_column_remains_readable(self) -> None:
+        record = _record(
+            "doc-legacy-lifecycle",
+            "legacy-lifecycle-article",
+            regulation_no="4-4-3",
+            regulation_title="구형 수명주기 규정",
+            article_no="제1조",
+            article_title="목적",
+            text="구형호환 수명주기 본문",
+            revision_date="2020-01-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, [record])
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+            connection = sqlite3.connect(index_path)
+            try:
+                connection.execute(
+                    "ALTER TABLE regulation_versions DROP COLUMN repealed_at"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="구형 수명주기 규정",
+                regulation_no="4-4-3",
+            )
+            catalog = list_indexed_regulations(
+                index_path,
+                profile_id="institution-a",
+            )
+            page, total = page_indexed_regulations(
+                index_path,
+                profile_id="institution-a",
+            )
+            toc = regulation_toc(
+                index_path,
+                regulation_unit_id=unit_id,
+            )
+            articles = load_article_records(
+                index_path,
+                vector_path,
+                regulation_unit_id=unit_id,
+                article_no="제1조",
+            )
+            results, trace = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="구형호환",
+                top_k=5,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(1, len(catalog))
+        self.assertEqual("", catalog[0]["repealed_at"])
+        self.assertEqual(1, total)
+        self.assertEqual("doc-legacy-lifecycle", page[0]["document_id"])
+        self.assertIsNotNone(toc["regulation"])
+        self.assertEqual(
+            ["legacy-lifecycle-article"],
+            [item["chunk_id"] for item in articles],
+        )
+        self.assertEqual(
+            ["legacy-lifecycle-article"],
+            [item["chunk_id"] for _score, item in results],
+        )
+        self.assertEqual(
+            "",
+            trace["candidate_regulations"][0]["repealed_at"],
+        )
 
     def test_future_effective_revision_does_not_displace_current_and_history_paginates_versions(self) -> None:
         old = _record(
@@ -1953,6 +2738,399 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual("item", by_label["제1호"]["node_type"])
         self.assertGreater(by_label["제1호"]["depth"], by_label["제1항"]["depth"])
 
+
+    def test_search_batch_reads_vector_candidates_with_one_open(self) -> None:
+        records = [
+            _record(
+                "doc-batch",
+                f"batch-chunk-{index}",
+                regulation_no="7-1",
+                regulation_title="Batch Read Regulation",
+                article_no=f"Article {index}",
+                article_title="Batch evidence",
+                text=f"batchmarker approved evidence {index}",
+                revision_date="2026-07-01",
+            )
+            for index in range(1, 5)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            original_open = Path.open
+            with patch.object(
+                Path,
+                "open",
+                autospec=True,
+                side_effect=original_open,
+            ) as open_mock:
+                results, _ = search_hierarchical_records(
+                    index_path,
+                    vector_path,
+                    query="batchmarker",
+                    top_k=4,
+                    profile_id="institution-a",
+                )
+
+            loaded = load_record_by_chunk(
+                index_path,
+                vector_path,
+                document_id="doc-batch",
+                chunk_id="batch-chunk-1",
+            )
+
+        self.assertEqual(1, open_mock.call_count)
+        self.assertEqual(
+            {record["chunk_id"] for record in records},
+            {record["chunk_id"] for _score, record in results},
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual("batch-chunk-1", loaded["chunk_id"])
+
+    def test_search_reranks_only_loaded_hierarchy_candidates_with_bm25(self) -> None:
+        records = [
+            _record(
+                "doc-rerank",
+                "candidate-a",
+                regulation_no="7-2",
+                regulation_title="Candidate Rerank Regulation",
+                article_no="Article 1",
+                article_title="Common evidence",
+                text="common evidence first candidate",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-rerank",
+                "candidate-b",
+                regulation_no="7-2",
+                regulation_title="Candidate Rerank Regulation",
+                article_no="Article 2",
+                article_title="Common evidence",
+                text="common evidence target candidate",
+                revision_date="2026-07-01",
+            ),
+            _record(
+                "doc-denied",
+                "candidate-denied",
+                regulation_no="9-9",
+                regulation_title="Denied Regulation",
+                article_no="Article 1",
+                article_title="Common evidence",
+                text="common evidence denied candidate",
+                revision_date="2026-07-01",
+            ),
+        ]
+
+        class TargetIndex:
+            def score_fast_query(
+                self,
+                _query: str,
+                *,
+                allowed_ids: set[str] | None = None,
+            ) -> dict[str, float]:
+                self.allowed_ids = allowed_ids
+                return {
+                    "doc-rerank:candidate-b": 100.0,
+                    "doc-denied:candidate-denied": 1000.0,
+                }
+
+        rerank_index = TargetIndex()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            results, trace = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="common evidence",
+                top_k=1,
+                profile_id="institution-a",
+                allowed_unit_ids={
+                    regulation_unit_id_for(
+                        profile_id="institution-a",
+                        regulation_title="Candidate Rerank Regulation",
+                        regulation_no="7-2",
+                    )
+                },
+                rerank_index=rerank_index,  # type: ignore[arg-type]
+            )
+
+        self.assertEqual("candidate-b", results[0][1]["chunk_id"])
+        self.assertEqual("verified_bm25_fast_query", trace["candidate_reranker"])
+        self.assertEqual(
+            {"doc-rerank:candidate-a", "doc-rerank:candidate-b"},
+            rerank_index.allowed_ids,
+        )
+        self.assertNotEqual("doc-denied", results[0][1]["document_id"])
+
+    def test_article_locator_prefix_survives_distractors_without_acl_leak(self) -> None:
+        allowed_title = "허용 채용 규정"
+        allowed_records = [
+            _record(
+                "doc-allowed-prefix",
+                f"distractor-{index:02d}",
+                regulation_no="7-3",
+                regulation_title=allowed_title,
+                article_no=f"제{index + 20}조",
+                article_title="적용 대상",
+                text="적용 대상 일반 설명",
+                revision_date="2026-07-01",
+            )
+            for index in range(61)
+        ]
+        allowed_records.append(
+            _record(
+                "doc-allowed-prefix",
+                "target-prefix",
+                regulation_no="7-3",
+                regulation_title=allowed_title,
+                article_no="제11조의3",
+                article_title="제11조의3의 적용 대상",
+                text="제11조의3의 적용 대상 특례",
+                revision_date="2026-07-01",
+                hierarchy_path="허용 채용 규정 > 제11조의3의 적용 대상",
+            )
+        )
+        denied_record = _record(
+            "doc-denied-prefix",
+            "denied-prefix",
+            regulation_no="9-9",
+            regulation_title="비공개 채용 규정",
+            article_no="제11조의3",
+            article_title="제11조의3의 적용 대상",
+            text="제11조의3의 적용 대상 비공개 정답",
+            revision_date="2026-07-01",
+            hierarchy_path="비공개 채용 규정 > 제11조의3의 적용 대상",
+        )
+        records = [*allowed_records, denied_record]
+        allowed_unit_id = regulation_unit_id_for(
+            profile_id="institution-a",
+            regulation_title=allowed_title,
+            regulation_no="7-3",
+        )
+        denied_unit_id = regulation_unit_id_for(
+            profile_id="institution-a",
+            regulation_title="비공개 채용 규정",
+            regulation_no="9-9",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            results, trace = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="제11조의3 적용 대상",
+                top_k=5,
+                profile_id="institution-a",
+                allowed_unit_ids={allowed_unit_id},
+            )
+
+        self.assertEqual("target-prefix", results[0][1]["chunk_id"])
+        self.assertNotIn(
+            "denied-prefix",
+            {record["chunk_id"] for _score, record in results},
+        )
+        self.assertEqual(
+            {allowed_unit_id},
+            {
+                item["regulation_unit_id"]
+                for item in trace["candidate_regulations"]
+            },
+        )
+        self.assertNotIn(
+            denied_unit_id,
+            {
+                item["regulation_unit_id"]
+                for item in trace["candidate_regulations"]
+            },
+        )
+
+    def test_batch_read_drops_only_rows_with_invalid_vector_payloads(self) -> None:
+        chunk_ids = (
+            "valid",
+            "negative-offset",
+            "short-read",
+            "invalid-utf8",
+            "invalid-json",
+        )
+        records = [
+            _record(
+                "doc-mixed",
+                chunk_id,
+                regulation_no="7-2",
+                regulation_title="Mixed Offset Regulation",
+                article_no=f"Article {index}",
+                article_title="Mixed evidence",
+                text=f"mixedmarker approved evidence {index}",
+                revision_date="2026-07-01",
+            )
+            for index, chunk_id in enumerate(chunk_ids, start=1)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            with vector_path.open("ab") as handle:
+                invalid_utf8_offset = handle.tell()
+                invalid_utf8_payload = b"\xff\n"
+                handle.write(invalid_utf8_payload)
+                invalid_json_offset = handle.tell()
+                invalid_json_payload = b"{not-json}\n"
+                handle.write(invalid_json_payload)
+                end_offset = handle.tell()
+
+            connection = sqlite3.connect(index_path)
+            try:
+                connection.execute(
+                    "UPDATE chunks SET vector_offset=-1 "
+                    "WHERE chunk_id='negative-offset'"
+                )
+                connection.execute(
+                    "UPDATE chunks SET vector_offset=?, vector_length=? "
+                    "WHERE chunk_id='short-read'",
+                    (end_offset, 64),
+                )
+                connection.execute(
+                    "UPDATE chunks SET vector_offset=?, vector_length=? "
+                    "WHERE chunk_id='invalid-utf8'",
+                    (invalid_utf8_offset, len(invalid_utf8_payload)),
+                )
+                connection.execute(
+                    "UPDATE chunks SET vector_offset=?, vector_length=? "
+                    "WHERE chunk_id='invalid-json'",
+                    (invalid_json_offset, len(invalid_json_payload)),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            results, _ = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="mixedmarker",
+                top_k=len(records),
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(
+            ["valid"],
+            [record["chunk_id"] for _score, record in results],
+        )
+
+    def test_batch_read_rejects_identity_and_content_hash_tampering(self) -> None:
+        chunk_ids = ("valid", "identity-tampered", "content-tampered")
+        records = [
+            _record(
+                "doc-tamper",
+                chunk_id,
+                regulation_no="7-3",
+                regulation_title="Vector Identity Regulation",
+                article_no=f"Article {index}",
+                article_title="Identity evidence",
+                text=f"tampermarker approved evidence {index}",
+                revision_date="2026-07-01",
+            )
+            for index, chunk_id in enumerate(chunk_ids, start=1)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+
+            identity_tampered = json.loads(json.dumps(records[1]))
+            identity_tampered["chunk_id"] = "different-chunk-id"
+            content_tampered = json.loads(json.dumps(records[2]))
+            content_tampered["text"] = "tampermarker modified without rehashing"
+            replacements: list[tuple[str, int, int]] = []
+            with vector_path.open("ab") as handle:
+                for chunk_id, record in (
+                    ("identity-tampered", identity_tampered),
+                    ("content-tampered", content_tampered),
+                ):
+                    payload = (
+                        json.dumps(
+                            record,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    offset = handle.tell()
+                    handle.write(payload)
+                    replacements.append((chunk_id, offset, len(payload)))
+
+            connection = sqlite3.connect(index_path)
+            try:
+                connection.executemany(
+                    "UPDATE chunks SET vector_offset=?, vector_length=? "
+                    "WHERE chunk_id=?",
+                    [
+                        (offset, length, chunk_id)
+                        for chunk_id, offset, length in replacements
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            results, _ = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="tampermarker",
+                top_k=len(records),
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(
+            ["valid"],
+            [record["chunk_id"] for _score, record in results],
+        )
 
     def test_body_search_ranks_stronger_bm25_match_first(self) -> None:
         records = [
