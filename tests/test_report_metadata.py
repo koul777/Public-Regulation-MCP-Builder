@@ -154,7 +154,9 @@ class ReportMetadataTests(unittest.TestCase):
 
     def test_source_state_file_set_drift_is_changed_during_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            # Windows runners may expose the temporary directory through an
+            # 8.3 alias while Path.resolve() expands it to the long form.
+            root = Path(tmp).resolve()
             _write_source_tree(
                 root,
                 [

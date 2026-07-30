@@ -1239,6 +1239,88 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("desktop_app_server_error = $SafeAppServerError", wizard)
         self.assertNotIn("desktop_app_server_error = $(if ($Report) { $Report.error", wizard)
 
+    def test_generated_installers_hash_files_without_powershell_utility_module(self) -> None:
+        config = build_mcp_client_config(
+            server_name="hash-contract-mcp",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+        )
+
+        scripts = {
+            "connect_wizard": config["quickstart"]["copy_paste"]["connect_wizard_ps"],
+            "claude_code": config["quickstart"]["copy_paste"]["claude_code_stdio_ps"],
+        }
+        for label, script in scripts.items():
+            with self.subTest(label=label):
+                self.assertEqual(1, script.count("function Get-McpFileSha256"))
+                self.assertIn("[System.Security.Cryptography.SHA256]::Create()", script)
+                self.assertIn("[System.IO.FileShare]::Read", script)
+                self.assertNotIn("Get-FileHash", script)
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell 5.1 hashing is Windows-specific.")
+    def test_generated_file_hash_helper_runs_without_powershell_modules(self) -> None:
+        powershell = shutil.which("powershell.exe")
+        if not powershell:
+            self.skipTest("Windows PowerShell 5.1 is not available.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload_path = root / "hash fixture" / "규정.txt"
+            payload_path.parent.mkdir()
+            payload = "module-independent hash\n".encode("utf-8")
+            payload_path.write_bytes(payload)
+            probe_path = root / "probe.ps1"
+            helper = "\n".join(
+                mcp_config_generator._powershell_file_sha256_function_lines()
+            )
+            probe_path.write_text(
+                "param([string]$LiteralPath)\n"
+                '$ErrorActionPreference = "Stop"\n'
+                '$env:PSModulePath = ""\n'
+                + helper
+                + "\nGet-McpFileSha256 $LiteralPath\n",
+                encoding="utf-8-sig",
+            )
+
+            completed = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(probe_path),
+                    str(payload_path),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            missing = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(probe_path),
+                    str(root / "missing.txt"),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), completed.stdout.strip())
+        self.assertNotEqual(0, missing.returncode, missing.stdout + missing.stderr)
+
     @unittest.skipUnless(os.name == "nt", "Codex PATH precedence is Windows-specific.")
     def test_generated_codex_resolver_prefers_working_path_command_over_app_cache(self) -> None:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
