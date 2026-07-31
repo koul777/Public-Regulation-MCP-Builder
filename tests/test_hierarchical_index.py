@@ -3226,6 +3226,31 @@ class HierarchicalIndexTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             loaded["metadata"]["article_title"] = "Changed"
 
+    def test_verified_vector_record_cache_does_not_refreeze_frozen_record(
+        self,
+    ) -> None:
+        frozen = hierarchical_index._freeze_verified_vector_record(
+            {"document_id": "doc-a", "metadata": {"tags": ["one"]}}
+        )
+
+        with patch.object(
+            hierarchical_index,
+            "_freeze_verified_vector_record",
+            side_effect=AssertionError("already frozen record was frozen again"),
+        ):
+            hierarchical_index._verified_vector_record_cache_put(
+                ("verified", "row"),
+                frozen,
+                encoded_size=32,
+            )
+
+        self.assertIs(
+            frozen,
+            hierarchical_index._verified_vector_record_cache_get(
+                ("verified", "row")
+            ),
+        )
+
     def test_verified_vector_record_cache_key_binds_every_identity_dimension(
         self,
     ) -> None:
