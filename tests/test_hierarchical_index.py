@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.mcp_server import regulation_tools
+from app.retrieval import hierarchical_index as hierarchical_index_module
 from app.ingestion.vector_adapter import stable_content_hash
 from app.core.config import Settings
 from app.mcp_server.regulation_tools import (
@@ -924,6 +925,118 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual({"doc-profile-a", "doc-profile-b"}, profile_document_ids)
         self.assertEqual(set(), other_profile_document_ids)
         self.assertEqual("institution-a", summary["profile_id"])
+
+    def test_indexed_chunk_topology_cache_reuses_sqlite_scan_across_callers(
+        self,
+    ) -> None:
+        record = _record(
+            "doc-cache-a",
+            "chunk-cache-a",
+            regulation_no="3-3",
+            regulation_title="Cache Topology Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="cache-backed topology row",
+            revision_date="2026-07-01",
+        )
+        visible_signature = {
+            (
+                str(record["document_id"]),
+                str(record["chunk_id"]),
+                str(record["content_hash"]),
+            )
+        }
+        expected_unit_id = regulation_unit_id_for(
+            profile_id="institution-a",
+            regulation_title="Cache Topology Regulation",
+            regulation_no="3-3",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            with patch.object(
+                hierarchical_index_module,
+                "_connect_readonly",
+                wraps=hierarchical_index_module._connect_readonly,
+            ) as readonly_connect:
+                document_ids = indexed_document_ids(
+                    index_path,
+                    profile_id="institution-a",
+                )
+                visible_unit_ids = fully_visible_regulation_unit_ids(
+                    index_path,
+                    visible_record_signatures=visible_signature,
+                    profile_id="institution-a",
+                )
+
+        self.assertEqual({"doc-cache-a"}, document_ids)
+        self.assertEqual({expected_unit_id}, visible_unit_ids)
+        self.assertEqual(1, readonly_connect.call_count)
+
+    def test_indexed_chunk_topology_cache_invalidates_after_rebuild(self) -> None:
+        first_records = [
+            _record(
+                "doc-cache-first",
+                "chunk-cache-first",
+                regulation_no="3-4",
+                regulation_title="Cache Invalidate Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="first indexed record",
+                revision_date="2026-07-01",
+            )
+        ]
+        second_records = first_records + [
+            _record(
+                "doc-cache-second",
+                "chunk-cache-second",
+                regulation_no="3-4",
+                regulation_title="Cache Invalidate Regulation",
+                article_no="Article 2",
+                article_title="Scope",
+                text="second indexed record",
+                revision_date="2026-07-01",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                first_records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            with patch.object(
+                hierarchical_index_module,
+                "_connect_readonly",
+                wraps=hierarchical_index_module._connect_readonly,
+            ) as readonly_connect:
+                first_document_ids = indexed_document_ids(
+                    index_path,
+                    profile_id="institution-a",
+                )
+                build_hierarchical_runtime_index(
+                    index_path,
+                    second_records,
+                    tenant_id="tenant-a",
+                    profile_id="institution-a",
+                )
+                second_document_ids = indexed_document_ids(
+                    index_path,
+                    profile_id="institution-a",
+                )
+
+        self.assertEqual({"doc-cache-first"}, first_document_ids)
+        self.assertEqual(
+            {"doc-cache-first", "doc-cache-second"},
+            second_document_ids,
+        )
+        self.assertEqual(2, readonly_connect.call_count)
 
     def test_build_rejects_mixed_tenant_records(self) -> None:
         records = [

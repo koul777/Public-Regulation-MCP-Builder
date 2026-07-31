@@ -59,6 +59,22 @@ _KOREAN_QUERY_SUFFIXES = (
     "\ub3c4",
     "\ub9cc",
 )
+_INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK = threading.Lock()
+_INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRIES = 8
+
+
+@dataclass(frozen=True)
+class _IndexedChunkTopology:
+    document_ids: frozenset[str]
+    unit_keys: dict[str, frozenset[tuple[str, str]]]
+    unit_signatures: dict[str, frozenset[tuple[str, str, str]]]
+    invalid_signature_units: frozenset[str]
+
+
+_INDEXED_CHUNK_TOPOLOGY_CACHE: OrderedDict[
+    tuple[Path, tuple[int, int, int, int], str],
+    _IndexedChunkTopology,
+] = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -126,6 +142,91 @@ def _default_as_of_date() -> str:
 def hierarchical_index_path(data_dir: str | Path) -> Path:
     """Return the conventional institution hierarchy index path."""
     return Path(data_dir) / HIERARCHICAL_INDEX_RELATIVE_PATH
+
+
+def _path_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns, stat.st_ino)
+
+
+def _indexed_chunk_topology(
+    path: str | Path,
+    *,
+    profile_id: str | None = None,
+) -> _IndexedChunkTopology:
+    index_path = Path(path)
+    normalized_profile_id = str(profile_id or "").strip().casefold()
+    signature = _path_signature(index_path)
+    cache_key: tuple[Path, tuple[int, int, int, int], str] | None = None
+    if signature is not None:
+        cache_key = (index_path.resolve(), signature, normalized_profile_id)
+        with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            cached = _INDEXED_CHUNK_TOPOLOGY_CACHE.get(cache_key)
+            if cached is not None:
+                _INDEXED_CHUNK_TOPOLOGY_CACHE.move_to_end(cache_key)
+                return cached
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if profile_id:
+        clauses.append("lower(v.profile_id)=lower(?)")
+        params.append(profile_id)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _connect_readonly(index_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT c.unit_id, c.document_id, c.chunk_id, c.content_hash
+            FROM chunks c
+            JOIN regulation_versions v ON v.version_id=c.version_id
+            {where_sql}
+            """,
+            params,
+        ).fetchall()
+
+    document_ids: set[str] = set()
+    unit_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    unit_signatures: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
+    invalid_signature_units: set[str] = set()
+    for row in rows:
+        unit_id = str(row["unit_id"] or "")
+        document_id = str(row["document_id"] or "")
+        chunk_id = str(row["chunk_id"] or "")
+        content_hash = str(row["content_hash"] or "")
+        if document_id:
+            document_ids.add(document_id)
+        if not unit_id:
+            continue
+        unit_keys[unit_id].add((document_id, chunk_id))
+        if not document_id or not chunk_id or not content_hash:
+            invalid_signature_units.add(unit_id)
+            continue
+        unit_signatures[unit_id].add((document_id, chunk_id, content_hash))
+
+    topology = _IndexedChunkTopology(
+        document_ids=frozenset(document_ids),
+        unit_keys={
+            unit_id: frozenset(indexed_keys)
+            for unit_id, indexed_keys in unit_keys.items()
+        },
+        unit_signatures={
+            unit_id: frozenset(indexed_signatures)
+            for unit_id, indexed_signatures in unit_signatures.items()
+        },
+        invalid_signature_units=frozenset(invalid_signature_units),
+    )
+    if cache_key is not None:
+        with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            _INDEXED_CHUNK_TOPOLOGY_CACHE[cache_key] = topology
+            _INDEXED_CHUNK_TOPOLOGY_CACHE.move_to_end(cache_key)
+            while (
+                len(_INDEXED_CHUNK_TOPOLOGY_CACHE)
+                > _INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRIES
+            ):
+                _INDEXED_CHUNK_TOPOLOGY_CACHE.popitem(last=False)
+    return topology
 
 
 def normalize_regulation_title(value: object) -> str:
@@ -1431,27 +1532,12 @@ def indexed_document_ids(
 ) -> set[str]:
     """Return distinct non-empty document IDs represented by indexed chunks."""
 
-    clauses: list[str] = []
-    params: list[Any] = []
-    if profile_id:
-        clauses.append("lower(v.profile_id)=lower(?)")
-        params.append(profile_id)
-    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    with _connect_readonly(Path(path)) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT DISTINCT c.document_id
-            FROM chunks c
-            JOIN regulation_versions v ON v.version_id=c.version_id
-            {where_sql}
-            """,
-            params,
-        ).fetchall()
-    return {
-        document_id
-        for row in rows
-        if (document_id := str(row["document_id"] or ""))
-    }
+    return set(
+        _indexed_chunk_topology(
+            path,
+            profile_id=profile_id,
+        ).document_ids
+    )
 
 
 def fully_visible_regulation_unit_ids(
@@ -1472,60 +1558,25 @@ def fully_visible_regulation_unit_ids(
         raise ValueError(
             "provide exactly one of visible_record_keys or visible_record_signatures"
         )
-
-    clauses: list[str] = []
-    params: list[Any] = []
-    if profile_id:
-        clauses.append("lower(v.profile_id)=lower(?)")
-        params.append(profile_id)
-    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    with _connect_readonly(Path(path)) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT c.unit_id, c.document_id, c.chunk_id, c.content_hash
-            FROM chunks c
-            JOIN regulation_versions v ON v.version_id=c.version_id
-            {where_sql}
-            """,
-            params,
-        ).fetchall()
+    topology = _indexed_chunk_topology(
+        path,
+        profile_id=profile_id,
+    )
     if visible_record_signatures is not None:
-        indexed_signatures_by_unit: dict[
-            str, set[tuple[str, str, str]]
-        ] = defaultdict(set)
-        invalid_signature_units: set[str] = set()
-        for row in rows:
-            unit_id = str(row["unit_id"] or "")
-            document_id = str(row["document_id"] or "")
-            chunk_id = str(row["chunk_id"] or "")
-            content_hash = str(row["content_hash"] or "")
-            if not unit_id:
-                continue
-            if not document_id or not chunk_id or not content_hash:
-                invalid_signature_units.add(unit_id)
-                continue
-            indexed_signatures_by_unit[unit_id].add(
-                (document_id, chunk_id, content_hash)
-            )
         return {
             unit_id
-            for unit_id, indexed_signatures in indexed_signatures_by_unit.items()
+            for unit_id, indexed_signatures in topology.unit_signatures.items()
             if (
-                unit_id not in invalid_signature_units
+                unit_id not in topology.invalid_signature_units
                 and indexed_signatures
                 and indexed_signatures.issubset(visible_record_signatures)
             )
         }
 
     assert visible_record_keys is not None
-    indexed_keys_by_unit: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    for row in rows:
-        indexed_keys_by_unit[str(row["unit_id"] or "")].add(
-            (str(row["document_id"] or ""), str(row["chunk_id"] or ""))
-        )
     return {
         unit_id
-        for unit_id, indexed_keys in indexed_keys_by_unit.items()
+        for unit_id, indexed_keys in topology.unit_keys.items()
         if unit_id and indexed_keys and indexed_keys.issubset(visible_record_keys)
     }
 
