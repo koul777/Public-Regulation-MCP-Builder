@@ -422,6 +422,31 @@ except BaseException:
     return base64.b64encode(code.encode("utf-8")).decode("ascii")
 
 
+def _powershell_file_sha256_function_lines() -> list[str]:
+    """Return a module-independent SHA-256 helper for generated installers."""
+
+    return [
+        "function Get-McpFileSha256([string]$LiteralPath) {",
+        "  $Stream = [System.IO.File]::Open(",
+        "    $LiteralPath,",
+        "    [System.IO.FileMode]::Open,",
+        "    [System.IO.FileAccess]::Read,",
+        "    [System.IO.FileShare]::Read",
+        "  )",
+        "  try {",
+        "    $Hasher = [System.Security.Cryptography.SHA256]::Create()",
+        "    try {",
+        '      return -join ($Hasher.ComputeHash($Stream) | ForEach-Object { $_.ToString("x2") })',
+        "    } finally {",
+        "      $Hasher.Dispose()",
+        "    }",
+        "  } finally {",
+        "    $Stream.Dispose()",
+        "  }",
+        "}",
+    ]
+
+
 def _powershell_runtime_identity_validator_lines() -> list[str]:
     modules_literal = _powershell_array_literal(RUNTIME_IDENTITY_MODULES)
     verifier_literal = _powershell_single_quoted_json(_runtime_identity_verifier_base64())
@@ -5348,6 +5373,7 @@ def _connect_wizard_script(
 )
 
 $ErrorActionPreference = "Stop"
+__FILE_SHA256_FUNCTION__
 $BundleDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerName = "__SERVER_NAME__"
 $EmbeddedClaudeDesktopConfigBase64 = "__EMBEDDED_CLAUDE_DESKTOP_CONFIG_BASE64__"
@@ -5413,8 +5439,8 @@ function Restore-FileAtomically([string]$BackupPath, [string]$LiteralPath) {
     } else {
       Move-Item -LiteralPath $TemporaryPath -Destination $LiteralPath
     }
-    $ExpectedHash = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash
-    $ActualHash = (Get-FileHash -LiteralPath $LiteralPath -Algorithm SHA256).Hash
+    $ExpectedHash = Get-McpFileSha256 $BackupPath
+    $ActualHash = Get-McpFileSha256 $LiteralPath
     if (-not [string]::Equals($ExpectedHash, $ActualHash, [System.StringComparison]::OrdinalIgnoreCase)) {
       throw "Restored file hash does not match the prior backup."
     }
@@ -6794,7 +6820,7 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
   }).TrimEnd()
   $Output = if ([string]::IsNullOrWhiteSpace($Clean)) { $Snippet } else { $Clean + [Environment]::NewLine + [Environment]::NewLine + $Snippet }
   Write-AtomicUtf8NoBom $TargetPath ($Output + [Environment]::NewLine)
-  $InstalledConfigFingerprint = "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  $InstalledConfigFingerprint = "sha256:" + (Get-McpFileSha256 $TargetPath)
   $DirectRegistrationUpdatedAtUtc = [DateTimeOffset]::UtcNow
   $Written = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8
   $InstalledBlock = ""
@@ -6824,7 +6850,7 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
     throw "The installed $ConsumerName MCP config could not complete its initialize/tools/search/fetch transport contract."
   }
   $PostSmokeConfigFingerprint = if (Test-Path -LiteralPath $TargetPath -PathType Leaf) {
-    "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    "sha256:" + (Get-McpFileSha256 $TargetPath)
   } else {
     $null
   }
@@ -7076,7 +7102,7 @@ function Assert-ClaudeDesktopInstalledContract(
       throw "Claude Desktop config contract verification found a mismatched environment value for ${ServerName}: $($ExpectedEnvProperty.Name)."
     }
   }
-  $ActualFingerprint = "sha256:" + (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  $ActualFingerprint = "sha256:" + (Get-McpFileSha256 $TargetPath)
   if (-not [string]::IsNullOrWhiteSpace($ExpectedFingerprint) -and
       -not [string]::Equals($ActualFingerprint, $ExpectedFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Claude Desktop config changed after its installed launch contract was verified."
@@ -7103,9 +7129,9 @@ function Install-ClaudeDesktopConfig {
   $BackupConfigFingerprint = $null
   if ($HadExistingConfig) {
     $BackupPath = "$TargetPath.bak-$(Get-Date -Format yyyyMMddHHmmssfff)"
-    $OriginalConfigFingerprint = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
+    $OriginalConfigFingerprint = Get-McpFileSha256 $TargetPath
     Copy-Item -LiteralPath $TargetPath -Destination $BackupPath
-    $BackupConfigFingerprint = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash
+    $BackupConfigFingerprint = Get-McpFileSha256 $BackupPath
     if (-not [string]::Equals($OriginalConfigFingerprint, $BackupConfigFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
       throw "Claude Desktop config backup hash mismatch; installation was not attempted."
     }
@@ -7216,7 +7242,7 @@ function Install-ClaudeDesktopConfig {
     try {
       if ($HadExistingConfig -and $BackupPath -and (Test-Path -LiteralPath $BackupPath)) {
         Restore-FileAtomically $BackupPath $TargetPath
-        $RestoredConfigFingerprint = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
+        $RestoredConfigFingerprint = Get-McpFileSha256 $TargetPath
         if (-not [string]::Equals($RestoredConfigFingerprint, $BackupConfigFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
           throw "Restored Claude Desktop config hash does not match the pre-install backup."
         }
@@ -7396,7 +7422,7 @@ function Show-Codex {
         Run-ChatGptDesktopRecognitionObservation (Get-CodexConfigPath)
         $PostProbeStatus = Read-JsonFile "bundle_status.json"
         $CurrentConfigFingerprint = if (Test-Path -LiteralPath (Get-CodexConfigPath)) {
-          "sha256:" + (Get-FileHash -LiteralPath (Get-CodexConfigPath) -Algorithm SHA256).Hash.ToLowerInvariant()
+          "sha256:" + (Get-McpFileSha256 (Get-CodexConfigPath))
         } else {
           $null
         }
@@ -7562,6 +7588,10 @@ if ($LocalConnectionTargets -contains $Target) {
         script.replace("__SERVER_NAME__", server_name)
         .replace("__EMBEDDED_CLAUDE_DESKTOP_CONFIG_BASE64__", embedded_config_base64)
         .replace("__EMBEDDED_CHATGPT_DESKTOP_CONFIG_BASE64__", embedded_config_base64)
+        .replace(
+            "__FILE_SHA256_FUNCTION__",
+            "\n".join(_powershell_file_sha256_function_lines()),
+        )
         .replace(
             "__LOCAL_STDIO_DOCTOR_ARGS__",
             _powershell_array_literal(local_stdio_doctor_args or []),
@@ -8505,6 +8535,7 @@ def _powershell_claude_code_stdio_bundle_script(
 ) -> str:
     lines: list[str] = [
         '$ErrorActionPreference = "Stop"',
+        *_powershell_file_sha256_function_lines(),
         *_powershell_bundle_data_dir_lines(),
         *_powershell_bundle_runtime_module_resolver_lines(),
         '$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"',
@@ -8557,7 +8588,7 @@ def _powershell_claude_code_stdio_bundle_script(
         '  if (-not [string]::Equals([string]$InstalledServer.type, "stdio", [System.StringComparison]::Ordinal)) { throw "Claude Code user-scope entry has the wrong transport type." }',
         '  if (-not [string]::Equals([string]$InstalledServer.command, "powershell.exe", [System.StringComparison]::OrdinalIgnoreCase)) { throw "Claude Code user-scope entry has the wrong command." }',
         '  if (-not (Test-ExactClaudeMcpArguments @($InstalledServer.args) $ExpectedArgs)) { throw "Claude Code user-scope entry has incomplete, duplicated, reordered, or mismatched arguments." }',
-        '  return "sha256:" + (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()',
+        '  return "sha256:" + (Get-McpFileSha256 $ConfigPath)',
         '}',
         'function Restore-ClaudeConfigAtomically([string]$BackupPath, [string]$TargetPath) {',
         '  $Parent = Split-Path -Parent $TargetPath',
@@ -8567,7 +8598,7 @@ def _powershell_claude_code_stdio_bundle_script(
         '    Copy-Item -LiteralPath $BackupPath -Destination $TemporaryPath -Force',
         '    if (Test-Path -LiteralPath $TargetPath) { [System.IO.File]::Replace($TemporaryPath, $TargetPath, $ReplaceBackupPath, $true) }',
         '    else { Move-Item -LiteralPath $TemporaryPath -Destination $TargetPath }',
-        '    if ((Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash) { throw "Claude Code config rollback hash mismatch." }',
+        '    if ((Get-McpFileSha256 $BackupPath) -ne (Get-McpFileSha256 $TargetPath)) { throw "Claude Code config rollback hash mismatch." }',
         '  } finally {',
         '    if (Test-Path -LiteralPath $TemporaryPath) { Remove-Item -LiteralPath $TemporaryPath -Force }',
         '    if (Test-Path -LiteralPath $ReplaceBackupPath) { Remove-Item -LiteralPath $ReplaceBackupPath -Force }',
@@ -8592,9 +8623,9 @@ def _powershell_claude_code_stdio_bundle_script(
         '  $ClaudeConfigExisted = Test-Path -LiteralPath $ClaudeUserConfig -PathType Leaf',
         '  if ($ClaudeConfigExisted) { $ClaudeConfigBackup = Join-Path (Split-Path -Parent $ClaudeUserConfig) (".claude.{0}.{1}.transaction-bak" -f $PID, [Guid]::NewGuid().ToString("N")) }',
         '  if ($ClaudeConfigExisted) {',
-        '    $ClaudeOriginalConfigFingerprint = (Get-FileHash -LiteralPath $ClaudeUserConfig -Algorithm SHA256).Hash',
+        '    $ClaudeOriginalConfigFingerprint = Get-McpFileSha256 $ClaudeUserConfig',
         '    Copy-Item -LiteralPath $ClaudeUserConfig -Destination $ClaudeConfigBackup -Force',
-        '    $ClaudeConfigBackupFingerprint = (Get-FileHash -LiteralPath $ClaudeConfigBackup -Algorithm SHA256).Hash',
+        '    $ClaudeConfigBackupFingerprint = Get-McpFileSha256 $ClaudeConfigBackup',
         '    if (-not [string]::Equals($ClaudeOriginalConfigFingerprint, $ClaudeConfigBackupFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Claude Code user config backup hash mismatch; registration was not attempted." }',
         '  }',
         '  $ClaudeMutationStarted = $true',
