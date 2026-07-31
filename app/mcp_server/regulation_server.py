@@ -10,7 +10,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp import FastMCP
 
-from app.core.input_limits import (
+from app.core.mcp_input_schemas import (
     McpArticleNo,
     McpDepartmentIds,
     McpIdentifier,

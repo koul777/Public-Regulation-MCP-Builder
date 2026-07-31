@@ -121,6 +121,40 @@ flat 저장을 검사할 때는 위 명령의 `--tenant-storage-isolation`만 `-
 
 따라서 벤치마크 자체가 API audit event나 RAG trace 운영 기록을 추가하지 않는다. 성능 보고서의 `trace_timing_ms`는 응답에 이미 포함된 메모리상의 timing metadata이며 운영 trace 파일이 아니다.
 
+## 검증된 읽기 경로의 성능 불변조건
+
+MCP 검색·조회 성능을 높일 때 승인 철회나 tenant/profile 경계 검사를 TTL cache로 늦추지 않는다. 현재 검증형 hierarchy 경로는 다음 불변조건을 유지한다.
+
+- 요청마다 manifest, hierarchy index, vector, BM25, 승인 snapshot의 identity를 하나의 read context에 고정한다. 이 context는 다음 요청에 재사용하지 않는다.
+- materialization 뒤 같은 identity를 다시 확인한다. 중간에 runtime, 승인 journal, ACL, chunk, sidecar, BM25가 바뀌면 계산한 결과를 반환하지 않는다.
+- 재사용 가능한 visibility·record cache에는 runtime identity와 tenant/profile/auth scope가 포함된다. cache hit 뒤에도 현재 요청의 role, department, security 범위를 다시 적용한다.
+- hierarchy postflight가 실패해 flat 검색으로 전환할 때도 profile topology를 검색 전후에 다시 확인한다. 생략된 profile이 다중 profile로 바뀌거나 단일 profile이 교체되면 fail-closed 한다.
+- 승인 파일의 content signature는 프로세스 전체에서 최대 4개 worker만 사용하고, 같은 파일·같은 identity의 동시 계산은 single-flight로 합친다. 읽기 전후 file identity가 다르면 hash를 cache하지 않는다.
+- 경량 길이·형식 검사는 Pydantic을 import하지 않는 `app.core.input_limits`에 둔다. MCP/API의 공개 `Annotated`·`Field` schema는 별도 모듈에 두되 기존 최소·최대값과 JSON schema 계약은 바꾸지 않는다.
+
+이 구조에서 prevalidated identity는 같은 요청의 바깥쪽 postflight가 최종 변경 검사를 수행할 때만 전달할 수 있다. 호출자가 임의 path나 오래된 signature를 넣을 수 있는 범용 우회로를 만들거나, directory mtime·TTL만으로 승인 상태를 신뢰해서는 안 된다. 또한 runtime manifest가 strict reindex를 요구하면 성능 최적화를 이유로 해당 blocker를 완화하지 않는다.
+
+### 2026-07-31 개발 비교 기록
+
+다음 값은 같은 장비·승인 snapshot·28개 비공개 query spec으로 공개 `v1.2.14` clean source와 후보 source state를 번갈아 세 쌍 실행한 개발 증거다. 식별자와 원시 질의는 포함하지 않는다. 각 값은 세 clean 실행과 세 후보 실행에서 얻은 p95 또는 batch 값의 중앙값이다. 이 보고서만으로 호스트 상태의 영향을 분리할 수 없으므로 절대 지연을 릴리스 SLO로 사용하지 않고, 같은 시각에 교차 실행한 상대 차이만 개발 판단에 사용한다. 이 표는 exact-commit 릴리스 기준선이나 보호된 CI 승인을 대신하지 않는다.
+
+| 지표 | `v1.2.14` clean | 후보 중앙값 | 변화 |
+| --- | ---: | ---: | ---: |
+| fresh-process wall p95 | 2,790.116 ms | 1,949.441 ms | 30.1% 감소 |
+| fresh-process setup p95 | 891.809 ms | 245.151 ms | 72.5% 감소 |
+| cold search p95 | 837.227 ms | 699.328 ms | 16.5% 감소 |
+| warm search p95 | 152.483 ms | 155.762 ms | 2.2% 증가 |
+| 순차 search p95 | 160.979 ms | 159.139 ms | 1.1% 감소 |
+| 순차 fetch p95 | 157.075 ms | 114.852 ms | 26.9% 감소 |
+| 순차 total p95 | 322.310 ms | 271.196 ms | 15.9% 감소 |
+| 동시성 8 fetch p95 | 1,074.204 ms | 765.321 ms | 28.8% 감소 |
+| 동시성 8 task total p95 | 1,978.169 ms | 1,773.685 ms | 10.3% 감소 |
+| 동시성 8 batch | 15,594.634 ms | 13,499.939 ms | 13.4% 감소 |
+
+같은 비교에서 Recall@1/3/5는 각각 `0.416667/0.583333/0.625`, MRR은 `0.496528`, document Recall@1/3/5는 모두 `1.0`으로 유지됐다. no-evidence false-positive rate는 `0`, abstention rate는 `1.0`, 검색 오류는 `0`이었다. 성능 변화 전체를 한 최적화에 귀속하지 않으며, source-state fingerprint가 같은 보고서끼리만 통합 게이트에 사용한다.
+
+후속 후보로 cold approval-sidecar miss에서 content signature bundle을 반복 계산하는 경로가 있다. 최적화하더라도 sidecar payload 비교까지의 pre-signature만 공유하고, materialization 뒤 approval journal·repository chunk·sidecar의 fresh signature 검사는 남겨야 한다. 이 작업은 sidecar parse 직후 mutation, 동일 크기·mtime 복원 교체, 직접 파일 수정, custom loader 호환 회귀가 먼저 준비되기 전에는 적용하지 않는다.
+
 ## 반복 수 권장값
 
 개발 smoke와 품질 게이트의 목적을 구분한다.

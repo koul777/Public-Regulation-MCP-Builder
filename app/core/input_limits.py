@@ -1,9 +1,14 @@
+"""Dependency-light input budgets and direct-call validators.
+
+Keep this module independent of Pydantic so service-only imports do not load
+protocol schema machinery. Pydantic-aware MCP aliases live in
+``app.core.mcp_input_schemas``.
+"""
+
 from __future__ import annotations
 
 import math
-from typing import Annotated, Any, TypeAlias
-
-from pydantic import Field
+from typing import Any
 
 
 # Review requests may legitimately cover an institution-wide approval batch.  The
@@ -40,43 +45,6 @@ MAX_MCP_SCOPE_VALUE_CHARS = 256
 MAX_MCP_TOP_K = 20
 MAX_MCP_PAGE = 100_000
 MAX_MCP_PAGE_SIZE = 100
-
-
-McpQuery: TypeAlias = Annotated[
-    str,
-    Field(min_length=1, max_length=MAX_MCP_QUERY_CHARS),
-]
-McpResultId: TypeAlias = Annotated[
-    str,
-    Field(min_length=1, max_length=MAX_MCP_RESULT_ID_CHARS),
-]
-McpIdentifier: TypeAlias = Annotated[
-    str,
-    Field(min_length=1, max_length=MAX_MCP_IDENTIFIER_CHARS),
-]
-McpOptionalIdentifier: TypeAlias = Annotated[
-    str,
-    Field(max_length=MAX_MCP_IDENTIFIER_CHARS),
-]
-McpArticleNo: TypeAlias = Annotated[
-    str,
-    Field(min_length=1, max_length=MAX_MCP_ARTICLE_NO_CHARS),
-]
-McpScopeValue: TypeAlias = Annotated[
-    str,
-    Field(min_length=1, max_length=MAX_MCP_SCOPE_VALUE_CHARS),
-]
-McpSecurityLevels: TypeAlias = Annotated[
-    list[McpScopeValue],
-    Field(max_length=MAX_MCP_SECURITY_LEVELS),
-]
-McpDepartmentIds: TypeAlias = Annotated[
-    list[McpScopeValue],
-    Field(max_length=MAX_MCP_DEPARTMENT_IDS),
-]
-McpTopK: TypeAlias = Annotated[int, Field(ge=1, le=MAX_MCP_TOP_K)]
-McpPage: TypeAlias = Annotated[int, Field(ge=1, le=MAX_MCP_PAGE)]
-McpPageSize: TypeAlias = Annotated[int, Field(ge=1, le=MAX_MCP_PAGE_SIZE)]
 
 
 def require_bounded_text(

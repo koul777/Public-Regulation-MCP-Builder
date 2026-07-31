@@ -132,13 +132,13 @@ class _VerifiedHierarchicalRuntimeToken:
     hierarchy_source_content_hashes: str | None
 
     def is_current(self) -> bool:
+        manifest_identity = routes_rag.path_signature(self.manifest_path)
+        index_identity = routes_rag.path_signature(self.index_path)
+        vector_identity = routes_rag.path_signature(self.vector_path)
         return bool(
-            routes_rag.path_signature(self.manifest_path)
-            == self.manifest_identity
-            and routes_rag.path_signature(self.index_path)
-            == self.index_identity
-            and routes_rag.path_signature(self.vector_path)
-            == self.vector_identity
+            manifest_identity == self.manifest_identity
+            and index_identity == self.index_identity
+            and vector_identity == self.vector_identity
         )
 
     def matches_scope(
@@ -164,6 +164,70 @@ class _VerifiedHierarchicalRuntimeToken:
                 if path == relative_path
             ),
             None,
+        )
+
+
+@dataclass(frozen=True)
+class _VerifiedHierarchicalReadContext:
+    """One request's verified runtime identities and final TOCTOU check.
+
+    This object is deliberately never cached. Reusable data caches remain keyed
+    by the captured identities and request security scope, while every MCP call
+    performs its own preflight and one postflight after materialization.
+    """
+
+    settings: Settings
+    auth: AuthContext
+    profile_id: str | None
+    runtime_token: _VerifiedHierarchicalRuntimeToken
+    authorization_identity: tuple[Any, ...]
+    authorization_document_ids: tuple[str, ...] | None
+    repository_paths: RepositoryPathDescriptor | None = None
+    repository: Any | None = None
+    bm25_path: Path | None = None
+    bm25_identity: Any | None = None
+
+    @property
+    def hierarchy_paths(self) -> tuple[Path, Path]:
+        return (
+            self.runtime_token.index_path,
+            self.runtime_token.vector_path,
+        )
+
+    @property
+    def prevalidated_sidecar_identity(self) -> tuple[Any, ...] | None:
+        identity = self.authorization_identity
+        if (
+            len(identity) == 2
+            and identity[0] == "runtime_sidecar"
+            and isinstance(identity[1], tuple)
+        ):
+            return identity[1]
+        return None
+
+    def postflight_is_current(self) -> bool:
+        runtime_is_current = self.runtime_token.is_current()
+        authorization_is_current = (
+            _hierarchical_authorization_source_identity(
+                settings=self.settings,
+                repository_paths=self.repository_paths,
+                repository=self.repository,
+                index_path=self.runtime_token.index_path,
+                profile_id=self.profile_id,
+                document_ids=self.authorization_document_ids,
+            )
+            == self.authorization_identity
+        )
+        bm25_is_current = True
+        if self.bm25_path is not None and self.bm25_identity is not None:
+            bm25_is_current = bool(
+                routes_rag.path_signature(self.bm25_path)
+                == self.bm25_identity
+            )
+        return bool(
+            runtime_is_current
+            and authorization_is_current
+            and bm25_is_current
         )
 
 
@@ -453,11 +517,14 @@ def search_regulations(
     try:
         normalized_metadata_profile = _normalize_mcp_metadata_profile(metadata_profile)
         normalized_as_of_date = _normalize_optional_as_of_date(as_of_date)
-        profile_id = _resolve_mcp_profile_scope(
-            settings=settings,
-            auth=auth,
-            profile_id=profile_id,
-            inspect_vector_records=True,
+        requested_profile_id = profile_id
+        profile_id, runtime_token = (
+            _resolve_mcp_profile_scope_with_runtime_token(
+                settings=settings,
+                auth=auth,
+                profile_id=requested_profile_id,
+                inspect_vector_records=True,
+            )
         )
         query_request = routes_rag.RegulationQuery(
             query=query,
@@ -469,13 +536,39 @@ def search_regulations(
             as_of_date=normalized_as_of_date,
         )
         _validate_mcp_security_scope(query_request, auth)
-        hierarchical = _search_hierarchical_runtime(
-            settings=settings,
-            auth=auth,
-            query=query_request,
+        hierarchical = (
+            _search_hierarchical_runtime(
+                settings=settings,
+                auth=auth,
+                query=query_request,
+                runtime_token=runtime_token,
+            )
+            if runtime_token is not None
+            else None
         )
         if hierarchical is None:
+            fallback_profile_id = _resolve_mcp_flat_fallback_profile_scope(
+                settings=settings,
+                auth=auth,
+                requested_profile_id=requested_profile_id,
+            )
+            query_request = replace(
+                query_request,
+                profile_id=fallback_profile_id,
+            )
             results, trace = routes_rag.search_records(query=query_request, auth=auth, settings=settings)
+            if (
+                _resolve_mcp_flat_fallback_profile_scope(
+                    settings=settings,
+                    auth=auth,
+                    requested_profile_id=requested_profile_id,
+                )
+                != fallback_profile_id
+            ):
+                raise ValueError(
+                    "Profile scope changed during fallback retrieval; retry with an explicit profile_id."
+                )
+            profile_id = fallback_profile_id
         else:
             results, trace = hierarchical
         relevance_guard = _mcp_relevance_guard(query, results)
@@ -677,43 +770,34 @@ def _search_hierarchical_runtime(
     settings: Settings,
     auth: AuthContext,
     query: Any,
+    runtime_token: _VerifiedHierarchicalRuntimeToken | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
     profile_id = str(query.profile_id or "").strip() or None
-    verified_runtime_token = _verified_hierarchical_runtime_token_for_scope(
+    repository_paths = repository_path_descriptor(settings)
+    read_context = _verified_hierarchical_read_context(
         settings=settings,
         auth=auth,
         profile_id=profile_id,
+        runtime_token=runtime_token,
+        repository_paths=repository_paths,
+        include_bm25=True,
     )
-    if verified_runtime_token is None:
+    if read_context is None:
         return None
-    paths = (
-        verified_runtime_token.index_path,
-        verified_runtime_token.vector_path,
-    )
-    repository_paths = repository_path_descriptor(settings)
+    verified_runtime_token = read_context.runtime_token
+    paths = read_context.hierarchy_paths
     index_signature = verified_runtime_token.index_identity
     vector_signature = verified_runtime_token.vector_identity
-    source_identity = _hierarchical_authorization_source_identity(
-        settings=settings,
-        repository_paths=repository_paths,
-        index_path=paths[0],
-        profile_id=profile_id,
-    )
-    if index_signature is None or vector_signature is None or source_identity is None:
+    if index_signature is None or vector_signature is None:
         return None
-    prevalidated_sidecar_identity = (
-        source_identity[1]
-        if len(source_identity) == 2
-        and source_identity[0] == "runtime_sidecar"
-        and isinstance(source_identity[1], tuple)
-        else None
-    )
+    prevalidated_sidecar_identity = read_context.prevalidated_sidecar_identity
     bm25_runtime = _verified_hierarchical_runtime_bm25(
         settings=settings,
         auth=auth,
         profile_id=profile_id,
         hierarchy_paths=paths,
         runtime_token=verified_runtime_token,
+        read_context=read_context,
     )
     started_at = time.perf_counter()
     allowed_unit_ids = _fully_visible_regulation_units(
@@ -740,25 +824,7 @@ def _search_hierarchical_runtime(
         allowed_unit_ids=allowed_unit_ids,
         rerank_index=bm25_runtime[0] if bm25_runtime is not None else None,
     )
-    runtime_is_current = verified_runtime_token.is_current()
-    authorization_is_current = (
-        _hierarchical_authorization_source_identity(
-            settings=settings,
-            repository_paths=repository_paths,
-            index_path=paths[0],
-            profile_id=profile_id,
-        )
-        == source_identity
-    )
-    bm25_is_current = bool(
-        bm25_runtime is None
-        or routes_rag.path_signature(bm25_runtime[1]) == bm25_runtime[2]
-    )
-    if (
-        not runtime_is_current
-        or not authorization_is_current
-        or not bm25_is_current
-    ):
+    if not read_context.postflight_is_current():
         return None
     visible_scored = [
         (score, record)
@@ -1069,6 +1135,63 @@ def _verified_hierarchical_runtime_token_for_scope(
     return token
 
 
+def _verified_hierarchical_read_context(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    profile_id: str | None,
+    runtime_token: _VerifiedHierarchicalRuntimeToken | None = None,
+    repository_paths: RepositoryPathDescriptor | None = None,
+    repository: Any | None = None,
+    authorization_document_ids: tuple[str, ...] | None = None,
+    include_bm25: bool,
+) -> _VerifiedHierarchicalReadContext | None:
+    """Capture one request's runtime and authorization identities once."""
+
+    token = runtime_token or _verified_hierarchical_runtime_token_for_scope(
+        settings=settings,
+        auth=auth,
+        profile_id=profile_id,
+    )
+    if token is None:
+        return None
+    matches_scope = getattr(token, "matches_scope", None)
+    if callable(matches_scope) and not matches_scope(
+        tenant_id=str(auth.tenant_id or "").strip(),
+        profile_id=profile_id,
+    ):
+        return None
+    if repository_paths is None and repository is None:
+        repository_paths = repository_path_descriptor(settings)
+    authorization_identity = _hierarchical_authorization_source_identity(
+        settings=settings,
+        repository_paths=repository_paths,
+        repository=repository,
+        index_path=token.index_path,
+        profile_id=profile_id,
+        document_ids=authorization_document_ids,
+    )
+    if authorization_identity is None:
+        return None
+    bm25_path: Path | None = None
+    bm25_identity: Any | None = None
+    if include_bm25:
+        bm25_path = routes_rag.bm25_index_path(settings=settings, auth=auth)
+        bm25_identity = routes_rag.path_signature(bm25_path)
+    return _VerifiedHierarchicalReadContext(
+        settings=settings,
+        auth=auth,
+        profile_id=profile_id,
+        runtime_token=token,
+        authorization_identity=authorization_identity,
+        authorization_document_ids=authorization_document_ids,
+        repository_paths=repository_paths,
+        repository=repository,
+        bm25_path=bm25_path,
+        bm25_identity=bm25_identity,
+    )
+
+
 def _hierarchical_authorization_source_identity(
     *,
     index_path: Path,
@@ -1076,6 +1199,7 @@ def _hierarchical_authorization_source_identity(
     settings: Settings | None = None,
     repository_paths: RepositoryPathDescriptor | None = None,
     repository: Any | None = None,
+    document_ids: tuple[str, ...] | None = None,
 ) -> tuple[Any, ...] | None:
     """Identify every authorization source used by hierarchy visibility.
 
@@ -1087,7 +1211,23 @@ def _hierarchical_authorization_source_identity(
     path_source = repository_paths or repository
     if path_source is None:
         return None
-    runtime_identity = routes_rag.runtime_approval_snapshot_identity(path_source)
+    normalized_document_ids = (
+        tuple(
+            sorted(
+                {
+                    str(document_id or "").strip()
+                    for document_id in document_ids
+                    if str(document_id or "").strip()
+                }
+            )
+        )
+        if document_ids is not None
+        else None
+    )
+    runtime_identity = routes_rag.runtime_approval_snapshot_identity(
+        path_source,
+        normalized_document_ids,
+    )
     if runtime_identity is not None:
         return ("runtime_sidecar", runtime_identity)
     live_repository = repository
@@ -1099,15 +1239,19 @@ def _hierarchical_authorization_source_identity(
             return None
         live_repository = _json_repository(settings)
     try:
-        document_ids = sorted(
-            indexed_document_ids(
-                index_path,
-                profile_id=profile_id,
+        scoped_document_ids = (
+            list(normalized_document_ids)
+            if normalized_document_ids is not None
+            else sorted(
+                indexed_document_ids(
+                    index_path,
+                    profile_id=profile_id,
+                )
             )
         )
         live_identity = routes_rag.approval_snapshot_signature(
             live_repository,
-            document_ids,
+            scoped_document_ids,
         )
     except (OSError, ValueError):
         return None
@@ -1121,6 +1265,7 @@ def _verified_hierarchical_runtime_bm25(
     profile_id: str | None,
     hierarchy_paths: tuple[Path, Path] | None = None,
     runtime_token: _VerifiedHierarchicalRuntimeToken | None = None,
+    read_context: _VerifiedHierarchicalReadContext | None = None,
 ) -> tuple[Bm25Index, Path, Any] | None:
     """Load a manifest-pinned BM25 index bound to the verified hierarchy corpus."""
 
@@ -1128,6 +1273,13 @@ def _verified_hierarchical_runtime_bm25(
     expected_manifest_path = data_dir / "mcp_runtime_manifest.json"
     expected_hierarchy_path = hierarchical_index_path(data_dir)
     expected_vector_path = routes_rag.local_vector_path(settings, auth)
+    if read_context is not None:
+        if runtime_token is not None and runtime_token is not read_context.runtime_token:
+            return None
+        if hierarchy_paths is not None and hierarchy_paths != read_context.hierarchy_paths:
+            return None
+        runtime_token = read_context.runtime_token
+        hierarchy_paths = read_context.hierarchy_paths
     if hierarchy_paths is None and isinstance(
         runtime_token,
         _VerifiedHierarchicalRuntimeToken,
@@ -1159,14 +1311,19 @@ def _verified_hierarchical_runtime_bm25(
             tenant_id=tenant_id,
             profile_id=profile_id,
         )
-        or not runtime_token.is_current()
+        or (read_context is None and not runtime_token.is_current())
     ):
         return None
 
     manifest_identity = runtime_token.manifest_identity
     hierarchy_identity = runtime_token.index_identity
     bm25_path = routes_rag.bm25_index_path(settings=settings, auth=auth)
-    bm25_identity = routes_rag.path_signature(bm25_path)
+    if read_context is not None:
+        if read_context.bm25_path != bm25_path:
+            return None
+        bm25_identity = read_context.bm25_identity
+    else:
+        bm25_identity = routes_rag.path_signature(bm25_path)
     if bm25_identity is None:
         return None
     try:
@@ -1212,7 +1369,10 @@ def _verified_hierarchical_runtime_bm25(
                 valid = _file_sha256(bm25_path) == expected_hash
             except OSError:
                 return None
-            if routes_rag.path_signature(bm25_path) != bm25_identity:
+            if (
+                read_context is None
+                and routes_rag.path_signature(bm25_path) != bm25_identity
+            ):
                 return None
             _HIERARCHICAL_BM25_VERIFICATION_CACHE[bm25_path] = (
                 bm25_identity,
@@ -1225,7 +1385,14 @@ def _verified_hierarchical_runtime_bm25(
     if not valid:
         return None
 
-    index = routes_rag.load_cached_bm25_index(bm25_path)
+    index = (
+        routes_rag.load_cached_bm25_index(
+            bm25_path,
+            prevalidated_signature=bm25_identity,
+        )
+        if read_context is not None
+        else routes_rag.load_cached_bm25_index(bm25_path)
+    )
     index_source_content_hashes = (
         index.source_content_hashes
         if isinstance(index, Bm25Index)
@@ -1246,10 +1413,11 @@ def _verified_hierarchical_runtime_bm25(
         or len(index.documents) != index.document_count
     ):
         return None
-    token_is_current = runtime_token.is_current()
-    bm25_is_current = routes_rag.path_signature(bm25_path) == bm25_identity
-    if not token_is_current or not bm25_is_current:
-        return None
+    if read_context is None:
+        token_is_current = runtime_token.is_current()
+        bm25_is_current = routes_rag.path_signature(bm25_path) == bm25_identity
+        if not token_is_current or not bm25_is_current:
+            return None
     return index, bm25_path, bm25_identity
 
 
@@ -3642,16 +3810,13 @@ def _visible_record_with_related_by_chunk(
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Authorize one fetch and its governing-article candidates together."""
 
-    resolved_profile_id = _resolve_mcp_profile_scope(
-        settings=settings,
-        auth=auth,
-        profile_id=profile_id,
-        inspect_vector_records=False,
-    )
-    hierarchical_paths = _verified_hierarchical_runtime_paths(
-        settings=settings,
-        auth=auth,
-        profile_id=resolved_profile_id,
+    resolved_profile_id, runtime_token = (
+        _resolve_mcp_profile_scope_with_runtime_token(
+            settings=settings,
+            auth=auth,
+            profile_id=profile_id,
+            inspect_vector_records=False,
+        )
     )
     query_request = routes_rag.RegulationQuery(
         query="mcp fetch",
@@ -3664,22 +3829,39 @@ def _visible_record_with_related_by_chunk(
     )
     _validate_mcp_security_scope(query_request, auth)
     repository = _json_repository(settings)
-    if hierarchical_paths is not None:
-        index_signature = routes_rag.path_signature(hierarchical_paths[0])
-        vector_signature = routes_rag.path_signature(hierarchical_paths[1])
-        approval_source_identity = (
-            routes_rag.runtime_approval_snapshot_identity(
-                repository,
-                [document_id],
-            )
+    read_context = (
+        _verified_hierarchical_read_context(
+            settings=settings,
+            auth=auth,
+            profile_id=resolved_profile_id,
+            runtime_token=runtime_token,
+            repository=repository,
+            authorization_document_ids=(document_id,),
+            include_bm25=False,
+        )
+        if runtime_token is not None
+        else None
+    )
+    if read_context is not None:
+        hierarchical_paths = read_context.hierarchy_paths
+        index_signature = read_context.runtime_token.index_identity
+        vector_signature = read_context.runtime_token.vector_identity
+        approval_source_identity = read_context.authorization_identity
+        prevalidated_sidecar_identity = (
+            read_context.prevalidated_sidecar_identity
         )
         approval_snapshot = (
             routes_rag.load_cached_runtime_approval_snapshot(
                 repository,
                 [document_id],
                 auth,
+                identity_loader=(
+                    lambda _repository, _document_ids=None: (
+                        prevalidated_sidecar_identity
+                    )
+                ),
             )
-            if approval_source_identity is not None
+            if prevalidated_sidecar_identity is not None
             else None
         )
         candidate = (
@@ -3687,6 +3869,7 @@ def _visible_record_with_related_by_chunk(
                 hierarchical_paths=hierarchical_paths,
                 document_id=document_id,
                 chunk_id=chunk_id,
+                read_context=read_context,
             )
             if (
                 index_signature is not None
@@ -3701,7 +3884,6 @@ def _visible_record_with_related_by_chunk(
                 query_request,
                 auth,
             )
-
             def visible(record: dict[str, Any]) -> bool:
                 return _hierarchical_record_visible_to_request(
                     record,
@@ -3735,6 +3917,8 @@ def _visible_record_with_related_by_chunk(
                     index_signature,
                     vector_signature,
                     approval_source_identity,
+                    str(auth.tenant_id or ""),
+                    str(resolved_profile_id or "").strip().casefold(),
                     str(document_id),
                     "article_candidates",
                 )
@@ -3772,17 +3956,7 @@ def _visible_record_with_related_by_chunk(
                     as_of=as_of_date,
                     include_legacy=True,
                 )
-            if (
-                routes_rag.path_signature(hierarchical_paths[0])
-                == index_signature
-                and routes_rag.path_signature(hierarchical_paths[1])
-                == vector_signature
-                and routes_rag.runtime_approval_snapshot_identity(
-                    repository,
-                    [document_id],
-                )
-                == approval_source_identity
-            ):
+            if read_context.postflight_is_current():
                 return (
                     target_records[0] if target_records else None,
                     related_records,
@@ -3825,14 +3999,31 @@ def _load_cached_hierarchical_record_by_chunk(
     hierarchical_paths: tuple[Path, Path],
     document_id: str,
     chunk_id: str,
+    read_context: _VerifiedHierarchicalReadContext | None = None,
 ) -> dict[str, Any] | None:
-    index_signature = routes_rag.path_signature(hierarchical_paths[0])
-    vector_signature = routes_rag.path_signature(hierarchical_paths[1])
+    if read_context is not None and hierarchical_paths != read_context.hierarchy_paths:
+        return None
+    index_signature = (
+        read_context.runtime_token.index_identity
+        if read_context is not None
+        else routes_rag.path_signature(hierarchical_paths[0])
+    )
+    vector_signature = (
+        read_context.runtime_token.vector_identity
+        if read_context is not None
+        else routes_rag.path_signature(hierarchical_paths[1])
+    )
     if index_signature is None or vector_signature is None:
         return None
     cache_key = (
         index_signature,
         vector_signature,
+        (
+            str(read_context.auth.tenant_id or ""),
+            str(read_context.profile_id or "").strip().casefold(),
+        )
+        if read_context is not None
+        else None,
         str(document_id),
         str(chunk_id),
     )
@@ -3841,7 +4032,7 @@ def _load_cached_hierarchical_record_by_chunk(
         if cached_record is not None:
             _HIERARCHICAL_FETCH_RECORD_CACHE.move_to_end(cache_key)
     if cached_record is not None:
-        if (
+        if read_context is not None or (
             routes_rag.path_signature(hierarchical_paths[0])
             == index_signature
             and routes_rag.path_signature(hierarchical_paths[1])
@@ -3858,7 +4049,7 @@ def _load_cached_hierarchical_record_by_chunk(
     )
     if record is None:
         return None
-    if (
+    if read_context is None and (
         routes_rag.path_signature(hierarchical_paths[0]) != index_signature
         or routes_rag.path_signature(hierarchical_paths[1]) != vector_signature
     ):
@@ -4244,6 +4435,15 @@ def _runtime_sidecar_visible_regulation_units(
             repository_paths,
             sorted(document_ids),
             auth,
+            **(
+                {
+                    "identity_loader": (
+                        lambda _repository, _document_ids=None: source_identity
+                    )
+                }
+                if has_prevalidated_identity
+                else {}
+            ),
         )
         if snapshot is None:
             return None
@@ -4329,6 +4529,42 @@ def _resolve_mcp_profile_scope(
     )
 
 
+def _resolve_mcp_profile_scope_with_runtime_token(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    profile_id: str | None,
+    inspect_vector_records: bool,
+) -> tuple[str | None, _VerifiedHierarchicalRuntimeToken | None]:
+    """Resolve profile and capture the request's hierarchy preflight together."""
+
+    requested_profile_id = str(profile_id or "").strip() or None
+    runtime_token = _verified_hierarchical_runtime_token_for_scope(
+        settings=settings,
+        auth=auth,
+        profile_id=requested_profile_id,
+    )
+    runtime_profile_id = (
+        str(getattr(runtime_token, "profile_id", None) or "").strip() or None
+        if runtime_token is not None
+        else None
+    )
+    resolved_profile_id = _require_unambiguous_profile_scope(
+        settings=settings,
+        auth=auth,
+        profile_id=requested_profile_id or runtime_profile_id,
+        inspect_vector_records=inspect_vector_records,
+    )
+    if runtime_token is not None:
+        matches_scope = getattr(runtime_token, "matches_scope", None)
+        if callable(matches_scope) and not matches_scope(
+            tenant_id=str(auth.tenant_id or "").strip(),
+            profile_id=resolved_profile_id,
+        ):
+            runtime_token = None
+    return resolved_profile_id, runtime_token
+
+
 def _require_unambiguous_profile_scope(
     *,
     settings: Settings,
@@ -4348,6 +4584,54 @@ def _require_unambiguous_profile_scope(
     if requested:
         return requested
 
+    profiles = _mcp_profile_scope_ids(
+        settings=settings,
+        auth=auth,
+        inspect_vector_records=inspect_vector_records,
+    )
+    if len(profiles) > 1:
+        raise ValueError(
+            "profile_id is required when the tenant contains multiple institution profiles."
+        )
+    return requested
+
+
+def _resolve_mcp_flat_fallback_profile_scope(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    requested_profile_id: str | None,
+) -> str | None:
+    """Pin a live fallback to the tenant's sole current profile.
+
+    Hierarchy postflight failures can be caused by authorization or repository
+    changes. Re-inventory the live profile topology before and after the flat
+    read so an omitted profile never turns into a cross-institution query.
+    """
+
+    requested = str(requested_profile_id or "").strip() or None
+    if requested:
+        return requested
+    profiles = _mcp_profile_scope_ids(
+        settings=settings,
+        auth=auth,
+        inspect_vector_records=True,
+    )
+    if len(profiles) > 1:
+        raise ValueError(
+            "profile_id is required when the tenant contains multiple institution profiles."
+        )
+    return next(iter(profiles), None)
+
+
+def _mcp_profile_scope_ids(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    inspect_vector_records: bool,
+) -> set[str]:
+    """Return normalized institution profiles visible in the tenant corpus."""
+
     profiles = {
         str(document.profile_id or "").strip().casefold()
         for document in _json_repository(settings).list_documents()
@@ -4364,11 +4648,7 @@ def _require_unambiguous_profile_scope(
                 profiles.add(record_profile.casefold())
                 if len(profiles) >= 2:
                     break
-    if len(profiles) > 1:
-        raise ValueError(
-            "profile_id is required when the tenant contains multiple institution profiles."
-        )
-    return requested
+    return profiles
 
 
 def _document_record_sort_key(record: dict[str, Any]) -> tuple[int, str, str]:
