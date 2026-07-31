@@ -2976,7 +2976,11 @@ def _verified_vector_record_cache_put(
         or encoded_size > _VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRY_BYTES
     ):
         return
-    frozen_record = _freeze_verified_vector_record(record)
+    frozen_record = (
+        record
+        if isinstance(record, _FrozenVectorRecordDict)
+        else _freeze_verified_vector_record(record)
+    )
     with _VERIFIED_VECTOR_RECORD_CACHE_LOCK:
         previous = _VERIFIED_VECTOR_RECORD_CACHE.pop(key, None)
         if previous is not None:
