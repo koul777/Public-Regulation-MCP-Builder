@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime
 import hashlib
@@ -194,6 +196,27 @@ _RUNTIME_CONTENT_SIGNATURE_CACHE: dict[
     Path,
     tuple[_FileIdentitySignature, tuple[int, str]],
 ] = {}
+_RUNTIME_CONTENT_SIGNATURE_INFLIGHT: dict[
+    tuple[Path, _FileIdentitySignature],
+    "_RuntimeContentSignatureFlight",
+] = {}
+_RUNTIME_CONTENT_SIGNATURE_MAX_WORKERS = 4
+_RUNTIME_CONTENT_SIGNATURE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_RUNTIME_CONTENT_SIGNATURE_MAX_WORKERS,
+    thread_name_prefix="runtime-content-signature",
+)
+atexit.register(
+    _RUNTIME_CONTENT_SIGNATURE_EXECUTOR.shutdown,
+    wait=True,
+    cancel_futures=True,
+)
+
+
+@dataclass
+class _RuntimeContentSignatureFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    waiters_ready: threading.Event = field(default_factory=threading.Event)
+    result: tuple[int, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -579,8 +602,16 @@ def _file_identity_signature(
     )
 
 
-def load_cached_bm25_index(path: Path) -> Bm25Index | None:
-    signature = path_signature(path)
+def load_cached_bm25_index(
+    path: Path,
+    *,
+    prevalidated_signature: Any | None = None,
+) -> Bm25Index | None:
+    signature = (
+        prevalidated_signature
+        if prevalidated_signature is not None
+        else path_signature(path)
+    )
     if signature is None:
         with _RAG_VECTOR_CACHE_LOCK:
             _RAG_BM25_INDEX_CACHE.pop(path, None)
@@ -964,38 +995,99 @@ def runtime_approval_snapshot_signature(
 def portable_file_signature(path: Path) -> tuple[int, str] | None:
     stat_signature = path_signature(path)
     if stat_signature is None:
+        with _RUNTIME_CONTENT_SIGNATURE_LOCK:
+            _RUNTIME_CONTENT_SIGNATURE_CACHE.pop(path, None)
         return None
+    flight_key = (path, stat_signature)
+    leader = False
     with _RUNTIME_CONTENT_SIGNATURE_LOCK:
         cached = _RUNTIME_CONTENT_SIGNATURE_CACHE.get(path)
         if cached and cached[0] == stat_signature:
             return cached[1]
+        flight = _RUNTIME_CONTENT_SIGNATURE_INFLIGHT.get(flight_key)
+        if flight is None:
+            flight = _RuntimeContentSignatureFlight()
+            _RUNTIME_CONTENT_SIGNATURE_INFLIGHT[flight_key] = flight
+            leader = True
+        else:
+            flight.waiters_ready.set()
+    if not leader:
+        flight.event.wait()
+        return flight.result
+    signature: tuple[int, str] | None = None
+    try:
         digest = hashlib.sha256()
-        try:
-            with path.open("rb") as handle:
-                while block := handle.read(1024 * 1024):
-                    digest.update(block)
-        except OSError:
+        with path.open("rb") as handle:
+            while block := handle.read(1024 * 1024):
+                digest.update(block)
+        if path_signature(path) != stat_signature:
             return None
         signature = (int(stat_signature[1]), digest.hexdigest())
-        _RUNTIME_CONTENT_SIGNATURE_CACHE[path] = (stat_signature, signature)
+        with _RUNTIME_CONTENT_SIGNATURE_LOCK:
+            _RUNTIME_CONTENT_SIGNATURE_CACHE[path] = (
+                stat_signature,
+                signature,
+            )
         return signature
+    except OSError:
+        return None
+    finally:
+        with _RUNTIME_CONTENT_SIGNATURE_LOCK:
+            current_flight = _RUNTIME_CONTENT_SIGNATURE_INFLIGHT.get(
+                flight_key
+            )
+            if current_flight is flight:
+                current_flight.result = signature
+                _RUNTIME_CONTENT_SIGNATURE_INFLIGHT.pop(
+                    flight_key,
+                    None,
+                )
+                current_flight.event.set()
+
+
+def _repository_chunk_content_signatures(
+    chunk_paths: Sequence[Path],
+) -> list[tuple[str, tuple[int, str]]] | None:
+    if not chunk_paths:
+        return []
+    signatures = list(
+        _RUNTIME_CONTENT_SIGNATURE_EXECUTOR.map(
+            portable_file_signature,
+            chunk_paths,
+        )
+    )
+    if any(signature is None for signature in signatures):
+        return None
+    return [
+        (path.name, signature)
+        for path, signature in zip(chunk_paths, signatures, strict=True)
+        if signature is not None
+    ]
 
 
 def repository_chunk_files_signature(
     repository: Any,
 ) -> tuple[int, str] | None:
-    chunk_paths = runtime_approval_identity_chunk_paths(
+    before_entries = _runtime_approval_identity_chunk_entries(
         repository,
         document_ids=None,
     )
-    if chunk_paths is None:
+    if before_entries is None:
         return None
-    file_signatures: list[tuple[str, tuple[int, str]]] = []
-    for path in chunk_paths:
-        signature = portable_file_signature(path)
-        if signature is None:
+    chunk_paths: list[Path] = []
+    for path, identity in before_entries:
+        if identity is _MISSING_FILE_IDENTITY:
             return None
-        file_signatures.append((path.name, signature))
+        chunk_paths.append(path)
+    file_signatures = _repository_chunk_content_signatures(chunk_paths)
+    if file_signatures is None:
+        return None
+    after_entries = _runtime_approval_identity_chunk_entries(
+        repository,
+        document_ids=None,
+    )
+    if after_entries != before_entries:
+        return None
     digest = hashlib.sha256(
         json.dumps(
             file_signatures,

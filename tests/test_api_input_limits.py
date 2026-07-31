@@ -15,10 +15,14 @@ from app.core.api_audit import api_audit_path
 from app.core.config import Settings, get_settings
 from app.core.input_limits import (
     MAX_IDENTIFIER_CHARS,
+    MAX_MCP_ARTICLE_NO_CHARS,
     MAX_MCP_DEPARTMENT_IDS,
     MAX_MCP_IDENTIFIER_CHARS,
+    MAX_MCP_PAGE,
+    MAX_MCP_PAGE_SIZE,
     MAX_MCP_QUERY_CHARS,
     MAX_MCP_RESULT_ID_CHARS,
+    MAX_MCP_SCOPE_VALUE_CHARS,
     MAX_MCP_SECURITY_LEVELS,
     MAX_MCP_TOP_K,
     MAX_METADATA_PATCH_KEYS,
@@ -132,19 +136,120 @@ class McpInputLimitTests(unittest.TestCase):
         search_properties = tools["search"].parameters["properties"]
         fetch_properties = tools["fetch"].parameters["properties"]
         article_properties = tools["get_article"].parameters["properties"]
+        catalog_properties = tools["list_regulations"].parameters["properties"]
 
-        self.assertEqual(MAX_MCP_QUERY_CHARS, search_properties["query"]["maxLength"])
-        self.assertEqual(MAX_MCP_TOP_K, search_properties["top_k"]["maximum"])
         self.assertEqual(
-            MAX_MCP_SECURITY_LEVELS,
-            search_properties["security_levels"]["anyOf"][0]["maxItems"],
+            {
+                "minLength": 1,
+                "maxLength": MAX_MCP_QUERY_CHARS,
+                "title": "Query",
+                "type": "string",
+            },
+            search_properties["query"],
         )
         self.assertEqual(
-            MAX_MCP_DEPARTMENT_IDS,
-            search_properties["department_ids"]["anyOf"][0]["maxItems"],
+            {
+                "default": 5,
+                "minimum": 1,
+                "maximum": MAX_MCP_TOP_K,
+                "title": "Top K",
+                "type": "integer",
+            },
+            search_properties["top_k"],
         )
-        self.assertEqual(MAX_MCP_RESULT_ID_CHARS, fetch_properties["id"]["maxLength"])
-        self.assertEqual(MAX_MCP_IDENTIFIER_CHARS, article_properties["document_id"]["maxLength"])
+        expected_scope_item = {
+            "minLength": 1,
+            "maxLength": MAX_MCP_SCOPE_VALUE_CHARS,
+            "type": "string",
+        }
+        self.assertEqual(
+            {
+                "anyOf": [
+                    {
+                        "items": expected_scope_item,
+                        "maxItems": MAX_MCP_SECURITY_LEVELS,
+                        "type": "array",
+                    },
+                    {"type": "null"},
+                ],
+                "default": None,
+                "title": "Security Levels",
+            },
+            search_properties["security_levels"],
+        )
+        self.assertEqual(
+            {
+                "anyOf": [
+                    {
+                        "items": expected_scope_item,
+                        "maxItems": MAX_MCP_DEPARTMENT_IDS,
+                        "type": "array",
+                    },
+                    {"type": "null"},
+                ],
+                "default": None,
+                "title": "Department Ids",
+            },
+            search_properties["department_ids"],
+        )
+        self.assertEqual(
+            {
+                "minLength": 1,
+                "maxLength": MAX_MCP_RESULT_ID_CHARS,
+                "title": "Id",
+                "type": "string",
+            },
+            fetch_properties["id"],
+        )
+        self.assertEqual(
+            {
+                "minLength": 1,
+                "maxLength": MAX_MCP_IDENTIFIER_CHARS,
+                "title": "Document Id",
+                "type": "string",
+            },
+            article_properties["document_id"],
+        )
+        self.assertEqual(
+            {
+                "minLength": 1,
+                "maxLength": MAX_MCP_ARTICLE_NO_CHARS,
+                "title": "Article No",
+                "type": "string",
+            },
+            article_properties["article_no"],
+        )
+        self.assertEqual(
+            {
+                "anyOf": [
+                    {"maxLength": MAX_MCP_IDENTIFIER_CHARS, "type": "string"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "title": "Profile Id",
+            },
+            search_properties["profile_id"],
+        )
+        self.assertEqual(
+            {
+                "default": 1,
+                "minimum": 1,
+                "maximum": MAX_MCP_PAGE,
+                "title": "Page",
+                "type": "integer",
+            },
+            catalog_properties["page"],
+        )
+        self.assertEqual(
+            {
+                "default": 50,
+                "minimum": 1,
+                "maximum": MAX_MCP_PAGE_SIZE,
+                "title": "Page Size",
+                "type": "integer",
+            },
+            catalog_properties["page_size"],
+        )
 
     def test_mcp_protocol_validation_rejects_oversized_query_before_tool_function(self) -> None:
         server = create_regulation_mcp_server(

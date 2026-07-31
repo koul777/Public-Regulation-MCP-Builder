@@ -9,12 +9,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from app.api import routes_documents, routes_rag
 from app.core.api_audit import api_audit_path
@@ -2009,6 +2011,190 @@ print(json.dumps({
             visible_units.call_args.kwargs["prevalidated_source_identity"],
         )
 
+    def test_search_read_context_checks_each_identity_twice_per_call(self) -> None:
+        query = SimpleNamespace(
+            profile_id="profile-a",
+            query="approved policy",
+            top_k=1,
+            document_id=None,
+            as_of_date=None,
+            security_levels=["internal"],
+            department_ids=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path, index_path, bm25_path = (
+                _write_bound_hierarchy_bm25_fixture(
+                    settings,
+                    profile_id="profile-a",
+                )
+            )
+            vector_path = regulation_tools.routes_rag.local_vector_path(
+                settings,
+                auth,
+            )
+            self.assertIsNotNone(
+                regulation_tools._verified_hierarchical_runtime_paths(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+            )
+            self.assertIsNotNone(
+                regulation_tools._verified_hierarchical_runtime_bm25(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+            )
+            original_path_signature = (
+                regulation_tools.routes_rag.path_signature
+            )
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    wraps=original_path_signature,
+                ) as path_signature,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-stable",),
+                ) as approval_identity,
+                patch.object(
+                    regulation_tools,
+                    "_fully_visible_regulation_units",
+                    return_value={"unit-a"},
+                ),
+                patch.object(
+                    regulation_tools,
+                    "search_hierarchical_records",
+                    return_value=(
+                        [],
+                        {
+                            "retrieval_model": "hier",
+                            "retrieval_strategy": "catalog_toc_body",
+                        },
+                    ),
+                ),
+            ):
+                first = regulation_tools._search_hierarchical_runtime(
+                    settings=settings,
+                    auth=auth,
+                    query=query,
+                )
+                second = regulation_tools._search_hierarchical_runtime(
+                    settings=settings,
+                    auth=auth,
+                    query=query,
+                )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(4, approval_identity.call_count)
+        self.assertEqual(
+            Counter(
+                {
+                    manifest_path: 4,
+                    index_path: 4,
+                    vector_path: 4,
+                    bm25_path: 4,
+                }
+            ),
+            Counter(
+                current.args[0]
+                for current in path_signature.call_args_list
+            ),
+        )
+
+    def test_search_flat_fallback_rejects_newly_ambiguous_profile_scope(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_resolve_mcp_profile_scope_with_runtime_token",
+                    return_value=(None, object()),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_search_hierarchical_runtime",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_mcp_profile_scope_ids",
+                    return_value={"profile-a", "profile-b"},
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "search_records",
+                ) as flat_search,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "profile_id is required",
+                ):
+                    regulation_tools.search_regulations(
+                        settings=settings,
+                        auth=auth,
+                        query="approved policy",
+                    )
+
+        flat_search.assert_not_called()
+
+    def test_search_flat_fallback_rejects_profile_change_during_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_resolve_mcp_profile_scope_with_runtime_token",
+                    return_value=(None, object()),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_search_hierarchical_runtime",
+                    return_value=None,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_mcp_profile_scope_ids",
+                    side_effect=[
+                        {"profile-a"},
+                        {"profile-a", "profile-b"},
+                    ],
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "search_records",
+                    return_value=([], {"trace_id": "flat-trace"}),
+                ) as flat_search,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "profile_id is required",
+                ):
+                    regulation_tools.search_regulations(
+                        settings=settings,
+                        auth=auth,
+                        query="approved policy",
+                    )
+
+        flat_search.assert_called_once()
+        self.assertEqual(
+            "profile-a",
+            flat_search.call_args.kwargs["query"].profile_id,
+        )
+
     def test_hierarchy_search_rejects_bm25_changed_after_scoring(self) -> None:
         query = SimpleNamespace(
             profile_id="profile-a",
@@ -2027,10 +2213,13 @@ print(json.dumps({
             is_current=lambda: True,
         )
         bm25_index = object()
-        bm25_path = Path("bm25.json")
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             auth = mcp_auth_context(tenant_id="tenant-a")
+            bm25_path = regulation_tools.routes_rag.bm25_index_path(
+                settings=settings,
+                auth=auth,
+            )
             with (
                 patch.object(
                     regulation_tools,
@@ -2054,7 +2243,10 @@ print(json.dumps({
                 patch.object(
                     regulation_tools.routes_rag,
                     "path_signature",
-                    return_value=("bm25-after",),
+                    side_effect=[
+                        ("bm25-before",),
+                        ("bm25-after",),
+                    ],
                 ) as path_signature,
                 patch.object(
                     regulation_tools,
@@ -2085,7 +2277,10 @@ print(json.dumps({
             search_records.call_args.kwargs["rerank_index"],
         )
         self.assertEqual(2, approval_identity.call_count)
-        path_signature.assert_called_once_with(bm25_path)
+        self.assertEqual(
+            [call(bm25_path), call(bm25_path)],
+            path_signature.call_args_list,
+        )
 
     def test_verified_runtime_profile_requires_matching_stable_manifest_and_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3853,22 +4048,33 @@ print(json.dumps({
                     "department_acl": set(),
                 },
             }
+            approval_revoked = threading.Event()
+            runtime_token = SimpleNamespace(
+                index_path=Path("hierarchy.sqlite"),
+                vector_path=Path("vectors.jsonl"),
+                index_identity=("index-stable",),
+                vector_identity=("vector-stable",),
+                profile_id="profile-a",
+                matches_scope=lambda **_kwargs: True,
+                is_current=lambda: True,
+            )
+
+            def load_related_and_revoke(*_args, **_kwargs):
+                approval_revoked.set()
+                return [article_record]
+
+            def current_approval_identity(*_args, **_kwargs):
+                return (
+                    ("approval-source-after",)
+                    if approval_revoked.is_set()
+                    else ("approval-source-before",)
+                )
 
             with (
                 patch.object(
                     regulation_tools,
-                    "_resolve_mcp_profile_scope",
-                    return_value="profile-a",
-                ),
-                patch.object(
-                    regulation_tools,
-                    "_verified_hierarchical_runtime_paths",
-                    return_value=(Path("hierarchy.sqlite"), Path("vectors.jsonl")),
-                ),
-                patch.object(
-                    regulation_tools.routes_rag,
-                    "path_signature",
-                    side_effect=lambda path: ("sig", str(path)),
+                    "_resolve_mcp_profile_scope_with_runtime_token",
+                    return_value=("profile-a", runtime_token),
                 ),
                 patch.object(
                     regulation_tools,
@@ -3878,13 +4084,13 @@ print(json.dumps({
                 patch.object(
                     regulation_tools,
                     "load_hierarchical_document_article_records",
-                    return_value=[article_record],
+                    side_effect=load_related_and_revoke,
                 ) as related_loader,
                 patch.object(
                     regulation_tools.routes_rag,
                     "runtime_approval_snapshot_identity",
-                    side_effect=[("approval-source-before",), ("approval-source-after",)],
-                ),
+                    side_effect=current_approval_identity,
+                ) as approval_identity,
                 patch.object(
                     regulation_tools.routes_rag,
                     "load_cached_runtime_approval_snapshot",
@@ -3935,6 +4141,128 @@ print(json.dumps({
         self.assertIsNone(record)
         self.assertEqual([], related_records)
         self.assertEqual(1, fallback_lookup.call_count)
+        self.assertEqual(2, approval_identity.call_count)
+
+    def test_fetch_read_context_checks_each_identity_once_before_and_after(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path, index_path, _bm25_path = (
+                _write_bound_hierarchy_bm25_fixture(
+                    settings,
+                    profile_id="profile-a",
+                )
+            )
+            self.assertIsNotNone(
+                regulation_tools._verified_hierarchical_runtime_paths(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+            )
+            vector_path = regulation_tools.routes_rag.local_vector_path(
+                settings,
+                auth,
+            )
+            target_record = {
+                "document_id": "doc-binding",
+                "chunk_id": "chunk-binding",
+                "text": "approved policy binding evidence",
+                "content_hash": "content-hash",
+                "metadata": {
+                    "document_id": "doc-binding",
+                    "chunk_id": "chunk-binding",
+                    "profile_id": "profile-a",
+                    "approval_status": "approved",
+                    "approval_id": "approval-binding",
+                    "approved_content_hash": "approved-binding",
+                    "security_level": "internal",
+                    "department_acl": [],
+                    "article_no": "Article 1",
+                    "article_title": "Purpose",
+                },
+            }
+            approval_snapshot = {
+                ("doc-binding", "chunk-binding"): {
+                    "approval_id": "approval-binding",
+                    "approved_content_hash": "approved-binding",
+                    "content_hash": "content-hash",
+                    "security_level": "internal",
+                    "department_acl": set(),
+                }
+            }
+            original_path_signature = (
+                regulation_tools.routes_rag.path_signature
+            )
+
+            with (
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "path_signature",
+                    wraps=original_path_signature,
+                ) as path_signature,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "runtime_approval_snapshot_identity",
+                    return_value=("approval-stable",),
+                ) as approval_identity,
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "load_cached_runtime_approval_snapshot",
+                    return_value=approval_snapshot,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_load_cached_hierarchical_record_by_chunk",
+                    return_value=target_record,
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "repository_cache",
+                    return_value=object(),
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "is_record_visible",
+                    return_value=True,
+                ),
+                patch.object(
+                    regulation_tools,
+                    "filter_to_latest_active_versions",
+                    side_effect=lambda records, **_kwargs: list(records),
+                ),
+            ):
+                fetched, related_records = (
+                    regulation_tools._visible_record_with_related_by_chunk(
+                        settings=settings,
+                        auth=auth,
+                        document_id="doc-binding",
+                        chunk_id="chunk-binding",
+                        security_levels=["internal"],
+                        department_ids=[],
+                        profile_id="profile-a",
+                        as_of_date="2026-07-01",
+                    )
+                )
+
+        self.assertEqual("chunk-binding", fetched["chunk_id"])
+        self.assertEqual([], related_records)
+        self.assertEqual(2, approval_identity.call_count)
+        self.assertEqual(
+            Counter(
+                {
+                    manifest_path: 2,
+                    index_path: 2,
+                    vector_path: 2,
+                }
+            ),
+            Counter(
+                current.args[0]
+                for current in path_signature.call_args_list
+            ),
+        )
 
     def test_fetch_governing_enrichment_fast_path_matches_fallback_semantics(
         self,

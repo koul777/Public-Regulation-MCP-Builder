@@ -19,6 +19,8 @@ from app.core.config import Settings, get_settings
 from app.core.input_limits import (
     MAX_MCP_QUERY_CHARS,
     MAX_MCP_TOP_K,
+)
+from app.core.mcp_input_schemas import (
     McpDepartmentIds,
     McpOptionalIdentifier,
     McpSecurityLevels,
