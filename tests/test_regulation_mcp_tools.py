@@ -504,6 +504,61 @@ class WindowsBulkChunkEnumerationTests(unittest.TestCase):
 
 
 class RegulationMcpToolsTests(unittest.TestCase):
+    def test_verified_read_context_builds_manifest_bound_vector_cache_namespace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            vector_path = (
+                settings.data_dir
+                / "vector_db"
+                / "tenant-a"
+                / "approved_vectors.jsonl"
+            )
+            vector_path.parent.mkdir(parents=True)
+            vector_path.write_bytes(b"{}\n")
+            relative_vector_path = vector_path.relative_to(
+                settings.data_dir
+            ).as_posix()
+            token = regulation_tools._VerifiedHierarchicalRuntimeToken(
+                manifest_path=settings.data_dir / "mcp_runtime_manifest.json",
+                index_path=settings.data_dir / "hierarchy" / "index.sqlite3",
+                vector_path=vector_path,
+                manifest_identity=("manifest",),
+                index_identity=("index",),
+                vector_identity=("vector",),
+                expected_index_sha256="a" * 64,
+                tenant_id="tenant-a",
+                profile_id="profile-a",
+                manifest_record_count=1,
+                manifest_file_sha256=((relative_vector_path, "b" * 64),),
+                hierarchy_record_count=1,
+                hierarchy_source_content_hashes="c" * 64,
+            )
+            context = regulation_tools._VerifiedHierarchicalReadContext(
+                settings=settings,
+                auth=mcp_auth_context(tenant_id="tenant-a"),
+                profile_id="profile-a",
+                runtime_token=token,
+                authorization_identity=("approval",),
+                authorization_document_ids=None,
+            )
+
+            namespace = context.verified_vector_cache_namespace
+            missing_hash = replace(
+                context,
+                runtime_token=replace(token, manifest_file_sha256=()),
+            ).verified_vector_cache_namespace
+
+        self.assertIsNotNone(namespace)
+        assert namespace is not None
+        self.assertEqual("tenant-a", namespace.tenant_id)
+        self.assertEqual("profile-a", namespace.profile_id)
+        self.assertEqual(("vector",), namespace.vector_identity)
+        self.assertEqual("a" * 64, namespace.expected_index_sha256)
+        self.assertEqual("b" * 64, namespace.expected_vector_sha256)
+        self.assertIsNone(missing_hash)
+
     def setUp(self) -> None:
         regulation_tools._HIERARCHICAL_INDEX_VERIFICATION_CACHE.clear()
         regulation_tools._HIERARCHICAL_VERIFIED_RUNTIME_TOKENS.clear()
