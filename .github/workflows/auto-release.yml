@@ -94,14 +94,31 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          release_commit_created=0
           if ! git diff --quiet -- app/__init__.py; then
             git add app/__init__.py
             git commit -m "chore(release): ${TAG} [skip auto-release]"
-            git push origin HEAD:main
+            release_commit_created=1
           fi
-          if ! git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null; then
+          if [ "${release_commit_created}" -eq 1 ]; then
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then
+                break
+              fi
+              if [ "${attempt}" -eq 3 ]; then
+                exit 1
+              fi
+              git fetch origin main
+              git rebase origin/main
+            done
+          fi
+          git fetch --tags origin
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null \
+            && ! git ls-remote --exit-code --tags origin "${TAG}" > /dev/null 2>&1; then
             git tag -a "${TAG}" -m "Release ${TAG}"
             git push origin "${TAG}"
+          else
+            echo "Tag ${TAG} already exists on origin; skipping tag publish."
           fi
 
       - name: Publish GitHub Release
