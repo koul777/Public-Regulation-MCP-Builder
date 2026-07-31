@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -48,6 +49,7 @@ from app.services.regulation_rag_runtime import (
 from app.retrieval.tokenizer import tokenize
 from app.retrieval.hierarchical_index import (
     HIERARCHICAL_INDEX_SCHEMA_VERSION,
+    VerifiedVectorCacheNamespace,
     fully_visible_regulation_unit_ids,
     hierarchical_index_path,
     indexed_document_ids,
@@ -204,6 +206,49 @@ class _VerifiedHierarchicalReadContext:
         ):
             return identity[1]
         return None
+
+    @property
+    def verified_vector_cache_namespace(
+        self,
+    ) -> VerifiedVectorCacheNamespace | None:
+        """Return the request's manifest-pinned raw-record cache namespace."""
+
+        if not isinstance(
+            self.runtime_token,
+            _VerifiedHierarchicalRuntimeToken,
+        ):
+            return None
+        vector_path = self.runtime_token.vector_path
+        try:
+            relative_path = vector_path.relative_to(
+                Path(self.settings.data_dir)
+            ).as_posix()
+            canonical_path = os.path.normcase(
+                str(vector_path.resolve(strict=True))
+            )
+        except (OSError, ValueError):
+            return None
+        expected_vector_sha256 = self.runtime_token.manifest_sha256_for(
+            relative_path
+        )
+        if (
+            not isinstance(expected_vector_sha256, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", expected_vector_sha256)
+        ):
+            return None
+        return VerifiedVectorCacheNamespace(
+            source_vector_path=os.path.normcase(
+                os.path.abspath(os.fspath(vector_path))
+            ),
+            canonical_vector_path=canonical_path,
+            vector_identity=self.runtime_token.vector_identity,
+            expected_index_sha256=self.runtime_token.expected_index_sha256,
+            expected_vector_sha256=expected_vector_sha256,
+            tenant_id=str(self.auth.tenant_id or "").strip(),
+            profile_id=str(
+                self.profile_id or self.runtime_token.profile_id or ""
+            ).strip().casefold(),
+        )
 
     def postflight_is_current(self) -> bool:
         runtime_is_current = self.runtime_token.is_current()
@@ -823,6 +868,9 @@ def _search_hierarchical_runtime(
         as_of_date=str(query.as_of_date or "").strip() or None,
         allowed_unit_ids=allowed_unit_ids,
         rerank_index=bm25_runtime[0] if bm25_runtime is not None else None,
+        verified_vector_cache_namespace=(
+            read_context.verified_vector_cache_namespace
+        ),
     )
     if not read_context.postflight_is_current():
         return None
@@ -3938,6 +3986,9 @@ def _visible_record_with_related_by_chunk(
                         hierarchical_paths[0],
                         hierarchical_paths[1],
                         document_id=document_id,
+                        verified_vector_cache_namespace=(
+                            read_context.verified_vector_cache_namespace
+                        ),
                     )
                     with _VISIBLE_DOCUMENT_RECORD_CACHE_LOCK:
                         _VISIBLE_DOCUMENT_RECORD_CACHE[article_cache_key] = list(
@@ -4046,6 +4097,11 @@ def _load_cached_hierarchical_record_by_chunk(
         hierarchical_paths[1],
         document_id=document_id,
         chunk_id=chunk_id,
+        verified_vector_cache_namespace=(
+            read_context.verified_vector_cache_namespace
+            if read_context is not None
+            else None
+        ),
     )
     if record is None:
         return None

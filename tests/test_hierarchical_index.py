@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import tempfile
 import json
+import os
+import operator
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -23,7 +27,9 @@ from app.mcp_server.regulation_tools import (
     search_regulations,
 )
 from app.retrieval.bm25_index import source_content_hashes
+from app.retrieval import hierarchical_index
 from app.retrieval.hierarchical_index import (
+    VerifiedVectorCacheNamespace,
     build_hierarchical_runtime_index,
     canonicalize_runtime_records,
     fully_visible_regulation_unit_ids,
@@ -45,6 +51,11 @@ from app.retrieval.hierarchical_index import (
 
 
 class HierarchicalIndexTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_LOCK:
+            hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE.clear()
+            hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_BYTES = 0
+
     def test_module_import_defers_reference_graph_builder(self) -> None:
         result = subprocess.run(
             [
@@ -3132,6 +3143,332 @@ class HierarchicalIndexTests(unittest.TestCase):
             [record["chunk_id"] for _score, record in results],
         )
 
+    def test_verified_vector_record_cache_hits_only_with_complete_namespace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_path, row, namespace, record = _verified_cache_fixture(
+                Path(tmp)
+            )
+            first = hierarchical_index._read_vector_records_at(
+                vector_path,
+                [row],
+                verified_vector_cache_namespace=namespace,
+            )
+            with (
+                patch.object(
+                    Path,
+                    "open",
+                    side_effect=AssertionError(
+                        "cache hit must not reopen JSONL"
+                    ),
+                ),
+                patch.object(
+                    hierarchical_index,
+                    "stable_content_hash",
+                    side_effect=AssertionError(
+                        "cache hit must not recompute content hash"
+                    ),
+                ),
+            ):
+                second = hierarchical_index._read_vector_records_at(
+                    vector_path,
+                    [row],
+                    verified_vector_cache_namespace=namespace,
+                )
+            with patch.object(Path, "open", side_effect=OSError("blocked")):
+                without_namespace = hierarchical_index._read_vector_records_at(
+                    vector_path,
+                    [row],
+                )
+                other_tenant = hierarchical_index._read_vector_records_at(
+                    vector_path,
+                    [row],
+                    verified_vector_cache_namespace=replace(
+                        namespace,
+                        tenant_id="tenant-b",
+                    ),
+                )
+                other_profile = hierarchical_index._read_vector_records_at(
+                    vector_path,
+                    [row],
+                    verified_vector_cache_namespace=replace(
+                        namespace,
+                        profile_id="institution-b",
+                    ),
+                )
+
+        self.assertEqual([record], first)
+        self.assertEqual([record], second)
+        self.assertEqual([None], without_namespace)
+        self.assertEqual([None], other_tenant)
+        self.assertEqual([None], other_profile)
+
+    def test_verified_vector_record_cache_freezes_cached_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_path, row, namespace, record = _verified_cache_fixture(
+                Path(tmp)
+            )
+            loaded = hierarchical_index._read_vector_records_at(
+                vector_path,
+                [row],
+                verified_vector_cache_namespace=namespace,
+            )[0]
+
+        self.assertEqual(record, loaded)
+        assert loaded is not None
+        self.assertEqual(
+            json.dumps(record, ensure_ascii=False),
+            json.dumps(loaded, ensure_ascii=False),
+        )
+        with self.assertRaises(TypeError):
+            loaded["document_id"] = "doc-b"
+        with self.assertRaises(TypeError):
+            loaded["metadata"]["article_title"] = "Changed"
+
+    def test_verified_vector_record_cache_key_binds_every_identity_dimension(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_path, row, namespace, _ = _verified_cache_fixture(Path(tmp))
+            base_key = hierarchical_index._verified_vector_record_cache_key(
+                vector_path,
+                row,
+                namespace,
+            )
+            self.assertIsNotNone(base_key)
+            namespace_variants = (
+                replace(namespace, vector_identity=("changed",)),
+                replace(namespace, expected_index_sha256="c" * 64),
+                replace(namespace, expected_vector_sha256="d" * 64),
+                replace(namespace, tenant_id="tenant-b"),
+                replace(namespace, profile_id="profile-b"),
+            )
+            row_variants = []
+            for field, value in (
+                ("vector_offset", int(row["vector_offset"]) + 1),
+                ("vector_length", int(row["vector_length"]) + 1),
+                ("document_id", "doc-b"),
+                ("chunk_id", "chunk-b"),
+                ("content_hash", "different-content-hash"),
+            ):
+                changed = dict(row)
+                changed[field] = value
+                row_variants.append(changed)
+            keys = {
+                hierarchical_index._verified_vector_record_cache_key(
+                    vector_path,
+                    row,
+                    variant,
+                )
+                for variant in namespace_variants
+            }
+            keys.update(
+                hierarchical_index._verified_vector_record_cache_key(
+                    vector_path,
+                    variant,
+                    namespace,
+                )
+                for variant in row_variants
+            )
+
+            other_path = Path(tmp) / "other.jsonl"
+            other_path.write_bytes(vector_path.read_bytes())
+            other_namespace = replace(
+                namespace,
+                source_vector_path=os.path.normcase(
+                    os.path.abspath(os.fspath(other_path))
+                ),
+                canonical_vector_path=os.path.normcase(
+                    str(other_path.resolve(strict=True))
+                ),
+            )
+            keys.add(
+                hierarchical_index._verified_vector_record_cache_key(
+                    other_path,
+                    row,
+                    other_namespace,
+                )
+            )
+
+        self.assertNotIn(base_key, keys)
+        self.assertEqual(11, len(keys))
+
+    def test_corrupt_and_oversized_vector_records_are_never_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corrupt_path = root / "corrupt.jsonl"
+            corrupt_payload = b"{not-json}\n"
+            corrupt_path.write_bytes(corrupt_payload)
+            corrupt_row = {
+                "vector_offset": 0,
+                "vector_length": len(corrupt_payload),
+                "document_id": "doc-a",
+                "chunk_id": "chunk-a",
+                "content_hash": "missing",
+            }
+            corrupt_namespace = _verified_cache_namespace(corrupt_path)
+            for _ in range(2):
+                self.assertEqual(
+                    [None],
+                    hierarchical_index._read_vector_records_at(
+                        corrupt_path,
+                        [corrupt_row],
+                        verified_vector_cache_namespace=corrupt_namespace,
+                    ),
+                )
+            self.assertEqual(0, len(hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE))
+
+            vector_path, row, namespace, record = _verified_cache_fixture(root)
+            with patch.object(
+                hierarchical_index,
+                "_VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRY_BYTES",
+                8,
+            ):
+                for _ in range(2):
+                    self.assertEqual(
+                        [record],
+                        hierarchical_index._read_vector_records_at(
+                            vector_path,
+                            [row],
+                            verified_vector_cache_namespace=namespace,
+                        ),
+                    )
+            self.assertEqual(0, len(hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE))
+
+    def test_verified_vector_record_cache_concurrently_enforces_bounds(self) -> None:
+        with (
+            patch.object(
+                hierarchical_index,
+                "_VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRIES",
+                32,
+            ),
+            patch.object(
+                hierarchical_index,
+                "_VERIFIED_VECTOR_RECORD_CACHE_MAX_BYTES",
+                4096,
+            ),
+            patch.object(
+                hierarchical_index,
+                "_VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRY_BYTES",
+                1024,
+            ),
+        ):
+            def write_and_read(index: int) -> None:
+                key = ("scope", index)
+                hierarchical_index._verified_vector_record_cache_put(
+                    key,
+                    {"index": index},
+                    encoded_size=256,
+                )
+                hierarchical_index._verified_vector_record_cache_get(key)
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                list(executor.map(write_and_read, range(500)))
+
+            with hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_LOCK:
+                entry_count = len(
+                    hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE
+                )
+                byte_count = (
+                    hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_BYTES
+                )
+
+        self.assertLessEqual(entry_count, 32)
+        self.assertLessEqual(byte_count, 4096)
+
+    def test_verified_vector_record_cache_evicts_least_recently_used(self) -> None:
+        with (
+            patch.object(
+                hierarchical_index,
+                "_VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRIES",
+                2,
+            ),
+            patch.object(
+                hierarchical_index,
+                "_VERIFIED_VECTOR_RECORD_CACHE_MAX_BYTES",
+                1024,
+            ),
+        ):
+            for key in ("a", "b"):
+                hierarchical_index._verified_vector_record_cache_put(
+                    (key,),
+                    {"key": key},
+                    encoded_size=100,
+                )
+            hierarchical_index._verified_vector_record_cache_get(("a",))
+            hierarchical_index._verified_vector_record_cache_put(
+                ("c",),
+                {"key": "c"},
+                encoded_size=100,
+            )
+
+            with hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_LOCK:
+                keys = list(
+                    hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE
+                )
+
+        self.assertEqual([("a",), ("c",)], keys)
+
+    def test_verified_vector_record_cache_recursively_blocks_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_path, row, namespace, expected = _verified_cache_fixture(
+                Path(tmp)
+            )
+            loaded = hierarchical_index._read_vector_records_at(
+                vector_path,
+                [row],
+                verified_vector_cache_namespace=namespace,
+            )[0]
+
+        self.assertIsInstance(loaded, dict)
+        assert loaded is not None
+        metadata = loaded["metadata"]
+        departments = metadata["department_acl"]
+        nested = metadata["nested"]
+        nested_items = nested["items"]
+        self.assertIsInstance(metadata, dict)
+        self.assertIsInstance(departments, list)
+        self.assertIsInstance(nested, dict)
+        self.assertIsInstance(nested_items, list)
+        self.assertEqual(expected, loaded)
+        self.assertEqual(
+            json.dumps(expected, ensure_ascii=False, sort_keys=True),
+            json.dumps(loaded, ensure_ascii=False, sort_keys=True),
+        )
+
+        dict_mutations = (
+            lambda: operator.setitem(loaded, "text", "changed"),
+            lambda: operator.delitem(loaded, "text"),
+            loaded.clear,
+            lambda: loaded.pop("text"),
+            loaded.popitem,
+            lambda: loaded.setdefault("new", "value"),
+            lambda: loaded.update({"text": "changed"}),
+            lambda: operator.ior(loaded, {"text": "changed"}),
+            lambda: operator.setitem(metadata, "profile_id", "changed"),
+            lambda: operator.setitem(nested, "new", True),
+        )
+        list_mutations = (
+            lambda: operator.setitem(departments, 0, "changed"),
+            lambda: operator.delitem(departments, 0),
+            lambda: departments.append("changed"),
+            departments.clear,
+            lambda: departments.extend(["changed"]),
+            lambda: departments.insert(0, "changed"),
+            departments.pop,
+            lambda: departments.remove("dept-a"),
+            departments.reverse,
+            departments.sort,
+            lambda: operator.iadd(departments, ["changed"]),
+            lambda: operator.imul(departments, 2),
+            lambda: operator.setitem(nested_items, 0, 99),
+        )
+        for mutate in (*dict_mutations, *list_mutations):
+            with self.assertRaisesRegex(TypeError, "immutable"):
+                mutate()
+        self.assertEqual(expected, loaded)
+
     def test_body_search_ranks_stronger_bm25_match_first(self) -> None:
         records = [
             _record(
@@ -3180,6 +3517,54 @@ class HierarchicalIndexTests(unittest.TestCase):
             ["leave-strong", "leave-weak"],
             [record["chunk_id"] for _, record in results],
         )
+
+
+def _verified_cache_namespace(
+    vector_path: Path,
+) -> VerifiedVectorCacheNamespace:
+    return VerifiedVectorCacheNamespace(
+        source_vector_path=os.path.normcase(
+            os.path.abspath(os.fspath(vector_path))
+        ),
+        canonical_vector_path=os.path.normcase(
+            str(vector_path.resolve(strict=True))
+        ),
+        vector_identity=(1, vector_path.stat().st_size, 2, 3),
+        expected_index_sha256="a" * 64,
+        expected_vector_sha256="b" * 64,
+        tenant_id="tenant-a",
+        profile_id="institution-a",
+    )
+
+
+def _verified_cache_fixture(
+    root: Path,
+) -> tuple[Path, dict[str, object], VerifiedVectorCacheNamespace, dict]:
+    record = _record(
+        "doc-a",
+        "chunk-a",
+        regulation_no="1-1",
+        regulation_title="Cache Regulation",
+        article_no="Article 1",
+        article_title="Cache",
+        text="verified vector cache evidence",
+        revision_date="2026-07-01",
+        metadata_updates={
+            "department_acl": ["dept-a", "dept-b"],
+            "nested": {"items": [1, 2]},
+        },
+    )
+    vector_path = root / "approved_vectors.jsonl"
+    offsets = write_vector_records_with_offsets(vector_path, [record])
+    offset, length = offsets[("doc-a", "chunk-a")]
+    row: dict[str, object] = {
+        "vector_offset": offset,
+        "vector_length": length,
+        "document_id": "doc-a",
+        "chunk_id": "chunk-a",
+        "content_hash": record["content_hash"],
+    }
+    return vector_path, row, _verified_cache_namespace(vector_path), record
 
 
 def _record(

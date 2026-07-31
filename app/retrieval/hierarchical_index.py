@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, timedelta
 import hashlib
 import json
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import unicodedata
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
@@ -28,6 +30,15 @@ _FTS_PREFIX_ARTICLE_LOCATOR_RE = re.compile(
 )
 _HISTORICAL_LIFECYCLE_STATUSES = ("approved", "superseded", "repealed")
 _CURRENT_LIFECYCLE_STATUSES = ("approved", "superseded")
+_VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRIES = 1024
+_VERIFIED_VECTOR_RECORD_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRY_BYTES = 512 * 1024
+_VERIFIED_VECTOR_RECORD_CACHE_LOCK = threading.Lock()
+_VERIFIED_VECTOR_RECORD_CACHE: OrderedDict[
+    tuple[Any, ...],
+    tuple[dict[str, Any], int],
+] = OrderedDict()
+_VERIFIED_VECTOR_RECORD_CACHE_BYTES = 0
 _KOREAN_QUERY_SUFFIXES = (
     "\uc5d0\uc11c",
     "\uc73c\ub85c",
@@ -48,6 +59,62 @@ _KOREAN_QUERY_SUFFIXES = (
     "\ub3c4",
     "\ub9cc",
 )
+
+
+@dataclass(frozen=True)
+class VerifiedVectorCacheNamespace:
+    """Manifest-pinned identity required to reuse raw vector record bytes.
+
+    The namespace contains no authorization decision. Tenant and profile are
+    included solely to prevent cross-scope reuse, while callers still perform
+    their normal approval, ACL, lifecycle, and request postflight checks.
+    """
+
+    source_vector_path: str
+    canonical_vector_path: str
+    vector_identity: Any
+    expected_index_sha256: str
+    expected_vector_sha256: str
+    tenant_id: str
+    profile_id: str
+
+
+class _FrozenVectorRecordDict(dict):
+    """JSON-compatible dict that rejects every ordinary mutation API."""
+
+    @staticmethod
+    def _reject_mutation(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("verified vector cache records are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+    __ior__ = _reject_mutation
+
+
+class _FrozenVectorRecordList(list):
+    """JSON-compatible list that rejects every ordinary mutation API."""
+
+    @staticmethod
+    def _reject_mutation(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("verified vector cache records are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    append = _reject_mutation
+    clear = _reject_mutation
+    extend = _reject_mutation
+    insert = _reject_mutation
+    pop = _reject_mutation
+    remove = _reject_mutation
+    reverse = _reject_mutation
+    sort = _reject_mutation
+    __iadd__ = _reject_mutation
+    __imul__ = _reject_mutation
 
 
 def _default_as_of_date() -> str:
@@ -1079,6 +1146,7 @@ def search_hierarchical_records(
     as_of_date: str | None = None,
     allowed_unit_ids: set[str] | None = None,
     rerank_index: Bm25Index | None = None,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
     """Search allowed catalog units first, then retrieve body evidence by offset."""
     path = Path(index_path)
@@ -1104,7 +1172,11 @@ def search_hierarchical_records(
         )
 
     version_scores = {str(row["version_id"]): float(score) for score, row in selected}
-    records = _read_vector_records_at(vector_path, rows)
+    records = _read_vector_records_at(
+        vector_path,
+        rows,
+        verified_vector_cache_namespace=verified_vector_cache_namespace,
+    )
     results: list[tuple[float, dict[str, Any]]] = []
     seen: set[tuple[str, str]] = set()
     for row, record in zip(rows, records):
@@ -1749,6 +1821,7 @@ def load_record_by_chunk(
     *,
     document_id: str,
     chunk_id: str,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> dict[str, Any] | None:
     with _connect_readonly(Path(index_path)) as connection:
         row = connection.execute(
@@ -1759,7 +1832,15 @@ def load_record_by_chunk(
             """,
             (document_id, chunk_id),
         ).fetchone()
-    return _read_vector_record_at(vector_path, row) if row is not None else None
+    return (
+        _read_vector_record_at(
+            vector_path,
+            row,
+            verified_vector_cache_namespace=verified_vector_cache_namespace,
+        )
+        if row is not None
+        else None
+    )
 
 
 def load_document_records(
@@ -1767,6 +1848,7 @@ def load_document_records(
     vector_path: str | Path,
     *,
     document_id: str,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> list[dict[str, Any]]:
     with _connect_readonly(Path(index_path)) as connection:
         rows = connection.execute(
@@ -1780,7 +1862,11 @@ def load_document_records(
         ).fetchall()
     return [
         record
-        for record in _read_vector_records_at(vector_path, rows)
+        for record in _read_vector_records_at(
+            vector_path,
+            rows,
+            verified_vector_cache_namespace=verified_vector_cache_namespace,
+        )
         if record is not None
     ]
 
@@ -1790,6 +1876,7 @@ def load_document_article_records(
     vector_path: str | Path,
     *,
     document_id: str,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> list[dict[str, Any]]:
     """Load only records eligible to govern appendix/form references.
 
@@ -1812,7 +1899,11 @@ def load_document_article_records(
         ).fetchall()
     return [
         record
-        for record in _read_vector_records_at(vector_path, rows)
+        for record in _read_vector_records_at(
+            vector_path,
+            rows,
+            verified_vector_cache_namespace=verified_vector_cache_namespace,
+        )
         if record is not None
     ]
 
@@ -1824,6 +1915,7 @@ def load_article_records(
     regulation_unit_id: str,
     article_no: str,
     as_of_date: str | None = None,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> list[dict[str, Any]]:
     with _connect_readonly(Path(index_path)) as connection:
         version = _version_for_unit(connection, regulation_unit_id, as_of_date=as_of_date)
@@ -1840,7 +1932,11 @@ def load_article_records(
         ).fetchall()
     return [
         record
-        for record in _read_vector_records_at(vector_path, rows)
+        for record in _read_vector_records_at(
+            vector_path,
+            rows,
+            verified_vector_cache_namespace=verified_vector_cache_namespace,
+        )
         if record is not None
     ]
 
@@ -2618,37 +2714,87 @@ def _version_for_unit(
 def _read_vector_record_at(
     vector_path: str | Path,
     row: Mapping[str, Any] | sqlite3.Row,
+    *,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> dict[str, Any] | None:
     """Load one verified vector record while preserving the public helper contract."""
 
-    records = _read_vector_records_at(vector_path, [row])
+    records = _read_vector_records_at(
+        vector_path,
+        [row],
+        verified_vector_cache_namespace=verified_vector_cache_namespace,
+    )
     return records[0] if records else None
 
 
 def _read_vector_records_at(
     vector_path: str | Path,
     rows: Iterable[Mapping[str, Any] | sqlite3.Row],
+    *,
+    verified_vector_cache_namespace: VerifiedVectorCacheNamespace | None = None,
 ) -> list[dict[str, Any] | None]:
     """Load offset-addressed records through one binary handle.
 
     The result list stays aligned with ``rows``. Any invalid row is rejected
     independently so one corrupt offset or payload cannot suppress valid
-    neighbors.
+    neighbors. Verified-cache callers must treat returned source records as
+    immutable; public result builders materialize separate dictionaries.
     """
 
     row_list = list(rows)
     if not row_list:
         return []
+    cache_prefix = _verified_vector_record_cache_prefix(
+        vector_path,
+        verified_vector_cache_namespace,
+    )
+    cache_keys = [
+        _verified_vector_record_cache_row_key(cache_prefix, row)
+        for row in row_list
+    ]
+    results: list[dict[str, Any] | None] = [None] * len(row_list)
+    missing_indexes: list[int] = []
+    for index, (row, cache_key) in enumerate(zip(row_list, cache_keys)):
+        cached_record = (
+            _verified_vector_record_cache_get(cache_key)
+            if cache_key is not None
+            else None
+        )
+        if cached_record is None:
+            missing_indexes.append(index)
+            continue
+        results[index] = cached_record
+    if not missing_indexes:
+        return results
     try:
         with Path(vector_path).open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             vector_size = handle.tell()
-            return [
-                _read_vector_record_from_handle(handle, row, vector_size=vector_size)
-                for row in row_list
-            ]
+            for index in missing_indexes:
+                row = row_list[index]
+                payload = _read_vector_payload_from_handle(
+                    handle,
+                    row,
+                    vector_size=vector_size,
+                )
+                if payload is None:
+                    continue
+                record = _decode_and_validate_vector_record(payload, row)
+                if record is None:
+                    continue
+                cache_key = cache_keys[index]
+                if cache_key is not None:
+                    record = _freeze_verified_vector_record(record)
+                results[index] = record
+                if cache_key is not None:
+                    _verified_vector_record_cache_put(
+                        cache_key,
+                        record,
+                        encoded_size=len(payload),
+                    )
     except OSError:
-        return [None] * len(row_list)
+        return results
+    return results
 
 
 def _read_vector_record_from_handle(
@@ -2657,6 +2803,24 @@ def _read_vector_record_from_handle(
     *,
     vector_size: int,
 ) -> dict[str, Any] | None:
+    payload = _read_vector_payload_from_handle(
+        handle,
+        row,
+        vector_size=vector_size,
+    )
+    return (
+        _decode_and_validate_vector_record(payload, row)
+        if payload is not None
+        else None
+    )
+
+
+def _read_vector_payload_from_handle(
+    handle: BinaryIO,
+    row: Mapping[str, Any] | sqlite3.Row,
+    *,
+    vector_size: int,
+) -> bytes | None:
     try:
         offset = int(row["vector_offset"])
         length = int(row["vector_length"])
@@ -2671,14 +2835,18 @@ def _read_vector_record_from_handle(
         payload = handle.read(length)
         if len(payload) != length:
             return None
+    except (OSError, ValueError, OverflowError):
+        return None
+    return payload
+
+
+def _decode_and_validate_vector_record(
+    payload: bytes,
+    row: Mapping[str, Any] | sqlite3.Row,
+) -> dict[str, Any] | None:
+    try:
         record = json.loads(payload.decode("utf-8"))
-    except (
-        OSError,
-        ValueError,
-        OverflowError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-    ):
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(record, dict):
         return None
@@ -2698,6 +2866,131 @@ def _read_vector_record_from_handle(
     if stable_content_hash(str(record.get("text") or ""), metadata) != content_hash:
         return None
     return record
+
+
+def _verified_vector_record_cache_key(
+    vector_path: str | Path,
+    row: Mapping[str, Any] | sqlite3.Row,
+    namespace: VerifiedVectorCacheNamespace | None,
+) -> tuple[Any, ...] | None:
+    return _verified_vector_record_cache_row_key(
+        _verified_vector_record_cache_prefix(vector_path, namespace),
+        row,
+    )
+
+
+def _verified_vector_record_cache_prefix(
+    vector_path: str | Path,
+    namespace: VerifiedVectorCacheNamespace | None,
+) -> tuple[Any, ...] | None:
+    if namespace is None:
+        return None
+    source_path = os.path.normcase(os.path.abspath(os.fspath(vector_path)))
+    if source_path != namespace.source_vector_path:
+        return None
+    if (
+        not namespace.canonical_vector_path
+        or not re.fullmatch(r"[a-f0-9]{64}", namespace.expected_index_sha256)
+        or not re.fullmatch(r"[a-f0-9]{64}", namespace.expected_vector_sha256)
+        or not namespace.tenant_id
+        or not namespace.profile_id
+    ):
+        return None
+    prefix = (
+        namespace.canonical_vector_path,
+        namespace.vector_identity,
+        namespace.expected_index_sha256,
+        namespace.expected_vector_sha256,
+        namespace.tenant_id,
+        namespace.profile_id,
+    )
+    try:
+        hash(prefix)
+    except TypeError:
+        return None
+    return prefix
+
+
+def _verified_vector_record_cache_row_key(
+    prefix: tuple[Any, ...] | None,
+    row: Mapping[str, Any] | sqlite3.Row,
+) -> tuple[Any, ...] | None:
+    if prefix is None:
+        return None
+    try:
+        key = (
+            *prefix,
+            int(row["vector_offset"]),
+            int(row["vector_length"]),
+            str(row["document_id"]),
+            str(row["chunk_id"]),
+            str(row["content_hash"]),
+        )
+        hash(key)
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    return key
+
+
+def _verified_vector_record_cache_get(
+    key: tuple[Any, ...],
+) -> dict[str, Any] | None:
+    with _VERIFIED_VECTOR_RECORD_CACHE_LOCK:
+        entry = _VERIFIED_VECTOR_RECORD_CACHE.get(key)
+        if entry is not None:
+            _VERIFIED_VECTOR_RECORD_CACHE.move_to_end(key)
+    return entry[0] if entry is not None else None
+
+
+def _freeze_verified_vector_record(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    frozen = _freeze_verified_vector_value(record)
+    if not isinstance(frozen, _FrozenVectorRecordDict):
+        raise TypeError("verified vector record must be a JSON object")
+    return frozen
+
+
+def _freeze_verified_vector_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _FrozenVectorRecordDict(
+            (key, _freeze_verified_vector_value(item))
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return _FrozenVectorRecordList(
+            _freeze_verified_vector_value(item) for item in value
+        )
+    return value
+
+
+def _verified_vector_record_cache_put(
+    key: tuple[Any, ...],
+    record: dict[str, Any],
+    *,
+    encoded_size: int,
+) -> None:
+    global _VERIFIED_VECTOR_RECORD_CACHE_BYTES
+    if (
+        encoded_size < 0
+        or encoded_size > _VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRY_BYTES
+    ):
+        return
+    frozen_record = _freeze_verified_vector_record(record)
+    with _VERIFIED_VECTOR_RECORD_CACHE_LOCK:
+        previous = _VERIFIED_VECTOR_RECORD_CACHE.pop(key, None)
+        if previous is not None:
+            _VERIFIED_VECTOR_RECORD_CACHE_BYTES -= previous[1]
+        _VERIFIED_VECTOR_RECORD_CACHE[key] = (frozen_record, encoded_size)
+        _VERIFIED_VECTOR_RECORD_CACHE_BYTES += encoded_size
+        while _VERIFIED_VECTOR_RECORD_CACHE and (
+            len(_VERIFIED_VECTOR_RECORD_CACHE)
+            > _VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRIES
+            or _VERIFIED_VECTOR_RECORD_CACHE_BYTES
+            > _VERIFIED_VECTOR_RECORD_CACHE_MAX_BYTES
+        ):
+            _, evicted = _VERIFIED_VECTOR_RECORD_CACHE.popitem(last=False)
+            _VERIFIED_VECTOR_RECORD_CACHE_BYTES -= evicted[1]
 
 
 def _toc_rows_for_record(
