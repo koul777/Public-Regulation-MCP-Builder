@@ -639,6 +639,37 @@ class StructureDetectorTests(unittest.TestCase):
             parsed.metadata["structure_boundary_diagnostic"],
         )
 
+    def test_numbered_single_regulation_attachment_label_without_article_restart_is_not_ambiguous(
+        self,
+    ) -> None:
+        text = "\n".join(
+            [
+                "여비규정",
+                "4-4-3. 여비규정",
+                "제1조(목적) 여비 지급 기준을 정한다.",
+                "제14조(지급) 별표의 지급기준을 따른다.",
+                "[별표 3]",
+                "지급기준",
+                "구분 금액 비고",
+            ]
+        )
+        parsed = ParsedDocument(
+            document_id="doc-single-numbered-attachment-label",
+            source_file="4-4-3-travel-expense.hwp",
+            document_name="4-4-3. 여비규정",
+            file_type="hwp",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+
+        nodes = StructureDetector().detect(parsed)
+
+        self.assertEqual(
+            [("4-4-3", "여비규정")],
+            [(node.number, node.title) for node in nodes if node.node_type == "regulation"],
+        )
+        self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+
     def test_ordinary_single_document_fallback_has_no_ambiguous_book_diagnostic(self) -> None:
         text = "일반 안내문\n구조화되지 않은 단일 문서 본문"
         parsed = ParsedDocument(

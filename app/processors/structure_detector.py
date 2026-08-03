@@ -655,7 +655,7 @@ class StructureDetector:
             first_text_index_by_page.setdefault(line.page_no, index)
 
         valid_candidates: list[tuple[int, str, str]] = []
-        invalid_candidates: list[tuple[int, str, str]] = []
+        ambiguous_candidates: list[tuple[int, str, str]] = []
         for candidate in raw_candidates:
             index, _title, _identity = candidate
             boundary_position = bisect_right(raw_boundary_indexes, index)
@@ -666,12 +666,10 @@ class StructureDetector:
             )
             article_position = bisect_right(article_indexes, index)
             if article_position >= len(article_indexes):
-                invalid_candidates.append(candidate)
                 continue
             article_index = article_indexes[article_position]
             first_article = article_by_index[article_index]
             if article_index >= next_boundary or first_article.number != "제1조":
-                invalid_candidates.append(candidate)
                 continue
 
             if not self._has_new_unit_evidence_after_attachment(
@@ -694,14 +692,14 @@ class StructureDetector:
                     index < attachment_index < article_index
                     for attachment_index in attachment_indexes
                 ):
-                    invalid_candidates.append(candidate)
+                    ambiguous_candidates.append(candidate)
                 continue
             valid_candidates.append(candidate)
 
         valid_identities = {identity for _index, _title, identity in valid_candidates}
-        has_distinct_invalid_candidate = any(
+        has_distinct_ambiguous_candidate = any(
             identity not in valid_identities
-            for _index, _title, identity in invalid_candidates
+            for _index, _title, identity in ambiguous_candidates
         )
         candidates = valid_candidates
         normalized_document_name = re.sub(
@@ -716,11 +714,12 @@ class StructureDetector:
             and document_title_identity
             and candidates[0][2] == document_title_identity
         )
-        if has_distinct_invalid_candidate and not single_document_title_match:
-            # A distinct malformed/attachment-scoped candidate may be a real
-            # regulation whose boundary evidence was lost. A standalone file
-            # may safely retain its own named root, but a combined book must
-            # not publish only the earlier subset and silently absorb the rest.
+        if has_distinct_ambiguous_candidate and not single_document_title_match:
+            # A title followed by an Article 1 restart after an attachment may
+            # be a real regulation whose page/preamble boundary evidence was
+            # lost. A bare attachment label such as "지급기준" without an
+            # Article 1 restart is ordinary attachment content and must not
+            # hard-block an otherwise explicit single-regulation document.
             if document_metadata is not None:
                 document_metadata[STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY] = (
                     AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC

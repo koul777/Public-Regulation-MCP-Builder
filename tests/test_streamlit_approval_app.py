@@ -304,7 +304,10 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             reflect.click().run()
 
             human_check = next(
-                checkbox for checkbox in app.checkbox if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             human_check.check().run()
 
@@ -346,7 +349,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "원본과 전처리 결과를 확인했습니다."
+                if checkbox.label == "사람 검증 결과: 원본과 전처리 결과를 확인했습니다."
             ).check().run()
             next(button for button in app.button if button.label == "승인하고 색인").click().run()
 
@@ -409,23 +412,20 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            next_button = next(
+            results_button = next(
                 button
                 for button in app.button
-                if button.label == "④ MCP 생성·AI 연결로 이동"
+                if button.label == "현재 규정의 결과 두 곳 확인하러 가기"
             )
             next(
                 radio for radio in app.radio if radio.label == "기본 작업 순서"
             ).set_value("④ MCP 생성·AI 연결").run()
 
-        self.assertTrue(next_button.disabled)
-        self.assertNotEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
-        self.assertTrue(
-            any(
-                "승인·색인을" in element.value
-                for element in (*app.info, *app.warning)
-            )
+        self.assertFalse(results_button.disabled)
+        self.assertFalse(
+            any(button.label == "④ MCP 생성·AI 연결로 이동" for button in app.button)
         )
+        self.assertNotEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
         self.assertFalse(app.exception)
 
     def test_approval_tabs_approve_only_reviewed_compare_chunk(self) -> None:
@@ -452,7 +452,10 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             reflect = next(button for button in app.button if button.label == "\ubc18\uc601")
             reflect.click().run()
             human_check = next(
-                checkbox for checkbox in app.checkbox if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             human_check.check().run()
             approve = next(button for button in app.button if button.label == "\uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
@@ -582,7 +585,8 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             first_human_check = next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             self.assertTrue(first_human_check.value)
 
@@ -606,7 +610,8 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             second_human_check = next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             self.assertTrue(second_human_check.value)
 
@@ -674,7 +679,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             first_human_check = next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "원본과 전처리 결과를 확인했습니다."
+                if checkbox.label == "사람 검증 결과: 원본과 전처리 결과를 확인했습니다."
             )
             first_human_check.check().run()
             next(
