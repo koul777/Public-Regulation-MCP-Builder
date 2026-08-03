@@ -412,23 +412,20 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            next_button = next(
+            results_button = next(
                 button
                 for button in app.button
-                if button.label == "④ MCP 생성·AI 연결로 이동"
+                if button.label == "현재 규정의 결과 두 곳 확인하러 가기"
             )
             next(
                 radio for radio in app.radio if radio.label == "기본 작업 순서"
             ).set_value("④ MCP 생성·AI 연결").run()
 
-        self.assertTrue(next_button.disabled)
-        self.assertNotEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
-        self.assertTrue(
-            any(
-                "승인·색인을" in element.value
-                for element in (*app.info, *app.warning)
-            )
+        self.assertFalse(results_button.disabled)
+        self.assertFalse(
+            any(button.label == "④ MCP 생성·AI 연결로 이동" for button in app.button)
         )
+        self.assertNotEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
         self.assertFalse(app.exception)
 
     def test_approval_tabs_approve_only_reviewed_compare_chunk(self) -> None:

@@ -247,6 +247,9 @@ BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY = "beginner_guide_preprocess_info_c
 BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY = "beginner_guide_preprocess_ai_choice_confirmed"
 BEGINNER_GUIDE_KORDOC_CHECKED_KEY = "beginner_guide_kordoc_checked"
 BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX = "beginner_guide_results_confirmed"
+BEGINNER_GUIDE_MCP_PRINCIPLE_CONFIRMED_PREFIX = (
+    "beginner_guide_mcp_principle_confirmed"
+)
 BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX = "beginner_guide_mcp_scope_confirmed"
 BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX = "beginner_guide_mcp_output_confirmed"
 BEGINNER_GUIDE_CONNECTION_CONFIRMED_PREFIX = "beginner_guide_connection_confirmed"
@@ -302,9 +305,12 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
         "각 청크 사람 검증 결과 확인",
         "모든 청크 승인 또는 반려 결정",
         "승인하고 색인 실행",
-        "색인 완료 상태 확인",
+        "현재 규정 색인 완료 상태 확인",
+        "다음 미완료 규정으로 이동해 같은 검수 반복",
+        "선택한 모든 규정의 검수·승인·색인 완료 확인",
     ),
     (
+        "MCP 원리와 변환 과정 확인",
         "MCP에 넣을 규정 범위 확인",
         "연결할 AI 앱 선택",
         "저장 위치·방식과 MCP 이름 확인",
@@ -1002,6 +1008,18 @@ def _beginner_guide_results_confirmed_key(document_id: str) -> str:
     return f"{BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX}:{document_id}:{revision}"
 
 
+def _beginner_guide_mcp_principle_confirmed_key(document_id: str) -> str:
+    revision = hashlib.sha256(
+        json.dumps(
+            _document_context_revision(document_id),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{BEGINNER_GUIDE_MCP_PRINCIPLE_CONFIRMED_PREFIX}:{document_id}:{revision}"
+
+
 def _beginner_guide_results_item_key(document_id: str, item: str) -> str:
     return f"{_beginner_guide_results_confirmed_key(document_id)}:{item}"
 
@@ -1470,6 +1488,21 @@ def _beginner_guide_procedure_states(
         )
         decisions_complete = bool(preprocessing_complete and pending_review_count == 0)
         indexed = bool(dict(ctx.get("mcp_connection_gate") or {}).get("ready")) if ctx else False
+        current_regulation_complete = bool(approval_complete and indexed)
+        selected_regulations_complete = current_regulation_complete
+        if ctx:
+            selected_document_ids = _selected_workflow_document_ids()
+            selected_approval_contexts = _selected_approval_contexts(
+                selected_document_ids,
+                ctx,
+            )
+            selected_regulations_complete = bool(
+                selected_document_ids
+                and not _selected_documents_pending_approval(
+                    selected_document_ids,
+                    selected_approval_contexts,
+                )
+            )
         return (
             decisions_complete,
             decisions_complete,
@@ -1477,10 +1510,18 @@ def _beginner_guide_procedure_states(
             decisions_complete,
             decisions_complete,
             decisions_complete,
-            bool(approval_complete and indexed),
+            current_regulation_complete,
+            selected_regulations_complete,
+            selected_regulations_complete,
         )
     if step == 4:
         bundle_created = _mcp_bundle_created(ctx) if mcp_bundle_created is None else mcp_bundle_created
+        principle_confirmed = bool(
+            document_id
+            and st.session_state.get(
+                _beginner_guide_mcp_principle_confirmed_key(document_id)
+            )
+        )
         scope_confirmed = bool(
             document_id
             and _session_has_true_prefix(
@@ -1516,6 +1557,7 @@ def _beginner_guide_procedure_states(
             )
         )
         return (
+            principle_confirmed,
             scope_confirmed,
             target_selected,
             output_confirmed,
@@ -4615,6 +4657,19 @@ def _selected_approval_contexts(selected_document_ids: list[str], current_ctx: d
             continue
         chunks = repository.get_chunks(normalized_document_id)
         tenant_id = str(getattr(document, "tenant_id", None) or _local_operator_tenant_id()).strip()
+        local_auth = AuthContext(
+            actor="streamlit-local-operator",
+            tenant_id=tenant_id or _local_operator_tenant_id(),
+            auth_mode="streamlit-local",
+        )
+        approved_count = sum(
+            1 for chunk in chunks if _approval_status(chunk) == "approved"
+        )
+        index_status = None
+        try:
+            index_status = get_index_status(normalized_document_id, local_auth)
+        except Exception:
+            pass
         latest_run = repository.latest_completed_run(normalized_document_id)
         agent_review_summary = (latest_run.stats or {}).get("agent_review") if latest_run else {}
         if not isinstance(agent_review_summary, dict):
@@ -4624,12 +4679,9 @@ def _selected_approval_contexts(selected_document_ids: list[str], current_ctx: d
             "document": document,
             "chunks": chunks,
             "document_tenant_id": tenant_id or _local_operator_tenant_id(),
-            "local_auth": AuthContext(
-                actor="streamlit-local-operator",
-                tenant_id=tenant_id or _local_operator_tenant_id(),
-                auth_mode="streamlit-local",
-            ),
-            "approved_count": sum(1 for chunk in chunks if _approval_status(chunk) == "approved"),
+            "local_auth": local_auth,
+            "approved_count": approved_count,
+            "mcp_connection_gate": _mcp_connection_gate(index_status, approved_count),
             "review_attention": {
                 chunk.chunk_id: chunk_review_attention_reasons(chunk)
                 for chunk in chunks
@@ -4667,7 +4719,12 @@ def _selected_documents_pending_approval(
             pending_document_ids.append(normalized_document_id)
             continue
         chunks = list(approval_ctx.get("chunks") or [])
-        approval_state = _mcp_scope_document_state(chunks, {"ready": True})
+        connection_gate = approval_ctx.get("mcp_connection_gate")
+        if not isinstance(connection_gate, dict):
+            # Compatibility for older cached/test contexts. Newly loaded
+            # contexts always carry the real approval/index visibility gate.
+            connection_gate = {"ready": True}
+        approval_state = _mcp_scope_document_state(chunks, connection_gate)
         if str(approval_state["state"]) == "blocking":
             pending_document_ids.append(normalized_document_id)
     return pending_document_ids
@@ -7783,6 +7840,26 @@ def _page_approval(ctx: dict | None) -> None:
         str(approval_ctx.get("document_id") or ""): _workflow_document_label(approval_ctx["document"])
         for approval_ctx in selected_approval_contexts
     }
+    beginner_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+    beginner_current_results_confirmed = bool(
+        st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
+    )
+    if beginner_mode_active and not beginner_current_results_confirmed:
+        _render_beginner_action_marker(
+            3,
+            "현재 규정의 결과 두 곳을 먼저 확인하세요",
+            "'② 결과 확인'으로 돌아가 문서 구조·정리된 내용(청크)을 확인하고, 이어서 품질 경고·이슈·표/별표를 확인한 뒤 두 확인란을 차례로 선택하세요.",
+            control_key_prefix="approval-goto-current-results",
+        )
+        st.warning(
+            "초보자 안내 모드에서는 규정마다 결과 확인을 끝낸 뒤에만 AI 검증과 사람 검증을 시작할 수 있습니다."
+        )
+        _render_workflow_next_button(
+            "현재 규정의 결과 두 곳 확인하러 가기",
+            NAV_RESULTS,
+            key="approval-goto-current-results",
+        )
+        return
     if len(selected_document_ids) > 1:
         st.markdown(f"### 선택한 규정 {len(selected_document_ids):,}개 일괄 처리")
         st.caption(
@@ -9270,7 +9347,11 @@ def _page_approval(ctx: dict | None) -> None:
         beginner_approval_incomplete = bool(
             beginner_current_document_incomplete or beginner_selected_documents_incomplete
         )
-        if beginner_selected_documents_incomplete:
+        if beginner_current_document_incomplete:
+            st.info(
+                "현재 규정의 모든 검수 결정을 마치고 승인·색인을 완료해야 다음 규정이나 MCP 단계로 이동할 수 있습니다."
+            )
+        elif beginner_selected_documents_incomplete:
             pending_labels = [
                 pending_label_by_document_id.get(document_id, document_id)
                 for document_id in selected_pending_document_ids[:3]
@@ -9286,13 +9367,38 @@ def _page_approval(ctx: dict | None) -> None:
                 "승인·색인되거나 명시적으로 반려되어 처리 방향이 모두 결정되어야 MCP 단계로 넘어갈 수 있습니다. "
                 f"아직 {len(selected_pending_document_ids):,}개 규정이 남았습니다.{pending_note}"
             )
+            next_document_id = str(selected_pending_document_ids[0])
+            next_document_label = pending_label_by_document_id.get(
+                next_document_id,
+                next_document_id,
+            )
+            next_document_button_key = (
+                f"approval-next-regulation-{document_id}-{next_document_id}"
+            )
+            _render_beginner_action_marker(
+                3,
+                "다음 미완료 규정을 하나씩 계속 확인하세요",
+                f"바로 아래 '{next_document_label}' 버튼을 누르세요. 결과 확인 두 곳부터 AI 검증, 왼쪽·오른쪽 사람 비교, 승인 또는 반려, 색인까지 같은 순서로 반복합니다.",
+                control_keys=(next_document_button_key,),
+            )
+            if st.button(
+                f"다음 미완료 규정 결과 확인 · {next_document_label}",
+                type="primary",
+                key=next_document_button_key,
+                width="stretch",
+            ):
+                st.session_state["document_id"] = next_document_id
+                _invalidate_document_context_cache()
+                _queue_workflow_navigation(
+                    NAV_RESULTS,
+                    label=f"{next_document_label} 결과 확인",
+                )
+                st.rerun()
         elif current_scope_state["state"] == "terminal-excluded":
             st.info(
                 "이 규정은 모든 활성 청크가 명시적으로 반려되어 MCP에서 제외됩니다. "
                 "검토 미완료는 아니지만, MCP를 만들려면 승인·색인된 다른 규정을 함께 선택해야 합니다."
             )
-        elif beginner_current_document_incomplete:
-            st.info("초보자 안내 모드에서는 모든 검수 결정을 마치고 승인·색인을 완료해야 다음 단계로 이동할 수 있습니다.")
         else:
             _render_beginner_action_marker(
                 3,
@@ -9995,6 +10101,61 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 - Codex can connect as an MCP client, but it is not a replacement API key for this product runtime.
                 """
             )
+        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            principle_confirmation_key = (
+                _beginner_guide_mcp_principle_confirmed_key(document_id)
+            )
+            _clear_other_beginner_confirmations(
+                f"{BEGINNER_GUIDE_MCP_PRINCIPLE_CONFIRMED_PREFIX}:{document_id}:",
+                principle_confirmation_key,
+            )
+            if not st.session_state.get(principle_confirmation_key):
+                _render_beginner_action_marker(
+                    4,
+                    "MCP가 작동하고 변환되는 원리를 먼저 확인하세요",
+                    "아래 설명에서 승인된 조문이 계층 색인·실행 데이터·AI 도구로 바뀌는 순서와 로컬 STDIO/원격 HTTPS 차이를 읽은 뒤 확인란을 선택하세요.",
+                    control_key_prefix=principle_confirmation_key,
+                )
+            st.markdown("#### 먼저 이해할 것: MCP는 어떻게 작동하나요?")
+            st.info(
+                "MCP는 규정 파일을 단순히 다른 파일 형식으로 바꾸는 기능이 아닙니다. "
+                "AI 앱이 승인된 규정 검색 서버의 도구를 안전하게 호출하도록 연결하는 공통 규칙입니다."
+            )
+            st.markdown(
+                """
+                **규정이 MCP로 준비되는 순서**
+
+                1. 업로드한 원문을 규정 → 장·절 → 조문 → 항·호 → 별표·서식 계층으로 나눕니다.
+                2. AI 제안과 사람의 왼쪽 원본/오른쪽 처리 결과 비교를 거쳐 승인한 청크만 남깁니다.
+                3. 승인 청크에 규정명·조문 번호·상위 계층·원문 출처를 붙여 계층 색인과 검색 색인을 만듭니다.
+                4. 선택한 규정 범위의 승인 데이터, MCP 서버 실행 명령, 앱별 연결 설정과 사용 안내를 한 묶음으로 생성합니다.
+                5. AI 앱에 그 연결을 등록하면 질문할 때 아래 도구를 호출하고, 서버는 승인 데이터만 돌려줍니다.
+
+                | AI가 호출하는 도구 | 하는 일 |
+                | --- | --- |
+                | `list_regulations` | MCP에 포함된 승인 규정 목록 확인 |
+                | `get_regulation_toc` | 규정의 장·절·조·별표 계층 확인 |
+                | `get_regulation_article` | 규정명과 조문 번호로 정확한 승인 조문 조회 |
+                | `get_regulation_references` | 현재 규정이 인용하거나 현재 규정을 인용한 규정 확인 |
+                | `list_regulation_reference_cycles` | 규정끼리 서로 순환 인용하는 관계 확인 |
+                | `search` | 질문과 관련된 승인 조문 후보 탐색 |
+                | `fetch` | 후보 ID의 승인 원문과 출처 확인 |
+
+                **연결 방식의 차이**
+
+                - **로컬 STDIO:** 같은 PC의 Claude Code·Codex·Claude Desktop이 생성된 명령으로 MCP 서버를 직접 실행합니다.
+                - **원격 HTTPS:** ChatGPT나 원격 Claude가 배포된 `/mcp` 주소로 접속합니다. 승인 데이터를 허용된 서버에 별도로 배포해야 합니다.
+                - 파일 묶음을 만든 것만으로 연결이 끝나지 않습니다. 앱 등록 → 앱 재시작/새 대화 → 연결 진단 → 실제 도구 호출을 모두 확인해야 합니다.
+                """
+            )
+            principle_confirmed = st.checkbox(
+                "승인된 조문이 계층 색인과 MCP 도구로 변환되는 원리를 확인했습니다.",
+                key=principle_confirmation_key,
+                help="설명을 읽은 뒤 선택하세요. 원문 전체나 미승인 청크가 MCP에 자동 공개되는 것은 아닙니다.",
+            )
+            if not principle_confirmed:
+                st.info("위 원리를 확인하면 MCP에 넣을 규정 범위 선택이 열립니다.")
+                return
         if mcp_connection_ready:
             st.caption(
                 "현재 승인된 조문은 색인되어 있습니다. 아래에서 선택한 MCP 범위에 검토가 남아 있는지도 함께 확인합니다."

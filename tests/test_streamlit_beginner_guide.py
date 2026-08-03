@@ -772,13 +772,16 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             for group in assignment.value.elts
         ]
 
-        self.assertEqual([6, 4, 7, 10], [len(group) for group in procedure_groups])
+        self.assertEqual([6, 4, 9, 11], [len(group) for group in procedure_groups])
         flattened = [item for group in procedure_groups for item in group]
         for required in (
             "자동 인식한 규정 정보 확인",
             "AI 추가 검수 사용 여부 결정",
             "품질 경고·이슈 확인",
             "각 청크 사람 검증 결과 확인",
+            "다음 미완료 규정으로 이동해 같은 검수 반복",
+            "선택한 모든 규정의 검수·승인·색인 완료 확인",
+            "MCP 원리와 변환 과정 확인",
             "MCP에 넣을 규정 범위 확인",
             "list_regulations 목록 호출 확인",
             "search 조문 검색 확인",
@@ -845,6 +848,30 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
 
         self.assertNotEqual(first, second)
         self.assertTrue(first.startswith("results-confirmed:doc-1:"))
+
+    def test_mcp_principle_confirmation_key_changes_with_document_revision(self) -> None:
+        _source, module = _source_and_module()
+        helper = _function(module, "_beginner_guide_mcp_principle_confirmed_key")
+        revisions = {"value": (("chunks", 1, 10),)}
+        namespace: dict[str, object] = {
+            "BEGINNER_GUIDE_MCP_PRINCIPLE_CONFIRMED_PREFIX": "mcp-principle",
+            "hashlib": hashlib,
+            "json": json,
+            "_document_context_revision": lambda _document_id: revisions["value"],
+        }
+        exec(
+            compile(ast.Module(body=[helper], type_ignores=[]), "<mcp-principle>", "exec"),
+            namespace,
+        )
+        confirmation_key = namespace[
+            "_beginner_guide_mcp_principle_confirmed_key"
+        ]
+        first = confirmation_key("doc-1")
+        revisions["value"] = (("chunks", 2, 10),)
+        second = confirmation_key("doc-1")
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("mcp-principle:doc-1:"))
 
     def test_beginner_mcp_requires_scope_and_output_confirmation_before_bundle(self) -> None:
         source, module = _source_and_module()
@@ -1929,6 +1956,24 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 ],
             ),
         )
+        self.assertEqual(
+            ["doc-index-failed"],
+            pending_documents(
+                ["doc-ready", "doc-index-failed"],
+                [
+                    {
+                        "document_id": "doc-ready",
+                        "chunks": [approved_chunk],
+                        "mcp_connection_gate": {"ready": True},
+                    },
+                    {
+                        "document_id": "doc-index-failed",
+                        "chunks": [approved_chunk],
+                        "mcp_connection_gate": {"ready": False},
+                    },
+                ],
+            ),
+        )
 
     def test_terminal_rejected_documents_are_not_pending_and_are_not_reindex_targets(self) -> None:
         _source, module = _source_and_module()
@@ -2117,6 +2162,11 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "_local_operator_tenant_id": lambda: "tenant-1",
             "AuthContext": lambda **kwargs: kwargs,
             "_approval_status": lambda chunk: chunk.approval_status,
+            "get_index_status": lambda _document_id, _auth: None,
+            "_mcp_connection_gate": lambda _status, approved_count: {
+                "ready": False,
+                "approved_count": approved_count,
+            },
             "chunk_review_attention_reasons": lambda _chunk: [],
         }
         exec(
@@ -2186,6 +2236,56 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("현재 화면의 규정부터 1개씩 검수합니다", page_source)
         self.assertIn("현재 규정 ③ 검수·승인으로 이동", page_source)
         self.assertIn("문서 목록에서 다음 규정을 선택", page_source)
+
+    def test_beginner_approval_requires_results_for_every_regulation_and_opens_next_one(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(
+            source,
+            _function(module, "_page_approval"),
+        ) or ""
+
+        for text in (
+            "현재 규정의 결과 두 곳을 먼저 확인하세요",
+            "현재 규정의 결과 두 곳 확인하러 가기",
+            "규정마다 결과 확인을 끝낸 뒤에만 AI 검증과 사람 검증을 시작",
+            "다음 미완료 규정을 하나씩 계속 확인하세요",
+            "결과 확인 두 곳부터 AI 검증, 왼쪽·오른쪽 사람 비교, 승인 또는 반려, 색인까지",
+            "다음 미완료 규정 결과 확인",
+        ):
+            self.assertIn(text, page_source)
+        self.assertIn(
+            "_beginner_guide_results_confirmed_key(document_id)",
+            page_source,
+        )
+        self.assertIn('st.session_state["document_id"] = next_document_id', page_source)
+        self.assertIn("_queue_workflow_navigation(\n                    NAV_RESULTS", page_source)
+
+    def test_beginner_mcp_explains_and_gates_principle_before_configuration(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(
+            source,
+            _function(module, "_page_connect"),
+        ) or ""
+
+        for text in (
+            "MCP는 규정 파일을 단순히 다른 파일 형식으로 바꾸는 기능이 아닙니다.",
+            "규정이 MCP로 준비되는 순서",
+            "승인 청크에 규정명·조문 번호·상위 계층·원문 출처",
+            "list_regulations",
+            "get_regulation_toc",
+            "get_regulation_article",
+            "get_regulation_references",
+            "list_regulation_reference_cycles",
+            "로컬 STDIO",
+            "원격 HTTPS",
+            "승인된 조문이 계층 색인과 MCP 도구로 변환되는 원리를 확인했습니다.",
+            "위 원리를 확인하면 MCP에 넣을 규정 범위 선택이 열립니다.",
+        ):
+            self.assertIn(text, page_source)
+        principle_gate = page_source.index("if not principle_confirmed:")
+        scope_control = page_source.index('st.radio(\n            "MCP 데이터 범위"')
+        self.assertLess(principle_gate, scope_control)
+        self.assertIn("return", page_source[principle_gate:scope_control])
 
     def test_beginner_mode_disables_batch_and_advanced_approval_paths(self) -> None:
         source, module = _source_and_module()
