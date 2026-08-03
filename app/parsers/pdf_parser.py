@@ -48,7 +48,7 @@ class PDFParser(BaseParser):
 
     def parse(self, path: Path, document_id: str) -> ParsedDocument:
         try:
-            import fitz  # PyMuPDF
+            from app.utils.fitz_compat import fitz
         except ImportError as exc:
             raise ParserError("PDF parsing requires PyMuPDF. Install package 'pymupdf'.") from exc
 
@@ -676,7 +676,7 @@ class PDFParser(BaseParser):
 
     def _parse_with_windows_ocr(self, path: Path, document_id: str) -> ParsedDocument:
         try:
-            import fitz  # PyMuPDF
+            from app.utils.fitz_compat import fitz
         except ImportError as exc:
             raise ParserError("PDF OCR rendering requires PyMuPDF. Install package 'pymupdf'.") from exc
 

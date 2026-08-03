@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -65,8 +64,13 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
             generated_at="2026-07-20T14:20:00Z",
         )
 
-        self.assertTrue(report["recognition_observation_ready"])
-        self.assertEqual("restart_and_mcp_status_list_observed", report["observation_status"])
+        self.assertFalse(report["recognition_observation_ready"])
+        self.assertEqual("chatgpt_local_unsupported", report["observation_status"])
+        self.assertTrue(report["legacy_observation_ready"])
+        self.assertEqual(
+            "restart_and_mcp_status_list_observed",
+            report["legacy_observation_status"],
+        )
         self.assertFalse(report["desktop_tool_scan_verified"])
         self.assertFalse(report["conversation_attachment_verified"])
         self.assertTrue(report["conversation_attachment_unverified"])
@@ -81,7 +85,7 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
 
         self.assertFalse(report["recognition_observation_ready"])
         self.assertTrue(report["desktop_process"]["restart_required"])
-        self.assertEqual("restart_required", report["observation_status"])
+        self.assertEqual("restart_required", report["legacy_observation_status"])
 
     def test_pre_registration_log_session_is_not_new_desktop_evidence(self) -> None:
         old_session = parse_desktop_log_text(
@@ -96,7 +100,10 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
 
         self.assertFalse(report["recognition_observation_ready"])
         self.assertFalse(report["desktop_logs"]["post_registration_session_observed"])
-        self.assertEqual("post_registration_log_session_not_observed", report["observation_status"])
+        self.assertEqual(
+            "post_registration_log_session_not_observed",
+            report["legacy_observation_status"],
+        )
 
     def test_new_session_without_successful_status_response_is_incomplete(self) -> None:
         session = parse_desktop_log_text("2026-07-20T14:10:00Z info desktop_started\n")
@@ -107,7 +114,10 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
         )
 
         self.assertFalse(report["recognition_observation_ready"])
-        self.assertEqual("mcp_status_list_success_not_observed", report["observation_status"])
+        self.assertEqual(
+            "mcp_status_list_success_not_observed",
+            report["legacy_observation_status"],
+        )
 
     def test_mixed_success_and_error_status_window_is_not_error_free(self) -> None:
         session = parse_desktop_log_text(
@@ -126,7 +136,7 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
         self.assertFalse(report["desktop_logs"]["mcp_status_list_observed_without_error"])
         self.assertEqual(1, report["desktop_logs"]["mcp_status_list_success_count"])
         self.assertEqual(1, report["desktop_logs"]["mcp_status_list_error_count"])
-        self.assertEqual("mcp_status_list_error_observed", report["observation_status"])
+        self.assertEqual("mcp_status_list_error_observed", report["legacy_observation_status"])
         self.assertTrue(report["support_summary"]["mcp_status_list_error_observed"])
 
     def test_not_running_is_distinct_from_restart_required(self) -> None:
@@ -138,7 +148,7 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
 
         self.assertFalse(report["desktop_process"]["detected"])
         self.assertFalse(report["desktop_process"]["restart_required"])
-        self.assertEqual("desktop_not_running", report["observation_status"])
+        self.assertEqual("desktop_not_running", report["legacy_observation_status"])
 
     def test_process_discovery_queries_chatgpt_only_and_never_codex_cli(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -224,10 +234,10 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
             )
             payload = json.loads(stdout.getvalue())
 
-        self.assertEqual(0, exit_code)
-        self.assertEqual("desktop_log_root_not_found", payload["observation_status"])
-        self.assertEqual("log_root_missing", payload["desktop_logs"]["discovery_status"])
-        self.assertEqual("log_root_missing", payload["support_summary"]["desktop_log_discovery_status"])
+        self.assertEqual(1, exit_code)
+        self.assertEqual("chatgpt_local_unsupported", payload["observation_status"])
+        self.assertEqual("not_checked", payload["desktop_logs"]["discovery_status"])
+        self.assertEqual("chatgpt-remote", payload["support_summary"]["replacement_target"])
         self.assertNotIn(str(missing_root), stdout.getvalue())
         self.assertNotIn("private-user-alice", stdout.getvalue())
 
@@ -249,10 +259,10 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
             )
             payload = json.loads(stdout.getvalue())
 
-        self.assertEqual(0, exit_code)
-        self.assertEqual("desktop_log_files_not_found", payload["observation_status"])
-        self.assertEqual("logs_not_found", payload["desktop_logs"]["discovery_status"])
-        self.assertEqual("logs_not_found", payload["support_summary"]["desktop_log_discovery_status"])
+        self.assertEqual(1, exit_code)
+        self.assertEqual("chatgpt_local_unsupported", payload["observation_status"])
+        self.assertEqual("not_checked", payload["desktop_logs"]["discovery_status"])
+        self.assertEqual("chatgpt-remote", payload["support_summary"]["replacement_target"])
         self.assertNotIn(str(empty_root), stdout.getvalue())
         self.assertNotIn("private-user-alice", stdout.getvalue())
 
@@ -338,8 +348,9 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             written = out_path.read_text(encoding="utf-8")
 
-        self.assertEqual(0, exit_code)
-        self.assertTrue(payload["recognition_observation_ready"])
+        self.assertEqual(2, exit_code)
+        self.assertFalse(payload["recognition_observation_ready"])
+        self.assertEqual("chatgpt_local_unsupported", payload["reason_code"])
         self.assertNotIn("alice", written.casefold())
         self.assertNotIn(str(log_path), written)
         self.assertFalse(payload["desktop_tool_scan_verified"])
@@ -370,10 +381,9 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             written = out_path.read_text(encoding="utf-8")
 
-        expected_sha256 = "sha256:" + hashlib.sha256(config_content).hexdigest()
-        self.assertEqual(0, exit_code)
+        self.assertEqual(1, exit_code)
         self.assertEqual(
-            {"exists": True, "content_sha256": expected_sha256},
+            {"exists": False, "content_sha256": None},
             payload["config_observation"],
         )
         for rendered in (
@@ -405,7 +415,7 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             written = out_path.read_text(encoding="utf-8")
 
-        self.assertEqual(0, exit_code)
+        self.assertEqual(1, exit_code)
         self.assertEqual(
             {"exists": False, "content_sha256": None},
             payload["config_observation"],
@@ -441,7 +451,7 @@ class ChatGptDesktopRecognitionTests(unittest.TestCase):
                 )
             payload = json.loads(stdout.getvalue())
 
-        self.assertEqual(0, exit_code)
+        self.assertEqual(1, exit_code)
         self.assertEqual(
             {"exists": False, "content_sha256": None},
             payload["config_observation"],

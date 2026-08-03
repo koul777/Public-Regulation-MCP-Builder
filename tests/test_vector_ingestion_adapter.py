@@ -17,6 +17,46 @@ from app.ingestion.vector_adapter import (
 
 
 class VectorIngestionAdapterTests(unittest.TestCase):
+    def test_publishes_canonical_hierarchy_and_keeps_source_structure_trace(self) -> None:
+        record = vector_record_from_chunk(
+            {
+                "chunk_id": "chunk-canonical-hierarchy",
+                "document_id": "doc-combined-book",
+                "tenant_id": "tenant-a",
+                "retrieval_text": "[문서명] 인사규정\n[위치] 인사규정 > 제1조 목적\n[본문]\n본문",
+                "hierarchy_path": "기관 규정집 > 제2장 인사 > 4-1 인사규정 > 제1조 목적",
+                "source_hierarchy_path": "기관 규정집 > 제2장 인사 > 4-1 인사규정 > 제1조 목적",
+                "canonical_hierarchy_path": "인사규정 > 제1조 목적",
+                "canonical_regulation_title": "인사규정",
+                "canonical_regulation_no": "4-1",
+                "parent_id": "source-parent-node",
+                "entity_id": "source-article-node",
+                "regulation_node_id": "source-regulation-node",
+                "regulation_source_node_id": "source-regulation-boundary",
+                "approval_status": "approved",
+                "approval_id": "approval-canonical-hierarchy",
+                "approved_content_hash": "approved-canonical-hierarchy",
+                "security_level": "internal",
+            }
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        metadata = record["metadata"]
+        self.assertEqual("인사규정 > 제1조 목적", metadata["hierarchy_path"])
+        self.assertEqual(
+            "기관 규정집 > 제2장 인사 > 4-1 인사규정 > 제1조 목적",
+            metadata["source_hierarchy_path"],
+        )
+        self.assertEqual("인사규정 > 제1조 목적", metadata["canonical_hierarchy_path"])
+        self.assertEqual("source-parent-node", metadata["parent_id"])
+        self.assertEqual("source-article-node", metadata["entity_id"])
+        self.assertEqual("source-regulation-node", metadata["regulation_node_id"])
+        self.assertEqual(
+            "source-regulation-boundary",
+            metadata["regulation_source_node_id"],
+        )
+
     def test_semantic_fingerprints_cover_retrieval_lifecycle_acl_and_profile_metadata(self) -> None:
         base = {
             "chunk_id": "chunk-semantic",

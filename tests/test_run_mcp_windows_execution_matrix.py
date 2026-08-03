@@ -55,7 +55,11 @@ def _write_bundle(root: Path, *, claude_code_add_stdio_contract: bool = True) ->
         encoding="utf-8",
     )
     contract_line = (
-        "claude mcp add --transport stdio --scope user aks_mcp --no-warm-cache\n"
+        '$ClaudeAddArgs = @("mcp", "add", "--transport", "stdio", "--scope", "user", '
+        '"aks_mcp", "--", "powershell.exe") + $LauncherArgs\n'
+        '$ClaudeGet = Invoke-ClaudeMcpCli @("mcp", "get", "aks_mcp")\n'
+        'if (-not $ClaudeScopeVerified) { throw "wrong-scope user registration" }\n'
+        '$InstalledConfigFingerprint = Assert-ClaudeUserConfigContract $ClaudeUserConfig $LauncherArgs\n'
         if claude_code_add_stdio_contract
         else "Write-Host \"not-a-claude-code-stdio-contract\"\n"
     )

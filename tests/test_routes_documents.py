@@ -2702,6 +2702,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                     file_type="pdf",
                     file_hash="hash",
                     tenant_id="tenant-a",
+                    regulation_status="approved",
                     status="completed",
                 )
             )
@@ -2768,6 +2769,7 @@ class RoutesDocumentsTests(unittest.TestCase):
             stored = vector_path.read_text(encoding="utf-8")
             scans = JsonRepository(settings).list_security_scan_records("doc_security_indexed")
             manual_scan = next(record for record in scans if record.get("scan_reason") == "manual")
+            document = JsonRepository(settings).get_document("doc_security_indexed")
 
         self.assertEqual(response["blocked_chunk_ids"], ["chunk-risk"])
         self.assertEqual(response["vector_sync"]["action"], "review_vector_sync")
@@ -2776,6 +2778,7 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(status["indexing_status"], "indexed")
         self.assertEqual(status["latest_job"]["record_count"], 0)
         self.assertEqual(stored.strip(), "")
+        self.assertEqual(document.regulation_status, "pending_approval")
 
     def test_approval_runs_preapproval_security_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2836,6 +2839,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                     file_type="pdf",
                     file_hash="hash",
                     tenant_id="tenant-a",
+                    regulation_status="approved",
                     status="completed",
                 )
             )
@@ -2867,11 +2871,261 @@ class RoutesDocumentsTests(unittest.TestCase):
             source = next(chunk for chunk in chunks if chunk.chunk_id == "chunk-1")
             created = [chunk for chunk in chunks if chunk.chunk_id in response["created_chunk_ids"]]
             records = JsonRepository(settings).list_review_records("doc_review")
+            document = JsonRepository(settings).get_document("doc_review")
 
         self.assertEqual(source.approval_status, "superseded")
         self.assertEqual(len(created), 2)
         self.assertEqual({chunk.approval_status for chunk in created}, {"needs_review"})
         self.assertEqual(records[0]["action"], "split")
+        self.assertEqual(document.regulation_status, "pending_approval")
+
+    def test_split_replacements_can_complete_document_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_split_approval",
+                    filename="split.pdf",
+                    document_name="Split Approval",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    regulation_id="reg-split-approval",
+                    regulation_status="approved",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc_split_approval",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-source",
+                        document_id="doc_split_approval",
+                        chunk_type="article",
+                        text="one two",
+                        retrieval_text="one two",
+                        approval_status="approved",
+                        approval_id="approval-old",
+                        approved_by="reviewer",
+                        approved_at="2026-07-08T00:00:00+00:00",
+                        approved_content_hash="hash-old",
+                        security_level="internal",
+                    )
+                ],
+                [],
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                split = routes_documents.split_review_chunk(
+                    "doc_split_approval",
+                    "chunk-source",
+                    routes_documents.SplitChunkRequest(texts=["one", "two"]),
+                    _auth_context(),
+                )
+                current_chunks = repository.get_chunks("doc_split_approval")
+                replacements = [
+                    chunk
+                    for chunk in current_chunks
+                    if chunk.chunk_id in split["created_chunk_ids"]
+                ]
+                evidence = _write_approval_evidence(
+                    root,
+                    settings=settings,
+                    document_id="doc_split_approval",
+                    chunks=replacements,
+                )
+                routes_documents.approve_review_chunks(
+                    "doc_split_approval",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=split["created_chunk_ids"],
+                        approval_id="approval-replacements",
+                        security_level="internal",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+
+            stored_chunks = repository.get_chunks("doc_split_approval")
+            stored_document = repository.get_document("doc_split_approval")
+
+        source = next(chunk for chunk in stored_chunks if chunk.chunk_id == "chunk-source")
+        replacements = [
+            chunk
+            for chunk in stored_chunks
+            if chunk.chunk_id in split["created_chunk_ids"]
+        ]
+        self.assertEqual("superseded", source.approval_status)
+        self.assertEqual({"approved"}, {chunk.approval_status for chunk in replacements})
+        self.assertEqual("approved", stored_document.regulation_status)
+
+    def test_rejected_chunk_is_terminal_when_another_active_chunk_is_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_terminal_rejected",
+                    filename="terminal.pdf",
+                    document_name="Terminal Decisions",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    regulation_id="reg-terminal-rejected",
+                    regulation_status="pending_approval",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc_terminal_rejected",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-rejected",
+                        document_id="doc_terminal_rejected",
+                        chunk_type="article",
+                        text="intentionally excluded",
+                        approval_status="rejected",
+                    ),
+                    Chunk(
+                        chunk_id="chunk-approve",
+                        document_id="doc_terminal_rejected",
+                        chunk_type="article",
+                        text="approved content",
+                    ),
+                ],
+                [],
+            )
+            requested_chunks = [repository.get_chunks("doc_terminal_rejected")[1]]
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id="doc_terminal_rejected",
+                chunks=requested_chunks,
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                routes_documents.approve_review_chunks(
+                    "doc_terminal_rejected",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-approve"],
+                        approval_id="approval-terminal",
+                        security_level="internal",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+
+            stored_document = repository.get_document("doc_terminal_rejected")
+            statuses = {
+                chunk.chunk_id: chunk.approval_status
+                for chunk in repository.get_chunks("doc_terminal_rejected")
+            }
+
+        self.assertEqual("rejected", statuses["chunk-rejected"])
+        self.assertEqual("approved", statuses["chunk-approve"])
+        self.assertEqual("approved", stored_document.regulation_status)
+
+    def test_security_blocked_active_chunk_keeps_document_pending(self) -> None:
+        stored_document = self._approve_one_chunk_with_unresolved_sibling(
+            sibling_status="security_blocked",
+            document_id="doc_security_blocked_pending",
+        )
+
+        self.assertEqual("pending_approval", stored_document.regulation_status)
+
+    def test_needs_review_active_chunk_keeps_document_pending(self) -> None:
+        stored_document = self._approve_one_chunk_with_unresolved_sibling(
+            sibling_status="needs_review",
+            document_id="doc_needs_review_pending",
+        )
+
+        self.assertEqual("pending_approval", stored_document.regulation_status)
+
+    def test_all_rejected_chunks_do_not_make_document_approval_ready(self) -> None:
+        chunks = [
+            Chunk(
+                chunk_id=f"chunk-{index}",
+                document_id="doc_all_rejected",
+                chunk_type="article",
+                text=f"rejected {index}",
+                approval_status="rejected",
+            )
+            for index in range(1, 3)
+        ]
+
+        self.assertFalse(routes_documents._document_chunks_ready_for_approval(chunks))
+
+    def _approve_one_chunk_with_unresolved_sibling(
+        self,
+        *,
+        sibling_status: str,
+        document_id: str,
+    ) -> Document:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id=document_id,
+                    filename="pending.pdf",
+                    document_name="Pending Decisions",
+                    file_type="pdf",
+                    file_hash=f"hash-{document_id}",
+                    tenant_id="tenant-a",
+                    regulation_id=f"reg-{document_id}",
+                    regulation_status="pending_approval",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                document_id,
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-unresolved",
+                        document_id=document_id,
+                        chunk_type="article",
+                        text="unresolved content",
+                        approval_status=sibling_status,
+                    ),
+                    Chunk(
+                        chunk_id="chunk-approve",
+                        document_id=document_id,
+                        chunk_type="article",
+                        text="approved content",
+                    ),
+                ],
+                [],
+            )
+            requested_chunks = [repository.get_chunks(document_id)[1]]
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id=document_id,
+                chunks=requested_chunks,
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                routes_documents.approve_review_chunks(
+                    document_id,
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-approve"],
+                        approval_id=f"approval-{document_id}",
+                        security_level="internal",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+
+            stored_document = repository.get_document(document_id)
+            if stored_document is None:
+                raise AssertionError("approved document fixture was not stored")
+            return stored_document
 
     def test_merge_review_chunks_supersedes_sources_and_creates_review_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2885,6 +3139,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                     file_type="pdf",
                     file_hash="hash",
                     tenant_id="tenant-a",
+                    regulation_status="approved",
                     status="completed",
                 )
             )
@@ -2921,11 +3176,13 @@ class RoutesDocumentsTests(unittest.TestCase):
             superseded = [chunk for chunk in chunks if chunk.chunk_id in {"chunk-1", "chunk-2"}]
             merged = next(chunk for chunk in chunks if chunk.chunk_id == response["created_chunk_ids"][0])
             records = JsonRepository(settings).list_review_records("doc_review")
+            document = JsonRepository(settings).get_document("doc_review")
 
         self.assertEqual({chunk.approval_status for chunk in superseded}, {"superseded"})
         self.assertEqual(merged.approval_status, "needs_review")
         self.assertEqual(merged.text, "one\n\ntwo")
         self.assertEqual(records[0]["action"], "merge")
+        self.assertEqual(document.regulation_status, "pending_approval")
 
     def test_update_review_chunk_invalidates_prior_approval_and_records_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2939,6 +3196,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                     file_type="pdf",
                     file_hash="hash",
                     tenant_id="tenant-a",
+                    regulation_status="approved",
                     status="completed",
                 )
             )
@@ -2979,6 +3237,7 @@ class RoutesDocumentsTests(unittest.TestCase):
             export_row = json.loads((settings.exports_dir / "doc_review.jsonl").read_text(encoding="utf-8").strip())
             review_records = JsonRepository(settings).list_review_records("doc_review")
             review_snapshot_exists = (settings.data_dir / review_records[0]["snapshot"]).is_file()
+            document = JsonRepository(settings).get_document("doc_review")
 
         self.assertEqual(response["chunk"]["text"], "reviewed text")
         self.assertEqual(updated.approval_status, "needs_review")
@@ -2992,6 +3251,44 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertTrue(review_snapshot_exists)
         self.assertIn("before_content_hashes", review_records[0])
         self.assertIn("after_content_hashes", review_records[0])
+        self.assertEqual(document.regulation_status, "pending_approval")
+
+    def test_review_chunk_mutation_preserves_noncurrent_lifecycle_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            for status in ("pending_approval", "superseded"):
+                document_id = f"doc_{status}"
+                repository.upsert_document(
+                    Document(
+                        document_id=document_id,
+                        filename="review.pdf",
+                        document_name="Review",
+                        file_type="pdf",
+                        file_hash=f"hash-{status}",
+                        tenant_id="tenant-a",
+                        regulation_status=status,
+                        status="completed",
+                    )
+                )
+                chunks = [
+                    Chunk(
+                        chunk_id=f"chunk-{status}",
+                        document_id=document_id,
+                        chunk_type="article",
+                        text="reviewed text",
+                        approval_status="needs_review",
+                    )
+                ]
+
+                routes_documents._save_review_chunk_mutation(
+                    repository,
+                    document_id,
+                    chunks,
+                )
+
+                document = repository.get_document(document_id)
+                self.assertEqual(document.regulation_status, status)
 
     def test_reject_review_chunks_blocks_chunk_and_records_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3005,6 +3302,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                     file_type="pdf",
                     file_hash="hash",
                     tenant_id="tenant-a",
+                    regulation_status="approved",
                     status="completed",
                 )
             )
@@ -3038,6 +3336,7 @@ class RoutesDocumentsTests(unittest.TestCase):
             export_row = json.loads((settings.exports_dir / "doc_review.jsonl").read_text(encoding="utf-8").strip())
             review_records = JsonRepository(settings).list_review_records("doc_review")
             reject_snapshot_exists = (settings.data_dir / review_records[0]["snapshot"]).is_file()
+            document = JsonRepository(settings).get_document("doc_review")
 
         self.assertEqual(response["status"], "rejected")
         self.assertEqual(updated.approval_status, "rejected")
@@ -3046,6 +3345,7 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(export_row["approval_status"], "rejected")
         self.assertEqual(review_records[0]["action"], "reject")
         self.assertTrue(reject_snapshot_exists)
+        self.assertEqual(document.regulation_status, "pending_approval")
 
     def test_reject_review_chunks_requires_reason_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3059,6 +3359,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                     file_type="pdf",
                     file_hash="hash",
                     tenant_id="tenant-a",
+                    regulation_status="approved",
                     status="completed",
                 )
             )
@@ -3090,11 +3391,13 @@ class RoutesDocumentsTests(unittest.TestCase):
                     )
             updated = JsonRepository(settings).get_chunks("doc_review")[0]
             review_records = JsonRepository(settings).list_review_records("doc_review")
+            document = JsonRepository(settings).get_document("doc_review")
 
         self.assertEqual(400, raised.exception.status_code)
         self.assertEqual("rejection reason is required.", raised.exception.detail)
         self.assertEqual("approved", updated.approval_status)
         self.assertEqual([], review_records)
+        self.assertEqual(document.regulation_status, "approved")
 
     def test_approval_records_are_append_only_even_when_approval_id_repeats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

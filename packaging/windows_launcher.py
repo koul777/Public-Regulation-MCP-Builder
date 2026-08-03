@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 from pathlib import Path
+
+try:
+    from app.utils.fitz_compat import fitz
+except ImportError:
+    fitz = None
 
 from scripts.find_available_ui_port import select_available_port
 
@@ -45,13 +52,69 @@ def _configure_runtime() -> tuple[Path, Path]:
     return bundle_root, runtime_root
 
 
+def portable_self_check() -> int:
+    """Verify the bundled PDF dependency and parser without creating runtime data."""
+    expected_text = "Portable PDF parser self-check"
+    try:
+        from app.parsers.pdf_parser import PDFParser
+
+        if fitz is None:
+            raise RuntimeError("pymupdf_not_available")
+        with tempfile.TemporaryDirectory(prefix="pr-mcp-pdf-check-") as temporary_directory:
+            pdf_path = Path(temporary_directory) / "self-check.pdf"
+            with fitz.open() as document:
+                page = document.new_page()
+                page.insert_text((72, 72), expected_text)
+                document.save(pdf_path)
+
+            parsed = PDFParser().parse(pdf_path, document_id="portable-self-check")
+            page_count = len(parsed.pages)
+            text_verified = expected_text in parsed.raw_text
+            if page_count != 1 or not text_verified:
+                raise RuntimeError("unexpected_pdf_parser_result")
+    except Exception:
+        print(
+            json.dumps(
+                {
+                    "schema_version": "pr-mcp-builder-portable-self-check-v1",
+                    "status": "failed",
+                    "reason": "pdf_parser_self_check_failed",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+
+    print(
+        json.dumps(
+            {
+                "schema_version": "pr-mcp-builder-portable-self-check-v1",
+                "status": "ok",
+                "pages": page_count,
+                "text_verified": text_verified,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def main() -> int:
+    if "--portable-self-check" in sys.argv[1:]:
+        return portable_self_check()
+
     if "--mcp-server" in sys.argv[1:]:
         server_args = [arg for arg in sys.argv[1:] if arg != "--mcp-server"]
         sys.argv = [sys.argv[0], *server_args]
         from scripts.run_regulation_mcp import main as run_mcp_server
 
         return int(run_mcp_server() or 0)
+
+    if sys.argv[1:] == ["--version"]:
+        from app import __version__
+
+        print(__version__)
+        return 0
 
     bundle_root, runtime_root = _configure_runtime()
     preferred_ui_port = int(os.getenv("REG_RAG_UI_PORT", "8501"))

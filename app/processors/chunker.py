@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,8 +43,16 @@ HWPX_SOURCE_LIST_METADATA_KEYS = (
     "source_hwpx_xml_block_indices",
 )
 
-CHUNKER_VERSION = "0.1.8"
+CHUNKER_VERSION = "0.1.11"
 PDF_TABLE_REGION_DUPLICATE_COVERAGE = 0.8
+STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
+    "ambiguous_combined_book_boundary_after_attachment"
+)
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY = "ambiguous_combined_book_boundary"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING = (
+    "ambiguous_combined_book_boundary_requires_reparse"
+)
 
 SUPPLEMENTARY_CONTEXT_DATE = re.compile(
     r"(?P<date>\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.?|\d{4}-\d{1,2}-\d{1,2})"
@@ -175,10 +184,14 @@ class Chunker:
                 answer_profile = build_answer_profile(text, metadata)
                 metadata.update(answer_profile)
                 hierarchy_path = metadata.get("hierarchy_path", parsed.document_name or parsed.source_file)
-                final_text = self._with_context_header(text, hierarchy_path, options)
+                canonical_hierarchy_path = metadata.get("canonical_hierarchy_path") or hierarchy_path
+                final_text = self._with_context_header(text, canonical_hierarchy_path, options)
                 retrieval_text = self._retrieval_text(
-                    parsed.document_name or parsed.source_file,
-                    hierarchy_path,
+                    metadata.get("canonical_regulation_title")
+                    or metadata.get("regulation_title")
+                    or parsed.document_name
+                    or parsed.source_file,
+                    canonical_hierarchy_path,
                     text,
                     metadata.get("table_markdown"),
                 )
@@ -202,7 +215,7 @@ class Chunker:
                 )
         if regulation_progress_callback is not None and len(regulation_nodes) > 1:
             report_regulations_through(max((node.order_index for node in nodes), default=0) + 1)
-        chunks.extend(self._pdf_table_region_chunks(parsed, len(chunks), chunks))
+        chunks.extend(self._pdf_table_region_chunks(parsed, len(chunks), chunks, regulation_nodes))
         if not chunks:
             chunks.extend(self._fallback_document_chunks(parsed, options))
         self._attach_pdf_document_metadata(chunks, parsed)
@@ -213,7 +226,24 @@ class Chunker:
             attach_kordoc_table_matches(chunks, parsed.metadata.get("kordoc_table_inventory"))
         self._inherit_temporal_metadata_from_chunks(chunks)
         self._attach_reference_edges(chunks)
+        self._attach_structure_boundary_diagnostic(chunks, parsed)
         return chunks
+
+    def _attach_structure_boundary_diagnostic(
+        self,
+        chunks: list[Chunk],
+        parsed: ParsedDocument,
+    ) -> None:
+        diagnostic = str(
+            parsed.metadata.get(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY) or ""
+        ).strip()
+        if diagnostic != AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC:
+            return
+        for chunk in chunks:
+            chunk.metadata[STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY] = diagnostic
+            chunk.metadata[AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY] = True
+            if AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING not in chunk.warnings:
+                chunk.warnings.append(AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING)
 
     _KORDOC_MATCH_RANK = {
         "weak_review_match": 1,
@@ -1180,6 +1210,7 @@ class Chunker:
         regulation_nodes: list[StructureNode] | None = None,
     ) -> dict:
         ancestors = self._ancestors(node, lookup)
+        source_hierarchy_path = self._hierarchy_path(parsed, ancestors, node)
         metadata = {
             "document_id": parsed.document_id,
             "document_name": parsed.document_name or parsed.source_file,
@@ -1187,7 +1218,12 @@ class Chunker:
             "source_page_start": node.page_start,
             "source_page_end": node.page_end,
             "chunk_type": self._chunk_type(node),
-            "hierarchy_path": self._hierarchy_path(parsed, ancestors, node),
+            # ``hierarchy_path`` remains the parser/source locator for backward
+            # compatibility and provenance. Retrieval and normalized TOC work
+            # use ``canonical_hierarchy_path`` below so a binder wrapper never
+            # changes the meaning of a regulation chunk.
+            "hierarchy_path": source_hierarchy_path,
+            "source_hierarchy_path": source_hierarchy_path,
             "order_index": node.order_index,
             "references": [],
             "effective_date": None,
@@ -1250,7 +1286,7 @@ class Chunker:
                     metadata["regulation_node_id"] = ancestor.node_id
                 if key_prefix == "paragraph" and ancestor.metadata.get("paragraph_label"):
                     metadata["paragraph_label"] = ancestor.metadata["paragraph_label"]
-        if not metadata.get("regulation_no"):
+        if not metadata.get("regulation_no") and not metadata.get("regulation_title"):
             inferred = self._nearest_preceding_regulation(node, regulation_nodes or [])
             if inferred:
                 metadata["regulation_no"] = inferred.number
@@ -1258,12 +1294,28 @@ class Chunker:
                 metadata["regulation_inferred_from_order"] = True
                 metadata["regulation_source_node_id"] = inferred.node_id
                 metadata["regulation_node_id"] = inferred.node_id
-        if not metadata.get("regulation_no"):
-            document_regulation_title = self._document_regulation_title(parsed)
+        if not metadata.get("regulation_title"):
+            document_regulation_no, document_regulation_title = self._document_regulation_identity(parsed)
             if document_regulation_title:
-                metadata["regulation_no"] = document_regulation_title
+                # A title is not a regulation number. Older standalone fallback
+                # metadata copied the title into both fields, which made the
+                # same regulation receive a different unit ID than its numbered
+                # entry in a combined regulation book.
+                metadata["regulation_no"] = document_regulation_no or ""
                 metadata["regulation_title"] = document_regulation_title
                 metadata["regulation_inferred_from_document"] = True
+        canonical_regulation_title = str(metadata.get("regulation_title") or "").strip()
+        if canonical_regulation_title:
+            metadata["canonical_regulation_title"] = canonical_regulation_title
+        canonical_regulation_no = str(metadata.get("regulation_no") or "").strip()
+        if canonical_regulation_no:
+            metadata["canonical_regulation_no"] = canonical_regulation_no
+        metadata["canonical_hierarchy_path"] = self._canonical_hierarchy_path(
+            ancestors,
+            node,
+            regulation_title=canonical_regulation_title,
+            regulation_no=canonical_regulation_no,
+        )
         return metadata
 
     def _is_supplementary_context(self, node: StructureNode, lookup: dict[str, StructureNode]) -> bool:
@@ -1530,12 +1582,14 @@ class Chunker:
         parsed: ParsedDocument,
         offset: int,
         existing_chunks: list[Chunk] | None = None,
+        regulation_nodes: list[StructureNode] | None = None,
     ) -> list[Chunk]:
         regions = parsed.metadata.get("pdf_table_regions") or []
         if not isinstance(regions, list):
             return []
         chunks: list[Chunk] = []
         existing_chunks = existing_chunks or []
+        candidate_index = self._pdf_table_region_candidate_index(existing_chunks)
         for index, region in enumerate(regions, start=1):
             if not isinstance(region, dict):
                 continue
@@ -1543,7 +1597,12 @@ class Chunker:
             if not text:
                 continue
             page_no = region.get("source_page")
-            duplicate = self._pdf_table_region_duplicate_target(region, page_no, existing_chunks)
+            duplicate = self._pdf_table_region_duplicate_target(
+                region,
+                page_no,
+                existing_chunks,
+                candidate_index=candidate_index,
+            )
             if duplicate:
                 target, coverage = duplicate
                 self._attach_suppressed_pdf_table_region(target, region, coverage)
@@ -1551,6 +1610,17 @@ class Chunker:
             title = str(region.get("title") or "").strip() or None
             column_count = int(region.get("column_count") or 0)
             row_count = int(region.get("row_count") or 0)
+            regulation_no, regulation_title, regulation_node = self._pdf_table_region_regulation_identity(
+                parsed,
+                region,
+                regulation_nodes or [],
+            )
+            source_hierarchy_path = " > ".join(
+                part for part in [parsed.document_name or parsed.source_file, title] if part
+            )
+            canonical_hierarchy_path = " > ".join(
+                part for part in [regulation_title or regulation_no, title] if part
+            ) or source_hierarchy_path
             metadata = {
                 "document_id": parsed.document_id,
                 "document_name": parsed.document_name or parsed.source_file,
@@ -1558,7 +1628,9 @@ class Chunker:
                 "source_page_start": page_no,
                 "source_page_end": page_no,
                 "chunk_type": "table",
-                "hierarchy_path": " > ".join(part for part in [parsed.document_name or parsed.source_file, title] if part),
+                "hierarchy_path": source_hierarchy_path,
+                "source_hierarchy_path": source_hierarchy_path,
+                "canonical_hierarchy_path": canonical_hierarchy_path,
                 "references": [],
                 "article_refs": [],
                 "appendix_refs": [],
@@ -1588,6 +1660,18 @@ class Chunker:
                 "raw_text": text,
                 "normalized_text": text,
             }
+            if regulation_title:
+                metadata["regulation_title"] = regulation_title
+                metadata["canonical_regulation_title"] = regulation_title
+                if regulation_node:
+                    metadata["regulation_inferred_from_pdf_table_region"] = True
+                    metadata["regulation_source_node_id"] = regulation_node.node_id
+                    metadata["regulation_node_id"] = regulation_node.node_id
+                else:
+                    metadata["regulation_inferred_from_document"] = True
+            if regulation_no:
+                metadata["regulation_no"] = regulation_no
+                metadata["canonical_regulation_no"] = regulation_no
             metadata.update(self.metadata_extractor.extract(text, None))
             chunk_id = f"{parsed.document_id}_table_pdf_region_{offset + index:04d}_p{page_no or 0}_001"
             chunks.append(
@@ -1599,8 +1683,8 @@ class Chunker:
                     text=text,
                     normalized_text=text,
                     retrieval_text=self._retrieval_text(
-                        parsed.document_name or parsed.source_file,
-                        metadata["hierarchy_path"],
+                        regulation_title or regulation_no or parsed.document_name or parsed.source_file,
+                        canonical_hierarchy_path,
                         text,
                         None,
                     ),
@@ -1613,11 +1697,77 @@ class Chunker:
             )
         return chunks
 
+    def _pdf_table_region_regulation_identity(
+        self,
+        parsed: ParsedDocument,
+        region: dict[str, Any],
+        regulation_nodes: list[StructureNode],
+    ) -> tuple[str | None, str | None, StructureNode | None]:
+        """Resolve a standalone PDF table to the regulation active at its layout position.
+
+        A combined PDF often begins with a wrapper or contents page.  Document-level
+        title inference consequently cannot identify a later table's owning
+        regulation.  Regulation headings retain their source page and, for PDFs,
+        their source bounding boxes.  Prefer a heading above the table on the same
+        page; otherwise use the closest heading on an earlier page.  The document
+        identity remains the fallback for standalone files or parser output without
+        regulation nodes.
+        """
+
+        try:
+            region_page = int(region.get("source_page"))
+        except (TypeError, ValueError):
+            region_page = None
+        region_bbox = self._coerce_bbox(region.get("source_bbox"))
+        region_top = region_bbox[1] if region_bbox else None
+
+        candidates: list[tuple[tuple[float, float, int], StructureNode]] = []
+        for node in regulation_nodes:
+            if node.page_start is None or region_page is None:
+                continue
+            try:
+                node_page = int(node.page_start)
+            except (TypeError, ValueError):
+                continue
+            if node_page > region_page:
+                continue
+
+            node_bbox = self._coerce_bbox(node.metadata.get("source_bbox"))
+            node_top = node_bbox[1] if node_bbox else None
+            if (
+                node_page == region_page
+                and region_top is not None
+                and node_top is not None
+                and node_top > region_top
+            ):
+                # A heading below the table starts the next regulation, so it
+                # cannot own this region even though it shares the page.
+                continue
+
+            page_distance = region_page - node_page
+            line_distance = (
+                region_top - node_top
+                if page_distance == 0 and region_top is not None and node_top is not None
+                else float("inf")
+            )
+            # In the absence of usable layout coordinates, order is still a
+            # deterministic parser-order proxy for the closest preceding heading.
+            candidates.append(((float(page_distance), line_distance, -node.order_index), node))
+
+        if candidates:
+            _, node = min(candidates, key=lambda item: item[0])
+            return node.number or None, node.title or None, node
+
+        regulation_no, regulation_title = self._document_regulation_identity(parsed)
+        return regulation_no, regulation_title, None
+
     def _pdf_table_region_duplicate_target(
         self,
         region: dict[str, Any],
         page_no: Any,
         existing_chunks: list[Chunk],
+        *,
+        candidate_index: dict[int | None, list[tuple[Chunk, list[list[float]]]]] | None = None,
     ) -> tuple[Chunk, float] | None:
         region_bbox = self._coerce_bbox(region.get("source_bbox"))
         if not region_bbox:
@@ -1629,11 +1779,11 @@ class Chunker:
             page = int(page_no)
         except (TypeError, ValueError):
             page = None
+        if candidate_index is None:
+            candidate_index = self._pdf_table_region_candidate_index(existing_chunks)
         best: tuple[Chunk, float] | None = None
-        for chunk in existing_chunks:
-            if not self._chunk_can_cover_pdf_table_region(chunk, page):
-                continue
-            for bbox in self._chunk_source_bboxes(chunk):
+        for chunk, bboxes in candidate_index.get(page, []):
+            for bbox in bboxes:
                 overlap = self._bbox_intersection_area(region_bbox, bbox)
                 if overlap <= 0:
                     continue
@@ -1643,6 +1793,39 @@ class Chunker:
                 if best is None or coverage > best[1]:
                     best = (chunk, coverage)
         return best
+
+    def _pdf_table_region_candidate_index(
+        self,
+        existing_chunks: list[Chunk],
+    ) -> dict[int | None, list[tuple[Chunk, list[list[float]]]]]:
+        """Index coverable table chunks by every page in their source span.
+
+        ``None`` is the fallback bucket used when a table region has no usable
+        source page.  That intentionally retains the former all-chunks
+        comparison semantics for page-less or malformed region metadata.
+        """
+
+        candidates: dict[int | None, list[tuple[Chunk, list[list[float]]]]] = {None: []}
+        for chunk in existing_chunks:
+            if not self._chunk_can_cover_pdf_table_region(chunk, None):
+                continue
+            bboxes = self._chunk_source_bboxes(chunk)
+            if not bboxes:
+                continue
+            entry = (chunk, bboxes)
+            candidates[None].append(entry)
+            metadata = chunk.metadata or {}
+            start = chunk.source_page_start or metadata.get("source_page_start") or metadata.get("source_page")
+            end = chunk.source_page_end or metadata.get("source_page_end") or start
+            try:
+                start_page = int(start)
+                end_page = int(end)
+            except (TypeError, ValueError):
+                continue
+            # An inverted span never covered a page under the previous check.
+            for page in range(start_page, end_page + 1):
+                candidates.setdefault(page, []).append(entry)
+        return candidates
 
     def _chunk_can_cover_pdf_table_region(self, chunk: Chunk, page: int | None) -> bool:
         metadata = chunk.metadata or {}
@@ -1750,6 +1933,10 @@ class Chunker:
         footnote_marker_references = parsed.metadata.get("pdf_footnote_marker_references") or []
         if not chunks:
             return
+        footnote_link_buckets = self._pdf_page_metadata_buckets(footnote_links)
+        footnote_marker_buckets = self._pdf_page_metadata_buckets(footnote_marker_references)
+        footnote_link_pages = sorted(footnote_link_buckets)
+        footnote_marker_pages = sorted(footnote_marker_buckets)
         attached_footnote_pages: set[int] = set()
         attached_footnote_marker_pages: set[int] = set()
         for chunk in chunks:
@@ -1757,31 +1944,26 @@ class Chunker:
                 chunk.metadata["blank_pages"] = blank_pages
             if embedded_image_pages:
                 chunk.metadata["pdf_embedded_image_pages"] = embedded_image_pages
-            start = chunk.source_page_start
-            end = chunk.source_page_end or start
+            start, end = self._chunk_page_span(chunk)
             if footnote_links:
-                page_links = [
-                    link
-                    for link in footnote_links
-                    if isinstance(link, dict)
-                    and start is not None
-                    and end is not None
-                    and start <= int(link.get("source_page") or -1) <= end
-                    and int(link.get("source_page") or -1) not in attached_footnote_pages
-                ]
+                page_links = self._pdf_page_metadata_for_span(
+                    footnote_link_buckets,
+                    footnote_link_pages,
+                    start,
+                    end,
+                    attached_footnote_pages,
+                )
                 if page_links:
                     chunk.metadata["footnote_links"] = page_links
                     attached_footnote_pages.update(int(link["source_page"]) for link in page_links if link.get("source_page"))
             if footnote_marker_references:
-                page_marker_references = [
-                    reference
-                    for reference in footnote_marker_references
-                    if isinstance(reference, dict)
-                    and start is not None
-                    and end is not None
-                    and start <= int(reference.get("source_page") or -1) <= end
-                    and int(reference.get("source_page") or -1) not in attached_footnote_marker_pages
-                ]
+                page_marker_references = self._pdf_page_metadata_for_span(
+                    footnote_marker_buckets,
+                    footnote_marker_pages,
+                    start,
+                    end,
+                    attached_footnote_marker_pages,
+                )
                 if page_marker_references:
                     chunk.metadata["footnote_marker_references"] = page_marker_references
                     chunk.metadata["footnote_marker_reference_count"] = sum(
@@ -1792,6 +1974,56 @@ class Chunker:
                         for reference in page_marker_references
                         if reference.get("source_page")
                     )
+
+    def _chunk_page_span(self, chunk: Chunk) -> tuple[int | None, int | None]:
+        """Return a usable inclusive chunk page span without changing its source fields."""
+
+        start = chunk.source_page_start
+        end = chunk.source_page_end or start
+        try:
+            start_page = int(start)
+            end_page = int(end)
+        except (TypeError, ValueError):
+            return None, None
+        return (start_page, end_page) if start_page <= end_page else (None, None)
+
+    def _pdf_page_metadata_buckets(self, entries: Any) -> dict[int, list[tuple[int, dict]]]:
+        """Keep source ordering while making page-local metadata cheap to retrieve."""
+
+        buckets: dict[int, list[tuple[int, dict]]] = {}
+        if not isinstance(entries, list):
+            return buckets
+        for position, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                page = int(entry.get("source_page") or -1)
+            except (TypeError, ValueError):
+                continue
+            buckets.setdefault(page, []).append((position, entry))
+        return buckets
+
+    def _pdf_page_metadata_for_span(
+        self,
+        buckets: dict[int, list[tuple[int, dict]]],
+        pages: list[int],
+        start: int | None,
+        end: int | None,
+        attached_pages: set[int],
+    ) -> list[dict]:
+        if start is None or end is None:
+            return []
+        first = bisect_left(pages, start)
+        last = bisect_right(pages, end)
+        entries = [
+            item
+            for page in pages[first:last]
+            if page not in attached_pages
+            for item in buckets[page]
+        ]
+        # The former full-list scan returned entries in parser/source order,
+        # not numeric page order.
+        return [entry for _, entry in sorted(entries, key=lambda item: item[0])]
 
     def _ancestors(self, node: StructureNode, lookup: dict[str, StructureNode]) -> list[StructureNode]:
         ancestors: list[StructureNode] = []
@@ -1810,6 +2042,49 @@ class Chunker:
                 parts.append(label)
         return " > ".join(parts)
 
+    def _canonical_hierarchy_path(
+        self,
+        ancestors: list[StructureNode],
+        node: StructureNode,
+        *,
+        regulation_title: str,
+        regulation_no: str,
+    ) -> str:
+        """Build the regulation-local path without a source document wrapper.
+
+        A combined book commonly adds a document name, part, and catalog
+        chapter before the actual ``regulation`` node. A standalone file has
+        none of those ancestors. Starting at the nearest regulation boundary
+        (or at the document-inferred regulation title) makes their searchable
+        hierarchy equivalent while ``source_hierarchy_path`` retains the raw
+        parser path.
+        """
+
+        lineage = ancestors + [node]
+        regulation_index = next(
+            (
+                index
+                for index in range(len(lineage) - 1, -1, -1)
+                if lineage[index].node_type == "regulation"
+            ),
+            None,
+        )
+        structural_nodes = (
+            lineage[regulation_index + 1 :]
+            if regulation_index is not None
+            else lineage
+        )
+        root_label = regulation_title or regulation_no
+        parts = [root_label] if root_label else []
+        for item in structural_nodes:
+            label = " ".join(value for value in (item.number, item.title) if value).strip()
+            if label and (not parts or self._canonical_path_key(label) != self._canonical_path_key(parts[-1])):
+                parts.append(label)
+        return " > ".join(parts)
+
+    def _canonical_path_key(self, value: object) -> str:
+        return re.sub(r"[^0-9A-Za-z가-힣]", "", str(value or "")).casefold()
+
     def _nearest_preceding_regulation(
         self,
         node: StructureNode,
@@ -1819,17 +2094,63 @@ class Chunker:
         return max(candidates, key=lambda item: item.order_index) if candidates else None
 
     def _document_regulation_title(self, parsed: ParsedDocument) -> str | None:
+        return self._document_regulation_identity(parsed)[1]
+
+    def _document_regulation_identity(self, parsed: ParsedDocument) -> tuple[str | None, str | None]:
+        explicit_no = str(parsed.metadata.get("regulation_no") or "").strip()
+        explicit_title = self._clean_document_regulation_title(
+            str(parsed.metadata.get("regulation_title") or "")
+        )
+        if explicit_title and self._looks_like_document_title(explicit_title):
+            return explicit_no or None, explicit_title
         for page in parsed.pages:
             for block in page.blocks:
+                if str(block.type or "").strip().casefold() == "table":
+                    continue
                 first_line = next((line.strip() for line in block.text.splitlines() if line.strip()), "")
+                prefixed_identity = self._regulation_identity_from_title_line(first_line)
+                if prefixed_identity is not None:
+                    return prefixed_identity
                 cleaned = self._clean_document_regulation_title(first_line)
-                if self._looks_like_document_title(cleaned):
-                    return cleaned
+                if self._looks_like_extracted_document_title(cleaned):
+                    return explicit_no or None, cleaned
         for fallback in (parsed.document_name, parsed.source_file):
+            prefixed_identity = self._regulation_identity_from_title_line(fallback or "")
+            if prefixed_identity is not None:
+                return prefixed_identity
             cleaned = self._clean_document_regulation_title(fallback or "")
             if self._looks_like_document_title(cleaned):
-                return cleaned
-        return None
+                return explicit_no or None, cleaned
+        return explicit_no or None, None
+
+    def _regulation_identity_from_title_line(self, value: object) -> tuple[str, str] | None:
+        candidate = re.sub(
+            r"\.(?:pdf|hwp|hwpx|docx)$",
+            "",
+            str(value or "").strip(),
+            flags=re.IGNORECASE,
+        )
+        match = re.match(
+            r"^\s*(?:제\s*)?(?P<number>\d+(?:\s*[-./]\s*\d+)+)(?:\s*호)?"
+            r"\s*[.)_:：-]*\s*(?P<title>.+?)\s*$",
+            candidate,
+        )
+        if not match:
+            return None
+        raw_number = re.sub(r"\s+", "", match.group("number"))
+        number_parts = re.split(r"[-./]", raw_number)
+        if (
+            len(number_parts) == 3
+            and len(number_parts[0]) == 4
+            and 1900 <= int(number_parts[0]) <= 2099
+            and 1 <= int(number_parts[1]) <= 12
+            and 1 <= int(number_parts[2]) <= 31
+        ):
+            return None
+        title = self._clean_document_regulation_title(match.group("title"))
+        if not self._looks_like_document_title(title):
+            return None
+        return "-".join(number_parts), title
 
     def _clean_document_regulation_title(self, text: str) -> str:
         cleaned = re.sub(r"\.(?:pdf|hwp|hwpx|docx)$", "", str(text or "").strip(), flags=re.IGNORECASE)
@@ -1846,9 +2167,24 @@ class Chunker:
             return False
         if re.match(r"^\[?(?:제정|일부개정|개정|시행)\b", text):
             return False
-        if re.match(r"^제\s*\d+\s*(?:장|조|절|항)\b", text):
+        if re.match(r"^제\s*\d+\s*(?:편|장|절|관|조|항)\b", text):
             return False
         if re.match(r"^\d+[\.\-]\d+", text):
+            return False
+        return True
+
+    def _looks_like_extracted_document_title(self, text: str) -> bool:
+        """Accept title evidence from text blocks, never table-shaped rows.
+
+        Native table blocks are already skipped by
+        :meth:`_document_regulation_identity`.  Keep the broader historical
+        text-title behavior here so non-Korean titles and OCR headings remain
+        usable, while rejecting flattened row separators defensively.
+        """
+
+        if not self._looks_like_document_title(text):
+            return False
+        if "|" in text or "\t" in text:
             return False
         return True
 
@@ -1965,22 +2301,28 @@ class Chunker:
         return edge
 
     def _append_reference_retrieval_text(self, chunk: Chunk, edges: list[dict]) -> None:
-        resolved_edges = [edge for edge in edges if edge.get("resolved")]
-        if not resolved_edges or not chunk.retrieval_text or REFERENCE_SECTION_MARKER in chunk.retrieval_text:
+        if not edges or not chunk.retrieval_text or REFERENCE_SECTION_MARKER in chunk.retrieval_text:
             return
-        lines = []
-        for edge in resolved_edges[:20]:
-            target_label = " ".join(
-                str(value)
-                for value in [
-                    edge.get("target_regulation_no"),
-                    edge.get("target_regulation_title"),
-                    edge.get("target_article_no"),
-                    edge.get("target_article_title"),
-                ]
-                if value
-            )
-            lines.append(f"- {edge.get('value')} -> {target_label or edge.get('target_chunk_id')}")
+        # A combined book can resolve a target while a standalone file cannot
+        # see the sibling regulation until the tenant-wide hierarchy is built.
+        # Index only the source mention here; target resolution belongs to the
+        # hierarchy/reference-graph stage. This keeps retrieval text and scores
+        # independent of how source files were packaged.
+        lines: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for edge in edges:
+            edge_type = str(edge.get("type") or "reference").strip()
+            value = str(edge.get("value") or "").strip()
+            key = (edge_type, value)
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            label = {"regulation": "규정", "article": "조문"}.get(edge_type, "참조")
+            lines.append(f"- {label}: {value}")
+            if len(lines) >= 20:
+                break
+        if not lines:
+            return
         chunk.retrieval_text = f"{chunk.retrieval_text.rstrip()}\n{REFERENCE_SECTION_MARKER}\n" + "\n".join(lines)
 
     def _primary_regulation_key(self, metadata: dict) -> str:
@@ -2073,17 +2415,27 @@ class Chunker:
                     "part_count": len(parts),
                     "chunk_type": "document",
                     "hierarchy_path": hierarchy_path,
+                    "source_hierarchy_path": hierarchy_path,
                     "structure_fallback": True,
                 }
             )
+            canonical_hierarchy_path = str(
+                metadata.get("regulation_title")
+                or metadata.get("regulation_no")
+                or hierarchy_path
+            ).strip()
+            metadata["canonical_hierarchy_path"] = canonical_hierarchy_path
             metadata.update(self._table_metadata(part, "document"))
             metadata.update(self.metadata_extractor.extract(part, None))
             answer_profile = build_answer_profile(part, metadata)
             metadata.update(answer_profile)
-            final_text = self._with_context_header(part, hierarchy_path, options)
+            final_text = self._with_context_header(part, canonical_hierarchy_path, options)
             retrieval_text = self._retrieval_text(
-                parsed.document_name or parsed.source_file,
-                hierarchy_path,
+                metadata.get("canonical_regulation_title")
+                or metadata.get("regulation_title")
+                or parsed.document_name
+                or parsed.source_file,
+                canonical_hierarchy_path,
                 part,
                 metadata.get("table_markdown"),
             )

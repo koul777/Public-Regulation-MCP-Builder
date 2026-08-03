@@ -4,15 +4,20 @@ from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import threading
+import time
+from types import MappingProxyType
 import unicodedata
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
+from uuid import uuid4
 
 from app.ingestion.vector_adapter import stable_content_hash
 from app.retrieval.bm25_index import Bm25Index, source_content_hashes
@@ -20,7 +25,7 @@ from app.retrieval.searcher import rerank_bm25_candidates
 
 
 HIERARCHICAL_INDEX_SCHEMA_VERSION = "reg-rag-hierarchical-index-v2"
-REBUILD_FINGERPRINT_SCHEMA_VERSION = "reg-rag-logical-corpus-v2"
+REBUILD_FINGERPRINT_SCHEMA_VERSION = "reg-rag-logical-corpus-v3"
 HIERARCHICAL_INDEX_RELATIVE_PATH = Path("hierarchy") / "regulation_hierarchy.sqlite3"
 _DATE_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})[-./](\d{1,2})[-./](\d{1,2})(?!\d)")
 _QUERY_TOKEN_RE = re.compile(r"[0-9A-Za-z\uac00-\ud7a3]+")
@@ -30,6 +35,18 @@ _FTS_PREFIX_ARTICLE_LOCATOR_RE = re.compile(
 )
 _HISTORICAL_LIFECYCLE_STATUSES = ("approved", "superseded", "repealed")
 _CURRENT_LIFECYCLE_STATUSES = ("approved", "superseded")
+STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
+    "ambiguous_combined_book_boundary_after_attachment"
+)
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY = "ambiguous_combined_book_boundary"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING = (
+    "ambiguous_combined_book_boundary_requires_reparse"
+)
+_INDEX_REPLACE_RETRY_SECONDS = 2.0
+_INDEX_REPLACE_RETRY_INTERVAL_SECONDS = 0.05
+_HIERARCHICAL_INDEX_BUILD_LOCK_TIMEOUT_SECONDS = 60.0
+_HIERARCHICAL_INDEX_BUILD_LOCK_POLL_SECONDS = 0.05
 _VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRIES = 1024
 _VERIFIED_VECTOR_RECORD_CACHE_MAX_BYTES = 32 * 1024 * 1024
 _VERIFIED_VECTOR_RECORD_CACHE_MAX_ENTRY_BYTES = 512 * 1024
@@ -61,20 +78,217 @@ _KOREAN_QUERY_SUFFIXES = (
 )
 _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK = threading.Lock()
 _INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRIES = 8
+_INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024
+_WINDOWS_HIERARCHICAL_INDEX_LOCK_RETRY_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EAGAIN,
+        getattr(errno, "EDEADLOCK", errno.EDEADLK),
+    }
+)
+_WINDOWS_HIERARCHICAL_INDEX_LOCK_RETRY_WINERRORS = frozenset({32, 33})
 
 
 @dataclass(frozen=True)
 class _IndexedChunkTopology:
     document_ids: frozenset[str]
-    unit_keys: dict[str, frozenset[tuple[str, str]]]
-    unit_signatures: dict[str, frozenset[tuple[str, str, str]]]
+    unit_keys: Mapping[str, frozenset[tuple[str, str]]]
+    unit_signatures: Mapping[str, frozenset[tuple[str, str, str]]]
     invalid_signature_units: frozenset[str]
+    estimated_size_bytes: int
 
 
+@dataclass
+class _IndexedChunkTopologyFlight:
+    event: threading.Event
+    result: _IndexedChunkTopology | None = None
+    error: BaseException | None = None
+    retry: bool = False
+
+
+_IndexedChunkTopologyCacheKey = tuple[
+    Path,
+    tuple[int, int, int, int],
+    int,
+    bool,
+    str,
+]
 _INDEXED_CHUNK_TOPOLOGY_CACHE: OrderedDict[
-    tuple[Path, tuple[int, int, int, int], str],
+    _IndexedChunkTopologyCacheKey,
     _IndexedChunkTopology,
 ] = OrderedDict()
+_INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES = 0
+_INDEXED_CHUNK_TOPOLOGY_INFLIGHT: dict[
+    _IndexedChunkTopologyCacheKey,
+    _IndexedChunkTopologyFlight,
+] = {}
+_INDEXED_CHUNK_TOPOLOGY_GENERATIONS: dict[Path, int] = {}
+_HIERARCHICAL_INDEX_BUILD_LOCKS_GUARD = threading.Lock()
+_HIERARCHICAL_INDEX_BUILD_LOCKS: dict[Path, tuple[Any, int]] = {}
+
+
+@contextmanager
+def _hierarchical_index_build_guard(
+    path: str | Path,
+    *,
+    timeout_seconds: float = _HIERARCHICAL_INDEX_BUILD_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Serialize one target across threads and processes through result hashing."""
+
+    resolved_path, lock_path = _confined_hierarchical_index_paths(path)
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    with _HIERARCHICAL_INDEX_BUILD_LOCKS_GUARD:
+        lock, users = _HIERARCHICAL_INDEX_BUILD_LOCKS.get(
+            resolved_path,
+            (threading.Lock(), 0),
+        )
+        _HIERARCHICAL_INDEX_BUILD_LOCKS[resolved_path] = (lock, users + 1)
+    thread_acquired = False
+    file_descriptor: int | None = None
+    file_lock_acquired = False
+    try:
+        thread_acquired = lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+        if not thread_acquired:
+            raise TimeoutError(
+                f"Timed out waiting for hierarchical index lock: {lock_path}"
+            )
+        file_descriptor = _open_hierarchical_index_lock_file(lock_path)
+        _acquire_hierarchical_index_file_lock(
+            file_descriptor,
+            lock_path,
+            deadline=deadline,
+        )
+        file_lock_acquired = True
+        yield
+    finally:
+        try:
+            if file_descriptor is not None:
+                try:
+                    if file_lock_acquired:
+                        _release_hierarchical_index_file_lock(file_descriptor)
+                finally:
+                    os.close(file_descriptor)
+        finally:
+            if thread_acquired:
+                lock.release()
+        with _HIERARCHICAL_INDEX_BUILD_LOCKS_GUARD:
+            current_lock, current_users = _HIERARCHICAL_INDEX_BUILD_LOCKS.get(
+                resolved_path,
+                (lock, 1),
+            )
+            if current_lock is lock and current_users <= 1:
+                _HIERARCHICAL_INDEX_BUILD_LOCKS.pop(resolved_path, None)
+            elif current_lock is lock:
+                _HIERARCHICAL_INDEX_BUILD_LOCKS[resolved_path] = (
+                    lock,
+                    current_users - 1,
+                )
+
+
+def _confined_hierarchical_index_paths(path: str | Path) -> tuple[Path, Path]:
+    target_path = Path(path)
+    parent = target_path.parent.resolve(strict=False)
+    resolved_target = target_path.resolve(strict=False)
+    if resolved_target.parent != parent:
+        raise ValueError(
+            f"Hierarchical index target must remain within its declared parent: {target_path}"
+        )
+    if target_path.is_symlink():
+        raise ValueError(
+            f"Hierarchical index target must not be a symbolic link: {target_path}"
+        )
+    lock_path = target_path.parent / f".{target_path.name}.reg-rag.lock"
+    resolved_lock = lock_path.resolve(strict=False)
+    if resolved_lock.parent != parent:
+        raise ValueError(
+            f"Hierarchical index lock must remain beside the target: {lock_path}"
+        )
+    if lock_path.is_symlink():
+        raise ValueError(
+            f"Hierarchical index lock must not be a symbolic link: {lock_path}"
+        )
+    return resolved_target, lock_path
+
+
+def _open_hierarchical_index_lock_file(lock_path: Path) -> int:
+    flags = os.O_CREAT | os.O_RDWR
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if no_follow:
+        flags |= no_follow
+    file_descriptor = os.open(lock_path, flags, 0o600)
+    file_stat = os.fstat(file_descriptor)
+    if not stat.S_ISREG(file_stat.st_mode):
+        os.close(file_descriptor)
+        raise ValueError(
+            f"Hierarchical index lock must be a regular file: {lock_path}"
+        )
+    path_stat = os.stat(lock_path, follow_symlinks=False)
+    if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        os.close(file_descriptor)
+        raise ValueError(
+            f"Hierarchical index lock changed while it was opened: {lock_path}"
+        )
+    if file_stat.st_size == 0:
+        os.write(file_descriptor, b"\0")
+        os.fsync(file_descriptor)
+    return file_descriptor
+
+
+def _acquire_hierarchical_index_file_lock(
+    file_descriptor: int,
+    lock_path: Path,
+    *,
+    deadline: float,
+) -> None:
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(file_descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(file_descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(file_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            retryable = _is_retryable_hierarchical_index_lock_error(exc)
+            if not retryable:
+                raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for hierarchical index lock: {lock_path}"
+                ) from exc
+            time.sleep(_HIERARCHICAL_INDEX_BUILD_LOCK_POLL_SECONDS)
+
+
+def _is_retryable_hierarchical_index_lock_error(exc: OSError) -> bool:
+    if os.name == "nt":
+        winerror = getattr(exc, "winerror", None)
+        if winerror in _WINDOWS_HIERARCHICAL_INDEX_LOCK_RETRY_WINERRORS:
+            return True
+        return exc.errno in _WINDOWS_HIERARCHICAL_INDEX_LOCK_RETRY_ERRNOS
+    return exc.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+    }
+
+
+def _release_hierarchical_index_file_lock(file_descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(file_descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(file_descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(file_descriptor, fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -152,29 +366,83 @@ def _path_signature(path: Path) -> tuple[int, int, int, int] | None:
     return (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns, stat.st_ino)
 
 
-def _indexed_chunk_topology(
+def _indexed_chunk_topology_cache_put_locked(
+    cache_key: _IndexedChunkTopologyCacheKey,
+    topology: _IndexedChunkTopology,
+) -> None:
+    """Insert a topology while ``_INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK`` is held."""
+
+    global _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES
+    if topology.estimated_size_bytes > _INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRY_BYTES:
+        return
+    previous = _INDEXED_CHUNK_TOPOLOGY_CACHE.pop(cache_key, None)
+    if previous is not None:
+        _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES -= previous.estimated_size_bytes
+    _INDEXED_CHUNK_TOPOLOGY_CACHE[cache_key] = topology
+    _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES += topology.estimated_size_bytes
+    while _INDEXED_CHUNK_TOPOLOGY_CACHE and (
+        len(_INDEXED_CHUNK_TOPOLOGY_CACHE)
+        > _INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRIES
+        or _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES
+        > _INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_BYTES
+    ):
+        evicted_key, evicted = _INDEXED_CHUNK_TOPOLOGY_CACHE.popitem(last=False)
+        _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES -= evicted.estimated_size_bytes
+        _prune_indexed_chunk_topology_generation_locked(evicted_key[0])
+
+
+def _prune_indexed_chunk_topology_generation_locked(resolved_path: Path) -> None:
+    if any(key[0] == resolved_path for key in _INDEXED_CHUNK_TOPOLOGY_CACHE):
+        return
+    if any(key[0] == resolved_path for key in _INDEXED_CHUNK_TOPOLOGY_INFLIGHT):
+        return
+    _INDEXED_CHUNK_TOPOLOGY_GENERATIONS.pop(resolved_path, None)
+
+
+def _prune_indexed_chunk_topology_generation(path: str | Path) -> None:
+    resolved_path = Path(path).resolve()
+    with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+        _prune_indexed_chunk_topology_generation_locked(resolved_path)
+
+
+def _evict_indexed_chunk_topology_cache(
     path: str | Path,
     *,
-    profile_id: str | None = None,
-) -> _IndexedChunkTopology:
-    index_path = Path(path)
-    normalized_profile_id = str(profile_id or "").strip().casefold()
-    signature = _path_signature(index_path)
-    cache_key: tuple[Path, tuple[int, int, int, int], str] | None = None
-    if signature is not None:
-        cache_key = (index_path.resolve(), signature, normalized_profile_id)
-        with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
-            cached = _INDEXED_CHUNK_TOPOLOGY_CACHE.get(cache_key)
-            if cached is not None:
-                _INDEXED_CHUNK_TOPOLOGY_CACHE.move_to_end(cache_key)
-                return cached
+    prune_generation_if_unused: bool = False,
+) -> None:
+    global _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES
+    resolved_path = Path(path).resolve()
+    with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+        _INDEXED_CHUNK_TOPOLOGY_GENERATIONS[resolved_path] = (
+            _INDEXED_CHUNK_TOPOLOGY_GENERATIONS.get(resolved_path, 0) + 1
+        )
+        matching_keys = [
+            key for key in _INDEXED_CHUNK_TOPOLOGY_CACHE if key[0] == resolved_path
+        ]
+        for key in matching_keys:
+            topology = _INDEXED_CHUNK_TOPOLOGY_CACHE.pop(key)
+            _INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES -= topology.estimated_size_bytes
+        if prune_generation_if_unused:
+            _prune_indexed_chunk_topology_generation_locked(resolved_path)
 
+
+def _scan_indexed_chunk_topology(
+    index_path: Path,
+    *,
+    normalized_profile_id: str,
+    has_profile_filter: bool,
+) -> _IndexedChunkTopology:
     clauses: list[str] = []
     params: list[Any] = []
-    if profile_id:
+    if has_profile_filter:
         clauses.append("lower(v.profile_id)=lower(?)")
-        params.append(profile_id)
+        params.append(normalized_profile_id)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    document_ids: set[str] = set()
+    unit_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    unit_signatures: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
+    invalid_signature_units: set[str] = set()
+    estimated_size_bytes = 1024
     with _connect_readonly(index_path) as connection:
         rows = connection.execute(
             f"""
@@ -184,49 +452,149 @@ def _indexed_chunk_topology(
             {where_sql}
             """,
             params,
-        ).fetchall()
+        )
+        for row in rows:
+            unit_id = str(row["unit_id"] or "")
+            document_id = str(row["document_id"] or "")
+            chunk_id = str(row["chunk_id"] or "")
+            content_hash = str(row["content_hash"] or "")
+            # Conservative budget estimate for the row, tuple/set slots, and
+            # referenced strings. It is an eviction heuristic, not an RSS claim.
+            estimated_size_bytes += 384 + 4 * (
+                len(unit_id) + len(document_id) + len(chunk_id) + len(content_hash)
+            )
+            if document_id:
+                document_ids.add(document_id)
+            if not unit_id:
+                continue
+            unit_keys[unit_id].add((document_id, chunk_id))
+            if not document_id or not chunk_id or not content_hash:
+                invalid_signature_units.add(unit_id)
+                continue
+            unit_signatures[unit_id].add((document_id, chunk_id, content_hash))
 
-    document_ids: set[str] = set()
-    unit_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    unit_signatures: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
-    invalid_signature_units: set[str] = set()
-    for row in rows:
-        unit_id = str(row["unit_id"] or "")
-        document_id = str(row["document_id"] or "")
-        chunk_id = str(row["chunk_id"] or "")
-        content_hash = str(row["content_hash"] or "")
-        if document_id:
-            document_ids.add(document_id)
-        if not unit_id:
-            continue
-        unit_keys[unit_id].add((document_id, chunk_id))
-        if not document_id or not chunk_id or not content_hash:
-            invalid_signature_units.add(unit_id)
-            continue
-        unit_signatures[unit_id].add((document_id, chunk_id, content_hash))
-
-    topology = _IndexedChunkTopology(
+    return _IndexedChunkTopology(
         document_ids=frozenset(document_ids),
-        unit_keys={
-            unit_id: frozenset(indexed_keys)
-            for unit_id, indexed_keys in unit_keys.items()
-        },
-        unit_signatures={
-            unit_id: frozenset(indexed_signatures)
-            for unit_id, indexed_signatures in unit_signatures.items()
-        },
+        unit_keys=MappingProxyType(
+            {
+                unit_id: frozenset(indexed_keys)
+                for unit_id, indexed_keys in unit_keys.items()
+            }
+        ),
+        unit_signatures=MappingProxyType(
+            {
+                unit_id: frozenset(indexed_signatures)
+                for unit_id, indexed_signatures in unit_signatures.items()
+            }
+        ),
         invalid_signature_units=frozenset(invalid_signature_units),
+        estimated_size_bytes=estimated_size_bytes,
     )
-    if cache_key is not None:
+
+
+def _indexed_chunk_topology(
+    path: str | Path,
+    *,
+    profile_id: str | None = None,
+) -> _IndexedChunkTopology:
+    index_path = Path(path)
+    normalized_profile_id = str(profile_id or "").strip().casefold()
+    has_profile_filter = bool(profile_id)
+    resolved_path = index_path.resolve()
+    while True:
+        signature = _path_signature(index_path)
+        cache_key: _IndexedChunkTopologyCacheKey | None = None
+        flight: _IndexedChunkTopologyFlight | None = None
+        flight_leader = False
+        if signature is not None:
+            with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+                generation = _INDEXED_CHUNK_TOPOLOGY_GENERATIONS.get(resolved_path, 0)
+                cache_key = (
+                    resolved_path,
+                    signature,
+                    generation,
+                    has_profile_filter,
+                    normalized_profile_id,
+                )
+                cached = _INDEXED_CHUNK_TOPOLOGY_CACHE.get(cache_key)
+                if cached is not None:
+                    _INDEXED_CHUNK_TOPOLOGY_CACHE.move_to_end(cache_key)
+                    return cached
+                flight = _INDEXED_CHUNK_TOPOLOGY_INFLIGHT.get(cache_key)
+                if flight is None:
+                    flight = _IndexedChunkTopologyFlight(event=threading.Event())
+                    _INDEXED_CHUNK_TOPOLOGY_INFLIGHT[cache_key] = flight
+                    flight_leader = True
+            if not flight_leader:
+                flight.event.wait()
+                if flight.retry:
+                    continue
+                if flight.error is not None:
+                    raise flight.error
+                if flight.result is None:
+                    raise RuntimeError(
+                        "indexed topology cache flight completed without a result"
+                    )
+                return flight.result
+
+        try:
+            topology = _scan_indexed_chunk_topology(
+                index_path,
+                normalized_profile_id=normalized_profile_id,
+                has_profile_filter=has_profile_filter,
+            )
+        except BaseException as exc:
+            retry_after_rebuild = False
+            if flight is not None and flight_leader:
+                with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+                    current_generation = _INDEXED_CHUNK_TOPOLOGY_GENERATIONS.get(
+                        resolved_path,
+                        0,
+                    )
+                    retry_after_rebuild = bool(
+                        cache_key is not None
+                        and current_generation != cache_key[2]
+                    )
+                    if retry_after_rebuild:
+                        # A rebuild replaced the index while the cold scan was
+                        # running.  Its failure belongs to the invalidated
+                        # generation, so wake waiters and retry the new index.
+                        flight.retry = True
+                    else:
+                        flight.error = exc
+                    if _INDEXED_CHUNK_TOPOLOGY_INFLIGHT.get(cache_key) is flight:
+                        _INDEXED_CHUNK_TOPOLOGY_INFLIGHT.pop(cache_key, None)
+                    flight.event.set()
+                    if not retry_after_rebuild:
+                        _prune_indexed_chunk_topology_generation_locked(
+                            resolved_path
+                        )
+            if retry_after_rebuild:
+                continue
+            raise
+
+        if cache_key is None:
+            return topology
+
         with _INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
-            _INDEXED_CHUNK_TOPOLOGY_CACHE[cache_key] = topology
-            _INDEXED_CHUNK_TOPOLOGY_CACHE.move_to_end(cache_key)
-            while (
-                len(_INDEXED_CHUNK_TOPOLOGY_CACHE)
-                > _INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRIES
-            ):
-                _INDEXED_CHUNK_TOPOLOGY_CACHE.popitem(last=False)
-    return topology
+            current_generation = _INDEXED_CHUNK_TOPOLOGY_GENERATIONS.get(
+                resolved_path,
+                0,
+            )
+            if current_generation != cache_key[2]:
+                flight.retry = True
+                should_retry = True
+            else:
+                _indexed_chunk_topology_cache_put_locked(cache_key, topology)
+                flight.result = topology
+                should_retry = False
+            if _INDEXED_CHUNK_TOPOLOGY_INFLIGHT.get(cache_key) is flight:
+                _INDEXED_CHUNK_TOPOLOGY_INFLIGHT.pop(cache_key, None)
+            flight.event.set()
+            _prune_indexed_chunk_topology_generation_locked(resolved_path)
+        if should_retry:
+            continue
+        return topology
 
 
 def normalize_regulation_title(value: object) -> str:
@@ -246,6 +614,103 @@ def normalize_regulation_number(value: object) -> str:
     canonical_match = re.fullmatch(r"\uc81c?(\d+(?:[-./]\d+)*)(?:\ud638)?", text)
     if canonical_match:
         return "-".join(re.split(r"[-./]", canonical_match.group(1)))
+    return text
+
+
+def _canonical_hierarchy_path(metadata: Mapping[str, Any]) -> str:
+    """Return a regulation-local path, including for pre-canonical records."""
+
+    explicit = str(metadata.get("canonical_hierarchy_path") or "").strip()
+    if explicit:
+        return explicit
+    raw_path = str(metadata.get("hierarchy_path") or "").strip()
+    segments = [segment.strip() for segment in raw_path.split(">") if segment.strip()]
+    title = str(metadata.get("regulation_title") or "").strip()
+    regulation_no = str(metadata.get("regulation_no") or "").strip()
+    normalized_title = normalize_regulation_title(title)
+    normalized_no = normalize_regulation_number(regulation_no)
+    # Prefer the regulation title. A short regulation number such as ``1``
+    # also appears in outer wrappers like ``제1편``/``제1장`` and must not make
+    # that binder structure part of the regulation-local path.
+    matched_index = next(
+        (
+            index
+            for index, segment in enumerate(segments)
+            if normalized_title
+            and normalized_title in normalize_regulation_title(segment)
+        ),
+        None,
+    )
+    if matched_index is None:
+        matched_index = next(
+            (
+                index
+                for index, segment in enumerate(segments)
+                if not _is_structural_toc_segment(segment)
+                and normalized_no
+                and normalized_no in normalize_regulation_number(segment)
+            ),
+            None,
+        )
+    if matched_index is not None:
+        tail = segments[matched_index + 1 :]
+    else:
+        structural_index = next(
+            (
+                index
+                for index, segment in enumerate(segments)
+                if _is_structural_toc_segment(segment)
+            ),
+            len(segments),
+        )
+        tail = segments[structural_index:]
+    root = title or regulation_no
+    canonical_segments = [root] if root else []
+    for segment in tail:
+        if canonical_segments and _compact(segment) == _compact(canonical_segments[-1]):
+            continue
+        canonical_segments.append(segment)
+    article_label = " ".join(
+        value
+        for value in (
+            str(metadata.get("article_no") or "").strip(),
+            str(metadata.get("article_title") or "").strip(),
+        )
+        if value
+    )
+    if article_label and all(
+        _compact(article_label) != _compact(segment)
+        for segment in canonical_segments
+    ):
+        canonical_segments.append(article_label)
+    return " > ".join(segment for segment in canonical_segments if segment)
+
+
+def _canonical_record_text(record: Mapping[str, Any]) -> str:
+    """Remove source-container headers from legacy retrieval text on the fly."""
+
+    text = str(record.get("text") or "")
+    metadata = _metadata(record)
+    canonical_path = _canonical_hierarchy_path(metadata)
+    canonical_title = str(
+        metadata.get("canonical_regulation_title")
+        or metadata.get("regulation_title")
+        or ""
+    ).strip()
+    if canonical_title:
+        text = re.sub(
+            r"(?m)^\[문서명\][ \t]*.*$",
+            f"[문서명] {canonical_title}",
+            text,
+            count=1,
+        )
+    if canonical_path:
+        text = re.sub(
+            r"(?m)^\[위치\][ \t]*.*$",
+            f"[위치] {canonical_path}",
+            text,
+            count=1,
+        )
     return text
 
 
@@ -369,17 +834,21 @@ def _canonical_record_regulation_identities(
             for group_key, group_entries in numbered_groups.items()
         }
         sole_numbered_group = next(iter(numbered_groups)) if len(numbered_groups) == 1 else None
+        matched_numbered_group_by_title: dict[str, str | None] = {}
         for entry in unassigned_entries:
             selected_group = sole_numbered_group
             if selected_group is None and numbered_groups:
                 probe_title = str(entry["normalized_title"])
-                matching_groups = [
-                    group_key
-                    for group_key, group_title in numbered_titles.items()
-                    if _regulation_titles_match(probe_title, group_title)
-                ]
-                if len(matching_groups) == 1:
-                    selected_group = matching_groups[0]
+                if probe_title not in matched_numbered_group_by_title:
+                    matching_groups = [
+                        group_key
+                        for group_key, group_title in numbered_titles.items()
+                        if _regulation_titles_match(probe_title, group_title)
+                    ]
+                    matched_numbered_group_by_title[probe_title] = (
+                        matching_groups[0] if len(matching_groups) == 1 else None
+                    )
+                selected_group = matched_numbered_group_by_title[probe_title]
             if selected_group is None:
                 selected_group = f"title:{entry['normalized_title'] or 'unknown'}"
             assigned_groups.setdefault(selected_group, []).append(entry)
@@ -420,10 +889,115 @@ def _canonical_record_regulation_identities(
             }
             for entry in group_entries:
                 identities[entry["record_key"]] = identity
+    identities = _assign_canonical_title_unit_ids(
+        records_by_document,
+        identities,
+        fallback_profile_id=fallback_profile_id,
+    )
     return _reconcile_authoritative_regulation_lineages(
         records_by_document,
         identities,
     )
+
+
+def _assign_canonical_title_unit_ids(
+    records_by_document: Mapping[str, list[dict[str, Any]]],
+    identities: dict[tuple[str, str], dict[str, str]],
+    *,
+    fallback_profile_id: object,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Make new canonical chunks packaging-independent without collapsing siblings.
+
+    New chunker records opt in with ``canonical_regulation_title``. When that
+    title has zero or one regulation number in the corpus, the title alone is
+    the stable unit identity, so a numbered combined-book entry and an
+    unnumbered standalone file converge. If the same title is used by multiple
+    numbered regulations, their numbers remain part of the identity.
+    """
+
+    grouped: dict[tuple[str, str], list[tuple[tuple[str, str], dict[str, str]]]] = defaultdict(list)
+    for entries in records_by_document.values():
+        for entry in entries:
+            metadata = entry["metadata"]
+            record_key = entry["record_key"]
+            identity = identities.get(record_key)
+            if identity is None:
+                continue
+            canonical_title = str(
+                metadata.get("canonical_regulation_title")
+                or (
+                    identity.get("title")
+                    if str(metadata.get("chunker_version") or "").strip()
+                    else ""
+                )
+                or ""
+            ).strip()
+            normalized_title = normalize_regulation_title(canonical_title)
+            if not normalized_title:
+                continue
+            profile_id = str(
+                identity.get("profile_id")
+                or metadata.get("profile_id")
+                or fallback_profile_id
+                or ""
+            ).strip()
+            profile_key = unicodedata.normalize("NFKC", profile_id).casefold().strip()
+            grouped[(profile_key, normalized_title)].append((record_key, identity))
+
+    for entries in grouped.values():
+        distinct_numbers = {
+            normalized
+            for _record_key, identity in entries
+            if (
+                normalized := normalize_regulation_number(
+                    identity.get("regulation_no")
+                )
+            )
+        }
+        disambiguate_by_number = len(distinct_numbers) > 1
+        unnumbered_document_ids = {
+            record_key[0]
+            for record_key, identity in entries
+            if not normalize_regulation_number(identity.get("regulation_no"))
+        }
+        ambiguous_unnumbered_siblings = len(unnumbered_document_ids) > 1
+        for record_key, identity in entries:
+            identity_number = normalize_regulation_number(
+                identity.get("regulation_no")
+            )
+            if ambiguous_unnumbered_siblings and not identity_number:
+                # With neither a number nor lifecycle lineage, two standalone
+                # documents having the same title cannot safely be assumed to
+                # be one regulation. Keep them distinct; a stable regulation_id
+                # or supersedes edge can still merge them in the lineage pass.
+                source_digest = hashlib.sha256(
+                    record_key[0].encode("utf-8")
+                ).hexdigest()[:16]
+                canonical_number = f"source-{source_digest}"
+            elif disambiguate_by_number:
+                canonical_number = identity.get("regulation_no")
+            else:
+                canonical_number = ""
+            identities[record_key] = {
+                **identity,
+                # A binder-local sequence number is packaging provenance, not
+                # part of the public identity when the canonical title is
+                # already unambiguous.  Dropping it here makes a numbered
+                # combined-book segment and an unnumbered standalone file
+                # expose the same catalog value and logical corpus fingerprint.
+                # The original number remains available on the source record.
+                "regulation_no": (
+                    str(identity.get("regulation_no") or "").strip()
+                    if disambiguate_by_number
+                    else ""
+                ),
+                "unit_id": regulation_unit_id_for(
+                    profile_id=identity.get("profile_id") or fallback_profile_id,
+                    regulation_title=identity.get("title"),
+                    regulation_no=canonical_number,
+                ),
+            }
+    return identities
 
 
 def _reconcile_authoritative_regulation_lineages(
@@ -449,10 +1023,13 @@ def _reconcile_authoritative_regulation_lineages(
             if not identity:
                 continue
             profile_key = _normalize_lineage_key(identity.get("profile_id"))
-            fallback_unit_id = regulation_unit_id_for(
-                profile_id=identity.get("profile_id"),
-                regulation_title=identity.get("title"),
-                regulation_no=identity.get("regulation_no"),
+            fallback_unit_id = str(
+                identity.get("unit_id")
+                or regulation_unit_id_for(
+                    profile_id=identity.get("profile_id"),
+                    regulation_title=identity.get("title"),
+                    regulation_no=identity.get("regulation_no"),
+                )
             )
             grouped_entries[(profile_key, fallback_unit_id)].append(entry)
 
@@ -681,17 +1258,24 @@ def _supersedes_cycle_nodes(edges: Iterable[tuple[int, int]]) -> set[int]:
         for successor, predecessor in edges
     }
     cycle_nodes: set[int] = set()
+    processed_nodes: set[int] = set()
     for start in predecessor_by_successor:
+        if start in processed_nodes:
+            continue
         path: list[int] = []
         positions: dict[int, int] = {}
         current = start
-        while current in predecessor_by_successor:
+        while (
+            current in predecessor_by_successor
+            and current not in processed_nodes
+        ):
             if current in positions:
                 cycle_nodes.update(path[positions[current] :])
                 break
             positions[current] = len(path)
             path.append(current)
             current = predecessor_by_successor[current]
+        processed_nodes.update(path)
     return cycle_nodes
 
 
@@ -899,6 +1483,62 @@ def build_hierarchical_runtime_index(
     vector_offsets: Mapping[tuple[str, str], tuple[int, int]] | None = None,
     progress_callback: Callable[[int, str, int, int], None] | None = None,
 ) -> dict[str, Any]:
+    """Build an index while serializing writers targeting the same path."""
+
+    record_list = records if isinstance(records, list) else list(records)
+    _reject_ambiguous_combined_book_boundary_records(record_list)
+    with _hierarchical_index_build_guard(path):
+        return _build_hierarchical_runtime_index_unlocked(
+            path,
+            record_list,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            vector_offsets=vector_offsets,
+            progress_callback=progress_callback,
+        )
+
+
+def _reject_ambiguous_combined_book_boundary_records(
+    records: Iterable[Mapping[str, Any]],
+) -> None:
+    blocked: list[str] = []
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, Mapping):
+            continue
+        metadata = _metadata(record)
+        warnings = metadata.get("warnings", record.get("warnings", []))
+        if isinstance(warnings, str):
+            warning_values = [warnings]
+        elif isinstance(warnings, (list, tuple, set)):
+            warning_values = [str(value) for value in warnings]
+        else:
+            warning_values = []
+        marked = bool(
+            metadata.get(AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY) is True
+            or record.get(AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY) is True
+            or str(metadata.get(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY) or "").strip()
+            == AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC
+            or AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING in warning_values
+        )
+        if marked:
+            document_id, chunk_id = _record_identity(record)
+            blocked.append(chunk_id or document_id or f"record-{index}")
+    if blocked:
+        raise ValueError(
+            "Hierarchical index rejected ambiguous combined-book regulation boundaries: "
+            + ", ".join(blocked[:20])
+        )
+
+
+def _build_hierarchical_runtime_index_unlocked(
+    path: str | Path,
+    records: Iterable[dict[str, Any]],
+    *,
+    tenant_id: str,
+    profile_id: str | None,
+    vector_offsets: Mapping[tuple[str, str], tuple[int, int]] | None = None,
+    progress_callback: Callable[[int, str, int, int], None] | None = None,
+) -> dict[str, Any]:
     """Build a regulation catalog, TOC, version, and body-search index."""
     record_list = records if isinstance(records, list) else list(records)
     scoped_tenant_id, scoped_profile_id = _validated_runtime_record_scope(
@@ -922,11 +1562,15 @@ def build_hierarchical_runtime_index(
     _report_hierarchy_progress(progress_callback, 1, "계층 색인 준비", 0, total_records)
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        output_path.unlink()
+    _evict_indexed_chunk_topology_cache(output_path)
+    staging_path = output_path.with_name(
+        f".{output_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+    )
 
-    connection = sqlite3.connect(output_path)
+    build_ready = False
+    connection: sqlite3.Connection | None = None
     try:
+        connection = sqlite3.connect(staging_path)
         connection.execute("PRAGMA journal_mode=OFF")
         connection.execute("PRAGMA synchronous=OFF")
         connection.execute("PRAGMA temp_store=MEMORY")
@@ -1026,6 +1670,7 @@ def build_hierarchical_runtime_index(
         for prepared_index, prepared in enumerate(prepared_records, start=1):
             record = prepared["record"]
             metadata = _metadata(record)
+            canonical_hierarchy_path = _canonical_hierarchy_path(metadata)
             document_id, chunk_id = _record_identity(record)
             cursor = connection.execute(
                 """
@@ -1042,7 +1687,7 @@ def build_hierarchical_runtime_index(
                     prepared["version_id"],
                     prepared["unit_id"],
                     str(metadata.get("chunk_type") or ""),
-                    str(metadata.get("hierarchy_path") or ""),
+                    canonical_hierarchy_path,
                     str(metadata.get("article_no") or ""),
                     str(metadata.get("article_title") or ""),
                     str(metadata.get("parent_id") or ""),
@@ -1059,7 +1704,7 @@ def build_hierarchical_runtime_index(
                 (
                     row_id,
                     str(metadata.get("regulation_title") or ""),
-                    str(metadata.get("hierarchy_path") or ""),
+                    canonical_hierarchy_path,
                     " ".join(
                         value
                         for value in (
@@ -1068,7 +1713,7 @@ def build_hierarchical_runtime_index(
                         )
                         if value
                     ),
-                    str(record.get("text") or ""),
+                    _canonical_record_text(record),
                 ),
             )
             for toc_row in _toc_rows_for_record(
@@ -1146,9 +1791,45 @@ def build_hierarchical_runtime_index(
         )
         connection.commit()
         connection.execute("PRAGMA optimize")
-        _report_hierarchy_progress(progress_callback, 100, "계층 색인 완료", total_records, total_records)
+        _report_hierarchy_progress(
+            progress_callback,
+            99,
+            "계층 색인 파일 확정 준비",
+            total_records,
+            total_records,
+        )
+        build_ready = True
     finally:
-        connection.close()
+        connection_closed = connection is None
+        try:
+            if connection is not None:
+                connection.close()
+                connection_closed = True
+        finally:
+            if not build_ready or not connection_closed:
+                staging_path.unlink(missing_ok=True)
+                _prune_indexed_chunk_topology_generation(output_path)
+
+    try:
+        _replace_index_with_retry(staging_path, output_path)
+    except BaseException:
+        staging_path.unlink(missing_ok=True)
+        _evict_indexed_chunk_topology_cache(
+            output_path,
+            prune_generation_if_unused=True,
+        )
+        raise
+    _evict_indexed_chunk_topology_cache(
+        output_path,
+        prune_generation_if_unused=True,
+    )
+    _report_hierarchy_progress(
+        progress_callback,
+        100,
+        "계층 색인 완료",
+        total_records,
+        total_records,
+    )
 
     version_count = len(finalized_versions)
     unit_count = len({item["unit_id"] for item in finalized_versions.values() if not item["is_navigation"]})
@@ -1179,6 +1860,24 @@ def build_hierarchical_runtime_index(
             (reference_graph.get("stats") or {}).get("cycle_count") or 0
         ),
     }
+
+
+def _replace_index_with_retry(source: Path, target: Path) -> None:
+    """Bound Windows reader locks without publishing a partial SQLite index."""
+
+    deadline = time.monotonic() + _INDEX_REPLACE_RETRY_SECONDS
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            retryable = isinstance(exc, PermissionError) or exc.errno in {
+                errno.EACCES,
+                errno.EBUSY,
+            }
+            if not retryable or time.monotonic() >= deadline:
+                raise
+            time.sleep(_INDEX_REPLACE_RETRY_INTERVAL_SECONDS)
 
 
 def index_summary(path: str | Path) -> dict[str, Any] | None:
@@ -1296,7 +1995,7 @@ def search_hierarchical_records(
         key=lambda item: (
             item[0],
             _normalize_date(_metadata(item[1]).get("revision_date")),
-            _logical_text(_metadata(item[1]).get("hierarchy_path")),
+            _logical_text(_canonical_hierarchy_path(_metadata(item[1]))),
         ),
         reverse=True,
     )
@@ -1603,13 +2302,19 @@ def regulation_toc(
             """,
             (version["version_id"], max(1, min(int(max_nodes), 5000))),
         ).fetchall()
+    public_node_ids = {
+        str(row["node_id"]): _public_toc_node_id(version, row)
+        for row in rows
+    }
     depth_by_id: dict[str, int] = {}
     nodes: list[dict[str, Any]] = []
-    for row in rows:
-        parent_id = str(row["parent_id"] or "")
-        depth = depth_by_id.get(parent_id, -1) + 1 if parent_id else 0
-        node_id = str(row["node_id"])
-        depth_by_id[node_id] = depth
+    for public_order, row in enumerate(rows):
+        storage_parent_id = str(row["parent_id"] or "")
+        storage_node_id = str(row["node_id"])
+        parent_id = public_node_ids.get(storage_parent_id, "")
+        depth = depth_by_id.get(storage_parent_id, -1) + 1 if storage_parent_id else 0
+        node_id = public_node_ids[storage_node_id]
+        depth_by_id[storage_node_id] = depth
         nodes.append(
             {
                 "node_id": node_id,
@@ -1619,7 +2324,10 @@ def regulation_toc(
                 "number": str(row["number"] or ""),
                 "title": str(row["title"] or ""),
                 "depth": depth,
-                "order_index": int(row["order_index"] or 0),
+                # Source order offsets differ between one combined binder and
+                # separate files. The selected row order is already stable, so
+                # expose a regulation-local ordinal instead.
+                "order_index": public_order,
                 "hierarchy_path": str(row["hierarchy_path"] or ""),
                 "chunk_id": str(row["chunk_id"] or ""),
             }
@@ -1628,6 +2336,29 @@ def regulation_toc(
         "regulation": _public_regulation_row(version, is_current=True),
         "nodes": nodes,
     }
+
+
+def _public_toc_node_id(
+    version: Mapping[str, Any] | sqlite3.Row,
+    row: Mapping[str, Any] | sqlite3.Row,
+) -> str:
+    """Create a source-document-independent public TOC node identifier."""
+
+    payload = "\n".join(
+        (
+            str(version["unit_id"] or ""),
+            str(version["revision_date"] or ""),
+            str(version["effective_from"] or ""),
+            str(version["effective_to"] or ""),
+            str(version["repealed_at"] or "")
+            if "repealed_at" in version.keys()
+            else "",
+            str(version["status"] or ""),
+            _logical_text(row["hierarchy_path"]),
+            str(row["node_type"] or ""),
+        )
+    )
+    return "toc-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
 def regulation_references(
@@ -2445,17 +3176,22 @@ def _add_runtime_record_to_version_groups(
     group["chunk_count"] += 1
     group["content_hashes"].append(str(record.get("content_hash") or ""))
     group["logical_chunk_hashes"].append(_logical_record_hash(record))
+    canonical_hierarchy_path = _canonical_hierarchy_path(metadata)
+    has_canonical_hierarchy = bool(
+        str(metadata.get("canonical_hierarchy_path") or "").strip()
+        or str(metadata.get("chunker_version") or "").strip()
+    )
     group["search_values"].extend(
         str(value or "")
         for value in (
             metadata.get("regulation_title"),
             metadata.get("regulation_no"),
-            metadata.get("part_title"),
-            metadata.get("chapter_title"),
-            metadata.get("section_title"),
+            None if has_canonical_hierarchy else metadata.get("part_title"),
+            None if has_canonical_hierarchy else metadata.get("chapter_title"),
+            None if has_canonical_hierarchy else metadata.get("section_title"),
             metadata.get("article_no"),
             metadata.get("article_title"),
-            metadata.get("hierarchy_path"),
+            canonical_hierarchy_path,
         )
         if str(value or "").strip()
     )
@@ -3056,7 +3792,7 @@ def _toc_rows_for_record(
     order_index: int,
 ) -> list[tuple[Any, ...]]:
     metadata = _metadata(record)
-    hierarchy_path = str(metadata.get("hierarchy_path") or "")
+    hierarchy_path = _canonical_hierarchy_path(metadata)
     segments = [segment.strip() for segment in hierarchy_path.split(">") if segment.strip()]
     title = str(metadata.get("regulation_title") or "").strip()
     regulation_no = str(metadata.get("regulation_no") or "").strip()
@@ -3403,16 +4139,20 @@ def _version_is_effective_on(item: Mapping[str, Any], reference_date: date) -> b
 
 def _runtime_record_sort_key(record: Mapping[str, Any]) -> tuple[str, ...]:
     metadata = _metadata(record)
+    canonicalized = bool(
+        metadata.get("canonical_hierarchy_path")
+        or metadata.get("chunker_version")
+    )
     return (
         _compact(metadata.get("profile_id")),
         normalize_regulation_title(metadata.get("regulation_title") or metadata.get("document_name")),
         _normalize_date(metadata.get("revision_date")),
         _normalize_date(metadata.get("effective_from") or metadata.get("valid_from")),
-        _logical_text(metadata.get("hierarchy_path")),
+        _logical_text(_canonical_hierarchy_path(metadata)),
         _logical_text(metadata.get("article_no")),
         _logical_text(metadata.get("paragraph_no")),
         _logical_text(metadata.get("item_no")),
-        str(_integer(metadata.get("source_page_start"), 0)).zfill(8),
+        "" if canonicalized else str(_integer(metadata.get("source_page_start"), 0)).zfill(8),
         _logical_text(metadata.get("chunk_type")),
         _logical_record_hash(record),
         str(_record_identity(record)[0]),
@@ -3422,8 +4162,11 @@ def _runtime_record_sort_key(record: Mapping[str, Any]) -> tuple[str, ...]:
 
 def _logical_record_hash(record: Mapping[str, Any]) -> str:
     metadata = _metadata(record)
+    canonicalized = bool(
+        metadata.get("canonical_hierarchy_path")
+        or metadata.get("chunker_version")
+    )
     stable_fields = (
-        "regulation_no",
         "regulation_title",
         "regulation_version",
         "revision_date",
@@ -3433,13 +4176,6 @@ def _logical_record_hash(record: Mapping[str, Any]) -> str:
         "valid_from",
         "valid_to",
         "chunk_type",
-        "hierarchy_path",
-        "part_no",
-        "part_title",
-        "chapter_no",
-        "chapter_title",
-        "section_no",
-        "section_title",
         "article_no",
         "article_title",
         "paragraph_no",
@@ -3455,12 +4191,32 @@ def _logical_record_hash(record: Mapping[str, Any]) -> str:
         "paragraph_item_unit_sample",
         "internal_regulation_refs",
         "regulation_article_refs",
-        "source_page_start",
-        "source_page_end",
     )
+    if not canonicalized:
+        stable_fields = (
+            "regulation_no",
+            *stable_fields,
+            "part_no",
+            "part_title",
+            "chapter_no",
+            "chapter_title",
+            "section_no",
+            "section_title",
+            "source_page_start",
+            "source_page_end",
+        )
     payload = {
-        "text": _logical_text(record.get("text")),
-        "metadata": {field: _logical_value(metadata.get(field)) for field in stable_fields if metadata.get(field) is not None},
+        "text": _logical_text(
+            _canonical_record_text(record) if canonicalized else record.get("text")
+        ),
+        "metadata": {
+            **{
+                field: _logical_value(metadata.get(field))
+                for field in stable_fields
+                if metadata.get(field) is not None
+            },
+            "hierarchy_path": _logical_value(_canonical_hierarchy_path(metadata)),
+        },
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -3488,6 +4244,7 @@ def _logical_corpus_hash(versions: Mapping[str, Mapping[str, Any]]) -> str:
         key=lambda item: (
             item["profile_id"],
             item["regulation_title"],
+            normalize_regulation_number(item["regulation_no"]),
             item["revision_date"],
             item["version"],
             item["logical_content_sha256"],

@@ -49,6 +49,11 @@ jobs:
             tests.test_kordoc_table_matcher \
             tests.test_kordoc_table_parser \
             tests.test_chunker \
+            tests.test_vector_ingestion_adapter \
+            tests.test_bm25_index \
+            tests.test_bm25_structured_metadata \
+            tests.test_hierarchical_index \
+            tests.test_input_packaging_parity \
             tests.test_quality_gate \
             tests.test_pipeline \
             tests.test_processing_service \

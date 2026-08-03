@@ -18,6 +18,7 @@ STAGE_ORDER = (
     "conversation",
 )
 CORE_CONFIGURATION_STAGES = STAGE_ORDER[:4]
+CHATGPT_LOCAL_UNSUPPORTED = "chatgpt_local_unsupported"
 STAGE_STATES = frozenset(
     {"not_applicable", "not_checked", "pending", "verified", "failed", "stale"}
 )
@@ -170,6 +171,39 @@ def build_connection_diagnostic(
                 "evidence": {"connection_target": normalized_target},
             }
 
+    if normalized_target == "chatgpt-desktop-local":
+        for stage_name in STAGE_ORDER:
+            normalized_stages[stage_name] = {
+                "state": "not_applicable",
+                "attempt_id": current_attempt,
+                "checked_at": normalized_checked_at,
+                "reason_code": CHATGPT_LOCAL_UNSUPPORTED,
+                "evidence": {"connection_target": normalized_target},
+            }
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "attempt_id": current_attempt,
+            "config_fingerprint": current_fingerprint,
+            "connection_target": normalized_target,
+            "checked_at": normalized_checked_at,
+            "stage_order": list(required_stage_order),
+            "configuration_stages": list(configuration_stages),
+            "stages": normalized_stages,
+            "overall_state": "unsupported",
+            "configured": False,
+            "pending": True,
+            "connected": False,
+            "has_failures": True,
+            "stale_stages": [],
+            "first_blocking_stage": None,
+            "reason_code": CHATGPT_LOCAL_UNSUPPORTED,
+            "support_summary": "ChatGPT local MCP is unsupported.",
+            "next_action": (
+                "Use ChatGPT web with an approved reachable HTTPS MCP app, "
+                "or use Codex/Claude for local stdio MCP."
+            ),
+        }
+
     configured = all(
         normalized_stages[name]["state"] == "verified" for name in configuration_stages
     )
@@ -235,7 +269,19 @@ def diagnostic_from_bundle_status(
     """
 
     status = dict(bundle_status or {})
-    normalized_target = _normalize_connection_target(connection_target)
+    normalized_target, target_required = _resolve_bundle_connection_target(
+        status,
+        connection_target,
+    )
+    if target_required:
+        return _target_required_diagnostic(
+            attempt_id=attempt_id,
+            config_fingerprint=config_fingerprint,
+            checked_at=checked_at
+            or status.get("updated_at")
+            or status.get("generated_at")
+            or status.get("generated_at_utc"),
+        )
     client_connections = status.get("client_connections")
     if (
         status.get("schema_version") == "mcp-bundle-status-v5"
@@ -269,6 +315,17 @@ def diagnostic_from_bundle_status(
         if config_fingerprint is not None
         else source_fingerprint
     )
+    if normalized_target == "chatgpt-desktop-local":
+        return build_connection_diagnostic(
+            {},
+            attempt_id=current_attempt,
+            config_fingerprint=current_fingerprint,
+            checked_at=checked_at
+            or status.get("updated_at")
+            or status.get("generated_at")
+            or status.get("generated_at_utc"),
+            connection_target=normalized_target,
+        )
     explicit_legacy_binding = bool(
         attempt_id is not None
         and config_fingerprint is not None
@@ -971,13 +1028,55 @@ def _safe_identifier_value(value: Any) -> str | None:
 def _normalize_connection_target(value: Any) -> str | None:
     normalized = str(value or "").strip().casefold().replace("_", "-")
     aliases = {
-        "chatgpt": "chatgpt-desktop-local",
+        "chatgpt": "chatgpt-remote",
         "chatgpt-desktop": "chatgpt-desktop-local",
         "codex-cli": "codex",
         "claude": "claude-desktop",
     }
     normalized = aliases.get(normalized, normalized)
     return _safe_identifier_value(normalized)
+
+
+def _resolve_bundle_connection_target(
+    status: Mapping[str, Any], explicit_target: Any
+) -> tuple[str | None, bool]:
+    if explicit_target is not None:
+        normalized = _normalize_connection_target(explicit_target)
+        return normalized, normalized not in CONNECTION_TARGET_STAGE_PROFILES
+
+    candidates: list[str] = []
+    for field in ("legacy_projection_target", "active_target"):
+        raw_target = status.get(field)
+        if raw_target is None or not str(raw_target).strip():
+            continue
+        normalized = _normalize_connection_target(raw_target)
+        if normalized not in CONNECTION_TARGET_STAGE_PROFILES:
+            return None, True
+        candidates.append(normalized)
+
+    unique_candidates = set(candidates)
+    if len(unique_candidates) == 1:
+        return candidates[0], False
+    return None, True
+
+
+def _target_required_diagnostic(
+    *,
+    attempt_id: str | None,
+    config_fingerprint: str | None,
+    checked_at: str | datetime | None,
+) -> dict[str, Any]:
+    report = build_connection_diagnostic(
+        {},
+        attempt_id=attempt_id,
+        config_fingerprint=config_fingerprint,
+        checked_at=checked_at,
+        connection_target=None,
+    )
+    report["reason_code"] = "target_required"
+    report["support_summary"] = "Select one MCP client target before evaluating status."
+    report["next_action"] = "Provide one explicit MCP client target and run the check again."
+    return report
 
 
 def _normalize_checked_at(value: str | datetime | None) -> str | None:
@@ -1123,6 +1222,7 @@ def _support_guidance(
 
 __all__ = [
     "SCHEMA_VERSION",
+    "CHATGPT_LOCAL_UNSUPPORTED",
     "CONNECTION_TARGET_STAGE_PROFILES",
     "CORE_CONFIGURATION_STAGES",
     "STAGE_ORDER",

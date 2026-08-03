@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 import zipfile
 
+import scripts.run_mcp_bundle_zip_extract_smoke as bundle_zip_extract_smoke
 from scripts.run_mcp_bundle_zip_extract_smoke import (
     _client_config_path_checks,
     _extract_archive_safely,
@@ -77,6 +78,10 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertEqual(str(extracted.resolve()), report["extract_dir"])
         self.assertEqual(str(Path(os.sys.executable).resolve().parent), child_env["PATH"].split(os.pathsep)[0])
         self.assertEqual(str(Path(os.sys.executable).resolve()), child_env["REG_RAG_PYTHON"])
+        self.assertEqual(
+            str(bundle_zip_extract_smoke.PROJECT_ROOT.resolve()),
+            child_env["REG_RAG_PYTHON_PROJECT_ROOT"],
+        )
         self.assertTrue(report["passed"])
 
     def test_require_console_scripts_reports_environment_blocker(self) -> None:
@@ -144,17 +149,33 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertTrue(checks["clients"]["codex"]["passed"])
         self.assertTrue(checks["clients"]["claude_desktop"]["passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["passed"])
+        self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["guard_passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
+        self.assertTrue(
+            checks["clients"]["chatgpt_desktop_local"]["warning_only_artifact_verified"]
+        )
+        self.assertEqual(
+            "unsupported",
+            checks["clients"]["chatgpt_desktop_local"]["support_status"],
+        )
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["direct_local_supported"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["connection_verified"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["process_started"])
+        self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["runnable_config_present"])
 
-    def test_path_checks_reject_missing_chatgpt_desktop_ui_fields(self) -> None:
+    def test_path_checks_reject_runnable_chatgpt_desktop_ui_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "bundle"
             bundle.mkdir()
             _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
             desktop_path = bundle / "chatgpt_desktop_local_mcp.json"
             payload = json.loads(desktop_path.read_text(encoding="utf-8"))
-            payload["removed_ui_fields"] = payload.pop("ui_fields")
+            payload["ui_fields"] = {
+                "name": "govreg-local",
+                "command": "powershell.exe",
+                "args": [],
+            }
             desktop_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
             checks = _client_config_path_checks(target_dir=bundle, server_name="govreg-local")
@@ -164,6 +185,43 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
         self.assertIn("ui_fields", checks["clients"]["chatgpt_desktop_local"]["schema_error"])
+
+    def test_path_checks_reject_supported_or_runnable_chatgpt_desktop_artifact(self) -> None:
+        mutations = {
+            "supported flag": {"direct_local_supported": True},
+            "runnable config": {"mcpServers": {"govreg-local": {"command": "python", "args": []}}},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                bundle = Path(tmp) / "bundle"
+                bundle.mkdir()
+                _write_client_configs(
+                    bundle,
+                    launcher=bundle / "run_mcp_stdio_server.ps1",
+                    data_dir=bundle / "data",
+                )
+                desktop_path = bundle / "chatgpt_desktop_local_mcp.json"
+                payload = json.loads(desktop_path.read_text(encoding="utf-8"))
+                payload.update(mutation)
+                desktop_path.write_text(
+                    json.dumps(payload, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+
+                checks = _client_config_path_checks(
+                    target_dir=bundle,
+                    server_name="govreg-local",
+                )
+
+                legacy = checks["clients"]["chatgpt_desktop_local"]
+                self.assertFalse(legacy["passed"])
+                self.assertFalse(legacy["guard_passed"])
+                self.assertFalse(legacy["connection_verified"])
+                self.assertFalse(legacy["process_started"])
+                self.assertEqual(
+                    label == "runnable config",
+                    legacy["runnable_config_present"],
+                )
 
     def test_path_checks_reject_chatgpt_desktop_config_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,7 +245,8 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
             _write_client_configs(bundle, launcher=bundle / "run_mcp_stdio_server.ps1", data_dir=bundle / "data")
             desktop_path = bundle / "chatgpt_desktop_local_mcp.json"
             desktop_path.write_text(
-                '{"ui_fields":{"name":"govreg-local","command":"powershell.exe","command":"other","args":[]}}',
+                '{"support_status":"unsupported","support_status":"supported",'
+                '"direct_local_supported":false}',
                 encoding="utf-8",
             )
 
@@ -197,7 +256,10 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["passed"])
         self.assertTrue(checks["clients"]["chatgpt_desktop_local"]["strict_utf8_without_bom"])
         self.assertFalse(checks["clients"]["chatgpt_desktop_local"]["config_schema_verified"])
-        self.assertIn("duplicate JSON key: command", checks["clients"]["chatgpt_desktop_local"]["schema_error"])
+        self.assertIn(
+            "duplicate JSON key: support_status",
+            checks["clients"]["chatgpt_desktop_local"]["schema_error"],
+        )
 
     def test_path_checks_reject_stale_generated_bundle_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -240,6 +302,90 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
                 archive.writestr("same.txt", "second")
             with self.assertRaisesRegex(ValueError, "Duplicate bundle archive member"):
                 _extract_archive_safely(duplicate, destination)
+
+    def test_safe_extract_allows_only_exact_omission_sidecar_and_rejects_review_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "extract"
+            destination.mkdir()
+            valid = root / "valid.zip"
+            with zipfile.ZipFile(valid, "w") as archive:
+                archive.writestr(
+                    "data/repository/omission_disposition_snapshot.json",
+                    "{}\n",
+                )
+            _extract_archive_safely(valid, destination)
+            self.assertTrue(
+                (
+                    destination
+                    / "data"
+                    / "repository"
+                    / "omission_disposition_snapshot.json"
+                ).is_file()
+            )
+
+            forbidden_names = (
+                "data/repository/journals/review_decisions.jsonl",
+                "data/raw/omission_disposition_snapshot.json",
+                "data/repository/raw/source-review.txt",
+            )
+            for index, name in enumerate(forbidden_names):
+                with self.subTest(name=name):
+                    archive_path = root / f"forbidden-{index}.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(name, "blocked")
+                    with self.assertRaisesRegex(ValueError, "sealed handoff allowlist"):
+                        _extract_archive_safely(archive_path, root / f"out-{index}")
+
+    def test_extract_smoke_validates_runtime_integrity_before_client_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            extracted = root / "extracted"
+            _write_client_configs(
+                source,
+                launcher=extracted / "run_mcp_stdio_server.ps1",
+                data_dir=extracted / "data",
+            )
+            (source / "validate_client_config_smoke.ps1").write_text("exit 0\n", encoding="utf-8")
+            (source / "run_mcp_stdio_server.ps1").write_text("exit 0\n", encoding="utf-8")
+            (source / "mcp_client_config_smoke.json").write_text('{"passed": true}\n', encoding="utf-8")
+            runtime_dir = source / "data"
+            runtime_dir.mkdir()
+            (runtime_dir / "mcp_runtime_manifest.json").write_text("{}\n", encoding="utf-8")
+            bundle_zip = root / "bundle.zip"
+            with zipfile.ZipFile(bundle_zip, "w") as archive:
+                for path in source.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, arcname=path.relative_to(source).as_posix())
+
+            with (
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke.validate_mcp_runtime_data_bundle_integrity"
+                ) as integrity,
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke._powershell_command",
+                    return_value="powershell.exe",
+                ),
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ),
+                mock.patch(
+                    "scripts.run_mcp_bundle_zip_extract_smoke.current_repo_commit",
+                    return_value="test-commit",
+                ),
+            ):
+                report = run_mcp_bundle_zip_extract_smoke(
+                    bundle_zip=bundle_zip,
+                    extract_dir=extracted,
+                    server_name="govreg-local",
+                )
+
+        integrity.assert_called_once_with(extracted / "data")
+        self.assertTrue(report["runtime_integrity_checked"])
+        self.assertTrue(report["runtime_integrity_passed"])
 
 
 def _write_client_configs(bundle: Path, *, launcher: Path, data_dir: Path) -> None:
@@ -287,14 +433,13 @@ def _write_client_configs(bundle: Path, *, launcher: Path, data_dir: Path) -> No
         json.dumps(
             {
                 "profile": "chatgpt-desktop-local",
+                "client": "ChatGPT",
+                "surface": "legacy_compatibility_artifact",
+                "support_status": "unsupported",
+                "direct_local_supported": False,
+                "chatgpt_direct_local_mcp_supported": False,
                 "server_name": "govreg-local",
-                "ui_fields": {
-                    "name": "govreg-local",
-                    "command": "powershell.exe",
-                    "args": args,
-                    "cwd": str(bundle),
-                    "env": {},
-                }
+                "warning": "ChatGPT does not directly connect to a local MCP server.",
             },
             ensure_ascii=False,
             indent=2,

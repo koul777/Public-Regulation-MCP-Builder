@@ -19,7 +19,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.report_metadata import current_repo_commit
+from scripts.report_metadata import current_repo_commit  # noqa: E402
+from scripts.generate_mcp_client_config import (  # noqa: E402
+    OMISSION_DISPOSITION_SNAPSHOT_FILENAME,
+    validate_mcp_runtime_data_bundle_integrity,
+)
 
 
 def run_mcp_bundle_zip_extract_smoke(
@@ -45,6 +49,10 @@ def run_mcp_bundle_zip_extract_smoke(
         _safe_remove_dir(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     _extract_archive_safely(zip_path, target_dir)
+    runtime_manifest_path = target_dir / "data" / "mcp_runtime_manifest.json"
+    runtime_integrity_checked = runtime_manifest_path.is_file()
+    if runtime_integrity_checked:
+        validate_mcp_runtime_data_bundle_integrity(target_dir / "data")
 
     # Running this module through ``python path\to\script.py`` does not add
     # that interpreter's Scripts directory to PATH.  Keep the smoke child and
@@ -57,6 +65,7 @@ def run_mcp_bundle_zip_extract_smoke(
         part for part in (interpreter_bin, inherited_path) if part
     )
     child_env["REG_RAG_PYTHON"] = str(Path(sys.executable).resolve())
+    child_env["REG_RAG_PYTHON_PROJECT_ROOT"] = str(PROJECT_ROOT)
 
     required_console_scripts = (
         "reg-rag-mcp-client-config-smoke",
@@ -113,6 +122,8 @@ def run_mcp_bundle_zip_extract_smoke(
         "missing_console_scripts": missing_console_scripts,
         "require_console_scripts": bool(require_console_scripts),
         "environment_checks_passed": not (require_console_scripts and missing_console_scripts),
+        "runtime_integrity_checked": runtime_integrity_checked,
+        "runtime_integrity_passed": True,
         "passed": bool(
             completed.returncode == 0
             and client_smoke.get("passed")
@@ -184,9 +195,49 @@ def _extract_archive_safely(
             if member.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
+            if not _runtime_archive_member_allowed(posix_name):
+                raise ValueError(
+                    "Bundle archive runtime member is outside the sealed handoff allowlist: "
+                    + member.filename
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(member, "r") as source, target.open("wb") as sink:
                 shutil.copyfileobj(source, sink, length=1024 * 1024)
+
+
+def _runtime_archive_member_allowed(path: PurePosixPath) -> bool:
+    parts = path.parts
+    if not parts or parts[0] != "data":
+        return True
+    if len(parts) == 2 and parts[1] == ".keep":
+        return True
+    normalized = path.as_posix()
+    if normalized == "data/mcp_runtime_manifest.json":
+        return True
+    if normalized in {
+        "data/repository/manifest.json",
+        "data/repository/approval_snapshot.json",
+        f"data/repository/{OMISSION_DISPOSITION_SNAPSHOT_FILENAME}",
+        "data/repository/journals/approvals.jsonl",
+        "data/repository/journals/indexing_jobs.jsonl",
+        "data/hierarchy/regulation_hierarchy.sqlite3",
+    }:
+        return True
+    if (
+        len(parts) == 3
+        and parts[:2] == ("data", "repository")
+        and parts[2].endswith("_chunks.json")
+        and parts[2] != "_chunks.json"
+    ):
+        return True
+    if (
+        len(parts) == 4
+        and parts[:2] == ("data", "vector_db")
+        and bool(parts[2])
+        and parts[3] in {"approved_vectors.jsonl", "bm25_index.json"}
+    ):
+        return True
+    return False
 
 
 def _powershell_command() -> str | None:
@@ -202,14 +253,14 @@ def _client_config_path_checks(*, target_dir: Path, server_name: str) -> dict[st
     expected_data_dir = str((target_dir / "data").resolve())
     codex = _codex_server(target_dir / "codex_config_snippet.toml", server_name)
     claude = _claude_desktop_server(target_dir / "claude_desktop_config.json", server_name)
-    desktop, desktop_encoding = _chatgpt_desktop_direct_server(target_dir, server_name)
+    chatgpt_legacy_guard = _chatgpt_desktop_warning_artifact_check(target_dir)
     clients = {
         "codex": _entry_path_check(codex, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
         "claude_desktop": _entry_path_check(claude, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
-        "chatgpt_desktop_local": {
-            **_entry_path_check(desktop, expected_launcher=expected_launcher, expected_data_dir=expected_data_dir),
-            **desktop_encoding,
-        },
+        # This is a packaging-policy guard, not a connection smoke.  A passing
+        # result proves only that the retained legacy filename is warning-only
+        # and cannot be mistaken for a runnable local ChatGPT configuration.
+        "chatgpt_desktop_local": chatgpt_legacy_guard,
     }
     return {
         "passed": all(bool(client.get("passed")) for client in clients.values()),
@@ -233,19 +284,26 @@ def _claude_desktop_server(path: Path, server_name: str) -> dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
-def _chatgpt_desktop_direct_server(
-    target_dir: Path,
-    server_name: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+def _chatgpt_desktop_warning_artifact_check(target_dir: Path) -> dict[str, Any]:
     path = target_dir / "chatgpt_desktop_local_mcp.json"
+    base_result: dict[str, Any] = {
+        "desktop_config_path": str(path),
+        "guard_type": "warning_only_compatibility_artifact",
+        "connection_verified": False,
+        "process_started": False,
+        "runnable_config_present": None,
+    }
+    runnable_fields: list[str] = []
     try:
         raw = path.read_bytes()
         if raw.startswith(b"\xef\xbb\xbf"):
             raise ValueError("forbidden UTF-8 BOM EF BB BF")
         text = raw.decode("utf-8", errors="strict")
     except (OSError, UnicodeDecodeError, ValueError) as exc:
-        return {}, {
-            "desktop_config_path": str(path),
+        return {
+            **base_result,
+            "passed": False,
+            "guard_passed": False,
             "strict_utf8_without_bom": False,
             "config_schema_verified": False,
             "encoding_error": str(exc),
@@ -253,22 +311,50 @@ def _chatgpt_desktop_direct_server(
     try:
         payload = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
         if not isinstance(payload, dict):
-            raise ValueError("desktop config must be a JSON object")
-        entry = payload.get("ui_fields")
-        if not isinstance(entry, dict):
-            raise ValueError("ui_fields must be an object")
-        if str(entry.get("name") or "") != server_name:
-            raise ValueError(f"ui_fields.name must equal {server_name}")
-        return entry, {
-            "desktop_config_path": str(path),
+            raise ValueError("legacy compatibility artifact must be a JSON object")
+        if payload.get("support_status") != "unsupported":
+            raise ValueError("support_status must equal unsupported")
+        if payload.get("direct_local_supported") is not False:
+            raise ValueError("direct_local_supported must equal false")
+        if (
+            "chatgpt_direct_local_mcp_supported" in payload
+            and payload.get("chatgpt_direct_local_mcp_supported") is not False
+        ):
+            raise ValueError("chatgpt_direct_local_mcp_supported must equal false")
+        runnable_fields = sorted(
+            key
+            for key in ("mcpServers", "ui_fields", "command", "args", "cwd", "env")
+            if key in payload
+        )
+        if runnable_fields:
+            raise ValueError(
+                "warning-only artifact must not contain runnable fields: "
+                + ", ".join(runnable_fields)
+            )
+        return {
+            **base_result,
+            "passed": True,
+            "guard_passed": True,
             "strict_utf8_without_bom": True,
             "config_schema_verified": True,
+            "warning_only_artifact_verified": True,
+            "runnable_config_present": False,
+            "support_status": "unsupported",
+            "direct_local_supported": False,
+            "chatgpt_direct_local_mcp_supported": payload.get(
+                "chatgpt_direct_local_mcp_supported"
+            ),
+            "runnable_fields_present": [],
         }
     except (json.JSONDecodeError, ValueError) as exc:
-        return {}, {
-            "desktop_config_path": str(path),
+        return {
+            **base_result,
+            "passed": False,
+            "guard_passed": False,
             "strict_utf8_without_bom": True,
             "config_schema_verified": False,
+            "runnable_config_present": bool(runnable_fields),
+            "runnable_fields_present": runnable_fields,
             "schema_error": str(exc),
         }
 

@@ -554,7 +554,12 @@ def _run_marker_fallback(
 
 
 def _check_direct_client_artifacts_contract(bundle: Path) -> dict[str, Any]:
-    required_phrase = "claude mcp add --transport stdio --scope user"
+    required_argument_contract = re.compile(
+        r'\$claudeaddargs\s*=\s*@\(\s*"mcp"\s*,\s*"add"\s*,\s*'
+        r'"--transport"\s*,\s*"stdio"\s*,\s*"--scope"\s*,\s*"user"\s*,'
+        r'.*?"--"\s*,\s*"powershell\.exe"\s*\)\s*\+\s*\$launcherargs',
+        re.IGNORECASE,
+    )
     desktop_config = bundle / CLAUDE_DESKTOP_CONFIG
     claude_code_script = bundle / CLAUDE_CODE_STDIO
     connect_script = bundle / CONNECT_SCRIPT
@@ -577,7 +582,11 @@ def _check_direct_client_artifacts_contract(bundle: Path) -> dict[str, Any]:
     try:
         script_text = claude_code_script.read_text(encoding="utf-8-sig")
         normalized = " ".join(script_text.lower().split())
-        claude_code_add_stdio_contract = required_phrase in normalized
+        claude_code_add_stdio_contract = bool(
+            required_argument_contract.search(normalized)
+            and "assert-claudeuserconfigcontract" in normalized
+            and "wrong-scope user registration" in normalized
+        )
     except OSError:
         claude_code_add_stdio_contract = False
 
@@ -599,7 +608,7 @@ def _check_direct_client_artifacts_contract(bundle: Path) -> dict[str, Any]:
             "claude_desktop_has_mcp_servers": claude_desktop_has_servers,
             "claude_desktop_mcp_servers_count": mcp_servers_count,
             "claude_code_add_stdio_contract": claude_code_add_stdio_contract,
-            "claude_code_add_stdio_phrase": required_phrase,
+            "claude_code_add_stdio_contract_version": "powershell-args-user-scope-v1",
         },
     )
 

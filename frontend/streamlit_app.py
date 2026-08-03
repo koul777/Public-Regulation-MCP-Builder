@@ -5,6 +5,7 @@ import hashlib
 import html
 import io
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -16,15 +17,18 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from app import __version__ as APP_VERSION
 from app.api.routes_documents import (
     ApprovalRequest,
     IndexRequest,
+    RejectRequest,
     RegulationLifecycleRequest,
     approve_review_chunks,
     chunk_review_attention_reasons,
@@ -32,6 +36,7 @@ from app.api.routes_documents import (
     index_document,
     index_documents_batch,
     pending_deferred_vector_sync_batch_ids,
+    reject_review_chunks,
     reindex_document,
     transition_regulation_status,
 )
@@ -84,8 +89,10 @@ from app.services.approval_governance import (
 from app.storage.repository import JsonRepository
 from scripts.generate_mcp_client_config import (
     KORDOC_TABLE_REQUIRED_FILE_TYPES,
+    RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES,
     _kordoc_table_parser_evidence_summary,
     build_mcp_client_config,
+    validate_mcp_runtime_data_bundle_integrity,
     write_mcp_runtime_data_bundle,
     write_mcp_setup_bundle,
     write_mcp_setup_bundle_zip,
@@ -232,11 +239,47 @@ NAV_PAGES = [NAV_HOME, NAV_PREPROCESS, NAV_RESULTS, NAV_APPROVAL, NAV_MCP, NAV_G
 PRIMARY_NAV_PAGES = [NAV_HOME, NAV_PREPROCESS, NAV_RESULTS, NAV_APPROVAL, NAV_MCP]
 ADVANCED_NAV_PAGES = [NAV_GOLDSET, NAV_ADMIN]
 
-# 전처리 기본 로직: 파서 초안 → 선택적 AI 검수 → 휴먼 승인.
+BEGINNER_GUIDE_CHOICE_KEY = "beginner_guide_choice_made"
+BEGINNER_GUIDE_ENABLED_KEY = "beginner_guide_enabled"
+BEGINNER_GUIDE_STEP_KEY = "beginner_guide_step"
+BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX = "beginner_guide_results_confirmed"
+BEGINNER_GUIDE_CONNECTION_CONFIRMED_PREFIX = "beginner_guide_connection_confirmed"
+BEGINNER_GUIDE_NAV_NOTICE_KEY = "beginner_guide_navigation_notice"
+MCP_RUNTIME_INTEGRITY_RENDER_NONCE_KEY = "_mcp_runtime_integrity_render_nonce"
+MCP_COMPLETION_SETUP_FILES = {
+    "codex_config": "codex_config_snippet.toml",
+    "connect": "connect_mcp_client.ps1",
+    "install": "install_local_package.ps1",
+    "stdio_launcher": "run_mcp_stdio_server.ps1",
+}
+BEGINNER_GUIDE_STEPS: tuple[tuple[str, str, str], ...] = (
+    (
+        NAV_PREPROCESS,
+        "규정 파일 올리고 전처리하기",
+        "파일을 선택한 뒤 문서 정보를 확인하고 전처리 시작을 누릅니다.",
+    ),
+    (
+        NAV_RESULTS,
+        "전처리 결과 확인하기",
+        "품질 결과와 원문·전처리 내용을 살펴본 뒤 다음 단계로 이동합니다.",
+    ),
+    (
+        NAV_APPROVAL,
+        "검수·승인·색인하기",
+        "사람이 원문을 확인한 내용만 승인하고 AI 검색에 등록합니다.",
+    ),
+    (
+        NAV_MCP,
+        "MCP 만들고 연결 확인하기",
+        "승인된 규정으로 MCP 파일 묶음을 만들고 사용할 AI의 연결을 확인합니다.",
+    ),
+)
+
+# 전처리 기본 로직: 파서 초안 → (선택) AI 추가 검수 → 사람 승인.
 PIPELINE_STAGES: list[tuple[str, str]] = [
     ("파서 초안", "프로그램이 문서를 조문·표·별표 단위로 1차 정리합니다."),
-    ("AI 검수(선택)", "기능을 켠 경우에만 외부 AI가 검토 초안을 만듭니다."),
-    ("휴먼 승인", "사람이 최종 확인하고 승인·색인합니다."),
+    ("(선택) AI 추가 검수", "기능을 켠 경우에만 외부 AI가 검토 초안을 만듭니다."),
+    ("사람 승인", "사람이 최종 확인하고 승인·색인합니다."),
 ]
 PIPELINE_STAGE_PARSER = 1
 PIPELINE_STAGE_AI_REVIEW = 2
@@ -263,7 +306,7 @@ AI_REVIEW_STATUS_MESSAGES: dict[tuple[str, str], str] = {
 
 
 def _render_pipeline_stages(active: int) -> None:
-    """파서 초안 → AI 검수 → 휴먼 승인 진행 띠. active는 1~3(현재 단계)."""
+    """파서 초안 → (선택) AI 추가 검수 → 사람 승인 진행 띠. active는 1~3(현재 단계)."""
     cells: list[str] = []
     for index, (title, desc) in enumerate(PIPELINE_STAGES, start=1):
         state = "done" if index < active else ("active" if index == active else "")
@@ -317,8 +360,66 @@ def _approval_chunk_state_key(document_id: str, chunk_id: str, name: str) -> str
     return f"approval:{document_id}:{chunk_id}:{name}"
 
 
+def _approval_ai_decision_control_keys(item_id: str) -> tuple[str, str]:
+    """Return the two exact widget keys for one AI review decision."""
+
+    normalized_item_id = str(item_id or "").strip()
+    return (
+        f"ai-reflect-{normalized_item_id}",
+        f"ai-skip-{normalized_item_id}",
+    )
+
+
+def _beginner_pending_review_navigation(
+    pending_review_entries: list[dict[str, object]],
+    *,
+    current_chunk_id: str,
+    enabled: bool,
+) -> dict[str, object]:
+    """Describe the beginner-only, review-before-approval chunk sequence."""
+
+    normalized_entries = [
+        entry
+        for entry in pending_review_entries
+        if str(entry.get("chunk_id") or "").strip()
+    ]
+    reviewed_chunk_ids = [
+        str(entry["chunk_id"])
+        for entry in normalized_entries
+        if bool(dict(entry.get("state") or {}).get("approve_enabled"))
+    ]
+    reviewed_chunk_id_set = set(reviewed_chunk_ids)
+    remaining_chunk_ids = [
+        str(entry["chunk_id"])
+        for entry in normalized_entries
+        if str(entry["chunk_id"]) not in reviewed_chunk_id_set
+    ]
+    normalized_current_chunk_id = str(current_chunk_id or "").strip()
+    current_reviewed = normalized_current_chunk_id in reviewed_chunk_id_set
+    next_chunk_id = (
+        remaining_chunk_ids[0]
+        if enabled and current_reviewed and remaining_chunk_ids
+        else ""
+    )
+    return {
+        "enabled": bool(enabled),
+        "reviewed_count": len(reviewed_chunk_ids),
+        "total_count": len(normalized_entries),
+        "current_reviewed": current_reviewed,
+        "all_reviewed": bool(normalized_entries)
+        and len(reviewed_chunk_ids) == len(normalized_entries),
+        "next_chunk_id": next_chunk_id,
+    }
+
+
 def _approval_status(chunk) -> str:
     return str(getattr(chunk, "approval_status", "") or "draft").strip().lower() or "draft"
+
+
+def _chunk_rejection_ready(*, reason: str, confirmed: bool, approvable: bool) -> bool:
+    """Allow an explicit single-chunk rejection only after reason and confirmation."""
+
+    return bool(approvable and confirmed and str(reason or "").strip())
 
 
 def _is_chunk_pending_approval(chunk) -> bool:
@@ -604,7 +705,7 @@ def _render_pdf_source_preview(source_context: dict[str, object]) -> None:
     bbox = source_context.get("source_bbox")
     if isinstance(source_path, Path) and source_path.is_file() and page_value:
         try:
-            import fitz  # type: ignore
+            from app.utils.fitz_compat import fitz
 
             page_number = max(1, int(page_value))
             with fitz.open(source_path) as pdf:
@@ -677,13 +778,26 @@ WORKFLOW_DOCUMENT_IDS_KEY = "workflow_document_ids"
 WORKFLOW_SELECTED_DOCUMENT_IDS_KEY = "workflow_selected_document_ids"
 WORKFLOW_MCP_GATE_CACHE_KEY = "workflow_mcp_gate_cache"
 DOCUMENT_CONTEXT_CACHE_KEY = "document_context_cache"
+SELECTED_APPROVAL_CONTEXT_CACHE_KEY = "selected_approval_context_cache"
+SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES = 4
 KORDOC_REPROCESS_NOTICE_KEY = "kordoc_reprocess_notice"
-KORDOC_AUTO_REPROCESS_ATTEMPT_PREFIX = "kordoc_auto_reprocess_attempted"
 DOCUMENT_CONTEXT_NAV_PAGES = {NAV_HOME, NAV_RESULTS, NAV_APPROVAL, NAV_MCP}
 
 
 def _queue_workflow_navigation(page: str, *, label: str | None = None) -> None:
     document_id = str(st.session_state.get("document_id") or "").strip()
+    if page == NAV_MCP and st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        guide_ctx = _cached_document_context(document_id) if document_id else None
+        if guide_ctx is None and document_id:
+            guide_ctx = _load_document_context(document_id)
+        completed_steps = _beginner_guide_completed_steps(guide_ctx)
+        if not completed_steps[2]:
+            recommended_step = _beginner_guide_recommended_step(completed_steps)
+            page = BEGINNER_GUIDE_STEPS[recommended_step - 1][0]
+            label = f"초보자 안내 {recommended_step}단계로 이동"
+            st.session_state[BEGINNER_GUIDE_NAV_NOTICE_KEY] = (
+                "초보자 안내 모드에서는 검수·승인·색인을 마친 뒤 ④ MCP 생성 단계로 이동할 수 있습니다."
+            )
     if document_id and page in DOCUMENT_CONTEXT_NAV_PAGES:
         st.session_state[WORKFLOW_TRANSITION_STATE_KEY] = {
             "label": label or page,
@@ -752,14 +866,529 @@ def _render_workflow_next_button(
     key: str,
     disabled: bool = False,
     width: str = "stretch",
+    navigation_document_id: str = "",
 ) -> None:
     if st.button(label, type="primary", key=key, disabled=disabled, width=width):
+        if navigation_document_id:
+            st.session_state["document_id"] = str(navigation_document_id).strip()
         _queue_workflow_navigation(target, label=label)
         st.rerun()
 
 
 def _go_primary_nav() -> None:
     _queue_workflow_navigation(st.session_state.get("primary_nav_page", NAV_HOME))
+
+
+def _beginner_guide_results_confirmed_key(document_id: str) -> str:
+    return f"{BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX}:{document_id}"
+
+
+def _default_mcp_scope(document_id: str) -> str:
+    normalized_document_id = str(document_id or "").strip()
+    if (
+        normalized_document_id
+        and st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+        and f"mcp-data-scope-{normalized_document_id}" not in st.session_state
+    ):
+        return "current_document"
+    return "selected_documents"
+
+
+def _active_mcp_scope(document_id: str, scope: str | None = None) -> str:
+    normalized_document_id = str(document_id or "").strip()
+    active_scope = str(
+        scope
+        or st.session_state.get(f"mcp-data-scope-{normalized_document_id}")
+        or _default_mcp_scope(normalized_document_id)
+    ).strip()
+    if active_scope == "document":
+        return "current_document"
+    if active_scope not in {
+        "current_document",
+        "selected_documents",
+        "selected_institution",
+    }:
+        return ""
+    return active_scope
+
+
+def _current_selected_document_ids() -> list[str]:
+    raw_selected_ids = st.session_state.get(WORKFLOW_SELECTED_DOCUMENT_IDS_KEY)
+    raw_document_ids = st.session_state.get(WORKFLOW_DOCUMENT_IDS_KEY)
+    document_ids = (
+        [
+            str(value or "").strip()
+            for value in raw_document_ids
+            if str(value or "").strip()
+        ]
+        if isinstance(raw_document_ids, list)
+        else []
+    )
+    selection_widget_keys = [
+        f"workflow-document-selected-{value}" for value in document_ids
+    ]
+    if selection_widget_keys and all(
+        key in st.session_state for key in selection_widget_keys
+    ):
+        # Widget values are updated before the aggregate list later in the page.
+        raw_selected_ids = [
+            value
+            for value, key in zip(document_ids, selection_widget_keys)
+            if bool(st.session_state.get(key))
+        ]
+    if not isinstance(raw_selected_ids, list):
+        return []
+    return sorted(
+        {
+            str(value or "").strip()
+            for value in raw_selected_ids
+            if str(value or "").strip()
+        }
+    )
+
+
+def _normalized_mcp_bundle_dir(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = Path(text)
+    try:
+        path = path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    except OSError:
+        pass
+    return os.path.normcase(str(path))
+
+
+def _mcp_request_identity(
+    document_id: str,
+    active_scope: str,
+    state: dict[str, object],
+    *,
+    current_widgets: bool,
+) -> dict[str, object]:
+    def current_or_saved(widget_key: str, state_key: str) -> object:
+        if current_widgets and widget_key in st.session_state:
+            return st.session_state.get(widget_key)
+        return state.get(state_key)
+
+    export_document_ids = sorted(
+        {
+            str(value or "").strip()
+            for value in state.get("export_document_ids") or []
+            if str(value or "").strip()
+        }
+    )
+    if current_widgets and active_scope == "selected_documents":
+        export_document_ids = _current_selected_document_ids()
+    elif current_widgets and active_scope == "selected_institution":
+        export_document_ids = sorted(
+            {
+                str(getattr(document, "document_id", "") or "").strip()
+                for document in _documents_for_selected_institution()
+                if str(getattr(document, "document_id", "") or "").strip()
+            }
+        )
+    elif current_widgets and active_scope == "current_document":
+        export_document_ids = [document_id]
+    selected_profile_id = str(state.get("profile_id") or "").strip().casefold()
+    if current_widgets and SELECTED_INSTITUTION_PROFILE_KEY in st.session_state:
+        selected_profile_id = str(
+            st.session_state.get(SELECTED_INSTITUTION_PROFILE_KEY) or ""
+        ).strip().casefold()
+
+    document_revisions: object = state.get("scope_revision_signature") or []
+    if current_widgets:
+        document_revisions = [
+            [current_document_id, _document_context_revision(current_document_id)]
+            for current_document_id in export_document_ids
+        ]
+    connection_target = str(
+        current_or_saved(
+            f"mcp-connection-target-{document_id}",
+            "connection_target",
+        )
+        or ""
+    ).strip()
+    public_url = ""
+    if connection_target in {"chatgpt-remote", "claude-api"}:
+        public_url = str(
+            current_or_saved(f"mcp-public-url-{document_id}", "public_url") or ""
+        ).strip()
+
+    return {
+        "scope": active_scope,
+        "export_document_id": (
+            (
+                document_id
+                if current_widgets
+                else str(state.get("export_document_id") or "").strip()
+            )
+            if active_scope == "current_document"
+            else ""
+        ),
+        "export_document_ids": export_document_ids,
+        "document_revisions": document_revisions,
+        "profile_id": selected_profile_id,
+        "save_mode": str(
+            current_or_saved(f"mcp-save-mode-{document_id}", "save_mode") or ""
+        ).strip(),
+        "bundle_dir": _normalized_mcp_bundle_dir(
+            current_or_saved(f"mcp-bundle-dir-{document_id}", "bundle_dir")
+        ),
+        "server_name": str(
+            current_or_saved(f"mcp-server-name-{document_id}", "server_name") or ""
+        ).strip(),
+        "connection_target": connection_target,
+        "public_url": public_url,
+    }
+
+
+def _beginner_guide_connection_confirmed_key(
+    document_id: str,
+    *,
+    scope: str | None = None,
+) -> str:
+    """Bind human search/fetch confirmation to one generated bundle revision."""
+
+    active_scope = _active_mcp_scope(document_id, scope)
+    candidates = _matching_mcp_bundle_state_candidates(document_id, active_scope)
+    state = candidates[0][1] if candidates else {}
+    request_identity = _mcp_request_identity(
+        document_id,
+        active_scope,
+        state,
+        current_widgets=True,
+    )
+    identity = {
+        "generated_at": state.get("generated_at"),
+        "request": request_identity,
+        "logical_corpus_sha256": state.get("logical_corpus_sha256"),
+        "zip": state.get("zip"),
+    }
+    revision = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return (
+        f"{BEGINNER_GUIDE_CONNECTION_CONFIRMED_PREFIX}:"
+        f"{active_scope}:{document_id}:{revision}"
+    )
+
+
+def _render_beginner_connection_confirmation(
+    document_id: str,
+    *,
+    scope: str | None = None,
+) -> None:
+    confirmation_key = _beginner_guide_connection_confirmed_key(
+        document_id,
+        scope=scope,
+    )
+    if not bool(st.session_state.get(confirmation_key)):
+        _render_beginner_action_marker(
+            4,
+            "실제 검색 결과를 마지막으로 확인하세요",
+            "새 AI 대화에서 search와 fetch를 각각 실행한 뒤, 성공했을 때만 아래 확인란을 선택하세요.",
+            control_key_prefix=confirmation_key,
+        )
+    st.checkbox(
+        "AI 앱에서 search와 fetch 도구 호출이 성공한 것을 확인했습니다.",
+        key=confirmation_key,
+        help=(
+            "파일 생성이나 서버 실행만으로 연결 완료가 되지는 않습니다. "
+            "실제 AI 대화에서 두 도구의 승인 원문·출처 반환을 확인한 뒤 선택하세요."
+        ),
+    )
+
+
+def _beginner_guide_completed_steps(
+    ctx: dict | None,
+    *,
+    results_confirmed: bool | None = None,
+    mcp_bundle_created: bool | None = None,
+    mcp_connection_confirmed: bool | None = None,
+) -> tuple[bool, bool, bool, bool]:
+    """Return real workflow completion without performing any workflow action."""
+
+    chunks = tuple(ctx.get("chunks") or ()) if ctx else ()
+    document = ctx.get("document") if ctx else None
+    document_status = str(getattr(document, "status", "") or "").strip().casefold()
+    preprocessing_complete = bool(
+        ctx
+        and document_status == "completed"
+        and chunks
+        and not ctx.get("large_result_warning")
+    )
+    approval_counts = dict(ctx.get("approval_counts") or {}) if ctx else {}
+    pending_review_count = sum(
+        int(approval_counts.get(status) or 0)
+        for status in APPROVABLE_CHUNK_STATUSES
+    )
+    approval_complete = bool(
+        preprocessing_complete
+        and int(ctx.get("approved_count") or 0) > 0
+        and pending_review_count == 0
+        and bool(dict(ctx.get("mcp_connection_gate") or {}).get("ready"))
+    )
+    if approval_complete:
+        approval_complete = _beginner_scope_approval_ready(ctx)
+    if results_confirmed is None:
+        document_id = str(ctx.get("document_id") or "") if ctx else ""
+        results_confirmed = bool(
+            document_id
+            and st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
+        )
+    results_complete = bool(preprocessing_complete and (results_confirmed or approval_complete))
+    if mcp_bundle_created is None:
+        mcp_bundle_created = _mcp_bundle_created(ctx)
+    if mcp_connection_confirmed is None:
+        document_id = str(ctx.get("document_id") or "") if ctx else ""
+        mcp_connection_confirmed = bool(
+            document_id
+            and st.session_state.get(
+                _beginner_guide_connection_confirmed_key(document_id)
+            )
+        )
+    mcp_complete = bool(
+        approval_complete
+        and mcp_bundle_created
+        and mcp_connection_confirmed
+    )
+    return preprocessing_complete, results_complete, approval_complete, mcp_complete
+
+
+def _beginner_guide_recommended_step(completed_steps: tuple[bool, ...]) -> int:
+    """Return the first unfinished 1-based guide step, capped at the last step."""
+
+    for index, completed in enumerate(completed_steps, start=1):
+        if not completed:
+            return index
+    return len(BEGINNER_GUIDE_STEPS)
+
+
+def _beginner_guide_start() -> None:
+    st.session_state[BEGINNER_GUIDE_CHOICE_KEY] = True
+    st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = True
+    st.session_state[BEGINNER_GUIDE_STEP_KEY] = 1
+    st.session_state["_nav_target"] = NAV_PREPROCESS
+
+
+def _beginner_guide_use_general_mode() -> None:
+    st.session_state[BEGINNER_GUIDE_CHOICE_KEY] = True
+    st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = False
+
+
+def _beginner_guide_skip() -> None:
+    st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = False
+
+
+def _beginner_guide_toggle_changed() -> None:
+    st.session_state[BEGINNER_GUIDE_CHOICE_KEY] = True
+    if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        st.session_state.setdefault(BEGINNER_GUIDE_STEP_KEY, 1)
+
+
+def _beginner_guide_move(step: int) -> None:
+    target_step = max(1, min(len(BEGINNER_GUIDE_STEPS), int(step)))
+    st.session_state[BEGINNER_GUIDE_STEP_KEY] = target_step
+    target_page = BEGINNER_GUIDE_STEPS[target_step - 1][0]
+    _queue_workflow_navigation(target_page, label=f"초보자 안내 {target_step}단계")
+
+
+def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
+    """Offer an explicit, reversible guide choice on the first session entry."""
+
+    if show_hero:
+        _render_hero("처음 사용한다면 화면이 가리키는 버튼만 순서대로 따라가세요.")
+    st.markdown("## 화면 안내 방식을 선택하세요")
+    st.info(
+        "초보자 안내 모드는 현재 눌러야 할 항목을 번호·문장·빨간 외곽선으로 표시합니다. "
+        "안내가 승인이나 색인을 대신 실행하지 않으며, 언제든 왼쪽 메뉴에서 끄거나 다시 볼 수 있습니다."
+    )
+    guide_col, general_col = st.columns(2)
+    with guide_col:
+        st.button(
+            "초보자 안내 시작",
+            type="primary",
+            key="beginner-guide-first-start",
+            on_click=_beginner_guide_start,
+            width="stretch",
+        )
+        st.caption("처음 규정을 처리하거나 MCP를 처음 만드는 사용자에게 권장합니다.")
+    with general_col:
+        st.button(
+            "일반 모드로 계속",
+            key="beginner-guide-first-general",
+            on_click=_beginner_guide_use_general_mode,
+            width="stretch",
+        )
+        st.caption("기존 화면을 이미 알고 있다면 안내 표시 없이 시작합니다.")
+
+
+def _beginner_guide_active_step(nav_page: str, completed_steps: tuple[bool, ...]) -> int:
+    page_steps = {
+        page: index
+        for index, (page, _title, _description) in enumerate(BEGINNER_GUIDE_STEPS, start=1)
+    }
+    if nav_page in page_steps:
+        return page_steps[nav_page]
+    stored_step = int(st.session_state.get(BEGINNER_GUIDE_STEP_KEY) or 0)
+    if 1 <= stored_step <= len(BEGINNER_GUIDE_STEPS):
+        return stored_step
+    return _beginner_guide_recommended_step(completed_steps)
+
+
+def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
+    st.session_state.setdefault(BEGINNER_GUIDE_ENABLED_KEY, False)
+    st.toggle(
+        "초보자 안내 모드",
+        key=BEGINNER_GUIDE_ENABLED_KEY,
+        on_change=_beginner_guide_toggle_changed,
+        help="켜면 현재 단계의 눌러야 할 항목을 번호와 빨간 외곽선으로 표시합니다.",
+    )
+    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        if st.button(
+            "초보자 안내 처음부터 다시 보기",
+            key="beginner-guide-restart-disabled",
+            on_click=_beginner_guide_start,
+            width="stretch",
+        ):
+            st.rerun()
+        return
+
+    mcp_bundle_created = _mcp_bundle_created(ctx)
+    completed_steps = _beginner_guide_completed_steps(
+        ctx,
+        mcp_bundle_created=mcp_bundle_created,
+    )
+    active_step = _beginner_guide_active_step(nav_page, completed_steps)
+    st.session_state[BEGINNER_GUIDE_STEP_KEY] = active_step
+    _page, title, description = BEGINNER_GUIDE_STEPS[active_step - 1]
+    st.progress(active_step / len(BEGINNER_GUIDE_STEPS), text=f"{active_step}/{len(BEGINNER_GUIDE_STEPS)} 단계")
+    st.markdown(f"**{active_step}. {title}**")
+    st.caption(description)
+    if completed_steps[active_step - 1]:
+        st.success("이 단계에 필요한 작업이 완료되었습니다.")
+    else:
+        st.warning("화면의 같은 번호가 붙은 안내를 따라 진행하세요.")
+
+    previous_col, next_col = st.columns(2)
+    previous_col.button(
+        "← 이전 단계",
+        key="beginner-guide-previous",
+        disabled=active_step <= 1,
+        on_click=_beginner_guide_move,
+        args=(active_step - 1,),
+        width="stretch",
+    )
+    next_col.button(
+        "다음 단계 →",
+        key="beginner-guide-next",
+        disabled=active_step >= len(BEGINNER_GUIDE_STEPS) or not completed_steps[active_step - 1],
+        on_click=_beginner_guide_move,
+        args=(active_step + 1,),
+        width="stretch",
+        help="현재 작업을 실제로 완료한 뒤에 열립니다. 승인·색인은 자동 실행되지 않습니다.",
+    )
+    st.button(
+        "안내 건너뛰기",
+        key="beginner-guide-skip",
+        on_click=_beginner_guide_skip,
+        width="stretch",
+    )
+    st.button(
+        "처음부터 다시 보기",
+        key="beginner-guide-restart",
+        on_click=_beginner_guide_start,
+        width="stretch",
+    )
+
+
+def _streamlit_key_css_fragment(value: object) -> str:
+    """Match Streamlit's st-key-* replacement for CSS-safe widget classes."""
+
+    return "".join(
+        character if character.isascii() and (character.isalnum() or character in "-_") else "-"
+        for character in str(value or "").strip()
+    )
+
+
+def _render_beginner_action_marker(
+    step: int,
+    title: str,
+    description: str,
+    *,
+    control_key_prefix: str = "",
+    control_keys: tuple[str, ...] = (),
+) -> None:
+    """Render an accessible server-side marker next to an existing control."""
+
+    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        return
+
+    navigation_notice = st.session_state.pop(BEGINNER_GUIDE_NAV_NOTICE_KEY, None)
+    if navigation_notice:
+        st.warning(str(navigation_notice))
+    if int(st.session_state.get(BEGINNER_GUIDE_STEP_KEY) or 0) != int(step):
+        return
+    safe_prefix = _streamlit_key_css_fragment(control_key_prefix)
+    if safe_prefix:
+        st.markdown(
+            f"""
+            <style>
+            div[class*="st-key-{safe_prefix}"] button,
+            div[class*="st-key-{safe_prefix}"] [data-testid="stFileUploaderDropzone"],
+            div[class*="st-key-{safe_prefix}"] [data-testid="stCheckbox"],
+            div[class*="st-key-{safe_prefix}"] [data-testid="stTextInput"],
+            div[class*="st-key-{safe_prefix}"] [data-testid="stRadio"],
+            div[class*="st-key-{safe_prefix}"] [data-testid="stLinkButton"] {{
+                outline: 3px solid #c62828 !important;
+                outline-offset: 3px;
+                box-shadow: 0 0 0 4px rgba(198, 40, 40, .12) !important;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    safe_control_keys = [
+        _streamlit_key_css_fragment(control_key)
+        for control_key in control_keys
+        if str(control_key or "").strip()
+    ]
+    if safe_control_keys:
+        exact_selectors = ",\n".join(
+            selector
+            for safe_control_key in safe_control_keys
+            for selector in (
+                f'div[class~="st-key-{safe_control_key}"] button',
+                f'div[class~="st-key-{safe_control_key}"] [data-testid="stFileUploaderDropzone"]',
+                f'div[class~="st-key-{safe_control_key}"] [data-testid="stCheckbox"]',
+                f'div[class~="st-key-{safe_control_key}"] [data-testid="stTextInput"]',
+                f'div[class~="st-key-{safe_control_key}"] [data-testid="stRadio"]',
+                f'div[class~="st-key-{safe_control_key}"] [data-testid="stLinkButton"]',
+            )
+        )
+        st.markdown(
+            f"""
+            <style>
+            {exact_selectors} {{
+                outline: 3px solid #c62828 !important;
+                outline-offset: 3px;
+                box-shadow: 0 0 0 4px rgba(198, 40, 40, .12) !important;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        f"""
+        <div class="rr-beginner-marker" role="note" aria-label="초보자 안내 {int(step)}단계">
+          <span class="rr-beginner-marker-number" aria-hidden="true">{int(step)}</span>
+          <div><strong>{html.escape(title)}</strong><p>{html.escape(description)}</p></div>
+          <span class="rr-beginner-marker-arrow" aria-hidden="true">↓</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _selected_institution_profile_id() -> str:
@@ -775,8 +1404,12 @@ def _select_institution_profile(profile_id: str) -> None:
     st.session_state.pop(WORKFLOW_SELECTED_DOCUMENT_IDS_KEY, None)
     st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
     st.session_state.pop(DOCUMENT_CONTEXT_CACHE_KEY, None)
+    st.session_state.pop(SELECTED_APPROVAL_CONTEXT_CACHE_KEY, None)
     st.session_state.pop("unreviewed_preview_requested", None)
     st.session_state.pop("_nav_target", None)
+    if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        st.session_state[BEGINNER_GUIDE_STEP_KEY] = 1
+        st.session_state["_nav_target"] = NAV_PREPROCESS
     st.session_state["nav_page"] = NAV_HOME
 
 
@@ -1129,8 +1762,29 @@ def _render_institution_registration_form(registry: InstitutionProfileRegistry) 
     if not registry_path:
         st.error("INSTITUTION_PROFILES_PATH가 설정되지 않아 기관을 저장할 수 없습니다.")
         return
-    institution_name = st.text_input("기관명", placeholder="예: 한국공공기관")
-    submitted = st.button("기관 생성", type="primary")
+    current_institution_name = str(
+        st.session_state.get("institution-name") or ""
+    ).strip()
+    if not registry.profiles and not current_institution_name:
+        _render_beginner_action_marker(
+            1,
+            "먼저 작업할 기관을 등록하세요",
+            "기관명을 입력하고 기관 생성 버튼을 누르세요. 규정과 승인 데이터는 이 기관 범위로 분리됩니다.",
+            control_key_prefix="institution-name",
+        )
+    institution_name = st.text_input(
+        "기관명",
+        placeholder="예: 한국공공기관",
+        key="institution-name",
+    )
+    if not registry.profiles and str(institution_name or "").strip():
+        _render_beginner_action_marker(
+            1,
+            "입력한 기관을 생성하세요",
+            "기관명을 확인한 뒤 바로 아래 기관 생성 버튼을 누르세요.",
+            control_key_prefix="create-institution",
+        )
+    submitted = st.button("기관 생성", type="primary", key="create-institution")
     if not submitted:
         return
     cleaned_institution_name = " ".join(
@@ -1174,11 +1828,15 @@ def _delete_registered_institution(registry: InstitutionProfileRegistry, profile
     if _selected_institution_profile_id() == str(profile_id or "").strip().lower():
         st.session_state.pop(SELECTED_INSTITUTION_PROFILE_KEY, None)
         st.session_state.pop("document_id", None)
+        st.session_state.pop(SELECTED_APPROVAL_CONTEXT_CACHE_KEY, None)
 
 
 def _page_institution_select(registry) -> None:
     """Require a deliberate institution choice before opening operator workspaces."""
     _render_hero("먼저 작업할 기관을 선택하세요. 이후 문서·승인·RAG 검색은 선택한 기관 범위로 관리됩니다.")
+    if not st.session_state.get(BEGINNER_GUIDE_CHOICE_KEY):
+        _render_beginner_mode_choice(show_hero=False)
+        st.divider()
     st.markdown("## 기관 선택")
     st.caption("기관을 클릭하면 해당 기관의 규정 관리 화면으로 들어갑니다.")
     # The first screen only creates/selects an institution.  API settings are
@@ -1198,11 +1856,17 @@ def _page_institution_select(registry) -> None:
         key=lambda profile: (profile.display_name or profile.profile_id).lower(),
     )
     if not profiles:
-        st.warning("등록된 기관 프로필이 없습니다. 관리자 설정에서 기관을 먼저 등록하세요.")
+        st.warning("등록된 기관이 없습니다. 위에 기관명을 입력하고 '기관 생성'을 눌러 주세요.")
         # Bare-mode imports used by helpers/tests swallow ``st.stop``; return
         # as well so an empty registry never reaches ``st.columns(0)``.
         return
 
+    _render_beginner_action_marker(
+        1,
+        "작업할 기관을 선택하세요",
+        "규정을 올릴 기관 카드의 '이 기관으로 시작' 버튼을 누르세요.",
+        control_key_prefix="select-institution-",
+    )
     columns = st.columns(min(3, len(profiles)))
     for index, profile in enumerate(profiles):
         with columns[index % len(columns)]:
@@ -1419,6 +2083,23 @@ def _format_elapsed_seconds(seconds: float) -> str:
 
 def _heartbeat_label(tick: int) -> str:
     return "작업 중" + "." * ((tick % 3) + 1)
+
+
+def _beginner_preprocess_stage_text(message: object) -> str:
+    """Translate the few remaining internal progress messages for first-time users."""
+
+    text = str(message or "").strip()
+    if text.startswith("Saving uploaded file"):
+        return "원본 파일을 안전하게 저장하는 중"
+    if text == "Upload saved; preprocessing queued":
+        return "파일 저장 완료 · 전처리를 시작하는 중"
+    if text in {"Processing started", "Preprocessing started", "Preprocessing"}:
+        return "문서 내용 분석을 시작하는 중"
+    if text == "Processing skipped; reusable completed run exists":
+        return "같은 설정의 완료 결과를 확인해 다시 사용하는 중"
+    if text == "Processing failed":
+        return "전처리를 완료하지 못함"
+    return text or "문서를 처리하는 중"
 
 
 def _render_upload_file_progress(container, rows: list[dict[str, object]]) -> None:
@@ -1681,112 +2362,22 @@ def _render_codex_registration_guide(
 def _render_chatgpt_codex_desktop_registration_guide(
     registration: dict[str, Any],
 ) -> None:
-    st.markdown("### ChatGPT Desktop에 등록하는 방법")
-    st.caption(
-        "아래 값은 방금 만든 연결 설정에서 그대로 읽어 온 실제 값입니다. "
-        "예시값으로 바꾸거나 다시 타이핑하지 말고 복사 버튼을 사용하세요."
+    """Fail closed for legacy bundles that advertised unsupported local ChatGPT."""
+
+    del registration
+    st.error(
+        "ChatGPT는 로컬 STDIO MCP 서버에 직접 연결하는 공개 지원 경로가 아닙니다. "
+        "이전 번들의 로컬 ChatGPT 설정값은 사용하지 마세요."
     )
-    st.info(
-        "ChatGPT Desktop에서 **왼쪽 아래 계정 > 설정 > 플러그인 > MCP > "
-        "+ 서버 추가 > STDIO** 순서로 누른 뒤, 아래 복사 상자를 위에서부터 "
-        "같은 이름의 칸에 넣습니다."
-    )
-    st.markdown("**Name (MCP 서버 이름) 복사**")
-    st.code(str(registration.get("name") or ""), language=None)
-    st.markdown(f"**Transport:** `{registration.get('transport') or ''}`")
-
-    st.markdown("**Command 복사**")
-    st.code(str(registration.get("command") or ""), language=None)
-
-    arguments = registration.get("arguments")
-    if not isinstance(arguments, list):
-        arguments = []
-    st.markdown(f"**Arguments ({len(arguments)}개) — 한 줄씩 따로 복사**")
-    st.caption(
-        "ChatGPT의 첫 번째 인자 칸에 Argument 1을 넣고, `+ 인자 추가`를 누른 뒤 "
-        "다음 칸에 Argument 2를 넣습니다. 마지막 번호까지 같은 방법으로 반복합니다."
-    )
-    if arguments:
-        for index, argument in enumerate(arguments, start=1):
-            st.markdown(
-                f"**Argument {index}/{len(arguments)} — 아래 한 줄만 복사**"
-            )
-            st.code(str(argument), language=None)
-    else:
-        st.code("입력하지 않음", language=None)
-
-    environment = registration.get("environment")
-    if not isinstance(environment, dict):
-        environment = {}
-    st.markdown(f"**Environment ({len(environment)}개) — 키와 값을 따로 복사**")
-    if environment:
-        for index, (key, value) in enumerate(environment.items(), start=1):
-            st.markdown(
-                f"**Environment {index}/{len(environment)} — 왼쪽 키 칸에 복사**"
-            )
-            st.code(str(key), language=None)
-            st.markdown(
-                f"**Environment {index}/{len(environment)} — 오른쪽 값 칸에 복사**"
-            )
-            st.code(str(value), language=None)
-    else:
-        st.code("입력하지 않음", language=None)
-
-    passthrough = registration.get("environment_passthrough")
-    if not isinstance(passthrough, list):
-        passthrough = []
     st.markdown(
-        f"**Environment passthrough ({len(passthrough)}개) — 한 칸씩 따로 복사**"
+        "ChatGPT에서 사용하려면 **ChatGPT · Vercel HTTPS MCP**를 선택해 원격 "
+        "`https://.../mcp` 주소를 등록하세요. 사설망·개발 PC 서버는 고급 사용자가 "
+        "OpenAI Secure MCP Tunnel을 별도로 구성할 수 있습니다."
     )
-    if passthrough:
-        for index, variable in enumerate(passthrough, start=1):
-            st.markdown(
-                f"**Passthrough {index}/{len(passthrough)} — 아래 한 줄만 복사**"
-            )
-            st.code(str(variable), language=None)
-    else:
-        st.code("입력하지 않음", language=None)
-    st.markdown("**Working directory 복사**")
-    st.code(str(registration.get("working_directory") or ""), language=None)
-
-    profile_id = str(registration.get("profile_id") or "")
-    tool_profile = str(registration.get("tool_profile") or "")
-    if profile_id:
-        st.markdown(f"**Profile ID:** `{profile_id}`")
-    if tool_profile:
-        st.markdown(f"**Tool profile:** `{tool_profile}`")
-
-    st.warning(
-        "MCP 서버 이름은 Name에만 입력합니다.\n\n"
-        "Command에는 서버 이름을 입력하지 않습니다.\n\n"
-        "각 Argument는 한 입력 칸에 하나씩 순서대로 넣어야 합니다.\n\n"
-        "Arguments를 일부라도 누락하면 서버가 실행되지 않습니다."
+    st.link_button(
+        "OpenAI의 ChatGPT MCP 지원 범위 확인",
+        "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
     )
-    if registration.get("command_matches_server_name"):
-        st.error(
-            "현재 표시된 Command가 MCP 서버 이름과 동일합니다. 명백히 잘못된 등록 "
-            "설정일 수 있습니다. 자동 수정하지 않았으므로 생성 파일과 입력값을 다시 "
-            "확인하세요."
-        )
-
-    st.markdown("**등록 후 절차**")
-    st.markdown(
-        "1. 위 Name을 ChatGPT의 이름 칸에 넣습니다.\n"
-        "2. 위 Command를 실행 명령 칸에 넣습니다.\n"
-        f"3. Argument 1을 첫 인자 칸에 넣고 `+ 인자 추가`를 눌러 "
-        f"마지막 Argument {len(arguments)}까지 각각 다른 칸에 넣습니다.\n"
-        "4. Environment 첫 키·값은 이미 보이는 첫 행에 넣고, 두 번째부터 "
-        "`+ 환경 변수 추가`를 누릅니다.\n"
-        "5. Environment passthrough 첫 값도 이미 보이는 첫 칸에 넣고, 두 번째부터 "
-        "`+ 변수 추가`를 누릅니다.\n"
-        "6. Working directory를 작업 중인 디렉터리 칸에 넣습니다.\n"
-        "7. 오른쪽 아래 저장을 누릅니다.\n"
-        "8. ChatGPT Desktop을 완전 종료했다가 다시 실행합니다.\n"
-        "9. 설정 > 플러그인 > MCP에서 새 서버를 켭니다.\n"
-        "10. 새 대화에서 `search`와 `fetch`를 실제로 호출해 연결을 검증합니다."
-    )
-
-
 def _read_claude_desktop_registration(
     config_path: str | Path,
 ) -> dict[str, Any]:
@@ -1921,8 +2512,11 @@ def _render_mcp_completion_connection_course(
 ) -> None:
     """Render a beginner-safe handoff that distinguishes local and remote MCP."""
 
+    if target == "chatgpt-desktop-local":
+        _render_chatgpt_codex_desktop_registration_guide({})
+        return
+
     local_targets = {
-        "chatgpt-desktop-local",
         "codex",
         "claude-code",
         "claude-desktop",
@@ -1935,10 +2529,8 @@ def _render_mcp_completion_connection_course(
     )
     target_method_labels = {
         "claude-code": "방법 A · Claude Code 로컬 STDIO",
-        "codex": "방법 B · ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
-        "chatgpt-desktop-local": (
-            "방법 B · ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO"
-        ),
+        "codex": "방법 B · Codex CLI / Codex IDE 로컬 STDIO",
+        "chatgpt-desktop-local": "지원 종료 · ChatGPT 로컬 STDIO",
         "claude-desktop": "방법 C · Claude Desktop 로컬 STDIO",
         "chatgpt-remote": "방법 D · ChatGPT · Vercel HTTPS MCP",
         "claude-api": "방법 E · Claude · Vercel HTTPS MCP",
@@ -1947,6 +2539,10 @@ def _render_mcp_completion_connection_course(
     resolved_runtime_data_dir = Path(runtime_data_dir).resolve()
     stage_dir = resolved_bundle_dir.parent / "vercel-mcp-stage"
     remote_url = connection_display_value.strip() if target in remote_targets else ""
+    packaged_runtime = bool(
+        getattr(sys, "frozen", False)
+        or str(os.getenv("REG_RAG_PACKAGED_EXE") or "").strip()
+    )
 
     st.markdown("#### 직접 MCP 연결 및 최종 확인")
     st.markdown(f"**등록할 MCP 이름:** `{server_name}`")
@@ -1956,7 +2552,7 @@ def _render_mcp_completion_connection_course(
     st.markdown(f"**이번에 선택한 방식:** `{selected_mode}`")
     st.caption(
         "`Claude Code`는 Claude CLI용, `Claude Desktop`은 설정 JSON 편집용, "
-        "`ChatGPT Desktop / Codex CLI / Codex IDE`는 개별 칸 또는 TOML 입력용입니다."
+        "`Codex CLI / Codex IDE`는 TOML 입력용입니다. ChatGPT는 원격 HTTPS 경로를 사용합니다."
     )
     st.markdown(
         """
@@ -1986,13 +2582,20 @@ def _render_mcp_completion_connection_course(
 
     if target in local_targets:
         st.markdown("##### 이번 번들: 로컬 STDIO — 이 PC에서 직접 실행")
-        st.info(
-            "Direct Python(프로젝트 Python 직접 실행)이 우선입니다. 생성기는 Python "
-            "3.11 이상과 `scripts.run_regulation_mcp` import를 확인한 뒤 실제 절대 "
-            "`command/args/env`를 만듭니다. 검증된 소스 Python을 사용할 수 없으면 "
-            "PowerShell 래퍼는 fallback으로 유지됩니다. 어느 형태든 위에서 표시된 생성 "
-            "설정을 수정하지 말고 그대로 등록하세요."
-        )
+        if packaged_runtime:
+            st.info(
+                "Windows 실행판은 포함된 `PR MCP Builder.exe --mcp-server` 모드로 MCP를 "
+                "실행하므로 Python을 따로 설치할 필요가 없습니다. 위에서 표시된 생성 설정을 "
+                "수정하지 말고 그대로 등록하세요."
+            )
+        else:
+            st.info(
+                "Direct Python(프로젝트 Python 직접 실행)이 우선입니다. 생성기는 Python "
+                "3.11 이상과 `scripts.run_regulation_mcp` import를 확인한 뒤 실제 절대 "
+                "`command/args/env`를 만듭니다. 검증된 소스 Python을 사용할 수 없으면 "
+                "PowerShell 래퍼는 fallback으로 유지됩니다. 어느 형태든 위에서 표시된 생성 "
+                "설정을 수정하지 말고 그대로 등록하세요."
+            )
         st.markdown("**초보자 실수 방지**")
         st.markdown(
             "- 로컬 STDIO에는 인터넷 URL을 입력하지 않습니다.\n"
@@ -2004,9 +2607,8 @@ def _render_mcp_completion_connection_course(
                 "- Claude Desktop은 **Developer > Edit Config**에서 등록합니다.\n"
                 "- 일반 Connectors 화면에 로컬 `command/args/env`를 넣지 않습니다."
             )
-        elif target in {"codex", "chatgpt-desktop-local"}:
+        elif target == "codex":
             st.markdown(
-                "- ChatGPT Desktop은 **설정 > 플러그인 > MCP > + 서버 추가 > STDIO**를 사용합니다.\n"
                 "- Codex CLI·IDE는 생성된 TOML 블록을 사용자 `~/.codex/config.toml`에 넣습니다."
             )
         elif target == "claude-code":
@@ -2016,17 +2618,10 @@ def _render_mcp_completion_connection_course(
             )
 
         st.markdown("**1. 선택한 앱의 등록 위치**")
-        if target == "chatgpt-desktop-local":
+        if target == "codex":
             st.markdown(
-                "ChatGPT Desktop의 **Settings > MCP servers > Add server**에서 "
-                "`chatgpt_desktop_local_mcp.json`의 Name·STDIO·Command·Working "
-                "directory·Arguments·Environment를 그대로 입력하고 Save합니다."
-            )
-        elif target == "codex":
-            st.markdown(
-                "ChatGPT Desktop은 완료 화면의 Name·Command·Arguments·Environment를 "
-                "각각 같은 이름의 입력 칸에 넣습니다. Codex CLI·IDE는 "
-                "`codex_config_snippet.toml`의 `[mcp_servers.<이름>]` 블록을 "
+                "Codex CLI·IDE는 `codex_config_snippet.toml`의 "
+                "`[mcp_servers.<이름>]` 블록을 "
                 "`~/.codex/config.toml`에 반영합니다."
             )
         elif target == "claude-code":
@@ -2035,10 +2630,64 @@ def _render_mcp_completion_connection_course(
                 "`claude mcp list`로 등록을 확인합니다."
             )
         elif target == "claude-desktop":
-            st.markdown(
-                "처음 사용자는 아래 자동 연결 마법사를 권장합니다. 기존 Claude 설정을 "
-                "백업하고 다른 서버와 `preferences`를 보존한 채 이번 `mcpServers` "
-                "항목만 병합하고 STDIO 설정을 검사합니다."
+            if packaged_runtime:
+                st.markdown(
+                    "Windows 실행판에서는 위에 표시된 `claude_desktop_config.json`의 새 "
+                    "`mcpServers` 항목을 **Settings > Developer > Edit Config**에서 수동으로 "
+                    "병합하세요. Python 설치용 `-InstallPackage` 마법사는 실행하지 않습니다."
+                )
+            else:
+                st.markdown(
+                    "처음 사용자는 아래 자동 연결 마법사를 권장합니다. 기존 Claude 설정을 "
+                    "백업하고 다른 서버와 `preferences`를 보존한 채 이번 `mcpServers` "
+                    "항목만 병합하고 STDIO 설정을 검사합니다."
+                )
+                st.code(
+                    _powershell_command(
+                        "powershell.exe",
+                        [
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(resolved_bundle_dir / "connect_mcp_client.ps1"),
+                            "-InstallPackage",
+                            "-Target",
+                            "claude-desktop",
+                            "-InstallClaudeDesktop",
+                        ],
+                    ),
+                    language="powershell",
+                )
+                st.caption(
+                    "`Installed-config stdio verification passed` 뒤에 "
+                    "`CLAUDE DESKTOP VERIFICATION REQUIRED`가 나오면 실패가 아니라, "
+                    "Claude Desktop을 완전히 재시작해 앱 안에서 최종 확인하라는 뜻입니다. "
+                    "자동 연결이 실패할 때만 **Settings > Developer > Edit Config**에서 "
+                    "`%APPDATA%\\Claude\\claude_desktop_config.json`을 열어 생성된 새 "
+                    "`mcpServers` 항목을 수동 병합하세요."
+                )
+
+        st.markdown("**2. AI 앱을 열기 전에 번들 자체 진단**")
+        if packaged_runtime:
+            st.info(
+                "Windows 실행판에서는 Python용 doctor 스크립트를 실행하지 않습니다. "
+                "선택한 AI 앱에 생성 설정을 등록하고 완전히 재시작한 뒤, 새 대화에서 "
+                "`search`와 `fetch`를 호출하는 것이 실제 진단입니다."
+            )
+        else:
+            st.code(
+                _powershell_command(
+                    "powershell.exe",
+                    [
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(resolved_bundle_dir / "doctor_mcp_connection.ps1"),
+                    ],
+                ),
+                language="powershell",
             )
             st.code(
                 _powershell_command(
@@ -2048,62 +2697,22 @@ def _render_mcp_completion_connection_course(
                         "-ExecutionPolicy",
                         "Bypass",
                         "-File",
-                        str(resolved_bundle_dir / "connect_mcp_client.ps1"),
-                        "-InstallPackage",
-                        "-Target",
-                        "claude-desktop",
-                        "-InstallClaudeDesktop",
+                        str(resolved_bundle_dir / "validate_mcp_smoke.ps1"),
                     ],
                 ),
                 language="powershell",
             )
             st.caption(
-                "`Installed-config stdio verification passed` 뒤에 "
-                "`CLAUDE DESKTOP VERIFICATION REQUIRED`가 나오면 실패가 아니라, "
-                "Claude Desktop을 완전히 재시작해 앱 안에서 최종 확인하라는 뜻입니다. "
-                "자동 연결이 실패할 때만 **Settings > Developer > Edit Config**에서 "
-                "`%APPDATA%\\Claude\\claude_desktop_config.json`을 열어 생성된 새 "
-                "`mcpServers` 항목을 수동 병합하세요."
+                "`doctor_mcp_connection.ps1`은 Python 파일 없음, 3.11 미만, 프로젝트 루트, "
+                "runtime marker, 모듈·필수 의존성 import 실패를 구분합니다. "
+                "`validate_mcp_smoke.ps1`은 실제 STDIO initialize와 search/fetch를 검사합니다."
             )
-
-        st.markdown("**2. AI 앱을 열기 전에 번들 자체 진단**")
-        st.code(
-            _powershell_command(
-                "powershell.exe",
-                [
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(resolved_bundle_dir / "doctor_mcp_connection.ps1"),
-                ],
-            ),
-            language="powershell",
-        )
-        st.code(
-            _powershell_command(
-                "powershell.exe",
-                [
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(resolved_bundle_dir / "validate_mcp_smoke.ps1"),
-                ],
-            ),
-            language="powershell",
-        )
-        st.caption(
-            "`doctor_mcp_connection.ps1`은 Python 파일 없음, 3.11 미만, 프로젝트 루트, "
-            "runtime marker, 모듈·필수 의존성 import 실패를 구분합니다. "
-            "`validate_mcp_smoke.ps1`은 실제 STDIO initialize와 search/fetch를 검사합니다."
-        )
 
         st.markdown("**3. 완전히 재시작하고 앱별 등록 상태 확인**")
         st.markdown(
             "설정을 저장한 뒤 창만 닫지 말고 앱을 트레이까지 완전히 종료합니다. 앱을 다시 "
             "열고 새 대화에서 서버가 등록·활성화됐는지 확인합니다. Claude Desktop은 "
-            "`running`, ChatGPT Desktop은 MCP 스위치, Claude Code는 `claude mcp list`, "
+            "`running`, Claude Code는 `claude mcp list`, "
             "Codex는 적용된 `config.toml`과 도구 목록으로 확인합니다."
         )
         st.caption(
@@ -2241,9 +2850,19 @@ def _render_mcp_completion_connection_course(
         st.markdown("**4. 선택한 앱의 원격 커넥터에 URL만 등록**")
         if target == "chatgpt-remote":
             st.markdown(
-                "ChatGPT/Codex Desktop의 **Settings > MCP servers > Add server**에서 "
-                "**Streamable HTTP**를 선택하고 위 `HTTPS /mcp` URL을 입력한 뒤 "
-                "앱을 Restart합니다."
+                "ChatGPT **웹**의 **Settings > Apps > Advanced settings > Developer mode**를 "
+                "켠 뒤 Apps 설정에서 새 앱을 만들어 위 `HTTPS /mcp` URL을 "
+                "등록합니다. 이용 가능 범위는 플랜과 워크스페이스 관리자 설정에 따라 "
+                "달라질 수 있습니다. 로컬 서버는 ChatGPT에 직접 연결되지 않으며, 필요한 "
+                "경우 OpenAI Secure MCP Tunnel을 별도로 구성해야 합니다."
+            )
+            st.link_button(
+                "OpenAI 공식 ChatGPT MCP 안내",
+                "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
+            )
+            st.link_button(
+                "OpenAI Secure MCP Tunnel 안내",
+                "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
             )
         elif target == "claude-api":
             st.markdown(
@@ -2287,14 +2906,18 @@ def _render_mcp_completion_connection_course(
 def _direct_python_mcp_config(payload: dict, *, tenant_storage_isolation: bool = False) -> dict:
     config = json.loads(json.dumps(payload, ensure_ascii=False))
     server_script = str((PROJECT_ROOT / "scripts" / "run_regulation_mcp.py").resolve())
-    python_executable = sys.executable or "python"
+    packaged_executable = str(os.getenv("REG_RAG_PACKAGED_EXE") or "").strip()
+    if not packaged_executable and bool(getattr(sys, "frozen", False)):
+        packaged_executable = str(sys.executable or "").strip()
+    python_executable = packaged_executable or sys.executable or "python"
+    server_prefix_args = ["--mcp-server"] if packaged_executable else [server_script]
 
     def visit(value: object) -> None:
         if isinstance(value, dict):
             if value.get("command") == "reg-rag-mcp-server":
                 args = [str(arg) for arg in (value.get("args") or [])]
                 value["command"] = python_executable
-                value["args"] = [server_script, *args]
+                value["args"] = [*server_prefix_args, *args]
                 if not tenant_storage_isolation and "--flat-storage" not in value["args"]:
                     value["args"].append("--flat-storage")
                 if "--no-warm-cache" not in value["args"]:
@@ -2339,13 +2962,13 @@ def _write_direct_python_quickstart_scripts(
                     "",
                 ]
             ),
-            encoding="utf-8",
+            encoding="utf-8-sig",
         )
     run_stdio_path = files.get("run_stdio")
     if run_stdio_path:
         Path(run_stdio_path).write_text(
             _powershell_command(stdio_command, stdio_args) + "\n",
-            encoding="utf-8",
+            encoding="utf-8-sig",
         )
 
 
@@ -2390,6 +3013,197 @@ def _mcp_connection_gate(index_status: dict | None, approved_count: int) -> dict
     }
 
 
+def _mcp_gate_guidance_items(
+    gate: dict[str, object] | None,
+    *,
+    pending_review_count: int = 0,
+) -> list[dict[str, str]]:
+    """Translate fail-closed MCP gate reasons into operator actions.
+
+    The raw reason codes are useful for diagnostics but are not a usable next
+    step for a first-time operator.  Keep this mapping presentation-only: the
+    approval and index gates remain enforced by their original checks.
+    """
+
+    normalized_gate = dict(gate or {})
+    normalized_pending_count = max(0, int(pending_review_count or 0))
+    if normalized_pending_count:
+        return [
+            {
+                "cause": f"검토가 끝나지 않은 조문이 {normalized_pending_count:,}개 있습니다.",
+                "action": (
+                    "③ 검수하고 승인 화면에서 각 조문의 AI 검수 확인과 사람 확인을 마친 뒤 "
+                    "'승인하고 색인' 버튼을 누르세요."
+                ),
+                "target": NAV_APPROVAL,
+            }
+        ]
+
+    reason = str(normalized_gate.get("reason") or "not_ready").strip().lower()
+    guidance_by_reason = {
+        "no_approved_chunks": (
+            "승인된 조문이 아직 없습니다.",
+            "③ 검수하고 승인 화면에서 검토를 마친 조문을 승인하고 '승인하고 색인' 버튼을 누르세요.",
+        ),
+        "document_not_indexed": (
+            "승인된 문서가 아직 AI 검색용으로 색인되지 않았습니다.",
+            "③ 검수하고 승인 화면에서 '이미 승인된 내용 AI에 등록만 실행' 버튼을 누르세요.",
+        ),
+        "visible_record_count_mismatch": (
+            "승인된 조문 수와 AI 검색에 등록된 조문 수가 일치하지 않습니다.",
+            "③ 검수하고 승인 화면에서 '이미 승인된 내용 AI에 등록만 실행' 버튼으로 다시 색인하세요.",
+        ),
+        "stale_vector_records": (
+            "이전 색인 기록이 남아 있어 최신 승인 내용과 일치하지 않습니다.",
+            "③ 검수하고 승인 화면에서 '이미 승인된 내용 AI에 등록만 실행' 버튼으로 최신 내용으로 다시 색인하세요.",
+        ),
+        "index_validation_error": (
+            "색인 결과 검증을 통과하지 못했습니다.",
+            "③ 검수하고 승인 화면에서 승인 상태를 확인한 뒤 '이미 승인된 내용 AI에 등록만 실행' 버튼을 다시 누르세요.",
+        ),
+        "not_ready": (
+            "MCP에 사용할 승인·색인 상태를 아직 확인하지 못했습니다.",
+            "③ 검수하고 승인 화면에서 검토·승인·색인 상태를 확인한 뒤 다시 시도하세요.",
+        ),
+    }
+    if reason == "approved_chunks_indexed":
+        return []
+    cause, action = guidance_by_reason.get(
+        reason,
+        (
+            "MCP에 사용할 승인·색인 상태를 아직 확인하지 못했습니다.",
+            "③ 검수하고 승인 화면에서 검토·승인·색인 상태를 확인한 뒤 다시 시도하세요.",
+        ),
+    )
+    return [{"cause": cause, "action": action, "target": NAV_APPROVAL}]
+
+
+def _mcp_scope_document_state(chunks: list[object], gate: dict[str, object] | None) -> dict[str, object]:
+    """Classify one document for an MCP scope without treating rejection as unfinished review.
+
+    A superseded chunk is historical only.  A document whose remaining active
+    chunks were all explicitly rejected is intentionally absent from MCP; it
+    is not an approval task.  It still cannot make a bundle usable by itself,
+    because a bundle needs at least one visible approved record.
+    """
+
+    active_statuses = [
+        _approval_status(chunk)
+        for chunk in chunks
+        if _approval_status(chunk) != "superseded"
+    ]
+    approved_count = sum(status == "approved" for status in active_statuses)
+    rejected_count = sum(status == "rejected" for status in active_statuses)
+    if active_statuses and rejected_count == len(active_statuses):
+        state = "terminal-excluded"
+    elif (
+        active_statuses
+        and approved_count > 0
+        and all(status in {"approved", "rejected"} for status in active_statuses)
+        and bool(dict(gate or {}).get("ready"))
+    ):
+        state = "visible-ready"
+    else:
+        state = "blocking"
+    return {
+        "state": state,
+        "active_chunk_count": len(active_statuses),
+        "approved_chunk_count": approved_count,
+        "rejected_chunk_count": rejected_count,
+    }
+
+
+def _mcp_visible_scope_documents(
+    scope_documents: list[object],
+    scope_gate: dict[str, object],
+) -> list[object]:
+    """Return only documents that may be reindexed for the current MCP scope."""
+
+    visible_ids = {
+        str(document_id or "").strip()
+        for document_id in scope_gate.get("visible_document_ids") or []
+        if str(document_id or "").strip()
+    }
+    return [
+        document
+        for document in scope_documents
+        if str(getattr(document, "document_id", "") or "") in visible_ids
+    ]
+
+
+def _mcp_bundle_blocking_guidance(
+    gate: dict[str, object] | None,
+    *,
+    pending_review_count: int = 0,
+    kordoc_ready: bool = True,
+) -> list[dict[str, str]]:
+    """Add the Kordoc evidence action to normal current-document gate guidance."""
+
+    guidance = _mcp_gate_guidance_items(
+        gate,
+        pending_review_count=pending_review_count,
+    )
+    if not kordoc_ready:
+        guidance.append(
+            {
+                "cause": "공식 MCP에 넣을 PDF·HWP·HWPX·DOCX 문서의 Kordoc 표 파싱 품질 증거가 아직 충분하지 않습니다.",
+                "action": (
+                    "위 'Kordoc 표 파싱 사전 점검'에서 안내된 설치 또는 안전 재전처리 버튼을 실행한 뒤, "
+                    "새 초안을 다시 검토·승인·색인하세요."
+                ),
+                "target": "kordoc_preflight",
+            }
+        )
+    return guidance
+
+
+def _render_mcp_bundle_blocking_guidance(
+    *,
+    document_id: str,
+    scope: str,
+    gate: dict[str, object] | None,
+    pending_review_count: int,
+    kordoc_ready: bool,
+    blocking_labels: list[str] | None = None,
+    navigation_document_id: str = "",
+) -> None:
+    """Render a beginner-safe, actionable explanation without leaking reason codes."""
+
+    guidance = _mcp_bundle_blocking_guidance(
+        gate,
+        pending_review_count=pending_review_count,
+        kordoc_ready=kordoc_ready,
+    )
+    if not guidance:
+        return
+    normalized_blocking_labels = [
+        str(label or "").strip()
+        for label in (blocking_labels or [])[:3]
+        if str(label or "").strip()
+    ]
+    if normalized_blocking_labels:
+        remaining_text = ", ".join(normalized_blocking_labels)
+        st.info(f"먼저 처리할 남은 규정: {remaining_text}")
+    st.warning("MCP 파일 묶음 생성을 잠시 멈췄습니다. 아래 원인과 다음 행동을 순서대로 확인하세요.")
+    for item in guidance:
+        st.markdown(f"- **원인:** {item['cause']}\n  - **다음 행동:** {item['action']}")
+    if any(item.get("target") == NAV_APPROVAL for item in guidance):
+        button_key = f"mcp-goto-approval-{document_id}-{scope}"
+        if normalized_blocking_labels:
+            _render_beginner_action_marker(
+                3,
+                "남은 규정을 검수하고 승인하세요",
+                "아래 버튼을 누르면 첫 번째 남은 규정의 ③ 검수 화면으로 바로 이동합니다.",
+                control_keys=(button_key,),
+            )
+        _render_workflow_next_button(
+            "③ 검수하고 승인으로 이동",
+            NAV_APPROVAL,
+            key=button_key,
+            navigation_document_id=navigation_document_id,
+        )
+
+
 def _workflow_mcp_gate_summary(document_ids: list[str], current_ctx: dict) -> dict[str, object]:
     normalized_ids = [str(document_id or "").strip() for document_id in document_ids if str(document_id or "").strip()]
     signature = tuple((document_id, _document_context_revision(document_id)) for document_id in normalized_ids)
@@ -2398,16 +3212,27 @@ def _workflow_mcp_gate_summary(document_ids: list[str], current_ctx: dict) -> di
         return dict(cached["summary"])
 
     rows: list[dict[str, object]] = []
-    all_ready = bool(normalized_ids)
+    visible_document_ids: list[str] = []
+    terminal_excluded_document_ids: list[str] = []
+    blocking_document_ids: list[str] = []
+    gate_by_document_id: dict[str, dict[str, object]] = {}
+    pending_review_count_by_document_id: dict[str, int] = {}
     for document_id in normalized_ids:
         document = repository.get_document(document_id)
         if document_id == str(current_ctx.get("document_id") or ""):
+            chunks = list(current_ctx.get("chunks") or [])
             gate = dict(current_ctx.get("mcp_connection_gate") or {})
         elif document is None:
+            chunks = []
             gate = _mcp_connection_gate(None, 0)
         else:
             chunks = repository.get_chunks(document_id)
-            approved_count = sum(1 for chunk in chunks if chunk.approval_status == "approved")
+            approved_count = sum(
+                1
+                for chunk in chunks
+                if _approval_status(chunk) == "approved"
+                and _approval_status(chunk) != "superseded"
+            )
             tenant_id = str(getattr(document, "tenant_id", "") or _local_operator_tenant_id()).strip()
             auth = AuthContext(
                 actor="streamlit-local-operator",
@@ -2418,19 +3243,73 @@ def _workflow_mcp_gate_summary(document_ids: list[str], current_ctx: dict) -> di
                 gate = _mcp_connection_gate(get_index_status(document_id, auth), approved_count)
             except Exception:
                 gate = _mcp_connection_gate(None, approved_count)
-        ready = bool(gate.get("ready"))
-        all_ready = all_ready and ready
+        pending_review_count = sum(
+            1
+            for chunk in chunks
+            if str(getattr(chunk, "approval_status", "") or "").strip().casefold()
+            in APPROVABLE_CHUNK_STATUSES
+        )
+        gate_by_document_id[document_id] = dict(gate)
+        pending_review_count_by_document_id[document_id] = pending_review_count
+        document_state = _mcp_scope_document_state(chunks, gate)
+        state = str(document_state["state"])
+        ready = state == "visible-ready" and pending_review_count == 0
+        if ready:
+            visible_document_ids.append(document_id)
+        elif state == "terminal-excluded":
+            terminal_excluded_document_ids.append(document_id)
+        else:
+            blocking_document_ids.append(document_id)
+        guidance = _mcp_gate_guidance_items(
+            gate,
+            pending_review_count=pending_review_count,
+        )
         rows.append(
             {
                 "규정": _workflow_document_label(document) if document is not None else document_id,
-                "승인 청크": int(gate.get("approved_count") or 0),
+                "승인 청크": int(document_state["approved_chunk_count"]),
+                "검수 대기": pending_review_count,
                 "MCP 노출 기록": int(gate.get("mcp_visible_count") or 0),
-                "상태": "준비 완료" if ready else str(gate.get("reason") or "확인 필요"),
+                "상태": (
+                    "준비 완료"
+                    if ready
+                    else "명시적으로 반려되어 MCP에서 제외됨"
+                    if state == "terminal-excluded"
+                    else str(guidance[0]["cause"] if guidance else "확인 필요")
+                ),
             }
         )
-    summary = {"ready": all_ready, "rows": rows}
+    summary = {
+        "ready": bool(visible_document_ids) and not blocking_document_ids,
+        "rows": rows,
+        "visible_document_ids": visible_document_ids,
+        "terminal_excluded_document_ids": terminal_excluded_document_ids,
+        "blocking_document_ids": blocking_document_ids,
+        "gate_by_document_id": gate_by_document_id,
+        "pending_review_count_by_document_id": pending_review_count_by_document_id,
+    }
     st.session_state[WORKFLOW_MCP_GATE_CACHE_KEY] = {"signature": signature, "summary": summary}
     return summary
+
+
+def _beginner_scope_approval_ready(ctx: dict) -> bool:
+    document_id = str(ctx.get("document_id") or "").strip()
+    active_scope = _active_mcp_scope(document_id)
+    if active_scope == "current_document":
+        return True
+    if active_scope == "selected_documents":
+        document_ids = _current_selected_document_ids()
+    elif active_scope == "selected_institution":
+        document_ids = sorted(
+            {
+                str(getattr(document, "document_id", "") or "").strip()
+                for document in _documents_for_selected_institution()
+                if str(getattr(document, "document_id", "") or "").strip()
+            }
+        )
+    else:
+        return False
+    return bool(_workflow_mcp_gate_summary(document_ids, ctx).get("ready"))
 
 
 def _missing_mcp_source_metadata(document: object) -> list[str]:
@@ -2510,6 +3389,36 @@ def _resolve_operator_output_path(raw_path: str) -> Path:
         raise ValueError("출력 폴더 경로를 입력해 주세요.")
     path = Path(text)
     return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+def _default_mcp_bundle_directory() -> str:
+    """Keep portable output in the user-writable runtime instead of _MEIPASS."""
+
+    if bool(getattr(sys, "frozen", False)):
+        return str(
+            (Path(settings.data_dir) / "exports" / "mcp_connection_bundle").resolve()
+        )
+    return "reports/mcp_connection_bundle"
+
+
+def _operator_handoff_wheel_path() -> Path | None:
+    """Return only the wheel that exactly matches the running application."""
+
+    expected_name = f"reg_rag_preprocessor-{APP_VERSION}-py3-none-any.whl"
+    candidates: list[Path] = []
+    configured = str(os.getenv("REG_RAG_BUNDLED_WHEEL") or "").strip()
+    if configured:
+        candidates.append(Path(configured))
+    if bool(getattr(sys, "frozen", False)):
+        candidates.append(Path(sys.executable).resolve().parent / expected_name)
+    else:
+        candidates.append(PROJECT_ROOT / "dist" / expected_name)
+    available = [
+        path
+        for path in candidates
+        if path.name == expected_name and path.is_file() and not path.is_symlink()
+    ]
+    return available[0] if available else None
 
 
 def _mcp_bundle_zip_output_path(bundle_dir: Path) -> Path:
@@ -2679,7 +3588,9 @@ def _run_background_operation_with_progress(
         detail_box.caption(
             f"{heartbeat} · 경과 {elapsed_text} · 마지막 상태 갱신 {last_update_at} · {last_message}{count_text}"
         )
-        time.sleep(0.5)
+        # Wake immediately when the worker finishes instead of adding a fixed
+        # polling delay to every completed long-running operation.
+        thread.join(timeout=0.5)
 
     thread.join()
     error = result.get("error")
@@ -2710,12 +3621,15 @@ def _write_operator_mcp_bundle_zip(
     bundle_dir: Path,
     preferred_zip_path: Path,
     *,
+    wheel_path: Path,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[str, bool]:
     try:
         return write_mcp_setup_bundle_zip(
             bundle_dir,
             preferred_zip_path,
+            include_wheel=True,
+            wheel_path=wheel_path,
             progress_callback=progress_callback,
         ), False
     except PermissionError:
@@ -2724,6 +3638,8 @@ def _write_operator_mcp_bundle_zip(
         return write_mcp_setup_bundle_zip(
             bundle_dir,
             fallback_zip_path,
+            include_wheel=True,
+            wheel_path=wheel_path,
             progress_callback=progress_callback,
         ), True
 
@@ -2742,16 +3658,14 @@ def _select_windows_output_directory(state_key: str, initial_path: str) -> None:
     if sys.platform != "win32":
         st.session_state[f"{state_key}:picker_error"] = "폴더 선택은 Windows 로컬 실행에서만 지원합니다."
         return
+    initial_directory = _resolve_operator_output_path(initial_path)
+    initial_directory.mkdir(parents=True, exist_ok=True)
+    selected = ""
+    tkinter_error: BaseException | None = None
     try:
         import tkinter as tk
         from tkinter import filedialog
-    except ImportError as exc:
-        st.session_state[f"{state_key}:picker_error"] = f"Windows 폴더 선택 기능을 불러올 수 없습니다: {exc}"
-        return
 
-    try:
-        initial_directory = _resolve_operator_output_path(initial_path)
-        initial_directory.mkdir(parents=True, exist_ok=True)
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -2764,11 +3678,73 @@ def _select_windows_output_directory(state_key: str, initial_path: str) -> None:
             )
         finally:
             root.destroy()
-        if selected:
-            st.session_state[state_key] = selected
-            st.session_state.pop(f"{state_key}:picker_error", None)
-    except (OSError, RuntimeError, tk.TclError) as exc:
-        st.session_state[f"{state_key}:picker_error"] = f"Windows 폴더 선택 창을 열 수 없습니다: {exc}"
+    except (ImportError, OSError, RuntimeError) as exc:
+        tkinter_error = exc
+    except Exception as exc:
+        # A frozen one-dir build can import tkinter while lacking its Tcl/Tk
+        # data files.  Fall back to the Windows-native .NET dialog in that case.
+        if exc.__class__.__module__.lstrip("_").startswith("tkinter"):
+            tkinter_error = exc
+        else:
+            raise
+
+    if tkinter_error is not None:
+        try:
+            selected = _select_windows_output_directory_via_powershell(
+                initial_directory
+            )
+        except OSError:
+            st.session_state[f"{state_key}:picker_error"] = (
+                "Windows 폴더 선택 창을 열 수 없습니다. 아래 폴더 입력칸에 "
+                "저장 위치를 직접 입력해 주세요."
+            )
+            return
+    if selected:
+        st.session_state[state_key] = selected
+        st.session_state.pop(f"{state_key}:picker_error", None)
+
+
+def _select_windows_output_directory_via_powershell(initial_directory: Path) -> str:
+    """Use FolderBrowserDialog when tkinter is unavailable in a portable build."""
+
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            "Add-Type -AssemblyName System.Windows.Forms",
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+            "$dialog.Description = '저장 폴더 선택'",
+            "$dialog.ShowNewFolderButton = $true",
+            "if (Test-Path -LiteralPath $env:PR_MCP_FOLDER_PICKER_INITIAL) {",
+            "  $dialog.SelectedPath = $env:PR_MCP_FOLDER_PICKER_INITIAL",
+            "}",
+            "$result = $dialog.ShowDialog()",
+            "if ($result -eq [System.Windows.Forms.DialogResult]::OK) {",
+            "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+            "  [Console]::Write($dialog.SelectedPath)",
+            "}",
+            "$dialog.Dispose()",
+        ]
+    )
+    child_env = os.environ.copy()
+    child_env["PR_MCP_FOLDER_PICKER_INITIAL"] = str(initial_directory.resolve())
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+            env=child_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OSError("PowerShell folder picker is unavailable.") from exc
+    if completed.returncode != 0:
+        raise OSError(
+            f"PowerShell folder picker failed with exit code {completed.returncode}."
+        )
+    return str(completed.stdout or "").lstrip("\ufeff").strip()
 
 
 def _load_goldset_label_rows(path: Path) -> list[dict[str, str]]:
@@ -3230,12 +4206,28 @@ def _selected_approval_contexts(selected_document_ids: list[str], current_ctx: d
     """Load the minimum review context for every selected regulation without merging chunks."""
     contexts: list[dict] = []
     current_document_id = str(current_ctx.get("document_id") or "")
+    cached_contexts = st.session_state.get(SELECTED_APPROVAL_CONTEXT_CACHE_KEY)
+    if not isinstance(cached_contexts, dict):
+        cached_contexts = {}
+    retained_contexts: dict[str, dict[str, object]] = {}
     for document_id in selected_document_ids:
         normalized_document_id = str(document_id or "").strip()
         if not normalized_document_id:
             continue
         if normalized_document_id == current_document_id:
             contexts.append(current_ctx)
+            continue
+        revision = _document_context_revision(normalized_document_id)
+        cached_entry = cached_contexts.get(normalized_document_id)
+        if (
+            isinstance(cached_entry, dict)
+            and cached_entry.get("revision") == revision
+            and isinstance(cached_entry.get("context"), dict)
+        ):
+            cached_context = dict(cached_entry["context"])
+            contexts.append(cached_context)
+            if len(retained_contexts) < SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES:
+                retained_contexts[normalized_document_id] = cached_entry
             continue
         document = repository.get_document(normalized_document_id)
         if document is None:
@@ -3246,27 +4238,58 @@ def _selected_approval_contexts(selected_document_ids: list[str], current_ctx: d
         agent_review_summary = (latest_run.stats or {}).get("agent_review") if latest_run else {}
         if not isinstance(agent_review_summary, dict):
             agent_review_summary = {}
-        contexts.append(
-            {
-                "document_id": normalized_document_id,
-                "document": document,
-                "chunks": chunks,
-                "document_tenant_id": tenant_id or _local_operator_tenant_id(),
-                "local_auth": AuthContext(
-                    actor="streamlit-local-operator",
-                    tenant_id=tenant_id or _local_operator_tenant_id(),
-                    auth_mode="streamlit-local",
-                ),
-                "approved_count": sum(1 for chunk in chunks if _approval_status(chunk) == "approved"),
-                "review_attention": {
-                    chunk.chunk_id: chunk_review_attention_reasons(chunk)
-                    for chunk in chunks
-                    if chunk_review_attention_reasons(chunk)
-                },
-                "agent_review_summary": agent_review_summary,
+        loaded_context = {
+            "document_id": normalized_document_id,
+            "document": document,
+            "chunks": chunks,
+            "document_tenant_id": tenant_id or _local_operator_tenant_id(),
+            "local_auth": AuthContext(
+                actor="streamlit-local-operator",
+                tenant_id=tenant_id or _local_operator_tenant_id(),
+                auth_mode="streamlit-local",
+            ),
+            "approved_count": sum(1 for chunk in chunks if _approval_status(chunk) == "approved"),
+            "review_attention": {
+                chunk.chunk_id: chunk_review_attention_reasons(chunk)
+                for chunk in chunks
+                if chunk_review_attention_reasons(chunk)
+            },
+            "agent_review_summary": agent_review_summary,
+        }
+        contexts.append(loaded_context)
+        if len(retained_contexts) < SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES:
+            retained_contexts[normalized_document_id] = {
+                "revision": revision,
+                "context": loaded_context,
             }
-        )
+    if retained_contexts:
+        st.session_state[SELECTED_APPROVAL_CONTEXT_CACHE_KEY] = retained_contexts
+    else:
+        st.session_state.pop(SELECTED_APPROVAL_CONTEXT_CACHE_KEY, None)
     return contexts
+
+
+def _selected_documents_pending_approval(
+    selected_document_ids: list[str],
+    approval_contexts: list[dict],
+) -> list[str]:
+    context_by_document_id = {
+        str(context.get("document_id") or ""): context for context in approval_contexts
+    }
+    pending_document_ids: list[str] = []
+    for document_id in selected_document_ids:
+        normalized_document_id = str(document_id or "").strip()
+        if not normalized_document_id:
+            continue
+        approval_ctx = context_by_document_id.get(normalized_document_id)
+        if approval_ctx is None:
+            pending_document_ids.append(normalized_document_id)
+            continue
+        chunks = list(approval_ctx.get("chunks") or [])
+        approval_state = _mcp_scope_document_state(chunks, {"ready": True})
+        if str(approval_state["state"]) == "blocking":
+            pending_document_ids.append(normalized_document_id)
+    return pending_document_ids
 
 
 def _approval_pending_entries(ctx: dict) -> list[dict[str, object]]:
@@ -3611,6 +4634,42 @@ def _render_operator_theme() -> None:
             color: #4c554f;
             margin-bottom: .8rem;
         }
+        .rr-beginner-marker {
+            display: flex;
+            align-items: center;
+            gap: .75rem;
+            position: relative;
+            padding: .85rem 2.8rem .85rem .85rem;
+            margin: .75rem 0 .65rem 0;
+            border: 3px solid #c62828;
+            border-radius: .9rem;
+            background: #fff8f7;
+            color: #3f2020;
+            box-shadow: 0 7px 18px rgba(198, 40, 40, .12);
+        }
+        .rr-beginner-marker-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 2rem;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 50%;
+            background: #c62828;
+            color: #fff;
+            font-weight: 800;
+            font-size: 1rem;
+        }
+        .rr-beginner-marker strong {display: block; color: #8e1b1b; line-height: 1.4;}
+        .rr-beginner-marker p {margin: .15rem 0 0 0; color: #543737; font-size: .9rem; line-height: 1.5;}
+        .rr-beginner-marker-arrow {
+            position: absolute;
+            right: .9rem;
+            bottom: .55rem;
+            color: #c62828;
+            font-size: 1.55rem;
+            font-weight: 900;
+        }
         .rr-stages {display: flex; align-items: stretch; flex-wrap: wrap; gap: .3rem; margin: .2rem 0 1.1rem 0;}
         .rr-stage {
             flex: 1 1 0; min-width: 9rem;
@@ -3683,8 +4742,23 @@ def _document_context_revision(document_id: str) -> tuple[tuple[str, int, int], 
         repository._result_path(document_id, result_type)
         for result_type in ("chunks", "issues", "nodes", "quality")
     ]
-    paths.append(Path(settings.data_dir) / "repository" / "manifest.json")
     revision: list[tuple[str, int, int]] = []
+    try:
+        document = repository.get_document(document_id)
+        document_payload = (
+            document.model_dump(mode="json") if document is not None else None
+        )
+        document_digest = hashlib.sha256(
+            json.dumps(
+                document_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    except (OSError, UnicodeError, ValueError, TypeError):
+        document_digest = "unavailable"
+    revision.append((f"document:{document_id}:{document_digest}", 0, 0))
     for path in paths:
         try:
             stat = path.stat()
@@ -3718,6 +4792,15 @@ def _cached_document_context(document_id: str) -> dict | None:
 
 def _invalidate_document_context_cache(document_id: str | None = None) -> None:
     st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
+    selected_cache = st.session_state.get(SELECTED_APPROVAL_CONTEXT_CACHE_KEY)
+    if document_id and isinstance(selected_cache, dict):
+        selected_cache.pop(document_id, None)
+        if selected_cache:
+            st.session_state[SELECTED_APPROVAL_CONTEXT_CACHE_KEY] = selected_cache
+        else:
+            st.session_state.pop(SELECTED_APPROVAL_CONTEXT_CACHE_KEY, None)
+    elif not document_id:
+        st.session_state.pop(SELECTED_APPROVAL_CONTEXT_CACHE_KEY, None)
     cached = st.session_state.get(DOCUMENT_CONTEXT_CACHE_KEY)
     if document_id and isinstance(cached, dict) and cached.get("document_id") != document_id:
         return
@@ -3857,6 +4940,91 @@ def _mcp_bundle_state_key(document_id: str, scope: str = "document") -> str:
     if scope == "document":
         return f"{MCP_BUNDLE_STATE_PREFIX}:{document_id}"
     return f"{MCP_BUNDLE_STATE_PREFIX}:{scope}:{document_id}"
+
+
+def _mcp_bundle_state_candidates(
+    document_id: str,
+    scope: str,
+) -> list[tuple[str, dict[str, object]]]:
+    """Return bundle proofs anchored here or at another document in the scope."""
+
+    keys = [_mcp_bundle_state_key(document_id, scope)]
+    if scope == "current_document":
+        keys.append(_mcp_bundle_state_key(document_id))
+    else:
+        prefix = f"{MCP_BUNDLE_STATE_PREFIX}:{scope}:"
+        keys.extend(
+            str(key)
+            for key in st.session_state
+            if str(key).startswith(prefix)
+        )
+    candidates: list[tuple[str, dict[str, object]]] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        state = st.session_state.get(key)
+        if not isinstance(state, dict):
+            continue
+        anchor_document_id = str(state.get("document_id") or "").strip()
+        exported_ids = {
+            str(value or "").strip()
+            for value in state.get("export_document_ids") or []
+            if str(value or "").strip()
+        }
+        if scope == "current_document":
+            if anchor_document_id != document_id:
+                continue
+        elif document_id not in exported_ids:
+            continue
+        candidates.append((key, state))
+    return candidates
+
+
+def _matching_mcp_bundle_state_candidates(
+    document_id: str,
+    scope: str,
+) -> list[tuple[str, dict[str, object]]]:
+    """Return current-request bundle proofs, newest generation first."""
+
+    matches: list[tuple[str, dict[str, object]]] = []
+    for key, state in _mcp_bundle_state_candidates(document_id, scope):
+        if not state.get("written"):
+            continue
+        saved_scope = str(state.get("scope") or "").strip()
+        if saved_scope == "document":
+            saved_scope = "current_document"
+        if saved_scope and saved_scope != scope:
+            continue
+        if _mcp_request_identity(
+            document_id,
+            scope,
+            state,
+            current_widgets=False,
+        ) != _mcp_request_identity(
+            document_id,
+            scope,
+            state,
+            current_widgets=True,
+        ):
+            continue
+        matches.append((key, state))
+    matches.sort(
+        key=lambda item: (
+            str(item[1].get("generated_at") or ""),
+            item[0],
+        ),
+        reverse=True,
+    )
+    return matches
+
+
+def _clear_mcp_bundle_states(document_id: str, scope: str) -> None:
+    """Invalidate every proof that could represent the active export scope."""
+
+    for key, _state in _mcp_bundle_state_candidates(document_id, scope):
+        st.session_state.pop(key, None)
 
 
 def _read_mcp_connection_diagnostic(
@@ -4161,15 +5329,6 @@ def _replace_workflow_document_id(source_document_id: str, draft_document_id: st
     _invalidate_document_context_cache()
 
 
-def _kordoc_auto_reprocess_attempt_key(
-    target_repository: JsonRepository,
-    document_id: str,
-) -> str:
-    document = target_repository.get_document(document_id)
-    file_hash = str(getattr(document, "file_hash", "") or "")[:16]
-    return f"{KORDOC_AUTO_REPROCESS_ATTEMPT_PREFIX}:{document_id}:{file_hash}"
-
-
 def _kordoc_installer_candidates() -> list[Path]:
     """Return source and portable locations for the explicit Kordoc setup script."""
 
@@ -4241,6 +5400,96 @@ def _run_kordoc_installer() -> dict[str, Any]:
     }
 
 
+def _application_restart_instruction() -> str:
+    if bool(getattr(sys, "frozen", False)):
+        return "앱과 함께 열린 창을 완전히 종료하고 'PR MCP Builder.exe'를 다시 더블클릭하세요."
+    return "앱을 완전히 종료하고 'START_HERE.bat'을 다시 실행하세요."
+
+
+def _render_kordoc_preprocess_preflight() -> bool:
+    """Show the MCP quality prerequisite without conflating it with structure parsing."""
+
+    command = str(getattr(settings, "kordoc_table_command", "") or "")
+    command_status = kordoc_table_command_status(command)
+    command_label = str(command_status.get("label") or "kordoc")
+    if command_status.get("available"):
+        version = str(command_status.get("version") or "unknown")
+        st.caption(
+            "공식 MCP 품질 준비 확인: PDF·HWP·HWPX·DOCX 문서에 필요한 "
+            f"Kordoc 사용 가능 ({command_label}, {version})"
+        )
+        return True
+
+    npm_available = shutil.which("npm") is not None
+    if npm_available:
+        _render_beginner_action_marker(
+            1,
+            "PDF·HWP·HWPX·DOCX를 공식 MCP로 만들려면 Kordoc을 준비하세요",
+            "Kordoc 없이도 일반 조문·항·호의 빠른 구조 전처리는 할 수 있습니다. "
+            "다만 공식 MCP 파일 묶음에는 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요하므로, 설치 범위를 읽고 동의한 뒤 바로 아래 설치·검증 시작 버튼을 누르세요.",
+            control_key_prefix="preprocess-kordoc-install-run",
+        )
+    else:
+        _render_beginner_action_marker(
+            1,
+            "먼저 Node.js LTS 설치 페이지를 여세요",
+            "Node.js LTS를 설치한 뒤 앱을 완전히 재시작하면 Kordoc 설치 버튼을 누를 수 있습니다.",
+            control_key_prefix="preprocess-nodejs-link",
+        )
+    st.warning(
+        "Kordoc는 PDF·HWP·HWPX·DOCX 문서의 표·별표·복잡한 서식을 확인하는 품질 도구입니다. "
+        "일반 본문의 조문·항·호 구조를 처음 읽는 파서 자체가 Kordoc인 것은 아닙니다. "
+        "하지만 PDF·HWP·HWPX·DOCX를 공식 MCP 파일 묶음으로 만들려면 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다. "
+        "지금 설치하지 않고 빠른 구조 전처리는 할 수 있지만, 미설치 상태에서 처리한 문서는 나중에 Kordoc 설치 후 새 초안으로 "
+        "다시 전처리·검수·승인해야 합니다."
+    )
+    st.info(
+        "지금은 빠른 구조 전처리로 계속할 수 있습니다. 아래 '파일 올리기'에서 규정 파일을 선택하세요. "
+        "다만 ④ 공식 MCP 파일 묶음을 만들기 전에는 Kordoc을 설치한 뒤 같은 원본을 새 초안으로 "
+        "다시 전처리·검수·승인해야 합니다."
+    )
+    st.caption(
+        "아래 버튼은 Node.js/npm을 사용해 Kordoc을 현재 사용자 환경에 전역 설치하고 "
+        "사용자 PATH를 갱신합니다. 이 변경에 동의할 때만 누르세요."
+    )
+    if not npm_available:
+        st.error(
+            "먼저 Node.js LTS를 https://nodejs.org 에서 설치하세요. 설치가 끝나면 "
+            f"{_application_restart_instruction()} 다시 이 화면에서 Kordoc 설치·검증을 시작하세요."
+        )
+        st.link_button(
+            "Node.js LTS 설치 페이지 열기",
+            "https://nodejs.org",
+            key="preprocess-nodejs-link",
+        )
+    if st.button(
+        "Kordoc 설치·검증 시작",
+        key="preprocess-kordoc-install-run",
+        help="Node.js LTS/npm이 설치된 Windows PC에서만 실행됩니다.",
+        disabled=not npm_available,
+    ):
+        with st.spinner("Kordoc 설치·검증 중..."):
+            install_result = _run_kordoc_installer()
+        if install_result.get("ok"):
+            kordoc_table_command_status.cache_clear()
+            st.success(
+                "Kordoc 설치·검증이 완료됐습니다. 새 PATH를 적용하려면 "
+                f"{_application_restart_instruction()} 다시 연 화면에서 'Kordoc 사용 가능'을 "
+                "확인한 뒤 전처리를 시작하세요."
+            )
+            if install_result.get("output"):
+                st.code(str(install_result["output"]), language="text")
+        else:
+            error_code = str(install_result.get("error") or "installer_failed")
+            st.error(
+                f"Kordoc 설치·검증을 완료하지 못했습니다 ({error_code}). "
+                "Node.js LTS/npm 설치 여부를 확인한 뒤 다시 시도하세요."
+            )
+            if install_result.get("output"):
+                st.code(str(install_result["output"]), language="text")
+    return False
+
+
 def _candidate_operator_paths(raw_path: object) -> list[Path]:
     text = str(raw_path or "").strip()
     if not text:
@@ -4251,46 +5500,338 @@ def _candidate_operator_paths(raw_path: object) -> list[Path]:
     return [path, PROJECT_ROOT / path]
 
 
-def _mcp_bundle_created(ctx: dict | None) -> bool:
+def _operator_file_sha256(raw_path: object) -> str:
+    """Hash the current bytes for an MCP integrity decision, without metadata caching."""
+
+    for path in _candidate_operator_paths(raw_path):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat = path.stat()
+            if stat.st_size <= 0:
+                continue
+            resolved = path.resolve(strict=True)
+            return _sha256_file(resolved)
+        except OSError:
+            continue
+    return ""
+
+
+def _runtime_bundle_stat_signature(
+    runtime_data_dir: Path,
+) -> tuple[tuple[str, int, int, bool, str], ...]:
+    """Return a content-bound invalidation key for runtime bundle validation."""
+
+    signature: list[tuple[str, int, int, bool, str]] = []
+    try:
+        root_stat = runtime_data_dir.lstat()
+        root_is_symlink = runtime_data_dir.is_symlink()
+        signature.append(
+            (
+                ".",
+                int(root_stat.st_mtime_ns),
+                int(root_stat.st_size),
+                root_is_symlink,
+                "",
+            )
+        )
+        if root_is_symlink or not runtime_data_dir.is_dir():
+            return tuple(signature)
+    except OSError:
+        return (("<unavailable>", 0, 0, False, ""),)
+    try:
+        paths = sorted(runtime_data_dir.rglob("*"))
+    except OSError:
+        return (("<unavailable>", 0, 0, False, ""),)
+    for path in paths:
+        try:
+            if path.name in RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES:
+                continue
+            is_symlink = path.is_symlink()
+            if not path.is_file() and not is_symlink:
+                continue
+            stat = path.lstat()
+            content_fingerprint = (
+                "link-sha256:"
+                + hashlib.sha256(
+                    os.readlink(path).encode("utf-8", errors="surrogatepass")
+                ).hexdigest()
+                if is_symlink
+                else "sha256:" + _sha256_file(path)
+            )
+            signature.append(
+                (
+                    path.relative_to(runtime_data_dir).as_posix(),
+                    int(stat.st_mtime_ns),
+                    int(stat.st_size),
+                    is_symlink,
+                    content_fingerprint,
+                )
+            )
+        except OSError:
+            try:
+                relative_path = path.relative_to(runtime_data_dir).as_posix()
+            except ValueError:
+                relative_path = "<outside-runtime-root>"
+            signature.append((relative_path, 0, 0, False, "<unavailable>"))
+    return tuple(signature)
+
+
+@lru_cache(maxsize=16)
+def _cached_mcp_runtime_bundle_integrity(
+    runtime_data_dir: str,
+    expected_corpus_hash: str,
+    _stat_signature: tuple[tuple[str, int, int, bool, str], ...],
+    _render_nonce: int,
+) -> bool:
+    """Hash a bundle once per observed filesystem revision."""
+
+    try:
+        validate_mcp_runtime_data_bundle_integrity(
+            Path(runtime_data_dir),
+            expected_logical_corpus_sha256=expected_corpus_hash or None,
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _mcp_runtime_bundle_ready(state: dict[str, object]) -> bool:
+    runtime_data_dirs = _candidate_operator_paths(state.get("runtime_data_dir"))
+    runtime_data_dirs.extend(
+        path.parent for path in _candidate_operator_paths(state.get("runtime_manifest"))
+    )
+    expected_corpus_hash = str(state.get("logical_corpus_sha256") or "").strip()
+    seen: set[str] = set()
+    for runtime_data_dir in runtime_data_dirs:
+        normalized = os.path.normcase(str(runtime_data_dir))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        signature = _runtime_bundle_stat_signature(runtime_data_dir)
+        if _cached_mcp_runtime_bundle_integrity(
+            str(runtime_data_dir),
+            expected_corpus_hash,
+            signature,
+            int(st.session_state.get(MCP_RUNTIME_INTEGRITY_RENDER_NONCE_KEY) or 0),
+        ):
+            return True
+    return False
+
+
+def _mcp_setup_files_ready(state: dict[str, object]) -> bool:
+    expected_hashes = state.get("setup_file_sha256")
+    if not isinstance(expected_hashes, dict):
+        return False
+    normalized_hashes = {
+        str(key): str(value or "").strip().lower()
+        for key, value in expected_hashes.items()
+    }
+    if set(normalized_hashes) != set(MCP_COMPLETION_SETUP_FILES):
+        return False
+    for bundle_dir in _candidate_operator_paths(state.get("bundle_dir")):
+        try:
+            if bundle_dir.is_symlink() or not bundle_dir.is_dir():
+                continue
+            if all(
+                _operator_file_sha256(bundle_dir / filename)
+                == normalized_hashes[file_key]
+                for file_key, filename in MCP_COMPLETION_SETUP_FILES.items()
+            ):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _mcp_zip_ready(state: dict[str, object]) -> bool:
+    if str(state.get("save_mode") or "").strip() == "folder-only":
+        return True
+    expected_sha256 = str(state.get("zip_sha256") or "").strip().lower()
+    if not expected_sha256:
+        return False
+    return any(
+        _operator_file_sha256(path) == expected_sha256
+        for path in _candidate_operator_paths(state.get("zip"))
+    )
+
+
+def _mcp_bundle_created(
+    ctx: dict | None,
+    *,
+    scope: str | None = None,
+) -> bool:
     if not ctx:
         return False
     document_id = str(ctx["document_id"])
-    try:
-        state = st.session_state[_mcp_bundle_state_key(document_id)]
-    except KeyError:
-        state = None
-    if not isinstance(state, dict) or not state.get("written"):
+    active_scope = _active_mcp_scope(document_id, scope)
+    if not active_scope:
         return False
-    if state.get("document_id") != document_id:
-        return False
-    bundle_dirs = _candidate_operator_paths(state.get("bundle_dir"))
-    zip_paths = _candidate_operator_paths(state.get("zip"))
-    has_connect_script = any((path / "connect_mcp_client.ps1").exists() for path in bundle_dirs)
-    has_zip = any(path.exists() for path in zip_paths)
-    return has_connect_script and has_zip
+    matching_states = _matching_mcp_bundle_state_candidates(
+        document_id,
+        active_scope,
+    )
+    for _key, state in matching_states[:1]:
+        if not isinstance(state, dict) or not state.get("written"):
+            continue
+        saved_scope = str(state.get("scope") or "").strip()
+        if saved_scope == "document":
+            saved_scope = "current_document"
+        if saved_scope and saved_scope != active_scope:
+            continue
+        saved_request_identity = _mcp_request_identity(
+            document_id,
+            active_scope,
+            state,
+            current_widgets=False,
+        )
+        current_request_identity = _mcp_request_identity(
+            document_id,
+            active_scope,
+            state,
+            current_widgets=True,
+        )
+        if saved_request_identity != current_request_identity:
+            continue
+        current_save_mode = str(
+            st.session_state.get(f"mcp-save-mode-{document_id}") or ""
+        ).strip()
+        saved_save_mode = str(state.get("save_mode") or "").strip()
+        if (
+            current_save_mode in {"folder-and-zip", "folder-only"}
+            and saved_save_mode
+            and current_save_mode != saved_save_mode
+        ):
+            continue
+        if active_scope == "selected_documents":
+            raw_selected_ids = st.session_state.get(
+                WORKFLOW_SELECTED_DOCUMENT_IDS_KEY
+            )
+            raw_document_ids = st.session_state.get(WORKFLOW_DOCUMENT_IDS_KEY)
+            document_ids = (
+                [
+                    str(value or "").strip()
+                    for value in raw_document_ids
+                    if str(value or "").strip()
+                ]
+                if isinstance(raw_document_ids, list)
+                else []
+            )
+            selection_widget_keys = [
+                f"workflow-document-selected-{value}" for value in document_ids
+            ]
+            if selection_widget_keys and all(
+                key in st.session_state for key in selection_widget_keys
+            ):
+                # Widget values are updated before a Streamlit rerun, while the
+                # aggregate list below is refreshed later in the page body.
+                # Prefer the widgets so the sidebar never reports a stale bundle.
+                raw_selected_ids = [
+                    value
+                    for value, key in zip(document_ids, selection_widget_keys)
+                    if bool(st.session_state.get(key))
+                ]
+            if isinstance(raw_selected_ids, list):
+                current_ids = sorted(
+                    {
+                        str(value or "").strip()
+                        for value in raw_selected_ids
+                        if str(value or "").strip()
+                    }
+                )
+                saved_ids = sorted(
+                    {
+                        str(value or "").strip()
+                        for value in state.get("export_document_ids") or []
+                        if str(value or "").strip()
+                    }
+                )
+                if saved_ids != current_ids:
+                    continue
+        if active_scope == "selected_institution":
+            selected_profile_id = str(
+                st.session_state.get(SELECTED_INSTITUTION_PROFILE_KEY) or ""
+            ).strip().casefold()
+            saved_profile_id = str(state.get("profile_id") or "").strip().casefold()
+            if selected_profile_id and saved_profile_id != selected_profile_id:
+                continue
+        target_sha256 = _operator_file_sha256(state.get("connection_target_file"))
+        saved_target_sha256 = str(
+            state.get("connection_target_file_sha256") or ""
+        ).strip().lower()
+        if (
+            _mcp_setup_files_ready(state)
+            and _mcp_zip_ready(state)
+            and bool(saved_target_sha256)
+            and target_sha256 == saved_target_sha256
+            and _mcp_runtime_bundle_ready(state)
+        ):
+            return True
+    return False
 
 
 def _workflow_states(ctx: dict | None) -> list[bool]:
-    """각 단계(1~5)의 완료 여부."""
-    step1 = ctx is not None
-    step2 = bool(ctx and ctx["quality_report"] and ctx["quality_report"].passed)
-    step3 = bool(ctx and ctx["approved_count"] > 0)
-    step4 = bool(ctx and ctx["mcp_connection_gate"].get("ready"))
-    step5 = _mcp_bundle_created(ctx)
-    return [step1, step2, step3, step4, step5]
+    """Return the fail-closed completion state for the four operator cards."""
+
+    document = ctx.get("document") if ctx else None
+    preprocessing_complete = bool(
+        ctx
+        and str(getattr(document, "status", "") or "").strip().casefold()
+        == "completed"
+        and ctx.get("chunks")
+        and not ctx.get("large_result_warning")
+    )
+    approval_counts = dict(ctx.get("approval_counts") or {}) if ctx else {}
+    pending_review_count = sum(
+        int(approval_counts.get(status) or 0)
+        for status in APPROVABLE_CHUNK_STATUSES
+    )
+    approval_evidence_complete = bool(
+        preprocessing_complete
+        and int(ctx.get("approved_count") or 0) > 0
+        and pending_review_count == 0
+        and bool(dict(ctx.get("mcp_connection_gate") or {}).get("ready"))
+    )
+    document_id = str(ctx.get("document_id") or "") if ctx else ""
+    results_confirmed = bool(
+        document_id
+        and st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
+    )
+    results_complete = bool(
+        preprocessing_complete
+        and (
+            bool(ctx.get("quality_report") and ctx["quality_report"].passed)
+            or results_confirmed
+            or approval_evidence_complete
+        )
+    )
+    approval_and_index_complete = bool(
+        results_complete and approval_evidence_complete
+    )
+    bundle_complete = bool(
+        approval_and_index_complete and _mcp_bundle_created(ctx)
+    )
+    return [
+        preprocessing_complete,
+        results_complete,
+        approval_and_index_complete,
+        bundle_complete,
+    ]
 
 
 def _next_action(ctx: dict | None) -> tuple[str, str]:
     """(안내 문구, 이동할 화면)"""
-    if ctx is None:
+    workflow_states = _workflow_states(ctx)
+    if not workflow_states[0]:
         return ("규정 문서 파일을 올리고 '전처리 시작'을 누르세요.", NAV_PREPROCESS)
-    if not ctx["quality_report"] or not ctx["quality_report"].passed:
+    if not workflow_states[1]:
         return ("전처리 결과와 품질 검사 내용을 확인하세요.", NAV_RESULTS)
-    if ctx["approved_count"] <= 0:
-        return ("결과를 사람이 확인한 뒤 '승인'을 진행하세요.", NAV_APPROVAL)
-    if not ctx["mcp_connection_gate"].get("ready"):
-        return ("승인한 내용을 색인(AI에 등록)하세요. ③ 화면의 마지막 단계입니다.", NAV_APPROVAL)
-    if not _mcp_bundle_created(ctx):
+    if not workflow_states[2]:
+        return (
+            "사람 검수 결정을 모두 마치고 승인한 내용을 색인(AI에 등록)하세요.",
+            NAV_APPROVAL,
+        )
+    if not workflow_states[3]:
         return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. Claude, ChatGPT, 내부 AI 연결용 ④ 단계입니다.", NAV_MCP)
     return ("MCP 설정 묶음까지 생성됐습니다. ④ 화면에서 검색 점검과 연결 상태를 확인해 보세요.", NAV_MCP)
 
@@ -4556,7 +6097,7 @@ def _page_home(ctx: dict | None) -> None:
                 row_cols[2].write(str(getattr(document, "document_id", ""))[:12])
                 if row_cols[3].button("삭제", key=f"home-delete-{document.document_id}"):
                     source_path = DocumentService(settings=settings, repository=repository).path_for(document)
-                    deleted = repository.delete_document(document.document_id)
+                    repository.delete_document(document.document_id)
                     if source_path.exists():
                         source_path.unlink()
                     if ctx and document.document_id == ctx.get("document_id"):
@@ -4571,15 +6112,15 @@ def _page_home(ctx: dict | None) -> None:
     _render_workflow_next_button(f"바로가기: {target}", target, key="home-next-action")
 
     st.markdown("### 전처리 진행 방식")
-    st.caption("모든 문서는 항상 아래 3단계로 처리됩니다: 파서 초안 → AI 검수 → 휴먼 승인.")
+    st.caption("처리 흐름: 파서 초안 → (선택) AI 추가 검수 → 사람 승인.")
     _render_pipeline_stages(0)
 
     st.markdown("### 작업 순서")
     states = _workflow_states(ctx)
     current_index = next((i for i, done in enumerate(states) if not done), None)
     steps = [
-        ("1단계", "문서 올려서 전처리", "규정 파일을 올리면 파서가 조문 단위로 1차 정리하고, 이어서 AI 검수가 함께 실행됩니다.", NAV_PREPROCESS),
-        ("2단계", "결과 확인", "정리 결과와 품질 검사, 그리고 AI 검수가 짚은 부분을 화면에서 확인합니다.", NAV_RESULTS),
+        ("1단계", "문서 올려서 전처리", "규정 파일을 올리면 파서가 조문 단위로 1차 정리합니다. AI 추가 검수는 직접 선택한 경우에만 실행됩니다.", NAV_PREPROCESS),
+        ("2단계", "결과 확인", "정리 결과와 품질 검사를 확인하고, AI 추가 검수를 선택했다면 AI가 짚은 부분도 함께 봅니다.", NAV_RESULTS),
         ("3단계", "검수하고 승인", "사람이 최종 확인을 마친 내용에만 '승인'을 하고 AI에 등록(색인)합니다.", NAV_APPROVAL),
         ("4단계", "MCP 생성·AI 연결", "Claude, ChatGPT, 내부 AI에 붙일 MCP 설정 JSON과 setup bundle을 생성합니다.", NAV_MCP),
     ]
@@ -4621,13 +6162,24 @@ def _page_preprocess() -> None:
     _render_pipeline_stages(PIPELINE_STAGE_PARSER)
     st.markdown(
         '<div class="rr-help">규정 파일을 올리고 문서 정보를 확인한 뒤 <b>전처리 시작</b> 버튼만 누르면 됩니다. '
-        "전처리를 시작하면 <b>파서 초안</b>과 <b>AI 검수</b>가 함께 실행됩니다. 나머지 설정은 그대로 두셔도 됩니다.</div>",
+        "기본은 <b>빠른 구조 전처리</b>로 조문·항·호를 먼저 정리합니다. AI 추가 검수는 필요할 때만 직접 선택하세요.</div>",
         unsafe_allow_html=True,
     )
 
     _render_api_key_setup_cta("preprocess")
+    kordoc_ready = _render_kordoc_preprocess_preflight()
 
     st.markdown("### 1. 파일 올리기")
+    if (
+        not _uploaded_file_list(st.session_state.get("regulation_document_upload"))
+        and not st.session_state.get("document_id")
+    ):
+        _render_beginner_action_marker(
+            1,
+            "먼저 규정 파일을 선택하세요",
+            "바로 아래 영역에 PDF·HWP·HWPX·DOCX 파일을 끌어놓거나 파일 찾기를 누르세요.",
+            control_key_prefix="regulation_document_upload",
+        )
     uploaded = st.file_uploader(
         "문서 업로드",
         type=["pdf", "docx", "hwpx", "hwp"],
@@ -4915,22 +6467,41 @@ def _page_preprocess() -> None:
                     help="개정본인 경우 이전 문서의 ID를 기록합니다.",
                 )
 
+    ai_review_requested = st.checkbox(
+        "AI로 의심 구간 추가 검수 (선택)",
+        value=False,
+        key="preprocess-enable-agent-review",
+        help=(
+            "기본 빠른 구조 전처리에는 외부 AI 호출이 없습니다. 켜면 처리 시간과 API 사용 비용이 늘 수 있으며, "
+            "선택된 의심 구간을 AI가 추가로 살펴봅니다."
+        ),
+    )
+    if ai_review_requested:
+        st.info(
+            "AI 추가 검수를 선택했습니다. 처리 시간과 API 사용 비용이 늘 수 있습니다. "
+            "AI 결과도 최종 결정이 아니며, 다음 검토 화면에서 사람이 확인·보완해야 공식 RAG/MCP에 사용할 수 있습니다."
+        )
+    else:
+        st.caption(
+            "기본값: 빠른 구조 전처리. 외부 AI 호출 없이 조문·항·호를 정리합니다. "
+            "나중에 검토 화면에서 사람이 내용을 보완할 수 있으며, 공식 승인·보안 확인은 그대로 진행됩니다."
+        )
+
     with st.expander("전문가 설정 (기본값 사용을 권장합니다)", expanded=False):
         max_chunk_chars = st.number_input("최대 청크 글자 수", min_value=500, max_value=10000, value=1800, step=100)
         overlap_chars = st.number_input("청크 겹침 글자 수", min_value=0, max_value=1000, value=120, step=20)
-        chunk_mode = st.selectbox(
-            "청크 방식",
-            ["article", "paragraph", "hybrid"],
-            index=0,
-            format_func=lambda value: {
-                "article": "조문 중심",
-                "paragraph": "문단 중심",
-                "hybrid": "혼합",
-            }.get(value, value),
-        )
+        # The current parser already preserves article/paragraph/item
+        # structure and splits oversized nodes automatically. Exposing three
+        # labels here suggested materially different algorithms even though
+        # ``chunk_mode`` is only retained in the processing snapshot today.
+        chunk_mode = "article"
+        st.caption("청크 방식: 규정의 조문·항목 구조에 맞춰 자동 적용")
         include_context_header = st.checkbox("위치/본문 헤더 포함", value=True)
         enable_table_extraction = st.checkbox("표/별표 추출 활성화", value=False)
-        st.caption("AI 검수 초안은 기본 전처리 단계입니다. 실제 API 실행은 운영 설정, 예산 한도, 승인 기준을 만족할 때만 진행됩니다.")
+        st.caption(
+            "AI 추가 검수는 위에서 직접 선택했을 때만 실행됩니다. "
+            "선택해도 실제 API 실행은 운영 설정과 예산 한도를 만족할 때만 진행되며, 사람 승인과 보안 게이트를 대신하지 않습니다."
+        )
         official_review_checkbox_kwargs: dict[str, object] = {
             "key": OFFICIAL_RAG_MCP_REVIEW_REQUIRED_KEY,
             "help": "끄면 품질과 연결 UX 확인용 미검수 프리뷰로만 취급합니다.",
@@ -4957,7 +6528,19 @@ def _page_preprocess() -> None:
     if not upload_sources:
         st.info("먼저 위에서 문서 파일을 올려 주세요.")
 
-    if upload_sources and st.button("전처리 시작", type="primary", disabled=poc_review_needs_ack):
+    if upload_sources:
+        _render_beginner_action_marker(
+            1,
+            "선택한 파일의 전처리를 시작하세요",
+            "문서 정보가 맞는지 확인한 뒤 바로 아래 전처리 시작 버튼을 누르세요.",
+            control_key_prefix="preprocess-start",
+        )
+    if upload_sources and st.button(
+        "전처리 시작",
+        type="primary",
+        key="preprocess-start",
+        disabled=poc_review_needs_ack,
+    ):
         if quality_profile_error:
             st.error(f"품질 프로필 설정이 올바르지 않습니다: {quality_profile_error}")
             st.stop()
@@ -5015,7 +6598,7 @@ def _page_preprocess() -> None:
             chunk_mode=chunk_mode,
             include_context_header=include_context_header,
             enable_table_extraction=enable_table_extraction,
-            enable_agent_review=True,
+            enable_agent_review=ai_review_requested,
         )
         max_single_upload_bytes = int(upload_settings.max_upload_mb) * 1024 * 1024
         max_batch_upload_bytes = int(getattr(upload_settings, "max_batch_upload_mb", upload_settings.max_upload_mb)) * 1024 * 1024
@@ -5049,6 +6632,8 @@ def _page_preprocess() -> None:
         completed_documents = []
         total_files = len(upload_sources)
         current_preprocess_regulation = "선택한 업로드 문서"
+        preprocessing_started = time.monotonic()
+        beginner_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
         with _long_operation_status(
             f"{total_files}개 문서를 전처리하는 중입니다...",
             failure_stage="문서 업로드·전처리",
@@ -5058,6 +6643,13 @@ def _page_preprocess() -> None:
             progress_bar = st.progress(0, text="Saving uploaded file")
             progress_text = st.empty()
             regulation_progress_box = st.empty()
+            beginner_status_box = st.empty()
+            if beginner_mode_active:
+                beginner_status_box.info(
+                    "프로그램이 정상적으로 처리 중입니다.\n\n"
+                    "**현재 단계:** 파일 저장 준비\n\n"
+                    "**경과 시간:** 00:00"
+                )
             file_status_rows = [
                 {"filename": str(source["filename"]), "status": "대기", "percent": 0}
                 for source in upload_sources
@@ -5085,6 +6677,13 @@ def _page_preprocess() -> None:
                 text = f"{file_index + 1}/{total_files} {filename}: {message}"
                 progress_bar.progress(safe_progress, text=text)
                 progress_text.caption(f"{safe_progress}% - {text}")
+                if beginner_mode_active:
+                    beginner_status_box.info(
+                        "프로그램이 정상적으로 처리 중입니다.\n\n"
+                        f"**현재 단계:** {_beginner_preprocess_stage_text(message)}\n\n"
+                        f"**처리 파일:** {file_index + 1}/{total_files} · {filename}\n\n"
+                        f"**경과 시간:** {_format_elapsed_seconds(time.monotonic() - preprocessing_started)}"
+                    )
 
             def _process_document_with_live_status(
                 *,
@@ -5168,7 +6767,16 @@ def _page_preprocess() -> None:
                         )
                         progress_bar.progress(safe_progress, text=text)
                         progress_text.caption(f"{safe_progress}% - {text}")
-                    time.sleep(0.7)
+                        if beginner_mode_active:
+                            beginner_status_box.info(
+                                "프로그램이 정상적으로 처리 중입니다.\n\n"
+                                f"**현재 단계:** {_beginner_preprocess_stage_text(last_message)}\n\n"
+                                f"**처리 파일:** {file_index + 1}/{total_files} · {filename}\n\n"
+                                f"**경과 시간:** {elapsed}"
+                            )
+                    # Preserve the heartbeat interval while avoiding up to
+                    # 0.7 seconds of tail latency for every completed file.
+                    thread.join(timeout=0.7)
                 thread.join()
                 error = result.get("error")
                 if isinstance(error, BaseException):
@@ -5246,6 +6854,12 @@ def _page_preprocess() -> None:
 
             document = completed_documents[-1]
             status.update(label=f"{len(completed_documents)}개 문서 전처리 완료", state="complete")
+            if beginner_mode_active:
+                beginner_status_box.success(
+                    "전처리가 정상적으로 끝났습니다.\n\n"
+                    f"**완료 문서:** {len(completed_documents)}개\n\n"
+                    f"**총 경과 시간:** {_format_elapsed_seconds(time.monotonic() - preprocessing_started)}"
+                )
         completed_document_ids = [item.document_id for item in completed_documents]
         st.session_state[WORKFLOW_DOCUMENT_IDS_KEY] = completed_document_ids
         st.session_state[WORKFLOW_SELECTED_DOCUMENT_IDS_KEY] = completed_document_ids
@@ -5255,8 +6869,33 @@ def _page_preprocess() -> None:
         st.session_state["unreviewed_preview_requested"] = not official_review_required
         st.success(f"{len(completed_documents)}개 문서 전처리가 끝났습니다. 이제 '② 결과 확인' 화면에서 내용을 확인하세요.")
 
-    if st.session_state.get("document_id"):
+    current_document_id = str(st.session_state.get("document_id") or "").strip()
+    current_document_ctx = (
+        _cached_document_context(current_document_id)
+        if current_document_id
+        else None
+    )
+    if current_document_id and current_document_ctx is None:
+        current_document_ctx = _load_document_context(current_document_id)
+    preprocessing_complete = bool(
+        current_document_ctx
+        and _beginner_guide_completed_steps(current_document_ctx)[0]
+    )
+    if preprocessing_complete:
+        _render_beginner_action_marker(
+            1,
+            "전처리 결과를 확인하세요",
+            "전처리가 끝났습니다. 바로 아래 버튼을 눌러 원문과 정리 결과를 비교하세요.",
+            control_key_prefix="preprocess-goto-results",
+        )
         _render_workflow_next_button("② 결과 확인으로 이동", NAV_RESULTS, key="preprocess-goto-results")
+    elif current_document_id:
+        _render_beginner_action_marker(
+            1,
+            "전처리가 끝날 때까지 기다리세요",
+            "아직 완료된 결과가 없습니다. 전처리 시작 또는 진행 상태를 확인한 뒤 완료되면 결과 확인으로 이동하세요.",
+            control_key_prefix="preprocess-start",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5330,6 +6969,12 @@ def _page_results(ctx: dict | None) -> None:
     st.markdown("### 개정 전후 버전")
     st.caption("현재 연 규정을 기준으로 직전·이전·이후 개정판을 표시합니다.")
     _render_regulation_version_history(ctx["document"])
+
+    _render_beginner_action_marker(
+        2,
+        "'정리된 내용(청크)'와 '이슈' 탭을 확인하세요",
+        "먼저 청크 탭에서 원문과 전처리 결과를 좌우로 비교하고, 이어서 이슈 탭의 확인 필요 항목을 읽으세요.",
+    )
 
     summary_tab, structure_tab, chunks_tab, tables_tab, issues_tab, downloads_tab = st.tabs(
         ["요약", "문서 구조", "정리된 내용(청크)", "표·별표", "이슈", "내려받기"]
@@ -5601,11 +7246,52 @@ def _page_results(ctx: dict | None) -> None:
             st.download_button("품질 Markdown 다운로드", quality_md, file_name=f"{document_id}.quality.md")
 
     st.divider()
+    beginner_reviews_one_document = bool(
+        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+        and len(selected_document_ids) > 1
+    )
+    if beginner_reviews_one_document:
+        st.info(
+            f"초보자 안내에서는 선택한 {len(selected_document_ids):,}개 규정을 현재 화면의 규정부터 1개씩 검수합니다. "
+            "이 규정을 승인한 뒤 문서 목록에서 다음 규정을 선택하면 같은 순서로 이어갈 수 있습니다."
+        )
+    beginner_results_confirmation_required = bool(
+        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+    )
+    results_confirmation_key = _beginner_guide_results_confirmed_key(document_id)
+    results_confirmed = bool(st.session_state.get(results_confirmation_key))
+    if beginner_results_confirmation_required:
+        if not results_confirmed:
+            _render_beginner_action_marker(
+                2,
+                "청크와 이슈를 확인했음을 기록하세요",
+                "'정리된 내용(청크)'과 '이슈' 탭을 확인한 뒤 바로 아래 확인란을 선택하세요.",
+                control_key_prefix=results_confirmation_key,
+            )
+        results_confirmed = st.checkbox(
+            "청크·이슈를 확인했습니다.",
+            key=results_confirmation_key,
+            help="선택해야 초보자 안내의 결과 확인 단계가 완료되고 다음 검수 단계로 이동할 수 있습니다.",
+        )
+    if not beginner_results_confirmation_required or results_confirmed:
+        _render_beginner_action_marker(
+            2,
+            "결과 확인을 마쳤다면 검수 화면으로 이동하세요",
+            "품질·이슈·원문과 전처리 결과를 살펴본 뒤 바로 아래 버튼을 누르세요.",
+            control_key_prefix="results-goto-approval",
+        )
     _render_workflow_next_button(
-        f"선택한 {len(selected_document_ids):,}개 규정을 ③ 검수하고 승인으로 이동",
+        (
+            f"현재 규정 ③ 검수·승인으로 이동 (선택 {len(selected_document_ids):,}개 중 1개씩 진행)"
+            if beginner_reviews_one_document
+            else f"선택한 {len(selected_document_ids):,}개 규정을 ③ 검수하고 승인으로 이동"
+        ),
         NAV_APPROVAL,
         key="results-goto-approval",
-        disabled=not selected_document_ids,
+        disabled=(
+            not selected_document_ids
+            or (beginner_results_confirmation_required and not results_confirmed)
+        ),
     )
 
 
@@ -5638,6 +7324,14 @@ def _page_approval(ctx: dict | None) -> None:
     st.caption("Secure RAG review gate — 승인·색인된 내용만 AI가 답변 근거로 사용합니다.")
 
     selected_approval_contexts = _selected_approval_contexts(selected_document_ids, ctx)
+    selected_pending_document_ids = _selected_documents_pending_approval(
+        selected_document_ids,
+        selected_approval_contexts,
+    )
+    pending_label_by_document_id = {
+        str(approval_ctx.get("document_id") or ""): _workflow_document_label(approval_ctx["document"])
+        for approval_ctx in selected_approval_contexts
+    }
     if len(selected_document_ids) > 1:
         st.markdown(f"### 선택한 규정 {len(selected_document_ids):,}개 일괄 처리")
         st.caption(
@@ -5669,6 +7363,10 @@ def _page_approval(ctx: dict | None) -> None:
             ready_count = sum(bool(dict(entry["state"]).get("approve_enabled")) for entry in pending_entries)
             approval_ctx_chunks = list(approval_ctx["chunks"])
             approved_chunks = sum(1 for chunk in approval_ctx_chunks if _approval_status(chunk) == "approved")
+            approval_scope_state = _mcp_scope_document_state(
+                approval_ctx_chunks,
+                {"ready": approved_chunks > 0},
+            )
             workflow_review_rows.append(
                 {
                     "규정": _workflow_document_label(approval_ctx["document"]),
@@ -5678,7 +7376,9 @@ def _page_approval(ctx: dict | None) -> None:
                     "사람 확인": f"{human_complete}/{len(pending_entries)}",
                     "승인 청크": approved_chunks,
                     "상태": (
-                        "색인 복구 대기"
+                        "명시적으로 반려되어 MCP에서 제외됨"
+                        if approval_scope_state["state"] == "terminal-excluded"
+                        else "색인 복구 대기"
                         if pending_sync_batch_ids
                         else (
                             "승인 완료"
@@ -5691,6 +7391,16 @@ def _page_approval(ctx: dict | None) -> None:
                 }
             )
         st.dataframe(pd.DataFrame(workflow_review_rows), width="stretch", hide_index=True)
+        terminal_excluded_count = sum(
+            1
+            for row in workflow_review_rows
+            if row["상태"] == "명시적으로 반려되어 MCP에서 제외됨"
+        )
+        if terminal_excluded_count:
+            st.info(
+                f"선택한 규정 중 {terminal_excluded_count:,}개는 모든 활성 청크가 명시적으로 반려되어 "
+                "MCP에서 제외됩니다. 이는 검토 미완료가 아니며, 승인·색인된 다른 규정이 있으면 함께 MCP를 만들 수 있습니다."
+            )
 
         workflow_pending_count = sum(len(entries) for _, entries in workflow_review_entries)
         workflow_ai_complete_count = sum(
@@ -5730,6 +7440,14 @@ def _page_approval(ctx: dict | None) -> None:
             key=f"workflow-security-level-{document_id}",
             format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
         )
+        beginner_bulk_review_disabled = bool(
+            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+        )
+        if beginner_bulk_review_disabled:
+            st.info(
+                "초보자 안내 모드에서는 일괄 검수·승인·색인 버튼을 사용할 수 없습니다. "
+                "아래에서 청크별 원문과 전처리 결과를 비교한 뒤 AI 판단과 사람 확인을 각각 완료하세요."
+            )
         st.caption("전체 완료는 기존 개별 결정을 다시 일괄 적용합니다.")
         batch_review_cols = st.columns(2)
         if batch_review_cols[0].button(
@@ -5738,6 +7456,7 @@ def _page_approval(ctx: dict | None) -> None:
             disabled=(
                 not workflow_contexts_complete
                 or workflow_pending_count == 0
+                or beginner_bulk_review_disabled
             ),
             width="stretch",
         ):
@@ -5768,6 +7487,7 @@ def _page_approval(ctx: dict | None) -> None:
             disabled=(
                 not workflow_contexts_complete
                 or workflow_pending_count == 0
+                or beginner_bulk_review_disabled
             ),
             width="stretch",
         ):
@@ -5800,6 +7520,7 @@ def _page_approval(ctx: dict | None) -> None:
                 not workflow_contexts_complete
                 or workflow_pending_count == 0
                 or workflow_ai_complete_count >= workflow_pending_count
+                or beginner_bulk_review_disabled
             ),
             width="stretch",
         ):
@@ -5832,6 +7553,7 @@ def _page_approval(ctx: dict | None) -> None:
                 not workflow_contexts_complete
                 or workflow_pending_count == 0
                 or workflow_human_complete_count >= workflow_pending_count
+                or beginner_bulk_review_disabled
             ),
             width="stretch",
         ):
@@ -5865,7 +7587,8 @@ def _page_approval(ctx: dict | None) -> None:
             type="primary",
             key=f"workflow-approve-index-{document_id}",
             disabled=(
-                not workflow_contexts_complete
+                beginner_bulk_review_disabled
+                or not workflow_contexts_complete
                 or (
                     workflow_pending_count == 0
                     and workflow_deferred_sync_count == 0
@@ -6133,6 +7856,7 @@ def _page_approval(ctx: dict | None) -> None:
     status_cols[0].metric("전체 청크", f"{total_chunks:,}")
     status_cols[1].metric("승인된 청크 (Approved chunks)", f"{approved_count:,}")
     status_cols[2].metric("검수 주의 청크", f"{len(review_attention):,}", help="파서·표 관련 경고가 있어 사람이 꼭 봐야 하는 청크입니다.")
+    current_scope_state = _mcp_scope_document_state(chunks, mcp_connection_gate)
     if index_status_error:
         status_cols[3].metric("색인 상태", "확인 불가")
         st.warning(f"MCP index status could not be checked: {index_status_error}")
@@ -6143,7 +7867,12 @@ def _page_approval(ctx: dict | None) -> None:
         )
         if index_status and index_status.get("validation_error"):
             st.warning(f"Index validation: {index_status['validation_error']}")
-        if not mcp_connection_gate.get("ready"):
+        if current_scope_state["state"] == "terminal-excluded":
+            st.info(
+                "이 규정의 모든 활성 청크는 명시적으로 반려되어 MCP에서 제외됩니다. "
+                "검토 미완료가 아니지만, 이 규정만으로는 MCP를 만들 수 없습니다."
+            )
+        elif not mcp_connection_gate.get("ready"):
             st.warning(
                 "AI는 '승인 후 색인된' 내용만 볼 수 있습니다. 승인과 색인을 마친 뒤에도 숫자가 맞지 않으면 아래 '다시 색인하기'를 눌러 주세요.\n\n"
                 "Claude/MCP can answer only from approved chunks that are currently indexed. "
@@ -6225,6 +7954,14 @@ def _page_approval(ctx: dict | None) -> None:
     review_task_complete = ai_complete_count + human_complete_count
     st.markdown("### 현재 연 규정 한 번에 검수")
     st.caption("현재 규정 디렉터리에서 열어 둔 규정 한 개의 모든 미승인 청크에만 적용됩니다.")
+    beginner_bulk_review_disabled = bool(
+        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+    )
+    if beginner_bulk_review_disabled:
+        st.info(
+            "초보자 안내 모드에서는 일괄 검수 버튼을 사용할 수 없습니다. "
+            "아래에서 청크별 원문과 전처리 결과를 비교한 뒤 AI 판단과 사람 확인을 각각 완료하세요."
+        )
     st.progress(
         100 if review_task_total == 0 else int((review_task_complete / review_task_total) * 100),
         text=(
@@ -6238,7 +7975,7 @@ def _page_approval(ctx: dict | None) -> None:
         "현재 규정 AI 검수 완료",
         type="primary",
         key=f"ai-full-review-{document_id}",
-        disabled=not pending_review_states,
+        disabled=not pending_review_states or beginner_bulk_review_disabled,
         width="stretch",
     ):
         with _long_operation_status(
@@ -6270,7 +8007,7 @@ def _page_approval(ctx: dict | None) -> None:
         "현재 규정 사람 확인 완료",
         type="primary",
         key=f"human-full-review-{document_id}",
-        disabled=not pending_review_states,
+        disabled=not pending_review_states or beginner_bulk_review_disabled,
         width="stretch",
     ):
         with _long_operation_status(
@@ -6302,7 +8039,11 @@ def _page_approval(ctx: dict | None) -> None:
     if remaining_review_cols[0].button(
         "나머지 부분 AI 점검 전체 완료",
         key=f"ai-remaining-review-{document_id}",
-        disabled=not pending_review_states or ai_complete_count >= len(pending_review_states),
+        disabled=(
+            not pending_review_states
+            or ai_complete_count >= len(pending_review_states)
+            or beginner_bulk_review_disabled
+        ),
         width="stretch",
     ):
         with _long_operation_status(
@@ -6334,7 +8075,11 @@ def _page_approval(ctx: dict | None) -> None:
     if remaining_review_cols[1].button(
         "나머지 부분 사람 점검 전체 완료",
         key=f"human-remaining-review-{document_id}",
-        disabled=not pending_review_states or human_complete_count >= len(pending_review_states),
+        disabled=(
+            not pending_review_states
+            or human_complete_count >= len(pending_review_states)
+            or beginner_bulk_review_disabled
+        ),
         width="stretch",
     ):
         with _long_operation_status(
@@ -6419,6 +8164,30 @@ def _page_approval(ctx: dict | None) -> None:
         human_confirmed=bool(st.session_state.get(human_confirmed_key)),
     )
 
+    if approved_count < total_chunks and not bool(review_state["ai_confirmed"]):
+        pending_ai_item_id = next(
+            (item_id for item_id in item_ids if item_id not in ai_decisions),
+            "",
+        )
+        _render_beginner_action_marker(
+            3,
+            "AI 검증 항목을 먼저 판단하세요",
+            "아래 첫 번째 탭에서 각 항목을 반영하거나 반영하지 않을지 선택하세요. 이 판단만으로 승인되지는 않습니다.",
+            control_keys=(
+                _approval_ai_decision_control_keys(pending_ai_item_id)
+                if pending_ai_item_id
+                else ()
+            ),
+        )
+    elif (
+        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+        and approved_count < total_chunks
+        and not bool(review_state["human_confirmed"])
+    ):
+        st.info(
+            "다음으로 바로 아래 '2. 사람 검증 확인' 탭을 여세요. "
+            "원문과 전처리 결과를 비교하면 선택해야 할 확인란이 빨간색으로 표시됩니다."
+        )
     ai_tab, human_tab = st.tabs(
         [
             f"1. AI 검증 확인 {_approval_tab_badge(bool(review_state['ai_confirmed']))}",
@@ -6429,7 +8198,16 @@ def _page_approval(ctx: dict | None) -> None:
     with ai_tab:
         st.markdown("#### AI가 확인이 필요하다고 표시한 부분")
         counter_cols = st.columns(3)
-        if st.button("전체 AI 제안 반영 안 함", key=f"ai-bulk-skip-{document_id}"):
+        if st.button(
+            "전체 AI 제안 반영 안 함",
+            key=f"ai-bulk-skip-{document_id}",
+            disabled=beginner_bulk_review_disabled,
+            help=(
+                "초보자 안내 모드에서는 각 제안을 직접 확인하세요."
+                if beginner_bulk_review_disabled
+                else None
+            ),
+        ):
             summary = _approval_set_bulk_ai_decisions(
                 document_id=document_id,
                 chunks=chunks,
@@ -6457,11 +8235,12 @@ def _page_approval(ctx: dict | None) -> None:
                 top_cols[1].markdown(f"**위험도: {severity}**")
                 st.info(f"AI 제안: {item.get('suggestion')}")
                 action_cols = st.columns([1, 1, 3])
-                if action_cols[0].button("반영", key=f"ai-reflect-{item_id}"):
+                reflect_button_key, skip_button_key = _approval_ai_decision_control_keys(item_id)
+                if action_cols[0].button("반영", key=reflect_button_key):
                     ai_decisions[item_id] = "reflect"
                     st.session_state[ai_decisions_key] = ai_decisions
                     st.rerun()
-                if action_cols[1].button("반영 안 함", key=f"ai-skip-{item_id}"):
+                if action_cols[1].button("반영 안 함", key=skip_button_key):
                     ai_decisions[item_id] = "skip"
                     st.session_state[ai_decisions_key] = ai_decisions
                     st.rerun()
@@ -6527,6 +8306,17 @@ def _page_approval(ctx: dict | None) -> None:
             st.caption("이 청크의 경고: " + ", ".join(compare_chunk.warnings))
         if human_confirmed_widget_key not in st.session_state:
             st.session_state[human_confirmed_widget_key] = bool(st.session_state.get(human_confirmed_key))
+        if (
+            approved_count < total_chunks
+            and bool(review_state["ai_confirmed"])
+            and not bool(st.session_state.get(human_confirmed_key))
+        ):
+            _render_beginner_action_marker(
+                3,
+                "원문과 전처리 결과를 직접 확인하세요",
+                "좌우 내용을 비교한 뒤에만 바로 아래 확인란을 선택하세요.",
+                control_key_prefix=human_confirmed_widget_key,
+            )
         st.checkbox(
             "원본과 전처리 결과를 확인했습니다.",
             key=human_confirmed_widget_key,
@@ -6565,24 +8355,128 @@ def _page_approval(ctx: dict | None) -> None:
     reviewed_approval_entries = [
         entry for entry in pending_review_entries if bool(dict(entry["state"]).get("approve_enabled"))
     ]
-    if reviewed_approval_entries:
+    beginner_review_navigation = _beginner_pending_review_navigation(
+        pending_review_entries,
+        current_chunk_id=str(compare_chunk.chunk_id),
+        enabled=beginner_bulk_review_disabled,
+    )
+    beginner_all_pending_reviewed = bool(
+        beginner_review_navigation["all_reviewed"]
+    )
+    if beginner_review_navigation["enabled"]:
+        reviewed_count = int(beginner_review_navigation["reviewed_count"])
+        pending_count = int(beginner_review_navigation["total_count"])
+        st.progress(
+            100 if pending_count == 0 else int(reviewed_count * 100 / pending_count),
+            text=f"검수 완료 {reviewed_count}/{pending_count}",
+        )
+        next_pending_chunk_id = str(
+            beginner_review_navigation["next_chunk_id"] or ""
+        )
+        if next_pending_chunk_id:
+            next_pending_button_key = f"approval-next-pending-{document_id}"
+            _render_beginner_action_marker(
+                3,
+                "다음 미검수 청크로 이동하세요",
+                "현재 청크 검수가 끝났습니다. 승인 전에 남은 청크도 같은 순서로 확인하세요.",
+                control_keys=(next_pending_button_key,),
+            )
+            if st.button(
+                "다음 미검수 청크",
+                type="primary",
+                key=next_pending_button_key,
+                width="stretch",
+            ):
+                st.session_state[compare_key] = next_pending_chunk_id
+                st.rerun()
+        elif not beginner_all_pending_reviewed and pending_count:
+            st.info("현재 청크의 AI 판단과 사람 확인을 모두 마치면 다음 청크로 이동할 수 있습니다.")
+    if reviewed_approval_entries and (
+        not beginner_review_navigation["enabled"]
+        or beginner_all_pending_reviewed
+    ):
         st.info(
             f"현재 선택한 조항과 관계없이 검수 완료된 전체 미승인 규정·조항 "
             f"{len(reviewed_approval_entries):,}개가 한 번에 승인·색인됩니다."
         )
     approve_enabled = bool(review_state["approve_enabled"])
     override_reason = ""
-    if approve_enabled:
+    if beginner_review_navigation["enabled"] and not beginner_all_pending_reviewed:
+        st.warning("모든 미승인 청크를 검수한 뒤에 승인·색인 버튼이 활성화됩니다.")
+    elif approve_enabled:
         st.success("두 검증 시트를 모두 확인했습니다. 승인하고 색인할 수 있습니다.")
     else:
         st.warning("두 검증 시트가 아직 모두 확인되지 않았습니다. 필요하면 사유를 남기고 확인 없이 승인할 수 있습니다.")
-        with st.expander("확인 없이 승인해야 하는 경우", expanded=False):
-            override_reason = st.text_area(
-                "확인 생략 승인 사유",
-                key=override_reason_key,
-                placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
-            )
-    hold_col, approve_col, index_col = st.columns([1, 2, 2])
+        if not beginner_review_navigation["enabled"]:
+            with st.expander("확인 없이 승인해야 하는 경우", expanded=False):
+                override_reason = st.text_area(
+                    "확인 생략 승인 사유",
+                    key=override_reason_key,
+                    placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
+                )
+    approve_index_button_key = f"approval-approve-index-{document_id}"
+    if approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
+        _render_beginner_action_marker(
+            3,
+            "승인된 내용을 AI 검색에 등록하세요",
+            "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
+            control_key_prefix="quick-index-only-",
+        )
+    elif (
+        approved_count < total_chunks
+        and bool(review_state["approve_enabled"])
+        and (
+            not beginner_review_navigation["enabled"]
+            or beginner_all_pending_reviewed
+        )
+    ):
+        _render_beginner_action_marker(
+            3,
+            "검수한 내용만 승인하고 색인하세요",
+            "두 검증 시트의 확인 상태를 다시 보고 바로 아래 승인하고 색인 버튼을 누르세요.",
+            control_keys=(approve_index_button_key,),
+        )
+    reject_reason_key = _approval_chunk_state_key(
+        document_id,
+        str(compare_chunk.chunk_id),
+        "reject_reason",
+    )
+    reject_confirm_key = _approval_chunk_state_key(
+        document_id,
+        str(compare_chunk.chunk_id),
+        "reject_confirm",
+    )
+    reject_button_key = f"approval-reject-{document_id}-{compare_chunk.chunk_id}"
+    with st.expander("이 청크를 MCP에서 제외해야 하는 경우 (선택)", expanded=False):
+        st.caption(
+            "반려는 승인이나 색인이 아닙니다. 현재 선택한 청크만 더 이상 승인 대기로 남지 않는 "
+            "최종 제외(terminal exclusion) 상태가 되어 MCP 검색에 들어가지 않습니다. "
+            "규정의 모든 활성 청크를 반려하면 그 규정 전체가 MCP에서 제외됩니다."
+        )
+        _render_beginner_action_marker(
+            3,
+            "이 청크를 제외할 때만 사유와 확인을 입력하세요",
+            "반려할 이유를 적고 현재 선택 청크 1개가 맞는지 확인한 뒤, 아래 '이 청크 반려' 버튼을 누르세요.",
+            control_keys=(reject_reason_key, reject_confirm_key, reject_button_key),
+        )
+        rejection_reason = st.text_area(
+            "반려 사유 (필수)",
+            key=reject_reason_key,
+            max_chars=1000,
+            placeholder="예: 다른 규정의 조문이 잘못 합쳐져 MCP 검색에서 제외해야 함",
+            disabled=not compare_chunk_approvable,
+        )
+        rejection_confirmed = st.checkbox(
+            "현재 화면에서 선택한 청크 1개만 반려하여 MCP에서 제외하는 것을 확인했습니다.",
+            key=reject_confirm_key,
+            disabled=not compare_chunk_approvable,
+        )
+    rejection_ready = _chunk_rejection_ready(
+        reason=str(rejection_reason or ""),
+        confirmed=bool(rejection_confirmed),
+        approvable=compare_chunk_approvable,
+    )
+    hold_col, reject_col, approve_col, index_col = st.columns([1, 1.4, 2, 2])
     if hold_col.button("보류", key=f"approval-hold-{document_id}-{compare_chunk.chunk_id}"):
         hold_event = {
             "event": "held",
@@ -6593,10 +8487,49 @@ def _page_approval(ctx: dict | None) -> None:
         st.session_state[hold_events_key].append(hold_event)
         st.session_state[audit_preview_key].append(_approval_audit_preview_entry("보류 — 추가 확인 필요"))
         st.info("보류로 기록했습니다. 승인 전 미리보기 감사 기록에 남습니다.")
+    if reject_col.button(
+        "이 청크 반려",
+        key=reject_button_key,
+        disabled=not rejection_ready,
+        help="사유 입력과 현재 청크 1개 반려 확인을 모두 마쳐야 누를 수 있습니다.",
+    ):
+        try:
+            reject_review_chunks(
+                document_id,
+                RejectRequest(
+                    chunk_ids=[str(compare_chunk.chunk_id)],
+                    reason=str(rejection_reason).strip(),
+                    note="streamlit_explicit_single_chunk_rejection",
+                ),
+                local_auth,
+            )
+            st.session_state.pop(reject_reason_key, None)
+            st.session_state.pop(reject_confirm_key, None)
+            st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
+            _invalidate_document_context_cache(document_id)
+            st.success(
+                "현재 선택한 청크 1개를 반려했습니다. 승인·색인하지 않았으며 MCP 검색에서 제외됩니다."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"청크를 반려하지 못했습니다: {redact_sensitive_paths(str(exc))}")
 
     override_reason_text = str(override_reason or "").strip()
-    approval_target_entries = reviewed_approval_entries
-    if not approval_target_entries and compare_chunk_approvable and (approve_enabled or override_reason_text):
+    approval_target_entries = (
+        reviewed_approval_entries
+        if not beginner_review_navigation["enabled"]
+        or beginner_all_pending_reviewed
+        else []
+    )
+    if (
+        not approval_target_entries
+        and compare_chunk_approvable
+        and (approve_enabled or override_reason_text)
+        and (
+            not beginner_review_navigation["enabled"]
+            or beginner_all_pending_reviewed
+        )
+    ):
         approval_target_entries = [
             _approval_chunk_review_state_from_session(
                 document_id=document_id,
@@ -6605,14 +8538,21 @@ def _page_approval(ctx: dict | None) -> None:
                 agent_review_summary=agent_review_summary,
             )
         ]
-    can_approve = bool(approval_target_entries) and (
-        all(bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries)
-        or bool(override_reason_text)
+    can_approve = (
+        (
+            not beginner_review_navigation["enabled"]
+            or beginner_all_pending_reviewed
+        )
+        and bool(approval_target_entries)
+        and (
+            all(bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries)
+            or bool(override_reason_text)
+        )
     )
     if approve_col.button(
         "승인하고 색인",
         type="primary",
-        key=f"approval-approve-index-{document_id}",
+        key=approve_index_button_key,
         disabled=not can_approve or approved_count >= total_chunks,
     ):
         try:
@@ -6783,17 +8723,64 @@ def _page_approval(ctx: dict | None) -> None:
         for event in audit_preview[-10:]:
             st.caption(f"{event.get('timestamp')} · {event.get('message')}")
 
+    beginner_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
     show_advanced_approval = st.checkbox(
         "전산 담당자용 고급 승인 절차 보기",
         value=False,
         key=f"show-advanced-approval-{document_id}",
+        disabled=beginner_mode_active,
     )
+    if beginner_mode_active:
+        show_advanced_approval = False
     if not show_advanced_approval:
         st.divider()
+        beginner_current_document_incomplete = bool(
+            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+            and not _beginner_guide_completed_steps(ctx)[2]
+        )
+        beginner_selected_documents_incomplete = bool(
+            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+            and len(selected_document_ids) > 1
+            and selected_pending_document_ids
+        )
+        beginner_approval_incomplete = bool(
+            beginner_current_document_incomplete or beginner_selected_documents_incomplete
+        )
+        if beginner_selected_documents_incomplete:
+            pending_labels = [
+                pending_label_by_document_id.get(document_id, document_id)
+                for document_id in selected_pending_document_ids[:3]
+            ]
+            pending_examples = ", ".join(pending_labels)
+            pending_note = (
+                f" 남은 규정 예시: {pending_examples}"
+                if pending_examples
+                else ""
+            )
+            st.info(
+                f"초보자 안내 모드에서는 선택한 {len(selected_document_ids):,}개 규정이 "
+                "승인·색인되거나 명시적으로 반려되어 처리 방향이 모두 결정되어야 MCP 단계로 넘어갈 수 있습니다. "
+                f"아직 {len(selected_pending_document_ids):,}개 규정이 남았습니다.{pending_note}"
+            )
+        elif current_scope_state["state"] == "terminal-excluded":
+            st.info(
+                "이 규정은 모든 활성 청크가 명시적으로 반려되어 MCP에서 제외됩니다. "
+                "검토 미완료는 아니지만, MCP를 만들려면 승인·색인된 다른 규정을 함께 선택해야 합니다."
+            )
+        elif beginner_current_document_incomplete:
+            st.info("초보자 안내 모드에서는 모든 검수 결정을 마치고 승인·색인을 완료해야 다음 단계로 이동할 수 있습니다.")
+        else:
+            _render_beginner_action_marker(
+                3,
+                "승인·색인을 마쳤다면 MCP 생성으로 이동하세요",
+                "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
+                control_key_prefix="approval-goto-connect-simple",
+            )
         _render_workflow_next_button(
             "④ MCP 생성·AI 연결로 이동",
             NAV_MCP,
             key="approval-goto-connect-simple",
+            disabled=beginner_approval_incomplete,
         )
         return
 
@@ -6930,7 +8917,7 @@ def _page_approval(ctx: dict | None) -> None:
     approval_evidence_missing = [
         label for label, value in required_approval_evidence.items() if not str(value or "").strip()
     ]
-    official_approval_disabled = bool(approval_evidence_missing)
+    official_approval_disabled = bool(approval_evidence_missing) or beginner_mode_active
     if official_approval_disabled:
         st.warning(
             "승인하려면 검수 증빙이 필요합니다. 위 1번에서 '증빙 자동으로 채우기'를 먼저 실행하세요. "
@@ -7069,6 +9056,12 @@ def _page_approval(ctx: dict | None) -> None:
                 st.error(str(exc))
 
     st.divider()
+    _render_beginner_action_marker(
+        3,
+        "승인·색인을 마쳤다면 MCP 생성으로 이동하세요",
+        "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
+        control_key_prefix="approval-goto-connect",
+    )
     _render_workflow_next_button(
         f"선택한 {len(selected_document_ids):,}개 규정을 ④ MCP 생성·AI 연결로 이동",
         NAV_MCP,
@@ -7152,7 +9145,7 @@ def _render_ai_connection_status_banner(settings_snapshot, *, context: str) -> N
     review_level, review_message = _review_api_connection_status(settings_snapshot)
     st.markdown("**AI 검수 연결 상태**")
     if context == "preprocess":
-        st.caption("문서를 올리면 이 설정으로 AI 검수 초안을 만듭니다. (실제 사용량만큼 과금)")
+        st.caption("AI 추가 검수를 직접 선택하면 이 설정으로 검수 초안을 만듭니다. (실제 사용량만큼 과금)")
     else:
         st.caption("이 API 연결은 전처리(검수) 전용입니다. 실제 질의응답은 '④ MCP 생성·AI 연결'로 외부 AI를 붙여서 합니다.")
     _render_status_line(review_level, review_message)
@@ -7313,7 +9306,7 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
         st.session_state[AI_CONNECTION_STATE_KEY] = overrides
         st.session_state.pop(OPEN_API_KEY_DIALOG_KEY, None)
         set_runtime_settings_overrides(**overrides)
-        st.success("AI 검수 연결 정보를 저장했습니다. 이제 전처리 시 이 설정으로 검수 초안을 만듭니다.")
+        st.success("AI 검수 연결 정보를 저장했습니다. 전처리에서 AI 추가 검수를 선택한 경우에만 이 설정으로 검수 초안을 만듭니다.")
         st.rerun()
 
     if st.button("연결 초기화 (.env 값으로 되돌리기)", key="ai-connection-reset"):
@@ -7374,6 +9367,10 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
     local_auth = ctx["local_auth"]
     mcp_connection_gate = ctx["mcp_connection_gate"]
     mcp_connection_ready = bool(mcp_connection_gate.get("ready"))
+    current_mcp_scope_state = _mcp_scope_document_state(
+        list(ctx.get("chunks") or []),
+        mcp_connection_gate,
+    )
     missing_mcp_source_metadata = _missing_mcp_source_metadata(document)
     selected_profile_id = _selected_institution_profile_id()
     document_profile_id = str(getattr(document, "profile_id", "") or "").strip().lower()
@@ -7460,8 +9457,8 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
     with mcp_tab:
         st.markdown("### MCP client connection")
         st.caption(
-            "승인·인덱싱 후 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, "
-            "ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS)에 붙일 설정을 생성합니다."
+            "승인·인덱싱 후 Claude Code, Codex CLI·IDE, Claude Desktop, "
+            "ChatGPT 웹 원격 MCP 또는 Claude HTTPS에 붙일 설정을 생성합니다."
         )
         with st.expander("MCP/AI connection guide", expanded=False):
             st.markdown(
@@ -7469,20 +9466,21 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 - 이 프로그램은 승인된 규정 데이터베이스와 MCP 서버 명령, 클라이언트 설정 묶음을 만들어 줍니다. 실제 연결 등록은 담당자가 각 AI 프로그램에서 직접 승인해야 합니다.
                 - This program creates the approved local regulation database, MCP server command, and client setup bundle.
                 - Operator action is still required: register or approve the generated MCP connection in Claude Desktop, Claude Code, ChatGPT, Codex, or an internal AI platform.
-                - AI review draft generation is part of the main preprocessing flow. Set `OPENAI_API_KEY` and `AGENT_REVIEW_MODEL` to run it through the API.
+                - AI review is optional. Select AI additional review during preprocessing, then set `OPENAI_API_KEY` and `AGENT_REVIEW_MODEL` to run it through the API.
                 - If the API key is empty, preprocessing still records the selected AI review targets and waits for configuration instead of publishing unreviewed output.
                 - Codex can connect as an MCP client, but it is not a replacement API key for this product runtime.
                 """
             )
         if mcp_connection_ready:
-            st.success("MCP setup bundle gate passed: approved chunks are indexed and visible.")
-        else:
-            st.warning(
-                "승인·색인이 끝나야 설정 묶음을 만들 수 있습니다. "
-                "MCP setup bundle can be written only after approved chunks are indexed and visible. "
-                f"Current gate: {mcp_connection_gate.get('reason')}"
+            st.caption(
+                "현재 승인된 조문은 색인되어 있습니다. 아래에서 선택한 MCP 범위에 검토가 남아 있는지도 함께 확인합니다."
             )
-        if missing_mcp_source_metadata:
+        else:
+            st.info(
+                "이 문서의 승인·색인 상태를 확인했습니다. 아래에서 MCP 데이터 범위를 고르면 "
+                "원인과 다음 행동을 한국어로 안내합니다."
+            )
+        if missing_mcp_source_metadata and current_mcp_scope_state["state"] != "terminal-excluded":
             st.warning(
                 "MCP handoff bundle requires citation/source metadata before export. "
                 "Missing fields: "
@@ -7519,15 +9517,25 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
+        elif current_mcp_scope_state["state"] == "terminal-excluded":
+            st.info(
+                "이 규정은 모든 활성 청크가 명시적으로 반려되어 MCP에서 제외됩니다. "
+                "출처 메타데이터 보완과 재색인 대상에도 포함하지 않습니다."
+            )
         status_cols = st.columns(4)
         status_cols[0].metric("승인 청크", int(mcp_connection_gate.get("approved_count") or 0))
         status_cols[1].metric("MCP 노출 기록", int(mcp_connection_gate.get("mcp_visible_count") or 0))
         status_cols[2].metric("색인 상태", str(mcp_connection_gate.get("indexing_status") or "-"))
         status_cols[3].metric("오래된 기록", int(mcp_connection_gate.get("stale_count") or 0))
         st.caption(
-            "아래 버튼을 누르면 Claude Code, Codex CLI, Claude Desktop, ChatGPT Desktop, "
-            "ChatGPT 원격 MCP, ChatGPT 웹, Claude (HTTPS) 연결 파일 묶음이 생성됩니다."
+            "아래 버튼을 누르면 Claude Code, Codex CLI·IDE, Claude Desktop, "
+            "ChatGPT 웹 원격 MCP 또는 Claude HTTPS 연결 파일 묶음이 생성됩니다."
         )
+        scope_key = f"mcp-data-scope-{document_id}"
+        if scope_key not in st.session_state and st.session_state.get(
+            BEGINNER_GUIDE_ENABLED_KEY
+        ):
+            st.session_state[scope_key] = "current_document"
         mcp_scope = st.radio(
             "MCP 데이터 범위",
             ["selected_documents", "current_document", "selected_institution"],
@@ -7536,7 +9544,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 "current_document": "현재 연 규정만",
                 "selected_institution": "선택 기관의 승인 규정 전체",
             }[value],
-            key=f"mcp-data-scope-{document_id}",
+            key=scope_key,
             horizontal=True,
         )
         workflow_documents_by_id = {
@@ -7553,17 +9561,24 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             scope_documents = [document]
         else:
             scope_documents = _documents_for_selected_institution()
-        missing_mcp_source_metadata = sorted(
-            {
-                field
-                for scope_document in scope_documents
-                for field in _missing_mcp_source_metadata(scope_document)
-            }
-        )
         scope_document_ids = [
             str(getattr(scope_document, "document_id", "") or "")
             for scope_document in scope_documents
         ]
+        scope_gate = _workflow_mcp_gate_summary(scope_document_ids, ctx)
+        visible_scope_documents = _mcp_visible_scope_documents(scope_documents, scope_gate)
+        visible_scope_document_ids = {
+            str(getattr(item, "document_id", "") or "").strip()
+            for item in visible_scope_documents
+            if str(getattr(item, "document_id", "") or "").strip()
+        }
+        missing_mcp_source_metadata = sorted(
+            {
+                field
+                for scope_document in visible_scope_documents
+                for field in _missing_mcp_source_metadata(scope_document)
+            }
+        )
         kordoc_command = str(getattr(settings, "kordoc_table_command", "") or "")
         command_refresh_key = f"kordoc_command_status_refreshed:{kordoc_command}"
         if not st.session_state.get(command_refresh_key):
@@ -7571,11 +9586,15 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.session_state[command_refresh_key] = True
         kordoc_preflight = _mcp_kordoc_preflight(
             repository,
-            scope_document_ids,
+            sorted(visible_scope_document_ids),
             command=kordoc_command,
         )
         if kordoc_preflight["required_document_count"]:
             st.markdown("#### Kordoc 표 파싱 사전 점검")
+            st.caption(
+                "공식 MCP 파일 묶음에는 PDF·HWP·HWPX·DOCX 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다. "
+                "Kordoc 미설치 상태에서 처리한 문서는 새 초안으로 재전처리·검수·승인해야 합니다."
+            )
             st.dataframe(
                 pd.DataFrame(
                     [
@@ -7614,19 +9633,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"기존 승인본·승인 기록·색인은 그대로 보존됩니다 (명령={command_label}, 버전={version})."
                     )
                     institution_history_scope = mcp_scope == "selected_institution"
-                    automatic_single = len(missing_document_ids) == 1 and not institution_history_scope
-                    attempt_key = (
-                        _kordoc_auto_reprocess_attempt_key(repository, missing_document_ids[0])
-                        if automatic_single
-                        else ""
-                    )
-                    automatic_trigger = bool(
-                        automatic_single
-                        and attempt_key
-                        and not st.session_state.get(attempt_key)
-                    )
-                    if automatic_trigger:
-                        st.session_state[attempt_key] = True
+                    single_reprocess = len(missing_document_ids) == 1 and not institution_history_scope
                     retry_trigger = False
                     if institution_history_scope:
                         st.info(
@@ -7637,16 +9644,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         retry_trigger = st.button(
                             (
                                 "설치된 Kordoc으로 안전 재전처리 다시 실행"
-                                if automatic_single
+                                if single_reprocess
                                 else f"증거 없는 규정 {len(missing_document_ids):,}개 안전 재전처리"
                             ),
                             key=f"kordoc-safe-reprocess-{document_id}-{mcp_scope}",
                             type="primary",
                             help="기존 문서를 덮어쓰지 않고 새 draft 문서 ID에서 처리합니다.",
                         )
-                    if automatic_trigger or retry_trigger:
-                        if retry_trigger and attempt_key:
-                            st.session_state[attempt_key] = True
+                    if retry_trigger:
                         try:
                             with _long_operation_status(
                                 "Kordoc 안전 재전처리 중…",
@@ -7704,19 +9709,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                             st.error(redact_sensitive_paths(str(exc)))
                             st.info("기존 승인본은 변경되지 않았습니다. 원본과 Kordoc 상태를 확인한 뒤 다시 시도해 주세요.")
                 else:
-                    auto_install_result: dict[str, Any] | None = None
-                    auto_install_key = "kordoc_auto_install_attempted"
-                    if not bool(st.session_state.get(auto_install_key)):
-                        st.session_state[auto_install_key] = True
-                        with st.spinner("Kordoc이 없어 자동 설치·검증을 시도하는 중..."):
-                            auto_install_result = _run_kordoc_installer()
-                        if auto_install_result.get("ok"):
-                            kordoc_table_command_status.cache_clear()
-                            st.success("Kordoc 자동 설치·검증이 완료됐습니다. 명령 상태를 다시 확인합니다.")
-                            st.rerun()
                     st.error(
                         f"Kordoc 명령({command_label})을 현재 실행 환경에서 찾을 수 없습니다. "
-                        "자동 설치가 실패했으면 Node.js LTS/npm을 확인한 뒤 다시 시도하세요."
+                        "Node.js LTS/npm을 확인한 뒤, 아래 설치 버튼에 동의하면 준비할 수 있습니다."
                     )
                     if st.button(
                         "Kordoc 설치·검증 다시 실행",
@@ -7727,10 +9722,12 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                             install_result = _run_kordoc_installer()
                         if install_result.get("ok"):
                             kordoc_table_command_status.cache_clear()
-                            st.success("Kordoc 설치·검증이 완료됐습니다. 화면을 새로 고쳐 명령 상태를 다시 확인합니다.")
+                            st.success(
+                                "Kordoc 설치·검증이 완료됐습니다. 새 PATH를 적용하려면 "
+                                f"{_application_restart_instruction()} 그 뒤 새 초안을 다시 전처리해야 합니다."
+                            )
                             if install_result.get("output"):
                                 st.code(str(install_result["output"]), language="text")
-                            st.rerun()
                         else:
                             error_code = str(install_result.get("error") or "installer_failed")
                             st.error(
@@ -7739,9 +9736,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                             )
                             if install_result.get("output"):
                                 st.code(str(install_result["output"]), language="text")
-                    elif auto_install_result and auto_install_result.get("output"):
-                        st.caption("자동 설치 시도 결과")
-                        st.code(str(auto_install_result["output"]), language="text")
                 missing_ids = ", ".join(missing_document_ids[:10])
                 if missing_ids:
                     st.info(
@@ -7750,24 +9744,107 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     )
         mcp_export_document_id = document_id if mcp_scope == "current_document" else None
         mcp_export_document_ids = selected_document_ids if mcp_scope == "selected_documents" else None
-        selected_scope_gate = (
-            _workflow_mcp_gate_summary(selected_document_ids, ctx)
-            if mcp_scope == "selected_documents"
-            else None
-        )
-        if selected_scope_gate is not None:
+        if mcp_scope in {"selected_documents", "selected_institution"}:
             st.markdown("#### 선택 규정 MCP 준비 상태")
-            st.dataframe(pd.DataFrame(selected_scope_gate["rows"]), width="stretch", hide_index=True)
-            if not selected_scope_gate["ready"]:
-                st.warning("선택한 모든 규정의 검수·승인·색인을 완료해야 규정이 빠지지 않은 MCP를 만들 수 있습니다.")
-        mcp_bundle_ready = bool(scope_documents) and bool(kordoc_preflight["ready"]) and (
-            bool(selected_scope_gate and selected_scope_gate["ready"])
-            if mcp_scope == "selected_documents"
-            else mcp_connection_ready
+            st.dataframe(pd.DataFrame(scope_gate["rows"]), width="stretch", hide_index=True)
+            if (
+                not scope_gate["ready"]
+                and not scope_gate.get("blocking_document_ids")
+            ):
+                st.warning(
+                    "범위에 포함될 규정은 승인·색인이 끝나 있어야 하고, 제외될 규정은 명시적으로 반려되어야 "
+                    "규정이 빠지지 않은 MCP를 만들 수 있습니다."
+                )
+            terminal_excluded_count = len(scope_gate.get("terminal_excluded_document_ids") or [])
+            if terminal_excluded_count:
+                st.info(
+                    f"이 범위의 {terminal_excluded_count:,}개 규정은 모든 활성 청크가 명시적으로 반려되어 "
+                    "MCP에서 제외됩니다. 검토 미완료가 아니며, MCP 생성에는 승인·색인된 규정이 최소 1개 필요합니다."
+                )
+            blocking_document_ids = [
+                str(blocking_document_id or "").strip()
+                for blocking_document_id in scope_gate.get("blocking_document_ids") or []
+                if str(blocking_document_id or "").strip()
+            ]
+            if blocking_document_ids:
+                scope_documents_by_id = {
+                    str(getattr(scope_document, "document_id", "") or ""): scope_document
+                    for scope_document in scope_documents
+                }
+                blocking_labels = [
+                    _workflow_document_label(scope_documents_by_id[blocking_document_id])
+                    if blocking_document_id in scope_documents_by_id
+                    else blocking_document_id
+                    for blocking_document_id in blocking_document_ids[:3]
+                ]
+                first_blocking_document_id = blocking_document_ids[0]
+                first_blocking_gate = dict(
+                    dict(scope_gate.get("gate_by_document_id") or {}).get(
+                        first_blocking_document_id
+                    )
+                    or {}
+                )
+                first_blocking_pending_count = int(
+                    dict(scope_gate.get("pending_review_count_by_document_id") or {}).get(
+                        first_blocking_document_id
+                    )
+                    or 0
+                )
+                if not _mcp_gate_guidance_items(
+                    first_blocking_gate,
+                    pending_review_count=first_blocking_pending_count,
+                ):
+                    first_blocking_gate = {"reason": "not_ready"}
+                _render_mcp_bundle_blocking_guidance(
+                    document_id=first_blocking_document_id,
+                    scope=mcp_scope,
+                    gate=first_blocking_gate,
+                    pending_review_count=first_blocking_pending_count,
+                    kordoc_ready=bool(kordoc_preflight["ready"]),
+                    blocking_labels=blocking_labels,
+                    navigation_document_id=first_blocking_document_id,
+                )
+        if mcp_scope == "current_document":
+            current_pending_review_count = sum(
+                1
+                for chunk in ctx.get("chunks") or []
+                if str(getattr(chunk, "approval_status", "") or "").strip().casefold()
+                in APPROVABLE_CHUNK_STATUSES
+            )
+            if scope_gate.get("terminal_excluded_document_ids"):
+                st.info(
+                    "이 규정의 모든 활성 청크는 명시적으로 반려되어 MCP에서 제외됩니다. "
+                    "검토 미완료는 아니지만, 이 규정만 선택해서는 MCP를 만들 수 없습니다."
+                )
+            else:
+                _render_mcp_bundle_blocking_guidance(
+                    document_id=document_id,
+                    scope=mcp_scope,
+                    gate=mcp_connection_gate,
+                    pending_review_count=current_pending_review_count,
+                    kordoc_ready=bool(kordoc_preflight["ready"]),
+                )
+        elif (
+            not scope_gate.get("blocking_document_ids")
+            and not kordoc_preflight["ready"]
+        ):
+            _render_mcp_bundle_blocking_guidance(
+                document_id=document_id,
+                scope=mcp_scope,
+                gate={"reason": "approved_chunks_indexed"},
+                kordoc_ready=False,
+                pending_review_count=0,
+            )
+        mcp_bundle_ready = (
+            bool(scope_documents)
+            and bool(kordoc_preflight["ready"])
+            and bool(scope_gate["ready"])
         )
+        if mcp_bundle_ready:
+            st.success("선택한 MCP 범위의 검토·승인·색인과 표 파싱 품질 확인이 모두 끝났습니다.")
         mcp_connection_target_labels = {
             "claude-code": "Claude Code",
-            "codex": "ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)",
+            "codex": "Codex CLI / Codex IDE",
             "claude-desktop": "Claude Desktop",
             "chatgpt-remote": "ChatGPT · Vercel HTTPS MCP",
             "claude-api": "Claude · Vercel HTTPS MCP",
@@ -7782,18 +9859,32 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         mcp_connection_target_key = f"mcp-connection-target-{document_id}"
         if st.session_state.get(mcp_connection_target_key) not in {None, *mcp_connection_target_options}:
             del st.session_state[mcp_connection_target_key]
+        beginner_target_choice_required = bool(
+            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+        ) and st.session_state.get(mcp_connection_target_key) not in mcp_connection_target_options
+        if beginner_target_choice_required:
+            _render_beginner_action_marker(
+                4,
+                "먼저 실제 사용할 AI 앱을 고르세요",
+                "Claude Code, Codex CLI·IDE, Claude Desktop, ChatGPT 원격 또는 Claude 원격 중 하나를 직접 선택하세요.",
+                control_key_prefix=mcp_connection_target_key,
+            )
         mcp_connection_target = st.radio(
             "연결할 AI 앱",
             mcp_connection_target_options,
             format_func=lambda value: mcp_connection_target_labels.get(value, value),
             key=mcp_connection_target_key,
             horizontal=True,
+            index=None if beginner_target_choice_required else 0,
         )
         st.caption(
             "로컬 연결은 클라이언트의 MCP Settings, 공식 CLI 또는 설정 파일에 직접 등록합니다. "
             "원격 연결은 Vercel에 배포한 HTTPS `/mcp` endpoint를 Connector에 등록합니다. "
             "연결 설정과 비밀값은 대화에 입력하지 마세요."
         )
+        if mcp_connection_target is None:
+            st.info("위에서 실제 사용할 AI 앱을 하나 선택하면 MCP 이름과 저장 위치 설정이 나타납니다.")
+            return
         if mcp_scope == "selected_institution":
             st.info(
                 f"선택 기관 '{selected_profile_id}'의 승인·색인된 규정을 하나의 MCP runtime bundle로 묶습니다. "
@@ -7821,12 +9912,13 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             mcp_transport = "streamable-http"
         else:
             st.info(
-                "MCP 로컬은 이 PC에서 stdio로 실행됩니다. ChatGPT Desktop은 Settings > MCP servers에서 생성된 값을 등록하고, "
-                "Codex CLI는 생성된 TOML을 적용하며 Claude Code는 공식 CLI 등록 PowerShell을 실행합니다. "
+                "MCP 로컬은 이 PC에서 stdio로 실행됩니다. Codex CLI·IDE는 생성된 TOML을 "
+                "적용하며 Claude Code는 공식 CLI 등록 PowerShell을 실행합니다. "
                 "Claude Desktop은 생성된 `mcpServers` 설정을 사용자 설정에 병합합니다. "
+                "ChatGPT는 로컬 STDIO에 직접 연결하지 않으므로 원격 HTTPS 대상을 선택해야 합니다. "
                 "등록과 현재 대화의 도구 노출은 서로 다른 상태입니다."
             )
-            mcp_profile_options = ["bundle", "chatgpt-desktop-local", "claude-desktop", "claude-code"]
+            mcp_profile_options = ["bundle", "claude-desktop", "claude-code"]
             mcp_transport = "stdio"
         st.caption(f"Selected MCP transport: {mcp_transport}")
         mcp_profile = "bundle"
@@ -7834,8 +9926,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             mcp_profile = mcp_connection_target
         elif mcp_connection_target == "claude-api":
             mcp_profile = "claude-remote"
-        elif mcp_connection_target == "chatgpt-desktop-local":
-            mcp_profile = "chatgpt-desktop-local"
         elif mcp_connection_target == "chatgpt-remote":
             mcp_profile = "chatgpt-remote"
         if mcp_profile not in mcp_profile_options:
@@ -7846,8 +9936,26 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         mcp_target_ready = True
         if mcp_mode == "http":
             st.markdown("#### Vercel MCP HTTPS 주소")
+            if mcp_connection_target == "chatgpt-remote":
+                st.info(
+                    "ChatGPT는 웹의 Developer mode에서 원격 MCP 앱을 등록합니다. "
+                    "Pro는 개발자 모드에서 read/fetch 도구 연결이 가능하고, full MCP는 "
+                    "Business·Enterprise·Edu에서 제공됩니다. 워크스페이스 관리자 승인과 "
+                    "권한 설정에 따라 메뉴가 보이지 않을 수 있습니다. ChatGPT는 로컬 MCP에 "
+                    "직접 연결하지 않으며, 사설망 서버에는 Secure MCP Tunnel이 필요합니다."
+                )
+                st.link_button(
+                    "OpenAI 공식 ChatGPT MCP 지원 범위",
+                    "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
+                    key=f"openai-chatgpt-mcp-help-{document_id}",
+                )
+                st.link_button(
+                    "OpenAI Secure MCP Tunnel 안내",
+                    "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
+                    key=f"openai-secure-mcp-tunnel-{document_id}",
+                )
             mcp_public_url_input = st.text_input(
-                "배포된 Vercel HTTPS `/mcp` 주소 (필수)",
+                "배포된 Vercel HTTPS `/mcp` 주소 (첫 배포 전에는 비워도 됨)",
                 value="",
                 placeholder="https://your-project.vercel.app/mcp",
                 key=f"mcp-public-url-{document_id}",
@@ -7858,20 +9966,22 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 public_url=mcp_public_url_input,
             )
             st.markdown("**생성된 MCP HTTP URL**")
-            st.code(mcp_http_url, language=None)
             if mcp_http_url.startswith("https://"):
+                st.code(mcp_http_url, language=None)
                 st.success("공개 HTTPS MCP URL이 연결 설정과 생성 파일에 포함됩니다.")
             else:
-                mcp_target_ready = False
+                st.code("아직 없음 — 배포 준비 묶음부터 생성하세요.", language=None)
                 st.warning(
-                    "ChatGPT와 Claude의 원격 MCP에는 Vercel에 배포된 외부 접근 가능 HTTPS `/mcp` 주소가 필요합니다."
+                    "아직 HTTPS 주소가 없습니다. 아래에서 **배포 준비용 MCP 묶음**을 먼저 "
+                    "만든 뒤 Vercel에 배포하세요. 고정 `https://.../mcp` 주소가 생기면 "
+                    "이 화면으로 돌아와 주소를 넣고 묶음을 다시 만들어야 실제 연결할 수 있습니다."
                 )
         else:
             mcp_http_url = ""
             st.markdown("#### 2. MCP 로컬 연결")
             st.caption(
-                "생성되는 stdio 실행 파일로 같은 PC의 ChatGPT Desktop 로컬 direct MCP, "
-                "Codex CLI, Claude Desktop, Claude Code에 연결합니다. HTTPS 주소는 필요하지 않습니다."
+                "생성되는 stdio 실행 파일로 같은 PC의 Codex CLI·IDE, Claude Desktop, "
+                "Claude Code에 연결합니다. HTTPS 주소는 필요하지 않습니다."
             )
 
         with st.expander("고급 설정: 연결 프로그램 선택", expanded=False):
@@ -7881,10 +9991,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 index=mcp_profile_options.index(mcp_profile),
                 key=f"mcp-client-profile-{document_id}-{mcp_mode}",
             )
-        mcp_public_url = mcp_http_url if mcp_mode == "http" else ""
+        mcp_public_url = (
+            mcp_http_url
+            if mcp_mode == "http" and mcp_http_url.startswith("https://")
+            else ""
+        )
         mcp_bundle_dir_key = f"mcp-bundle-dir-{document_id}"
         if mcp_bundle_dir_key not in st.session_state:
-            st.session_state[mcp_bundle_dir_key] = "reports/mcp_connection_bundle"
+            st.session_state[mcp_bundle_dir_key] = _default_mcp_bundle_directory()
         st.button(
             "Windows 탐색기에서 저장 폴더 선택",
             key=f"select-mcp-bundle-dir-{document_id}",
@@ -7895,7 +10009,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         if picker_error:
             st.error(picker_error)
         if not str(st.session_state.get(mcp_bundle_dir_key) or "").strip():
-            st.session_state[mcp_bundle_dir_key] = "reports/mcp_connection_bundle"
+            st.session_state[mcp_bundle_dir_key] = _default_mcp_bundle_directory()
         mcp_bundle_dir = st.text_input(
             "MCP 파일 묶음을 만들 폴더",
             key=mcp_bundle_dir_key,
@@ -7910,8 +10024,25 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             }[value],
             key=f"mcp-save-mode-{document_id}",
             horizontal=True,
-            help="AI 앱 연결은 생성된 폴더를 사용합니다. ZIP은 다른 PC나 담당자에게 전달할 때만 필요합니다.",
+            help=(
+                "AI 앱 연결은 생성된 폴더를 사용합니다. ZIP은 다른 PC나 담당자에게 전달할 때만 "
+                "필요하며, 다른 PC에서 로컬 STDIO로 실행하려면 그 PC에 Python 3.11 이상이 필요합니다."
+            ),
         )
+        if mcp_save_mode == "folder-and-zip" and mcp_mode == "stdio":
+            st.info(
+                "전달용 ZIP을 다른 Windows PC에서 로컬 STDIO로 실행하려면 대상 PC에 "
+                "Python 3.11 이상을 설치해야 합니다. 'Python 설치 불필요'는 이 PC에 있는 "
+                "Windows 실행판과 생성 폴더를 함께 사용하는 경우에만 해당합니다."
+            )
+        mcp_handoff_wheel_path = _operator_handoff_wheel_path()
+        if mcp_save_mode == "folder-and-zip" and mcp_handoff_wheel_path is None:
+            mcp_target_ready = False
+            st.warning(
+                "다른 PC에서 설치할 wheel 파일이 없어 전달용 ZIP을 만들 수 없습니다. "
+                "소스 실행은 먼저 `python -m build --wheel`을 실행하고, Windows 실행판은 "
+                "공식 portable ZIP을 다시 받아 주세요. 이 PC에서만 쓸 경우 '폴더만 저장'을 선택할 수 있습니다."
+            )
         if st.button("Windows 탐색기에서 현재 저장 폴더 열기", key=f"open-mcp-bundle-dir-{document_id}"):
             try:
                 _open_directory_in_explorer(mcp_bundle_output_dir)
@@ -7926,6 +10057,25 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.caption(f"최종 폴더 저장 위치: {mcp_bundle_output_dir}")
         suggested_mcp_server_name = _default_mcp_server_name(mcp_bundle_output_dir, selected_profile_id)
         mcp_server_name_key = f"mcp-server-name-{document_id}"
+        current_mcp_server_name = str(
+            st.session_state.get(mcp_server_name_key) or ""
+        ).strip()
+        current_normalized_mcp_server_name = _normalize_mcp_server_name(
+            current_mcp_server_name
+        )
+        if (
+            not current_mcp_server_name
+            or current_normalized_mcp_server_name != current_mcp_server_name
+        ):
+            _render_beginner_action_marker(
+                4,
+                "먼저 MCP 이름을 입력하세요",
+                (
+                    "예시를 참고해 영문 소문자·숫자·하이픈·밑줄·점만 사용하세요. "
+                    "이 이름이 실제 AI 앱의 MCP 목록에 표시됩니다."
+                ),
+                control_key_prefix=mcp_server_name_key,
+            )
         mcp_server_name = st.text_input(
             "생성할 MCP 이름 (필수 입력)",
             key=mcp_server_name_key,
@@ -8013,13 +10163,40 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         }
         mcp_target_file_key = mcp_target_file_keys.get(mcp_connection_target, "connect")
         st.markdown("#### 최종 산출물 생성")
-        st.caption("일반 사용자는 아래 버튼만 누르면 됩니다. JSON과 명령어는 아래 전산 담당자용 영역에 숨겨져 있습니다.")
+        st.caption(
+            "④ MCP 생성·업데이트 한 번으로 선택 범위의 규정 목록·목차·조문 계층 색인과 "
+            "runtime manifest를 자동 생성합니다. 개별 규정 파일 여러 개와 통합 규정집 모두 동일하게 처리됩니다."
+        )
+        if mcp_mode == "http" and not mcp_public_url:
+            st.caption(
+                "지금 버튼은 승인 데이터와 Vercel 배포 준비 파일을 만듭니다. 배포 후 생긴 "
+                "HTTPS `/mcp` 주소를 위에 입력해 다시 생성해야 AI 연결 설정이 완성됩니다."
+            )
+        else:
+            st.caption("일반 사용자는 아래 버튼만 누르면 됩니다. JSON과 명령어는 아래 전산 담당자용 영역에 숨겨져 있습니다.")
+        if not _mcp_bundle_created(ctx):
+            if mcp_bundle_ready and not mcp_profile_scope_mismatch and mcp_target_ready:
+                _render_beginner_action_marker(
+                    4,
+                    "MCP 파일 묶음을 만드세요",
+                    "연결할 AI와 저장 위치를 확인한 뒤 바로 아래 버튼을 누르세요.",
+                    control_key_prefix="write-mcp-bundle-",
+                )
+            else:
+                _render_beginner_action_marker(
+                    4,
+                    "MCP 생성 조건을 먼저 확인하세요",
+                    "바로 위 경고의 미완료 항목을 해결하면 MCP 파일 묶음 만들기 버튼이 활성화됩니다.",
+                )
         if st.button(
             "MCP로 쓸 파일 묶음 만들기",
             key=f"write-mcp-bundle-{document_id}",
             type="primary",
             disabled=not mcp_bundle_ready or mcp_profile_scope_mismatch or not mcp_target_ready,
         ):
+            # A regeneration attempt invalidates the previous completion proof
+            # immediately.  Only the final successful stage writes fresh state.
+            _clear_mcp_bundle_states(document_id, mcp_scope)
             try:
                 _ensure_mcp_output_directory_writable(mcp_bundle_output_dir)
                 bundle_progress = st.progress(0, text="MCP 묶음 생성 준비 0%")
@@ -8047,7 +10224,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 if missing_mcp_source_metadata:
                     _bundle_stage(10, "누락된 로컬 출처 정보 자동 보완")
                     documents_to_patch = [
-                        item for item in scope_documents if _missing_mcp_source_metadata(item)
+                        item
+                        for item in visible_scope_documents
+                        if _missing_mcp_source_metadata(item)
                     ]
                     patch_total = len(documents_to_patch)
                     patched_document_ids: list[str] = []
@@ -8162,7 +10341,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 st.caption(
                     f"기관 규정 {runtime_data.get('regulation_count', 0)}개 · "
                     f"개정판 {runtime_data.get('regulation_version_count', 0)}개 · "
-                    f"목차 노드 {runtime_data.get('toc_node_count', 0)}개를 색인했습니다."
+                    f"목차 노드 {runtime_data.get('toc_node_count', 0)}개와 조문 계층 색인을 자동 생성했습니다."
                 )
                 _bundle_stage(78, "MCP 연결 설정 JSON 생성")
                 bundle_config = _direct_python_mcp_config(
@@ -8212,30 +10391,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 desktop_local_config_path = Path(
                     str(files["chatgpt_desktop_local"])
                 )
-                desktop_registration = (
-                    _read_chatgpt_codex_desktop_registration(
-                        desktop_local_config_path
-                    )
-                )
-                if mcp_mode == "local":
-                    connection_display_value = json.dumps(
-                        {
-                            "name": desktop_registration.get("name"),
-                            "transport": desktop_registration.get("transport"),
-                            "command": desktop_registration.get("command"),
-                            "args": desktop_registration.get("arguments") or [],
-                            "cwd": desktop_registration.get("working_directory"),
-                            "env": desktop_registration.get("environment") or {},
-                            "env_passthrough": (
-                                desktop_registration.get(
-                                    "environment_passthrough"
-                                )
-                                or []
-                            ),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
                 selected_target_file = files.get(mcp_target_file_key)
                 local_server = (bundle_config.get("quickstart") or {}).get("run_local_stdio_server") or {}
                 _write_direct_python_quickstart_scripts(
@@ -8273,6 +10428,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     zip_path, zip_fallback_used = _write_operator_mcp_bundle_zip(
                         mcp_bundle_output_dir,
                         mcp_bundle_zip,
+                        wheel_path=mcp_handoff_wheel_path,
                         progress_callback=_zip_progress,
                     )
                     _bundle_stage(99, "최종 ZIP 파일 압축 완료")
@@ -8282,18 +10438,57 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     st.warning(
                         f"기존 ZIP 파일이 사용 중이어서 새 이름으로 저장했습니다: {Path(str(zip_path)).name}"
                     )
+                runtime_document_ids = sorted(
+                    {
+                        str(value or "").strip()
+                        for value in runtime_data.get("document_ids") or scope_document_ids
+                        if str(value or "").strip()
+                    }
+                )
+                connection_target_file_sha256 = _operator_file_sha256(
+                    selected_target_file
+                )
+                if not connection_target_file_sha256:
+                    raise RuntimeError(
+                        "선택한 AI 앱의 연결 설정 파일을 생성하지 못했습니다. "
+                        "불완전한 묶음은 완료로 표시하지 않습니다."
+                    )
+                setup_file_sha256 = {
+                    file_key: _operator_file_sha256(
+                        mcp_bundle_output_dir / filename
+                    )
+                    for file_key, filename in MCP_COMPLETION_SETUP_FILES.items()
+                }
+                if not all(setup_file_sha256.values()):
+                    raise RuntimeError(
+                        "필수 MCP 연결 스크립트를 완전하게 생성하지 못했습니다. "
+                        "불완전한 묶음은 완료로 표시하지 않습니다."
+                    )
+                zip_sha256 = _operator_file_sha256(zip_path) if zip_path else ""
+                if mcp_save_mode == "folder-and-zip" and not zip_sha256:
+                    raise RuntimeError(
+                        "전달용 ZIP 파일을 완전하게 생성하지 못했습니다. "
+                        "불완전한 묶음은 완료로 표시하지 않습니다."
+                    )
                 st.session_state[_mcp_bundle_state_key(document_id, mcp_scope)] = {
                     "written": True,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
                     "document_id": document_id,
                     "scope": mcp_scope,
                     "export_document_id": mcp_export_document_id,
-                    "export_document_ids": mcp_export_document_ids or [],
+                    "export_document_ids": runtime_document_ids,
+                    "scope_revision_signature": [
+                        [current_document_id, _document_context_revision(current_document_id)]
+                        for current_document_id in runtime_document_ids
+                    ],
                     "profile_id": selected_profile_id,
                     "server_name": mcp_server_name,
                     "tenant_id": document_tenant_id,
                     "bundle_dir": str(mcp_bundle_output_dir),
                     "zip": str(zip_path) if zip_path else "",
+                    "zip_sha256": zip_sha256,
                     "save_mode": mcp_save_mode,
+                    "setup_file_sha256": setup_file_sha256,
                     "runtime_data_dir": str(mcp_runtime_data_dir),
                     "runtime_record_count": runtime_data.get("record_count"),
                     "runtime_regulation_count": runtime_data.get("regulation_count"),
@@ -8304,8 +10499,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "runtime_manifest": runtime_data.get("files", {}).get("runtime_manifest"),
                     "source_metadata_patch": source_metadata_patch,
                     "connection_target": mcp_connection_target,
+                    "public_url": mcp_public_url_input.strip(),
+                    "generated_public_url": mcp_public_url.strip(),
                     "connection_target_label": mcp_connection_target_labels.get(mcp_connection_target),
                     "connection_target_file": selected_target_file,
+                    "connection_target_file_sha256": connection_target_file_sha256,
                     "connection_display_label": connection_display_label,
                     "connection_display_value": connection_display_value,
                     "chatgpt_desktop_local_config": str(
@@ -8327,6 +10525,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"누락된 로컬 출처 정보를 규정 {len(source_metadata_patch):,}개에 보완한 뒤 다시 색인했습니다."
                     )
                 st.success("MCP 실행 데이터와 연결 파일 묶음을 만들었습니다.")
+                if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+                    st.info(
+                        "아래 앱별 등록·진단 안내를 끝까지 진행한 뒤, 맨 아래에서 "
+                        "search와 fetch의 실제 성공 여부를 확인하세요."
+                    )
                 if connection_display_value:
                     st.markdown(f"**{connection_display_label}**")
                     if mcp_mode == "local":
@@ -8348,7 +10551,6 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"- Codex 직접 설정: `{Path(str(files.get('codex_config'))).name}`",
                         f"- Claude Desktop 직접 설정: `{Path(str(files.get('claude_desktop'))).name}`",
                         f"- Claude Code 직접 등록: `{Path(str(files.get('claude_code_stdio'))).name}`",
-                        f"- ChatGPT Desktop 직접 설정: `{Path(str(files.get('chatgpt_desktop_local'))).name}`",
                         f"- 한국어 안내문: `{Path(str(files.get('readme_ko'))).name}`",
                     ]
                 )
@@ -8365,16 +10567,40 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         )
                 st.markdown("\n".join(generated_file_lines))
             except Exception as exc:
+                error_text = str(exc)
+                incomplete_runtime_export = "MCP runtime export would be incomplete" in error_text
+                no_visible_approved_records = "No MCP-visible approved records" in error_text
+                if incomplete_runtime_export:
+                    beginner_error_message = "검토가 끝나지 않은 조문이 있어 MCP 파일 묶음을 만들지 않았습니다."
+                elif no_visible_approved_records:
+                    beginner_error_message = "MCP에 넣을 승인·색인된 규정이 하나도 없어 파일 묶음을 만들지 않았습니다."
+                else:
+                    beginner_error_message = error_text
                 if "bundle_status" in locals():
                     bundle_status.update(label="MCP 파일 묶음 생성 실패", state="error")
                 if "bundle_detail" in locals():
                     failed_regulation = current_bundle_regulation or "해당 없음"
                     bundle_detail.error(
-                        f"실패 단계: {current_bundle_stage} · 규정: {failed_regulation} · 오류: {exc} · "
+                        f"실패 단계: {current_bundle_stage} · 규정: {failed_regulation} · 오류: {beginner_error_message} · "
                         "처리 방침: 불완전한 MCP 묶음을 만들지 않도록 전체 작업을 중단했습니다."
                     )
-                st.error(str(exc))
-        bundle_state = st.session_state.get(_mcp_bundle_state_key(document_id, mcp_scope))
+                if incomplete_runtime_export:
+                    st.info(
+                        "③ 검수하고 승인에서 남은 항목을 처리하고 색인한 뒤 'MCP로 쓸 파일 묶음 만들기'를 다시 누르세요. "
+                        "아직 검수·승인 또는 반려가 끝나지 않은 청크가 있어 MCP 생성을 중단했습니다. "
+                        "승인되지 않았거나 검토가 남은 조문이 있어 MCP 파일 묶음을 만들지 않았습니다."
+                    )
+                elif no_visible_approved_records:
+                    st.info(
+                        "반려된 규정은 MCP에서 제외됩니다. ③ 검수하고 승인에서 사용할 규정을 최소 1개 승인·색인한 뒤 "
+                        "'MCP로 쓸 파일 묶음 만들기'를 다시 누르세요."
+                    )
+                st.error(beginner_error_message)
+        bundle_candidates = _matching_mcp_bundle_state_candidates(
+            document_id,
+            mcp_scope,
+        )
+        bundle_state = bundle_candidates[0][1] if bundle_candidates else None
         if isinstance(bundle_state, dict) and bundle_state.get("connection_display_value"):
             st.success(f"선택한 AI 앱: {bundle_state.get('connection_target_label')}")
             st.markdown(f"**{bundle_state.get('connection_display_label')}**")
@@ -8393,88 +10619,29 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             st.info(f"최근 생성한 MCP 파일 묶음: {recent_output}")
             installed_server_name = str(bundle_state.get("server_name") or mcp_server_name)
             installed_target = str(bundle_state.get("connection_target") or "")
-            method_b_destination = ""
             if installed_target == "chatgpt-desktop-local":
-                desktop_config_path = str(
-                    bundle_state.get("chatgpt_desktop_local_config") or ""
+                _render_chatgpt_codex_desktop_registration_guide({})
+            elif installed_target == "codex":
+                codex_config_path = str(
+                    bundle_state.get("connection_target_file") or ""
                 ).strip()
-                if desktop_config_path:
+                if codex_config_path:
                     try:
-                        desktop_registration = (
-                            _read_chatgpt_codex_desktop_registration(
-                                desktop_config_path
-                            )
+                        codex_snippet = _read_codex_config_snippet(
+                            codex_config_path
                         )
-                    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                    except (OSError, UnicodeError, ValueError) as exc:
                         st.warning(
-                            "생성된 ChatGPT/Codex Desktop 등록값을 다시 읽지 "
-                            f"못했습니다: {exc}"
+                            "생성된 Codex TOML 등록값을 다시 읽지 못했습니다: "
+                            f"{exc}"
                         )
                     else:
-                        _render_chatgpt_codex_desktop_registration_guide(
-                            desktop_registration
+                        _render_codex_registration_guide(
+                            codex_snippet,
+                            generated_config_path=str(
+                                Path(codex_config_path).resolve()
+                            ),
                         )
-            elif installed_target == "codex":
-                st.markdown("### 방법 B에서 실제로 연결할 앱 하나 선택")
-                st.caption(
-                    "ChatGPT Desktop과 Codex의 등록 화면은 다릅니다. 실제로 사용할 앱 "
-                    "하나만 고르면 바로 아래에 그 앱의 절차만 표시됩니다."
-                )
-                method_b_destination = st.radio(
-                    "이번에 연결할 앱",
-                    ["chatgpt-desktop-local", "codex"],
-                    format_func=lambda value: {
-                        "chatgpt-desktop-local": "ChatGPT Desktop — 인자를 한 줄씩 서로 다른 칸에 입력",
-                        "codex": "Codex CLI / Codex IDE — 생성된 TOML 블록 전체 붙여 넣기",
-                    }[value],
-                    key=f"method-b-destination-{document_id}-{mcp_scope}",
-                )
-                if method_b_destination == "chatgpt-desktop-local":
-                    desktop_config_path = str(
-                        bundle_state.get("chatgpt_desktop_local_config") or ""
-                    ).strip()
-                    if desktop_config_path:
-                        try:
-                            desktop_registration = (
-                                _read_chatgpt_codex_desktop_registration(
-                                    desktop_config_path
-                                )
-                            )
-                        except (
-                            OSError,
-                            UnicodeError,
-                            json.JSONDecodeError,
-                            ValueError,
-                        ) as exc:
-                            st.warning(
-                                "생성된 ChatGPT Desktop 등록값을 다시 읽지 "
-                                f"못했습니다: {exc}"
-                            )
-                        else:
-                            _render_chatgpt_codex_desktop_registration_guide(
-                                desktop_registration
-                            )
-                else:
-                    codex_config_path = str(
-                        bundle_state.get("connection_target_file") or ""
-                    ).strip()
-                    if codex_config_path:
-                        try:
-                            codex_snippet = _read_codex_config_snippet(
-                                codex_config_path
-                            )
-                        except (OSError, UnicodeError, ValueError) as exc:
-                            st.warning(
-                                "생성된 Codex TOML 등록값을 다시 읽지 못했습니다: "
-                                f"{exc}"
-                            )
-                        else:
-                            _render_codex_registration_guide(
-                                codex_snippet,
-                                generated_config_path=str(
-                                    Path(codex_config_path).resolve()
-                                ),
-                            )
             elif installed_target == "claude-desktop":
                 claude_config_path = str(
                     bundle_state.get("claude_desktop_config") or ""
@@ -8495,25 +10662,18 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         _render_claude_desktop_registration_guide(
                             claude_registration
                         )
-            diagnostic_target = (
-                method_b_destination
-                if installed_target == "codex" and method_b_destination
-                else installed_target
-            )
+            diagnostic_target = installed_target
             if diagnostic_target in {
-                "chatgpt-desktop-local",
                 "codex",
                 "claude-code",
                 "claude-desktop",
             }:
                 diagnostic_title = {
-                    "chatgpt-desktop-local": "ChatGPT Desktop 연결 진단",
                     "codex": "Codex CLI 연결 진단",
                     "claude-code": "Claude Code 연결 진단",
                     "claude-desktop": "Claude Desktop 연결 진단",
                 }[diagnostic_target]
                 diagnostic_client_label = {
-                    "chatgpt-desktop-local": "ChatGPT Desktop",
                     "codex": "Codex CLI",
                     "claude-code": "Claude Code",
                     "claude-desktop": "Claude Desktop",
@@ -8526,16 +10686,19 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "이 프로그램은 다른 앱의 현재 대화 결과를 자동으로 읽을 수 없으므로, "
                     "아래 최종 도구 호출 성공은 해당 대화에서 직접 확인해야 합니다."
                 )
+                _render_beginner_action_marker(
+                    4,
+                    "연결 상태를 확인하세요",
+                    "AI 프로그램에서 MCP를 켠 뒤 바로 아래 새로고침 버튼으로 설정·서버 상태를 다시 확인하세요.",
+                    control_key_prefix="refresh-mcp-connection-diagnostic-",
+                )
                 diagnostic_refreshed = st.button(
                     "MCP 연결 상태 새로고침",
                     key=f"refresh-mcp-connection-diagnostic-{document_id}-{mcp_scope}",
                 )
                 refresh_succeeded = False
                 refresh_message = ""
-                if diagnostic_refreshed and diagnostic_target in {
-                    "chatgpt-desktop-local",
-                    "claude-desktop",
-                }:
+                if diagnostic_refreshed and diagnostic_target == "claude-desktop":
                     refresh_succeeded, refresh_message = _refresh_mcp_connection_observation(
                         str(bundle_state.get("bundle_dir") or ""),
                         diagnostic_target,
@@ -8612,6 +10775,16 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     bundle_state.get("connection_display_value") or ""
                 ),
             )
+            if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+                st.markdown("### 마지막 확인: 실제 AI 대화에서 검색하기")
+                st.caption(
+                    "위의 앱 등록·활성화·연결 진단을 마친 뒤 새 AI 대화를 열어 "
+                    "search와 fetch를 차례로 호출하세요."
+                )
+                _render_beginner_connection_confirmation(
+                    document_id,
+                    scope=mcp_scope,
+                )
         with st.expander("전산 담당자용 JSON/명령어 보기", expanded=False):
             if isinstance(mcp_quickstart, dict):
                 for warning in mcp_quickstart.get("warnings") or []:
@@ -9259,6 +11432,7 @@ def _page_admin() -> None:
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="공공기관 규정 MCP 빌더", layout="wide")
+st.session_state.setdefault(MCP_RUNTIME_INTEGRITY_RENDER_NONCE_KEY, 0)
 
 _apply_ai_connection_overrides()
 settings = get_settings()
@@ -9327,6 +11501,9 @@ if institution_registry and institution_registry.profiles:
         _page_institution_select(institution_registry)
         st.stop()
 
+if not st.session_state.get(BEGINNER_GUIDE_CHOICE_KEY):
+    _render_beginner_mode_choice(show_hero=False)
+
 if st.session_state.get(WORKFLOW_TRANSITION_STATE_KEY):
     _render_workflow_transition_dialog()
     st.stop()
@@ -9377,6 +11554,8 @@ with st.sidebar:
         st.divider()
     st.markdown("### 공공기관 규정 MCP 빌더")
     st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
+    _render_beginner_guide_sidebar(ctx, current_nav_page)
+    st.divider()
     stored_primary_page = str(st.session_state.get("primary_nav_page") or "")
     desired_primary_page = (
         current_nav_page

@@ -199,6 +199,51 @@ class StructureDetectorTests(unittest.TestCase):
 
         self.assertEqual(article_numbers, ["제1조", "제2조"])
 
+    def test_article_titles_accept_square_and_guillemet_delimiters(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(
+                [
+                    "제1조【목적】 이 규정의 목적을 정한다.",
+                    "제2조 [정의] 이 규정에서 사용하는 용어를 정의한다.",
+                    "제3조 적용범위",
+                    "이 규정은 모든 임직원에게 적용한다.",
+                ]
+            )
+        )
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["제1조", "제2조", "제3조"], [node.number for node in articles])
+        self.assertEqual(["목적", "정의", "적용범위"], [node.title for node in articles])
+        self.assertEqual("이 규정의 목적을 정한다.", articles[0].metadata["article_lead_text"])
+        self.assertEqual("이 규정에서 사용하는 용어를 정의한다.", articles[1].metadata["article_lead_text"])
+        self.assertNotIn("article_lead_text", articles[2].metadata)
+        self.assertIn("이 규정은 모든 임직원에게 적용한다.", articles[2].text)
+
+    def test_bracketed_inline_article_title_splits_without_splitting_reference(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "제1조【목적】 첫 문장. 제2조 [정의] 둘째 문장. 제3조【준용】에 따른다."
+        )
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["제1조", "제2조"], [node.number for node in articles])
+        self.assertEqual(["목적", "정의"], [node.title for node in articles])
+        self.assertNotIn("제2조", articles[0].text)
+        self.assertIn("제3조【준용】에 따른다.", articles[1].text)
+
+    def test_bare_article_body_is_not_misclassified_as_title(self) -> None:
+        for text in (
+            "제1조 이 규정은 사업 운영에 적용한다.",
+            "제2조 이 규정에 따른다",
+        ):
+            with self.subTest(text=text):
+                nodes = StructureDetector().detect_from_text(text)
+                article = next(node for node in nodes if node.node_type == "article")
+
+                self.assertIsNone(article.title)
+                self.assertIn("article_title_missing", article.warnings)
+                self.assertNotIn("article_lead_text", article.metadata)
+                self.assertIn(text.removeprefix(article.number).strip(), article.text)
+
     def test_supplementary_articles_are_children_of_supplementary_node(self) -> None:
         text = "\n".join(
             [
@@ -215,6 +260,33 @@ class StructureDetectorTests(unittest.TestCase):
 
         self.assertEqual(article.parent_id, supplementary.node_id)
         self.assertEqual(by_id[article.parent_id].node_type, "supplementary")
+
+    def test_standalone_attachments_use_regulation_root_not_last_chapter(self) -> None:
+        text = "\n".join(
+            [
+                "제1장 총칙",
+                "제1조(목적) 본문",
+                "[별표 1]",
+                "평가 기준",
+                "【별지 제1호 서식】",
+                "신청서",
+                "부칙 <2026.1.1.>",
+                "제1조(시행일) 이 규정은 공포한 날부터 시행한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        attachments = [
+            node
+            for node in nodes
+            if node.node_type in {"appendix", "form", "supplementary"}
+        ]
+
+        self.assertEqual(
+            ["appendix", "form", "supplementary"],
+            [node.node_type for node in attachments],
+        )
+        self.assertTrue(all(node.parent_id is None for node in attachments))
 
     def test_articles_inside_form_are_kept_inside_form_text(self) -> None:
         text = "\n".join(
@@ -320,6 +392,517 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertEqual(len(regulations), 1)
         self.assertEqual([node.number for node in articles], ["제1조", "제2조"])
         self.assertTrue(all(node.parent_id == regulations[0].node_id for node in articles))
+
+    def test_contents_regulation_entries_do_not_hide_repeated_body_boundaries(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-2-1. 인사규정 ........................ 4",
+                "1-2-2. 보수규정 ........................ 8",
+                "1-2-1. 인사규정",
+                "제1조(목적) 인사규정 본문",
+                "1-2-2. 보수규정",
+                "제1조(목적) 보수규정 본문",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual([node.number for node in regulations], ["1-2-1", "1-2-2"])
+        self.assertEqual([node.text for node in articles], ["제1조(목적) 인사규정 본문", "제1조(목적) 보수규정 본문"])
+        self.assertEqual(articles[0].parent_id, regulations[0].node_id)
+        self.assertEqual(articles[1].parent_id, regulations[1].node_id)
+
+    def test_contents_entries_seed_title_only_body_regulation_boundaries(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-1-1. 인사규정 ........................ 4",
+                "1-1-2. 보수규정 ........................ 8",
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "제2조(적용범위) 모든 직원에게 적용한다.",
+                "보수규정",
+                "제1조(목적) 보수 지급의 기준을 정한다.",
+                "제2조(지급일) 보수는 매월 지급한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual([node.number for node in regulations], ["1-1-1", "1-1-2"])
+        self.assertEqual([node.title for node in regulations], ["인사규정", "보수규정"])
+        self.assertEqual([node.text for node in regulations], ["인사규정", "보수규정"])
+        self.assertEqual(
+            [node.parent_id for node in articles],
+            [
+                regulations[0].node_id,
+                regulations[0].node_id,
+                regulations[1].node_id,
+                regulations[1].node_id,
+            ],
+        )
+        self.assertFalse(any("목차" in node.text for node in nodes))
+
+    def test_contents_order_disambiguates_same_title_regulations_by_number(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-1-1. 인사규정 ........ 10",
+                "1-1-2. 인사규정 ........ 20",
+                "인사규정",
+                "제1조(목적) 첫 번째 인사 기준을 정한다.",
+                "인사규정",
+                "제1조(목적) 두 번째 인사 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["1-1-1", "1-1-2"], [node.number for node in regulations])
+        self.assertEqual(["인사규정", "인사규정"], [node.title for node in regulations])
+        self.assertEqual(
+            [regulations[0].node_id, regulations[1].node_id],
+            [node.parent_id for node in articles],
+        )
+
+    def test_title_only_contents_prepass_classifies_each_source_line_once(self) -> None:
+        class CountingDetector(StructureDetector):
+            def __init__(self) -> None:
+                super().__init__()
+                self.detect_line_calls = 0
+
+            def _detect_line(self, line, document_id, order_index):
+                self.detect_line_calls += 1
+                return super()._detect_line(line, document_id, order_index)
+
+        lines = [
+            "목차",
+            "1-1-1. 인사규정 ........................ 4",
+            "1-1-2. 보수규정 ........................ 8",
+            "인사규정",
+            "제1조(목적) 인사 운영의 기준을 정한다.",
+            "제2조(적용범위) 모든 직원에게 적용한다.",
+            "보수규정",
+            "제1조(목적) 보수 지급의 기준을 정한다.",
+            "제2조(지급일) 보수는 매월 지급한다.",
+        ]
+        detector = CountingDetector()
+
+        detector.detect_from_text("\n".join(lines))
+
+        self.assertEqual(len(lines), detector.detect_line_calls)
+
+    def test_title_only_boundaries_without_contents_require_article_restarts(self) -> None:
+        text = "\n".join(
+            [
+                "기관 통합 규정집",
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "제2조(적용범위) 모든 직원에게 적용한다.",
+                "보수규정",
+                "제1조(목적) 보수 지급의 기준을 정한다.",
+                "제2조(지급일) 보수는 매월 지급한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["인사규정", "보수규정"], [node.title for node in regulations])
+        self.assertEqual([None, None], [node.number for node in regulations])
+        self.assertEqual(
+            [regulations[0].node_id, regulations[0].node_id, regulations[1].node_id, regulations[1].node_id],
+            [node.parent_id for node in articles],
+        )
+        self.assertTrue(
+            all(
+                "regulation_boundary_inferred_without_contents" in node.warnings
+                for node in regulations
+            )
+        )
+
+    def test_no_contents_repeated_running_header_does_not_cancel_later_boundary(self) -> None:
+        text = "\n".join(
+            [
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "인사규정",
+                "제2조(적용범위) 모든 직원에게 적용한다.",
+                "보수규정",
+                "제1조(목적) 보수 지급의 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["인사규정", "보수규정"], [node.title for node in regulations])
+        self.assertEqual(
+            [regulations[0].node_id, regulations[0].node_id, regulations[1].node_id],
+            [node.parent_id for node in articles],
+        )
+
+    def test_no_contents_recognizes_common_public_regulation_suffixes(self) -> None:
+        text = "\n".join(
+            [
+                "인사운영세칙",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "출장비지급기준",
+                "제1조(목적) 출장비 지급 기준을 정한다.",
+                "공직자행동강령",
+                "제1조(목적) 행동 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+
+        self.assertEqual(
+            ["인사운영세칙", "출장비지급기준", "공직자행동강령"],
+            [node.title for node in nodes if node.node_type == "regulation"],
+        )
+
+    def test_attachment_embedded_regulation_samples_are_not_new_units(self) -> None:
+        text = "\n".join(
+            [
+                "시설관리규정",
+                "제1조(목적) 시설 관리 기준을 정한다.",
+                "[별표 1]",
+                "보안업무지침",
+                "제1조(목적) 견본 본문이다.",
+                "개인정보처리지침",
+                "제1조(목적) 두 번째 견본 본문이다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text, document_name="시설관리규정")
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+
+        self.assertEqual(["시설관리규정"], [node.title for node in regulations])
+
+    def test_named_attachment_embedded_regulation_sample_is_not_new_unit(self) -> None:
+        text = "\n".join(
+            [
+                "시설관리규정",
+                "제1조(목적) 시설 관리 기준을 정한다.",
+                "붙임 1. 규정 예시",
+                "보안업무지침",
+                "제1조(목적) 견본 본문이다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text, document_name="시설관리규정")
+
+        self.assertEqual(
+            ["시설관리규정"],
+            [node.title for node in nodes if node.node_type == "regulation"],
+        )
+        self.assertTrue(
+            any(node.node_type == "appendix" and node.number == "붙임1" for node in nodes)
+        )
+
+    def test_ambiguous_regulation_after_attachment_does_not_publish_partial_book(self) -> None:
+        text = "\n".join(
+            [
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "보수규정",
+                "제1조(목적) 보수 운영의 기준을 정한다.",
+                "[별표 1]",
+                "첨부 내용",
+                "복무규정",
+                "제1조(목적) 복무 운영의 기준을 정한다.",
+            ]
+        )
+        parsed = ParsedDocument(
+            document_id="doc-ambiguous-book",
+            source_file="통합규정집.txt",
+            document_name="통합규정집",
+            file_type="text",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+
+        nodes = StructureDetector().detect(parsed)
+
+        self.assertEqual([], [node for node in nodes if node.node_type == "regulation"])
+        self.assertEqual(
+            "ambiguous_combined_book_boundary_after_attachment",
+            parsed.metadata["structure_boundary_diagnostic"],
+        )
+
+    def test_ordinary_single_document_fallback_has_no_ambiguous_book_diagnostic(self) -> None:
+        text = "일반 안내문\n구조화되지 않은 단일 문서 본문"
+        parsed = ParsedDocument(
+            document_id="doc-normal-fallback",
+            source_file="일반안내.txt",
+            document_name="일반안내",
+            file_type="text",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+
+        StructureDetector().detect(parsed)
+
+        self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+
+    def test_contents_entry_does_not_promote_appendix_sample_to_regulation(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-1-1. 시설관리규정",
+                "1-1-2. 보안업무지침",
+                "시설관리규정",
+                "제1조(목적) 시설 관리 기준을 정한다.",
+                "[별표 1]",
+                "보안업무지침",
+                "제1조(목적) 별표 안의 견본 본문이다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+
+        self.assertEqual([], [node for node in nodes if node.node_type == "regulation"])
+
+    def test_contents_article_previews_do_not_create_ghost_regulations(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "인사규정",
+                "제1조(목적) 4",
+                "보수규정",
+                "제1조(목적) 8",
+                "1-1-1. 인사규정",
+                "제1조(목적) 실제 인사 본문",
+                "1-1-2. 보수규정",
+                "제1조(목적) 실제 보수 본문",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text, document_name="통합규정집")
+
+        self.assertEqual(
+            [("1-1-1", "인사규정"), ("1-1-2", "보수규정")],
+            [(node.number, node.title) for node in nodes if node.node_type == "regulation"],
+        )
+
+    def test_new_page_alone_does_not_promote_appendix_sample_to_regulation(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc-appendix-page-sample",
+            source_file="시설관리규정.pdf",
+            document_name="시설관리규정",
+            file_type="pdf",
+            pages=[
+                ParsedPage(
+                    page_no=1,
+                    blocks=[
+                        ParsedBlock(
+                            text="시설관리규정\n제1조(목적) 시설 관리 기준을 정한다.\n[별표 1]"
+                        )
+                    ],
+                ),
+                ParsedPage(
+                    page_no=2,
+                    blocks=[
+                        ParsedBlock(
+                            text="보안업무지침\n제1조(목적) 별표 안의 견본 본문이다."
+                        )
+                    ],
+                ),
+            ],
+            raw_text="",
+        )
+
+        nodes = StructureDetector().detect(parsed)
+
+        self.assertEqual(
+            ["시설관리규정"],
+            [node.title for node in nodes if node.node_type == "regulation"],
+        )
+
+    def test_new_page_and_chapter_preamble_can_close_attachment_scope(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc-after-appendix-new-unit",
+            source_file="통합규정집.pdf",
+            document_name="통합규정집",
+            file_type="pdf",
+            pages=[
+                ParsedPage(
+                    page_no=1,
+                    blocks=[
+                        ParsedBlock(
+                            text="시설관리규정\n제1조(목적) 시설 관리 기준을 정한다.\n[별표 1]"
+                        )
+                    ],
+                ),
+                ParsedPage(
+                    page_no=10,
+                    blocks=[
+                        ParsedBlock(
+                            text="보안업무지침\n제1장 총칙\n제1조(목적) 보안 업무 기준을 정한다."
+                        )
+                    ],
+                ),
+            ],
+            raw_text="",
+        )
+
+        nodes = StructureDetector().detect(parsed)
+
+        self.assertEqual(
+            ["시설관리규정", "보안업무지침"],
+            [node.title for node in nodes if node.node_type == "regulation"],
+        )
+
+    def test_contents_titles_match_wrappers_and_inline_revision_labels(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-1-1. 인사규정 ........ 3",
+                "1-1-2. 보수규정 ........ 5",
+                "「인사규정」 (2026. 7. 1. 일부개정)",
+                "제1조(목적) 인사 기준을 정한다.",
+                "【보수규정】 (2026. 7. 1. 전부개정)",
+                "제1조(목적) 보수 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["1-1-1", "1-1-2"], [node.number for node in regulations])
+        self.assertEqual(["인사규정", "보수규정"], [node.title for node in regulations])
+        self.assertEqual(
+            [regulations[0].node_id, regulations[1].node_id],
+            [node.parent_id for node in articles],
+        )
+
+    def test_title_identity_preserves_non_revision_parenthetical_name(self) -> None:
+        detector = StructureDetector()
+
+        self.assertNotEqual(
+            detector._regulation_title_identity("교육규정(시행계획)"),
+            detector._regulation_title_identity("교육규정"),
+        )
+        self.assertEqual(
+            detector._regulation_title_identity("교육규정"),
+            detector._regulation_title_identity("교육규정 (2026. 7. 1. 일부개정)"),
+        )
+
+    def test_contents_block_longer_than_sixty_lines_maps_every_regulation(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-1-1. 인사규정",
+                "1-1-2. 보수규정",
+                *[f"분류 안내 {index}" for index in range(61)],
+                "1-1-3. 복무규정",
+                "인사규정",
+                "제1조(목적) 인사 기준을 정한다.",
+                "보수규정",
+                "제1조(목적) 보수 기준을 정한다.",
+                "복무규정",
+                "제1조(목적) 복무 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["1-1-1", "1-1-2", "1-1-3"], [node.number for node in regulations])
+        self.assertEqual(
+            [regulations[0].node_id, regulations[1].node_id, regulations[2].node_id],
+            [node.parent_id for node in articles],
+        )
+
+    def test_title_only_boundary_without_contents_is_not_inferred_from_one_title(self) -> None:
+        text = "\n".join(
+            [
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "제2조(적용범위) 모든 직원에게 적용한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+
+        self.assertNotIn("regulation", [node.node_type for node in nodes])
+
+    def test_standalone_document_title_becomes_regulation_boundary_before_revision_history(self) -> None:
+        text = "\n".join(
+            [
+                "인사규정",
+                "2026.7.1. 일부개정",
+                "제1장 총칙",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(
+            text,
+            document_name="인사규정",
+        )
+        regulation = next(node for node in nodes if node.node_type == "regulation")
+        chapter = next(node for node in nodes if node.node_type == "chapter")
+
+        self.assertEqual("인사규정", regulation.title)
+        self.assertIn("2026.7.1. 일부개정", regulation.text)
+        self.assertEqual(regulation.node_id, chapter.parent_id)
+        self.assertIn("regulation_boundary_inferred_from_document_title", regulation.warnings)
+
+    def test_title_only_boundaries_without_contents_fail_closed_without_every_restart(self) -> None:
+        text = "\n".join(
+            [
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "보수규정",
+                "제2조(인용) 보수규정을 인용한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+
+        self.assertNotIn("regulation", [node.node_type for node in nodes])
+        first_article = next(node for node in nodes if node.node_type == "article")
+        self.assertTrue(first_article.text.endswith("\n보수규정"))
+
+    def test_title_only_boundary_requires_article_number_restart(self) -> None:
+        text = "\n".join(
+            [
+                "목차",
+                "1-1-1. 인사규정",
+                "1-1-2. 보수규정",
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "보수규정",
+                "제2조(보수규정) 보수규정은 별도로 정한다.",
+                "보수규정은 이 규정과 함께 적용한다.",
+                "보수규정",
+                "제1조(목적) 보수 지급의 기준을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual([node.text for node in regulations], ["인사규정", "보수규정"])
+        self.assertEqual(articles[0].parent_id, regulations[0].node_id)
+        self.assertEqual(articles[1].parent_id, regulations[0].node_id)
+        self.assertEqual(articles[2].parent_id, regulations[1].node_id)
+        self.assertTrue(articles[0].text.endswith("\n보수규정"))
+        self.assertEqual(articles[1].title, "보수규정")
+        self.assertIn("보수규정은 이 규정과 함께 적용한다.", articles[1].text)
 
     def test_repeated_same_regulation_heading_after_internal_chapter_is_skipped(self) -> None:
         text = "\n".join(

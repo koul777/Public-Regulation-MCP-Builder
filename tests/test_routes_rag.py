@@ -21,6 +21,7 @@ from app.main import app
 from app.retrieval.bm25_index import write_bm25_index
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
+from app.services import regulation_rag_runtime as rag_runtime
 from app.storage.repository import JsonRepository
 from app.ingestion.vector_adapter import VECTOR_RECORD_SCHEMA_VERSION, stable_content_hash
 
@@ -2066,6 +2067,228 @@ class RoutesRagTests(unittest.TestCase):
         self.assertNotEqual(first, third)
         self.assertEqual(2, list_records.call_count)
 
+    def test_later_review_rejection_invalidates_cached_approval_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="api_token",
+                role="admin",
+            )
+            document = Document(
+                document_id="doc-latest-decision",
+                filename="latest.pdf",
+                document_name="Latest decision",
+                file_type="pdf",
+                file_hash="document-hash",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            chunk = Chunk(
+                chunk_id="chunk-latest",
+                document_id=document.document_id,
+                chunk_type="article",
+                text="approved content retained in the old vector",
+                retrieval_text="approved content retained in the old vector",
+                approval_status="approved",
+                approval_id="approval-old",
+                approved_by="reviewer",
+                approved_at="2026-07-28T00:00:00+00:00",
+                approved_content_hash="approved-hash-old",
+                security_level="internal",
+                metadata=_approval_provenance_metadata(),
+            )
+            repository.upsert_document(document)
+            repository.save_processing_result(
+                document.document_id,
+                [],
+                [chunk],
+                [],
+            )
+            repository.append_approval_record(
+                _approval_journal_record(
+                    document_id=document.document_id,
+                    chunk_id=chunk.chunk_id,
+                    approval_id="approval-old",
+                    approved_content_hash="approved-hash-old",
+                    approved_at="2026-07-28T00:00:00+00:00",
+                )
+            )
+            vector_record = routes_rag._expected_vector_record_for_chunk(
+                chunk,
+                document,
+                auth,
+            )
+            self.assertIsNotNone(vector_record)
+
+            first_signature = routes_rag._approval_snapshot_signature(
+                repository,
+                [document.document_id],
+            )
+            first_snapshot = routes_rag._load_cached_approval_snapshot(
+                repository,
+                [vector_record],
+                auth,
+            )
+            repository.append_review_record(
+                {
+                    "review_id": "review-later-reject",
+                    "document_id": document.document_id,
+                    "chunk_ids": [chunk.chunk_id],
+                    "action": "reject",
+                    "status": "rejected",
+                    "reason": "later human rejection",
+                    "reviewed_by": "reviewer",
+                    "reviewed_at": "2026-07-29T00:00:00+00:00",
+                    "tenant_id": "tenant-a",
+                }
+            )
+            second_signature = routes_rag._approval_snapshot_signature(
+                repository,
+                [document.document_id],
+            )
+            second_snapshot = routes_rag._load_cached_approval_snapshot(
+                repository,
+                [vector_record],
+                auth,
+            )
+
+        self.assertIn((document.document_id, chunk.chunk_id), first_snapshot)
+        self.assertNotEqual(first_signature, second_signature)
+        self.assertNotIn((document.document_id, chunk.chunk_id), second_snapshot)
+
+    def test_later_reapproval_supersedes_review_rejection_for_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="api_token",
+                role="admin",
+            )
+            document = Document(
+                document_id="doc-reapproval",
+                filename="reapproval.pdf",
+                document_name="Reapproval",
+                file_type="pdf",
+                file_hash="document-hash",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+            chunk = Chunk(
+                chunk_id="chunk-reapproval",
+                document_id=document.document_id,
+                chunk_type="article",
+                text="reviewed and reapproved content",
+                retrieval_text="reviewed and reapproved content",
+                approval_status="approved",
+                approval_id="approval-new",
+                approved_by="reviewer",
+                approved_at="2026-07-30T00:00:00+00:00",
+                approved_content_hash="approved-hash-new",
+                security_level="internal",
+                metadata=_approval_provenance_metadata(),
+            )
+            repository.upsert_document(document)
+            repository.save_processing_result(
+                document.document_id,
+                [],
+                [chunk],
+                [],
+            )
+            repository.append_review_record(
+                {
+                    "review_id": "review-before-reapproval",
+                    "document_id": document.document_id,
+                    "chunk_ids": [chunk.chunk_id],
+                    "action": "reject",
+                    "status": "rejected",
+                    "reason": "rejected before correction",
+                    "reviewed_by": "reviewer",
+                    "reviewed_at": "2026-07-29T00:00:00+00:00",
+                    "tenant_id": "tenant-a",
+                }
+            )
+            repository.append_approval_record(
+                _approval_journal_record(
+                    document_id=document.document_id,
+                    chunk_id=chunk.chunk_id,
+                    approval_id="approval-new",
+                    approved_content_hash="approved-hash-new",
+                    approved_at="2026-07-30T00:00:00+00:00",
+                )
+            )
+
+            snapshot = routes_rag._build_approval_snapshot(
+                repository,
+                [document.document_id],
+                auth,
+            )
+
+        self.assertEqual(
+            "approval-new",
+            snapshot[(document.document_id, chunk.chunk_id)]["approval_id"],
+        )
+
+    def test_latest_decision_gate_fails_closed_for_invalid_or_tied_timestamp(self) -> None:
+        approval = _approval_journal_record(
+            document_id="doc-ambiguous",
+            chunk_id="chunk-ambiguous",
+            approval_id="approval-ambiguous",
+            approved_content_hash="hash-ambiguous",
+            approved_at="2026-07-30T00:00:00+00:00",
+        )
+        for reviewed_at in (
+            None,
+            "not-a-timestamp",
+            "2026-07-30T00:00:00+00:00",
+        ):
+            with self.subTest(reviewed_at=reviewed_at):
+                review = {
+                    "review_id": f"review-{reviewed_at}",
+                    "document_id": "doc-ambiguous",
+                    "chunk_ids": ["chunk-ambiguous"],
+                    "action": "reject",
+                    "status": "rejected",
+                    "reviewed_at": reviewed_at,
+                    "tenant_id": "tenant-a",
+                }
+                latest = rag_runtime.latest_approval_journal_match_index(
+                    [approval],
+                    [review],
+                    tenant_id="tenant-a",
+                )
+                self.assertEqual(set(), latest)
+
+    def test_latest_decision_gate_ignores_other_tenant_review(self) -> None:
+        approval = _approval_journal_record(
+            document_id="doc-shared-id",
+            chunk_id="chunk-shared-id",
+            approval_id="approval-tenant-a",
+            approved_content_hash="hash-tenant-a",
+            approved_at="2026-07-30T00:00:00+00:00",
+        )
+        other_tenant_review = {
+            "review_id": "review-tenant-b",
+            "document_id": "doc-shared-id",
+            "chunk_ids": ["chunk-shared-id"],
+            "action": "reject",
+            "status": "rejected",
+            "reviewed_at": "2026-07-31T00:00:00+00:00",
+            "tenant_id": "tenant-b",
+        }
+
+        latest = rag_runtime.latest_approval_journal_match_index(
+            [approval],
+            [other_tenant_review],
+            tenant_id="tenant-a",
+        )
+
+        self.assertEqual(1, len(latest))
+
     def test_runtime_approval_snapshot_sidecar_avoids_live_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
@@ -2399,6 +2622,48 @@ class RoutesRagTests(unittest.TestCase):
         self.assertEqual(live_snapshot, snapshot)
         self.assertEqual(1, build_snapshot.call_count)
 
+    def test_runtime_approval_snapshot_sidecar_falls_back_on_review_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="mcp_internal",
+                role="operator",
+            )
+            record = _vector_record("doc:chunk-1", "approved text")
+            _write_runtime_approval_snapshot_sidecar_fixture(
+                settings.data_dir,
+                [record],
+                tenant_id="tenant-a",
+            )
+            repository.append_review_record(
+                {
+                    "review_id": "review-after-sidecar",
+                    "document_id": "doc",
+                    "chunk_ids": ["chunk-1"],
+                    "action": "reject",
+                    "status": "rejected",
+                    "reviewed_at": "2026-07-31T00:00:00+00:00",
+                    "tenant_id": "tenant-a",
+                }
+            )
+
+            with patch.object(
+                routes_rag,
+                "_build_approval_snapshot",
+                return_value={},
+            ) as build_snapshot:
+                snapshot = routes_rag._load_cached_approval_snapshot(
+                    repository,
+                    [record],
+                    auth,
+                )
+
+        self.assertEqual({}, snapshot)
+        self.assertEqual(1, build_snapshot.call_count)
+
     def test_runtime_approval_snapshot_sidecar_without_chunk_file_signature_falls_back_live(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
@@ -2603,6 +2868,47 @@ def _approval_provenance_metadata() -> dict[str, str]:
         "approval_review_batch_id": "approval-batch-001",
         "approval_review_batch_chunk_fingerprint": "c" * 64,
         "approval_review_strategy": "human_bulk_review",
+    }
+
+
+def _approval_journal_record(
+    *,
+    document_id: str,
+    chunk_id: str,
+    approval_id: str,
+    approved_content_hash: str,
+    approved_at: str,
+) -> dict[str, object]:
+    provenance = _approval_provenance_metadata()
+    return {
+        "approval_record_id": f"record-{approval_id}",
+        "approval_id": approval_id,
+        "document_id": document_id,
+        "chunk_ids": [chunk_id],
+        "approved_content_hashes": {
+            chunk_id: approved_content_hash,
+        },
+        "approved_at": approved_at,
+        "tenant_id": "tenant-a",
+        "worklist_evidence": {
+            "worklist_report_path": provenance[
+                "approval_worklist_report_path"
+            ],
+            "worklist_report_sha256": provenance[
+                "approval_worklist_report_sha256"
+            ],
+            "review_batch_manifest_path": provenance[
+                "approval_review_batch_manifest_path"
+            ],
+            "review_batch_manifest_sha256": provenance[
+                "approval_review_batch_manifest_sha256"
+            ],
+            "review_batch_id": provenance["approval_review_batch_id"],
+            "review_batch_chunk_fingerprint": provenance[
+                "approval_review_batch_chunk_fingerprint"
+            ],
+            "review_strategy": provenance["approval_review_strategy"],
+        },
     }
 
 

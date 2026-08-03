@@ -16,6 +16,8 @@ REVIEW_LABEL = "preprocessing-reviewed"
 LOGIC_PREFIXES = (
     "app/parsers/",
     "app/processors/",
+    "app/ingestion/",
+    "app/retrieval/",
     "app/mcp_server/",
 )
 LOGIC_FILES = {
@@ -66,7 +68,10 @@ FOCUSED_TEST_KEYWORDS = (
     "archive_safety",
     "article_validity",
     "chunk",
+    "bm25",
+    "hierarchical",
     "hwp_inventory",
+    "input_packaging",
     "metadata_extractor",
     "mcp",
     "normalizer",
@@ -76,9 +81,11 @@ FOCUSED_TEST_KEYWORDS = (
     "preprocess",
     "processing_service",
     "quality",
+    "retrieval",
     "structure",
     "streamlit_operator",
     "table",
+    "vector_ingestion",
 )
 BODY_FIELDS = (
     "summary",

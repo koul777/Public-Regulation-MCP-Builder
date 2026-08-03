@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.report_metadata import current_repo_commit
+from scripts.report_metadata import current_repo_commit  # noqa: E402
 
 
 UTF8_BOM = b"\xef\xbb\xbf"
@@ -169,13 +169,15 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
         if isinstance(result, dict) and isinstance(result.get("index_status_summary"), dict)
     ]
     verified = bool(report.get("end_to_end_verified"))
-    verification_modes = sorted(
-        {
-            str(result.get("verification_mode") or "index_status")
-            for result in results
-            if isinstance(result, dict) and result.get("end_to_end_verified")
-        }
-    )
+    verified_results = [
+        result
+        for result in results
+        if isinstance(result, dict) and result.get("end_to_end_verified")
+    ]
+    verification_mode_set = {
+        str(result.get("verification_mode") or "index_status")
+        for result in verified_results
+    }
     index_status_verified = any(
         str(result.get("verification_mode") or "index_status") == "index_status"
         and bool(result.get("index_status_verified"))
@@ -183,11 +185,11 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
         if isinstance(result, dict)
     )
     search_fetch_verified = any(
-        str(result.get("verification_mode") or "") == "search_fetch"
-        and bool(result.get("contract_verified"))
-        for result in results
-        if isinstance(result, dict)
+        _search_fetch_result_verified(result) for result in verified_results
     )
+    if search_fetch_verified:
+        verification_mode_set.add("search_fetch")
+    verification_modes = sorted(verification_mode_set)
     catalog_tools_verified = EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
     return {
         "status": "verified" if verified else "not_verified",
@@ -211,6 +213,16 @@ def _verification_answer(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _search_fetch_result_verified(result: dict[str, Any]) -> bool:
+    if str(result.get("verification_mode") or "") == "search_fetch":
+        return bool(result.get("contract_verified"))
+    try:
+        search_result_count = int(result.get("search_result_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return search_result_count > 0 and bool(result.get("fetch_has_text"))
+
+
 def _has_external_tool_contract(tool_names: Sequence[str]) -> bool:
     return EXTERNAL_CHATGPT_DATA_TOOLS.issubset(set(tool_names))
 
@@ -230,6 +242,31 @@ def _run_single_client_config_smoke(
         "chatgpt_desktop_local": "ChatGPT Desktop",
         "legacy_plugin": "Legacy ChatGPT Desktop plugin",
     }.get(client_key, client_key)
+    if client_key == "chatgpt_desktop_local":
+        return {
+            "label": client_key,
+            "config_path": str(config_path),
+            "passed": False,
+            "support_status": "unsupported",
+            "direct_local_supported": False,
+            "chatgpt_direct_local_mcp_supported": False,
+            "unsupported_finding": "chatgpt_direct_local_mcp_unsupported",
+            "launcher_ready": False,
+            "process_started": False,
+            "mcp_initialized": False,
+            "tools_discovered": False,
+            "config_encoding_verified": False,
+            "strict_stdio_wire_verified": False,
+            "connection_verified": False,
+            "end_to_end_verified": False,
+            "error": (
+                "ChatGPT does not directly connect to a local MCP server. "
+                "The legacy --chatgpt-desktop-config input is accepted only "
+                "to report this unsupported configuration; no process was started. "
+                "Use ChatGPT web with a reachable remote HTTPS MCP app or the "
+                "OpenAI Secure MCP Tunnel."
+            ),
+        }
     try:
         entry = _read_client_server_entry(client_key=client_key, config_path=config_path, server_name=server_name)
         command = str(entry.get("command") or "")
@@ -290,15 +327,10 @@ def _read_client_server_entry(*, client_key: str, config_path: Path, server_name
         payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
         servers = payload.get("mcpServers") if isinstance(payload, dict) else None
     elif client_key == "chatgpt_desktop_local":
-        payload = _read_strict_utf8_json(config_path)
-        entry = payload.get("ui_fields") if isinstance(payload, dict) else None
-        if not isinstance(entry, dict):
-            raise ValueError(f"{config_path} does not contain ChatGPT Desktop ui_fields.")
-        if str(entry.get("name") or "") != server_name:
-            raise ValueError(f"{config_path} does not contain MCP server {server_name}.")
-        if str(entry.get("transport") or "stdio") != "stdio":
-            raise ValueError(f"{config_path} server {server_name} is not local stdio.")
-        return entry
+        raise ValueError(
+            "ChatGPT direct local MCP is unsupported; this legacy configuration "
+            "must never be interpreted as a runnable server entry."
+        )
     elif client_key == "legacy_plugin":
         payload = _read_strict_utf8_json(config_path)
         if isinstance(payload, dict) and "mcp_servers" in payload:

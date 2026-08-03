@@ -4,11 +4,15 @@ import ast
 import hashlib
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts.mcp_connection_diagnostic import diagnostic_from_bundle_status
 from scripts.mcp_client_status import begin_attempt, commit_success, create_bundle_status
@@ -351,7 +355,9 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         batch_end = source.index("if workflow_ready_count < workflow_pending_count:", batch_start)
         self.assertIn("_update_long_operation_error(", source[batch_start:batch_end])
         bundle_start = source.index('bundle_status = st.status("MCP 파일 묶음 생성 중…')
-        bundle_end = source.index("bundle_state = st.session_state.get", bundle_start)
+        bundle_end = source.index(
+            "bundle_candidates = _matching_mcp_bundle_state_candidates", bundle_start
+        )
         self.assertIn('state="error"', source[bundle_start:bundle_end])
 
     def test_mcp_connection_diagnostic_reader_reloads_bundle_status_each_call(self):
@@ -461,7 +467,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
                     self.assertIsNone(report["config_fingerprint"])
                     self.assertFalse(report["configured"])
 
-    def test_mcp_connection_diagnostic_reader_shows_v5_manual_registration(self):
+    def test_mcp_connection_diagnostic_reader_rejects_historical_chatgpt_local_success(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
         reader_node = next(
@@ -492,25 +498,39 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             config_fingerprint = "sha256:" + hashlib.sha256(
                 config_path.read_bytes()
             ).hexdigest()
-            status = begin_attempt(
-                create_bundle_status(
-                    "final",
-                    runtime_fingerprint="runtime-current",
-                    generated_at="2026-07-21T00:00:00Z",
-                ),
-                "chatgpt-desktop-local",
-                "manual-settings-attempt",
-                started_at="2026-07-21T00:01:00Z",
+            status = create_bundle_status(
+                "final",
+                runtime_fingerprint="runtime-current",
+                generated_at="2026-07-21T00:00:00Z",
             )
-            status = commit_success(
-                status,
-                "chatgpt-desktop-local",
-                "manual-settings-attempt",
-                verified_stages=("registration",),
-                config_entry_fingerprint=config_fingerprint,
-                bundle_location_fingerprint=str(bundle_dir),
-                verified_at="2026-07-21T00:02:00Z",
+            historical = status["client_connections"]["chatgpt-desktop-local"]
+            historical.update(
+                {
+                    "support_status": "supported",
+                    "supported": True,
+                    "configured": True,
+                    "connected": True,
+                }
             )
+            historical["last_attempt"].update(
+                {"id": "manual-settings-attempt", "state": "completed"}
+            )
+            historical["effective"].update(
+                {
+                    "state": "connected",
+                    "attempt_id": "manual-settings-attempt",
+                    "config_entry_fingerprint": config_fingerprint,
+                }
+            )
+            historical["stages"]["registration"].update(
+                {
+                    "state": "verified",
+                    "attempt_id": "manual-settings-attempt",
+                    "verified": True,
+                }
+            )
+            status["legacy_projection_target"] = "chatgpt-desktop-local"
+            status["active_target"] = "chatgpt-desktop-local"
             status["direct_config_path"] = str(config_path)
             (bundle_dir / "bundle_status.json").write_text(
                 json.dumps(status),
@@ -525,12 +545,11 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIsNone(read_error)
         self.assertEqual("client_connections", report["status_source"])
         self.assertEqual("manual-settings-attempt", report["attempt_id"])
-        self.assertEqual("completed", report["last_attempt_state"])
-        self.assertEqual("verified", report["stages"]["registration"]["state"])
-        self.assertEqual("not_checked", report["stages"]["transport"]["state"])
-        self.assertEqual("pending", report["overall_state"])
+        self.assertEqual("unsupported", report["overall_state"])
+        self.assertEqual("chatgpt_local_unsupported", report["reason_code"])
         self.assertFalse(report["configured"])
         self.assertFalse(report["connected"])
+        self.assertNotEqual("verified", report["stages"]["registration"]["state"])
 
     def test_mcp_connection_diagnostic_reader_requires_real_installed_config_fingerprint(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -575,7 +594,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             installed_fingerprint = "sha256:" + hashlib.sha256(config_path.read_bytes()).hexdigest()
             legacy_success["direct_config_path"] = str(config_path)
             status_path.write_text(json.dumps(legacy_success), encoding="utf-8")
-            missing_fingerprint, missing_error = read_diagnostic(tmp)
+            missing_fingerprint, missing_error = read_diagnostic(tmp, "codex")
 
             status_path.write_text(
                 json.dumps(
@@ -586,7 +605,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            actual_fingerprint, actual_error = read_diagnostic(tmp)
+            actual_fingerprint, actual_error = read_diagnostic(tmp, "codex")
 
         self.assertIsNone(missing_error)
         self.assertEqual("pending", missing_fingerprint["overall_state"])
@@ -774,7 +793,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("diagnostic_from_bundle_status", source)
         self.assertIn('status_path = Path(bundle_dir) / "bundle_status.json"', source)
         self.assertIn("MCP 연결 상태 새로고침", source)
-        self.assertIn("ChatGPT Desktop 연결 진단", source)
+        self.assertNotIn('"chatgpt-desktop-local": "ChatGPT Desktop 연결 진단"', source)
         self.assertIn("Codex CLI 연결 진단", source)
         self.assertIn("Claude Code 연결 진단", source)
         self.assertIn("Claude Desktop 연결 진단", source)
@@ -859,6 +878,83 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("_render_operator_project_controls(NAV_MCP)", source)
         self.assertIn("Windows 탐색기에서 저장 폴더 선택", source)
         self.assertIn("저장하기 — Windows 탐색기에서 산출물 폴더 열기", source)
+        self.assertIn("System.Windows.Forms.FolderBrowserDialog", source)
+        self.assertIn("_default_mcp_bundle_directory()", source)
+
+    def test_portable_folder_picker_fallback_uses_initial_path_without_interpolation(self) -> None:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_select_windows_output_directory_via_powershell"
+        )
+        namespace = {"Path": Path, "os": os, "subprocess": subprocess}
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<folder-picker>", "exec"),
+            namespace,
+        )
+        completed = subprocess.CompletedProcess(
+            args=["powershell.exe"],
+            returncode=0,
+            stdout="\ufeffC:\\사용자\\MCP",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "subprocess.run", return_value=completed
+        ) as run_process:
+            selected = namespace["_select_windows_output_directory_via_powershell"](
+                Path(tmp)
+            )
+
+        self.assertEqual("C:\\사용자\\MCP", selected)
+        args, kwargs = run_process.call_args
+        self.assertEqual("powershell.exe", args[0][0])
+        self.assertNotIn(str(Path(tmp).resolve()), args[0][-1])
+        self.assertEqual(
+            str(Path(tmp).resolve()),
+            kwargs["env"]["PR_MCP_FOLDER_PICKER_INITIAL"],
+        )
+
+    def test_portable_mcp_config_uses_executable_server_mode(self) -> None:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_direct_python_mcp_config"
+        )
+        namespace = {
+            "json": json,
+            "os": SimpleNamespace(getenv=lambda name: "C:\\Portable\\PR MCP Builder.exe" if name == "REG_RAG_PACKAGED_EXE" else None),
+            "sys": SimpleNamespace(executable="C:\\Portable\\PR MCP Builder.exe", frozen=True),
+            "Path": Path,
+            "PROJECT_ROOT": REPO_ROOT,
+            "_powershell_command": lambda command, args: " ".join([command, *args]),
+        }
+        exec(
+            compile(ast.Module(body=[helper_node], type_ignores=[]), "<portable-mcp-config>", "exec"),
+            namespace,
+        )
+        payload = {
+            "quickstart": {
+                "run_local_stdio_server": {
+                    "command": "reg-rag-mcp-server",
+                    "args": ["--data-dir", ".\\data"],
+                },
+                "copy_paste": {},
+            }
+        }
+
+        result = namespace["_direct_python_mcp_config"](payload)
+        server = result["quickstart"]["run_local_stdio_server"]
+        self.assertEqual("C:\\Portable\\PR MCP Builder.exe", server["command"])
+        self.assertEqual("--mcp-server", server["args"][0])
+        self.assertNotIn("run_regulation_mcp.py", server["args"])
+        self.assertIn("--flat-storage", server["args"])
+        self.assertIn("--no-warm-cache", server["args"])
 
     def test_saved_projects_are_available_only_after_institution_selection(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -926,6 +1022,13 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("전체 규정 자료 사람 확인 완료 (선택 {len(selected_document_ids):,}개)", source)
         self.assertIn("나머지 부분 AI 점검 전체 완료 (선택 {len(selected_document_ids):,}개)", source)
         self.assertIn("나머지 부분 사람 점검 전체 완료 (선택 {len(selected_document_ids):,}개)", source)
+        self.assertGreaterEqual(source.count("or beginner_bulk_review_disabled"), 8)
+        self.assertIn("초보자 안내 모드에서는 일괄 검수 버튼을 사용할 수 없습니다", source)
+        bulk_skip_start = source.index('key=f"ai-bulk-skip-{document_id}"')
+        self.assertIn(
+            "disabled=beginner_bulk_review_disabled",
+            source[bulk_skip_start : bulk_skip_start + 250],
+        )
         self.assertIn("_prepare_reviewed_document_approval_plan", source)
         self.assertIn("_execute_reviewed_document_approval_plan", source)
         self.assertIn("규정별 문서 ID·규정 ID·목차 계층", source)
@@ -1016,11 +1119,11 @@ class StreamlitOperatorModeTests(unittest.TestCase):
     def test_streamlit_reflects_parser_ai_review_human_approval_stages(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
-        # 파서 초안 → AI 검수 → 휴먼 승인 3단계 진행 띠가 정의되고 각 페이지에서 렌더링돼야 한다.
+        # 파서 초안 → (선택) AI 추가 검수 → 사람 승인 3단계 진행 띠가 정의되고 각 페이지에서 렌더링돼야 한다.
         self.assertIn("PIPELINE_STAGES", source)
         self.assertIn("파서 초안", source)
-        self.assertIn("AI 검수", source)
-        self.assertIn("휴먼 승인", source)
+        self.assertIn("(선택) AI 추가 검수", source)
+        self.assertIn("사람 승인", source)
         self.assertIn("def _render_pipeline_stages", source)
         self.assertIn("_render_pipeline_stages(PIPELINE_STAGE_PARSER)", source)
         self.assertIn("_render_pipeline_stages(PIPELINE_STAGE_AI_REVIEW)", source)
@@ -1035,6 +1138,74 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         # 기술 상세(비용 가드)는 유지하되 전산 담당자용으로 접어 둔다.
         self.assertIn("AI review API and cost guard", source)
 
+    def test_preprocess_ai_review_is_opt_in_while_official_gates_remain(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn("AI로 의심 구간 추가 검수 (선택)", source)
+        self.assertIn('key="preprocess-enable-agent-review"', source)
+        self.assertIn("enable_agent_review=ai_review_requested", source)
+        self.assertNotIn("enable_agent_review=True", source)
+        self.assertIn("휴먼리뷰 후 공식 RAG/MCP 사용", source)
+        self.assertIn("공식 승인·보안 확인은 그대로 진행됩니다.", source)
+        self.assertIn("사람 승인과 보안 게이트를 대신하지 않습니다.", source)
+
+    def test_mcp_export_failure_guidance_is_not_nested_in_folder_open_error(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        dialog_start = source.index("def _render_operator_project_dialog")
+        dialog_end = source.index("\ndef ", dialog_start + 1)
+        folder_dialog_source = source[dialog_start:dialog_end]
+        self.assertNotIn("MCP runtime export would be incomplete", folder_dialog_source)
+
+        mcp_page_start = source.index("def _page_connect")
+        export_reason_index = source.index("MCP runtime export would be incomplete", mcp_page_start)
+        export_exception_start = source.rfind("except Exception as exc:", mcp_page_start, export_reason_index)
+        self.assertGreater(export_exception_start, mcp_page_start)
+        self.assertIn(
+            "③ 검수하고 승인에서 남은 항목을 처리하고 색인한 뒤 'MCP로 쓸 파일 묶음 만들기'를 다시 누르세요.",
+            source[
+                export_exception_start : source.index(
+                    "bundle_candidates = _matching_mcp_bundle_state_candidates",
+                    export_exception_start,
+                )
+            ],
+        )
+        export_exception_source = source[
+            export_exception_start : source.index(
+                "bundle_candidates = _matching_mcp_bundle_state_candidates",
+                export_exception_start,
+            )
+        ]
+        self.assertIn("beginner_error_message", export_exception_source)
+        self.assertIn(
+            "검토가 끝나지 않은 조문이 있어 MCP 파일 묶음을 만들지 않았습니다.",
+            export_exception_source,
+        )
+        self.assertNotIn("st.error(str(exc))", export_exception_source)
+
+    def test_kordoc_guidance_keeps_fast_preprocess_separate_from_official_mcp_gate(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn("Kordoc 없이도 일반 조문·항·호의 빠른 구조 전처리는 할 수 있습니다.", source)
+        self.assertIn("PDF·HWP·HWPX·DOCX를 공식 MCP로 만들려면 Kordoc을 준비하세요", source)
+        self.assertIn("공식 MCP 파일 묶음에는 PDF·HWP·HWPX·DOCX 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다.", source)
+        self.assertIn("미설치 상태에서 처리한 문서는 나중에 Kordoc 설치 후 새 초안으로", source)
+        self.assertIn("다시 전처리·검수·승인해야 합니다.", source)
+        self.assertNotIn("HWP/HWPX의 표·별표가 중요한 문서", source)
+
+    def test_single_chunk_rejection_reuses_guarded_backend_action(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn("RejectRequest", source)
+        self.assertIn("reject_review_chunks", source)
+        self.assertIn("_chunk_rejection_ready", source)
+        self.assertIn("반려 사유 (필수)", source)
+        self.assertIn("현재 화면에서 선택한 청크 1개만 반려", source)
+        self.assertIn("chunk_ids=[str(compare_chunk.chunk_id)]", source)
+        self.assertIn("disabled=not rejection_ready", source)
+        self.assertIn("최종 제외(terminal exclusion)", source)
+        self.assertIn("_invalidate_document_context_cache(document_id)", source)
+
     def test_connection_handoff_uses_direct_stdio_and_vercel_http(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
@@ -1042,10 +1213,21 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertNotIn("전용 연결 버튼을 실행하면 됩니다", source)
         self.assertNotIn('mcp_mode == "tunnel"', source)
         self.assertNotIn('files.get("openai_tunnel")', source)
-        self.assertIn("ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)", source)
+        self.assertIn('"codex": "Codex CLI / Codex IDE"', source)
+        self.assertIn(
+            "ChatGPT는 로컬 STDIO에 직접 연결하지 않으므로 원격 HTTPS 대상을 선택",
+            source,
+        )
         self.assertIn("ChatGPT · Vercel HTTPS MCP", source)
         self.assertIn("Claude · Vercel HTTPS MCP", source)
-        self.assertIn("배포된 Vercel HTTPS `/mcp` 주소 (필수)", source)
+        self.assertIn("배포된 Vercel HTTPS `/mcp` 주소 (첫 배포 전에는 비워도 됨)", source)
+        self.assertIn("배포 준비용 MCP 묶음", source)
+        self.assertIn("아직 없음 — 배포 준비 묶음부터 생성하세요", source)
+        self.assertIn('mcp_http_url.startswith("https://")', source)
+        self.assertIn("Settings > Apps > Advanced settings > Developer mode", source)
+        self.assertIn("Secure MCP Tunnel", source)
+        self.assertIn("다른 Windows PC에서 로컬 STDIO로 실행하려면 대상 PC에", source)
+        self.assertIn("Python 3.11 이상을 설치해야 합니다", source)
         options_start = source.index("mcp_connection_target_options = [")
         options_end = source.index("]", options_start)
         options_source = source[options_start:options_end]
@@ -1079,18 +1261,6 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('"http": "Vercel HTTPS /mcp"', source)
         self.assertIn('"local": "로컬 stdio"', source)
         self.assertIn(
-            '"command": desktop_registration.get("command")',
-            source,
-        )
-        self.assertIn(
-            '"args": desktop_registration.get("arguments") or []',
-            source,
-        )
-        self.assertIn(
-            '"cwd": desktop_registration.get("working_directory")',
-            source,
-        )
-        self.assertIn(
             '"chatgpt_desktop_local_config": str(',
             source,
         )
@@ -1109,6 +1279,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Streamable HTTP", source)
         self.assertIn("bearer", source)
         self.assertIn("OAuth", source)
+        self.assertNotIn('if mcp_mode == "local":\n                    connection_display_value = json.dumps', source)
 
         target_files_start = source.index("mcp_target_file_keys = {")
         target_files_end = source.index("}", target_files_start)
@@ -1268,46 +1439,21 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "def _render_chatgpt_codex_desktop_registration_guide("
         )
         guide_end = source.index(
-            "def _direct_python_mcp_config(",
+            "def _read_claude_desktop_registration(",
             guide_start,
         )
         guide_source = source[guide_start:guide_end]
 
         for expected in (
-            "ChatGPT Desktop에 등록하는 방법",
-            "Name (MCP 서버 이름)",
-            "Transport",
-            "Command 복사",
-            "Working directory 복사",
-            "Arguments (",
-            "한 줄씩 따로 복사",
-            "첫 번째 인자 칸에 Argument 1",
-            "`+ 인자 추가`",
-            "아래 한 줄만 복사",
-            "Environment (",
-            "키와 값을 따로 복사",
-            "왼쪽 키 칸에 복사",
-            "오른쪽 값 칸에 복사",
-            "Environment passthrough (",
-            "Passthrough",
-            "입력하지 않음",
-            "MCP 서버 이름은 Name에만 입력합니다.",
-            "Command에는 서버 이름을 입력하지 않습니다.",
-            "각 Argument는 한 입력 칸에 하나씩 순서대로 넣어야 합니다.",
-            "Arguments를 일부라도 누락하면 서버가 실행되지 않습니다.",
-            "자동 수정하지 않았으므로",
-            "왼쪽 아래 계정 > 설정 > 플러그인 > MCP > ",
-            "+ 서버 추가 > STDIO",
-            "위 Name을 ChatGPT의 이름 칸에 넣습니다.",
-            "Argument 1을 첫 인자 칸에 넣고 `+ 인자 추가`",
-            "Environment 첫 키·값은 이미 보이는 첫 행",
-            "Environment passthrough 첫 값도 이미 보이는 첫 칸",
-            "오른쪽 아래 저장을 누릅니다.",
-            "ChatGPT Desktop을 완전 종료했다가 다시 실행합니다.",
-            "설정 > 플러그인 > MCP에서 새 서버를 켭니다.",
-            "`search`와 `fetch`를 실제로 호출해 연결을 검증합니다.",
+            "로컬 STDIO MCP 서버에 직접 연결하는 공개 지원 경로가 아닙니다",
+            "이전 번들의 로컬 ChatGPT 설정값은 사용하지 마세요",
+            "ChatGPT · Vercel HTTPS MCP",
+            "OpenAI Secure MCP Tunnel",
+            "OpenAI의 ChatGPT MCP 지원 범위 확인",
         ):
             self.assertIn(expected, guide_source)
+        self.assertNotIn("Command 복사", guide_source)
+        self.assertNotIn("+ 서버 추가 > STDIO", guide_source)
         self.assertNotIn("\ufffd", guide_source)
 
     def test_chatgpt_codex_desktop_registration_renders_each_value_separately(
@@ -1346,6 +1492,9 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             def error(self, value: str) -> None:
                 self.events.append(("error", value))
 
+            def link_button(self, label: str, url: str) -> None:
+                self.events.append(("link_button", f"{label} {url}"))
+
         fake_st = FakeStreamlit()
         namespace = {"Any": Any, "st": fake_st}
         exec(
@@ -1380,32 +1529,14 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             }
         )
 
-        code_values = [
-            value for event, value in fake_st.events if event == "code"
-        ]
-        self.assertEqual(
-            [
-                "기관 규정",
-                "powershell.exe",
-                *arguments,
-                "PYTHONPATH",
-                r"C:\Users\테스트 사용자\Public Regulation MCP",
-                "PYTHONSAFEPATH",
-                "1",
-                "REG_RAG_TOKEN",
-                r"C:\MCP 번들\기관 규정",
-            ],
-            code_values,
-        )
+        self.assertFalse([value for event, value in fake_st.events if event == "code"])
         rendered_text = "\n".join(value for _, value in fake_st.events)
         for expected in (
-            "Argument 1/3",
-            "Argument 2/3",
-            "Argument 3/3",
-            "Environment 1/2 — 왼쪽 키 칸에 복사",
-            "Environment 2/2 — 오른쪽 값 칸에 복사",
-            "Passthrough 1/1",
-            "마지막 Argument 3까지 각각 다른 칸",
+            "로컬 STDIO MCP 서버에 직접 연결하는 공개 지원 경로가 아닙니다",
+            "이전 번들의 로컬 ChatGPT 설정값은 사용하지 마세요",
+            "ChatGPT · Vercel HTTPS MCP",
+            "OpenAI Secure MCP Tunnel",
+            "help.openai.com",
         ):
             self.assertIn(expected, rendered_text)
 
@@ -1513,14 +1644,13 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         )
         self.assertIn('elif installed_target == "codex":', source)
         for expected in (
-            "방법 B에서 실제로 연결할 앱 하나 선택",
-            "이번에 연결할 앱",
-            "ChatGPT Desktop — 인자를 한 줄씩 서로 다른 칸에 입력",
-            "Codex CLI / Codex IDE — 생성된 TOML 블록 전체 붙여 넣기",
-            'if method_b_destination == "chatgpt-desktop-local":',
-            "diagnostic_target =",
+            "Codex CLI / Codex IDE에 등록하는 방법",
+            "이전 번들의 로컬 ChatGPT 설정값은 사용하지 마세요",
+            "diagnostic_target = installed_target",
         ):
             self.assertIn(expected, source)
+        self.assertNotIn("method_b_destination", source)
+        self.assertNotIn("ChatGPT Desktop — 인자를", source)
         self.assertNotIn(
             'if installed_target in {"chatgpt-desktop-local", "codex"}:',
             source,
@@ -1672,7 +1802,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "MCP_ALLOW_UNAUTHENTICATED_HTTP",
             "MCP_TOOL_PROFILE",
             "방법 A · Claude Code 로컬 STDIO",
-            "방법 B · ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+            "방법 B · Codex CLI / Codex IDE 로컬 STDIO",
             "방법 C · Claude Desktop 로컬 STDIO",
             "방법 D · ChatGPT · Vercel HTTPS MCP",
             "방법 E · Claude · Vercel HTTPS MCP",
@@ -1730,6 +1860,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         namespace = {
             "Path": Path,
             "st": recorder,
+            "sys": SimpleNamespace(frozen=False),
+            "os": SimpleNamespace(getenv=lambda _name: ""),
             "_powershell_command": powershell_command,
         }
         exec(
@@ -1762,6 +1894,23 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             self.assertIn("Settings > Developer > Edit Config", local_output)
             self.assertIn("서버 이름을 Command 칸에 직접 쓰지 않습니다", local_output)
 
+            namespace["sys"].frozen = True
+            recorder.values.clear()
+            render(
+                target="claude-desktop",
+                server_name="portable-demo",
+                bundle_dir=str(bundle_dir),
+                runtime_data_dir=str(runtime_dir),
+                connection_display_value="{}",
+            )
+            packaged_output = "\n".join(recorder.values)
+            self.assertIn("PR MCP Builder.exe --mcp-server", packaged_output)
+            self.assertIn("Python을 따로 설치할 필요가 없습니다", packaged_output)
+            self.assertNotIn("doctor_mcp_connection.ps1", packaged_output)
+            self.assertNotIn("validate_mcp_smoke.ps1", packaged_output)
+            self.assertNotIn("connect_mcp_client.ps1", packaged_output)
+
+            namespace["sys"].frozen = False
             recorder.values.clear()
             render(
                 target="claude-api",
@@ -1810,23 +1959,39 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("status_box.update(", helper_source)
         self.assertNotIn("status_box.write(", helper_source)
         self.assertIn("min(measured_percent, 99) if thread.is_alive()", helper_source)
+        self.assertIn("thread.join(timeout=0.5)", helper_source)
+        self.assertNotIn("time.sleep(0.5)", helper_source)
         self.assertNotIn("estimated_percent", helper_source)
         self.assertNotIn("elapsed_fraction", helper_source)
 
         bundle_start = source.index('"MCP로 쓸 파일 묶음 만들기"')
-        bundle_end = source.index("bundle_state = st.session_state.get", bundle_start)
+        bundle_end = source.index(
+            "bundle_candidates = _matching_mcp_bundle_state_candidates", bundle_start
+        )
         bundle_source = source[bundle_start:bundle_end]
         self.assertIn('start_percent=35', bundle_source)
         self.assertIn('end_percent=78', bundle_source)
         self.assertIn('label="MCP 데이터·검색 인덱스 생성"', bundle_source)
+        self.assertIn("④ MCP 생성·업데이트 한 번으로 선택 범위의 규정 목록·목차·조문 계층 색인", source)
+        self.assertIn("개별 규정 파일 여러 개와 통합 규정집 모두 동일하게 처리됩니다.", source)
+        self.assertIn("목차 노드 {runtime_data.get('toc_node_count', 0)}개와 조문 계층 색인을 자동 생성했습니다.", source)
         self.assertIn("current_bundle_regulation", bundle_source)
         self.assertIn('bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")', bundle_source)
         self.assertIn('state="error"', bundle_source)
         self.assertIn("전체 작업을 중단했습니다", bundle_source)
+        self.assertIn("아직 검수·승인 또는 반려가 끝나지 않은 청크가 있어 MCP 생성을 중단했습니다.", source)
         self.assertNotIn("time.sleep(0.12)", bundle_source)
 
         self.assertIn("progress_callback=report", source)
         self.assertIn('progress_callback(50, "검색 인덱스 생성", 0, 1)', source)
+
+    def test_streamlit_does_not_offer_inactive_chunk_mode_choices(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn('chunk_mode = "article"', source)
+        self.assertIn("청크 방식: 규정의 조문·항목 구조에 맞춰 자동 적용", source)
+        self.assertNotIn('"paragraph": "문단 중심"', source)
+        self.assertNotIn('"hybrid": "혼합"', source)
 
 
 if __name__ == "__main__":

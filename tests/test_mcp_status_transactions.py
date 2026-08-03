@@ -336,6 +336,10 @@ class McpStatusTransactionTests(unittest.TestCase):
                     return_value={},
                 ),
                 patch(
+                    "scripts.generate_mcp_client_config._runtime_omission_disposition_projection",
+                    return_value={},
+                ),
+                patch(
                     "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
                     side_effect=RuntimeError("forced-mid-runtime-failure"),
                 ),

@@ -19,17 +19,16 @@ if __package__ in {None, ""}:  # Keep a third-party ``scripts`` package from sha
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
-    from scripts import check_chatgpt_desktop_recognition as chatgpt_observer
     from scripts import inspect_claude_desktop_connection as claude_observer
     from scripts import mcp_client_status
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - local fallback
-    import check_chatgpt_desktop_recognition as chatgpt_observer
     import inspect_claude_desktop_connection as claude_observer
     import mcp_client_status
 
 
 SCHEMA_VERSION = "mcp-client-connection-refresh-v1"
 TARGETS = ("chatgpt-desktop-local", "claude-desktop")
+CHATGPT_LOCAL_UNSUPPORTED = "chatgpt_local_unsupported"
 _SAFE_TOKEN = re.compile(r"^[a-z0-9_]{1,96}$")
 _MAX_COUNT = 2_147_483_647
 
@@ -413,7 +412,7 @@ def _sanitize_claude(report: Mapping[str, Any]) -> dict[str, Any]:
 
 def sanitize_observation(target: str, report: Mapping[str, Any]) -> dict[str, Any]:
     if target == "chatgpt-desktop-local":
-        return _sanitize_chatgpt(report)
+        raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
     if target == "claude-desktop":
         return _sanitize_claude(report)
     raise RefreshError("target_unsupported")
@@ -425,49 +424,7 @@ def _chatgpt_probe(
     config_path: Path | None,
     _server_name_value: str,
 ) -> Mapping[str, Any]:
-    registration = chatgpt_observer.load_registration_observation(
-        bundle_status_path=bundle_status_path,
-        config_path=config_path,
-    )
-    try:
-        process_times = chatgpt_observer.discover_desktop_process_start_times()
-    except Exception:
-        process_times = []
-    try:
-        candidate_roots = chatgpt_observer.discover_desktop_log_roots()
-    except Exception:
-        candidate_roots = []
-    existing_roots = [path for path in candidate_roots if path.is_dir()]
-    log_paths: list[Path] = []
-    seen: set[str] = set()
-    for root in existing_roots:
-        for path in chatgpt_observer.discover_log_files(root):
-            key = os.path.normcase(str(path))
-            if key not in seen:
-                seen.add(key)
-                log_paths.append(path)
-    sessions = [
-        session
-        for path in log_paths
-        if (session := chatgpt_observer.load_log_session(path)) is not None
-    ]
-    if not existing_roots:
-        discovery_status = "log_root_missing"
-    elif not log_paths:
-        discovery_status = "logs_not_found"
-    elif not sessions:
-        discovery_status = "logs_unreadable"
-    else:
-        discovery_status = "logs_loaded"
-    return chatgpt_observer.evaluate_recognition_observation(
-        registration=registration,
-        process_start_times=process_times,
-        log_sessions=sessions,
-        log_discovery_status=discovery_status,
-        log_root_candidate_count=len(candidate_roots),
-        log_root_existing_count=len(existing_roots),
-        log_file_count=len(log_paths),
-    )
+    raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
 
 
 def _claude_probe(
@@ -532,26 +489,7 @@ def _merge_observation_fields(
     observed_at = observation.get("observed_at")
     observation_status = str(observation.get("observation_status") or "unknown")
     if target == "chatgpt-desktop-local":
-        status["chatgpt_desktop_connection_observation"] = dict(observation)
-        status["desktop_recognition_observation_status"] = observation_status
-        status["desktop_process_detected"] = bool(observation.get("desktop_process_detected"))
-        status["desktop_restart_checked_at"] = observed_at
-        status["desktop_restart_required"] = observation.get("desktop_restart_required")
-        status["desktop_restart_status"] = str(
-            observation.get("desktop_restart_status") or "unknown"
-        )
-        status["desktop_restart_reason_code"] = observation_status
-        status["desktop_restarted_after_registration"] = (
-            _safe_count(observation.get("post_registration_process_count")) > 0
-            and observation.get("desktop_restart_required") is False
-        )
-        status["desktop_post_registration_log_session_observed"] = bool(
-            observation.get("post_registration_log_session_observed")
-        )
-        status["desktop_status_scan_request_observed"] = bool(
-            observation.get("mcp_status_list_observed_without_error")
-        )
-        return
+        raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
 
     status["claude_desktop_connection_observation"] = dict(observation)
     status["claude_desktop_recognition_observation_status"] = observation_status
@@ -613,29 +551,7 @@ def _commit_v5_manual_registration(
 ) -> dict[str, Any]:
     """Record only the exact Settings registration in the v5 client model."""
 
-    target = "chatgpt-desktop-local"
-    started = mcp_client_status.begin_attempt(
-        status,
-        target,
-        attempt_id,
-        started_at=registered_at,
-    )
-    return mcp_client_status.commit_success(
-        started,
-        target,
-        attempt_id,
-        verified_stages={
-            "registration": {
-                "manual_settings_registration_adopted": True,
-                "exact_entry_match_verified": True,
-            }
-        },
-        config_entry_fingerprint=evidence.config_fingerprint,
-        config_container_fingerprint=evidence.config_fingerprint,
-        bundle_fingerprint=status.get("bundle_fingerprint"),
-        bundle_location_fingerprint=str(evidence.snippet_path.parent),
-        verified_at=registered_at,
-    )
+    raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
 
 
 def _v5_transport_observation_transition(
@@ -647,85 +563,9 @@ def _v5_transport_observation_transition(
 ) -> dict[str, Any] | None:
     """Upgrade an exact registration-only v5 scope through transport, and no further."""
 
-    if target != "chatgpt-desktop-local":
+    if target == "chatgpt-desktop-local":
         return None
-    record = _v5_client_record(status, target)
-    if record is None:
-        return None
-    transport_observed = bool(
-        observation.get("recognition_observation_ready")
-        and observation.get("registration_observed")
-        and observation.get("post_registration_log_session_observed")
-        and observation.get("mcp_status_list_observed_without_error")
-    )
-    if not transport_observed:
-        return None
-
-    last_attempt = _mapping(record.get("last_attempt"))
-    effective = _mapping(record.get("effective"))
-    stages = _mapping(record.get("stages"))
-    registration = _mapping(stages.get("registration"))
-    transport = _mapping(stages.get("transport"))
-    if (
-        last_attempt.get("id") != attempt_id
-        or last_attempt.get("state") != "completed"
-        or effective.get("attempt_id") != attempt_id
-        or registration.get("state") != "verified"
-        or registration.get("attempt_id") != attempt_id
-        or transport.get("state") == "verified"
-    ):
-        return None
-    # This observer may extend only an isolated registration-only scope. It
-    # must never rewrite loader, app inventory, client surface, or conversation
-    # evidence produced by another setup path.
-    for stage_name in (
-        "loader",
-        "fresh_app_server",
-        "client_reload",
-        "client_surface",
-        "conversation",
-    ):
-        if _mapping(stages.get(stage_name)).get("state") != "not_checked":
-            return None
-    if transport.get("state") != "not_checked":
-        return None
-
-    config_fingerprint = effective.get("config_entry_fingerprint")
-    location_fingerprint = effective.get("bundle_location_fingerprint")
-    runtime_fingerprint = status.get("runtime_fingerprint")
-    if not config_fingerprint or not location_fingerprint or not runtime_fingerprint:
-        return None
-    observed_at = str(observation.get("observed_at") or "").strip() or None
-    started_at = str(last_attempt.get("started_at") or "").strip() or observed_at
-    started = mcp_client_status.begin_attempt(
-        status,
-        target,
-        attempt_id,
-        started_at=started_at,
-    )
-    return mcp_client_status.commit_success(
-        started,
-        target,
-        attempt_id,
-        verified_stages={
-            "registration": {
-                "registration_scope_preserved": True,
-                "exact_entry_match_verified": True,
-            },
-            "transport": {
-                "desktop_transport_observed": True,
-                "post_registration_session_observed": True,
-                "mcp_status_list_observed_without_error": True,
-            },
-        },
-        config_entry_fingerprint=config_fingerprint,
-        config_container_fingerprint=effective.get("config_container_fingerprint"),
-        runtime_fingerprint=runtime_fingerprint,
-        bundle_fingerprint=effective.get("bundle_fingerprint")
-        or status.get("bundle_fingerprint"),
-        bundle_location_fingerprint=location_fingerprint,
-        verified_at=observed_at,
-    )
+    return None
 
 
 def _commit_manual_registration_adoption(
@@ -737,88 +577,7 @@ def _commit_manual_registration_adoption(
     attempt_id: str,
     registered_at: str,
 ) -> None:
-    current, current_digest = _read_status(path)
-    if current_digest != expected_status_digest:
-        raise RefreshError("bundle_status_changed_during_manual_adoption")
-    _validate_server_identity(current, expected_server_name)
-    if _optional_attempt_id(current, "chatgpt-desktop-local") is not None:
-        raise RefreshError("installation_attempt_created_during_manual_adoption")
-    if (
-        _source_digest(
-            evidence.config_path,
-            error_code="manual_registration_source_changed",
-        )
-        != evidence.config_source_digest
-        or _source_digest(
-            evidence.snippet_path,
-            error_code="manual_registration_source_changed",
-        )
-        != evidence.snippet_source_digest
-    ):
-        raise RefreshError("manual_registration_source_changed")
-
-    is_v5 = _v5_client_record(current, "chatgpt-desktop-local") is not None
-    if is_v5:
-        current = _commit_v5_manual_registration(
-            current,
-            evidence=evidence,
-            attempt_id=attempt_id,
-            registered_at=registered_at,
-        )
-    legacy_updates = {
-        "installation_attempt_id": attempt_id,
-        "installation_state": "installed_pending_desktop_verification",
-        "connection_state": "pending_desktop_verification",
-        "direct_config_registered": True,
-        "direct_config_path": str(evidence.config_path),
-        "installed_config_fingerprint": evidence.config_fingerprint,
-        "desktop_mcp_registration_updated_at": registered_at,
-        "direct_config_loader_verified": False,
-        "loader_verification_state": "not_checked",
-        "loader_verification_reason": "manual_registration_pending_verification",
-        "installed_config_transport_verified": False,
-        "installed_config_transport_runtime_fingerprint": None,
-        "direct_stdio_verified": False,
-        "transport_end_to_end_verified": False,
-        "fresh_codex_app_server_inventory_verified": False,
-        "fresh_codex_app_server_runtime_fingerprint": None,
-        "desktop_app_server_loader_verified": False,
-        "desktop_app_server_tool_count": 0,
-        "desktop_app_server_tool_names": [],
-        "desktop_app_server_server_info": None,
-        "desktop_app_server_error": None,
-        "desktop_recognition_observation_status": "not_checked",
-        "desktop_restarted_after_registration": False,
-        "desktop_post_registration_log_session_observed": False,
-        "desktop_status_scan_request_observed": False,
-        "desktop_tool_scan_verified": False,
-        "conversation_attachment_verified": False,
-        "conversation_attachment_unverified": True,
-        "tool_scan_unverified": True,
-        "end_to_end_verified": False,
-    }
-    if is_v5:
-        # Keep the v5 transition's legacy projection authoritative. Only add
-        # compatibility metadata that the projection model does not own.
-        for projected_key in (
-            "installation_attempt_id",
-            "installation_state",
-            "connection_state",
-            "installed_config_fingerprint",
-            "direct_config_registered",
-            "direct_config_loader_verified",
-            "installed_config_transport_verified",
-            "direct_stdio_verified",
-            "fresh_codex_app_server_inventory_verified",
-            "desktop_app_server_loader_verified",
-            "desktop_tool_scan_verified",
-            "conversation_attachment_verified",
-            "transport_end_to_end_verified",
-            "end_to_end_verified",
-        ):
-            legacy_updates.pop(projected_key, None)
-    current.update(legacy_updates)
-    _atomic_write_json(path, current)
+    raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
 
 
 def _commit_observation(
@@ -831,6 +590,8 @@ def _commit_observation(
     observation: Mapping[str, Any],
     manual_evidence: ManualRegistrationEvidence | None = None,
 ) -> None:
+    if target == "chatgpt-desktop-local":
+        raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
     current, current_digest = _read_status(path)
     if current_digest != expected_digest:
         raise RefreshError("bundle_status_changed_during_observation")
@@ -878,7 +639,8 @@ def _safe_result(
         "report_type": "mcp_client_connection_refresh",
         "schema_version": SCHEMA_VERSION,
         "target": target,
-        "ok": bool(observation.get("recognition_observation_ready")),
+        "ok": target != "chatgpt-desktop-local"
+        and bool(observation.get("recognition_observation_ready")),
         "status_updated": status_updated,
         "installation_attempt_preserved": status_updated and not manual_registration_adopted,
         "installation_attempt_created_by_explicit_adoption": manual_registration_adopted,
@@ -931,6 +693,8 @@ def run(
     manual_registration_adopted = False
     manual_evidence: ManualRegistrationEvidence | None = None
     try:
+        if args.target == "chatgpt-desktop-local":
+            raise RefreshError(CHATGPT_LOCAL_UNSUPPORTED)
         if args.adopt_manual_registration and args.target != "chatgpt-desktop-local":
             raise RefreshError("manual_registration_target_unsupported")
         if args.out_json is not None:

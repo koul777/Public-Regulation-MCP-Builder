@@ -7,6 +7,7 @@ include *.bat
 include docs/mcp_client_config_examples_ko.md
 include docs/mcp_quickconnect_ko.md
 include docs/mcp_tool_contract_ko.md
+include docs/operator_quickstart_ko.md
 include docs/harness_engineering_plan_ko.md
 include docs/hermes_engineering_plan_ko.md
 include docs/prd_integrated_rag_chatbot_ko.md
@@ -18,6 +19,7 @@ include docs/ui_ux_release_scope_ko.md
 include docs/vercel_https_mcp_ko.md
 include vercel_mcp.py
 recursive-include tests *.py
+include tests/fixtures/sample_regulation.md
 recursive-include scripts *.ps1
 recursive-include packaging *.py *.spec *.txt *.ps1
 prune build

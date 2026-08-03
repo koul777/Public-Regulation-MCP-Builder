@@ -385,6 +385,49 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertNotIn("workflow_transition_state", app.session_state.filtered_state)
         self.assertFalse(app.exception)
 
+    def test_beginner_mode_blocks_mcp_navigation_until_approval_and_index_complete(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            set_runtime_settings_overrides(data_dir=settings.data_dir, artifact_root=settings.artifact_root)
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(str(REPO_ROOT / "frontend" / "streamlit_app.py"), default_timeout=20)
+            _seed_app_institution_context(app)
+            app.session_state["document_id"] = "doc_streamlit_approval"
+            app.session_state["nav_page"] = "③ 검수하고 승인"
+            app.session_state["beginner_guide_choice_made"] = True
+            app.session_state["beginner_guide_enabled"] = True
+            app.session_state["beginner_guide_step"] = 3
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+
+            next_button = next(
+                button
+                for button in app.button
+                if button.label == "④ MCP 생성·AI 연결로 이동"
+            )
+            next(
+                radio for radio in app.radio if radio.label == "기본 작업 순서"
+            ).set_value("④ MCP 생성·AI 연결").run()
+
+        self.assertTrue(next_button.disabled)
+        self.assertNotEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
+        self.assertTrue(
+            any(
+                "승인·색인을" in element.value
+                for element in (*app.info, *app.warning)
+            )
+        )
+        self.assertFalse(app.exception)
+
     def test_approval_tabs_approve_only_reviewed_compare_chunk(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")

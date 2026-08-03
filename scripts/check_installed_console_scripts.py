@@ -3,11 +3,20 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Sequence, TextIO
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app import __version__ as APP_VERSION  # noqa: E402
 
 
 DEFAULT_COMMANDS = (
@@ -129,11 +138,12 @@ def check_installed_console_scripts(
     commands: Sequence[str] = DEFAULT_COMMANDS,
     run_help: bool = True,
     timeout_seconds: float = 10.0,
+    search_path: str | None = None,
 ) -> dict[str, object]:
     checked: list[dict[str, object]] = []
     issues: list[ConsoleScriptIssue] = []
     for command in commands:
-        resolved = shutil.which(command)
+        resolved = shutil.which(command, path=search_path)
         item: dict[str, object] = {"command": command, "path": resolved, "help_checked": False}
         if not resolved:
             issues.append(
@@ -190,6 +200,7 @@ def check_installed_console_scripts(
     high_count = sum(1 for issue in issues if issue.severity == "high")
     return {
         "report_type": "installed_console_scripts",
+        "check_scope": "current-environment",
         "passed": high_count == 0,
         "command_count": len(commands),
         "checked": checked,
@@ -197,6 +208,140 @@ def check_installed_console_scripts(
         "issue_count": len(issues),
         "issues": [issue.to_dict() for issue in issues],
     }
+
+
+def _normalized_wheel_version(value: str) -> str:
+    return value.strip().lower().replace("_", "-")
+
+
+def _select_wheel(wheel_dist_dir: Path, *, expected_version: str) -> Path:
+    candidates = [
+        path
+        for path in wheel_dist_dir.glob("reg_rag_preprocessor-*.whl")
+        if path.is_file()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No reg_rag_preprocessor wheel found in {wheel_dist_dir.resolve()}"
+        )
+    expected = _normalized_wheel_version(expected_version)
+    matching = [
+        path
+        for path in candidates
+        if len(path.name.split("-")) >= 5
+        and _normalized_wheel_version(path.name.split("-")[1]) == expected
+    ]
+    if not matching:
+        available = ", ".join(sorted(path.name for path in candidates))
+        raise FileNotFoundError(
+            f"No reg_rag_preprocessor wheel for version {expected_version!r} found in "
+            f"{wheel_dist_dir.resolve()}; available: {available}"
+        )
+    return max(matching, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def _wheel_setup_failure_report(
+    *,
+    commands: Sequence[str],
+    code: str,
+    detail: str,
+    wheel_path: Path | None = None,
+) -> dict[str, object]:
+    issue = ConsoleScriptIssue(
+        "high",
+        code,
+        str(wheel_path) if wheel_path is not None else "wheel-installation",
+        detail,
+    )
+    return {
+        "report_type": "installed_console_scripts",
+        "check_scope": "built-wheel",
+        "wheel_path": str(wheel_path.resolve()) if wheel_path is not None else None,
+        "passed": False,
+        "command_count": len(commands),
+        "checked": [],
+        "high_count": 1,
+        "issue_count": 1,
+        "issues": [issue.to_dict()],
+    }
+
+
+def check_wheel_console_scripts(
+    *,
+    wheel_dist_dir: Path,
+    commands: Sequence[str] = DEFAULT_COMMANDS,
+    run_help: bool = True,
+    timeout_seconds: float = 10.0,
+    setup_timeout_seconds: float = 120.0,
+    expected_version: str = APP_VERSION,
+) -> dict[str, object]:
+    """Install the expected-version wheel in a temporary venv and check entry points."""
+
+    try:
+        wheel_path = _select_wheel(
+            wheel_dist_dir,
+            expected_version=expected_version,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return _wheel_setup_failure_report(
+            commands=commands,
+            code="console-script-wheel-missing",
+            detail=str(exc),
+        )
+
+    with tempfile.TemporaryDirectory(prefix="reg-rag-console-scripts-") as tmp:
+        venv_dir = Path(tmp) / "venv"
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)],
+                capture_output=True,
+                text=True,
+                timeout=setup_timeout_seconds,
+                check=True,
+            )
+            scripts_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+            venv_python = scripts_dir / ("python.exe" if os.name == "nt" else "python")
+            subprocess.run(
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-deps",
+                    str(wheel_path.resolve()),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=setup_timeout_seconds,
+                check=True,
+            )
+        except subprocess.TimeoutExpired:
+            return _wheel_setup_failure_report(
+                commands=commands,
+                code="console-script-wheel-install-timeout",
+                detail=f"Temporary wheel installation exceeded {setup_timeout_seconds:g} seconds.",
+                wheel_path=wheel_path,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            stderr = getattr(exc, "stderr", None)
+            detail = str(stderr or exc).strip()
+            return _wheel_setup_failure_report(
+                commands=commands,
+                code="console-script-wheel-install-failed",
+                detail=detail,
+                wheel_path=wheel_path,
+            )
+
+        report = check_installed_console_scripts(
+            commands=commands,
+            run_help=run_help,
+            timeout_seconds=timeout_seconds,
+            search_path=str(scripts_dir),
+        )
+        report["check_scope"] = "built-wheel"
+        report["wheel_path"] = str(wheel_path.resolve())
+        return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,6 +354,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-help", action="store_true", help="Only check PATH visibility, not --help execution.")
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--wheel-dist-dir",
+        default=None,
+        help=(
+            "Install the expected-version reg_rag_preprocessor wheel from this directory in a temporary "
+            "virtual environment and validate that artifact instead of the current PATH."
+        ),
+    )
+    parser.add_argument(
+        "--wheel-version",
+        default=APP_VERSION,
+        help="Exact application version expected in --wheel-dist-dir (default: running source version).",
+    )
+    parser.add_argument("--setup-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--out-json", default=None)
     parser.add_argument("--fail-on-issue", action="store_true")
@@ -219,11 +378,21 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
     stdout = sys.stdout if stdout is None else stdout
     args = build_parser().parse_args(argv)
     commands = tuple(args.commands or DEFAULT_COMMANDS)
-    report = check_installed_console_scripts(
-        commands=commands,
-        run_help=not args.skip_help,
-        timeout_seconds=args.timeout_seconds,
-    )
+    if args.wheel_dist_dir:
+        report = check_wheel_console_scripts(
+            wheel_dist_dir=Path(args.wheel_dist_dir),
+            commands=commands,
+            run_help=not args.skip_help,
+            timeout_seconds=args.timeout_seconds,
+            setup_timeout_seconds=args.setup_timeout_seconds,
+            expected_version=args.wheel_version,
+        )
+    else:
+        report = check_installed_console_scripts(
+            commands=commands,
+            run_help=not args.skip_help,
+            timeout_seconds=args.timeout_seconds,
+        )
     payload = json.dumps(report, ensure_ascii=False, indent=2)
     if args.out_json:
         out_path = Path(args.out_json)

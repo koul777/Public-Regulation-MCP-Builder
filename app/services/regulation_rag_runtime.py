@@ -5,7 +5,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import os
@@ -927,7 +927,14 @@ def runtime_approval_snapshot_identity(
         sidecar_signature,
         path_signature(repository.manifest_path),
         path_signature(repository.legacy_path),
+        path_signature(repository.root / "journals" / "approvals.jsonl.gz"),
         path_signature(repository.root / "journals" / "approvals.jsonl"),
+        path_signature(
+            repository.root / "journals" / "review_decisions.jsonl.gz"
+        ),
+        path_signature(
+            repository.root / "journals" / "review_decisions.jsonl"
+        ),
         tuple(chunk_signatures),
     )
 
@@ -936,13 +943,13 @@ def runtime_approval_identity_covers_scope(
     cached_identity: tuple[Any, ...],
     scoped_identity: tuple[Any, ...],
 ) -> bool:
-    if len(cached_identity) != 6 or len(scoped_identity) != 6:
+    if len(cached_identity) != 9 or len(scoped_identity) != 9:
         return cached_identity == scoped_identity
-    if cached_identity[:5] != scoped_identity[:5]:
+    if cached_identity[:8] != scoped_identity[:8]:
         return False
     try:
-        cached_chunk_signatures = dict(cached_identity[5])
-        scoped_chunk_signatures = dict(scoped_identity[5])
+        cached_chunk_signatures = dict(cached_identity[8])
+        scoped_chunk_signatures = dict(scoped_identity[8])
     except (TypeError, ValueError):
         return False
     return all(
@@ -1112,6 +1119,15 @@ def runtime_approval_snapshot_file_signatures(
         "legacy_repository": portable_file_signature(repository.legacy_path),
         "approval_journal": portable_file_signature(
             repository.root / "journals" / "approvals.jsonl"
+        ),
+        "approval_journal_gzip": portable_file_signature(
+            repository.root / "journals" / "approvals.jsonl.gz"
+        ),
+        "review_journal": portable_file_signature(
+            repository.root / "journals" / "review_decisions.jsonl"
+        ),
+        "review_journal_gzip": portable_file_signature(
+            repository.root / "journals" / "review_decisions.jsonl.gz"
         ),
         "repository_chunk_files": repository_chunk_files_signature(repository),
     }
@@ -1381,14 +1397,30 @@ def approval_journal_cache_path(repository: Any) -> Path | None:
     return Path(root) / "journals" / "approvals.jsonl"
 
 
-def approval_journal_records_by_document(
+def review_journal_cache_path(repository: Any) -> Path | None:
+    root = getattr(repository, "root", None)
+    if root is None:
+        return None
+    return Path(root) / "journals" / "review_decisions.jsonl"
+
+
+def journal_records_by_document(
     repository: Any,
     document_ids: list[str],
+    *,
+    journal_path: Path | None,
+    record_loader: Callable[[], Iterable[dict[str, Any]]],
 ) -> dict[str, list[dict[str, Any]]]:
+    """Read one append-only journal once and cache its document grouping."""
+
     selected_document_ids = set(document_ids)
-    journal_path = approval_journal_cache_path(repository)
     journal_signature = (
-        path_signature(journal_path) if journal_path is not None else None
+        (
+            path_signature(Path(f"{journal_path}.gz")),
+            path_signature(journal_path),
+        )
+        if journal_path is not None
+        else None
     )
     if journal_path is not None:
         with _RAG_VECTOR_CACHE_LOCK:
@@ -1401,7 +1433,7 @@ def approval_journal_records_by_document(
                 }
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for record in repository.list_approval_journal_records():
+    for record in record_loader():
         if not isinstance(record, dict):
             continue
         document_id = str(record.get("document_id") or "")
@@ -1410,7 +1442,11 @@ def approval_journal_records_by_document(
 
     if (
         journal_path is not None
-        and path_signature(journal_path) == journal_signature
+        and (
+            path_signature(Path(f"{journal_path}.gz")),
+            path_signature(journal_path),
+        )
+        == journal_signature
     ):
         immutable_grouped = {
             document_id: tuple(records)
@@ -1434,10 +1470,34 @@ def approval_journal_records_by_document(
     }
 
 
+def approval_journal_records_by_document(
+    repository: Any,
+    document_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    return journal_records_by_document(
+        repository,
+        document_ids,
+        journal_path=approval_journal_cache_path(repository),
+        record_loader=repository.list_approval_journal_records,
+    )
+
+
+def review_journal_records_by_document(
+    repository: Any,
+    document_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    return journal_records_by_document(
+        repository,
+        document_ids,
+        journal_path=review_journal_cache_path(repository),
+        record_loader=repository.list_review_journal_records,
+    )
+
+
 def approval_journal_signature(
     repository: Any,
     document_ids: list[str],
-) -> str:
+) -> str | None:
     try:
         records_by_document = approval_journal_records_by_document(
             repository,
@@ -1447,33 +1507,43 @@ def approval_journal_signature(
             record
             for document_id in document_ids
             for record in records_by_document.get(document_id, ())
+            if isinstance(record, dict)
         ]
-    except Exception:
-        records = []
-    payload = [
-        {
-            "approval_record_id": record.get("approval_record_id"),
-            "approval_id": record.get("approval_id"),
-            "document_id": record.get("document_id"),
-            "chunk_ids": record.get("chunk_ids"),
-            "approved_content_hashes": record.get(
-                "approved_content_hashes"
-            ),
-            "worklist_evidence": record.get("worklist_evidence"),
-            "tenant_id": record.get("tenant_id"),
-            "approved_at": record.get("approved_at"),
-        }
-        for record in records
-        if isinstance(record, dict)
-    ]
-    return hashlib.sha256(
-        json.dumps(
-            payload,
+        encoded = json.dumps(
+            records,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    ).hexdigest()
+    except Exception:
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def review_journal_signature(
+    repository: Any,
+    document_ids: list[str],
+) -> str | None:
+    try:
+        records_by_document = review_journal_records_by_document(
+            repository,
+            document_ids,
+        )
+        records = [
+            record
+            for document_id in document_ids
+            for record in records_by_document.get(document_id, ())
+            if isinstance(record, dict)
+        ]
+        encoded = json.dumps(
+            records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        return None
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def repository_documents_signature(
@@ -1551,11 +1621,19 @@ def approval_snapshot_signature(
         )
         for document_id in document_ids
     )
+    approval_signature = approval_journal_signature(
+        repository,
+        document_ids,
+    )
+    review_signature = review_journal_signature(repository, document_ids)
+    if approval_signature is None or review_signature is None:
+        return None
     return (
         repository_documents_signature(repository, document_ids),
         path_signature(repository.legacy_path),
         chunk_signatures,
-        approval_journal_signature(repository, document_ids),
+        approval_signature,
+        review_signature,
     )
 
 
@@ -1883,6 +1961,198 @@ def approval_journal_match_index(
     return index
 
 
+def journal_event_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None or offset is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def journal_record_chunk_ids(
+    record: dict[str, Any],
+    *,
+    approval_record: bool,
+) -> set[str]:
+    chunk_ids: set[str] = set()
+    sequence_fields = ["chunk_ids"]
+    if not approval_record:
+        sequence_fields.append("created_chunk_ids")
+    for field_name in sequence_fields:
+        values = record.get(field_name)
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        chunk_ids.update(
+            str(value or "").strip()
+            for value in values
+            if str(value or "").strip()
+        )
+    hash_fields = (
+        ("approved_content_hashes",)
+        if approval_record
+        else ("before_content_hashes", "after_content_hashes")
+    )
+    for field_name in hash_fields:
+        hashes = record.get(field_name)
+        if isinstance(hashes, dict):
+            chunk_ids.update(
+                str(value or "").strip()
+                for value in hashes
+                if str(value or "").strip()
+            )
+    if approval_record:
+        approved_chunks = record.get("approved_chunks")
+        if isinstance(approved_chunks, list):
+            chunk_ids.update(
+                str(item.get("chunk_id") or "").strip()
+                for item in approved_chunks
+                if isinstance(item, dict)
+                and str(item.get("chunk_id") or "").strip()
+            )
+    return chunk_ids
+
+
+def latest_approval_journal_match_index(
+    approval_records: Iterable[dict[str, Any]],
+    review_records: Iterable[dict[str, Any]],
+    *,
+    tenant_id: str,
+) -> set[tuple[Any, ...]]:
+    """Return approvals that are the unique latest decision for a chunk."""
+
+    from app.services.review_decision_service import (
+        APPROVAL_WORKLIST_METADATA_KEYS,
+        approval_worklist_metadata,
+    )
+
+    events: dict[
+        tuple[str, str],
+        list[tuple[datetime, tuple[Any, ...] | None]],
+    ] = defaultdict(list)
+    ambiguous_chunks: set[tuple[str, str]] = set()
+    ambiguous_documents: set[str] = set()
+    expected_worklist_keys = set(APPROVAL_WORKLIST_METADATA_KEYS)
+    normalized_tenant_id = str(tenant_id or "").strip()
+
+    for record in approval_records:
+        if not isinstance(record, dict):
+            continue
+        document_id = str(record.get("document_id") or "").strip()
+        if not document_id:
+            continue
+        record_tenant_id = str(record.get("tenant_id") or "").strip()
+        if record_tenant_id and record_tenant_id != normalized_tenant_id:
+            continue
+        chunk_ids = journal_record_chunk_ids(
+            record,
+            approval_record=True,
+        )
+        if not chunk_ids:
+            ambiguous_documents.add(document_id)
+            continue
+        timestamp = journal_event_timestamp(record.get("approved_at"))
+        if not record_tenant_id or timestamp is None:
+            ambiguous_chunks.update(
+                (document_id, chunk_id) for chunk_id in chunk_ids
+            )
+            continue
+        approval_id = str(record.get("approval_id") or "").strip()
+        approved_hashes = (
+            {
+                str(chunk_id or "").strip(): str(value or "").strip()
+                for chunk_id, value in record.get(
+                    "approved_content_hashes",
+                    {},
+                ).items()
+                if str(chunk_id or "").strip()
+            }
+            if isinstance(record.get("approved_content_hashes"), dict)
+            else {}
+        )
+        for item in record.get("approved_chunks") or []:
+            if not isinstance(item, dict):
+                continue
+            chunk_id = str(item.get("chunk_id") or "").strip()
+            approved_hash = str(
+                item.get("approved_content_hash") or ""
+            ).strip()
+            if chunk_id and approved_hash and chunk_id not in approved_hashes:
+                approved_hashes[chunk_id] = approved_hash
+        worklist_evidence = record.get("worklist_evidence")
+        worklist_metadata = (
+            approval_worklist_metadata(worklist_evidence)
+            if isinstance(worklist_evidence, dict)
+            else {}
+        )
+        has_valid_worklist = (
+            set(worklist_metadata) == expected_worklist_keys
+        )
+        for chunk_id in chunk_ids:
+            approved_hash = approved_hashes.get(chunk_id, "")
+            match_key = None
+            if approval_id and approved_hash and has_valid_worklist:
+                match_key = approval_journal_match_key(
+                    chunk_id=chunk_id,
+                    document_id=document_id,
+                    tenant_id=record_tenant_id,
+                    approval_id=approval_id,
+                    approved_content_hash=approved_hash,
+                    expected_metadata=worklist_metadata,
+                )
+            events[(document_id, chunk_id)].append(
+                (timestamp, match_key)
+            )
+
+    for record in review_records:
+        if not isinstance(record, dict):
+            continue
+        document_id = str(record.get("document_id") or "").strip()
+        if not document_id:
+            continue
+        record_tenant_id = str(record.get("tenant_id") or "").strip()
+        if record_tenant_id and record_tenant_id != normalized_tenant_id:
+            continue
+        chunk_ids = journal_record_chunk_ids(
+            record,
+            approval_record=False,
+        )
+        if not chunk_ids:
+            ambiguous_documents.add(document_id)
+            continue
+        timestamp = journal_event_timestamp(record.get("reviewed_at"))
+        if not record_tenant_id or timestamp is None:
+            ambiguous_chunks.update(
+                (document_id, chunk_id) for chunk_id in chunk_ids
+            )
+            continue
+        for chunk_id in chunk_ids:
+            events[(document_id, chunk_id)].append((timestamp, None))
+
+    latest_approvals: set[tuple[Any, ...]] = set()
+    for scope, scoped_events in events.items():
+        if scope in ambiguous_chunks or scope[0] in ambiguous_documents:
+            continue
+        latest_at = max(timestamp for timestamp, _match in scoped_events)
+        latest_events = [
+            match_key
+            for timestamp, match_key in scoped_events
+            if timestamp == latest_at
+        ]
+        if len(latest_events) == 1 and latest_events[0] is not None:
+            latest_approvals.add(latest_events[0])
+    return latest_approvals
+
+
 def build_approval_snapshot(
     repository: Any,
     document_ids: list[str],
@@ -1895,10 +2165,25 @@ def build_approval_snapshot(
         repository,
         document_ids,
     )
-    approval_match_index = approval_journal_match_index(
-        record
-        for document_id in document_ids
-        for record in records_by_document.get(document_id, ())
+    review_records_by_document = review_journal_records_by_document(
+        repository,
+        document_ids,
+    )
+    approval_match_index = latest_approval_journal_match_index(
+        (
+            record
+            for document_id in document_ids
+            for record in records_by_document.get(document_id, ())
+        ),
+        (
+            record
+            for document_id in document_ids
+            for record in review_records_by_document.get(
+                document_id,
+                (),
+            )
+        ),
+        tenant_id=auth.tenant_id,
     )
     for document_id in document_ids:
         document = repository.get_document(document_id)
@@ -2011,8 +2296,16 @@ def load_cached_approval_snapshot(
     with _RAG_VECTOR_CACHE_LOCK:
         cached = _RAG_APPROVAL_SNAPSHOT_CACHE.get(cache_key)
         if cached and cached[0] == signature:
-            return cached[1]
+            cached_snapshot = cached[1]
+        else:
+            cached_snapshot = None
+    if cached_snapshot is not None:
+        if signature_loader(repository, document_ids) != signature:
+            return {}
+        return cached_snapshot
     snapshot = snapshot_builder(repository, document_ids, auth)
+    if signature_loader(repository, document_ids) != signature:
+        return {}
     with _RAG_VECTOR_CACHE_LOCK:
         _RAG_APPROVAL_SNAPSHOT_CACHE[cache_key] = (signature, snapshot)
     return snapshot

@@ -1,10 +1,39 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 from app.schemas.structure import StructureNode
+
+
+ARTICLE_TITLE_DELIMITER_PATTERN = r"(?:\([^\)\n]{1,80}\)|\[[^\]\n]{1,80}\]|【[^】\n]{1,80}】)"
+
+# Keep this set aligned with the internal-regulation title vocabulary used by
+# MetadataExtractor and the regulation metadata service.  The extra governance
+# suffixes occur frequently as standalone public-institution rules.
+IMPLICIT_REGULATION_TITLE_SUFFIXES = (
+    "정관",
+    "규정",
+    "규칙",
+    "지침",
+    "요령",
+    "규약",
+    "내규",
+    "준칙",
+    "기준",
+    "세칙",
+    "편람",
+    "강령",
+    "예규",
+    "직제",
+    "규율",
+)
+IMPLICIT_REGULATION_TITLE_SUFFIX_PATTERN = re.compile(
+    rf"(?:{'|'.join(re.escape(suffix) for suffix in IMPLICIT_REGULATION_TITLE_SUFFIXES)})"
+    r"(?:[\(（](?:안|개정안)[\)）])?$"
+)
 
 
 PATTERNS = {
@@ -13,7 +42,10 @@ PATTERNS = {
     "section": re.compile(r"^\s*(제\s*\d+\s*절)\s+(.+)$"),
     "subsection": re.compile(r"^\s*(제\s*\d+\s*관)\s+(.+)$"),
     "regulation": re.compile(r"^\s*(\d+-\d+-\d+)\.\s+(.+)$"),
-    "article": re.compile(r"^\s*(제\s*\d+\s*조(?:의\s*\d+)?)(?=\s*(?:\(|<|삭제|$|\s))\s*(?:\(([^)]+)\))?\s*(.*)$"),
+    "article": re.compile(
+        r"^\s*(제\s*\d+\s*조(?:의\s*\d+)?)(?=\s*(?:\(|\[|【|<|삭제|$|\s))"
+        r"\s*(?:\(([^)\n]+)\)|\[([^\]\n]+)\]|【([^】\n]+)】)?\s*(.*)$"
+    ),
     "paragraph_symbol": re.compile(r"^\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚])\s*(.*)$"),
     "paragraph_je_hang": re.compile(r"^\s*(제\s*\d+\s*항)(?=\s|$)\s*(.*)$"),
     "paragraph_number": re.compile(r"^\s*(\(\d+\))\s*(.*)$"),
@@ -27,7 +59,12 @@ PATTERNS = {
     "item_je_ho": re.compile(r"^\s*(제\s*\d+\s*호)(?=\s|$)\s*(.*)$"),
     "subitem_korean": re.compile(r"^\s*([가나다라마바사아자차카타파하][\.\)])\s*(.+)$"),
     "subitem_hangul_paren": re.compile(r"^\s*(\([가나다라마바사아자차카타파하]\))\s*(.+)$"),
-    "appendix": re.compile(r"^\s*[\[【<]?\s*(별\s*표\s*(?:\d+(?:\s*(?:의|-)\s*\d+)?)?)\s*[\]】>]?\s*(.*)$"),
+    "appendix": re.compile(
+        r"^\s*[\[【<]?\s*((?:별\s*표\s*(?:\d+(?:\s*(?:의|-)\s*\d+)?)?"
+        r"|(?:붙\s*임|첨\s*부)\s*제?\s*\d+(?:\s*(?:의|-)\s*\d+)?"
+        r"|부\s*록\s*(?:제?\s*\d+(?:\s*(?:의|-)\s*\d+)?)?))"
+        r"\s*[\]】>]?\s*(.*)$"
+    ),
     "form": re.compile(r"^\s*[\[【<]?\s*(별\s*지\s*제?\s*(?:\d+(?:\s*(?:의|-)\s*\d+)?)?\s*호?\s*서식)\s*[\]】>]?\s*(.*)$"),
     "supplementary": re.compile(r"^\s*(부\s*칙)\s*(.*)$"),
 }
@@ -54,7 +91,7 @@ INLINE_STRUCTURE_MARKER_PATTERN = re.compile(
     r")"
 )
 INLINE_ARTICLE_MARKER_PATTERN = re.compile(
-    r"(?<!\S)제\s*\d+\s*조(?:의\s*\d+)?(?=\s*\([^)]{1,80}\))"
+    rf"(?<!\S)제\s*\d+\s*조(?:의\s*\d+)?(?=\s*{ARTICLE_TITLE_DELIMITER_PATTERN})"
 )
 
 FOOTNOTE_CAPTION_MARKER_PATTERN = re.compile(
@@ -79,6 +116,11 @@ HWPX_SOURCE_LIST_METADATA_KEYS = (
     "hwpx_nested_table_text_snippets",
 )
 
+STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
+    "ambiguous_combined_book_boundary_after_attachment"
+)
+
 
 @dataclass
 class SourceLine:
@@ -90,7 +132,31 @@ class SourceLine:
 
 class StructureDetector:
     def detect(self, parsed: ParsedDocument) -> list[StructureNode]:
+        parsed.metadata.pop(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY, None)
         lines = self._extract_lines(parsed)
+        detected_lines = [
+            self._detect_line(line, parsed.document_id, 0)
+            for line in lines
+        ]
+        title_only_regulation_boundaries = self._title_only_regulation_boundaries(
+            lines,
+            parsed.document_id,
+            detected_lines,
+        )
+        if not title_only_regulation_boundaries:
+            title_only_regulation_boundaries = self._implicit_title_only_regulation_boundaries(
+                lines,
+                parsed.document_id,
+                detected_lines,
+                document_name=parsed.document_name,
+                document_metadata=parsed.metadata,
+            )
+        navigation_line_indexes = self._navigation_line_indexes(
+            lines,
+            parsed.document_id,
+            detected_lines,
+            title_only_regulation_boundaries,
+        )
         nodes: list[StructureNode] = []
         pending_orphan_lines: list[SourceLine] = []
         current: dict[str, StructureNode | None] = {
@@ -109,8 +175,16 @@ class StructureDetector:
         }
         seen_regulation_keys: set[tuple[str | None, str]] = set()
 
-        for line in lines:
-            detected = self._detect_line(line, parsed.document_id, len(nodes))
+        for line_index, line in enumerate(lines):
+            if line_index in navigation_line_indexes:
+                continue
+            detected = title_only_regulation_boundaries.get(line_index)
+            if detected is not None:
+                detected = self._reindex_node(detected, len(nodes))
+            else:
+                detected = detected_lines[line_index]
+                if detected is not None:
+                    detected = self._reindex_node(detected, len(nodes))
             if detected is None:
                 if not self._append_to_current(current, line):
                     pending_orphan_lines.append(line)
@@ -224,12 +298,24 @@ class StructureDetector:
         match = PATTERNS["article"].match(text)
         if match:
             number = self._normalize_number(match.group(1))
-            title = (match.group(2) or "").strip() or None
-            trailing = (match.group(3) or "").strip()
+            title = next(
+                (
+                    candidate.strip()
+                    for candidate in match.group(2, 3, 4)
+                    if candidate and candidate.strip()
+                ),
+                None,
+            )
+            trailing = (match.group(5) or "").strip()
             if not title:
                 title = self._article_lifecycle_title(trailing)
             if not title and self._looks_like_article_reference_tail(trailing):
                 return None
+            if not title:
+                plain_title = self._plain_article_title(trailing)
+                if plain_title:
+                    title = plain_title
+                    trailing = ""
             node = self._node(document_id, "article", number, title, text, line.page_no, order_index, line.metadata)
             if not title:
                 node.warnings.append("article_title_missing")
@@ -280,6 +366,27 @@ class StructureDetector:
             return "삭제"
         return None
 
+    def _plain_article_title(self, trailing: str) -> str | None:
+        """Return an unbracketed article heading only when it is title-only.
+
+        A bare ``제1조 목적`` is common in converted public regulations, but a
+        bare ``제1조 이 규정은 ...`` is ordinary body text.  Do not guess a title
+        from a line that contains sentence punctuation or a common Korean
+        predicate; the latter must keep the existing missing-title warning.
+        """
+        candidate = trailing.strip()
+        if not candidate or len(candidate) > 80:
+            return None
+        if re.search(r"[.!?。:：;；]", candidate):
+            return None
+        if re.search(r"(?:한다|된다|있다|없다|같다|따른다|본다|말한다|하여야\s*한다|할\s*수\s*있다)$", candidate):
+            return None
+        if re.search(r"(?:은|는|이|가|을|를|에|에서|으로|로)\s", candidate):
+            return None
+        if not re.fullmatch(r"[가-힣A-Za-z0-9ㆍ·&/\-\s]+", candidate):
+            return None
+        return candidate
+
     def _should_skip_repeated_regulation_header(
         self,
         current: dict[str, StructureNode | None],
@@ -303,6 +410,649 @@ class StructureDetector:
         same_number = active.number == detected.number
         same_title = (active.title or "").strip() == (detected.title or "").strip()
         return bool(same_number and same_title)
+
+    def _title_only_regulation_boundaries(
+        self,
+        lines: list[SourceLine],
+        document_id: str,
+        detected_lines: list[StructureNode | None],
+    ) -> dict[int, StructureNode]:
+        """Infer numbered regulation boundaries from ordered contents-title matches.
+
+        A title match alone is too weak: the same text can be prose, an article
+        title, or a running header.  Inference therefore requires at least two
+        unique regulation entries in a contents block, all titles to recur as
+        plain standalone lines in contents order, and the first article after
+        each selected occurrence to restart at Article 1 before another known
+        regulation title or numbered regulation boundary.
+        """
+        detected = list(enumerate(detected_lines))
+        numbered_regulations = [
+            (index, node)
+            for index, node in detected
+            if node is not None and node.node_type == "regulation"
+        ]
+        articles = [
+            (index, node)
+            for index, node in detected
+            if node is not None and node.node_type == "article"
+        ]
+        if len(numbered_regulations) < 2 or not articles:
+            return {}
+
+        first_article_index = articles[0][0]
+        numbered_by_index = dict(numbered_regulations)
+        contents_starts = self._contents_starts_by_regulation_index(lines, numbered_by_index)
+        contents_entries: list[tuple[int, StructureNode, str, str]] = []
+        for index, regulation in numbered_regulations:
+            if index >= first_article_index:
+                continue
+            if index not in contents_starts and not self._looks_like_navigation_entry(lines[index].text):
+                continue
+            title = self._navigation_regulation_title(regulation.title or "")
+            if not self._looks_like_plain_regulation_title(title):
+                continue
+            identity = self._regulation_title_identity(title)
+            if identity:
+                contents_entries.append((index, regulation, title, identity))
+
+        if len(contents_entries) < 2:
+            return {}
+        contents_identities = [entry[3] for entry in contents_entries]
+
+        contents_end = max(entry[0] for entry in contents_entries)
+        known_identities = set(contents_identities)
+        occurrences: list[tuple[int, str]] = []
+        for index, line in enumerate(lines):
+            if index <= contents_end or line.block_type == "table":
+                continue
+            if detected_lines[index] is not None:
+                continue
+            if not self._looks_like_plain_regulation_title(line.text):
+                continue
+            identity = self._regulation_title_identity(line.text)
+            if identity in known_identities:
+                occurrences.append((index, identity))
+
+        if len(occurrences) < len(contents_entries):
+            return {}
+
+        occurrence_indexes = {index for index, _identity in occurrences}
+        numbered_body_indexes = {
+            index for index, _node in numbered_regulations if index > contents_end
+        }
+        possible_boundary_indexes = sorted(occurrence_indexes | numbered_body_indexes)
+        article_indexes = [index for index, _article in articles]
+        article_by_index = dict(articles)
+        attachment_indexes = [
+            index
+            for index, node in enumerate(detected_lines)
+            if node is not None and node.node_type in {"appendix", "form", "supplementary"}
+        ]
+        preamble_prefix = [0]
+        for node in detected_lines:
+            preamble_prefix.append(
+                preamble_prefix[-1]
+                + int(node is not None and node.node_type in {"part", "chapter"})
+            )
+        first_text_index_by_page: dict[int, int] = {}
+        for line_index, line in enumerate(lines):
+            if line.block_type == "table" or line.page_no is None or not line.text.strip():
+                continue
+            first_text_index_by_page.setdefault(line.page_no, line_index)
+        valid_occurrences: dict[str, list[int]] = {identity: [] for identity in known_identities}
+        for index, identity in occurrences:
+            boundary_position = bisect_right(possible_boundary_indexes, index)
+            next_boundary = (
+                possible_boundary_indexes[boundary_position]
+                if boundary_position < len(possible_boundary_indexes)
+                else len(lines)
+            )
+            article_position = bisect_right(article_indexes, index)
+            first_following_article = None
+            if (
+                article_position < len(article_indexes)
+                and article_indexes[article_position] < next_boundary
+            ):
+                first_following_article = article_by_index[article_indexes[article_position]]
+            if first_following_article is None or first_following_article.number != "제1조":
+                continue
+            first_article_index = article_indexes[article_position]
+            if not self._has_new_unit_evidence_after_attachment(
+                lines=lines,
+                candidate_index=index,
+                article_index=first_article_index,
+                attachment_indexes=attachment_indexes,
+                first_text_index_by_page=first_text_index_by_page,
+                preamble_prefix=preamble_prefix,
+            ):
+                continue
+            valid_occurrences[identity].append(index)
+
+        expected_occurrence_counts = {
+            identity: contents_identities.count(identity)
+            for identity in known_identities
+        }
+        if any(
+            len(valid_occurrences[identity]) != expected_count
+            for identity, expected_count in expected_occurrence_counts.items()
+        ):
+            return {}
+
+        selected: list[tuple[int, StructureNode, str, int]] = []
+        previous_body_index = contents_end
+        for contents_index, regulation, title, identity in contents_entries:
+            body_index = next(
+                (index for index in valid_occurrences[identity] if index > previous_body_index),
+                None,
+            )
+            if body_index is None:
+                return {}
+            selected.append((contents_index, regulation, title, body_index))
+            previous_body_index = body_index
+
+        boundaries: dict[int, StructureNode] = {}
+        for contents_index, regulation, title, body_index in selected:
+            line = lines[body_index]
+            node = self._node(
+                document_id,
+                "regulation",
+                regulation.number,
+                title,
+                line.text,
+                line.page_no,
+                0,
+                line.metadata,
+            )
+            node.confidence = 0.96
+            node.warnings.append("regulation_number_inferred_from_contents_title")
+            node.metadata["regulation_boundary_source"] = "contents_title_and_article_restart"
+            node.metadata["contents_line_index"] = contents_index
+            boundaries[body_index] = node
+        return boundaries
+
+    def _implicit_title_only_regulation_boundaries(
+        self,
+        lines: list[SourceLine],
+        document_id: str,
+        detected_lines: list[StructureNode | None],
+        *,
+        document_name: str,
+        document_metadata: dict | None = None,
+    ) -> dict[int, StructureNode]:
+        """Infer a title-only combined book when no numbered contents exists.
+
+        Every candidate must be a regulation-shaped standalone title,
+        candidates must be unique, and each candidate's first article before
+        the next boundary must restart at Article 1. A single title is accepted
+        only when it exactly matches the standalone document name.
+        """
+
+        raw_candidates = [
+            (
+                index,
+                self._regulation_title_for_matching(line.text),
+                self._regulation_title_identity(line.text),
+            )
+            for index, line in enumerate(lines)
+            if line.block_type != "table"
+            and detected_lines[index] is None
+            and self._looks_like_implicit_regulation_title(line.text)
+        ]
+        if not raw_candidates:
+            return {}
+
+        articles = [
+            (index, node)
+            for index, node in enumerate(detected_lines)
+            if node is not None and node.node_type == "article"
+        ]
+        article_indexes = [index for index, _node in articles]
+        article_by_index = dict(articles)
+        explicit_boundary_indexes = {
+            index
+            for index, node in enumerate(detected_lines)
+            if node is not None and node.node_type == "regulation"
+        }
+        contents_marker_indexes = [
+            index
+            for index, line in enumerate(lines)
+            if re.sub(r"\s+", "", line.text).casefold() in {"목차", "차례", "contents"}
+        ]
+        if explicit_boundary_indexes and contents_marker_indexes:
+            first_explicit_boundary = min(explicit_boundary_indexes)
+            active_contents_markers = [
+                index for index in contents_marker_indexes if index < first_explicit_boundary
+            ]
+            if active_contents_markers:
+                contents_start = max(active_contents_markers)
+                raw_candidates = [
+                    candidate
+                    for candidate in raw_candidates
+                    if candidate[0] < contents_start or candidate[0] >= first_explicit_boundary
+                ]
+                if not raw_candidates:
+                    return {}
+        raw_boundary_indexes = sorted(
+            {index for index, _title, _identity in raw_candidates}
+            | explicit_boundary_indexes
+        )
+        attachment_indexes = [
+            index
+            for index, node in enumerate(detected_lines)
+            if node is not None and node.node_type in {"appendix", "form", "supplementary"}
+        ]
+        preamble_prefix = [0]
+        for node in detected_lines:
+            preamble_prefix.append(
+                preamble_prefix[-1]
+                + int(node is not None and node.node_type in {"part", "chapter"})
+            )
+        first_text_index_by_page: dict[int, int] = {}
+        for index, line in enumerate(lines):
+            if line.block_type == "table" or line.page_no is None or not line.text.strip():
+                continue
+            first_text_index_by_page.setdefault(line.page_no, index)
+
+        valid_candidates: list[tuple[int, str, str]] = []
+        invalid_candidates: list[tuple[int, str, str]] = []
+        for candidate in raw_candidates:
+            index, _title, _identity = candidate
+            boundary_position = bisect_right(raw_boundary_indexes, index)
+            next_boundary = (
+                raw_boundary_indexes[boundary_position]
+                if boundary_position < len(raw_boundary_indexes)
+                else len(lines)
+            )
+            article_position = bisect_right(article_indexes, index)
+            if article_position >= len(article_indexes):
+                invalid_candidates.append(candidate)
+                continue
+            article_index = article_indexes[article_position]
+            first_article = article_by_index[article_index]
+            if article_index >= next_boundary or first_article.number != "제1조":
+                invalid_candidates.append(candidate)
+                continue
+
+            if not self._has_new_unit_evidence_after_attachment(
+                lines=lines,
+                candidate_index=index,
+                article_index=article_index,
+                attachment_indexes=attachment_indexes,
+                first_text_index_by_page=first_text_index_by_page,
+                preamble_prefix=preamble_prefix,
+            ):
+                # A regulation-shaped title and Article 1 inside an
+                # appendix/form/supplementary provision is commonly an
+                # embedded sample or amendment quotation, not a new unit.
+                # If another attachment/supplementary marker intervenes, the
+                # later Article 1 belongs to that nested scope and this title
+                # is ordinary attachment content. Without such a marker the
+                # boundary is genuinely ambiguous, so a combined book must
+                # fail closed instead of publishing only its earlier units.
+                if not any(
+                    index < attachment_index < article_index
+                    for attachment_index in attachment_indexes
+                ):
+                    invalid_candidates.append(candidate)
+                continue
+            valid_candidates.append(candidate)
+
+        valid_identities = {identity for _index, _title, identity in valid_candidates}
+        has_distinct_invalid_candidate = any(
+            identity not in valid_identities
+            for _index, _title, identity in invalid_candidates
+        )
+        candidates = valid_candidates
+        normalized_document_name = re.sub(
+            r"\.(?:pdf|hwp|hwpx|docx)$",
+            "",
+            str(document_name or "").strip(),
+            flags=re.IGNORECASE,
+        )
+        document_title_identity = self._regulation_title_identity(normalized_document_name)
+        single_document_title_match = bool(
+            len(candidates) == 1
+            and document_title_identity
+            and candidates[0][2] == document_title_identity
+        )
+        if has_distinct_invalid_candidate and not single_document_title_match:
+            # A distinct malformed/attachment-scoped candidate may be a real
+            # regulation whose boundary evidence was lost. A standalone file
+            # may safely retain its own named root, but a combined book must
+            # not publish only the earlier subset and silently absorb the rest.
+            if document_metadata is not None:
+                document_metadata[STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY] = (
+                    AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC
+                )
+            return {}
+        if len(candidates) < 2 and not single_document_title_match:
+            return {}
+        identities = [identity for _index, _title, identity in candidates]
+        if len(set(identities)) != len(identities):
+            return {}
+
+        if len(articles) < len(candidates):
+            return {}
+        possible_boundary_indexes = sorted(
+            {index for index, _title, _identity in candidates}
+            | explicit_boundary_indexes
+        )
+
+        boundaries: dict[int, StructureNode] = {}
+        for index, title, _identity in candidates:
+            boundary_position = bisect_right(possible_boundary_indexes, index)
+            next_boundary = (
+                possible_boundary_indexes[boundary_position]
+                if boundary_position < len(possible_boundary_indexes)
+                else len(lines)
+            )
+            article_position = bisect_right(article_indexes, index)
+            if article_position >= len(article_indexes):
+                return {}
+            article_index = article_indexes[article_position]
+            first_article = article_by_index[article_index]
+            if article_index >= next_boundary or first_article.number != "제1조":
+                return {}
+
+            line = lines[index]
+            node = self._node(
+                document_id,
+                "regulation",
+                None,
+                title,
+                line.text,
+                line.page_no,
+                0,
+                line.metadata,
+            )
+            node.confidence = 0.9
+            if single_document_title_match:
+                node.warnings.append("regulation_boundary_inferred_from_document_title")
+                node.metadata["regulation_boundary_source"] = "document_title_and_article_restart"
+            else:
+                node.warnings.append("regulation_boundary_inferred_without_contents")
+                node.metadata["regulation_boundary_source"] = "title_suffix_and_article_restart"
+            boundaries[index] = node
+        return boundaries
+
+    def _navigation_line_indexes(
+        self,
+        lines: list[SourceLine],
+        document_id: str,
+        detected_lines: list[StructureNode | None],
+        title_only_regulation_boundaries: dict[int, StructureNode] | None = None,
+    ) -> set[int]:
+        """Return a tightly-evidenced table-of-contents range to exclude from body state.
+
+        A repeated regulation code alone is a valid running-header pattern, so it
+        must not be treated as navigation.  We only suppress an initial range
+        when it has a contents marker (or a dot-leader/page-number entry), each
+        candidate is repeated later, and that later occurrence is followed by a
+        real article before the next regulation boundary.
+        """
+        detected = list(enumerate(detected_lines))
+        numbered_regulations = [
+            (index, node)
+            for index, node in detected
+            if node is not None and node.node_type == "regulation"
+        ]
+        preview_navigation_indexes, preview_identities = self._unnumbered_contents_preview_range(
+            lines,
+            numbered_regulations,
+        )
+        article_indexes = {
+            index
+            for index, node in detected
+            if node is not None
+            and node.node_type == "article"
+            and index not in preview_navigation_indexes
+        }
+        if not numbered_regulations or not article_indexes:
+            return set()
+
+        first_article_index = min(article_indexes)
+        evidence_regulations = sorted(
+            [*numbered_regulations, *(title_only_regulation_boundaries or {}).items()],
+            key=lambda item: item[0],
+        )
+        regulation_by_index = dict(evidence_regulations)
+        body_article_evidence = self._regulation_body_article_evidence(
+            len(lines),
+            regulation_by_index,
+            article_indexes,
+        )
+        repeated_body_evidence = self._later_repeated_regulation_evidence(
+            evidence_regulations,
+            body_article_evidence,
+        )
+        numbered_regulation_by_index = dict(numbered_regulations)
+        contents_starts = self._contents_starts_by_regulation_index(lines, numbered_regulation_by_index)
+        navigation_indexes: set[int] = set(preview_navigation_indexes)
+        navigation_starts: list[int] = []
+        named_contents_identities: set[tuple[str | None, str]] = set(preview_identities)
+
+        for index, _regulation in numbered_regulations:
+            # Navigation entries appear before the first body article.  This
+            # prevents a repeated page header in an already-started regulation
+            # from being misclassified as a contents entry.
+            if index >= first_article_index:
+                continue
+            toc_start = contents_starts.get(index)
+            has_dot_leader = self._looks_like_navigation_entry(lines[index].text)
+            if toc_start is None and not has_dot_leader:
+                continue
+            identity = self._navigation_regulation_identity(_regulation)
+            first_named_contents_occurrence = bool(
+                toc_start is not None and identity not in named_contents_identities
+            )
+            if toc_start is not None:
+                named_contents_identities.add(identity)
+            # An exact named contents marker is sufficient evidence that these
+            # first pre-article numbered occurrences are navigation. Suppress
+            # them even when body boundary inference fails closed, while
+            # preserving a later repeated numbered body boundary.
+            if first_named_contents_occurrence or repeated_body_evidence.get(index, False):
+                navigation_indexes.add(index)
+                if toc_start is not None:
+                    navigation_starts.append(toc_start)
+
+        if not navigation_indexes:
+            return set()
+        # A named contents block is safe to remove as a contiguous range once
+        # its pre-article regulation rows have been identified above.
+        if navigation_starts:
+            start = min(navigation_starts)
+            end = max(navigation_indexes)
+            navigation_indexes.update(range(start, end + 1))
+        return navigation_indexes
+
+    def _unnumbered_contents_preview_range(
+        self,
+        lines: list[SourceLine],
+        numbered_regulations: list[tuple[int, StructureNode]],
+    ) -> tuple[set[int], set[tuple[str | None, str]]]:
+        """Recognize a named TOC whose title rows include Article 1 previews."""
+
+        if len(numbered_regulations) < 2:
+            return set(), set()
+        body_identities = {
+            self._navigation_regulation_identity(node)
+            for _index, node in numbered_regulations
+        }
+        first_numbered_index = min(index for index, _node in numbered_regulations)
+        marker_indexes = [
+            index
+            for index, line in enumerate(lines[:first_numbered_index])
+            if re.sub(r"\s+", "", line.text).casefold() in {"목차", "차례", "contents"}
+        ]
+        if not marker_indexes:
+            return set(), set()
+        contents_start = max(marker_indexes)
+        preview_identities = {
+            (None, self._regulation_title_identity(line.text))
+            for line in lines[contents_start + 1 : first_numbered_index]
+            if line.block_type != "table"
+            and self._looks_like_implicit_regulation_title(line.text)
+            and self._regulation_title_identity(line.text)
+        }
+        if len(preview_identities) < 2:
+            return set(), set()
+        body_title_identities = {identity for _number, identity in body_identities}
+        preview_title_identities = {identity for _number, identity in preview_identities}
+        if not preview_title_identities.issubset(body_title_identities):
+            return set(), set()
+        matched_body_identities = {
+            identity
+            for identity in body_identities
+            if identity[1] in preview_title_identities
+        }
+        return set(range(contents_start, first_numbered_index)), matched_body_identities
+
+    def _regulation_body_article_evidence(
+        self,
+        line_count: int,
+        regulation_by_index: dict[int, StructureNode],
+        article_indexes: set[int],
+    ) -> dict[int, bool]:
+        """Return whether each regulation is followed by an article before the next one."""
+        evidence: dict[int, bool] = {}
+        article_before_next_regulation = False
+        for index in range(line_count - 1, -1, -1):
+            if index in article_indexes:
+                article_before_next_regulation = True
+            if index in regulation_by_index:
+                evidence[index] = article_before_next_regulation
+                article_before_next_regulation = False
+        return evidence
+
+    def _later_repeated_regulation_evidence(
+        self,
+        regulations: list[tuple[int, StructureNode]],
+        body_article_evidence: dict[int, bool],
+    ) -> dict[int, bool]:
+        """Return later same-identity occurrences that have body-article evidence.
+
+        Processing the ordered regulations in reverse avoids rescanning all
+        regulations/articles for every table-of-contents entry.
+        """
+        seen_evidenced_identities: set[tuple[str | None, str]] = set()
+        evidence: dict[int, bool] = {}
+        for index, regulation in reversed(regulations):
+            identity = self._navigation_regulation_identity(regulation)
+            evidence[index] = identity in seen_evidenced_identities
+            if body_article_evidence.get(index, False):
+                seen_evidenced_identities.add(identity)
+        return evidence
+
+    def _contents_starts_by_regulation_index(
+        self,
+        lines: list[SourceLine],
+        regulation_by_index: dict[int, StructureNode],
+    ) -> dict[int, int]:
+        """Map regulation entries to the active named contents block.
+
+        Consumers already constrain navigation candidates to the lines before
+        the first body article.  Avoid a fixed line-distance cutoff here:
+        public regulation books can have long multi-page contents sections and
+        partial TOC recognition would silently merge the omitted final units.
+        """
+        contents_start: int | None = None
+        starts: dict[int, int] = {}
+        for index, line in enumerate(lines):
+            compact = re.sub(r"\s+", "", line.text).lower()
+            if compact in {"목차", "차례", "contents"}:
+                contents_start = index
+            if (
+                index in regulation_by_index
+                and contents_start is not None
+            ):
+                starts[index] = contents_start
+        return starts
+
+    def _has_new_unit_evidence_after_attachment(
+        self,
+        *,
+        lines: list[SourceLine],
+        candidate_index: int,
+        article_index: int,
+        attachment_indexes: list[int],
+        first_text_index_by_page: dict[int, int],
+        preamble_prefix: list[int],
+    ) -> bool:
+        """Require both page-layout and structural evidence after an embedded scope."""
+
+        attachment_position = bisect_right(attachment_indexes, candidate_index - 1) - 1
+        if attachment_position < 0:
+            return True
+        preceding_attachment = attachment_indexes[attachment_position]
+        candidate_page = lines[candidate_index].page_no
+        attachment_page = lines[preceding_attachment].page_no
+        starts_later_page = bool(
+            candidate_page is not None
+            and candidate_page != attachment_page
+            and first_text_index_by_page.get(candidate_page) == candidate_index
+        )
+        has_new_regulation_preamble = bool(
+            preamble_prefix[article_index] - preamble_prefix[candidate_index + 1]
+        )
+        return starts_later_page and has_new_regulation_preamble
+
+    def _looks_like_navigation_entry(self, text: str) -> bool:
+        return bool(re.search(r"\.{3,}\s*\d{1,4}\s*$", text))
+
+    def _navigation_regulation_title(self, title: str) -> str:
+        return re.sub(r"\.{3,}\s*\d{1,4}\s*$", "", title).strip()
+
+    def _looks_like_plain_regulation_title(self, text: str) -> bool:
+        candidate = self._regulation_title_for_matching(text)
+        if not candidate or len(candidate) > 120:
+            return False
+        if re.search(r"[.!?。:：;；]", candidate):
+            return False
+        return bool(re.fullmatch(r"[가-힣A-Za-z0-9ㆍ·&/()（）\-\s]+", candidate))
+
+    def _looks_like_implicit_regulation_title(self, text: str) -> bool:
+        if not self._looks_like_plain_regulation_title(text):
+            return False
+        compact = re.sub(r"\s+", "", self._regulation_title_for_matching(text))
+        return bool(IMPLICIT_REGULATION_TITLE_SUFFIX_PATTERN.search(compact))
+
+    def _regulation_title_identity(self, title: str) -> str:
+        return re.sub(r"\s+", "", self._regulation_title_for_matching(title)).casefold()
+
+    def _regulation_title_for_matching(self, title: str) -> str:
+        """Normalize display wrappers and trailing revision labels for identity only."""
+
+        candidate = str(title or "").strip()
+        revision_suffix = re.search(r"\s*[\(（](?P<label>[^\n()（）]{1,120})[\)）]\s*$", candidate)
+        if revision_suffix:
+            compact_label = re.sub(r"\s+", "", revision_suffix.group("label"))
+            date_token = r"(?:\d{4}(?:\.\d{1,2}\.\d{1,2}\.?|년\d{1,2}월\d{1,2}일))"
+            revision_marker = r"(?:제정|일부개정|전부개정|전문개정|개정|시행)"
+            is_revision_label = bool(
+                re.fullmatch(
+                    rf"(?:{date_token})?{revision_marker}(?:{date_token})?",
+                    compact_label,
+                )
+            )
+            is_version_label = compact_label in {"구", "신", "현행", "개정전", "개정후"}
+            if is_revision_label or is_version_label:
+                candidate = candidate[: revision_suffix.start()].strip()
+        wrapper_pairs = {
+            "「": "」",
+            "『": "』",
+            "【": "】",
+            "〈": "〉",
+            "《": "》",
+        }
+        if candidate and wrapper_pairs.get(candidate[0]) == candidate[-1]:
+            candidate = candidate[1:-1].strip()
+        return candidate
+
+    def _navigation_regulation_identity(self, node: StructureNode) -> tuple[str | None, str]:
+        title = self._navigation_regulation_title(node.title or "")
+        return node.number, self._regulation_title_identity(title)
 
     def _should_keep_inside_current_container(
         self,
@@ -402,6 +1152,8 @@ class StructureDetector:
     def _split_inline_structure_lines(self, text: str) -> list[str]:
         if FOOTNOTE_CAPTION_MARKER_PATTERN.match(text):
             return [text]
+        if PATTERNS["appendix"].match(text) or PATTERNS["form"].match(text):
+            return [text]
         starts: list[int] = []
         for match in INLINE_ARTICLE_MARKER_PATTERN.finditer(text):
             if match.start() == 0:
@@ -451,7 +1203,10 @@ class StructureDetector:
         after = text[match.end() :]
         if re.match(r"\s*제\s*\d+\s*(?:항|호)", after):
             return True
-        if re.match(r"\s*\([^)]{1,80}\)\s*(?:의|에|에서|으로|로|을|를|은|는|과|와|및|관련|따라|중)", after):
+        if re.match(
+            rf"\s*{ARTICLE_TITLE_DELIMITER_PATTERN}\s*(?:의|에|에서|으로|로|을|를|은|는|과|와|및|관련|따라|중)",
+            after,
+        ):
             return True
         if re.search(r"(?:따라|관련|준용|의한다|정한다|개정|삭제|신설|변경|중)\s*$", before):
             return True
@@ -586,7 +1341,25 @@ class StructureDetector:
         x0 = float(bbox[0])
         y0 = float(bbox[1])
         compact = re.sub(r"\s+", "", text)
-        bracketed = compact.startswith(("[별표", "【별표", "<별표", "[별지", "【별지", "<별지"))
+        bracketed = compact.startswith(
+            (
+                "[별표",
+                "【별표",
+                "<별표",
+                "[별지",
+                "【별지",
+                "<별지",
+                "[붙임",
+                "【붙임",
+                "<붙임",
+                "[첨부",
+                "【첨부",
+                "<첨부",
+                "[부록",
+                "【부록",
+                "<부록",
+            )
+        )
         top_header = y0 <= page_height * 0.17 and x0 <= page_width * 0.16
         near_top_header = y0 <= page_height * 0.12 and x0 <= page_width * 0.25
         prose_tail = bool(re.search(r"(하여야\s*한다|제출하여야|작성하여|참조하여|따른다)", trailing))
@@ -886,6 +1659,9 @@ class StructureDetector:
             current[key] = None
 
     def _parent_id_for(self, node_type: str, current: dict[str, StructureNode | None]) -> str | None:
+        if node_type in {"appendix", "form", "supplementary"}:
+            regulation = current.get("regulation")
+            return regulation.node_id if regulation else None
         if node_type == "regulation" and current.get("regulation"):
             parent = current.get("regulation_parent")
             if parent:
@@ -908,9 +1684,6 @@ class StructureDetector:
             "paragraph": ["article"],
             "item": ["paragraph", "article"],
             "subitem": ["item", "paragraph", "article"],
-            "appendix": ["regulation", "section", "chapter", "part"],
-            "form": ["regulation", "section", "chapter", "part"],
-            "supplementary": ["regulation", "section", "chapter", "part"],
             "table": ["article", "regulation", "section", "chapter", "part"],
         }
         for key in parent_priority.get(node_type, []):

@@ -292,7 +292,7 @@ def _parse_page_ranges(value: str) -> tuple[list[tuple[int, int]], list[str]]:
 def _pdf_page_count(path: Path) -> tuple[int, str]:
     errors: list[str] = []
     try:
-        import fitz  # PyMuPDF
+        from app.utils.fitz_compat import fitz
 
         with fitz.open(path) as document:
             return int(document.page_count), ""

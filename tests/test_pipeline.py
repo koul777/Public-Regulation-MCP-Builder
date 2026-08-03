@@ -12,6 +12,7 @@ from app.core.pipeline import (
     processing_options_payload,
     quality_profile_config_hash,
 )
+from app.processors.chunker import CHUNKER_VERSION
 from app.schemas.chunk import ChunkOptions
 
 
@@ -21,8 +22,9 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(payload["max_chunk_chars"], 1200)
         self.assertEqual(payload["pipeline_version"], PREPROCESSOR_PIPELINE_VERSION)
+        self.assertEqual(payload["chunker_version"], CHUNKER_VERSION)
         self.assertEqual(payload["main_ai_review_stage"], "parser_ai_review_draft")
-        self.assertNotIn("enable_agent_review", payload)
+        self.assertFalse(payload["enable_agent_review"])
 
     def test_processing_options_payload_includes_quality_profile_config_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,6 +82,32 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(staged["agent_review_provider_execution_ready"])
         self.assertTrue(executable["agent_review_provider_execution_ready"])
         self.assertNotEqual(staged, executable)
+
+    def test_processing_options_payload_separates_agent_review_request_state(self) -> None:
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_agent_review=True,
+            openai_api_key="configured",
+            agent_review_model="model-a",
+        )
+
+        disabled = processing_options_payload(
+            ChunkOptions(enable_agent_review=False),
+            settings=settings,
+        )
+        enabled = processing_options_payload(
+            ChunkOptions(enable_agent_review=True),
+            settings=settings,
+        )
+
+        self.assertFalse(disabled["enable_agent_review"])
+        self.assertFalse(disabled["agent_review_request_enabled"])
+        self.assertTrue(disabled["agent_review_provider_execution_ready"])
+        self.assertFalse(disabled["agent_review_provider_execution_enabled"])
+        self.assertTrue(enabled["enable_agent_review"])
+        self.assertTrue(enabled["agent_review_request_enabled"])
+        self.assertTrue(enabled["agent_review_provider_execution_enabled"])
+        self.assertNotEqual(disabled, enabled)
 
     def test_processing_options_payload_changes_when_kordoc_table_parser_is_enabled(self) -> None:
         options = ChunkOptions()
@@ -156,6 +184,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(payload["kordoc_table_command_version"], "4.2.3")
         kordoc_table_command_status.cache_clear()
 
+    def test_processing_options_payload_does_not_mark_unrunnable_kordoc_as_available(self) -> None:
+        options = ChunkOptions()
+        kordoc_table_command_status.cache_clear()
+
+        with patch("app.core.pipeline.resolve_kordoc_command", return_value=r"C:\Npm\kordoc.cmd"):
+            with patch("app.core.pipeline._command_version", return_value=""):
+                payload = processing_options_payload(
+                    options,
+                    settings=Settings(
+                        data_dir=Path("data"),
+                        enable_kordoc_table_parser=True,
+                        kordoc_table_command="kordoc",
+                    ),
+                )
+
+        self.assertFalse(payload["kordoc_table_command_available"])
+        self.assertEqual(payload["kordoc_table_command_resolved_name"], "kordoc.cmd")
+        self.assertNotIn("kordoc_table_command_version", payload)
+        kordoc_table_command_status.cache_clear()
+
     def test_processing_options_payload_keeps_agent_review_scope_when_provider_execution_disabled(self) -> None:
         payload = processing_options_payload(
             ChunkOptions(enable_agent_review=False),
@@ -164,7 +212,9 @@ class PipelineTests(unittest.TestCase):
 
         self.assertTrue(payload["agent_review_cache_scope_hash"].startswith("sha256:"))
         self.assertEqual(payload["main_ai_review_stage"], "parser_ai_review_draft")
-        self.assertNotIn("enable_agent_review", payload)
+        self.assertFalse(payload["enable_agent_review"])
+        self.assertFalse(payload["agent_review_request_enabled"])
+        self.assertFalse(payload["agent_review_provider_execution_enabled"])
 
 
 if __name__ == "__main__":

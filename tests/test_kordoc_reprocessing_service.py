@@ -59,6 +59,7 @@ class KordocReprocessingServiceTests(unittest.TestCase):
                         "chunk_mode": "hybrid",
                         "include_context_header": False,
                         "enable_table_extraction": True,
+                        "enable_agent_review": False,
                         "pipeline_version": "old-version",
                     },
                 )
@@ -130,7 +131,7 @@ class KordocReprocessingServiceTests(unittest.TestCase):
             self.assertEqual(seen_options[0].chunk_mode, "hybrid")
             self.assertFalse(seen_options[0].include_context_header)
             self.assertTrue(seen_options[0].enable_table_extraction)
-            self.assertTrue(seen_options[0].enable_agent_review)
+            self.assertFalse(seen_options[0].enable_agent_review)
             draft = repository.get_document(first.draft_document_id)
             self.assertEqual(draft.regulation_status, "draft")
             self.assertEqual(draft.supersedes_document_id, source.document_id)
@@ -206,6 +207,31 @@ class KordocReprocessingServiceTests(unittest.TestCase):
 
         self.assertEqual(options.max_chunk_chars, 3200)
         self.assertEqual(options.overlap_chars, 160)
+        self.assertFalse(options.enable_agent_review)
+
+    def test_reprocessing_options_preserve_explicit_prior_ai_review_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            repository.upsert_run(
+                ProcessingRun(
+                    run_id="run-ai-opt-in",
+                    document_id="doc-ai-opt-in",
+                    job_id="job-ai-opt-in",
+                    status="completed",
+                    started_at=datetime.now(timezone.utc),
+                    completed_at=datetime.now(timezone.utc),
+                    elapsed_seconds=1.0,
+                    options={"enable_agent_review": True},
+                )
+            )
+
+            options = _reprocessing_chunk_options(
+                repository,
+                "doc-ai-opt-in",
+                settings,
+            )
+
         self.assertTrue(options.enable_agent_review)
 
 

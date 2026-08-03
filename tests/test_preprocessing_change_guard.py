@@ -104,6 +104,37 @@ class PreprocessingChangeGuardTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertIn("app/mcp_server/regulation_server.py", report["logic_files"])
 
+    def test_retrieval_and_vector_changes_require_focused_review_contract(self) -> None:
+        cases = (
+            ("app/ingestion/vector_adapter.py", "tests/test_vector_ingestion_adapter.py"),
+            ("app/retrieval/bm25_index.py", "tests/test_bm25_index.py"),
+            ("app/retrieval/hierarchical_index.py", "tests/test_input_packaging_parity.py"),
+        )
+        for logic_path, test_path in cases:
+            with self.subTest(logic_path=logic_path):
+                unreviewed = evaluate_guard(
+                    [{"path": logic_path, "status": "modified"}],
+                    pr_body="",
+                    labels=[],
+                )
+                self.assertFalse(unreviewed["passed"])
+                self.assertIn(logic_path, unreviewed["logic_files"])
+                self.assertIn(
+                    "missing-focused-regression-test",
+                    {item["code"] for item in unreviewed["failures"]},
+                )
+
+                reviewed = evaluate_guard(
+                    [
+                        {"path": logic_path, "status": "modified"},
+                        {"path": test_path, "status": "modified"},
+                    ],
+                    pr_body=completed_body(),
+                    labels=["preprocessing-reviewed"],
+                )
+                self.assertTrue(reviewed["passed"])
+                self.assertEqual([test_path], reviewed["focused_tests"])
+
     def test_deleted_test_does_not_count_as_regression_evidence(self) -> None:
         report = evaluate_guard(
             [

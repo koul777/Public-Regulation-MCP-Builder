@@ -289,7 +289,7 @@ class DocumentMetadataTests(unittest.TestCase):
 
         chunk = Chunker().build_chunks([node], parsed, ChunkOptions(include_context_header=False))[0]
 
-        self.assertEqual(chunk.metadata["regulation_no"], "Safety Management Guideline")
+        self.assertEqual(chunk.metadata["regulation_no"], "")
         self.assertEqual(chunk.metadata["regulation_title"], "Safety Management Guideline")
         self.assertTrue(chunk.metadata["regulation_inferred_from_document"])
 

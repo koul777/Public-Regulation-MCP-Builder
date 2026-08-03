@@ -35,12 +35,13 @@ class PublicGithubReleaseChecklistTests(unittest.TestCase):
         self.assertIn("사람에게 승인되지 않은 청크", text)
         self.assertIn("승인된 규정만 MCP 데이터로 생성", text)
         self.assertIn("MCP로 쓸 파일 묶음 만들기", text)
-        self.assertIn("ChatGPT Desktop / Codex CLI / Codex IDE", text)
+        self.assertIn("Codex CLI / Codex IDE", text)
         self.assertIn("Claude Code", text)
         self.assertIn("Claude Desktop", text)
+        self.assertIn("ChatGPT 웹 Developer mode", text)
         self.assertIn("Aliased:", text)
         self.assertIn("reg-rag-mcp-vercel-stage", text)
-        self.assertNotIn("OpenAI Secure MCP Tunnel", text)
+        self.assertIn("OpenAI Secure MCP Tunnel", text)
         self.assertNotIn("run_openai_secure_tunnel.ps1", text)
 
 

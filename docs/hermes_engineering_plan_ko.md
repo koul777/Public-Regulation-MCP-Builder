@@ -6,7 +6,7 @@
 
 1. README의 실행, 검수, MCP 연결 절차가 현재 화면과 일치하는지 확인합니다.
 2. 생성 ZIP에 승인된 샘플 런타임 데이터만 들어가고 원본 업로드와 비밀정보가 없는지 확인합니다.
-3. Codex, ChatGPT Desktop, Claude Desktop, Claude Code용 설정이 사용자가 입력한 MCP 이름과 실제 묶음 경로를 사용하는지 확인합니다.
+3. Codex·Claude Desktop·Claude Code의 로컬 설정과 ChatGPT 웹 원격 설정이 사용자가 입력한 MCP 이름과 실제 묶음 경로 또는 검증된 HTTPS URL을 사용하는지 확인합니다.
 4. 같은 MCP 이름으로 재생성했을 때 기존 설정을 갱신하고 중복 등록하지 않는지 확인합니다.
 5. 공개 저장소는 별도 orphan snapshot 정책을 따르고 비공개 저장소 이력을 노출하지 않는지 확인합니다.
 

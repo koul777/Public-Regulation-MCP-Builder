@@ -152,6 +152,96 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         self.assertEqual("1", seen["env"]["PYTHONSAFEPATH"])
         self.assertEqual(str(root / "source"), seen["env"]["PYTHONPATH"])
 
+    def test_legacy_chatgpt_desktop_config_fails_closed_without_process_start(self) -> None:
+        legacy_payloads = {
+            "warning-only": {
+                "profile": "chatgpt-desktop-local",
+                "support_status": "unsupported",
+                "direct_local_supported": False,
+                "chatgpt_direct_local_mcp_supported": False,
+                "warning": "ChatGPT does not directly connect to a local MCP server.",
+            },
+            "formerly-runnable": {
+                "profile": "chatgpt-desktop-local",
+                "ui_fields": {
+                    "name": "govreg-local",
+                    "transport": "stdio",
+                    "command": "python",
+                    "args": ["-m", "scripts.run_regulation_mcp"],
+                },
+            },
+        }
+        for label, payload in legacy_payloads.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                config = Path(tmp) / "chatgpt_desktop_local_mcp.json"
+                config.write_text(json.dumps(payload), encoding="utf-8")
+
+                with patch(
+                    "scripts.run_mcp_client_config_smoke._run_client_entry"
+                ) as run_client_entry:
+                    report = run_mcp_client_config_smoke(
+                        chatgpt_desktop_config=config,
+                        server_name="govreg-local",
+                    )
+
+                run_client_entry.assert_not_called()
+                self.assertFalse(report["passed"])
+                self.assertFalse(report["launcher_ready"])
+                self.assertFalse(report["process_started"])
+                self.assertFalse(report["direct_stdio_verified"])
+                finding = report["results"][0]
+                self.assertEqual("chatgpt_desktop_local", finding["label"])
+                self.assertEqual("unsupported", finding["support_status"])
+                self.assertFalse(finding["direct_local_supported"])
+                self.assertFalse(finding["chatgpt_direct_local_mcp_supported"])
+                self.assertEqual(
+                    "chatgpt_direct_local_mcp_unsupported",
+                    finding["unsupported_finding"],
+                )
+                self.assertFalse(finding["connection_verified"])
+                self.assertIn("no process was started", finding["error"])
+
+    def test_public_legacy_chatgpt_cli_reports_unsupported_and_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "legacy-chatgpt.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "ui_fields": {
+                            "name": "govreg-local",
+                            "command": "python",
+                            "args": ["-m", "scripts.run_regulation_mcp"],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+
+            with patch(
+                "scripts.run_mcp_client_config_smoke._run_client_entry"
+            ) as run_client_entry:
+                exit_code = run(
+                    [
+                        "--chatgpt-desktop-config",
+                        str(config),
+                        "--server-name",
+                        "govreg-local",
+                        "--fail-on-issue",
+                    ],
+                    stdout=stdout,
+                )
+
+            run_client_entry.assert_not_called()
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(2, exit_code)
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["process_started"])
+            self.assertEqual(
+                "chatgpt_direct_local_mcp_unsupported",
+                report["results"][0]["unsupported_finding"],
+            )
+
     def test_claude_code_config_smoke_keeps_client_identity_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -252,7 +342,9 @@ class RunMcpClientConfigSmokeTests(unittest.TestCase):
         answer = report["verification_answer"]
         self.assertEqual("verified", answer["status"])
         self.assertTrue(answer["get_index_status_verified"])
+        self.assertTrue(answer["search_fetch_verified"])
         self.assertTrue(answer["catalog_tools_verified"])
+        self.assertIn("search_fetch", answer["verification_modes"])
         self.assertIn("get_index_status", answer["available_regulation_tools"])
         self.assertEqual(7, answer["index_status_summaries"][0]["indexed_records"])
         self.assertTrue(answer["conversation_attachment_unverified"])

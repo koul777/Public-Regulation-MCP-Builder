@@ -312,7 +312,7 @@ def _row(
 
 
 def _write_pdf(path: Path, *, page_count: int) -> None:
-    import fitz
+    from app.utils.fitz_compat import fitz
 
     document = fitz.open()
     for _ in range(page_count):

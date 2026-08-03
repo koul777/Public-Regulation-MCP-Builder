@@ -1,9 +1,15 @@
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
 project_root = Path(SPECPATH).resolve().parent
+version_file = os.environ.get("PR_MCP_BUILDER_VERSION_FILE", "").strip()
+if not version_file or not Path(version_file).is_file():
+    raise RuntimeError(
+        "PR_MCP_BUILDER_VERSION_FILE must point to the generated release version metadata."
+    )
 
 streamlit_datas, streamlit_binaries, streamlit_hidden = collect_all("streamlit")
 hiddenimports = list(streamlit_hidden)
@@ -12,6 +18,8 @@ hiddenimports += [
     "scripts.analyze_regulation_corpus",
     "scripts.generate_mcp_client_config",
     "scripts.mcp_bundle_contract",
+    "scripts.mcp_connection_diagnostic",
+    "scripts.refresh_mcp_client_connection",
     "scripts.find_available_ui_port",
     "scripts.run_regulation_mcp",
 ]
@@ -66,6 +74,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=version_file,
 )
 
 coll = COLLECT(

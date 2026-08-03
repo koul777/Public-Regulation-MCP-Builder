@@ -218,6 +218,51 @@ class ReviewWorkflowServiceTests(unittest.TestCase):
         self.assertEqual({"chunk-1"}, result.requested_ids)
         self.assertEqual({"chunk-1": ["warning:table parse warning"]}, result.review_attention)
 
+    def test_validate_approval_preconditions_hard_blocks_ambiguous_combined_book(self) -> None:
+        blocked = _chunk("chunk-ambiguous").model_copy(
+            update={
+                "metadata": {"ambiguous_combined_book_boundary": True},
+                "warnings": ["ambiguous_combined_book_boundary_requires_reparse"],
+            }
+        )
+
+        for acknowledged, override_reason in (
+            (True, None),
+            (False, "director override"),
+            (True, "director override"),
+        ):
+            with self.subTest(
+                review_flags_acknowledged=acknowledged,
+                approval_override_reason=override_reason,
+            ):
+                with self.assertRaises(ReviewWorkflowError) as raised:
+                    validate_approval_preconditions(
+                        chunks=[blocked],
+                        chunk_ids=[blocked.chunk_id],
+                        review_flags_acknowledged=acknowledged,
+                        approval_override_reason=override_reason,
+                    )
+
+                self.assertEqual(400, raised.exception.status_code)
+                self.assertIn("must be reparsed before approval", raised.exception.detail)
+                self.assertIn(blocked.chunk_id, raised.exception.detail)
+
+    def test_validate_approval_preconditions_does_not_hard_block_ordinary_fallback(self) -> None:
+        fallback = _chunk("chunk-fallback").model_copy(
+            update={
+                "metadata": {"structure_fallback": True},
+                "warnings": ["structure_fallback_document_chunk"],
+            }
+        )
+
+        result = validate_approval_preconditions(
+            chunks=[fallback],
+            chunk_ids=[fallback.chunk_id],
+            review_flags_acknowledged=False,
+        )
+
+        self.assertEqual({fallback.chunk_id}, result.requested_ids)
+
     def test_security_scan_update_blocks_high_risk_without_raw_match_storage(self) -> None:
         chunk = _chunk("chunk-1").model_copy(
             update={

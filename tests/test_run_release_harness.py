@@ -31,6 +31,54 @@ class ReleaseHarnessTests(unittest.TestCase):
         self.assertFalse(steps["public_release_audit"].required)
         self.assertIn("--include-wheel", steps["mcp_bundle_config"].command)
 
+    def test_windows_release_mode_builds_and_smokes_portable_executable(self) -> None:
+        root = Path.cwd()
+        artifact_dir = Path("reports/overnight_runs/run-1/release")
+        options = HarnessOptions(
+            project_root=root,
+            mode="internal",
+            artifact_dir=artifact_dir,
+        )
+
+        with patch(
+            "scripts.run_release_harness._WINDOWS_RELEASE_SUPPORTED",
+            True,
+        ):
+            steps = build_harness_steps(options)
+
+        steps_by_name = {step.name: step for step in steps}
+        portable = steps_by_name["windows_portable_build_smoke"]
+        command = [str(value).replace("\\", "/") for value in portable.command]
+        expected_root = str((root / artifact_dir).resolve()).replace("\\", "/")
+        self.assertLess(
+            [step.name for step in steps].index("package_build"),
+            [step.name for step in steps].index("windows_portable_build_smoke"),
+        )
+        self.assertIn("powershell", command[0].lower())
+        self.assertNotIn("-SkipWheelBuild", command)
+        self.assertIn("-DistRoot", command)
+        self.assertIn(f"{expected_root}/dist", command)
+        self.assertIn("-BuildRoot", command)
+        self.assertIn(f"{expected_root}/windows-build", command)
+
+    def test_windows_portable_step_can_be_explicitly_skipped(self) -> None:
+        with patch(
+            "scripts.run_release_harness._WINDOWS_RELEASE_SUPPORTED",
+            True,
+        ):
+            steps = build_harness_steps(
+                HarnessOptions(
+                    project_root=Path.cwd(),
+                    mode="public",
+                    skip_windows_portable=True,
+                )
+            )
+
+        self.assertNotIn(
+            "windows_portable_build_smoke",
+            [step.name for step in steps],
+        )
+
     def test_public_mode_requires_public_audit(self) -> None:
         options = HarnessOptions(project_root=Path.cwd(), mode="public")
 
@@ -257,6 +305,53 @@ class ReleaseHarnessTests(unittest.TestCase):
 
         self.assertEqual(steps["package_build"].command[0], str(root / build_python))
         self.assertEqual(steps["sdist_rehearsal"].command[0], sys.executable)
+
+    def test_console_check_validates_the_wheel_built_by_the_same_harness(self) -> None:
+        root = Path.cwd()
+        artifact_dir = Path("reports/overnight_runs/run-1/release")
+        built_steps = {
+            step.name: step
+            for step in build_harness_steps(
+                HarnessOptions(project_root=root, mode="mcp", artifact_dir=artifact_dir)
+            )
+        }
+        source_steps = {
+            step.name: step
+            for step in build_harness_steps(
+                HarnessOptions(project_root=root, mode="mcp", skip_build=True)
+            )
+        }
+
+        built_command = [str(value).replace("\\", "/") for value in built_steps["console_scripts"].command]
+        self.assertIn("--wheel-dist-dir", built_command)
+        expected_dist = str((root / artifact_dir / "dist").resolve()).replace("\\", "/")
+        self.assertIn(expected_dist, built_command)
+        self.assertNotIn("--wheel-dist-dir", source_steps["console_scripts"].command)
+
+    def test_skip_build_bundle_uses_root_dist_when_rebased_artifact_dist_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dist_dir = root / "dist"
+            dist_dir.mkdir()
+            (dist_dir / "reg_rag_preprocessor-1.2.16-py3-none-any.whl").write_text("wheel", encoding="utf-8")
+            artifact_dir = Path("reports/overnight_runs/run-1/release")
+            options = HarnessOptions(
+                project_root=root,
+                mode="mcp",
+                artifact_dir=artifact_dir,
+                skip_build=True,
+                include_wheel_in_bundle=True,
+            )
+
+            steps = {
+                step.name: step
+                for step in build_harness_steps(options)
+            }
+
+        bundle_command = [str(value).replace("\\", "/") for value in steps["mcp_bundle_config"].command]
+        self.assertIn("--wheel-dist-dir", bundle_command)
+        self.assertIn(str(dist_dir.resolve()).replace("\\", "/"), bundle_command)
+        self.assertNotIn(str((root / artifact_dir / "dist").resolve()).replace("\\", "/"), bundle_command)
 
     def test_source_date_epoch_normalizes_sdist_before_rehearsal(self) -> None:
         root = Path.cwd()

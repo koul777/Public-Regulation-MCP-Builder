@@ -16,6 +16,34 @@ from scripts.run_mcp_smoke import (
 
 
 class RunMcpSmokeTests(unittest.TestCase):
+    def test_run_mcp_smoke_writes_runtime_manifest_before_verified_search(self) -> None:
+        class _StopAfterManifestCheck(Exception):
+            pass
+
+        seen: dict[str, object] = {}
+
+        def _assert_manifest(*, settings, **_: object) -> None:
+            manifest_path = Path(settings.data_dir) / "mcp_runtime_manifest.json"
+            seen["manifest_exists"] = manifest_path.exists()
+            seen["manifest"] = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raise _StopAfterManifestCheck
+
+        with patch(
+            "scripts.run_mcp_smoke.search_regulations",
+            side_effect=_assert_manifest,
+        ):
+            with self.assertRaises(_StopAfterManifestCheck):
+                run_mcp_smoke(
+                    tenant_id="tenant-mcp-smoke",
+                    tenant_storage_isolation=True,
+                )
+
+        self.assertTrue(seen["manifest_exists"])
+        manifest = seen["manifest"]
+        self.assertEqual("mcp_runtime_data_bundle", manifest["report_type"])
+        self.assertEqual("ready", manifest["hierarchical_index_status"])
+        self.assertEqual(SYNTHETIC_SMOKE_PROFILE_ID, manifest["profile_id"])
+
     def test_run_mcp_smoke_passes_with_synthetic_data(self) -> None:
         report = run_mcp_smoke(
             tenant_id="tenant-mcp-smoke",

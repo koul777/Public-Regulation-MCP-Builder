@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.core.config import Settings
 from app.processors.answer_profile import ANSWER_PROFILE_MARKER, build_answer_profile
@@ -300,6 +301,109 @@ class ChunkerTests(unittest.TestCase):
         self.assertFalse(chunks[0].metadata.get("pdf_table_region_duplicate_suppressed", False))
         self.assertEqual("pdf_ruling_line_table", chunks[1].metadata["table_classification"])
 
+    def test_pdf_table_region_in_combined_pdf_uses_nearest_preceding_regulation(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_pdf_combined_table",
+            source_file="combined-rules.pdf",
+            document_name="Combined regulations",
+            file_type="pdf",
+            pages=[
+                ParsedPage(page_no=1, blocks=[ParsedBlock(text="Contents\n1. Personnel regulation")]),
+                ParsedPage(page_no=5, blocks=[ParsedBlock(text="Benefits table")]),
+            ],
+            metadata={
+                "pdf_table_regions": [
+                    {
+                        "source_page": 5,
+                        "source_bbox": [40, 220, 500, 400],
+                        "title": "Benefits rate table",
+                        "text": "Grade | Rate\nA | 100",
+                        "column_count": 2,
+                        "row_count": 2,
+                    }
+                ]
+            },
+        )
+        nodes = [
+            StructureNode(
+                node_id="reg-personnel",
+                document_id=parsed.document_id,
+                node_type="regulation",
+                number="1-1",
+                title="Personnel regulation",
+                text="Personnel regulation",
+                page_start=2,
+                page_end=2,
+                order_index=1,
+                metadata={"source_bbox": [40, 80, 400, 110]},
+            ),
+            StructureNode(
+                node_id="reg-benefits",
+                document_id=parsed.document_id,
+                node_type="regulation",
+                number="2-1",
+                title="Benefits regulation",
+                text="Benefits regulation",
+                page_start=5,
+                page_end=5,
+                order_index=4,
+                metadata={"source_bbox": [40, 100, 400, 130]},
+            ),
+            StructureNode(
+                node_id="reg-next",
+                document_id=parsed.document_id,
+                node_type="regulation",
+                number="3-1",
+                title="Next regulation",
+                text="Next regulation",
+                page_start=5,
+                page_end=5,
+                order_index=6,
+                metadata={"source_bbox": [40, 450, 400, 480]},
+            ),
+        ]
+
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+
+        table_chunk = next(chunk for chunk in chunks if chunk.metadata.get("pdf_table_region"))
+        self.assertEqual("Benefits regulation", table_chunk.metadata["regulation_title"])
+        self.assertEqual("2-1", table_chunk.metadata["regulation_no"])
+        self.assertEqual("Benefits regulation", table_chunk.metadata["canonical_regulation_title"])
+        self.assertEqual("2-1", table_chunk.metadata["canonical_regulation_no"])
+        self.assertEqual(
+            "Benefits regulation > Benefits rate table",
+            table_chunk.metadata["canonical_hierarchy_path"],
+        )
+        self.assertEqual("reg-benefits", table_chunk.metadata["regulation_source_node_id"])
+        self.assertNotEqual("Contents", table_chunk.metadata["regulation_title"])
+
+    def test_pdf_table_region_without_regulation_nodes_keeps_document_identity(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_pdf_standalone_table",
+            source_file="standalone-rules.pdf",
+            document_name="Standalone regulation",
+            file_type="pdf",
+            metadata={
+                "regulation_no": "9-9",
+                "regulation_title": "Standalone regulation",
+                "pdf_table_regions": [
+                    {
+                        "source_page": 1,
+                        "source_bbox": [40, 100, 500, 300],
+                        "title": "Rate table",
+                        "text": "Grade | Rate\nA | 100",
+                    }
+                ],
+            },
+        )
+
+        chunks = Chunker().build_chunks([], parsed, ChunkOptions(include_context_header=False))
+
+        self.assertEqual(1, len(chunks))
+        self.assertEqual("Standalone regulation", chunks[0].metadata["regulation_title"])
+        self.assertEqual("9-9", chunks[0].metadata["regulation_no"])
+        self.assertTrue(chunks[0].metadata["regulation_inferred_from_document"])
+
     def test_pdf_footnote_marker_references_attach_once_to_covering_chunk(self) -> None:
         parsed = ParsedDocument(
             document_id="doc_pdf_footnotes",
@@ -350,6 +454,138 @@ class ChunkerTests(unittest.TestCase):
         self.assertEqual([23], chunks[1].metadata["pdf_embedded_image_pages"])
         self.assertNotIn("footnote_marker_reference_count", chunks[1].metadata)
         self.assertNotIn("footnote_links", chunks[1].metadata)
+
+    def test_pdf_postprocessing_indexes_table_bboxes_once_per_existing_chunk(self) -> None:
+        """Regions on one dense page must not rescan every chunk's bboxes."""
+        parsed = ParsedDocument(
+            document_id="doc_pdf_dense_tables",
+            source_file="dense.pdf",
+            document_name="Dense tables",
+            file_type="pdf",
+            metadata={
+                "pdf_table_regions": [
+                    {
+                        "source_page": 7,
+                        "source_bbox": [index * 20, 0, index * 20 + 10, 10],
+                        "text": f"Table {index}",
+                    }
+                    for index in range(12)
+                ]
+            },
+        )
+        nodes = [
+            StructureNode(
+                node_id=f"form_{index}",
+                document_id=parsed.document_id,
+                node_type="form",
+                number=str(index),
+                title=f"Form {index}",
+                text=f"Existing table {index}",
+                page_start=7,
+                page_end=7,
+                order_index=index,
+                metadata={"source_bbox": [index * 20, 0, index * 20 + 10, 10]},
+            )
+            for index in range(12)
+        ]
+        chunker = Chunker()
+
+        with mock.patch.object(
+            chunker,
+            "_chunk_source_bboxes",
+            wraps=chunker._chunk_source_bboxes,
+        ) as source_bboxes:
+            chunks = chunker.build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+
+        self.assertEqual(12, len(chunks))
+        self.assertEqual(12, source_bboxes.call_count)
+        self.assertTrue(all(chunk.metadata.get("pdf_table_region_duplicate_suppressed") for chunk in chunks))
+
+    def test_pdf_table_region_index_keeps_multi_page_and_page_less_fallback_matching(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_pdf_table_page_spans",
+            source_file="rules.pdf",
+            file_type="pdf",
+            metadata={
+                "pdf_table_regions": [
+                    {"source_page": 4, "source_bbox": [0, 0, 100, 100], "text": "on span"},
+                    {"source_page": None, "source_bbox": [0, 0, 100, 100], "text": "page missing"},
+                    {"source_page": "malformed", "source_bbox": [0, 0, 100, 100], "text": "page malformed"},
+                ]
+            },
+        )
+        node = StructureNode(
+            node_id="multi_page_form",
+            document_id=parsed.document_id,
+            node_type="form",
+            number="1",
+            title="Multi-page form",
+            text="form body",
+            page_start=3,
+            page_end=5,
+            order_index=1,
+            metadata={"source_bbox": [0, 0, 100, 100]},
+        )
+
+        chunks = Chunker().build_chunks([node], parsed, ChunkOptions(include_context_header=False))
+
+        self.assertEqual(1, len(chunks))
+        self.assertEqual(3, chunks[0].metadata["suppressed_pdf_table_region_count"])
+
+    def test_pdf_footnote_page_buckets_preserve_order_and_ignore_malformed_pages(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_pdf_footnote_pages",
+            source_file="rules.pdf",
+            file_type="pdf",
+            metadata={
+                "pdf_footnote_links": [
+                    {"source_page": 2, "marker": "later"},
+                    {"source_page": "bad", "marker": "ignored"},
+                    {"source_page": 1, "marker": "earlier"},
+                ],
+                "pdf_footnote_marker_references": [
+                    {"source_page": 2, "marker_count": 2},
+                    {"source_page": 1, "marker_count": 1},
+                    {"source_page": None, "marker_count": 99},
+                ],
+            },
+        )
+        chunks = [
+            Chunk(
+                chunk_id="span",
+                document_id=parsed.document_id,
+                source_node_ids=[],
+                chunk_type="appendix",
+                text="span",
+                retrieval_text="span",
+                metadata={},
+                source_page_start=1,
+                source_page_end=2,
+            ),
+            Chunk(
+                chunk_id="missing-page",
+                document_id=parsed.document_id,
+                source_node_ids=[],
+                chunk_type="appendix",
+                text="missing",
+                retrieval_text="missing",
+                metadata={},
+            ),
+        ]
+        chunker = Chunker()
+
+        with mock.patch.object(
+            chunker,
+            "_pdf_page_metadata_buckets",
+            wraps=chunker._pdf_page_metadata_buckets,
+        ) as bucket_builder:
+            chunker._attach_pdf_document_metadata(chunks, parsed)
+
+        self.assertEqual(2, bucket_builder.call_count)
+        self.assertEqual(["later", "earlier"], [link["marker"] for link in chunks[0].metadata["footnote_links"]])
+        self.assertEqual(3, chunks[0].metadata["footnote_marker_reference_count"])
+        self.assertNotIn("footnote_links", chunks[1].metadata)
+        self.assertNotIn("footnote_marker_references", chunks[1].metadata)
 
     def test_document_inventory_metadata_targets_table_like_chunk(self) -> None:
         chunks = [
@@ -1570,6 +1806,152 @@ class ChunkerTests(unittest.TestCase):
         self.assertIn("제2장 법인 및 조직 > 1-2-1 한국학중앙연구원정관 > 제1장 총칙", chunk.metadata["hierarchy_path"])
         self.assertNotIn("regulation_inferred_from_order", chunk.metadata)
 
+    def test_combined_and_standalone_articles_share_canonical_hierarchy_and_retrieval_text(self) -> None:
+        combined = ParsedDocument(
+            document_id="doc_combined",
+            source_file="combined.pdf",
+            document_name="기관 통합 규정집",
+            file_type="pdf",
+            pages=[ParsedPage(page_no=37, blocks=[ParsedBlock(text="한국학중앙연구원정관")])],
+            raw_text="한국학중앙연구원정관",
+        )
+        combined_nodes = [
+            StructureNode(
+                node_id="combined_part",
+                document_id=combined.document_id,
+                node_type="part",
+                number="제1편",
+                title="기본법령",
+                text="제1편 기본법령",
+                order_index=0,
+            ),
+            StructureNode(
+                node_id="combined_catalog_chapter",
+                document_id=combined.document_id,
+                node_type="chapter",
+                number="제2장",
+                title="법인 및 조직",
+                text="제2장 법인 및 조직",
+                parent_id="combined_part",
+                order_index=1,
+            ),
+            StructureNode(
+                node_id="combined_regulation",
+                document_id=combined.document_id,
+                node_type="regulation",
+                number="1-2-1",
+                title="한국학중앙연구원정관",
+                text="1-2-1. 한국학중앙연구원정관",
+                parent_id="combined_catalog_chapter",
+                order_index=2,
+            ),
+            StructureNode(
+                node_id="combined_internal_chapter",
+                document_id=combined.document_id,
+                node_type="chapter",
+                number="제1장",
+                title="총칙",
+                text="제1장 총칙",
+                parent_id="combined_regulation",
+                order_index=3,
+            ),
+            StructureNode(
+                node_id="combined_article",
+                document_id=combined.document_id,
+                node_type="article",
+                number="제1조",
+                title="목적",
+                text="제1조(목적) 본문",
+                parent_id="combined_internal_chapter",
+                page_start=37,
+                page_end=37,
+                order_index=4,
+            ),
+        ]
+        standalone = ParsedDocument(
+            document_id="doc_standalone",
+            source_file="한국학중앙연구원정관.hwp",
+            document_name="한국학중앙연구원정관",
+            file_type="hwp",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text="한국학중앙연구원정관")])],
+            raw_text="한국학중앙연구원정관",
+        )
+        standalone_nodes = [
+            StructureNode(
+                node_id="standalone_internal_chapter",
+                document_id=standalone.document_id,
+                node_type="chapter",
+                number="제1장",
+                title="총칙",
+                text="제1장 총칙",
+                order_index=0,
+            ),
+            StructureNode(
+                node_id="standalone_article",
+                document_id=standalone.document_id,
+                node_type="article",
+                number="제1조",
+                title="목적",
+                text="제1조(목적) 본문",
+                parent_id="standalone_internal_chapter",
+                page_start=1,
+                page_end=1,
+                order_index=1,
+            ),
+        ]
+
+        combined_chunk = Chunker().build_chunks(
+            combined_nodes,
+            combined,
+            ChunkOptions(include_context_header=False),
+        )[0]
+        standalone_chunk = Chunker().build_chunks(
+            standalone_nodes,
+            standalone,
+            ChunkOptions(include_context_header=False),
+        )[0]
+
+        expected = "한국학중앙연구원정관 > 제1장 총칙 > 제1조 목적"
+        self.assertEqual(expected, combined_chunk.metadata["canonical_hierarchy_path"])
+        self.assertEqual(expected, standalone_chunk.metadata["canonical_hierarchy_path"])
+        self.assertNotEqual(
+            combined_chunk.metadata["source_hierarchy_path"],
+            standalone_chunk.metadata["source_hierarchy_path"],
+        )
+        self.assertEqual(37, combined_chunk.metadata["source_page_start"])
+        self.assertEqual(1, standalone_chunk.metadata["source_page_start"])
+        self.assertEqual(combined_chunk.retrieval_text, standalone_chunk.retrieval_text)
+        self.assertEqual("1-2-1", combined_chunk.metadata["regulation_no"])
+        self.assertEqual("", standalone_chunk.metadata["regulation_no"])
+
+    def test_standalone_title_prefix_supplies_real_regulation_number(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_numbered_standalone",
+            source_file="1-2-1. 한국학중앙연구원정관.hwp",
+            document_name="1-2-1. 한국학중앙연구원정관",
+            file_type="hwp",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text="제1조(목적) 본문")])],
+            raw_text="제1조(목적) 본문",
+        )
+        article = StructureNode(
+            node_id="numbered_standalone_article",
+            document_id=parsed.document_id,
+            node_type="article",
+            number="제1조",
+            title="목적",
+            text="제1조(목적) 본문",
+            order_index=0,
+        )
+
+        chunk = Chunker().build_chunks(
+            [article],
+            parsed,
+            ChunkOptions(include_context_header=False),
+        )[0]
+
+        self.assertEqual("1-2-1", chunk.metadata["regulation_no"])
+        self.assertEqual("한국학중앙연구원정관", chunk.metadata["regulation_title"])
+
     def test_infers_regulation_metadata_from_nearest_preceding_regulation_for_legacy_nodes(self) -> None:
         parsed = ParsedDocument(
             document_id="doc_infer_reg",
@@ -1681,7 +2063,7 @@ class ChunkerTests(unittest.TestCase):
 
         chunk = Chunker().build_chunks([node], parsed, ChunkOptions(include_context_header=False))[0]
 
-        self.assertEqual(chunk.metadata["regulation_no"], "공기업 지침")
+        self.assertEqual(chunk.metadata["regulation_no"], "")
         self.assertEqual(chunk.metadata["regulation_title"], "공기업 지침")
 
     def test_document_title_inference_strips_revision_suffix_from_ocr_title_line(self) -> None:
@@ -1716,8 +2098,42 @@ class ChunkerTests(unittest.TestCase):
 
         chunk = Chunker().build_chunks([node], parsed, ChunkOptions(include_context_header=False))[0]
 
-        self.assertEqual(chunk.metadata["regulation_no"], "수의 계약 집행기준")
+        self.assertEqual(chunk.metadata["regulation_no"], "")
         self.assertEqual(chunk.metadata["regulation_title"], "수의 계약 집행기준")
+
+    def test_document_title_inference_never_uses_native_table_header(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_native_table_title",
+            source_file="보수규정.pdf",
+            document_name="보수규정",
+            file_type="pdf",
+            pages=[
+                ParsedPage(
+                    page_no=1,
+                    blocks=[
+                        ParsedBlock(text="제1장 총칙\n제1조(목적) 보수 지급 기준을 정한다."),
+                        ParsedBlock(type="table", text="구분 | 금액\nA | 10"),
+                    ],
+                )
+            ],
+            raw_text="제1장 총칙\n제1조(목적) 보수 지급 기준을 정한다.\n구분 | 금액\nA | 10",
+        )
+        node = StructureNode(
+            node_id="node_article",
+            document_id=parsed.document_id,
+            node_type="article",
+            number="제1조",
+            title="목적",
+            text="제1조(목적) 보수 지급 기준을 정한다.",
+            page_start=1,
+            page_end=1,
+            order_index=0,
+        )
+
+        chunk = Chunker().build_chunks([node], parsed, ChunkOptions(include_context_header=False))[0]
+
+        self.assertEqual("보수규정", chunk.metadata["regulation_title"])
+        self.assertTrue(chunk.metadata["canonical_hierarchy_path"].startswith("보수규정 > "))
 
     def test_top_level_paragraph_nodes_become_chunks(self) -> None:
         parsed = ParsedDocument(
@@ -1761,6 +2177,69 @@ class ChunkerTests(unittest.TestCase):
         self.assertTrue(chunk.metadata["structure_fallback"])
         self.assertEqual(chunk.metadata["hierarchy_path"], "Fallback Guideline")
         self.assertIn("structure_fallback_document_chunk", chunk.warnings)
+        self.assertNotIn("ambiguous_combined_book_boundary", chunk.metadata)
+        self.assertNotIn("ambiguous_combined_book_boundary_requires_reparse", chunk.warnings)
+
+    def test_ambiguous_combined_book_chunks_retain_text_and_hard_block_marker(self) -> None:
+        text = "\n".join(
+            [
+                "인사규정",
+                "제1조(목적) 인사 운영의 기준을 정한다.",
+                "보수규정",
+                "제1조(목적) 보수 운영의 기준을 정한다.",
+                "[별표 1]",
+                "첨부 내용",
+                "복무규정",
+                "제1조(목적) 복무 운영의 기준을 정한다.",
+            ]
+        )
+        parsed = ParsedDocument(
+            document_id="doc-ambiguous-book",
+            source_file="통합규정집.txt",
+            document_name="통합규정집",
+            file_type="text",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+        nodes = StructureDetector().detect(parsed)
+
+        chunks = Chunker().build_chunks(
+            nodes,
+            parsed,
+            ChunkOptions(include_context_header=False),
+        )
+
+        self.assertTrue(chunks)
+        self.assertIn("인사규정", "\n".join(chunk.normalized_text or "" for chunk in chunks))
+        self.assertTrue(
+            all(chunk.metadata["ambiguous_combined_book_boundary"] is True for chunk in chunks)
+        )
+        self.assertTrue(
+            all(
+                chunk.metadata["structure_boundary_diagnostic"]
+                == "ambiguous_combined_book_boundary_after_attachment"
+                for chunk in chunks
+            )
+        )
+        self.assertTrue(
+            all(
+                "ambiguous_combined_book_boundary_requires_reparse" in chunk.warnings
+                for chunk in chunks
+            )
+        )
+
+        fallback = Chunker().build_chunks(
+            [],
+            parsed,
+            ChunkOptions(include_context_header=False),
+        )[0]
+        self.assertEqual("document", fallback.chunk_type)
+        self.assertEqual(text, fallback.normalized_text)
+        self.assertTrue(fallback.metadata["ambiguous_combined_book_boundary"])
+        self.assertIn(
+            "ambiguous_combined_book_boundary_requires_reparse",
+            fallback.warnings,
+        )
 
     def test_root_item_with_subitems_becomes_recoverable_chunk(self) -> None:
         parsed = ParsedDocument(

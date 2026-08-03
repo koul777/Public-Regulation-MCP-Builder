@@ -12,6 +12,7 @@ from typing import Any, Sequence, TextIO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_WINDOWS_RELEASE_SUPPORTED = os.name == "nt"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -77,6 +78,7 @@ class HarnessOptions:
     skip_tests: bool = False
     skip_build: bool = False
     skip_sdist_rehearsal: bool = False
+    skip_windows_portable: bool = False
     skip_console_check: bool = False
     skip_mcp_smoke: bool = False
     skip_mcp_transport_smoke: bool = False
@@ -89,6 +91,10 @@ class HarnessOptions:
 def _path_arg(root: Path, value: Path) -> str:
     path = value if value.is_absolute() else root / value
     return str(path)
+
+
+def _resolved_path(root: Path, value: Path) -> Path:
+    return value if value.is_absolute() else (root / value)
 
 
 def _source_date_epoch_arg(value: str) -> int:
@@ -146,6 +152,17 @@ def _scope_artifact_outputs(options: HarnessOptions) -> HarnessOptions:
     return replace(options, **updates)
 
 
+def _bundle_wheel_dist_dir(root: Path, options: HarnessOptions) -> Path:
+    build_dist_dir = options.build_dist_dir
+    if options.skip_build and options.artifact_dir is not None:
+        configured = _resolved_path(root, build_dist_dir)
+        artifact_default = _resolved_path(root, options.artifact_dir / "dist")
+        source_default = root / "dist"
+        if configured == artifact_default and not configured.exists() and source_default.exists():
+            return Path("dist")
+    return build_dist_dir
+
+
 def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
     options = _scope_artifact_outputs(options)
     root = options.project_root
@@ -158,6 +175,7 @@ def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
         if options.source_date_epoch is not None
         else {}
     )
+    bundle_wheel_dist_dir = _bundle_wheel_dist_dir(root, options)
     steps: list[HarnessStep] = []
 
     if not options.skip_build and not options.allow_dirty_build:
@@ -242,17 +260,53 @@ def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
                     ),
                 )
             )
+    if (
+        not options.skip_build
+        and not options.skip_windows_portable
+        and options.mode in {"internal", "public"}
+        and _WINDOWS_RELEASE_SUPPORTED
+    ):
+        portable_build_root = (
+            options.artifact_dir / "windows-build"
+            if options.artifact_dir is not None
+            else Path("build")
+        )
+        steps.append(
+            HarnessStep(
+                "windows_portable_build_smoke",
+                (
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(root / "scripts" / "build_windows_portable.ps1"),
+                    "-BasePython",
+                    build_python,
+                    "-DistRoot",
+                    _path_arg(root, options.build_dist_dir),
+                    "-BuildRoot",
+                    _path_arg(root, portable_build_root),
+                ),
+                env=build_env,
+            )
+        )
     if not options.skip_console_check:
+        console_command = [
+            python,
+            "scripts/check_installed_console_scripts.py",
+            "--out-json",
+            _path_arg(root, options.console_json),
+            "--fail-on-issue",
+        ]
+        if not options.skip_build:
+            console_command.extend(
+                ["--wheel-dist-dir", _path_arg(root, options.build_dist_dir)]
+            )
         steps.append(
             HarnessStep(
                 "console_scripts",
-                (
-                    python,
-                    "scripts/check_installed_console_scripts.py",
-                    "--out-json",
-                    _path_arg(root, options.console_json),
-                    "--fail-on-issue",
-                ),
+                tuple(console_command),
             )
         )
     if not options.skip_mcp_smoke:
@@ -342,7 +396,7 @@ def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
             [
                 "--include-wheel",
                 "--wheel-dist-dir",
-                _path_arg(root, options.build_dist_dir),
+                _path_arg(root, bundle_wheel_dist_dir),
             ]
         )
 
@@ -677,6 +731,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow non-release validation builds from a dirty tree; generated artifacts must not be published.",
     )
     parser.add_argument("--skip-sdist-rehearsal", action="store_true")
+    parser.add_argument(
+        "--skip-windows-portable",
+        action="store_true",
+        help="Skip the Windows portable EXE build, version check, and MCP help probe.",
+    )
     parser.add_argument("--skip-console-check", action="store_true")
     parser.add_argument("--skip-mcp-smoke", action="store_true")
     parser.add_argument("--skip-mcp-transport-smoke", action="store_true")
@@ -718,6 +777,7 @@ def options_from_args(args: argparse.Namespace) -> HarnessOptions:
         skip_build=args.skip_build,
         allow_dirty_build=args.allow_dirty_build,
         skip_sdist_rehearsal=args.skip_sdist_rehearsal,
+        skip_windows_portable=args.skip_windows_portable,
         skip_console_check=args.skip_console_check,
         skip_mcp_smoke=args.skip_mcp_smoke,
         skip_mcp_transport_smoke=args.skip_mcp_transport_smoke,

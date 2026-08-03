@@ -58,8 +58,10 @@ class AgentReviewPolicy:
         *,
         cached_content_hashes: set[str] | None = None,
     ) -> dict:
-        provider_execution_enabled = self.provider_execution_configured()
-        enabled = True
+        request_enabled = bool(options.enable_agent_review)
+        provider_execution_ready = self.provider_execution_configured()
+        provider_execution_enabled = request_enabled and provider_execution_ready
+        enabled = request_enabled
         limits = self._limits()
         cache = set(cached_content_hashes or set())
         cache_scope_hash = self.cache_scope_hash()
@@ -68,9 +70,9 @@ class AgentReviewPolicy:
             "pipeline_stage": "parser_ai_review_draft",
             "pipeline_stage_required": True,
             "provider_execution_enabled": provider_execution_enabled,
-            "provider_execution_ready": provider_execution_enabled,
+            "provider_execution_ready": provider_execution_ready,
             "settings_enabled": bool(self.settings.enable_agent_review),
-            "request_enabled": True,
+            "request_enabled": request_enabled,
             "provider": self.settings.llm_provider,
             "model": self.settings.agent_review_model,
             "mode": "main_pipeline_review_draft",
@@ -102,6 +104,9 @@ class AgentReviewPolicy:
             "candidates": [],
             "selected_candidates": [],
         }
+        if not request_enabled:
+            base["skip_reason"] = "agent_review_not_requested"
+            return base
         if self._is_clean_quality_report(quality_report):
             candidates = self._candidate_chunks(chunks, cached_content_hashes=cache)
             if not candidates:

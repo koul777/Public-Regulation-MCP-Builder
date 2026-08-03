@@ -127,6 +127,14 @@ REVIEW_ATTENTION_WARNING_KEYWORDS = (
     "appendix",
     "image",
 )
+STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
+    "ambiguous_combined_book_boundary_after_attachment"
+)
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY = "ambiguous_combined_book_boundary"
+AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING = (
+    "ambiguous_combined_book_boundary_requires_reparse"
+)
 
 
 def normalize_security_level(value: str | None) -> str:
@@ -207,6 +215,21 @@ def validate_approval_preconditions(
     approval_override_reason: str | None = None,
 ) -> ApprovalPreconditions:
     requested_ids = require_chunk_ids(chunks, chunk_ids)
+    ambiguous_boundary_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.chunk_id in requested_ids and _has_ambiguous_combined_book_boundary(chunk)
+    ]
+    if ambiguous_boundary_chunks:
+        sample = ", ".join(
+            chunk.chunk_id
+            for chunk in sorted(ambiguous_boundary_chunks, key=lambda item: item.chunk_id)[:20]
+        )
+        raise ReviewWorkflowError(
+            "Ambiguous combined-book regulation boundaries must be reparsed before approval: "
+            f"{sample}",
+            status_code=400,
+        )
     non_approvable_chunks = [
         chunk
         for chunk in chunks
@@ -227,6 +250,16 @@ def validate_approval_preconditions(
         )
         raise ReviewWorkflowError(f"Review flags must be acknowledged before approval: {sample}", status_code=400)
     return ApprovalPreconditions(requested_ids=requested_ids, review_attention=review_attention)
+
+
+def _has_ambiguous_combined_book_boundary(chunk: Chunk) -> bool:
+    metadata = chunk.metadata or {}
+    return bool(
+        metadata.get(AMBIGUOUS_COMBINED_BOOK_BOUNDARY_METADATA_KEY) is True
+        or str(metadata.get(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY) or "").strip()
+        == AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC
+        or AMBIGUOUS_COMBINED_BOOK_BOUNDARY_WARNING in (chunk.warnings or [])
+    )
 
 
 def _warning_requires_review(warning: str) -> bool:

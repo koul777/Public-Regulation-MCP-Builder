@@ -460,6 +460,42 @@ def _load_review_chunks(repository: JsonRepository, document_id: str) -> list[Ch
     return chunks
 
 
+def _save_review_chunk_mutation(
+    repository: JsonRepository,
+    document_id: str,
+    chunks: list[Chunk],
+) -> None:
+    """Persist a validated review mutation and invalidate document approval.
+
+    ``superseded`` and other lifecycle states remain authoritative history. A
+    current approved document, however, cannot stay approved after a chunk is
+    made review-incomplete by update/split/merge/reject/security blocking.
+    """
+    repository.save_chunks(document_id, chunks)
+    document = repository.get_document(document_id)
+    if (
+        document is not None
+        and str(document.regulation_status or "").strip().casefold() == "approved"
+    ):
+        repository.upsert_document(
+            document.model_copy(update={"regulation_status": "pending_approval"})
+        )
+
+
+def _document_chunks_ready_for_approval(chunks: Sequence[Chunk]) -> bool:
+    """Return whether current chunk decisions permit document approval."""
+
+    active_statuses = [
+        str(chunk.approval_status or "").strip().casefold()
+        for chunk in chunks
+        if str(chunk.approval_status or "").strip().casefold() != "superseded"
+    ]
+    return (
+        APPROVED_CHUNK_STATUS in active_statuses
+        and all(status in {APPROVED_CHUNK_STATUS, "rejected"} for status in active_statuses)
+    )
+
+
 def _require_chunk_ids(chunks: list[Chunk], chunk_ids: list[str]) -> set[str]:
     try:
         return _service_require_chunk_ids(chunks, chunk_ids)
@@ -774,7 +810,7 @@ def _run_security_scan_record(
     )
     updated_chunks = scan_update.updated_chunks
     if scan_update.blocked_chunk_ids:
-        repository.save_chunks(document_id, updated_chunks)
+        _save_review_chunk_mutation(repository, document_id, updated_chunks)
         _refresh_review_exports(settings, document_id, updated_chunks)
     vector_sync = (
         _sync_vector_index_after_review_change(
@@ -2260,7 +2296,7 @@ def update_review_chunk(
             updated_chunk = chunk.model_copy(update=update_fields)
             updated_chunks.append(updated_chunk)
 
-        repository.save_chunks(document_id, updated_chunks)
+        _save_review_chunk_mutation(repository, document_id, updated_chunks)
         artifacts = _refresh_review_exports(request_settings, document_id, updated_chunks)
         vector_sync = _sync_vector_index_after_review_change(
             settings=request_settings,
@@ -2380,7 +2416,7 @@ def split_review_chunk(
                 updated_chunks.extend(new_chunks)
             else:
                 updated_chunks.append(chunk)
-        repository.save_chunks(document_id, updated_chunks)
+        _save_review_chunk_mutation(repository, document_id, updated_chunks)
         artifacts = _refresh_review_exports(request_settings, document_id, updated_chunks)
         vector_sync = _sync_vector_index_after_review_change(
             settings=request_settings,
@@ -2496,7 +2532,7 @@ def merge_review_chunks(
                 )
             else:
                 updated_chunks.append(chunk)
-        repository.save_chunks(document_id, updated_chunks)
+        _save_review_chunk_mutation(repository, document_id, updated_chunks)
         artifacts = _refresh_review_exports(request_settings, document_id, updated_chunks)
         vector_sync = _sync_vector_index_after_review_change(
             settings=request_settings,
@@ -2688,7 +2724,7 @@ def approve_review_chunks(
             if current_regulation_status not in {"superseded", "repealed"}:
                 next_regulation_status = (
                     "approved"
-                    if updated_chunks and all(chunk.approval_status == APPROVED_CHUNK_STATUS for chunk in updated_chunks)
+                    if _document_chunks_ready_for_approval(updated_chunks)
                     else "pending_approval"
                 )
                 staged_revision_activation = bool(
@@ -2999,7 +3035,7 @@ def reject_review_chunks(
         rejection_update = rejection_decision.rejection_update
         updated_chunks = rejection_update.updated_chunks
 
-        repository.save_chunks(document_id, updated_chunks)
+        _save_review_chunk_mutation(repository, document_id, updated_chunks)
         artifacts = _refresh_review_exports(request_settings, document_id, updated_chunks)
         vector_sync = _sync_vector_index_after_review_change(
             settings=request_settings,
