@@ -242,7 +242,13 @@ ADVANCED_NAV_PAGES = [NAV_GOLDSET, NAV_ADMIN]
 BEGINNER_GUIDE_CHOICE_KEY = "beginner_guide_choice_made"
 BEGINNER_GUIDE_ENABLED_KEY = "beginner_guide_enabled"
 BEGINNER_GUIDE_STEP_KEY = "beginner_guide_step"
+BEGINNER_GUIDE_PREPROCESS_SELECTION_KEY = "beginner_guide_preprocess_selection"
+BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY = "beginner_guide_preprocess_info_confirmed"
+BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY = "beginner_guide_preprocess_ai_choice_confirmed"
+BEGINNER_GUIDE_KORDOC_CHECKED_KEY = "beginner_guide_kordoc_checked"
 BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX = "beginner_guide_results_confirmed"
+BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX = "beginner_guide_mcp_scope_confirmed"
+BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX = "beginner_guide_mcp_output_confirmed"
 BEGINNER_GUIDE_CONNECTION_CONFIRMED_PREFIX = "beginner_guide_connection_confirmed"
 BEGINNER_GUIDE_NAV_NOTICE_KEY = "beginner_guide_navigation_notice"
 MCP_RUNTIME_INTEGRITY_RENDER_NONCE_KEY = "_mcp_runtime_integrity_render_nonce"
@@ -272,6 +278,43 @@ BEGINNER_GUIDE_STEPS: tuple[tuple[str, str, str], ...] = (
         NAV_MCP,
         "MCP 만들고 연결 확인하기",
         "승인된 규정으로 MCP 파일 묶음을 만들고 사용할 AI의 연결을 확인합니다.",
+    ),
+)
+BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
+    (
+        "작업 기관 선택",
+        "Kordoc 준비 상태 확인",
+        "규정 파일 선택",
+        "자동 인식한 규정 정보 확인",
+        "AI 추가 검수 사용 여부 결정",
+        "전처리 완료 확인",
+    ),
+    (
+        "전처리 완료 상태 확인",
+        "원문·조문 구조·청크 확인",
+        "품질 경고·이슈 확인",
+        "결과 확인 완료 표시",
+    ),
+    (
+        "AI 제안 항목별 판단",
+        "AI 검증 결과 확인",
+        "각 청크의 원문·전처리 결과 비교",
+        "각 청크 사람 검증 결과 확인",
+        "모든 청크 승인 또는 반려 결정",
+        "승인하고 색인 실행",
+        "색인 완료 상태 확인",
+    ),
+    (
+        "MCP에 넣을 규정 범위 확인",
+        "연결할 AI 앱 선택",
+        "저장 위치·방식과 MCP 이름 확인",
+        "MCP 파일 묶음 생성",
+        "AI 앱에 MCP 등록",
+        "AI 앱 재시작 또는 새 대화 열기",
+        "연결 진단 결과 확인",
+        "list_regulations 목록 호출 확인",
+        "search 조문 검색 확인",
+        "fetch 원문·출처 조회 확인",
     ),
 )
 
@@ -568,6 +611,68 @@ def _approval_sync_human_confirmation_from_widget(
     st.session_state[human_confirmed_key] = bool(st.session_state.get(human_confirmed_widget_key))
 
 
+def _approval_ai_result_signature(
+    item_ids: list[str],
+    ai_decisions: dict[str, str],
+) -> str:
+    payload = {
+        "item_ids": sorted(str(item_id) for item_id in item_ids),
+        "ai_decisions": sorted(
+            (str(item_id), str(decision))
+            for item_id, decision in ai_decisions.items()
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _approval_sync_ai_result_confirmation_from_widget(
+    *,
+    durable_key: str,
+    widget_key: str,
+    signature: str,
+) -> None:
+    st.session_state[durable_key] = (
+        signature if bool(st.session_state.get(widget_key)) else ""
+    )
+
+
+def _approval_review_completion_with_beginner_confirmation(
+    *,
+    document_id: str,
+    chunk_id: str,
+    item_ids: list[str],
+    ai_decisions: dict[str, str],
+    human_confirmed: bool,
+) -> dict[str, object]:
+    state = approval_review_completion_state(
+        item_ids,
+        ai_decisions,
+        human_confirmed=human_confirmed,
+    )
+    signature = _approval_ai_result_signature(item_ids, ai_decisions)
+    durable_key = _approval_chunk_state_key(
+        document_id,
+        chunk_id,
+        "ai_result_confirmed",
+    )
+    beginner_mode = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+    ai_result_confirmed = bool(
+        bool(state["ai_confirmed"])
+        and (
+            not beginner_mode
+            or st.session_state.get(durable_key) == signature
+        )
+    )
+    return {
+        **state,
+        "ai_result_signature": signature,
+        "ai_result_confirmed": ai_result_confirmed,
+        "approve_enabled": bool(state["approve_enabled"] and ai_result_confirmed),
+    }
+
+
 def _approval_chunk_review_state_from_session(
     *,
     document_id: str,
@@ -587,7 +692,13 @@ def _approval_chunk_review_state_from_session(
         if str(decision) in {"reflect", "skip"}
     }
     human_confirmed = bool(st.session_state.get(human_confirmed_key))
-    state = approval_review_completion_state(item_ids, ai_decisions, human_confirmed=human_confirmed)
+    state = _approval_review_completion_with_beginner_confirmation(
+        document_id=document_id,
+        chunk_id=chunk_id,
+        item_ids=item_ids,
+        ai_decisions=ai_decisions,
+        human_confirmed=human_confirmed,
+    )
     edited_text = _approval_edited_text_from_session(document_id, chunk)
     if not edited_text.strip():
         state = {**state, "approve_enabled": False}
@@ -880,7 +991,106 @@ def _go_primary_nav() -> None:
 
 
 def _beginner_guide_results_confirmed_key(document_id: str) -> str:
-    return f"{BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX}:{document_id}"
+    revision = hashlib.sha256(
+        json.dumps(
+            _document_context_revision(document_id),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX}:{document_id}:{revision}"
+
+
+def _beginner_guide_results_item_key(document_id: str, item: str) -> str:
+    return f"{_beginner_guide_results_confirmed_key(document_id)}:{item}"
+
+
+def _beginner_preprocess_selection_identity(
+    upload_sources: list[dict[str, object]],
+) -> str:
+    """Return a path-free identity so confirmations reset for a new selection."""
+
+    selection = sorted(
+        (
+            str(source.get("filename") or "").strip(),
+            int(source.get("size") or 0),
+            _beginner_upload_source_content_digest(source),
+        )
+        for source in upload_sources
+    )
+    return hashlib.sha256(
+        json.dumps(selection, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _beginner_upload_source_content_digest(source: dict[str, object]) -> str:
+    """Use the persisted upload digest, with a byte-hash fallback for tests."""
+
+    raw_path = source.get("pending_path") or source.get("path")
+    if raw_path:
+        path = Path(str(raw_path))
+        digest_prefix = path.name.split("__", 1)[0].lower()
+        if len(digest_prefix) == 64 and all(
+            character in "0123456789abcdef" for character in digest_prefix
+        ):
+            return digest_prefix
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest()
+        except OSError:
+            return "unavailable"
+    uploaded_file = source.get("file")
+    getvalue = getattr(uploaded_file, "getvalue", None)
+    if callable(getvalue):
+        payload = getvalue()
+        if isinstance(payload, bytes):
+            return hashlib.sha256(payload).hexdigest()
+    return "unavailable"
+
+
+def _reset_beginner_preprocess_confirmations_for_selection(
+    upload_sources: list[dict[str, object]],
+) -> None:
+    """Invalidate manual acknowledgements when the selected source set changes."""
+
+    identity = _beginner_preprocess_selection_identity(upload_sources)
+    if st.session_state.get(BEGINNER_GUIDE_PREPROCESS_SELECTION_KEY) == identity:
+        return
+    st.session_state[BEGINNER_GUIDE_PREPROCESS_SELECTION_KEY] = identity
+    st.session_state.pop(BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY, None)
+    st.session_state.pop(BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY, None)
+
+
+def _beginner_mcp_confirmation_key(
+    prefix: str,
+    document_id: str,
+    *values: object,
+) -> str:
+    identity = hashlib.sha256(
+        json.dumps(values, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{prefix}:{document_id}:{identity}"
+
+
+def _beginner_connection_item_key(confirmation_key: str, item: str) -> str:
+    return f"{confirmation_key}:{item}"
+
+
+def _session_has_true_prefix(prefix: str) -> bool:
+    return any(
+        str(key).startswith(prefix) and bool(value)
+        for key, value in st.session_state.items()
+    )
+
+
+def _clear_other_beginner_confirmations(prefix: str, current_key: str) -> None:
+    for key in list(st.session_state):
+        if str(key).startswith(prefix) and str(key) != current_key:
+            st.session_state.pop(key, None)
 
 
 def _default_mcp_scope(document_id: str) -> str:
@@ -1083,21 +1293,69 @@ def _render_beginner_connection_confirmation(
         document_id,
         scope=scope,
     )
-    if not bool(st.session_state.get(confirmation_key)):
-        _render_beginner_action_marker(
-            4,
-            "실제 검색 결과를 마지막으로 확인하세요",
-            "새 AI 대화에서 search와 fetch를 각각 실행한 뒤, 성공했을 때만 아래 확인란을 선택하세요.",
-            control_key_prefix=confirmation_key,
-        )
-    st.checkbox(
-        "AI 앱에서 search와 fetch 도구 호출이 성공한 것을 확인했습니다.",
-        key=confirmation_key,
-        help=(
-            "파일 생성이나 서버 실행만으로 연결 완료가 되지는 않습니다. "
-            "실제 AI 대화에서 두 도구의 승인 원문·출처 반환을 확인한 뒤 선택하세요."
+    checks = (
+        (
+            "registered",
+            "선택한 AI 앱에 MCP 등록을 완료했습니다.",
+            "생성된 앱별 안내에 따라 MCP 설정을 등록하세요.",
+        ),
+        (
+            "restarted",
+            "AI 앱을 완전히 다시 시작했거나 새 대화를 열었습니다.",
+            "기존 대화에는 새 도구가 나타나지 않을 수 있으므로 앱을 다시 시작하거나 새 대화를 여세요.",
+        ),
+        (
+            "diagnostic",
+            "MCP 연결 상태 새로고침 결과를 확인했습니다.",
+            "이 화면의 연결 상태 새로고침을 누르고 설정·서버 진단 결과를 확인하세요.",
+        ),
+        (
+            "list_regulations",
+            "list_regulations로 규정 목록이 보이는 것을 확인했습니다.",
+            "AI 앱에서 list_regulations를 호출해 승인된 규정명과 규정 식별자가 나오는지 확인하세요.",
+        ),
+        (
+            "search",
+            "search로 관련 조문이 검색되는 것을 확인했습니다.",
+            "규정 질문으로 search를 호출해 조·항·호 위치와 청크 식별자가 나오는지 확인하세요.",
+        ),
+        (
+            "fetch",
+            "fetch로 조문 원문과 출처가 조회되는 것을 확인했습니다.",
+            "search 결과의 식별자로 fetch를 호출해 원문·규정명·조문 위치·출처를 확인하세요.",
         ),
     )
+    item_keys = {
+        item: _beginner_connection_item_key(confirmation_key, item)
+        for item, _label, _help in checks
+    }
+    first_incomplete = next(
+        (
+            (item, label, help_text)
+            for item, label, help_text in checks
+            if not bool(st.session_state.get(item_keys[item]))
+        ),
+        None,
+    )
+    if first_incomplete is not None:
+        incomplete_item, incomplete_label, incomplete_help = first_incomplete
+        _render_beginner_action_marker(
+            4,
+            incomplete_label,
+            incomplete_help,
+            control_key_prefix=item_keys[incomplete_item],
+        )
+    previous_complete = True
+    for item, label, help_text in checks:
+        item_key = item_keys[item]
+        checked = st.checkbox(
+            label,
+            key=item_key,
+            disabled=not previous_complete,
+            help=help_text,
+        )
+        previous_complete = bool(previous_complete and checked)
+    st.session_state[confirmation_key] = previous_complete
 
 
 def _beginner_guide_completed_steps(
@@ -1154,6 +1412,117 @@ def _beginner_guide_completed_steps(
         and mcp_connection_confirmed
     )
     return preprocessing_complete, results_complete, approval_complete, mcp_complete
+
+
+def _beginner_guide_procedure_states(
+    ctx: dict | None,
+    step: int,
+    *,
+    mcp_bundle_created: bool | None = None,
+) -> tuple[bool, ...]:
+    """Expose granular, fail-closed progress for the active beginner page."""
+
+    completed_steps = _beginner_guide_completed_steps(
+        ctx,
+        mcp_bundle_created=mcp_bundle_created,
+    )
+    preprocessing_complete, results_complete, approval_complete, _mcp_complete = completed_steps
+    document_id = str(ctx.get("document_id") or "") if ctx else ""
+    if step == 1:
+        source_selected = bool(
+            _uploaded_file_list(st.session_state.get("regulation_document_upload"))
+            or document_id
+        )
+        return (
+            bool(_selected_institution_profile_id()),
+            bool(st.session_state.get(BEGINNER_GUIDE_KORDOC_CHECKED_KEY)) or preprocessing_complete,
+            source_selected,
+            bool(st.session_state.get(BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY))
+            or preprocessing_complete,
+            bool(st.session_state.get(BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY))
+            or preprocessing_complete,
+            preprocessing_complete,
+        )
+    if step == 2:
+        structure_checked = bool(
+            document_id
+            and st.session_state.get(
+                _beginner_guide_results_item_key(document_id, "structure")
+            )
+        )
+        issues_checked = bool(
+            document_id
+            and st.session_state.get(
+                _beginner_guide_results_item_key(document_id, "issues")
+            )
+        )
+        return (
+            preprocessing_complete,
+            structure_checked or approval_complete,
+            issues_checked or approval_complete,
+            results_complete,
+        )
+    if step == 3:
+        approval_counts = dict(ctx.get("approval_counts") or {}) if ctx else {}
+        pending_review_count = sum(
+            int(approval_counts.get(status) or 0)
+            for status in APPROVABLE_CHUNK_STATUSES
+        )
+        decisions_complete = bool(preprocessing_complete and pending_review_count == 0)
+        indexed = bool(dict(ctx.get("mcp_connection_gate") or {}).get("ready")) if ctx else False
+        return (
+            decisions_complete,
+            decisions_complete,
+            decisions_complete,
+            decisions_complete,
+            decisions_complete,
+            decisions_complete,
+            bool(approval_complete and indexed),
+        )
+    if step == 4:
+        bundle_created = _mcp_bundle_created(ctx) if mcp_bundle_created is None else mcp_bundle_created
+        scope_confirmed = bool(
+            document_id
+            and _session_has_true_prefix(
+                f"{BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX}:{document_id}:"
+            )
+        )
+        target_selected = bool(
+            document_id
+            and st.session_state.get(f"mcp-connection-target-{document_id}")
+        )
+        output_confirmed = bool(
+            document_id
+            and _session_has_true_prefix(
+                f"{BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX}:{document_id}:"
+            )
+        )
+        connection_key = (
+            _beginner_guide_connection_confirmed_key(document_id)
+            if document_id and bundle_created
+            else ""
+        )
+        external_states = tuple(
+            bool(st.session_state.get(_beginner_connection_item_key(connection_key, item)))
+            if connection_key
+            else False
+            for item in (
+                "registered",
+                "restarted",
+                "diagnostic",
+                "list_regulations",
+                "search",
+                "fetch",
+            )
+        )
+        return (
+            scope_confirmed,
+            target_selected,
+            output_confirmed,
+            bool(bundle_created),
+            *external_states,
+        )
+    return ()
 
 
 def _beginner_guide_recommended_step(completed_steps: tuple[bool, ...]) -> int:
@@ -1270,6 +1639,18 @@ def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
         st.success("이 단계에 필요한 작업이 완료되었습니다.")
     else:
         st.warning("화면의 같은 번호가 붙은 안내를 따라 진행하세요.")
+    procedure_states = _beginner_guide_procedure_states(
+        ctx,
+        active_step,
+        mcp_bundle_created=mcp_bundle_created,
+    )
+    st.markdown("**세부 확인 절차**")
+    for index, (procedure, completed) in enumerate(
+        zip(BEGINNER_GUIDE_PROCEDURES[active_step - 1], procedure_states),
+        start=1,
+    ):
+        icon = "✅" if completed else "⬜"
+        st.caption(f"{icon} {active_step}-{index}. {procedure}")
 
     previous_col, next_col = st.columns(2)
     previous_col.button(
@@ -6168,6 +6549,8 @@ def _page_preprocess() -> None:
 
     _render_api_key_setup_cta("preprocess")
     kordoc_ready = _render_kordoc_preprocess_preflight()
+    if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        st.session_state[BEGINNER_GUIDE_KORDOC_CHECKED_KEY] = True
 
     st.markdown("### 1. 파일 올리기")
     if (
@@ -6487,6 +6870,44 @@ def _page_preprocess() -> None:
             "나중에 검토 화면에서 사람이 내용을 보완할 수 있으며, 공식 승인·보안 확인은 그대로 진행됩니다."
         )
 
+    beginner_preprocess_confirmations_complete = True
+    if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) and upload_sources:
+        _reset_beginner_preprocess_confirmations_for_selection(upload_sources)
+        info_confirmed = bool(
+            st.session_state.get(BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY)
+        )
+        if not info_confirmed:
+            _render_beginner_action_marker(
+                1,
+                "자동 인식한 규정 정보를 확인하세요",
+                "파일명·규정명·버전·날짜가 맞는지 보고, 틀리면 직접 수정한 뒤 아래 확인란을 선택하세요.",
+                control_key_prefix=BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY,
+            )
+        info_confirmed = st.checkbox(
+            "자동 인식한 규정 정보와 필요한 수정값을 확인했습니다.",
+            key=BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY,
+            help="규정명·버전·개정일·시행일이 맞는지 확인한 뒤 선택하세요.",
+        )
+        ai_choice_confirmed = bool(
+            st.session_state.get(BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY)
+        )
+        if info_confirmed and not ai_choice_confirmed:
+            _render_beginner_action_marker(
+                1,
+                "AI 추가 검수 사용 여부를 결정하세요",
+                "위 선택값을 확인하세요. 빠른 전처리는 체크하지 않은 상태이며, 외부 AI 검수가 필요할 때만 켭니다.",
+                control_key_prefix=BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY,
+            )
+        ai_choice_confirmed = st.checkbox(
+            "AI 추가 검수를 사용할지 여부를 결정했습니다.",
+            key=BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY,
+            disabled=not info_confirmed,
+            help="AI 추가 검수 체크박스를 켤지 결정한 뒤 이 확인란을 선택하세요.",
+        )
+        beginner_preprocess_confirmations_complete = bool(
+            info_confirmed and ai_choice_confirmed
+        )
+
     with st.expander("전문가 설정 (기본값 사용을 권장합니다)", expanded=False):
         max_chunk_chars = st.number_input("최대 청크 글자 수", min_value=500, max_value=10000, value=1800, step=100)
         overlap_chars = st.number_input("청크 겹침 글자 수", min_value=0, max_value=1000, value=120, step=20)
@@ -6527,8 +6948,10 @@ def _page_preprocess() -> None:
         st.warning("미검수 미리보기(Unreviewed PoC Review) 확인란에 체크해야 전처리를 시작할 수 있습니다.")
     if not upload_sources:
         st.info("먼저 위에서 문서 파일을 올려 주세요.")
+    if upload_sources and not beginner_preprocess_confirmations_complete:
+        st.warning("초보자 안내의 문서 정보와 AI 검수 선택 확인을 차례로 완료해야 전처리 시작 버튼이 열립니다.")
 
-    if upload_sources:
+    if upload_sources and beginner_preprocess_confirmations_complete:
         _render_beginner_action_marker(
             1,
             "선택한 파일의 전처리를 시작하세요",
@@ -6539,7 +6962,7 @@ def _page_preprocess() -> None:
         "전처리 시작",
         type="primary",
         key="preprocess-start",
-        disabled=poc_review_needs_ack,
+        disabled=poc_review_needs_ack or not beginner_preprocess_confirmations_complete,
     ):
         if quality_profile_error:
             st.error(f"품질 프로필 설정이 올바르지 않습니다: {quality_profile_error}")
@@ -7261,18 +7684,46 @@ def _page_results(ctx: dict | None) -> None:
     results_confirmation_key = _beginner_guide_results_confirmed_key(document_id)
     results_confirmed = bool(st.session_state.get(results_confirmation_key))
     if beginner_results_confirmation_required:
-        if not results_confirmed:
+        structure_confirmation_key = _beginner_guide_results_item_key(
+            document_id,
+            "structure",
+        )
+        issues_confirmation_key = _beginner_guide_results_item_key(
+            document_id,
+            "issues",
+        )
+        structure_confirmed = bool(
+            st.session_state.get(structure_confirmation_key)
+        )
+        issues_confirmed = bool(st.session_state.get(issues_confirmation_key))
+        if not structure_confirmed:
             _render_beginner_action_marker(
                 2,
-                "청크와 이슈를 확인했음을 기록하세요",
-                "'정리된 내용(청크)'과 '이슈' 탭을 확인한 뒤 바로 아래 확인란을 선택하세요.",
-                control_key_prefix=results_confirmation_key,
+                "원문·조문 구조·청크를 먼저 확인하세요",
+                "'문서 구조'와 '정리된 내용(청크)' 탭에서 원문과 전처리 결과를 비교한 뒤 첫 번째 확인란을 선택하세요.",
+                control_key_prefix=structure_confirmation_key,
             )
-        results_confirmed = st.checkbox(
-            "청크·이슈를 확인했습니다.",
-            key=results_confirmation_key,
-            help="선택해야 초보자 안내의 결과 확인 단계가 완료되고 다음 검수 단계로 이동할 수 있습니다.",
+        elif not issues_confirmed:
+            _render_beginner_action_marker(
+                2,
+                "품질 경고와 이슈를 확인하세요",
+                "'이슈' 탭과 표·별표 검토 결과를 살펴본 뒤 두 번째 확인란을 선택하세요.",
+                control_key_prefix=issues_confirmation_key,
+            )
+        st.caption("초보자 모드에서는 '청크·이슈를 확인했습니다'를 아래 두 절차로 나누어 기록합니다.")
+        structure_confirmed = st.checkbox(
+            "원문·조문 구조·청크를 확인했습니다.",
+            key=structure_confirmation_key,
+            help="원문과 전처리 결과, 조문 구조, 청크 위치를 확인한 뒤 선택하세요.",
         )
+        issues_confirmed = st.checkbox(
+            "품질 경고·이슈와 표·별표 결과를 확인했습니다.",
+            key=issues_confirmation_key,
+            disabled=not structure_confirmed,
+            help="첫 번째 확인 후 품질 경고와 검증 이슈까지 살펴봐야 선택할 수 있습니다.",
+        )
+        results_confirmed = bool(structure_confirmed and issues_confirmed)
+        st.session_state[results_confirmation_key] = results_confirmed
     if not beginner_results_confirmation_required or results_confirmed:
         _render_beginner_action_marker(
             2,
@@ -8137,6 +8588,11 @@ def _page_approval(ctx: dict | None) -> None:
     review_items = _approval_ai_review_items(compare_chunk, compare_reasons, agent_review_summary)
     item_ids = [str(item["item_id"]) for item in review_items]
     ai_decisions_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "ai_decisions")
+    ai_result_confirmed_key = _approval_chunk_state_key(
+        document_id,
+        compare_chunk.chunk_id,
+        "ai_result_confirmed",
+    )
     human_confirmed_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "human_confirmed")
     human_confirmed_widget_key = _approval_chunk_state_key(
         document_id,
@@ -8158,9 +8614,11 @@ def _page_approval(ctx: dict | None) -> None:
         for item_id, decision in dict(st.session_state.get(ai_decisions_key) or {}).items()
         if str(decision) in {"reflect", "skip"}
     }
-    review_state = approval_review_completion_state(
-        item_ids,
-        ai_decisions,
+    review_state = _approval_review_completion_with_beginner_confirmation(
+        document_id=document_id,
+        chunk_id=str(compare_chunk.chunk_id),
+        item_ids=item_ids,
+        ai_decisions=ai_decisions,
         human_confirmed=bool(st.session_state.get(human_confirmed_key)),
     )
 
@@ -8182,6 +8640,22 @@ def _page_approval(ctx: dict | None) -> None:
     elif (
         st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
         and approved_count < total_chunks
+        and not bool(review_state["ai_result_confirmed"])
+    ):
+        ai_result_widget_key = _approval_chunk_state_key(
+            document_id,
+            compare_chunk.chunk_id,
+            f"ai_result_confirmed_widget_{review_state['ai_result_signature']}",
+        )
+        _render_beginner_action_marker(
+            3,
+            "AI 검증 결과를 확인했다고 표시하세요",
+            "AI 제안별 판단이 모두 끝났습니다. 첫 번째 탭 아래의 AI 검증 결과 확인란을 선택하세요.",
+            control_key_prefix=ai_result_widget_key,
+        )
+    elif (
+        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+        and approved_count < total_chunks
         and not bool(review_state["human_confirmed"])
     ):
         st.info(
@@ -8190,7 +8664,7 @@ def _page_approval(ctx: dict | None) -> None:
         )
     ai_tab, human_tab = st.tabs(
         [
-            f"1. AI 검증 확인 {_approval_tab_badge(bool(review_state['ai_confirmed']))}",
+            f"1. AI 검증 확인 {_approval_tab_badge(bool(review_state['ai_result_confirmed']))}",
             f"2. 사람 검증 확인 {_approval_tab_badge(bool(review_state['human_confirmed']))}",
         ]
     )
@@ -8251,6 +8725,43 @@ def _page_approval(ctx: dict | None) -> None:
                 else:
                     action_cols[2].warning("아직 결정하지 않음")
 
+        current_ai_decisions = {
+            str(item_id): str(decision)
+            for item_id, decision in dict(
+                st.session_state.get(ai_decisions_key) or {}
+            ).items()
+            if str(decision) in {"reflect", "skip"}
+        }
+        current_ai_state = _approval_review_completion_with_beginner_confirmation(
+            document_id=document_id,
+            chunk_id=str(compare_chunk.chunk_id),
+            item_ids=item_ids,
+            ai_decisions=current_ai_decisions,
+            human_confirmed=bool(st.session_state.get(human_confirmed_key)),
+        )
+        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            ai_result_widget_key = _approval_chunk_state_key(
+                document_id,
+                compare_chunk.chunk_id,
+                f"ai_result_confirmed_widget_{current_ai_state['ai_result_signature']}",
+            )
+            if ai_result_widget_key not in st.session_state:
+                st.session_state[ai_result_widget_key] = bool(
+                    current_ai_state["ai_result_confirmed"]
+                )
+            st.checkbox(
+                "AI 검증 결과와 제안별 반영 여부를 확인했습니다.",
+                key=ai_result_widget_key,
+                disabled=not bool(current_ai_state["ai_confirmed"]),
+                help="모든 AI 제안에 반영 또는 반영 안 함을 결정한 뒤 결과를 다시 확인하세요.",
+                on_change=_approval_sync_ai_result_confirmation_from_widget,
+                kwargs={
+                    "durable_key": ai_result_confirmed_key,
+                    "widget_key": ai_result_widget_key,
+                    "signature": str(current_ai_state["ai_result_signature"]),
+                },
+            )
+
         st.markdown("#### AI 표시 부분 수정 전·후 비교")
         st.caption("왼쪽은 저장된 전처리 원문이며, 오른쪽 내용은 직접 고칠 수 있습니다. 수정본은 승인할 때 저장됩니다.")
         edit_cols = st.columns(2)
@@ -8279,12 +8790,14 @@ def _page_approval(ctx: dict | None) -> None:
         for item_id, decision in dict(st.session_state.get(ai_decisions_key) or {}).items()
         if str(decision) in {"reflect", "skip"}
     }
-    review_state = approval_review_completion_state(
-        item_ids,
-        ai_decisions,
+    review_state = _approval_review_completion_with_beginner_confirmation(
+        document_id=document_id,
+        chunk_id=str(compare_chunk.chunk_id),
+        item_ids=item_ids,
+        ai_decisions=ai_decisions,
         human_confirmed=bool(st.session_state.get(human_confirmed_key)),
     )
-    if review_state["ai_confirmed"] and not st.session_state.get(ai_logged_key):
+    if review_state["ai_result_confirmed"] and not st.session_state.get(ai_logged_key):
         st.session_state[audit_preview_key].append(
             _approval_audit_preview_entry(
                 f"AI 검증 확인 완료 — 반영 {review_state['reflected']} / 반영 안 함 {review_state['skipped']}"
@@ -8295,10 +8808,17 @@ def _page_approval(ctx: dict | None) -> None:
     processed_preview_text = _approval_edited_text_from_session(document_id, compare_chunk)
     with human_tab:
         st.markdown("#### 실제 규정 ↔ 전처리 결과 비교")
+        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            st.info(
+                "**왼쪽의 원본 규정**과 **오른쪽의 전처리·수정 결과**를 같은 위치끼리 비교하세요. "
+                "빠진 문장, 잘못 합쳐진 조문, 표·별표 오류가 없는지 확인한 뒤 아래 사람 검증 확인란을 선택합니다."
+            )
         compare_cols = st.columns(2)
         with compare_cols[0]:
+            st.markdown("**왼쪽: 원본 규정**")
             _render_original_source_preview(document, compare_chunk)
         with compare_cols[1]:
+            st.markdown("**오른쪽: 전처리·수정 결과**")
             _render_processed_result_preview(compare_chunk, processed_preview_text)
         if compare_reasons:
             st.warning("이 청크의 검수 주의 사유: " + ", ".join(str(reason) for reason in compare_reasons))
@@ -8308,18 +8828,20 @@ def _page_approval(ctx: dict | None) -> None:
             st.session_state[human_confirmed_widget_key] = bool(st.session_state.get(human_confirmed_key))
         if (
             approved_count < total_chunks
-            and bool(review_state["ai_confirmed"])
+            and bool(review_state["ai_result_confirmed"])
             and not bool(st.session_state.get(human_confirmed_key))
         ):
             _render_beginner_action_marker(
                 3,
-                "원문과 전처리 결과를 직접 확인하세요",
-                "좌우 내용을 비교한 뒤에만 바로 아래 확인란을 선택하세요.",
+                "사람 검증 결과를 직접 확인하세요",
+                "왼쪽 원본 규정과 오른쪽 전처리·수정 결과를 비교한 뒤 바로 아래 확인란을 선택하세요. "
+                "남은 청크까지 모두 확인하면 승인하고 색인 버튼을 누르도록 다음 안내가 표시됩니다.",
                 control_key_prefix=human_confirmed_widget_key,
             )
         st.checkbox(
-            "원본과 전처리 결과를 확인했습니다.",
+            "사람 검증 결과: 원본과 전처리 결과를 확인했습니다.",
             key=human_confirmed_widget_key,
+            disabled=not bool(review_state["ai_result_confirmed"]),
             on_change=_approval_sync_human_confirmation_from_widget,
             kwargs={
                 "human_confirmed_key": human_confirmed_key,
@@ -8327,9 +8849,11 @@ def _page_approval(ctx: dict | None) -> None:
             },
         )
 
-    review_state = approval_review_completion_state(
-        item_ids,
-        ai_decisions,
+    review_state = _approval_review_completion_with_beginner_confirmation(
+        document_id=document_id,
+        chunk_id=str(compare_chunk.chunk_id),
+        item_ids=item_ids,
+        ai_decisions=ai_decisions,
         human_confirmed=bool(st.session_state.get(human_confirmed_key)),
     )
     if review_state["human_confirmed"] and not st.session_state.get(human_logged_key):
@@ -9565,6 +10089,30 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             str(getattr(scope_document, "document_id", "") or "")
             for scope_document in scope_documents
         ]
+        beginner_scope_confirmed = True
+        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            scope_confirmation_key = _beginner_mcp_confirmation_key(
+                BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX,
+                document_id,
+                mcp_scope,
+                sorted(scope_document_ids),
+            )
+            _clear_other_beginner_confirmations(
+                f"{BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX}:{document_id}:",
+                scope_confirmation_key,
+            )
+            if not st.session_state.get(scope_confirmation_key):
+                _render_beginner_action_marker(
+                    4,
+                    "MCP에 넣을 규정 범위를 확인하세요",
+                    "현재 규정만, 선택한 규정, 기관 전체 중 원하는 범위가 맞는지 확인한 뒤 아래 확인란을 선택하세요.",
+                    control_key_prefix=scope_confirmation_key,
+                )
+            beginner_scope_confirmed = st.checkbox(
+                "MCP에 포함할 규정 범위를 확인했습니다.",
+                key=scope_confirmation_key,
+                help="범위를 바꾸면 새 범위에 대해 다시 확인해야 합니다.",
+            )
         scope_gate = _workflow_mcp_gate_summary(scope_document_ids, ctx)
         visible_scope_documents = _mcp_visible_scope_documents(scope_documents, scope_gate)
         visible_scope_document_ids = {
@@ -9842,6 +10390,12 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         )
         if mcp_bundle_ready:
             st.success("선택한 MCP 범위의 검토·승인·색인과 표 파싱 품질 확인이 모두 끝났습니다.")
+        if (
+            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+            and not beginner_scope_confirmed
+        ):
+            st.info("위에서 MCP에 넣을 규정 범위를 확인하면 연결 방식 선택 절차가 열립니다.")
+            return
         mcp_connection_target_labels = {
             "claude-code": "Claude Code",
             "codex": "Codex CLI / Codex IDE",
@@ -9885,6 +10439,33 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         if mcp_connection_target is None:
             st.info("위에서 실제 사용할 AI 앱을 하나 선택하면 MCP 이름과 저장 위치 설정이 나타납니다.")
             return
+        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            beginner_target_paths = {
+                "claude-code": (
+                    "Claude Code 로컬 연결",
+                    "로컬 묶음 생성 → 생성된 Claude Code 등록 명령 실행 → Claude Code 재시작 → 연결 진단 → 도구 호출 확인",
+                ),
+                "codex": (
+                    "Codex CLI·IDE 로컬 연결",
+                    "로컬 묶음 생성 → 생성된 TOML 설정 등록 → Codex 재시작 또는 새 task → 연결 진단 → 도구 호출 확인",
+                ),
+                "claude-desktop": (
+                    "Claude Desktop 로컬 연결",
+                    "로컬 묶음 생성 → mcpServers 설정 병합 → Claude Desktop 완전 종료·재시작 → 연결 진단 → 도구 호출 확인",
+                ),
+                "chatgpt-remote": (
+                    "ChatGPT 원격 HTTPS 연결",
+                    "Vercel 배포 준비 묶음 생성 → 배포 → HTTPS /mcp 주소 입력 후 묶음 재생성 → ChatGPT 커넥터 등록 → 새 대화에서 도구 호출 확인",
+                ),
+                "claude-api": (
+                    "Claude 원격 HTTPS 연결",
+                    "Vercel 배포 준비 묶음 생성 → 배포 → HTTPS /mcp 주소 입력 후 묶음 재생성 → Claude 원격 연결 등록 → 새 대화에서 도구 호출 확인",
+                ),
+            }
+            target_path_title, target_path_steps = beginner_target_paths[
+                mcp_connection_target
+            ]
+            st.info(f"**선택한 방법: {target_path_title}**\n\n{target_path_steps}")
         if mcp_scope == "selected_institution":
             st.info(
                 f"선택 기관 '{selected_profile_id}'의 승인·색인된 규정을 하나의 MCP runtime bundle로 묶습니다. "
@@ -10094,6 +10675,44 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             if normalized_mcp_server_name and normalized_mcp_server_name == mcp_server_name
             else suggested_mcp_server_name
         )
+        beginner_output_confirmed = True
+        if (
+            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+            and beginner_scope_confirmed
+            and mcp_connection_target
+            and mcp_server_name
+            and normalized_mcp_server_name == mcp_server_name
+        ):
+            output_confirmation_key = _beginner_mcp_confirmation_key(
+                BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX,
+                document_id,
+                mcp_scope,
+                mcp_connection_target,
+                mcp_bundle_output_dir,
+                mcp_save_mode,
+                mcp_server_name,
+                mcp_public_url,
+            )
+            _clear_other_beginner_confirmations(
+                f"{BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX}:{document_id}:",
+                output_confirmation_key,
+            )
+            if not st.session_state.get(output_confirmation_key):
+                _render_beginner_action_marker(
+                    4,
+                    "저장 위치·방식과 MCP 이름을 확인하세요",
+                    "저장 폴더, ZIP 포함 여부, MCP 이름과 연결 대상을 확인한 뒤 아래 확인란을 선택하세요.",
+                    control_key_prefix=output_confirmation_key,
+                )
+            beginner_output_confirmed = st.checkbox(
+                "저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.",
+                key=output_confirmation_key,
+                help="이 값 중 하나를 바꾸면 변경된 설정을 다시 확인해야 합니다.",
+            )
+        elif st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            beginner_output_confirmed = False
+        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) and not beginner_output_confirmed:
+            mcp_target_ready = False
         mcp_config = _direct_python_mcp_config(
             build_mcp_client_config(
                 server_name=config_server_name,

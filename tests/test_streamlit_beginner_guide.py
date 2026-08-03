@@ -21,6 +21,7 @@ from app.core.institution_profiles import (
     InstitutionProfileRegistry,
     institution_profile_registry_to_bytes,
 )
+from app.services.approval_governance import approval_review_completion_state
 from scripts.generate_mcp_client_config import (
     RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES,
     validate_mcp_runtime_data_bundle_integrity,
@@ -408,7 +409,12 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "다음 단계",
             "안내 건너뛰기",
             "처음부터 다시 보기",
-            "AI 앱에서 search와 fetch 도구 호출이 성공한 것을 확인했습니다.",
+            "선택한 AI 앱에 MCP 등록을 완료했습니다.",
+            "AI 앱을 완전히 다시 시작했거나 새 대화를 열었습니다.",
+            "MCP 연결 상태 새로고침 결과를 확인했습니다.",
+            "list_regulations로 규정 목록이 보이는 것을 확인했습니다.",
+            "search로 관련 조문이 검색되는 것을 확인했습니다.",
+            "fetch로 조문 원문과 출처가 조회되는 것을 확인했습니다.",
         ):
             self.assertIn(label, source)
         self.assertIn('role="note"', source)
@@ -421,8 +427,8 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('div[class~="st-key-{safe_control_key}"] button', source)
         self.assertIn("control_key_prefix=human_confirmed_widget_key", source)
         self.assertNotIn("'2. 사람 검증 확인' 탭을 누르세요", source)
-        self.assertIn("원문과 전처리 결과를 직접 확인하세요", source)
-        self.assertIn("청크·이슈를 확인했습니다.", source)
+        self.assertIn("사람 검증 결과를 직접 확인하세요", source)
+        self.assertIn("청크·이슈를 확인했습니다", source)
         self.assertIn("먼저 MCP 이름을 입력하세요", source)
         self.assertIn("'정리된 내용(청크)'와 '이슈' 탭을 확인하세요", source)
         self.assertIn('control_key_prefix="institution-name"', source)
@@ -644,7 +650,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             ast.unparse(disabled_value),
         )
 
-    def test_search_fetch_confirmation_marker_targets_the_exact_checkbox_key(self) -> None:
+    def test_connection_confirmation_requires_each_external_step_in_order(self) -> None:
         _source, module = _source_and_module()
         helper = _function(module, "_render_beginner_connection_confirmation")
 
@@ -678,7 +684,6 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertEqual(1, len(confirmation_key_names))
         self.assertEqual(1, len(marker_calls))
         self.assertEqual(1, len(checkbox_calls))
-        confirmation_key_name = next(iter(confirmation_key_names))
         marker_prefix = next(
             keyword.value
             for keyword in marker_calls[0].keywords
@@ -689,11 +694,23 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             for keyword in checkbox_calls[0].keywords
             if keyword.arg == "key"
         )
-        self.assertIsInstance(marker_prefix, ast.Name)
+        self.assertIsInstance(marker_prefix, ast.Subscript)
         self.assertIsInstance(checkbox_key, ast.Name)
-        self.assertEqual(confirmation_key_name, marker_prefix.id)
-        self.assertEqual(confirmation_key_name, checkbox_key.id)
+        self.assertEqual("item_keys", ast.unparse(marker_prefix.value))
+        self.assertEqual("item_key", checkbox_key.id)
         self.assertLess(marker_calls[0].lineno, checkbox_calls[0].lineno)
+        helper_source = ast.unparse(helper)
+        for item in (
+            "registered",
+            "restarted",
+            "diagnostic",
+            "list_regulations",
+            "search",
+            "fetch",
+        ):
+            self.assertIn(repr(item), helper_source)
+        self.assertIn("disabled=not previous_complete", helper_source)
+        self.assertIn("st.session_state[confirmation_key] = previous_complete", helper_source)
 
     def test_guide_uses_all_four_existing_workflow_pages(self) -> None:
         source, module = _source_and_module()
@@ -740,6 +757,108 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         }
         self.assertEqual({1, 2, 3, 4}, marker_steps)
         self.assertNotIn("javascript", source.lower())
+
+    def test_guide_exposes_every_required_subprocedure(self) -> None:
+        _source, module = _source_and_module()
+        assignment = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "BEGINNER_GUIDE_PROCEDURES"
+        )
+        procedure_groups = [
+            [item.value for item in group.elts]
+            for group in assignment.value.elts
+        ]
+
+        self.assertEqual([6, 4, 7, 10], [len(group) for group in procedure_groups])
+        flattened = [item for group in procedure_groups for item in group]
+        for required in (
+            "자동 인식한 규정 정보 확인",
+            "AI 추가 검수 사용 여부 결정",
+            "품질 경고·이슈 확인",
+            "각 청크 사람 검증 결과 확인",
+            "MCP에 넣을 규정 범위 확인",
+            "list_regulations 목록 호출 확인",
+            "search 조문 검색 확인",
+            "fetch 원문·출처 조회 확인",
+        ):
+            self.assertIn(required, flattened)
+
+    def test_beginner_preprocess_requires_sequential_manual_confirmations(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_preprocess")) or ""
+
+        self.assertIn("_reset_beginner_preprocess_confirmations_for_selection(upload_sources)", page_source)
+        self.assertIn("자동 인식한 규정 정보와 필요한 수정값을 확인했습니다.", page_source)
+        self.assertIn("AI 추가 검수를 사용할지 여부를 결정했습니다.", page_source)
+        self.assertIn("disabled=not info_confirmed", page_source)
+        self.assertIn(
+            "disabled=poc_review_needs_ack or not beginner_preprocess_confirmations_complete",
+            page_source,
+        )
+
+    def test_preprocess_confirmation_identity_uses_file_content(self) -> None:
+        _source, module = _source_and_module()
+        helpers = [
+            _function(module, "_beginner_upload_source_content_digest"),
+            _function(module, "_beginner_preprocess_selection_identity"),
+        ]
+        namespace: dict[str, object] = {
+            "Path": Path,
+            "hashlib": hashlib,
+            "json": json,
+        }
+        exec(
+            compile(ast.Module(body=helpers, type_ignores=[]), "<upload-confirmation>", "exec"),
+            namespace,
+        )
+        identity = namespace["_beginner_preprocess_selection_identity"]
+        first = identity(
+            [{"filename": "same.hwp", "size": 4, "file": SimpleNamespace(getvalue=lambda: b"AAAA")}]
+        )
+        second = identity(
+            [{"filename": "same.hwp", "size": 4, "file": SimpleNamespace(getvalue=lambda: b"BBBB")}]
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_results_confirmation_key_changes_with_document_revision(self) -> None:
+        _source, module = _source_and_module()
+        helper = _function(module, "_beginner_guide_results_confirmed_key")
+        revisions = {"value": (("chunks", 1, 10),)}
+        namespace: dict[str, object] = {
+            "BEGINNER_GUIDE_RESULTS_CONFIRMED_PREFIX": "results-confirmed",
+            "hashlib": hashlib,
+            "json": json,
+            "_document_context_revision": lambda _document_id: revisions["value"],
+        }
+        exec(
+            compile(ast.Module(body=[helper], type_ignores=[]), "<results-confirmation>", "exec"),
+            namespace,
+        )
+        confirmation_key = namespace["_beginner_guide_results_confirmed_key"]
+        first = confirmation_key("doc-1")
+        revisions["value"] = (("chunks", 2, 10),)
+        second = confirmation_key("doc-1")
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("results-confirmed:doc-1:"))
+
+    def test_beginner_mcp_requires_scope_and_output_confirmation_before_bundle(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_connect")) or ""
+
+        self.assertIn("MCP에 포함할 규정 범위를 확인했습니다.", page_source)
+        self.assertIn("저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.", page_source)
+        self.assertIn("BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX", page_source)
+        self.assertIn("BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX", page_source)
+        self.assertIn("mcp_target_ready = False", page_source)
+        self.assertIn(
+            "disabled=not mcp_bundle_ready or mcp_profile_scope_mismatch or not mcp_target_ready",
+            page_source,
+        )
 
     def test_completion_state_requires_real_approval_and_index_gate(self) -> None:
         _source, module = _source_and_module()
@@ -925,8 +1044,13 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
 
         self.assertIn("beginner_results_confirmation_required", page_source)
         self.assertIn("results_confirmation_key = _beginner_guide_results_confirmed_key(document_id)", page_source)
-        self.assertIn("청크·이슈를 확인했습니다.", page_source)
-        self.assertIn("control_key_prefix=results_confirmation_key", page_source)
+        self.assertIn("청크·이슈를 확인했습니다", page_source)
+        self.assertIn("structure_confirmation_key", page_source)
+        self.assertIn("issues_confirmation_key", page_source)
+        self.assertIn("control_key_prefix=structure_confirmation_key", page_source)
+        self.assertIn("control_key_prefix=issues_confirmation_key", page_source)
+        self.assertIn("disabled=not structure_confirmed", page_source)
+        self.assertIn("results_confirmed = bool(structure_confirmed and issues_confirmed)", page_source)
         self.assertIn(
             "beginner_results_confirmation_required and not results_confirmed",
             page_source,
@@ -944,6 +1068,99 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("확인란이 빨간색으로 표시됩니다", page_source)
         self.assertIn("control_key_prefix=human_confirmed_widget_key", page_source)
         self.assertIn("key=human_confirmed_widget_key", page_source)
+
+    def test_approval_guides_ai_result_human_comparison_and_index_separately(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_approval")) or ""
+
+        for text in (
+            "AI 검증 결과와 제안별 반영 여부를 확인했습니다.",
+            "왼쪽: 원본 규정",
+            "오른쪽: 전처리·수정 결과",
+            "사람 검증 결과: 원본과 전처리 결과를 확인했습니다.",
+            "승인하고 색인",
+            "이미 승인된 내용 AI에 등록만 실행",
+        ):
+            self.assertIn(text, page_source)
+        self.assertIn("not bool(review_state[\"ai_result_confirmed\"])", page_source)
+        self.assertIn("disabled=not bool(review_state[\"ai_result_confirmed\"])", page_source)
+        self.assertIn("control_keys=(approve_index_button_key,)", page_source)
+        self.assertIn('control_key_prefix="quick-index-only-"', page_source)
+
+    def test_beginner_approval_requires_ai_result_confirmation_signature(self) -> None:
+        _source, module = _source_and_module()
+        helpers = [
+            _function(module, "_approval_ai_result_signature"),
+            _function(module, "_approval_review_completion_with_beginner_confirmation"),
+        ]
+        state = {"beginner": True}
+        namespace: dict[str, object] = {
+            "hashlib": hashlib,
+            "json": json,
+            "BEGINNER_GUIDE_ENABLED_KEY": "beginner",
+            "st": SimpleNamespace(session_state=state),
+            "_approval_chunk_state_key": lambda document_id, chunk_id, item: (
+                f"approval:{document_id}:{chunk_id}:{item}"
+            ),
+            "approval_review_completion_state": approval_review_completion_state,
+        }
+        exec(
+            compile(ast.Module(body=helpers, type_ignores=[]), "<ai-result-confirmation>", "exec"),
+            namespace,
+        )
+        completion = namespace["_approval_review_completion_with_beginner_confirmation"]
+        signature = namespace["_approval_ai_result_signature"](
+            ["item-1"],
+            {"item-1": "reflect"},
+        )
+
+        unconfirmed = completion(
+            document_id="doc-1",
+            chunk_id="chunk-1",
+            item_ids=["item-1"],
+            ai_decisions={"item-1": "reflect"},
+            human_confirmed=True,
+        )
+        self.assertTrue(unconfirmed["ai_confirmed"])
+        self.assertFalse(unconfirmed["ai_result_confirmed"])
+        self.assertFalse(unconfirmed["approve_enabled"])
+
+        state["approval:doc-1:chunk-1:ai_result_confirmed"] = signature
+        confirmed = completion(
+            document_id="doc-1",
+            chunk_id="chunk-1",
+            item_ids=["item-1"],
+            ai_decisions={"item-1": "reflect"},
+            human_confirmed=True,
+        )
+        self.assertTrue(confirmed["ai_result_confirmed"])
+        self.assertTrue(confirmed["approve_enabled"])
+
+        changed = completion(
+            document_id="doc-1",
+            chunk_id="chunk-1",
+            item_ids=["item-1"],
+            ai_decisions={"item-1": "skip"},
+            human_confirmed=True,
+        )
+        self.assertFalse(changed["ai_result_confirmed"])
+        self.assertFalse(changed["approve_enabled"])
+
+    def test_beginner_mcp_shows_only_the_selected_connection_path(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_connect")) or ""
+
+        self.assertIn("beginner_target_paths", page_source)
+        for path_name in (
+            "Claude Code 로컬 연결",
+            "Codex CLI·IDE 로컬 연결",
+            "Claude Desktop 로컬 연결",
+            "ChatGPT 원격 HTTPS 연결",
+            "Claude 원격 HTTPS 연결",
+        ):
+            self.assertIn(path_name, page_source)
+        self.assertIn("and not beginner_scope_confirmed", page_source)
+        self.assertIn("선택한 방법:", page_source)
 
     def test_connection_confirmation_is_scoped_to_bundle_generation(self) -> None:
         _source, module = _source_and_module()

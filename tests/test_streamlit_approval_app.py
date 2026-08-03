@@ -304,7 +304,10 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             reflect.click().run()
 
             human_check = next(
-                checkbox for checkbox in app.checkbox if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             human_check.check().run()
 
@@ -346,7 +349,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "원본과 전처리 결과를 확인했습니다."
+                if checkbox.label == "사람 검증 결과: 원본과 전처리 결과를 확인했습니다."
             ).check().run()
             next(button for button in app.button if button.label == "승인하고 색인").click().run()
 
@@ -452,7 +455,10 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             reflect = next(button for button in app.button if button.label == "\ubc18\uc601")
             reflect.click().run()
             human_check = next(
-                checkbox for checkbox in app.checkbox if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             human_check.check().run()
             approve = next(button for button in app.button if button.label == "\uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
@@ -582,7 +588,8 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             first_human_check = next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             self.assertTrue(first_human_check.value)
 
@@ -606,7 +613,8 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             second_human_check = next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "\uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
+                if checkbox.label
+                == "\uc0ac\ub78c \uac80\uc99d \uacb0\uacfc: \uc6d0\ubcf8\uacfc \uc804\ucc98\ub9ac \uacb0\uacfc\ub97c \ud655\uc778\ud588\uc2b5\ub2c8\ub2e4."
             )
             self.assertTrue(second_human_check.value)
 
@@ -674,7 +682,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             first_human_check = next(
                 checkbox
                 for checkbox in app.checkbox
-                if checkbox.label == "원본과 전처리 결과를 확인했습니다."
+                if checkbox.label == "사람 검증 결과: 원본과 전처리 결과를 확인했습니다."
             )
             first_human_check.check().run()
             next(
