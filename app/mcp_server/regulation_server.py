@@ -253,6 +253,7 @@ def create_regulation_mcp_server(
                 query=query,
                 page=page,
                 page_size=page_size,
+                require_hierarchy=True,
             )
             return ChatGPTDataRegulationListOutput.model_validate(
                 {
@@ -364,6 +365,7 @@ def create_regulation_mcp_server(
                 regulation_unit_id=regulation_unit_id,
                 page=page,
                 page_size=page_size,
+                require_hierarchy=True,
             )
 
         @server.tool(

@@ -30,7 +30,8 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "reg-rag-mcp-vercel-stage",
             "MCP_ALLOW_UNAUTHENTICATED_HTTP",
             "bearer_token_env_var",
-            "https://learn.chatgpt.com/docs/extend/mcp",
+            "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
+            "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
             "https://code.claude.com/docs/en/mcp",
             "설정 > 개발자 > 로컬 MCP 서버 > 구성 편집",
             "파일·커넥터 추가 > Connectors",
@@ -91,7 +92,8 @@ class McpQuickConnectDocsTests(unittest.TestCase):
 
         self.assertIn("docs/mcp_quickconnect_ko.md", text)
         self.assertIn("docs/vercel_https_mcp_ko.md", text)
-        self.assertIn("Settings > MCP servers > Add server", text)
+        self.assertIn("Settings > Apps > Advanced settings > Developer mode", text)
+        self.assertIn("OpenAI Secure MCP Tunnel", text)
         self.assertIn("설정 > 개발자 > 로컬 MCP 서버 > 구성 편집", text)
         self.assertIn("설정 > 개발자 > 로컬 MCP 서버", text)
         self.assertIn("Customize > Connectors", text)
@@ -112,12 +114,12 @@ class McpQuickConnectDocsTests(unittest.TestCase):
         for expected in (
             "## 2. 다섯 방법 중 하나 선택하기",
             "### 방법 A — Claude Code 로컬 STDIO",
-            "### 방법 B — ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+            "### 방법 B — Codex CLI / Codex IDE 로컬 STDIO",
             "### 방법 C — Claude Desktop 로컬 STDIO",
             "### 방법 D — ChatGPT · Vercel HTTPS MCP",
             "### 방법 E — Claude · Vercel HTTPS MCP",
             "`Claude Code`",
-            "`ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)`",
+            "`Codex CLI / Codex IDE`",
             "`Claude Desktop`",
             "`ChatGPT · Vercel HTTPS MCP`",
             "`Claude · Vercel HTTPS MCP`",
@@ -125,20 +127,19 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "**Claude Desktop 앱의 JSON 설정 파일**에 붙일 것 → **방법 C**",
             "**A는 Claude Code(Claude CLI)** 입니다.",
             "**C는 Claude Desktop** 입니다.",
-            "Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다.",
-            "주소가 있어야 생성 버튼이 켜집니다.",
+            "Vercel 주소가 아직 없어도 D를 선택",
+            "배포 준비용 MCP 묶음",
             "방법 A·B·C는 로컬 STDIO이고, 방법 D·E는 Vercel HTTPS입니다.",
             "같은 PC의 Claude Code에서 사용",
-            "같은 PC의 ChatGPT Desktop에서 사용",
             "같은 PC의 Codex CLI 또는 IDE에서 사용",
-            "ChatGPT에서 Vercel 주소로 원격 사용",
+            "ChatGPT에서 사용",
             "Claude에서 Vercel 주소로 원격 사용",
         ):
             self.assertIn(expected, text)
 
         detailed_headings = (
             "## 방법 A 상세: Claude Code 로컬 STDIO 연결",
-            "## 방법 B 상세: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO 연결",
+            "## 방법 B 상세: Codex CLI / Codex IDE 로컬 STDIO 연결",
             "## 방법 C 상세: Claude Desktop 로컬 STDIO 연결",
             "## 방법 D·E 공통 준비: Vercel HTTPS 배포와 검증",
             "## 방법 D 상세: ChatGPT · Vercel HTTPS MCP 연결",
@@ -227,47 +228,26 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             merged["mcpServers"]["기관-규정"]["args"][:2],
         )
 
-    def test_readme_contains_field_by_field_chatgpt_stdio_walkthrough(self) -> None:
+    def test_readme_separates_codex_local_from_chatgpt_remote(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
-            "## 방법 B 상세: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO 연결",
-            "### B-1. Builder에서 ChatGPT Desktop 또는 Codex 번들 만들기",
-            "### B-2. Builder에서 복사할 값 찾기",
-            "### B-3. ChatGPT Desktop에서 MCP 추가 화면 열기",
-            "### B-4. Name과 Command 넣기",
-            "### B-5. Arguments를 한 줄씩 서로 다른 칸에 넣기",
-            "### B-6. Environment와 Working directory 넣고 저장하기",
-            "### B-7. 서버 켜고 `search`와 `fetch` 확인하기",
-            "### B-8. Codex CLI·IDE에 생성된 TOML 넣기",
-            "Argument 1/17 — 아래 한 줄만 복사",
-            "Argument 2/17 — 아래 한 줄만 복사",
-            "`Argument 17/17`이 마지막",
-            "**+ 인자 추가**를 한 번 누릅니다.",
-            "바로 아래 코드 상자의 **복사 아이콘**을 누릅니다.",
-            "**한 인자 칸에는 한 줄만 넣습니다.**",
-            "Builder에 표시된 개수 = ChatGPT의 인자 칸 개수",
-            "**실행 명령** 칸",
-            "`powershell.exe`만 넣습니다.",
-            "첫 값부터 **+ 환경 변수 추가**를 누르지 않습니다.",
-            "첫 값부터 **+ 변수 추가**를 누르지 않습니다.",
-            "**+ 환경 변수 추가**",
-            "**Working directory 복사**",
-            "**설정 → 플러그인 → MCP**",
-            "긴 JSON을 해석하지 말고 현재 화면의 개별 복사",
-            "docs/assets/readme-course-06-chatgpt-stdio-form.png",
-            "docs/assets/readme-course-06b-chatgpt-stdio-filled.png",
+            "## 방법 B 상세: Codex CLI / Codex IDE 로컬 STDIO 연결",
+            "### B-2. Codex CLI·IDE에 생성된 TOML 넣기",
             "notepad %USERPROFILE%\\.codex\\config.toml",
             "`codex_config_snippet.toml` 전체를 **그 아래에** 붙이면",
             "[mcp_servers.weather]",
             "[mcp_servers.기관_규정]",
             "같은 `[mcp_servers.기관_규정]` 제목이 이미 있으면 두 개를 만들지 말고",
             "Codex 연결\n완료입니다.",
-            "docs/assets/readme-course-01-stdio-bundle.png",
-            "docs/assets/readme-course-05-mcp-verification.png",
+            "ChatGPT는 로컬 STDIO MCP에 직접 연결하지 않습니다",
+            "ChatGPT 웹 원격 MCP",
+            "Settings > Apps > Advanced settings > Developer mode",
+            "OpenAI Secure MCP Tunnel",
         ):
             self.assertIn(expected, text)
-
+        self.assertNotIn("ChatGPT Desktop 로컬 STDIO", text)
+        self.assertNotIn("+ 서버 추가 > STDIO", text)
     def test_readme_contains_beginner_vercel_https_walkthrough(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -277,7 +257,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "prepare_vercel_mcp_deployment.py",
             "생성 완료 화면 읽는 법",
             "MCP 파일 묶음 생성 완료`는 Vercel 배포 완료가 아닙니다",
-            "ChatGPT에서 Vercel 주소로 원격 사용",
+            "ChatGPT에서 사용",
             "### V-3. Vercel CLI 설치하고 로그인",
             "node --version",
             "npm --version",
@@ -288,11 +268,13 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "MCP_TOOL_PROFILE",
             "Aliased",
             "브라우저로 읽는 홈페이지가 아니므로",
-            "docs/assets/readme-course-08-chatgpt-http-form.png",
-            "**기본 token 환경 변수**",
-            "**환경 변수의 헤더**",
+            "Settings > Apps > Advanced settings > Developer mode",
+            "OpenAI 공식 ChatGPT Developer mode·MCP 지원 안내",
+            "OpenAI Secure MCP Tunnel",
+            "ChatGPT 웹 앱 설정",
+            "**인증**",
             "**URL (MCP URL / Server URL)**",
-            "**Command / Executable** | 넣지 않음",
+            "**로컬 Command / Arguments / Working directory** | 넣지 않음",
             "run_mcp_client_config_smoke.py",
             "mcp_initialized",
             "end_to_end_verified",
@@ -331,10 +313,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-claude-mcp-03-verify.svg",
             "docs/assets/readme-vercel-claude-connection.svg",
             "docs/assets/readme-course-00-completion-guide.png",
-            "docs/assets/readme-course-00b-real-completion.png",
-            "docs/assets/readme-course-00c-builder-chatgpt-stdio-selection.png",
             "docs/assets/readme-course-00d-builder-claude-selection.png",
-            "docs/assets/readme-course-01b-builder-chatgpt-stdio-output.png",
             "docs/assets/readme-course-03-vercel-production.png",
             "docs/assets/readme-course-04-claude-remote-connector.png",
             "docs/assets/readme-course-04b-builder-claude-direct-config.png",
@@ -343,13 +322,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "docs/assets/readme-course-02c-claude-developer-config-edit.png",
             "docs/assets/readme-course-02d-claude-config-file-explorer.png",
             "docs/assets/readme-course-02b-claude-local-mcp-server.png",
-            "docs/assets/readme-course-06-chatgpt-plugin-home.png",
-            "docs/assets/readme-course-06-chatgpt-plugin-settings.png",
-            "docs/assets/readme-course-06-chatgpt-mcp-tab.png",
-            "docs/assets/readme-course-06-chatgpt-stdio-form.png",
-            "docs/assets/readme-course-06b-chatgpt-stdio-filled.png",
             "docs/assets/readme-course-07-claude-config-editor.png",
-            "docs/assets/readme-course-08-chatgpt-http-form.png",
         )
 
         for image_path in expected_images:
@@ -446,7 +419,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "실제 생성 완료 화면에서 확인할 곳",
             "## 2. 다섯 방법 중 하나 선택하기",
             "### 방법 A — Claude Code 로컬 STDIO",
-            "### 방법 B — ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO",
+            "### 방법 B — Codex CLI / Codex IDE 로컬 STDIO",
             "### 방법 C — Claude Desktop 로컬 STDIO",
             "### 방법 D — ChatGPT · Vercel HTTPS MCP",
             "### 방법 E — Claude · Vercel HTTPS MCP",
@@ -459,15 +432,11 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "**붙여 넣을 위치는 파일 전체입니다.**",
             "서버 이름 옆 파란 배지가 **`running`**",
             "%APPDATA%\\Claude\\claude_desktop_config.json",
-            "플러그인 / 앱 / MCP / 스킬",
-            "**+ 서버 추가**",
-            "Argument 1/17",
-            "**+ 인자 추가**",
-            "**한 인자 칸에는 한 줄만 넣습니다.**",
-            "**작업 중인 디렉터리**",
-            "**스트리밍 가능한 HTTP**",
-            "`https://mcp.example.com/mcp`",
-            "`MCP_BEARER_TOKEN`",
+            "Settings > Apps > Advanced settings > Developer mode",
+            "Apps 설정에서 새 앱",
+            "ChatGPT 웹 앱 설정",
+            "**URL (MCP URL / Server URL)**",
+            "OpenAI Secure MCP Tunnel",
         ):
             self.assertIn(expected, text)
 
@@ -489,22 +458,19 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             self.assertIsNotNone(root.find("svg:title", namespace))
             self.assertIsNotNone(root.find("svg:desc", namespace))
 
-    def test_readme_maps_chatgpt_desktop_builder_boxes_to_app_fields(self) -> None:
+    def test_readme_maps_chatgpt_web_remote_fields(self) -> None:
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for expected in (
-            "**Name** 아래 코드 상자",
-            "맨 위 **이름** 칸",
-            "**Command 복사** 아래 코드 상자",
-            "ChatGPT의 **실행 명령** 칸",
-            "ChatGPT의 첫 번째 **인자** 칸",
-            "ChatGPT의 두 번째 인자 칸",
-            "`Argument 17/17`이 마지막",
-            "Builder에 `Environment (0개)`",
-            "Builder의 **Working directory 복사**",
-            "오른쪽 아래 **저장**",
+            "ChatGPT 웹 앱 설정",
+            "**이름 (Name)**",
+            "**URL (MCP URL / Server URL)**",
+            "**인증**",
+            "**로컬 Command / Arguments / Working directory** | 넣지 않음",
+            "Apps 설정에서 새 앱을 만들고",
         ):
             self.assertIn(expected, text)
+        self.assertNotIn("ChatGPT의 **실행 명령** 칸", text)
 
 
 if __name__ == "__main__":

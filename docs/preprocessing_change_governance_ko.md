@@ -5,6 +5,7 @@
 ## 보호 범위
 
 - `app/parsers/`, `app/processors/`
+- `app/ingestion/`, `app/retrieval/`의 Vector metadata, BM25, 계층 색인·검색 로직
 - `app/core/pipeline.py`, `app/services/processing_service.py`
 - 파싱·구조·품질·chunk 관련 schema
 - 배치 전처리와 회귀 판정에 관여하는 핵심 script
@@ -68,6 +69,6 @@ python scripts\audit_release_hygiene.py --workflow-scope available --include-unt
 - 플러그인 등록과 현재 대화의 도구 첨부를 같은 상태로 표시하지 않는다.
 - 프로세스 실행만으로 연결 완료를 표시하지 않는다.
 - 실제 `initialize`, `tools/list`, `get_index_status`가 성공하기 전에는 `end_to_end_verified`를 참으로 만들지 않는다.
-- ChatGPT Desktop companion JSON과 상태 JSON/TOML은 BOM 없는 UTF-8 계약을 지키며, 검증기가 `utf-8-sig`로 결함을 숨기지 않는다.
+- 이전 ChatGPT 로컬 호환 경고 JSON과 상태 JSON/TOML은 BOM 없는 UTF-8 계약을 지키며, 검증기가 `utf-8-sig`로 결함을 숨기지 않는다. 이 JSON은 ChatGPT 로컬 연결 지원을 의미하지 않는다.
 - MCP 연결 완료는 생성 파일의 존재만으로 판단하지 않고, 직접 등록된 설정과 `initialize`·`tools/list`·`search`·`fetch` 실행 결과를 함께 확인한다.
 - ChatGPT 로컬 플러그인과 원격 HTTPS MCP를 서로 다른 프로필로 유지한다.

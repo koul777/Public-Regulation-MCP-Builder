@@ -21,7 +21,7 @@ from app.retrieval.tokenizer import (
 BM25_INDEX_VERSION = "reg-rag-bm25-index-v2"
 BM25_RETRIEVAL_MODEL = "kiwi-bm25-v1"
 DEFAULT_BM25_FILENAME = "bm25_index.json"
-BM25_STRUCTURED_METADATA_VERSION = 2
+BM25_STRUCTURED_METADATA_VERSION = 3
 _FAST_QUERY_TOKEN_RE = re.compile(r"[0-9A-Za-z\uac00-\ud7a3]+", re.UNICODE)
 _FAST_QUERY_MAX_RAW_TOKENS = 64
 _FAST_QUERY_MAX_TOKEN_LENGTH = 64
@@ -472,13 +472,131 @@ def source_content_hashes(records: Iterable[dict[str, Any]]) -> str:
 
 def _weighted_term_frequencies(record: dict[str, Any], *, title_weight: int) -> Counter[str]:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    counter: Counter[str] = Counter(tokenize(str(record.get("text") or ""), dedupe=False))
+    canonical_hierarchy_path = _canonical_hierarchy_path(metadata)
+    raw_hierarchy_path = str(metadata.get("hierarchy_path") or "").strip()
+    canonicalized = bool(
+        metadata.get("canonical_hierarchy_path")
+        or metadata.get("chunker_version")
+        or canonical_hierarchy_path != raw_hierarchy_path
+    )
+    counter: Counter[str] = Counter(
+        tokenize(_canonical_record_text(record, canonical_hierarchy_path), dedupe=False)
+    )
     for field in ("regulation_title", "article_title"):
         for token in tokenize(str(metadata.get(field) or "")):
             counter[token] += max(1, int(title_weight))
     for field, weight in _STRUCTURED_METADATA_FIELD_WEIGHTS:
-        _add_weighted_tokens(counter, metadata.get(field), weight)
+        if field == "hierarchy_path":
+            value = canonical_hierarchy_path
+        elif canonicalized and field in {
+            "part_no",
+            "chapter_no",
+            "section_no",
+        }:
+            # These fields may describe a binder catalog wrapper. The
+            # regulation-local hierarchy already carries the true structure.
+            continue
+        else:
+            value = metadata.get(field)
+        _add_weighted_tokens(counter, value, weight)
     return counter
+
+
+def _canonical_record_text(
+    record: dict[str, Any],
+    canonical_hierarchy_path: str,
+) -> str:
+    text = str(record.get("text") or "")
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    regulation_title = str(
+        metadata.get("canonical_regulation_title")
+        or metadata.get("regulation_title")
+        or ""
+    ).strip()
+    if regulation_title:
+        text = re.sub(
+            r"(?m)^\[문서명\][ \t]*.*$",
+            f"[문서명] {regulation_title}",
+            text,
+            count=1,
+        )
+    if canonical_hierarchy_path:
+        text = re.sub(
+            r"(?m)^\[위치\][ \t]*.*$",
+            f"[위치] {canonical_hierarchy_path}",
+            text,
+            count=1,
+        )
+    return text
+
+
+def _canonical_hierarchy_path(metadata: dict[str, Any]) -> str:
+    explicit = str(metadata.get("canonical_hierarchy_path") or "").strip()
+    if explicit:
+        return explicit
+    raw_path = str(metadata.get("hierarchy_path") or "").strip()
+    segments = [segment.strip() for segment in raw_path.split(">") if segment.strip()]
+    title = str(metadata.get("regulation_title") or "").strip()
+    regulation_no = str(metadata.get("regulation_no") or "").strip()
+    title_key = _canonical_path_key(title)
+    number_key = _canonical_number_key(regulation_no)
+    # Prefer the regulation title. A short number (for example ``1``) can
+    # otherwise attach the canonical path to a binder's ``제1편``/``제1장``.
+    matched_index = next(
+        (
+            index
+            for index, segment in enumerate(segments)
+            if title_key and title_key in _canonical_path_key(segment)
+        ),
+        None,
+    )
+    if matched_index is None:
+        matched_index = next(
+            (
+                index
+                for index, segment in enumerate(segments)
+                if not _is_structural_path_segment(segment)
+                and number_key
+                and number_key in _canonical_number_key(segment)
+            ),
+            None,
+        )
+    if matched_index is not None:
+        tail = segments[matched_index + 1 :]
+    else:
+        structural_index = next(
+            (
+                index
+                for index, segment in enumerate(segments)
+                if re.match(
+                    r"^(?:제\s*\d+(?:의\s*\d+)?\s*(?:편|장|절|관|조|항)|부칙|별표|별지|서식)",
+                    segment,
+                )
+            ),
+            len(segments),
+        )
+        tail = segments[structural_index:]
+    canonical_segments = [title or regulation_no, *tail]
+    return " > ".join(segment for segment in canonical_segments if segment)
+
+
+def _canonical_path_key(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^0-9a-z가-힣]", "", normalized)
+
+
+def _canonical_number_key(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    normalized = re.sub(r"[‐-―−]", "-", normalized)
+    return re.sub(r"[^0-9a-z가-힣./-]", "", normalized)
+
+
+def _is_structural_path_segment(value: object) -> bool:
+    marker = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+    return bool(
+        re.match(r"^제?\d+(?:의\d+)?(?:편|장|절|관|조|항|호)", marker)
+        or re.match(r"^(?:부칙|별표|별지|서식)", marker)
+    )
 
 
 def _add_weighted_tokens(counter: Counter[str], value: Any, weight: int) -> None:

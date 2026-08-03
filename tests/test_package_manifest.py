@@ -26,6 +26,7 @@ class PackageManifestTests(unittest.TestCase):
         text = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
 
         self.assertIn("include docs/mcp_quickconnect_ko.md", text)
+        self.assertIn("include docs/operator_quickstart_ko.md", text)
         self.assertIn("include docs/harness_engineering_plan_ko.md", text)
         self.assertIn("include docs/hermes_engineering_plan_ko.md", text)
         self.assertIn("include docs/ui_ux_release_scope_ko.md", text)
@@ -37,6 +38,7 @@ class PackageManifestTests(unittest.TestCase):
         self.assertIn("include THIRD_PARTY_NOTICES.md", text)
         self.assertIn("include *.bat", text)
         self.assertIn("recursive-include tests *.py", text)
+        self.assertIn("include tests/fixtures/sample_regulation.md", text)
         self.assertIn("recursive-include scripts *.ps1", text)
         self.assertIn("recursive-include packaging *.py *.spec *.txt", text)
 

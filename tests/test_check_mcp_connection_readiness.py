@@ -108,10 +108,25 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
             check_data=False,
         )
 
-        self.assertTrue(local["passed"])
+        self.assertFalse(local["passed"])
+        self.assertEqual("chatgpt-desktop-local", local["client_profile"])
+        self.assertIn("chatgpt-local-unsupported", {item["code"] for item in local["findings"]})
         self.assertNotIn("remote-client-stdio", {item["code"] for item in local["findings"]})
         self.assertFalse(remote["passed"])
         self.assertIn("remote-client-stdio", {item["code"] for item in remote["findings"]})
+
+    def test_cli_accepts_legacy_chatgpt_local_profile_but_fails_closed(self) -> None:
+        stdout = io.StringIO()
+
+        exit_code = run(
+            ["--client-profile", "chatgpt-desktop-local", "--skip-data-check", "--json"],
+            stdout=stdout,
+        )
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(1, exit_code)
+        self.assertFalse(report["passed"])
+        self.assertIn("chatgpt-local-unsupported", {item["code"] for item in report["findings"]})
 
     def test_non_loopback_http_requires_token_env(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -551,7 +566,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
                             + '", "--data-dir", "'
                             + bundle_data_dir.as_posix()
                             + '", "--tenant-id", "default", "--transport", "stdio", '
-                            '"--flat-storage", "--tool-profile", "chatgpt-data", "--no-warm-cache"]'
+                            '"--flat-storage", "--tool-profile", "full", "--no-warm-cache"]'
                         ),
                     ]
                 ),
@@ -691,7 +706,7 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertEqual("invalid_contract", summary["status"])
         self.assertIn("entry is disabled", summary["contract_issues"])
         self.assertIn("--data-dir must occur exactly once", summary["contract_issues"])
-        self.assertIn("--tool-profile is minimal, expected chatgpt-data", summary["contract_issues"])
+        self.assertIn("--tool-profile is minimal, expected full", summary["contract_issues"])
 
     def test_generated_codex_config_matches_generated_direct_bundle_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -719,10 +734,10 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
 
         self.assertTrue(report["passed"], report["findings"])
         summary = report["installed_client_config_summary"]["clients"]["codex"]
-        self.assertEqual("chatgpt-data", summary["expected_tool_profile"])
+        self.assertEqual("full", summary["expected_tool_profile"])
         self.assertEqual("checked", summary["status"])
 
-    def test_bundle_dir_rejects_invalid_chatgpt_desktop_ui_fields(self) -> None:
+    def test_bundle_dir_rejects_runnable_chatgpt_desktop_legacy_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp) / "bundle"
             _write_minimal_bundle(bundle_dir)
@@ -751,6 +766,50 @@ class CheckMcpConnectionReadinessTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn(
             "bundle-chatgpt-desktop-local-config-invalid",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_bundle_dir_rejects_true_chatgpt_local_support_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            _write_minimal_bundle(bundle_dir)
+            artifact_path = bundle_dir / "chatgpt_desktop_local_mcp.json"
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            artifact["chatgpt_direct_local_mcp_supported"] = True
+            artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+            report = check_mcp_connection_readiness(
+                client_profile="bundle",
+                bundle_dir=bundle_dir,
+                check_data=False,
+                allow_local_only_bundle=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "bundle-chatgpt-desktop-local-config-invalid",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_bundle_dir_rejects_invalid_codex_contract_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            _write_minimal_bundle(bundle_dir)
+            (bundle_dir / "codex_config_snippet.toml").write_text(
+                '[mcp_servers.govreg-local]\ncommand = "powershell.exe"\nargs = ["--transport", "stdio"]\n',
+                encoding="utf-8",
+            )
+
+            report = check_mcp_connection_readiness(
+                client_profile="bundle",
+                bundle_dir=bundle_dir,
+                check_data=False,
+                allow_local_only_bundle=True,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "bundle-codex-config-invalid",
             {finding["code"] for finding in report["findings"]},
         )
 
@@ -1401,17 +1460,24 @@ def _write_minimal_bundle(bundle_dir: Path, *, chatgpt_ready: bool = True, claud
         if filename == "chatgpt_desktop_local_mcp.json":
             content = json.dumps(
                 {
+                    "profile": "chatgpt-desktop-local",
                     "server_name": "govreg-local",
-                    "ui_fields": {
-                        "name": "govreg-local",
-                        "transport": "stdio",
-                        "command": "powershell.exe",
-                        "args": ["-NoProfile"],
-                        "cwd": str(bundle_dir),
-                        "env": {},
-                        "env_passthrough": [],
-                    },
+                    "support_status": "unsupported",
+                    "direct_local_supported": False,
+                    "chatgpt_direct_local_mcp_supported": False,
                 }
+            )
+        if filename == "codex_config_snippet.toml":
+            content = "\n".join(
+                [
+                    "[mcp_servers.govreg-local]",
+                    'command = "powershell.exe"',
+                    (
+                        'args = ["--data-dir", "data", "--tenant-id", "default", '
+                        '"--transport", "stdio", "--flat-storage", "--tool-profile", '
+                        '"full", "--no-warm-cache"]'
+                    ),
+                ]
             )
         if filename == "connect_mcp_client.ps1":
             content = 'powershell -File "install_local_package.ps1"'

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from app.agents.review_executor import AgentReviewExecutor
 from app.agents.review_policy import AgentReviewPolicy
 from app.core.config import Settings
 from app.schemas.chunk import Chunk, ChunkOptions
@@ -71,17 +72,36 @@ class AgentReviewPolicyTests(unittest.TestCase):
         self.assertEqual(plan["status"], "skipped")
         self.assertEqual(plan["skip_reason"], "quality_gate_clean")
 
-    def test_request_option_cannot_disable_main_review_draft(self) -> None:
-        policy = AgentReviewPolicy(Settings(data_dir=Path("data"), enable_agent_review=True, openai_api_key=""))
+    def test_request_option_disables_provider_execution_even_when_api_is_ready(self) -> None:
+        calls: list[tuple] = []
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_agent_review=True,
+            openai_api_key="configured",
+        )
+        policy = AgentReviewPolicy(settings)
 
         plan = policy.plan([review_chunk(table_like=True)], quality_report(warnings=1), ChunkOptions(enable_agent_review=False))
+        result = AgentReviewExecutor(
+            settings,
+            http_post=lambda *args: calls.append(args) or {},
+        ).execute(
+            document_id="doc_review",
+            run_id="run_review",
+            plan=plan,
+            chunks=[review_chunk(table_like=True)],
+        )
 
-        self.assertTrue(plan["enabled"])
+        self.assertFalse(plan["enabled"])
         self.assertTrue(plan["settings_enabled"])
-        self.assertTrue(plan["request_enabled"])
-        self.assertEqual(plan["status"], "api_configuration_needed")
-        self.assertEqual(plan["skip_reason"], "openai_api_key_missing")
-        self.assertEqual(plan["selected_count"], 1)
+        self.assertFalse(plan["request_enabled"])
+        self.assertTrue(plan["provider_execution_ready"])
+        self.assertFalse(plan["provider_execution_enabled"])
+        self.assertEqual(plan["status"], "skipped")
+        self.assertEqual(plan["skip_reason"], "agent_review_not_requested")
+        self.assertEqual(plan["selected_count"], 0)
+        self.assertEqual(result, plan)
+        self.assertEqual(calls, [])
 
     def test_disabled_api_keeps_draft_without_provider_execution(self) -> None:
         policy = AgentReviewPolicy(

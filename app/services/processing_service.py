@@ -99,27 +99,64 @@ class ProcessingService:
             progress=5,
             message="Processing started",
         )
-        self.repository.upsert_job(job)
-        self._notify_progress(job, progress_callback)
-        reusable_run = self.repository.latest_completed_run(
-            document_id,
-            options=processing_options_payload(
-                options,
-                settings=self.settings,
-                quality_profiles_sha256=self.quality_profiles_sha256,
-            ),
-            require_outputs=True,
+        processing_options = processing_options_payload(
+            options,
+            settings=self.settings,
+            quality_profiles_sha256=self.quality_profiles_sha256,
         )
-        if reusable_run is not None:
-            job.status = "completed"
-            job.progress = 100
-            job.message = "Processing skipped; reusable completed run exists"
-            job.completed_at = datetime.now(timezone.utc)
+        document_runs = self.repository.list_runs(document_id)
+        previous_owner_run_id = (
+            document_runs[-1].run_id
+            if document_runs and document_runs[-1].status == "completed"
+            else None
+        )
+        claim = self.repository.begin_processing_claim(
+            document_id=document_id,
+            run_id=run_id,
+            job_id=job.job_id,
+            previous_owner_run_id=previous_owner_run_id,
+        )
+        if not claim.acquired:
+            active_job = (
+                self.repository.get_job(claim.job_id) if claim.job_id else None
+            )
+            if active_job is None:
+                active_job = ProcessingJob(
+                    job_id=claim.job_id or f"active_{document_id}",
+                    document_id=document_id,
+                    tenant_id=document.tenant_id,
+                    status="processing",
+                    progress=5,
+                    message="Processing is already active for this document",
+                )
+            self._notify_progress(active_job, progress_callback)
+            return active_job
+
+        terminal_outcome_committed = False
+        try:
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
-            return job
+            reusable_run = self.repository.latest_completed_run(
+                document_id,
+                options=processing_options,
+                require_outputs=True,
+                processing_claim_id=run_id,
+            )
+            if reusable_run is not None:
+                job.status = "completed"
+                job.progress = 100
+                job.message = "Processing skipped; reusable completed run exists"
+                job.completed_at = datetime.now(timezone.utc)
+                self.repository.upsert_job(job)
+                self.repository.finish_processing_claim(
+                    document_id=document_id,
+                    run_id=run_id,
+                    owner_run_id=reusable_run.run_id,
+                )
+                terminal_outcome_committed = True
+                self._notify_progress(job, progress_callback)
+                return job
 
-        try:
             path = self.documents.path_for(document)
             job.progress = 15
             job.message = "원본 파일에서 텍스트를 추출하는 중"
@@ -143,19 +180,25 @@ class ProcessingService:
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
             phase_started = time.perf_counter()
+            # Both filename-only and content-aware inference must see the same
+            # repository state.  A single snapshot avoids a second manifest,
+            # legacy-store, and progress-sidecar scan for every document while
+            # also making the paired metadata decisions deterministic.
+            existing_documents = self.repository.list_documents()
             filename_detected = infer_regulation_metadata(
                 document.filename,
-                existing_documents=self.repository.list_documents(),
+                existing_documents=existing_documents,
                 profile_id=document.profile_id,
                 tenant_id=document.tenant_id,
             )
             detected = infer_regulation_metadata(
                 document.filename,
                 text=parsed.raw_text,
-                existing_documents=self.repository.list_documents(),
+                existing_documents=existing_documents,
                 profile_id=document.profile_id,
                 tenant_id=document.tenant_id,
             )
+            del existing_documents
             old_regulation_id = document.regulation_id
             old_regulation_version = document.regulation_version
             auto_named_upload = (
@@ -303,17 +346,26 @@ class ProcessingService:
             self._notify_progress(job, progress_callback)
 
             phase_started = time.perf_counter()
+            cached_content_hashes = (
+                self._agent_review_content_hash_cache(
+                    document.tenant_id,
+                    cache_scope_hash=self.agent_review_policy.cache_scope_hash(),
+                )
+                if options.enable_agent_review
+                else set()
+            )
             agent_review_plan = self.agent_review_policy.plan(
                 chunks,
                 quality_report,
                 options,
-                cached_content_hashes=self._agent_review_content_hash_cache(
-                    document.tenant_id,
-                    cache_scope_hash=self.agent_review_policy.cache_scope_hash(),
-                ),
+                cached_content_hashes=cached_content_hashes,
             )
             job.progress = 85
-            job.message = "전체 규정 AI 검수 초안을 준비하는 중"
+            job.message = (
+                "전체 규정 AI 검수 초안을 준비하는 중"
+                if agent_review_plan.get("request_enabled")
+                else "전처리 결과 검증을 마무리하는 중"
+            )
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
             agent_review_plan = self.agent_review_executor.execute(
@@ -348,6 +400,7 @@ class ProcessingService:
                 nodes,
                 chunks,
                 issues,
+                processing_claim_id=run_id,
                 progress_callback=_storage_progress,
             )
             job.progress = 96
@@ -357,7 +410,11 @@ class ProcessingService:
             job.message = "품질 보고서 저장 1/1"
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
-            self.repository.save_quality_report(document_id, quality_report)
+            self.repository.save_quality_report(
+                document_id,
+                quality_report,
+                processing_claim_id=run_id,
+            )
             record_phase("processing_result_storage", phase_started)
 
             def _export_progress(
@@ -418,11 +475,7 @@ class ProcessingService:
                 started_at=started_at,
                 completed_at=job.completed_at,
                 elapsed_seconds=round(time.perf_counter() - started_perf, 3),
-                options=processing_options_payload(
-                    options,
-                    settings=self.settings,
-                    quality_profiles_sha256=self.quality_profiles_sha256,
-                ),
+                options=processing_options,
                 stats=self._run_stats(
                     quality_report,
                     agent_review_plan,
@@ -430,10 +483,18 @@ class ProcessingService:
                 ),
                 artifacts=artifacts,
             )
-            self.repository.commit_processing_outcome(document=document, job=job, run=run)
+            self.repository.commit_processing_outcome(
+                document=document,
+                job=job,
+                run=run,
+                processing_claim_id=run_id,
+            )
+            terminal_outcome_committed = True
             self._notify_progress(job, progress_callback)
             return job
         except Exception as exc:
+            if terminal_outcome_committed:
+                raise
             phase_timings_ms["total_before_terminal_commit"] = round(
                 (time.perf_counter() - started_perf) * 1000,
                 3,
@@ -457,11 +518,7 @@ class ProcessingService:
                 started_at=started_at,
                 completed_at=job.completed_at,
                 elapsed_seconds=round(time.perf_counter() - started_perf, 3),
-                options=processing_options_payload(
-                    options,
-                    settings=self.settings,
-                    quality_profiles_sha256=self.quality_profiles_sha256,
-                ),
+                options=processing_options,
                 stats={
                     "failure": failure.as_row_fields(),
                     "phase_timings_ms": phase_timings_ms,
@@ -473,6 +530,7 @@ class ProcessingService:
                     document=document,
                     job=job,
                     run=run,
+                    processing_claim_id=run_id,
                 )
             except Exception as terminal_commit_error:
                 if hasattr(exc, "add_note"):
@@ -480,6 +538,21 @@ class ProcessingService:
                         "Failed to persist the terminal failure outcome: "
                         f"{terminal_commit_error}"
                     )
+                try:
+                    # If the terminal manifest/journal commit rolled back, do
+                    # not leave a same-process claim looking permanently live.
+                    # Invalid ownership is conservative and permits a retry.
+                    self.repository.finish_processing_claim(
+                        document_id=document_id,
+                        run_id=run_id,
+                        owner_run_id=None,
+                    )
+                except Exception as claim_cleanup_error:
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            "Failed to invalidate the processing output claim: "
+                            f"{claim_cleanup_error}"
+                        )
                 raise exc from terminal_commit_error
             self._notify_progress(job, progress_callback)
             raise

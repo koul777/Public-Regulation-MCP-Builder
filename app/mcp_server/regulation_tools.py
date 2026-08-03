@@ -107,6 +107,25 @@ _HIERARCHICAL_INDEX_VERIFICATION_CACHE: dict[
     Path,
     tuple[Any, str, str, str, bool],
 ] = {}
+_AUTOMATIC_HIERARCHY_UNAVAILABLE_MESSAGE = (
+    "The MCP runtime hierarchy is unavailable or failed integrity verification. "
+    "The Builder creates this read-only hierarchy automatically during MCP creation or update."
+)
+_CONNECTOR_HIERARCHY_REQUIRED_MESSAGE = (
+    "The chatgpt-data connector requires a verified MCP runtime hierarchy, "
+    "but the hierarchy is unavailable, degraded, or changed during the request. "
+    "No flat RAG fallback was used."
+)
+_OFFICIAL_RUNTIME_HIERARCHY_REQUIRED_MESSAGE = (
+    "The official MCP runtime requires its generated hierarchy, but the hierarchy "
+    "is unavailable, degraded, or changed during the request. No flat RAG fallback "
+    "was used; fallback remains available only for legacy or development runtimes "
+    "without generated runtime artifacts."
+)
+_HIERARCHICAL_READ_CHANGED_MESSAGE = (
+    "The hierarchical regulation index or authorization source changed "
+    "during the request."
+)
 
 
 def _json_repository(settings: Settings) -> Any:
@@ -170,6 +189,74 @@ class _VerifiedHierarchicalRuntimeToken:
 
 
 @dataclass(frozen=True)
+class _RevalidatingHierarchicalRuntimeToken:
+    """Fallback token that repeats full hierarchy verification postflight.
+
+    Normal runtimes always obtain the manifest-bound token above. This token
+    preserves older injected/test callers that provide verified paths without
+    exposing the warm token, while still failing closed by running the complete
+    path verifier again before any materialized response can be returned.
+    """
+
+    settings: Settings
+    auth: AuthContext
+    profile_id: str | None
+    manifest_path: Path
+    index_path: Path
+    vector_path: Path
+    manifest_identity: Any
+    index_identity: Any
+    vector_identity: Any
+
+    def is_current(self) -> bool:
+        try:
+            captured_identities = (
+                self.manifest_identity,
+                self.index_identity,
+                self.vector_identity,
+            )
+            if (
+                routes_rag.path_signature(self.manifest_path),
+                routes_rag.path_signature(self.index_path),
+                routes_rag.path_signature(self.vector_path),
+            ) != captured_identities:
+                return False
+            verified_paths = _verified_hierarchical_runtime_paths(
+                settings=self.settings,
+                auth=self.auth,
+                profile_id=self.profile_id,
+            )
+            return bool(
+                verified_paths == (self.index_path, self.vector_path)
+                and (
+                    routes_rag.path_signature(self.manifest_path),
+                    routes_rag.path_signature(self.index_path),
+                    routes_rag.path_signature(self.vector_path),
+                )
+                == captured_identities
+            )
+        except (OSError, ValueError):
+            return False
+
+    def matches_scope(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: str | None,
+    ) -> bool:
+        requested_profile = str(profile_id or "").strip().casefold()
+        return bool(
+            str(tenant_id or "").strip()
+            == str(self.auth.tenant_id or "").strip()
+            and (
+                not requested_profile
+                or requested_profile
+                == str(self.profile_id or "").strip().casefold()
+            )
+        )
+
+
+@dataclass(frozen=True)
 class _VerifiedHierarchicalReadContext:
     """One request's verified runtime identities and final TOCTOU check.
 
@@ -181,7 +268,10 @@ class _VerifiedHierarchicalReadContext:
     settings: Settings
     auth: AuthContext
     profile_id: str | None
-    runtime_token: _VerifiedHierarchicalRuntimeToken
+    runtime_token: (
+        _VerifiedHierarchicalRuntimeToken
+        | _RevalidatingHierarchicalRuntimeToken
+    )
     authorization_identity: tuple[Any, ...]
     authorization_document_ids: tuple[str, ...] | None
     repository_paths: RepositoryPathDescriptor | None = None
@@ -561,6 +651,10 @@ def search_regulations(
 ) -> dict[str, Any]:
     try:
         normalized_metadata_profile = _normalize_mcp_metadata_profile(metadata_profile)
+        hierarchy_required = _mcp_search_requires_verified_hierarchy(
+            settings=settings,
+            metadata_profile=normalized_metadata_profile,
+        )
         normalized_as_of_date = _normalize_optional_as_of_date(as_of_date)
         requested_profile_id = profile_id
         profile_id, runtime_token = (
@@ -592,6 +686,14 @@ def search_regulations(
             else None
         )
         if hierarchical is None:
+            if hierarchy_required:
+                raise ValueError(
+                    _CONNECTOR_HIERARCHY_REQUIRED_MESSAGE
+                    if _is_external_metadata_profile(
+                        normalized_metadata_profile
+                    )
+                    else _OFFICIAL_RUNTIME_HIERARCHY_REQUIRED_MESSAGE
+                )
             fallback_profile_id = _resolve_mcp_flat_fallback_profile_scope(
                 settings=settings,
                 auth=auth,
@@ -1188,7 +1290,11 @@ def _verified_hierarchical_read_context(
     settings: Settings,
     auth: AuthContext,
     profile_id: str | None,
-    runtime_token: _VerifiedHierarchicalRuntimeToken | None = None,
+    runtime_token: (
+        _VerifiedHierarchicalRuntimeToken
+        | _RevalidatingHierarchicalRuntimeToken
+        | None
+    ) = None,
     repository_paths: RepositoryPathDescriptor | None = None,
     repository: Any | None = None,
     authorization_document_ids: tuple[str, ...] | None = None,
@@ -1238,6 +1344,72 @@ def _verified_hierarchical_read_context(
         bm25_path=bm25_path,
         bm25_identity=bm25_identity,
     )
+
+
+def _verified_hierarchical_catalog_read_context(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    profile_id: str | None,
+) -> _VerifiedHierarchicalReadContext | None:
+    """Capture one hierarchy-only catalog request's fail-closed identities."""
+
+    paths = _verified_hierarchical_runtime_paths(
+        settings=settings,
+        auth=auth,
+        profile_id=profile_id,
+    )
+    if paths is None:
+        return None
+    runtime_token = _verified_hierarchical_runtime_token(paths)
+    required_token_attributes = (
+        "index_path",
+        "vector_path",
+        "index_identity",
+        "vector_identity",
+        "is_current",
+    )
+    if runtime_token is None or any(
+        not hasattr(runtime_token, attribute)
+        for attribute in required_token_attributes
+    ):
+        manifest_path = Path(settings.data_dir) / "mcp_runtime_manifest.json"
+        runtime_token = _RevalidatingHierarchicalRuntimeToken(
+            settings=settings,
+            auth=auth,
+            profile_id=profile_id,
+            manifest_path=manifest_path,
+            index_path=paths[0],
+            vector_path=paths[1],
+            manifest_identity=routes_rag.path_signature(manifest_path),
+            index_identity=routes_rag.path_signature(paths[0]),
+            vector_identity=routes_rag.path_signature(paths[1]),
+        )
+        if not runtime_token.is_current():
+            raise ValueError(_HIERARCHICAL_READ_CHANGED_MESSAGE)
+    repository_paths = repository_path_descriptor(settings)
+    read_context = _verified_hierarchical_read_context(
+        settings=settings,
+        auth=auth,
+        profile_id=profile_id,
+        runtime_token=runtime_token,
+        repository_paths=repository_paths,
+        include_bm25=False,
+    )
+    if read_context is None:
+        raise ValueError(
+            "The hierarchical regulation authorization source is not available."
+        )
+    return read_context
+
+
+def _require_hierarchical_read_context_current(
+    read_context: _VerifiedHierarchicalReadContext,
+) -> None:
+    """Reject materialized hierarchy output when any preflight identity drifted."""
+
+    if not read_context.postflight_is_current():
+        raise ValueError(_HIERARCHICAL_READ_CHANGED_MESSAGE)
 
 
 def _hierarchical_authorization_source_identity(
@@ -1982,6 +2154,7 @@ def list_regulations(
     page: int = 1,
     page_size: int = 50,
     limit: int | None = None,
+    require_hierarchy: bool = False,
 ) -> dict[str, Any]:
     """List unique approved regulations from the generated catalog."""
     normalized_page = max(1, int(page))
@@ -1994,12 +2167,22 @@ def list_regulations(
         profile_id=profile_id,
         inspect_vector_records=False,
     )
-    paths = _verified_hierarchical_runtime_paths(
+    read_context = _verified_hierarchical_catalog_read_context(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
     )
-    if paths is None:
+    if read_context is None:
+        hierarchy_required = require_hierarchy or _mcp_search_requires_verified_hierarchy(
+            settings=settings,
+            metadata_profile="full",
+        )
+        if hierarchy_required:
+            raise ValueError(
+                _CONNECTOR_HIERARCHY_REQUIRED_MESSAGE
+                if require_hierarchy
+                else _OFFICIAL_RUNTIME_HIERARCHY_REQUIRED_MESSAGE
+            )
         return {
             "regulations": [],
             "total_count": 0,
@@ -2008,14 +2191,24 @@ def list_regulations(
             "next_cursor": None,
             "metadata": {
                 "hierarchical_index_ready": False,
-                "message": "Regenerate the institution MCP bundle to create the regulation catalog.",
+                "message": _AUTOMATIC_HIERARCHY_UNAVAILABLE_MESSAGE,
             },
         }
+    paths = read_context.hierarchy_paths
     allowed_unit_ids = _fully_visible_regulation_units(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
         index_path=paths[0],
+        prevalidated_index_signature=(
+            read_context.runtime_token.index_identity
+            if read_context.prevalidated_sidecar_identity is not None
+            else None
+        ),
+        prevalidated_source_identity=(
+            read_context.prevalidated_sidecar_identity
+        ),
+        repository_paths=read_context.repository_paths,
     )
     indexed_rows, total_count = page_indexed_regulations(
         paths[0],
@@ -2057,6 +2250,7 @@ def list_regulations(
         )
     start = (normalized_page - 1) * normalized_page_size
     next_cursor = str(normalized_page + 1) if start + len(regulations) < total_count else None
+    _require_hierarchical_read_context_current(read_context)
     audit_api_event(
         settings,
         auth,
@@ -2122,18 +2316,28 @@ def get_regulation_toc(
         inspect_vector_records=False,
     )
     normalized_as_of = _normalize_optional_as_of_date(as_of_date)
-    paths = _verified_hierarchical_runtime_paths(
+    read_context = _verified_hierarchical_catalog_read_context(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
     )
-    if paths is None:
-        raise ValueError("The hierarchical regulation index is not available. Regenerate the MCP bundle.")
+    if read_context is None:
+        raise ValueError(_AUTOMATIC_HIERARCHY_UNAVAILABLE_MESSAGE)
+    paths = read_context.hierarchy_paths
     allowed_unit_ids = _fully_visible_regulation_units(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
         index_path=paths[0],
+        prevalidated_index_signature=(
+            read_context.runtime_token.index_identity
+            if read_context.prevalidated_sidecar_identity is not None
+            else None
+        ),
+        prevalidated_source_identity=(
+            read_context.prevalidated_sidecar_identity
+        ),
+        repository_paths=read_context.repository_paths,
     )
     if requested_unit_id not in allowed_unit_ids:
         raise ValueError("The requested regulation is not available in the caller's security scope.")
@@ -2185,6 +2389,7 @@ def get_regulation_toc(
         for node in (result.get("nodes") or [])
         if isinstance(node, dict)
     ]
+    _require_hierarchical_read_context_current(read_context)
     audit_api_event(
         settings,
         auth,
@@ -2229,18 +2434,28 @@ def get_regulation_references(
         profile_id=profile_id,
         inspect_vector_records=False,
     )
-    paths = _verified_hierarchical_runtime_paths(
+    read_context = _verified_hierarchical_catalog_read_context(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
     )
-    if paths is None:
-        raise ValueError("The hierarchical regulation index is not available. Regenerate the MCP bundle.")
+    if read_context is None:
+        raise ValueError(_AUTOMATIC_HIERARCHY_UNAVAILABLE_MESSAGE)
+    paths = read_context.hierarchy_paths
     allowed_unit_ids = _fully_visible_regulation_units(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
         index_path=paths[0],
+        prevalidated_index_signature=(
+            read_context.runtime_token.index_identity
+            if read_context.prevalidated_sidecar_identity is not None
+            else None
+        ),
+        prevalidated_source_identity=(
+            read_context.prevalidated_sidecar_identity
+        ),
+        repository_paths=read_context.repository_paths,
     )
     if requested_unit_id not in allowed_unit_ids:
         raise ValueError("The requested regulation is not available in the caller's security scope.")
@@ -2278,6 +2493,7 @@ def get_regulation_references(
         if normalized_page * normalized_page_size < total_count
         else None
     )
+    _require_hierarchical_read_context_current(read_context)
     audit_api_event(
         settings,
         auth,
@@ -2317,6 +2533,7 @@ def list_regulation_reference_cycles(
     regulation_unit_id: str | None = None,
     page: int = 1,
     page_size: int = 50,
+    require_hierarchy: bool = False,
 ) -> dict[str, Any]:
     """List circular references in the approved current regulation graph."""
 
@@ -2335,14 +2552,24 @@ def list_regulation_reference_cycles(
         profile_id=profile_id,
         inspect_vector_records=False,
     )
-    paths = _verified_hierarchical_runtime_paths(
+    read_context = _verified_hierarchical_catalog_read_context(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
     )
     normalized_page = max(1, int(page))
     normalized_page_size = max(1, min(int(page_size), 100))
-    if paths is None:
+    if read_context is None:
+        hierarchy_required = require_hierarchy or _mcp_search_requires_verified_hierarchy(
+            settings=settings,
+            metadata_profile="full",
+        )
+        if hierarchy_required:
+            raise ValueError(
+                _CONNECTOR_HIERARCHY_REQUIRED_MESSAGE
+                if require_hierarchy
+                else _OFFICIAL_RUNTIME_HIERARCHY_REQUIRED_MESSAGE
+            )
         return {
             "cycles": [],
             "total_count": 0,
@@ -2351,14 +2578,24 @@ def list_regulation_reference_cycles(
             "next_cursor": None,
             "metadata": {
                 "hierarchical_index_ready": False,
-                "message": "Regenerate the institution MCP bundle to create the regulation reference graph.",
+                "message": _AUTOMATIC_HIERARCHY_UNAVAILABLE_MESSAGE,
             },
         }
+    paths = read_context.hierarchy_paths
     allowed_unit_ids = _fully_visible_regulation_units(
         settings=settings,
         auth=auth,
         profile_id=resolved_profile,
         index_path=paths[0],
+        prevalidated_index_signature=(
+            read_context.runtime_token.index_identity
+            if read_context.prevalidated_sidecar_identity is not None
+            else None
+        ),
+        prevalidated_source_identity=(
+            read_context.prevalidated_sidecar_identity
+        ),
+        repository_paths=read_context.repository_paths,
     )
     cycles, total_count = page_reference_cycles(
         paths[0],
@@ -2378,6 +2615,7 @@ def list_regulation_reference_cycles(
         if normalized_page * normalized_page_size < total_count
         else None
     )
+    _require_hierarchical_read_context_current(read_context)
     audit_api_event(
         settings,
         auth,
@@ -2551,7 +2789,7 @@ def get_regulation_article(
         profile_id=resolved_profile,
     )
     if paths is None:
-        raise ValueError("The hierarchical regulation index is not available. Regenerate the MCP bundle.")
+        raise ValueError(_AUTOMATIC_HIERARCHY_UNAVAILABLE_MESSAGE)
     verified_runtime_token = _verified_hierarchical_runtime_token(paths)
     if verified_runtime_token is None:
         raise ValueError(
@@ -5131,6 +5369,38 @@ def _citation_metadata(
             }
         )
     return _metadata_for_profile(metadata, metadata_profile)
+
+
+def _mcp_search_requires_verified_hierarchy(
+    *,
+    settings: Settings,
+    metadata_profile: str,
+) -> bool:
+    """Keep connector and generated runtimes from silently using flat RAG."""
+
+    if _is_external_metadata_profile(metadata_profile):
+        return True
+    data_dir = Path(settings.data_dir)
+    hierarchy_path = hierarchical_index_path(data_dir)
+    if os.path.lexists(os.fspath(hierarchy_path)):
+        return True
+    manifest_path = data_dir / "mcp_runtime_manifest.json"
+    if not os.path.lexists(os.fspath(manifest_path)):
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(manifest, dict):
+        return True
+    files = manifest.get("files")
+    return bool(
+        "hierarchical_index_status" in manifest
+        or (
+            isinstance(files, dict)
+            and "hierarchical_index_sha256" in files
+        )
+    )
 
 
 def _is_external_metadata_profile(metadata_profile: str) -> bool:

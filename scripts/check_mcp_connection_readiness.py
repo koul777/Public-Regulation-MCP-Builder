@@ -106,6 +106,15 @@ def check_mcp_connection_readiness(
         raise ValueError("transport must be stdio or streamable-http.")
 
     findings: list[McpConnectionFinding] = []
+    if requested_profile == "chatgpt-desktop-local":
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "chatgpt-local-unsupported",
+                "ChatGPT does not directly connect to a local stdio MCP server; this profile is retained only as a legacy input alias.",
+                "Use ChatGPT web with an approved reachable HTTPS MCP app, or use Codex/Claude for supported local stdio MCP.",
+            )
+        )
     visibility_integrity_requested = bool(
         require_indexed or forbid_smoke_docs or min_visible_records != 1
     )
@@ -946,7 +955,7 @@ def _check_bundle_dir(
                 )
             )
 
-    scanned_suffixes = {".ps1", ".md", ".json"}
+    scanned_suffixes = {".ps1", ".md", ".json", ".toml"}
     for path in sorted(bundle_dir.iterdir()):
         if not path.is_file() or path.suffix.lower() not in scanned_suffixes:
             continue
@@ -974,6 +983,8 @@ def _check_bundle_dir(
                 )
         if path.suffix.lower() == ".json":
             _check_bundle_json_file(path, findings)
+        elif path.name == "codex_config_snippet.toml":
+            _check_bundle_codex_config_file(path, findings)
 
     connect_path = bundle_dir / "connect_mcp_client.ps1"
     if connect_path.is_file():
@@ -1322,13 +1333,14 @@ def _expected_bundle_tool_profile(
 
     args: list[str] | None = None
     if client_key == "codex":
-        path = bundle_dir / "chatgpt_desktop_local_mcp.json"
+        path = bundle_dir / "codex_config_snippet.toml"
         try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             payload = {}
-        ui_fields = payload.get("ui_fields") if isinstance(payload, dict) else None
-        raw_args = ui_fields.get("args") if isinstance(ui_fields, dict) else None
+        servers = payload.get("mcp_servers") if isinstance(payload, dict) else None
+        server = servers.get(server_name) if isinstance(servers, dict) else None
+        raw_args = server.get("args") if isinstance(server, dict) else None
         if isinstance(raw_args, list) and all(isinstance(value, str) for value in raw_args):
             args = list(raw_args)
     else:
@@ -1346,7 +1358,7 @@ def _expected_bundle_tool_profile(
         configured = _arg_value(args, "--tool-profile")
         if configured:
             return configured
-    return "chatgpt-data" if client_key == "codex" else "full"
+    return "full"
 
 
 def _check_installed_stdio_launcher(
@@ -1507,28 +1519,80 @@ def _check_bundle_json_file(path: Path, findings: list[McpConnectionFinding]) ->
         _check_chatgpt_desktop_local_payload(payload, path.name, findings)
 
 
+def _check_bundle_codex_config_file(
+    path: Path,
+    findings: list[McpConnectionFinding],
+) -> None:
+    try:
+        payload = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        findings.append(
+            McpConnectionFinding(
+                "high",
+                "bundle-codex-config-invalid",
+                f"Generated bundle file {path.name} is not valid TOML: {exc}",
+                "Regenerate the setup bundle and merge the generated Codex server block without hand-editing it.",
+            )
+        )
+        return
+
+    servers = payload.get("mcp_servers") if isinstance(payload, dict) else None
+    valid = isinstance(servers, dict) and bool(servers)
+    if valid:
+        for server in servers.values():
+            if not isinstance(server, dict):
+                valid = False
+                break
+            command = server.get("command")
+            args = server.get("args")
+            if not isinstance(command, str) or not command.strip():
+                valid = False
+                break
+            if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
+                valid = False
+                break
+            if _arg_values(args, "--transport") != ["stdio"]:
+                valid = False
+                break
+            tool_profiles = _arg_values(args, "--tool-profile")
+            if len(tool_profiles) != 1 or not tool_profiles[0]:
+                valid = False
+                break
+    if valid:
+        return
+    findings.append(
+        McpConnectionFinding(
+            "high",
+            "bundle-codex-config-invalid",
+            f"{path.name} must contain at least one local stdio mcp_servers entry with command, ordered args, and one --tool-profile value.",
+            "Regenerate the setup bundle and use codex_config_snippet.toml as the Codex local contract.",
+        )
+    )
+
+
 def _check_chatgpt_desktop_local_payload(
     payload: object,
     filename: str,
     findings: list[McpConnectionFinding],
 ) -> None:
-    ui_fields = payload.get("ui_fields") if isinstance(payload, dict) else None
-    required_string_fields = ("name", "transport", "command", "cwd")
-    valid = isinstance(ui_fields, dict)
+    valid = isinstance(payload, dict)
     if valid:
-        valid = all(
-            isinstance(ui_fields.get(field), str) and bool(ui_fields[field].strip())
-            for field in required_string_fields
-        )
+        valid = payload.get("support_status") == "unsupported"
     if valid:
-        args = ui_fields.get("args")
-        valid = isinstance(args, list) and bool(args) and all(
-            isinstance(value, str) for value in args
-        )
+        valid = payload.get("direct_local_supported") is False
     if valid:
-        valid = str(ui_fields.get("transport")).strip().lower() == "stdio"
-    if valid and isinstance(payload, dict) and payload.get("server_name") is not None:
-        valid = str(payload.get("server_name")) == str(ui_fields.get("name"))
+        equivalent_flags = [
+            key
+            for key in payload
+            if isinstance(key, str)
+            and key != "direct_local_supported"
+            and key.endswith("_supported")
+            and ("local" in key or "stdio" in key)
+        ]
+        valid = all(payload.get(key) is False for key in equivalent_flags)
+    if valid:
+        runnable_fields = ("mcpServers", "ui_fields", "command", "args", "cwd", "env")
+        valid = all(field not in payload for field in runnable_fields)
     if valid:
         return
     findings.append(
@@ -1536,10 +1600,10 @@ def _check_chatgpt_desktop_local_payload(
             "high",
             "bundle-chatgpt-desktop-local-config-invalid",
             (
-                f"{filename} must contain valid ui_fields with matching name, "
-                "transport=stdio, command, ordered args, and cwd."
+                f"{filename} must be a warning-only compatibility artifact with "
+                "support_status=unsupported, false local-support flags, and no runnable MCP fields."
             ),
-            "Regenerate the direct MCP bundle and copy the displayed ui_fields without omitting arguments.",
+            "Regenerate the bundle so this legacy artifact is warning-only: support_status=unsupported, false local-support flags, and no runnable fields.",
         )
     )
 

@@ -77,42 +77,32 @@ class McpDirectBundleStandardTests(unittest.TestCase):
             }.issubset(generated_names)
         )
         self.assertNotIn("plugin", json.dumps(desktop, ensure_ascii=False).casefold())
-        self.assertTrue(
-            {
-                "name",
-                "transport",
-                "command",
-                "args",
-                "cwd",
-                "env",
-                "env_passthrough",
-            }.issubset(
-                desktop["ui_fields"]
-            )
-        )
-        self.assertEqual("stdio", desktop["ui_fields"]["transport"])
-        self.assertTrue(desktop["ui_fields"]["command"])
-        self.assertTrue(desktop["ui_fields"]["args"])
-        self.assertTrue(desktop["ui_fields"]["cwd"])
+        self.assertEqual("unsupported", desktop["support_status"])
+        self.assertFalse(desktop["direct_local_supported"])
+        self.assertFalse(desktop["chatgpt_direct_local_mcp_supported"])
+        self.assertIn("does not directly connect to a local MCP server", desktop["warning"])
+        self.assertIn("12584461", desktop["official_help_url"])
+        self.assertIn("secure-mcp-tunnels", desktop["secure_mcp_tunnel_url"])
+        for runnable_key in ("mcpServers", "ui_fields", "command", "args", "cwd", "env"):
+            self.assertNotIn(runnable_key, desktop)
         codex_server = codex["mcp_servers"]["direct-standard"]
+        self.assertEqual("powershell.exe", codex_server["command"])
+        self.assertIn("--tool-profile", codex_server["args"])
         self.assertEqual(
-            desktop["ui_fields"]["command"],
-            codex_server["command"],
+            "full",
+            codex_server["args"][codex_server["args"].index("--tool-profile") + 1],
         )
-        self.assertEqual(
-            desktop["ui_fields"]["args"],
-            codex_server["args"],
-        )
-        self.assertEqual(
-            desktop["ui_fields"]["cwd"],
-            codex_server["cwd"],
-        )
+        connection_clients = {item["client"] for item in manifest["connections"]}
         self.assertIn(
-            "ChatGPT Desktop / Codex CLI / Codex IDE",
-            {item["client"] for item in manifest["connections"]},
+            "Codex CLI / Codex IDE",
+            connection_clients,
         )
+        self.assertIn("ChatGPT web · remote HTTPS MCP", connection_clients)
+        self.assertNotIn("ChatGPT Desktop / Codex CLI / Codex IDE", connection_clients)
         self.assertNotIn("plugin list", connect_script.casefold())
-        self.assertNotIn("secure mcp tunnel", connect_script.casefold())
+        self.assertIn("secure mcp tunnel", connect_script.casefold())
+        self.assertNotIn("ChatGPT Desktop", connect_script)
+        self.assertIn('"chatgpt-desktop-local" { Show-UnsupportedChatGptLocal }', connect_script)
         self.assertNotIn("settings > plugins", connect_script.casefold())
 
     def test_handoff_zip_excludes_bat_prompts_and_plugins(self) -> None:
@@ -131,6 +121,10 @@ class McpDirectBundleStandardTests(unittest.TestCase):
             write_mcp_setup_bundle_zip(bundle_dir, zip_path)
             with zipfile.ZipFile(zip_path) as archive:
                 names = {name.casefold() for name in archive.namelist()}
+                desktop = json.loads(
+                    archive.read("chatgpt_desktop_local_mcp.json").decode("utf-8")
+                )
+                status = json.loads(archive.read("bundle_status.json").decode("utf-8"))
 
         self.assertFalse(any(name.endswith(".bat") for name in names))
         self.assertFalse(any("prompt" in name for name in names))
@@ -147,6 +141,17 @@ class McpDirectBundleStandardTests(unittest.TestCase):
         self.assertIn("claude_https_mcp.json", names)
         self.assertNotIn("claude_api_fragment.json", names)
         self.assertIn("run_mcp_stdio_server.ps1", names)
+        self.assertEqual("unsupported", desktop["support_status"])
+        self.assertFalse(desktop["direct_local_supported"])
+        self.assertNotIn("mcpServers", desktop)
+        self.assertFalse(
+            status["portable_handoff_runtime"]["bundled_windows_executable"]
+        )
+        self.assertTrue(
+            status["portable_handoff_runtime"][
+                "python_required_when_packaged_executable_absent"
+            ]
+        )
 
 
 if __name__ == "__main__":

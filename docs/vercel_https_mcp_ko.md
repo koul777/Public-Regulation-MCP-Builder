@@ -63,22 +63,23 @@ vercel env add MCP_TOOL_PROFILE production --value "chatgpt-data" --yes --cwd .\
 
 다음 배포 모드 중 하나를 명시해야 하며, 둘을 혼용하지 않는다.
 
-- ChatGPT Desktop·Codex와 Claude가 함께 쓰는 승인된 공개 read-only endpoint:
+- ChatGPT 웹·Codex와 Claude가 함께 쓰는 승인된 공개 read-only endpoint:
   `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`, `MCP_AUTH_TOKEN`은 비움
-- 비공개 ChatGPT Desktop·Codex endpoint: `MCP_AUTH_TOKEN`을 Vercel Secret으로 등록하고
-  공용 `config.toml`의 `bearer_token_env_var`에 환경변수 이름만 설정하거나 OAuth 사용
+- 비공개 Codex endpoint: `MCP_AUTH_TOKEN`을 Vercel Secret으로 등록하고
+  `config.toml`의 `bearer_token_env_var`에 환경변수 이름만 설정. ChatGPT 웹은
+  워크스페이스가 승인한 OAuth 정책 사용
 - `MCP_AUTH_ISSUER_URL`: 사용자 도메인을 쓸 때 `https://mcp.example.go.kr`
 - `MCP_ALLOWED_HTTP_HOSTS`: 사용자 도메인을 쓸 때 `mcp.example.go.kr`
 - `MCP_ALLOWED_HTTP_ORIGINS`: 신뢰하는 Origin이 실제 전송될 때만 쉼표로 구분해 등록
 - `MCP_TENANT_ID`, `MCP_PROFILE_ID`: 생략하면 runtime manifest 값을 사용
 - `MCP_TOOL_PROFILE`: 기본값 `chatgpt-data`; 원격 공개 범위는 읽기 전용 `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch`
 
-현재 adapter의 `MCP_AUTH_TOKEN`은 bearer 인증을 지원하는 ChatGPT Desktop·Codex와 일반 MCP
+현재 adapter의 `MCP_AUTH_TOKEN`은 bearer 인증을 지원하는 Codex와 일반 MCP
 클라이언트에서 사용할 수 있다. 토큰 값은 Vercel Secret과 로컬 환경변수에만 두고
 `config.toml`에는 `bearer_token_env_var = "MCP_AUTH_TOKEN"`처럼 환경변수 이름만 기록한다.
 OAuth를 선택하는 경우 authorization server, protected-resource metadata, PKCE,
-audience/scope 검증은 별도로 구성해야 한다. ChatGPT 웹의 hosted plugin 연결은 이
-Codex-host 설정과 별도이며 이 staging 도구의 자동 연결 범위가 아니다.
+audience/scope 검증은 별도로 구성해야 한다. ChatGPT 웹의 원격 MCP 앱 등록은 이
+staging 도구가 자동 수행하지 않으며, Developer mode·플랜·관리자 권한을 따로 확인한다.
 
 ## 배포와 확인
 
@@ -96,12 +97,12 @@ vercel --prod --cwd vercel-mcp-stage
 https://<production-host>/mcp
 ```
 
-이 endpoint 하나를 ChatGPT Desktop·Codex와 Claude에서 공통으로 사용한다. 클라이언트별
-Vercel 프로젝트를 따로 만들 필요는 없다. ChatGPT Desktop은 `Settings > MCP servers >
-Add server`의 Streamable HTTP URL 또는 공용 `config.toml`에 등록하고, Claude는 해당
-Connector 등록 화면에 같은 URL을 등록한다.
+이 endpoint 하나를 ChatGPT 웹·Codex와 Claude에서 공통으로 사용할 수 있다. 클라이언트별
+Vercel 프로젝트를 따로 만들 필요는 없다. ChatGPT 웹은 Developer mode의 Apps 설정에서
+원격 MCP 앱을 만들고, Codex는 `config.toml`, Claude는 해당 Connector 등록 화면에 같은
+URL을 등록한다. ChatGPT는 로컬 MCP에 직접 연결하지 않는다.
 
-ChatGPT Desktop·Codex 공용 설정 예시:
+Codex 원격 설정 예시:
 
 ```toml
 [mcp_servers.aks_mcp]
@@ -179,7 +180,9 @@ Vercel의 표준 500 MB 비압축 Python Function 한도에 애플리케이션�
 - Vercel MCP 배포: https://vercel.com/docs/mcp/deploy-mcp-servers-to-vercel
 - Vercel Python Functions:
   https://vercel.com/docs/functions/runtimes/python
-- OpenAI ChatGPT Desktop·Codex MCP:
-  https://learn.chatgpt.com/docs/extend/mcp
+- OpenAI ChatGPT Developer mode·MCP:
+  https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta
+- OpenAI Secure MCP Tunnel:
+  https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
 - Anthropic Claude remote custom connectors:
   https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp

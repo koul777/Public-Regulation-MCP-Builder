@@ -3,7 +3,6 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,9 +11,25 @@ from app.parsers.base import OCRRequiredError, ParserError
 from app.parsers.factory import get_parser
 from app.parsers.pdf_parser import PDFParser
 from app.schemas.parsed import ParsedBlock
+from app.utils.fitz_compat import fitz
+from app.utils.fitz_compat import import_fitz
 
 
 class PDFParserTests(unittest.TestCase):
+    def test_pymupdf_import_path_is_used_when_fitz_alias_is_unavailable(self) -> None:
+        fallback_backend = SimpleNamespace(open=object())
+        original_import = __import__
+
+        def import_with_missing_fitz(name: str, *args, **kwargs):
+            if name == "fitz":
+                raise ImportError("fitz alias unavailable")
+            if name == "pymupdf":
+                return fallback_backend
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_with_missing_fitz):
+            self.assertIs(import_fitz(), fallback_backend)
+
     def test_factory_supports_pdf_extension(self) -> None:
         self.assertIsInstance(get_parser(Path("sample.pdf")), PDFParser)
 
@@ -45,8 +60,6 @@ class PDFParserTests(unittest.TestCase):
                 PDFParser().parse(path, "doc_invalid_pdf")
 
     def test_text_pdf_emits_low_risk_uncertainty_report(self) -> None:
-        import fitz
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "text.pdf"
             doc = fitz.open()
@@ -63,8 +76,6 @@ class PDFParserTests(unittest.TestCase):
         self.assertIn("embedded_text_extracted", parsed.metadata["parser_uncertainty_flags"])
 
     def test_ambiguous_two_column_page_emits_medium_uncertainty(self) -> None:
-        import fitz
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "ambiguous-columns.pdf"
             doc = fitz.open()
@@ -93,8 +104,6 @@ class PDFParserTests(unittest.TestCase):
         self.assertEqual([1], parsed.metadata["pdf_two_column_reading_order_ambiguous_pages"])
 
     def test_confirmed_two_column_page_keeps_low_uncertainty(self) -> None:
-        import fitz
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "confirmed-columns.pdf"
             doc = fitz.open()
@@ -142,7 +151,7 @@ class PDFParserTests(unittest.TestCase):
                 )
 
         fake_fitz = SimpleNamespace(open=lambda path: FakePdfDocument())
-        with patch.dict(sys.modules, {"fitz": fake_fitz}):
+        with patch("app.utils.fitz_compat.fitz", fake_fitz):
             parsed = PDFParser().parse(Path("mixed.pdf"), "doc_mixed_pdf")
 
         self.assertEqual([2], parsed.metadata["blank_pages"])
@@ -167,7 +176,7 @@ class PDFParserTests(unittest.TestCase):
                 return iter([_TextImagePage(width=600, height=800, lines=[[_fake_chars("text", x=40, y=100)]])])
 
         fake_fitz = SimpleNamespace(open=lambda path: FakePdfDocument())
-        with patch.dict(sys.modules, {"fitz": fake_fitz}):
+        with patch("app.utils.fitz_compat.fitz", fake_fitz):
             parsed = PDFParser().parse(Path("text-image.pdf"), "doc_text_image_pdf")
 
         self.assertEqual([1], parsed.metadata["pdf_embedded_image_pages"])
@@ -308,8 +317,6 @@ class PDFParserTests(unittest.TestCase):
         self.assertEqual(3, references[0]["body_marker_count"])
 
     def test_blank_pdf_raises_ocr_required_error(self) -> None:
-        import fitz
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "blank.pdf"
             doc = fitz.open()
@@ -328,8 +335,6 @@ class PDFParserTests(unittest.TestCase):
         self.assertIn("ocr_required", ctx.exception.uncertainty_report["flags"])
 
     def test_blank_pdf_uses_windows_ocr_backend_when_enabled(self) -> None:
-        import fitz
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scanned.pdf"
             doc = fitz.open()

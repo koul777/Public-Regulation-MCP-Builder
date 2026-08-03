@@ -61,6 +61,10 @@ VECTOR_METADATA_FIELDS = (
     "supersedes_document_id",
     "chunk_type",
     "hierarchy_path",
+    "source_hierarchy_path",
+    "canonical_hierarchy_path",
+    "canonical_regulation_title",
+    "canonical_regulation_no",
     "part_no",
     "part_title",
     "chapter_no",
@@ -75,6 +79,10 @@ VECTOR_METADATA_FIELDS = (
     "paragraph_label",
     "item_no",
     "subitem_no",
+    "parent_id",
+    "entity_id",
+    "regulation_node_id",
+    "regulation_source_node_id",
     "structural_child_count_source",
     "paragraph_unit_count",
     "item_unit_count",
@@ -309,7 +317,31 @@ def public_vector_metadata(
         if _is_empty(value) and not (preserve_optional_lifecycle_field and value is None):
             continue
         metadata[field] = value
+    metadata = _normalize_public_hierarchy_metadata(metadata)
     return _normalize_public_lifecycle_metadata(chunk, metadata)
+
+
+def _normalize_public_hierarchy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Expose the canonical hierarchy while retaining the raw source locator."""
+
+    normalized = dict(metadata)
+    canonical_path = str(normalized.get("canonical_hierarchy_path") or "").strip()
+    if not canonical_path:
+        return normalized
+    source_path = str(
+        normalized.get("source_hierarchy_path")
+        or normalized.get("hierarchy_path")
+        or ""
+    ).strip()
+    if source_path:
+        normalized["source_hierarchy_path"] = source_path
+    # ``hierarchy_path`` is the established public/search field. New chunks
+    # keep its parser path in ``source_hierarchy_path`` and publish the
+    # regulation-local canonical path here, preserving legacy records that do
+    # not yet carry a canonical value.
+    normalized["hierarchy_path"] = canonical_path
+    normalized["canonical_hierarchy_path"] = canonical_path
+    return normalized
 
 
 def _public_structural_child_sample(value: Any) -> list[dict[str, str]]:

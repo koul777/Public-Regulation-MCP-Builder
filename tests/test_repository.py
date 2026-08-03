@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import multiprocessing
 import errno
 import gzip
@@ -118,6 +119,66 @@ def _admit_same_regulation_version(
         queue.put(("duplicate", str(exc)))
     except Exception:  # pragma: no cover - surfaced in parent process
         queue.put(("error", traceback.format_exc()))
+
+
+def _race_processing_claim(
+    data_dir: str,
+    run_id: str,
+    job_id: str,
+    ready,
+    start,
+    release,
+    results,
+) -> None:
+    try:
+        repo = JsonRepository(Settings(data_dir=Path(data_dir)))
+        ready.put(run_id)
+        if not start.wait(timeout=10):
+            raise TimeoutError("processing claim race was not released")
+        claim = repo.begin_processing_claim(
+            document_id="doc-processing-claim-race",
+            run_id=run_id,
+            job_id=job_id,
+        )
+        results.put(
+            (
+                claim.acquired,
+                claim.run_id,
+                claim.job_id,
+                claim.previous_owner_run_id,
+            )
+        )
+        if claim.acquired and not release.wait(timeout=10):
+            raise TimeoutError("processing claim owner was not released")
+    except Exception:  # pragma: no cover - surfaced in parent process
+        results.put(("error", traceback.format_exc()))
+
+
+def _leave_processing_claim(
+    data_dir: str,
+    *,
+    dirty: bool,
+    ready,
+) -> None:
+    try:
+        repo = JsonRepository(Settings(data_dir=Path(data_dir)))
+        claim = repo.begin_processing_claim(
+            document_id="doc-processing-claim-crash",
+            run_id="run-crashed-owner",
+            job_id="job-crashed-owner",
+            previous_owner_run_id="run-stable-owner",
+        )
+        if not claim.acquired:
+            raise RuntimeError("crash fixture could not acquire processing claim")
+        if dirty:
+            repo.mark_processing_outputs_dirty(
+                document_id="doc-processing-claim-crash",
+                run_id=claim.run_id,
+            )
+        ready.set()
+    except Exception:  # pragma: no cover - surfaced by process exit code
+        traceback.print_exc()
+        raise
 
 
 def _save_reusable_outputs(settings: Settings, repo: JsonRepository, document_id: str) -> dict[str, str]:
@@ -544,6 +605,186 @@ class JsonRepositoryTests(unittest.TestCase):
             )
             self.assertEqual(1, len(stored))
 
+    def test_processing_claim_allows_only_one_live_writer_across_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context = multiprocessing.get_context("spawn")
+            ready = context.Queue()
+            start = context.Event()
+            release = context.Event()
+            results = context.Queue()
+            workers = [
+                context.Process(
+                    target=_race_processing_claim,
+                    args=(
+                        tmp,
+                        f"run-claim-{index}",
+                        f"job-claim-{index}",
+                        ready,
+                        start,
+                        release,
+                        results,
+                    ),
+                )
+                for index in range(2)
+            ]
+            for worker in workers:
+                worker.start()
+            self.assertEqual(
+                {"run-claim-0", "run-claim-1"},
+                {ready.get(timeout=10), ready.get(timeout=10)},
+            )
+            start.set()
+            outcomes = [results.get(timeout=10), results.get(timeout=10)]
+            release.set()
+            for worker in workers:
+                worker.join(timeout=15)
+                self.assertEqual(0, worker.exitcode)
+
+            self.assertFalse(any(outcome[0] == "error" for outcome in outcomes))
+            self.assertEqual([False, True], sorted(outcome[0] for outcome in outcomes))
+            self.assertEqual(1, len({outcome[1] for outcome in outcomes}))
+            self.assertEqual(1, len({outcome[2] for outcome in outcomes}))
+
+    def test_clean_crashed_claim_preserves_prior_owner_for_next_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc-processing-claim-crash",
+                filename="claim-crash.pdf",
+                file_type="pdf",
+                file_hash="claim-crash-hash",
+            )
+            options = {"chunk_mode": "article"}
+            repo.upsert_document(document)
+            artifacts = _save_reusable_outputs(settings, repo, document.document_id)
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run-stable-owner",
+                    document_id=document.document_id,
+                    job_id="job-stable-owner",
+                    status="completed",
+                    started_at=datetime.now(timezone.utc),
+                    elapsed_seconds=0.5,
+                    options=options,
+                    artifacts=artifacts,
+                )
+            )
+            context = multiprocessing.get_context("spawn")
+            ready = context.Event()
+            worker = context.Process(
+                target=_leave_processing_claim,
+                args=(tmp,),
+                kwargs={"dirty": False, "ready": ready},
+            )
+            worker.start()
+            self.assertTrue(ready.wait(timeout=10))
+            worker.join(timeout=10)
+            self.assertEqual(0, worker.exitcode)
+
+            fresh = JsonRepository(settings)
+            self.assertIsNone(
+                fresh.latest_completed_run(
+                    document.document_id,
+                    options=options,
+                    require_outputs=True,
+                )
+            )
+            claim = fresh.begin_processing_claim(
+                document_id=document.document_id,
+                run_id="run-recovered-owner",
+                job_id="job-recovered-owner",
+            )
+            self.assertTrue(claim.acquired)
+            self.assertEqual("run-stable-owner", claim.previous_owner_run_id)
+            reusable = fresh.latest_completed_run(
+                document.document_id,
+                options=options,
+                require_outputs=True,
+                processing_claim_id=claim.run_id,
+            )
+            self.assertIsNotNone(reusable)
+            self.assertEqual("run-stable-owner", reusable.run_id)
+            fresh.finish_processing_claim(
+                document_id=document.document_id,
+                run_id=claim.run_id,
+                owner_run_id=reusable.run_id,
+            )
+            self.assertEqual(
+                "run-stable-owner",
+                fresh.latest_completed_run(
+                    document.document_id,
+                    options=options,
+                    require_outputs=True,
+                ).run_id,
+            )
+
+    def test_dirty_crashed_claim_invalidates_prior_owner_for_next_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc-processing-claim-crash",
+                filename="claim-crash.pdf",
+                file_type="pdf",
+                file_hash="claim-crash-hash",
+            )
+            options = {"chunk_mode": "article"}
+            repo.upsert_document(document)
+            artifacts = _save_reusable_outputs(settings, repo, document.document_id)
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run-stable-owner",
+                    document_id=document.document_id,
+                    job_id="job-stable-owner",
+                    status="completed",
+                    started_at=datetime.now(timezone.utc),
+                    elapsed_seconds=0.5,
+                    options=options,
+                    artifacts=artifacts,
+                )
+            )
+            context = multiprocessing.get_context("spawn")
+            ready = context.Event()
+            worker = context.Process(
+                target=_leave_processing_claim,
+                args=(tmp,),
+                kwargs={"dirty": True, "ready": ready},
+            )
+            worker.start()
+            self.assertTrue(ready.wait(timeout=10))
+            worker.join(timeout=10)
+            self.assertEqual(0, worker.exitcode)
+
+            fresh = JsonRepository(settings)
+            claim = fresh.begin_processing_claim(
+                document_id=document.document_id,
+                run_id="run-recovered-dirty-owner",
+                job_id="job-recovered-dirty-owner",
+            )
+            self.assertTrue(claim.acquired)
+            self.assertIsNone(claim.previous_owner_run_id)
+            self.assertIsNone(
+                fresh.latest_completed_run(
+                    document.document_id,
+                    options=options,
+                    require_outputs=True,
+                    processing_claim_id=claim.run_id,
+                )
+            )
+            fresh.finish_processing_claim(
+                document_id=document.document_id,
+                run_id=claim.run_id,
+                owner_run_id=None,
+            )
+            self.assertIsNone(
+                fresh.latest_completed_run(
+                    document.document_id,
+                    options=options,
+                    require_outputs=True,
+                )
+            )
+
     def test_regulation_version_admission_is_scoped_by_tenant_and_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = JsonRepository(
@@ -714,7 +955,14 @@ class JsonRepositoryTests(unittest.TestCase):
             with patch.object(repo, "_write_json", wraps=repo._write_json) as write_json:
                 repo.commit_processing_outcome(document=document, job=job, run=run)
 
-            self.assertEqual(1, write_json.call_count)
+            written_paths = [call.args[0] for call in write_json.call_args_list]
+            self.assertEqual(1, written_paths.count(repo.manifest_path))
+            self.assertEqual(
+                1,
+                written_paths.count(
+                    repo._processing_output_state_path(document.document_id)
+                ),
+            )
             self.assertEqual("completed", repo.get_document(document.document_id).status)
             self.assertEqual("completed", repo.get_job(job.job_id).status)
             self.assertEqual(run.run_id, repo.get_run(run.run_id).run_id)
@@ -1044,6 +1292,212 @@ class JsonRepositoryTests(unittest.TestCase):
         self.assertIn(("nodes", 0, 0), progress)
         self.assertIn(("issues", 0, 0), progress)
 
+    def test_json_array_writer_matches_compact_json_bytes_and_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "writer-contract.json"
+            records = [
+                {"id": "첫째", "text": "줄1\n줄2", "nested": {"ok": True}},
+                {"id": "second", "values": [1, 2, None]},
+            ]
+            progress: list[tuple[str, int, int]] = []
+
+            repo._write_json_array(
+                path,
+                iter(records),
+                total=len(records),
+                phase="contract",
+                progress_callback=lambda phase, current, total: progress.append(
+                    (phase, current, total)
+                ),
+            )
+
+            expected = json.dumps(
+                records,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.assertEqual(expected, path.read_bytes())
+            self.assertEqual(records, json.loads(path.read_text(encoding="utf-8")))
+            self.assertEqual(
+                [("contract", 1, 2), ("contract", 2, 2)],
+                progress,
+            )
+
+    def test_json_array_writer_preserves_target_and_cleans_temp_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "writer-atomicity.json"
+            original = b'[{"existing":true}]'
+            path.write_bytes(original)
+
+            with self.assertRaises(TypeError):
+                repo._write_json_array(
+                    path,
+                    iter(({"ok": 1}, {"unsupported": object()})),
+                    total=2,
+                    phase="atomicity",
+                )
+
+            self.assertEqual(original, path.read_bytes())
+            self.assertEqual([], list(repo.root.glob("writer-atomicity.json.*.tmp")))
+
+    def test_json_array_writer_round_trips_one_large_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "writer-large-record.json"
+            large_text = "공공기관 규정" * 200_000
+
+            repo._write_json_array(
+                path,
+                iter(({"document_id": "doc-large-record", "text": large_text},)),
+                total=1,
+                phase="large-record",
+            )
+
+            loaded = list(repo._iter_json_array(path))
+            self.assertEqual(1, len(loaded))
+            self.assertEqual(large_text, loaded[0]["text"])
+
+    def test_json_array_writer_does_not_materialize_a_full_record_string(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "writer-streamed-record.json"
+            record = {
+                "document_id": "doc-streamed-record",
+                "cells": [f"규정 표 셀 {index}" for index in range(20_000)],
+            }
+
+            with patch.object(
+                json.JSONEncoder,
+                "encode",
+                side_effect=AssertionError("full record encode is forbidden"),
+            ):
+                repo._write_json_array(
+                    path,
+                    iter((record,)),
+                    total=1,
+                    phase="streamed-record",
+                )
+
+            self.assertEqual([record], json.loads(path.read_text(encoding="utf-8")))
+
+    def test_json_array_writer_streams_large_aggregate_string_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "writer-aggregate-streamed-record.json"
+            cell_chars = (
+                repository_module._JSON_BUFFERED_ENCODE_MAX_STRING_CHARS // 2
+            )
+            cell = "규" * cell_chars
+            cell_count = (
+                repository_module._JSON_BUFFERED_ENCODE_MAX_TOTAL_STRING_CHARS
+                // cell_chars
+                + 1
+            )
+            record = {
+                "document_id": "doc-aggregate-streamed-record",
+                "cells": [cell] * cell_count,
+            }
+
+            self.assertTrue(
+                repository_module._json_value_needs_buffered_encoding(record)
+            )
+            with patch.object(
+                json.JSONEncoder,
+                "encode",
+                side_effect=AssertionError("full record encode is forbidden"),
+            ):
+                repo._write_json_array(
+                    path,
+                    iter((record,)),
+                    total=1,
+                    phase="aggregate-streamed-record",
+                )
+
+            self.assertEqual([record], json.loads(path.read_text(encoding="utf-8")))
+
+    def test_json_array_reader_limits_large_value_decode_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "reader-large-value.json"
+            record = {"text": "규" * (4 * 1024 * 1024)}
+            path.write_text(
+                json.dumps([record], ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            original_raw_decode = json.JSONDecoder.raw_decode
+            raw_decode_calls = 0
+
+            def counting_raw_decode(decoder, *args, **kwargs):
+                nonlocal raw_decode_calls
+                raw_decode_calls += 1
+                return original_raw_decode(decoder, *args, **kwargs)
+
+            with patch.object(
+                json.JSONDecoder,
+                "raw_decode",
+                new=counting_raw_decode,
+            ):
+                loaded = list(repo._iter_json_array(path))
+
+            self.assertEqual([record], loaded)
+            self.assertLessEqual(raw_decode_calls, 10)
+
+    def test_json_array_reader_rejects_truncated_and_malformed_values(self) -> None:
+        invalid_payloads = (
+            '[{"text":"unterminated}',
+            '[{"ok":true},definitely-not-json]',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            for index, payload in enumerate(invalid_payloads):
+                with self.subTest(payload=payload):
+                    path = repo.root / f"reader-invalid-{index}.json"
+                    path.write_text(payload, encoding="utf-8")
+                    with self.assertRaises(json.JSONDecodeError):
+                        list(repo._iter_json_array(path))
+
+    def test_json_array_writer_buffers_deep_table_inventory_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            path = repo.root / "writer-nested-table-inventory.json"
+            record = {
+                "document_id": "doc-nested-table-inventory",
+                "metadata": {
+                    "kordoc_table_inventory": {
+                        "tables": [
+                            {
+                                "rows": [
+                                    {
+                                        "cells": [
+                                            f"표 {table_index} 행 {row_index}",
+                                            "규정 표 셀 내용" * 8,
+                                        ]
+                                    }
+                                    for row_index in range(30)
+                                ]
+                            }
+                            for table_index in range(40)
+                        ]
+                    }
+                },
+            }
+
+            with patch.object(
+                json.JSONEncoder,
+                "encode",
+                side_effect=AssertionError("deep inventory full encode is forbidden"),
+            ):
+                repo._write_json_array(
+                    path,
+                    iter((record,)),
+                    total=1,
+                    phase="nested-table-inventory",
+                )
+
+            self.assertEqual([record], json.loads(path.read_text(encoding="utf-8")))
+
     def test_append_records_are_recoverable_from_journal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
@@ -1121,6 +1575,128 @@ class JsonRepositoryTests(unittest.TestCase):
                     )
             finally:
                 repository_module._JOURNAL_RECORD_CACHE.pop(cache_key, None)
+
+    def test_journal_reader_streams_lines_without_path_read_text(self) -> None:
+        class _LineOnlyHandle:
+            def __init__(self, handle) -> None:
+                self._handle = handle
+
+            def __enter__(self):
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback_value):
+                return self._handle.__exit__(exc_type, exc_value, traceback_value)
+
+            def read(self, size=-1):
+                if size <= 0 or size > repository_module._JOURNAL_READ_CHUNK_CHARS:
+                    raise AssertionError("journal reads must use a bounded buffer")
+                return self._handle.read(size)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            record = {
+                "approval_record_id": "approval_record_streamed",
+                "approval_id": "approval-streamed",
+                "document_id": "doc-streamed",
+                "chunk_ids": ["chunk-1"],
+                "approved_at": "2026-07-10T00:00:00+00:00",
+                "tenant_id": "tenant-a",
+            }
+            repo.append_approval_record(record)
+            journal_path = settings.data_dir / "repository" / "journals" / "approvals.jsonl"
+            cache_key = str(journal_path.resolve())
+            compressed_path = Path(f"{journal_path}.gz")
+            compressed_cache_key = str(compressed_path.resolve())
+            repository_module._JOURNAL_RECORD_CACHE.pop(cache_key, None)
+            original_path_open = Path.open
+
+            def guarded_path_open(candidate, *args, **kwargs):
+                handle = original_path_open(candidate, *args, **kwargs)
+                if candidate == journal_path:
+                    return _LineOnlyHandle(handle)
+                return handle
+
+            try:
+                with patch.object(Path, "open", new=guarded_path_open):
+                    records = repo._read_journal_records("approvals")
+
+                self.assertEqual("approval_record_streamed", records[0]["approval_record_id"])
+
+                original_gzip_open = gzip.open
+                with original_gzip_open(compressed_path, "wt", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    )
+                journal_path.unlink()
+                repository_module._JOURNAL_RECORD_CACHE.pop(compressed_cache_key, None)
+
+                def guarded_gzip_open(candidate, *args, **kwargs):
+                    handle = original_gzip_open(candidate, *args, **kwargs)
+                    if Path(candidate) == compressed_path:
+                        return _LineOnlyHandle(handle)
+                    return handle
+
+                with patch.object(repository_module.gzip, "open", new=guarded_gzip_open):
+                    compressed_records = repo._read_journal_records("approvals")
+
+                self.assertEqual(records, compressed_records)
+            finally:
+                repository_module._JOURNAL_RECORD_CACHE.pop(cache_key, None)
+                repository_module._JOURNAL_RECORD_CACHE.pop(compressed_cache_key, None)
+
+    def test_journal_caches_evict_least_recently_used_entries(self) -> None:
+        record_cache_snapshot = OrderedDict(repository_module._JOURNAL_RECORD_CACHE)
+        identity_cache_snapshot = OrderedDict(repository_module._JOURNAL_IDENTITY_CACHE)
+        repository_module._JOURNAL_RECORD_CACHE.clear()
+        repository_module._JOURNAL_IDENTITY_CACHE.clear()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = JsonRepository(Settings(data_dir=Path(tmp)))
+                cache_count = repository_module._JOURNAL_IDENTITY_CACHE_MAX_ENTRIES
+                for index in range(cache_count):
+                    journal_name = f"cache-{index}"
+                    path = repo._journal_path(journal_name)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("{}\n", encoding="utf-8")
+                    self.assertEqual([{}], repo._read_journal_records(journal_name))
+                    self.assertEqual({}, repo._journal_identity_index(journal_name))
+
+                first_key = str(repo._journal_path("cache-0").resolve())
+                identity_second_key = str(repo._journal_path("cache-1").resolve())
+                oldest_record_index = (
+                    cache_count - repository_module._JOURNAL_RECORD_CACHE_MAX_ENTRIES
+                )
+                record_second_key = str(
+                    repo._journal_path(f"cache-{oldest_record_index}").resolve()
+                )
+                self.assertEqual([{}], repo._read_journal_records("cache-0"))
+                self.assertEqual({}, repo._journal_identity_index("cache-0"))
+
+                added_name = f"cache-{cache_count}"
+                added_path = repo._journal_path(added_name)
+                added_path.write_text("{}\n", encoding="utf-8")
+                self.assertEqual([{}], repo._read_journal_records(added_name))
+                self.assertEqual({}, repo._journal_identity_index(added_name))
+
+                self.assertLessEqual(
+                    len(repository_module._JOURNAL_RECORD_CACHE),
+                    repository_module._JOURNAL_RECORD_CACHE_MAX_ENTRIES,
+                )
+                self.assertLessEqual(
+                    len(repository_module._JOURNAL_IDENTITY_CACHE),
+                    repository_module._JOURNAL_IDENTITY_CACHE_MAX_ENTRIES,
+                )
+                self.assertIn(first_key, repository_module._JOURNAL_RECORD_CACHE)
+                self.assertIn(first_key, repository_module._JOURNAL_IDENTITY_CACHE)
+                self.assertNotIn(record_second_key, repository_module._JOURNAL_RECORD_CACHE)
+                self.assertNotIn(identity_second_key, repository_module._JOURNAL_IDENTITY_CACHE)
+        finally:
+            repository_module._JOURNAL_RECORD_CACHE.clear()
+            repository_module._JOURNAL_RECORD_CACHE.update(record_cache_snapshot)
+            repository_module._JOURNAL_IDENTITY_CACHE.clear()
+            repository_module._JOURNAL_IDENTITY_CACHE.update(identity_cache_snapshot)
 
     def test_rag_trace_append_is_recoverable_from_journal_without_manifest_growth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1691,6 +2267,165 @@ class JsonRepositoryTests(unittest.TestCase):
             self.assertIsNone(reusable_old)
             self.assertIsNotNone(reusable_new)
             self.assertEqual(reusable_new[1].run_id, "run_new")
+
+    def test_reusable_run_rejects_completed_run_after_later_failed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_failed_overwrite",
+                filename="sample.pdf",
+                file_type="pdf",
+                file_hash="same-hash",
+                profile_id="default-public-institution",
+            )
+            options = {"chunk_mode": "article"}
+            repo.upsert_document(document)
+            artifacts = _save_reusable_outputs(
+                settings,
+                repo,
+                document.document_id,
+            )
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run_before_failure",
+                    document_id=document.document_id,
+                    job_id="job_before_failure",
+                    status="completed",
+                    started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    elapsed_seconds=0.5,
+                    options=options,
+                    artifacts=artifacts,
+                )
+            )
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run_failed_after_storage",
+                    document_id=document.document_id,
+                    job_id="job_failed_after_storage",
+                    status="failed",
+                    started_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    elapsed_seconds=0.5,
+                    options={"chunk_mode": "paragraph"},
+                    error="synthetic export failure after result storage",
+                )
+            )
+
+            reusable = repo.latest_completed_run(
+                document.document_id,
+                options=options,
+                require_outputs=True,
+            )
+
+            self.assertIsNone(reusable)
+
+    def test_output_owner_uses_commit_order_not_concurrent_run_start_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc-overlapping-run-order",
+                filename="sample.pdf",
+                file_type="pdf",
+                file_hash="same-hash",
+            )
+            options = {"chunk_mode": "article"}
+            repo.upsert_document(document)
+            artifacts = _save_reusable_outputs(settings, repo, document.document_id)
+            # The newer-started run commits first. An older-started concurrent
+            # run then fails after touching the shared output namespace.
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run-newer-start-completed-first",
+                    document_id=document.document_id,
+                    job_id="job-newer-start",
+                    status="completed",
+                    started_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    elapsed_seconds=0.5,
+                    options=options,
+                    artifacts=artifacts,
+                )
+            )
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run-older-start-failed-last",
+                    document_id=document.document_id,
+                    job_id="job-older-start",
+                    status="failed",
+                    started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    elapsed_seconds=1.5,
+                    options=options,
+                    error="failed after overwriting outputs",
+                )
+            )
+
+            self.assertIsNone(
+                repo.latest_completed_run(
+                    document.document_id,
+                    options=options,
+                    require_outputs=True,
+                )
+            )
+
+    def test_latest_reusable_run_validates_only_last_result_owner_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_many_completed_runs",
+                filename="sample.pdf",
+                file_type="pdf",
+                file_hash="same-hash",
+                profile_id="default-public-institution",
+            )
+            options = {"chunk_mode": "article"}
+            repo.upsert_document(document)
+            artifacts = _save_reusable_outputs(
+                settings,
+                repo,
+                document.document_id,
+            )
+            for index in range(25):
+                repo.upsert_run(
+                    ProcessingRun(
+                        run_id=f"run_reusable_{index:02d}",
+                        document_id=document.document_id,
+                        job_id=f"job_reusable_{index:02d}",
+                        status="completed",
+                        started_at=datetime.fromtimestamp(
+                            index,
+                            tz=timezone.utc,
+                        ),
+                        elapsed_seconds=0.5,
+                        options=options,
+                        artifacts=artifacts,
+                    )
+                )
+
+            with patch.object(
+                repo,
+                "list_runs",
+                wraps=repo.list_runs,
+            ) as list_runs, patch.object(
+                repo,
+                "_stored_results_are_reusable",
+                wraps=repo._stored_results_are_reusable,
+            ) as stored_results, patch.object(
+                repo,
+                "_iter_json_array",
+                wraps=repo._iter_json_array,
+            ) as iter_json_array:
+                reusable = repo.latest_completed_run(
+                    document.document_id,
+                    options=options,
+                    require_outputs=True,
+                )
+
+            self.assertIsNotNone(reusable)
+            self.assertEqual("run_reusable_24", reusable.run_id)
+            self.assertEqual(1, list_runs.call_count)
+            self.assertEqual(1, stored_results.call_count)
+            self.assertEqual(3, iter_json_array.call_count)
 
     def test_reusable_run_requires_matching_provenance_when_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

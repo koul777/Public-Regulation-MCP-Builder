@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import gzip
@@ -14,6 +16,7 @@ import re
 import socket
 from threading import Lock
 import time
+from typing import TextIO, TypeVar
 from uuid import uuid4
 
 from app.core.config import Settings
@@ -44,6 +47,8 @@ except OSError:
     ).strip().casefold()
 
 _FileIdentity = tuple[int, int, int, int]
+_JournalFileIdentity = tuple[_FileIdentity | None, _FileIdentity | None]
+_CacheValue = TypeVar("_CacheValue")
 
 _JOURNAL_ID_FIELDS: dict[str, tuple[str, ...]] = {
     "runs": ("run_id",),
@@ -63,16 +68,115 @@ _MANIFEST_JOURNAL_MIRRORS: dict[str, str] = {
     "rag_feedback": "rag_feedback",
     "security_scans": "security_scans",
 }
-_JOURNAL_IDENTITY_CACHE: dict[str, tuple[_FileIdentity | None, dict[str, str]]] = {}
-_JOURNAL_RECORD_CACHE: dict[str, tuple[_FileIdentity | None, list[dict]]] = {}
+_JOURNAL_IDENTITY_CACHE_MAX_ENTRIES = 64
+_JOURNAL_RECORD_CACHE_MAX_ENTRIES = 16
+_JOURNAL_IDENTITY_CACHE: OrderedDict[
+    str, tuple[_JournalFileIdentity, dict[str, str]]
+] = OrderedDict()
+_JOURNAL_RECORD_CACHE: OrderedDict[
+    str, tuple[_JournalFileIdentity, list[dict]]
+] = OrderedDict()
 _CURRENT_PROCESS_IDENTITY: tuple[int, str | None] | None = None
 _TERMINAL_DOCUMENT_STATUSES = frozenset(
     {"completed", "failed", "approved", "rejected", "superseded"}
 )
+_JSON_BUFFERED_ENCODE_MAX_STRING_CHARS = 256 * 1024
+_JSON_BUFFERED_ENCODE_MAX_TOTAL_STRING_CHARS = 1024 * 1024
+_JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS = 4096
+_JSON_BUFFERED_ENCODE_MAX_INSPECTED_VALUES = 4096
+_JOURNAL_READ_CHUNK_CHARS = 1024 * 1024
+
+
+def _journal_cache_get(
+    cache: OrderedDict[str, _CacheValue],
+    key: str,
+) -> _CacheValue | None:
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+
+def _journal_cache_set(
+    cache: OrderedDict[str, _CacheValue],
+    key: str,
+    value: _CacheValue,
+    *,
+    max_entries: int,
+) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
+
+
+def _iter_journal_lines(handle: TextIO) -> Iterator[str]:
+    """Yield JSONL records with bounded read buffers and C-level splitting."""
+
+    pending = ""
+    while True:
+        block = handle.read(_JOURNAL_READ_CHUNK_CHARS)
+        if not block:
+            break
+        lines = f"{pending}{block}".split("\n")
+        pending = lines.pop()
+        yield from lines
+    if pending:
+        yield pending
+
+
+def _json_value_needs_buffered_encoding(value: object) -> bool:
+    """Detect exceptional JSON shapes with a bounded iterative traversal."""
+
+    pending: list[object] = [value]
+    seen_containers: set[int] = set()
+    inspected_values = 0
+    total_string_chars = 0
+    while pending:
+        current = pending.pop()
+        inspected_values += 1
+        if inspected_values > _JSON_BUFFERED_ENCODE_MAX_INSPECTED_VALUES:
+            return True
+        if isinstance(current, str):
+            string_chars = len(current)
+            total_string_chars += string_chars
+            if (
+                string_chars > _JSON_BUFFERED_ENCODE_MAX_STRING_CHARS
+                or total_string_chars
+                > _JSON_BUFFERED_ENCODE_MAX_TOTAL_STRING_CHARS
+            ):
+                return True
+        elif isinstance(current, dict):
+            if len(current) > _JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS:
+                return True
+            container_id = id(current)
+            if container_id in seen_containers:
+                continue
+            seen_containers.add(container_id)
+            pending.extend(child for pair in current.items() for child in pair)
+        elif isinstance(current, (list, tuple)):
+            if len(current) > _JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS:
+                return True
+            container_id = id(current)
+            if container_id in seen_containers:
+                continue
+            seen_containers.add(container_id)
+            pending.extend(current)
+    return False
 
 
 class JournalIntegrityError(RuntimeError):
     """Raised when an append-only repository journal is structurally ambiguous."""
+
+
+@dataclass(frozen=True)
+class ProcessingClaim:
+    """Result of atomically claiming one document's mutable output namespace."""
+
+    acquired: bool
+    run_id: str
+    job_id: str
+    previous_owner_run_id: str | None = None
 
 
 class _DuplicateJournalJsonKey(ValueError):
@@ -96,6 +200,7 @@ class JsonRepository:
         self.manifest_path = self.root / "manifest.json"
         self.job_progress_root = self.root / "job_progress"
         self.document_progress_root = self.root / "document_progress"
+        self.processing_owner_root = self.root / "processing_owners"
         self._manifest_cache: dict | None = None
         self._manifest_identity: _FileIdentity | None = None
         self._legacy_cache: dict | None = None
@@ -193,6 +298,7 @@ class JsonRepository:
                 if raw is not None and str(raw.get("document_id") or "") == document_id:
                     path.unlink(missing_ok=True)
             self._document_progress_path(document_id).unlink(missing_ok=True)
+            self._processing_output_state_path(document_id).unlink(missing_ok=True)
             for result_type in ("nodes", "chunks", "issues", "quality"):
                 path = self._result_path(document_id, result_type)
                 if path.exists():
@@ -572,6 +678,119 @@ class JsonRepository:
                     pass
         return recovered_jobs
 
+    def begin_processing_claim(
+        self,
+        *,
+        document_id: str,
+        run_id: str,
+        job_id: str,
+        previous_owner_run_id: str | None = None,
+    ) -> ProcessingClaim:
+        """Atomically claim the shared result files for one document.
+
+        The claim is durable so readers fail closed while a writer is active,
+        but it is not a long-held file lock. Process identity metadata lets a
+        later worker recover a claim immediately after a local process crash.
+        """
+
+        normalized_document_id = str(document_id or "").strip()
+        normalized_run_id = str(run_id or "").strip()
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_document_id or not normalized_run_id or not normalized_job_id:
+            raise ValueError("document_id, run_id, and job_id are required for processing claims.")
+
+        path = self._processing_output_state_path(normalized_document_id)
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            raw = self._read_processing_output_state_path(path)
+            if (
+                raw is not None
+                and str(raw.get("state") or "").strip().casefold() == "processing"
+                and not self._progress_sidecar_is_stale(path, raw)
+            ):
+                return ProcessingClaim(
+                    acquired=False,
+                    run_id=str(raw.get("claim_run_id") or "").strip(),
+                    job_id=str(raw.get("job_id") or "").strip(),
+                    previous_owner_run_id=self._optional_identifier(
+                        raw.get("previous_owner_run_id")
+                    ),
+                )
+
+            prior_owner: str | None = None
+            state = str((raw or {}).get("state") or "").strip().casefold()
+            if state == "committed":
+                prior_owner = self._optional_identifier((raw or {}).get("owner_run_id"))
+            elif state == "processing" and not bool((raw or {}).get("outputs_dirty")):
+                # A process that died before its first output write did not
+                # disturb the previous reusable result set.
+                prior_owner = self._optional_identifier(
+                    (raw or {}).get("previous_owner_run_id")
+                )
+            elif raw is None and not path.exists():
+                # Backward-compatible adoption for repositories created before
+                # durable output ownership was introduced.
+                prior_owner = self._optional_identifier(previous_owner_run_id)
+
+            payload: dict[str, object] = {
+                "schema_version": "processing-output-owner-v1",
+                "document_id": normalized_document_id,
+                "state": "processing",
+                "claim_run_id": normalized_run_id,
+                "job_id": normalized_job_id,
+                "previous_owner_run_id": prior_owner,
+                "outputs_dirty": False,
+            }
+            payload.update(self._progress_owner_metadata())
+            self._write_processing_output_state(path, payload)
+            return ProcessingClaim(
+                acquired=True,
+                run_id=normalized_run_id,
+                job_id=normalized_job_id,
+                previous_owner_run_id=prior_owner,
+            )
+
+    def finish_processing_claim(
+        self,
+        *,
+        document_id: str,
+        run_id: str,
+        owner_run_id: str | None,
+    ) -> None:
+        """Publish a reusable owner, or invalidate outputs, for an active claim."""
+
+        normalized_document_id = str(document_id or "").strip()
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_document_id or not normalized_run_id:
+            raise ValueError("document_id and run_id are required to finish a processing claim.")
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            path = self._processing_output_state_path(normalized_document_id)
+            raw = self._require_processing_claim_unlocked(
+                path,
+                document_id=normalized_document_id,
+                run_id=normalized_run_id,
+            )
+            self._publish_processing_owner_unlocked(
+                path,
+                document_id=normalized_document_id,
+                owner_run_id=self._optional_identifier(owner_run_id),
+                invalidated_by_run_id=normalized_run_id,
+                prior_state=raw,
+            )
+
+    def mark_processing_outputs_dirty(
+        self,
+        *,
+        document_id: str,
+        run_id: str,
+    ) -> None:
+        """Durably invalidate the prior owner before the first output write."""
+
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            self._prepare_processing_output_write_unlocked(
+                document_id,
+                processing_claim_id=run_id,
+            )
+
     def save_processing_result(
         self,
         document_id: str,
@@ -579,9 +798,14 @@ class JsonRepository:
         chunks: list[Chunk],
         issues: list[ValidationIssue],
         *,
+        processing_claim_id: str | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> None:
         with _REPOSITORY_LOCK, self._repository_write_lock():
+            self._prepare_processing_output_write_unlocked(
+                document_id,
+                processing_claim_id=processing_claim_id,
+            )
             self._write_json_array(
                 self._result_path(document_id, "nodes"),
                 (node.model_dump(mode="json") for node in nodes),
@@ -609,9 +833,14 @@ class JsonRepository:
         document_id: str,
         chunks: list[Chunk],
         *,
+        processing_claim_id: str | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> None:
         with _REPOSITORY_LOCK, self._repository_write_lock():
+            self._prepare_processing_output_write_unlocked(
+                document_id,
+                processing_claim_id=processing_claim_id,
+            )
             self._write_json_array(
                 self._result_path(document_id, "chunks"),
                 (chunk.model_dump(mode="json") for chunk in chunks),
@@ -653,6 +882,15 @@ class JsonRepository:
 
     def list_review_records(self, document_id: str | None = None) -> list[dict]:
         records = self._list_records_with_journal("review_decisions", "review_decisions", ("review_id",))
+        if document_id:
+            records = [record for record in records if record.get("document_id") == document_id]
+        return sorted(records, key=lambda record: str(record.get("reviewed_at") or ""))
+
+    def list_review_journal_records(self, document_id: str | None = None) -> list[dict]:
+        """Read review decisions exclusively from the append-only journal."""
+
+        with _REPOSITORY_LOCK, self._repository_read_lock():
+            records = self._read_journal_records("review_decisions")
         if document_id:
             records = [record for record in records if record.get("document_id") == document_id]
         return sorted(records, key=lambda record: str(record.get("reviewed_at") or ""))
@@ -744,8 +982,18 @@ class JsonRepository:
     def get_issues(self, document_id: str) -> list[ValidationIssue]:
         return [ValidationIssue.model_validate(raw) for raw in self._read_result(document_id, "issues")]
 
-    def save_quality_report(self, document_id: str, report: QualityReport) -> None:
+    def save_quality_report(
+        self,
+        document_id: str,
+        report: QualityReport,
+        *,
+        processing_claim_id: str | None = None,
+    ) -> None:
         with _REPOSITORY_LOCK, self._repository_write_lock():
+            self._prepare_processing_output_write_unlocked(
+                document_id,
+                processing_claim_id=processing_claim_id,
+            )
             self._write_json(self._result_path(document_id, "quality"), report.model_dump(mode="json"))
 
     def get_quality_report(self, document_id: str) -> QualityReport | None:
@@ -756,6 +1004,14 @@ class JsonRepository:
         with _REPOSITORY_LOCK, self._repository_write_lock():
             record = run.model_dump(mode="json")
             append_required = self._require_journal_append_compatible("runs", record)
+            state_path = self._processing_output_state_path(run.document_id)
+            self._publish_processing_owner_unlocked(
+                state_path,
+                document_id=run.document_id,
+                owner_run_id=run.run_id if run.status == "completed" else None,
+                invalidated_by_run_id=run.run_id,
+                prior_state=self._read_processing_output_state_path(state_path),
+            )
             if append_required:
                 self._append_journal_record("runs", record, identity_validated=True)
 
@@ -765,6 +1021,7 @@ class JsonRepository:
         document: Document,
         job: ProcessingJob,
         run: ProcessingRun,
+        processing_claim_id: str | None = None,
     ) -> None:
         """Exception-atomically commit one terminal document, job, and run outcome."""
 
@@ -776,10 +1033,19 @@ class JsonRepository:
             raise ValueError("Processing outcome must be terminal.")
         with _REPOSITORY_LOCK, self._repository_write_lock():
             run_journal_path = self._journal_path("runs")
+            state_path = self._processing_output_state_path(document.document_id)
             manifest_snapshot = _capture_file_snapshot(self.manifest_path)
             run_journal_snapshot = _capture_file_snapshot(run_journal_path)
+            state_snapshot = _capture_file_snapshot(state_path)
             run_record = run.model_dump(mode="json")
             append_required = self._require_journal_append_compatible("runs", run_record)
+            prior_state = self._read_processing_output_state_path(state_path)
+            if processing_claim_id is not None:
+                prior_state = self._require_processing_claim_unlocked(
+                    state_path,
+                    document_id=document.document_id,
+                    run_id=processing_claim_id,
+                )
             data = self._read_manifest_for_update()
             data.setdefault("documents", {})[document.document_id] = document.model_dump(mode="json")
             data.setdefault("jobs", {})[job.job_id] = job.model_dump(mode="json")
@@ -794,9 +1060,17 @@ class JsonRepository:
                         run_record,
                         identity_validated=True,
                     )
+                self._publish_processing_owner_unlocked(
+                    state_path,
+                    document_id=document.document_id,
+                    owner_run_id=run.run_id if run.status == "completed" else None,
+                    invalidated_by_run_id=run.run_id,
+                    prior_state=prior_state,
+                )
             except BaseException as exc:
                 rollback_errors: list[str] = []
                 for path, snapshot in (
+                    (state_path, state_snapshot),
                     (run_journal_path, run_journal_snapshot),
                     (self.manifest_path, manifest_snapshot),
                 ):
@@ -853,19 +1127,70 @@ class JsonRepository:
         *,
         options: dict | None = None,
         require_outputs: bool = False,
+        processing_claim_id: str | None = None,
     ) -> ProcessingRun | None:
-        runs = [run for run in self.list_runs(document_id) if run.status == "completed"]
+        document_runs = self.list_runs(document_id)
+        if require_outputs:
+            owner_run_id = self._reusable_output_owner_run_id(
+                document_id,
+                document_runs=document_runs,
+                processing_claim_id=processing_claim_id,
+            )
+            if owner_run_id is None:
+                return None
+            candidate = next(
+                (run for run in document_runs if run.run_id == owner_run_id),
+                None,
+            )
+            if candidate is None:
+                return None
+            if candidate.status != "completed":
+                return None
+            if options is not None and self._canonical_json(
+                candidate.options
+            ) != self._canonical_json(options):
+                return None
+            return (
+                candidate
+                if self._has_reusable_outputs(
+                    document_id,
+                    candidate,
+                    expected_owner_run_id=owner_run_id,
+                )
+                else None
+            )
+
+        runs = [run for run in document_runs if run.status == "completed"]
         if options is not None:
             expected = self._canonical_json(options)
             runs = [run for run in runs if self._canonical_json(run.options) == expected]
-        if require_outputs:
-            runs = [run for run in runs if self.has_reusable_outputs(document_id, run)]
         return runs[-1] if runs else None
 
     def has_reusable_outputs(self, document_id: str, run: ProcessingRun) -> bool:
+        document_runs = self.list_runs(document_id)
+        owner_run_id = self._reusable_output_owner_run_id(
+            document_id,
+            document_runs=document_runs,
+        )
+        return self._has_reusable_outputs(
+            document_id,
+            run,
+            expected_owner_run_id=owner_run_id,
+        )
+
+    def _has_reusable_outputs(
+        self,
+        document_id: str,
+        run: ProcessingRun,
+        *,
+        expected_owner_run_id: str | None,
+    ) -> bool:
         if run.status != "completed" or run.document_id != document_id:
             return False
-        if not self._run_outputs_still_match_document_results(document_id, run):
+        if not self._run_outputs_still_match_document_results(
+            run,
+            expected_owner_run_id=expected_owner_run_id,
+        ):
             return False
         return self._stored_results_are_reusable(document_id) and self._run_artifacts_are_reusable(run)
 
@@ -918,21 +1243,15 @@ class JsonRepository:
                 return document, run
         return None
 
-    def _run_outputs_still_match_document_results(self, document_id: str, run: ProcessingRun) -> bool:
-        """Document-level result files are overwritten by later completed runs."""
+    def _run_outputs_still_match_document_results(
+        self,
+        run: ProcessingRun,
+        *,
+        expected_owner_run_id: str | None,
+    ) -> bool:
+        """Return whether ``run`` exclusively owns the current result files."""
 
-        expected_options = self._canonical_json(run.options)
-        completed_runs = [candidate for candidate in self.list_runs(document_id) if candidate.status == "completed"]
-        seen_target = False
-        for candidate in completed_runs:
-            if candidate.run_id == run.run_id:
-                seen_target = True
-                continue
-            if not seen_target:
-                continue
-            if self._canonical_json(candidate.options) != expected_options:
-                return False
-        return seen_target
+        return bool(expected_owner_run_id and expected_owner_run_id == run.run_id)
 
     def _filter_documents_by_provenance(
         self,
@@ -1118,6 +1437,157 @@ class JsonRepository:
     def _result_path(self, document_id: str, result_type: str) -> Path:
         return self.root / f"{document_id}_{result_type}.json"
 
+    def _processing_output_state_path(self, document_id: str) -> Path:
+        digest = hashlib.sha256(str(document_id or "").encode("utf-8")).hexdigest()
+        return self.processing_owner_root / f"{digest}.json"
+
+    def _read_processing_output_state_path(self, path: Path) -> dict | None:
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def _write_processing_output_state(self, path: Path, payload: dict) -> None:
+        self.processing_owner_root.mkdir(parents=True, exist_ok=True)
+        self._write_json(path, payload)
+
+    @staticmethod
+    def _optional_identifier(value: object) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    def _require_processing_claim_unlocked(
+        self,
+        path: Path,
+        *,
+        document_id: str,
+        run_id: str,
+    ) -> dict:
+        raw = self._read_processing_output_state_path(path)
+        if (
+            raw is None
+            or str(raw.get("state") or "").strip().casefold() != "processing"
+            or str(raw.get("document_id") or "").strip() != document_id
+            or str(raw.get("claim_run_id") or "").strip() != run_id
+        ):
+            raise RuntimeError(
+                "The processing output claim is missing or belongs to another writer."
+            )
+        return raw
+
+    def _prepare_processing_output_write_unlocked(
+        self,
+        document_id: str,
+        *,
+        processing_claim_id: str | None,
+    ) -> None:
+        normalized_document_id = str(document_id or "").strip()
+        if not normalized_document_id:
+            raise ValueError("document_id is required when writing processing outputs.")
+        path = self._processing_output_state_path(normalized_document_id)
+        normalized_claim_id = self._optional_identifier(processing_claim_id)
+        if normalized_claim_id is not None:
+            raw = self._require_processing_claim_unlocked(
+                path,
+                document_id=normalized_document_id,
+                run_id=normalized_claim_id,
+            )
+            if bool(raw.get("outputs_dirty")):
+                return
+            updated = dict(raw)
+            updated["outputs_dirty"] = True
+            updated.update(self._progress_owner_metadata())
+            self._write_processing_output_state(path, updated)
+            return
+
+        raw = self._read_processing_output_state_path(path)
+        if (
+            raw is not None
+            and str(raw.get("state") or "").strip().casefold() == "processing"
+            and not self._progress_sidecar_is_stale(path, raw)
+        ):
+            raise RuntimeError(
+                "Processing outputs cannot be changed while another writer is active."
+            )
+        # Unclaimed maintenance edits cannot keep an earlier processing run as
+        # the reusable owner, even when the edited files remain valid JSON.
+        self._publish_processing_owner_unlocked(
+            path,
+            document_id=normalized_document_id,
+            owner_run_id=None,
+            invalidated_by_run_id="unclaimed-output-write",
+            prior_state=raw,
+        )
+
+    def _publish_processing_owner_unlocked(
+        self,
+        path: Path,
+        *,
+        document_id: str,
+        owner_run_id: str | None,
+        invalidated_by_run_id: str,
+        prior_state: dict | None,
+    ) -> None:
+        if (
+            prior_state is not None
+            and str(prior_state.get("state") or "").strip().casefold()
+            == "processing"
+            and not self._progress_sidecar_is_stale(path, prior_state)
+            and str(prior_state.get("claim_run_id") or "").strip()
+            != invalidated_by_run_id
+        ):
+            raise RuntimeError(
+                "The document output namespace is owned by another processing run."
+            )
+        normalized_owner = self._optional_identifier(owner_run_id)
+        payload: dict[str, object] = {
+            "schema_version": "processing-output-owner-v1",
+            "document_id": document_id,
+            "state": "committed" if normalized_owner else "invalid",
+            "owner_run_id": normalized_owner,
+            "invalidated_by_run_id": invalidated_by_run_id,
+        }
+        payload.update(self._progress_owner_metadata())
+        self._write_processing_output_state(path, payload)
+
+    def _reusable_output_owner_run_id(
+        self,
+        document_id: str,
+        *,
+        document_runs: list[ProcessingRun],
+        processing_claim_id: str | None = None,
+    ) -> str | None:
+        path = self._processing_output_state_path(document_id)
+        with _REPOSITORY_LOCK, self._repository_read_lock():
+            marker_exists = path.is_file()
+            raw = self._read_processing_output_state_path(path)
+        if marker_exists:
+            if (
+                raw is None
+                or str(raw.get("document_id") or "").strip() != document_id
+            ):
+                return None
+            state = str(raw.get("state") or "").strip().casefold()
+            if state == "committed":
+                return self._optional_identifier(raw.get("owner_run_id"))
+            if (
+                state == "processing"
+                and not bool(raw.get("outputs_dirty"))
+                and self._optional_identifier(processing_claim_id)
+                == self._optional_identifier(raw.get("claim_run_id"))
+            ):
+                return self._optional_identifier(raw.get("previous_owner_run_id"))
+            return None
+
+        # Legacy repositories have no owner marker. Their best available
+        # evidence is the final run by started_at, matching the old behavior.
+        if not document_runs or document_runs[-1].status != "completed":
+            return None
+        return document_runs[-1].run_id
+
     def _job_progress_path(self, job_id: str) -> Path:
         digest = hashlib.sha256(str(job_id or "").encode("utf-8")).hexdigest()
         return self.job_progress_root / f"{digest}.json"
@@ -1194,6 +1664,15 @@ class JsonRepository:
     def _journal_path(self, journal_name: str) -> Path:
         return self.root / "journals" / f"{journal_name}.jsonl"
 
+    def _journal_file_identity(self, path: Path) -> _JournalFileIdentity:
+        """Identify the immutable gzip base and mutable JSONL tail together."""
+
+        compressed_path = Path(f"{path}.gz")
+        return (
+            self._file_identity(compressed_path) if compressed_path.is_file() else None,
+            self._file_identity(path) if path.is_file() else None,
+        )
+
     def _append_journal_record(
         self,
         journal_name: str,
@@ -1205,27 +1684,34 @@ class JsonRepository:
             return
         path = self._journal_path(journal_name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        before_identity = self._file_identity(path)
+        before_identity = self._journal_file_identity(path)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
         cache_key = str(path.resolve())
-        cached = _JOURNAL_IDENTITY_CACHE.get(cache_key)
+        cached = _journal_cache_get(_JOURNAL_IDENTITY_CACHE, cache_key)
         if cached is not None and cached[0] == before_identity:
             updated_index = dict(cached[1])
             id_fields = _JOURNAL_ID_FIELDS.get(journal_name, ())
             record_id = self._record_identity(record, id_fields) if id_fields else ""
             if record_id:
                 updated_index[record_id] = self._record_digest(record)
-            _JOURNAL_IDENTITY_CACHE[cache_key] = (self._file_identity(path), updated_index)
+            _journal_cache_set(
+                _JOURNAL_IDENTITY_CACHE,
+                cache_key,
+                (self._journal_file_identity(path), updated_index),
+                max_entries=_JOURNAL_IDENTITY_CACHE_MAX_ENTRIES,
+            )
         else:
             _JOURNAL_IDENTITY_CACHE.pop(cache_key, None)
-        cached_records = _JOURNAL_RECORD_CACHE.get(cache_key)
+        cached_records = _journal_cache_get(_JOURNAL_RECORD_CACHE, cache_key)
         if cached_records is not None and cached_records[0] == before_identity:
             updated_records = list(cached_records[1])
             updated_records.append(record)
-            _JOURNAL_RECORD_CACHE[cache_key] = (
-                self._file_identity(path),
-                updated_records,
+            _journal_cache_set(
+                _JOURNAL_RECORD_CACHE,
+                cache_key,
+                (self._journal_file_identity(path), updated_records),
+                max_entries=_JOURNAL_RECORD_CACHE_MAX_ENTRIES,
             )
         else:
             _JOURNAL_RECORD_CACHE.pop(cache_key, None)
@@ -1233,59 +1719,71 @@ class JsonRepository:
     def _read_journal_records(self, journal_name: str) -> list[dict]:
         path = self._journal_path(journal_name)
         compressed_path = Path(f"{path}.gz")
-        if not path.is_file() and compressed_path.is_file():
-            path = compressed_path
-        if not path.is_file():
+        identity = self._journal_file_identity(path)
+        if not any(identity):
             return []
-        identity = self._file_identity(path)
         cache_key = str(path.resolve())
-        cached = _JOURNAL_RECORD_CACHE.get(cache_key)
+        cached = _journal_cache_get(_JOURNAL_RECORD_CACHE, cache_key)
         if cached is not None and cached[0] == identity:
             return list(cached[1])
-        try:
-            if path.suffix.casefold() == ".gz":
-                with gzip.open(path, "rt", encoding="utf-8") as handle:
-                    lines = handle.read().splitlines()
-            else:
-                lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError) as exc:
-            raise JournalIntegrityError(f"Journal '{journal_name}' could not be read as UTF-8 JSONL.") from exc
         records: list[dict] = []
         records_by_id: dict[str, dict] = {}
         id_fields = _JOURNAL_ID_FIELDS.get(journal_name, ())
-        for line_number, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line, object_pairs_hook=_journal_json_object)
-            except _DuplicateJournalJsonKey as exc:
-                raise JournalIntegrityError(
-                    f"Journal '{journal_name}' contains a duplicate JSON key at line {line_number}."
-                ) from exc
-            except json.JSONDecodeError as exc:
-                raise JournalIntegrityError(
-                    f"Journal '{journal_name}' contains malformed JSON at line {line_number}."
-                ) from exc
-            if not isinstance(item, dict):
-                raise JournalIntegrityError(
-                    f"Journal '{journal_name}' contains a non-object record at line {line_number}."
+        try:
+            line_number = 0
+            for journal_path, is_compressed in (
+                (compressed_path, True),
+                (path, False),
+            ):
+                if not journal_path.is_file():
+                    continue
+                journal_handle = (
+                    gzip.open(journal_path, "rt", encoding="utf-8")
+                    if is_compressed
+                    else journal_path.open("r", encoding="utf-8")
                 )
-            record_id = self._record_identity(item, id_fields) if id_fields else ""
-            if id_fields and not record_id:
-                raise JournalIntegrityError(
-                    f"Journal '{journal_name}' is missing its record identity at line {line_number}."
-                )
-            previous = records_by_id.get(record_id) if record_id else None
-            if previous is not None and previous != item:
-                raise JournalIntegrityError(
-                    f"Journal '{journal_name}' contains conflicting records for identity "
-                    f"'{record_id[:128]}' at line {line_number}."
-                )
-            if record_id and previous is None:
-                records_by_id[record_id] = item
-            records.append(item)
-        _JOURNAL_RECORD_CACHE[cache_key] = (identity, records)
-        return records
+                with journal_handle as handle:
+                    for line in _iter_journal_lines(handle):
+                        line_number += 1
+                        if not line.strip():
+                            continue
+                        try:
+                            item = json.loads(line, object_pairs_hook=_journal_json_object)
+                        except _DuplicateJournalJsonKey as exc:
+                            raise JournalIntegrityError(
+                                f"Journal '{journal_name}' contains a duplicate JSON key at line {line_number}."
+                            ) from exc
+                        except json.JSONDecodeError as exc:
+                            raise JournalIntegrityError(
+                                f"Journal '{journal_name}' contains malformed JSON at line {line_number}."
+                            ) from exc
+                        if not isinstance(item, dict):
+                            raise JournalIntegrityError(
+                                f"Journal '{journal_name}' contains a non-object record at line {line_number}."
+                            )
+                        record_id = self._record_identity(item, id_fields) if id_fields else ""
+                        if id_fields and not record_id:
+                            raise JournalIntegrityError(
+                                f"Journal '{journal_name}' is missing its record identity at line {line_number}."
+                            )
+                        previous = records_by_id.get(record_id) if record_id else None
+                        if previous is not None and previous != item:
+                            raise JournalIntegrityError(
+                                f"Journal '{journal_name}' contains conflicting records for identity "
+                                f"'{record_id[:128]}' at line {line_number}."
+                            )
+                        if record_id and previous is None:
+                            records_by_id[record_id] = item
+                        records.append(item)
+        except (OSError, UnicodeError) as exc:
+            raise JournalIntegrityError(f"Journal '{journal_name}' could not be read as UTF-8 JSONL.") from exc
+        _journal_cache_set(
+            _JOURNAL_RECORD_CACHE,
+            cache_key,
+            (identity, records),
+            max_entries=_JOURNAL_RECORD_CACHE_MAX_ENTRIES,
+        )
+        return list(records)
 
     def _require_journal_append_compatible(self, journal_name: str, record: dict) -> bool:
         id_fields = _JOURNAL_ID_FIELDS.get(journal_name, ())
@@ -1306,22 +1804,24 @@ class JsonRepository:
 
     def _journal_identity_index(self, journal_name: str) -> dict[str, str]:
         path = self._journal_path(journal_name)
-        compressed_path = Path(f"{path}.gz")
-        if not path.is_file() and compressed_path.is_file():
-            path = compressed_path
-        identity = self._file_identity(path)
+        identity = self._journal_file_identity(path)
         cache_key = str(path.resolve())
-        cached = _JOURNAL_IDENTITY_CACHE.get(cache_key)
+        cached = _journal_cache_get(_JOURNAL_IDENTITY_CACHE, cache_key)
         if cached is not None and cached[0] == identity:
             return cached[1]
         id_fields = _JOURNAL_ID_FIELDS.get(journal_name, ())
         index: dict[str, str] = {}
-        if id_fields and identity is not None:
+        if id_fields and any(identity):
             for record in self._read_journal_records(journal_name):
                 record_id = self._record_identity(record, id_fields)
                 if record_id:
                     index[record_id] = self._record_digest(record)
-        _JOURNAL_IDENTITY_CACHE[cache_key] = (identity, index)
+        _journal_cache_set(
+            _JOURNAL_IDENTITY_CACHE,
+            cache_key,
+            (identity, index),
+            max_entries=_JOURNAL_IDENTITY_CACHE_MAX_ENTRIES,
+        )
         return index
 
     def _record_digest(self, record: dict) -> str:
@@ -1380,6 +1880,7 @@ class JsonRepository:
 
         tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
         encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+        write_buffer_chars = 64 * 1024
         progress_interval = max(1, total // 100) if total else 1
         try:
             with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -1388,8 +1889,24 @@ class JsonRepository:
                 for written, record in enumerate(records, start=1):
                     if written > 1:
                         handle.write(",")
-                    for piece in encoder.iterencode(record):
-                        handle.write(piece)
+                    if not _json_value_needs_buffered_encoding(record):
+                        # The usual small record stays on the fast one-write path.
+                        handle.write(encoder.encode(record))
+                    else:
+                        # Coalesce the encoder's pieces into bounded writes.
+                        # This avoids a second full-record string for exceptional
+                        # large tables or parser inventory rows.
+                        pieces: list[str] = []
+                        buffered_chars = 0
+                        for piece in encoder.iterencode(record):
+                            pieces.append(piece)
+                            buffered_chars += len(piece)
+                            if buffered_chars >= write_buffer_chars:
+                                handle.write("".join(pieces))
+                                pieces.clear()
+                                buffered_chars = 0
+                        if pieces:
+                            handle.write("".join(pieces))
                     if progress_callback is not None and (
                         written == 1 or written == total or written % progress_interval == 0
                     ):
@@ -1408,9 +1925,11 @@ class JsonRepository:
         with path.open("r", encoding="utf-8") as handle:
             buffer = ""
 
-            def fill() -> bool:
+            def fill(requested_size: int | None = None) -> bool:
                 nonlocal buffer
-                part = handle.read(read_size)
+                part = handle.read(
+                    read_size if requested_size is None else requested_size
+                )
                 if not part:
                     return False
                 buffer += part
@@ -1447,13 +1966,20 @@ class JsonRepository:
                 if state == "value" and buffer.startswith("]"):
                     raise json.JSONDecodeError("Trailing comma in JSON array", buffer, 0)
 
+                next_decode_read_size = max(1, read_size)
                 while True:
                     try:
                         value, end = decoder.raw_decode(buffer)
                         break
                     except json.JSONDecodeError:
-                        if not fill():
+                        if not fill(next_decode_read_size):
                             raise
+                        # A large string, table, or nested inventory is still one
+                        # top-level JSON value. Retrying after every fixed 64 KiB
+                        # chunk reparses its entire prefix and becomes quadratic.
+                        # Geometric refills bound the repeated prefix work while
+                        # retaining only this record and any small read-ahead.
+                        next_decode_read_size *= 2
                 yield value
                 buffer = buffer[end:]
                 state = "comma_or_end"

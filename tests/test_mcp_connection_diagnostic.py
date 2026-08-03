@@ -137,6 +137,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             },
             attempt_id=ATTEMPT,
             config_fingerprint=FINGERPRINT,
+            connection_target="codex",
         )
 
         self.assertEqual("pending", report["overall_state"])
@@ -163,6 +164,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             },
             attempt_id=ATTEMPT,
             config_fingerprint=FINGERPRINT,
+            connection_target="codex",
         )
 
         self.assertEqual("pending", report["overall_state"])
@@ -346,11 +348,12 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             legacy,
             attempt_id=ATTEMPT,
             config_fingerprint=FINGERPRINT,
+            connection_target="codex",
         )
 
         self.assertEqual("configured", report["overall_state"])
         self.assertFalse(report["connected"])
-        self.assertEqual("pending", report["stages"]["desktop_surface"]["state"])
+        self.assertEqual("not_applicable", report["stages"]["desktop_surface"]["state"])
         self.assertEqual("pending", report["stages"]["conversation"]["state"])
         self.assertEqual(
             "legacy_conversation_proof_not_current",
@@ -371,7 +374,8 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
                 "fresh_codex_app_server_runtime_fingerprint": "sha256:runtime-current",
                 "desktop_app_server_loader_verified": True,
                 "updated_at": CHECKED_AT,
-            }
+            },
+            connection_target="codex",
         )
 
         self.assertEqual("pending", report["overall_state"])
@@ -403,6 +407,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             },
             attempt_id=ATTEMPT,
             config_fingerprint=FINGERPRINT,
+            connection_target="codex",
         )
 
         self.assertEqual("configured", report["overall_state"])
@@ -423,6 +428,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             },
             attempt_id=ATTEMPT,
             config_fingerprint=FINGERPRINT,
+            connection_target="codex",
         )
 
         self.assertEqual("pending", report["overall_state"])
@@ -522,7 +528,7 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
         self.assertEqual("not_applicable", report["stages"]["desktop_reload"]["state"])
         self.assertEqual("not_applicable", report["stages"]["desktop_surface"]["state"])
 
-    def test_post_restart_observer_status_satisfies_chatgpt_reload_only(self) -> None:
+    def test_chatgpt_local_observer_status_is_always_unsupported(self) -> None:
         runtime_fingerprint = "sha256:runtime-current"
         report = diagnostic_from_bundle_status(
             {
@@ -544,9 +550,81 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
             connection_target="chatgpt-desktop-local",
         )
 
-        self.assertEqual("verified", report["stages"]["desktop_reload"]["state"])
-        self.assertEqual("pending", report["stages"]["desktop_surface"]["state"])
+        self.assertEqual("unsupported", report["overall_state"])
+        self.assertEqual("chatgpt_local_unsupported", report["reason_code"])
+        self.assertEqual("not_applicable", report["stages"]["desktop_reload"]["state"])
+        self.assertFalse(report["configured"])
         self.assertFalse(report["connected"])
+
+    def test_omitted_target_fails_closed_for_local_or_ambiguous_status(self) -> None:
+        direct_success = {
+            "installation_attempt_id": ATTEMPT,
+            "installed_config_fingerprint": FINGERPRINT,
+            "direct_config_registered": True,
+            "direct_config_loader_verified": True,
+            "installed_config_transport_verified": True,
+            "transport_end_to_end_verified": True,
+            "fresh_codex_app_server_inventory_verified": True,
+            "desktop_app_server_loader_verified": True,
+            "end_to_end_verified": True,
+        }
+        local = diagnostic_from_bundle_status(
+            {
+                **direct_success,
+                "legacy_projection_target": "chatgpt_desktop",
+                "active_target": "chatgpt-desktop-local",
+            }
+        )
+
+        self.assertEqual("chatgpt-desktop-local", local["connection_target"])
+        self.assertEqual("unsupported", local["overall_state"])
+        self.assertEqual("chatgpt_local_unsupported", local["reason_code"])
+        self.assertFalse(local["configured"])
+        self.assertFalse(local["connected"])
+
+        ambiguous = diagnostic_from_bundle_status(
+            {
+                **direct_success,
+                "legacy_projection_target": "codex-cli",
+                "active_target": "claude-desktop",
+            }
+        )
+        self.assertEqual("pending", ambiguous["overall_state"])
+        self.assertEqual("target_required", ambiguous["reason_code"])
+        self.assertFalse(ambiguous["configured"])
+        self.assertFalse(ambiguous["connected"])
+
+    def test_invalid_explicit_target_cannot_promote_legacy_direct_success(self) -> None:
+        legacy_success = {
+            "installation_attempt_id": ATTEMPT,
+            "installed_config_fingerprint": FINGERPRINT,
+            "direct_config_registered": True,
+            "direct_config_loader_verified": True,
+            "installed_config_transport_verified": True,
+            "transport_end_to_end_verified": True,
+            "fresh_codex_app_server_inventory_verified": True,
+            "desktop_app_server_loader_verified": True,
+            "end_to_end_verified": True,
+        }
+
+        for invalid_target in ("", "unknown-client"):
+            with self.subTest(connection_target=invalid_target):
+                report = diagnostic_from_bundle_status(
+                    legacy_success,
+                    connection_target=invalid_target,
+                )
+
+                self.assertEqual("pending", report["overall_state"])
+                self.assertEqual("target_required", report["reason_code"])
+                self.assertFalse(report["configured"])
+                self.assertFalse(report["connected"])
+
+        remote = diagnostic_from_bundle_status(
+            legacy_success,
+            connection_target="chatgpt",
+        )
+        self.assertEqual("chatgpt-remote", remote["connection_target"])
+        self.assertNotEqual("target_required", remote.get("reason_code"))
 
     def test_post_restart_observer_status_satisfies_claude_reload_only(self) -> None:
         runtime_fingerprint = "sha256:runtime-current"
@@ -627,8 +705,22 @@ class McpConnectionDiagnosticTests(unittest.TestCase):
         self.assertTrue(codex["configured"])
         self.assertEqual("client_connections", codex["status_source"])
         self.assertFalse(chatgpt["configured"])
-        self.assertEqual("registration", chatgpt["first_blocking_stage"])
-        self.assertEqual("not_checked", chatgpt["stages"]["registration"]["state"])
+        self.assertEqual("unsupported", chatgpt["overall_state"])
+        self.assertEqual("chatgpt_local_unsupported", chatgpt["reason_code"])
+        self.assertIsNone(chatgpt["first_blocking_stage"])
+        self.assertEqual("not_applicable", chatgpt["stages"]["registration"]["state"])
+
+    def test_generic_chatgpt_alias_selects_remote_profile(self) -> None:
+        report = build_connection_diagnostic(
+            {},
+            attempt_id=None,
+            config_fingerprint=None,
+            connection_target="chatgpt",
+        )
+
+        self.assertEqual("chatgpt-remote", report["connection_target"])
+        self.assertNotEqual("unsupported", report["overall_state"])
+        self.assertNotIn("fresh_app_server", report["stage_order"])
 
     def test_v5_diagnostic_uses_each_remote_client_record(self) -> None:
         required_stages = {

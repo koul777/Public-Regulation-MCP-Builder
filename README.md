@@ -1,3 +1,90 @@
+# 최근 업데이트: 2026년 8월 3일
+
+오늘은 처음 사용하는 사람도 규정 파일을 올려 MCP를 만들 수 있도록 화면 안내를
+보완하고, 규정을 각각 올렸을 때와 합본 규정집으로 올렸을 때의 결과가 같도록 처리
+기준을 강화했습니다.
+
+## 초보자 안내 모드 추가
+
+- 첫 화면에서 **초보자 안내 시작**과 일반 모드 중 하나를 선택할 수 있습니다.
+- 초보자 모드에서는 지금 눌러야 할 위치를 빨간 테두리·화살표·단계 번호로 보여 주고,
+  이전·다음·건너뛰기·다시 시작을 지원합니다.
+- 파일 등록 → 결과 확인 → 사람 검수·승인 → MCP 생성·연결 순서로 안내하되, 승인이나
+  색인을 사용자 확인 없이 자동 실행하지 않습니다.
+- 같은 문서를 안내 단계마다 다시 전처리하지 않고 기존 결과를 이어서 사용하도록 해
+  불필요한 대기 시간을 줄였습니다.
+
+## 개별 규정 파일과 합본 규정집의 결과 통일
+
+- 규정을 파일별로 각각 올리거나 여러 규정을 합친 규정집 한 개로 올려도 MCP에서 보이는
+  **규정 목록·목차·조문·검색 결과의 논리적 구조**가 같도록 정규화했습니다.
+- MCP를 만들거나 갱신할 때 계층 색인을 자동 생성하므로 사용자가 별도로 다시 만들 필요가
+  없습니다.
+- 합본 안의 규정 경계를 확실히 구분할 수 없으면 일부 조문을 잘못 등록하지 않고 검수와
+  MCP 노출을 안전하게 차단합니다.
+- `chatgpt-data` 연결에는 `list_regulations`를 포함해 목록 → 목차 → 정확 조문 → 참조 관계 →
+  검색 → 원문 확인에 필요한 읽기 도구 7개를 노출합니다.
+
+## 안전성과 성능 검증 보강
+
+- 사람이 승인한 내용만 검색 색인과 MCP에 포함하며, 전달 파일에는 담당자 이름·검토 메모·
+  작업 PC 경로 같은 운영 정보를 넣지 않도록 승인 자료를 최소화했습니다.
+- 500페이지 합성 텍스트 PDF를 같은 바이트로 다시 측정한 결과 16.981초, 초당 29.445페이지,
+  품질 98점을 확인했습니다. 이 수치는 스캔 이미지 OCR이나 모든 HWP/HWPX 문서의 속도를
+  보장하는 값은 아닙니다.
+- 저장소 전체 3,002개 테스트, 핵심 업로드·계층 MCP·성능 회귀 315개 테스트, 격리된 소스
+  배포본 296개 테스트와 Windows 실행판 자체 점검을 통과했습니다.
+
+---
+
+# 이전 업데이트: 2026년 7월 29일~8월 1일
+
+아래 내용은 이 기간에 적용된 주요 변경을 비전공자도 이해하기 쉽도록 기능 중심으로
+정리한 것입니다.
+
+## 7월 29일 — 많은 규정을 더 빠르고 정확하게 관리
+
+- 규정을 단순한 파일 목록이 아니라 **규정 → 개정본 → 장·절·조·별표·부칙** 순서로
+  살펴볼 수 있도록 구조를 정리했습니다.
+- 새 규정이나 개정본을 추가할 때 전체 자료를 처음부터 다시 만들지 않고, **바뀐 규정만
+  다시 처리하고 검색 목록에 반영**하도록 개선했습니다.
+- 현재 시행 중인 규정과 과거 개정본을 구분해, 질문한 날짜에 맞는 내용을 찾을 수
+  있도록 날짜 기준 조회를 보강했습니다.
+- ChatGPT·Codex·Claude가 규정을 조회하게 하는 MCP 연결 기능에서 규정 목록, 목차,
+  조문, 인용 관계, 순환 인용, 자연어 검색과 원문 확인을 일관되게 사용할 수 있도록
+  7개 도구의 동작을 점검했습니다.
+- 처음 사용하는 사람도 파일 등록부터 검수·승인, AI 연결까지 따라 할 수 있도록
+  README 안내를 쉬운 표현과 단계별 흐름으로 개편했습니다.
+
+## 7월 31일 — 검색 속도와 Windows 배포 안정성 개선
+
+- 규정 수가 많아져도 목록·목차·조문 검색이 느려지지 않도록 반복 작업을 줄이고 검색
+  처리 속도를 개선했습니다.
+- 검색 속도와 결과 품질을 같은 기준으로 측정할 수 있도록 검증 자료와 자동 점검 절차를
+  보강했습니다.
+- Windows에서 테스트와 배포를 실행할 때 운영체제별 경로 차이 때문에 실패하던 문제를
+  수정했습니다.
+
+## 8월 1일 — 반복 조회와 첫 연결의 대기 시간 단축
+
+- 한 번 안전성을 확인한 검색 데이터를 다시 사용할 수 있도록 저장해, 같은 자료를
+  반복해서 확인하는 시간을 줄였습니다.
+- 규정의 장·절·조 연결 구조를 매번 새로 계산하지 않고 재사용하도록 개선해, 목록·목차·
+  조문을 연속해서 조회할 때의 준비 시간을 단축했습니다.
+- 잘못된 형식의 MCP 요청은 실제 검색을 시작하기 전에 명확하게 거절하도록 입력 검사를
+  강화했습니다.
+- 서버가 시작할 때 미리 수행하던 불필요한 작업을 줄여 첫 연결과 첫 요청의 대기 시간을
+  개선했습니다.
+- 성능 개선으로 기존 검색 결과가 달라지지 않는지 자동 테스트를 추가했습니다.
+- 자동 배포가 다른 변경과 겹쳐도 버전이 잘못 게시되지 않도록 배포 절차를
+  안정화했습니다.
+
+버전별 세부 변경 내용과 다운로드 파일은
+[GitHub Releases](https://github.com/koul777/Public-Regulation-MCP-Builder/releases)에서
+확인할 수 있습니다.
+
+---
+
 # PR MCP Builder
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&logoColor=white)](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)
@@ -18,6 +105,67 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 2. **승인 기반 RAG 검색엔진** — 사람이 승인한 청크만 검색하고 원문 근거를 돌려줍니다.
 3. **MCP 서버** — 로컬 STDIO 또는 Vercel HTTPS로 AI 프로그램에 도구를 제공합니다.
 
+## 처음 사용자를 위한 5분 빠른 시작
+
+이 안내를 읽는 데 약 5분이 걸립니다. 문서 자체의 전처리 시간은 파일 크기·형식에 따라
+별도로 걸릴 수 있습니다. 처음에는 연결 기술 용어를 고르지 말고 아래 네 화면만
+순서대로 완료하세요.
+
+[Windows 실행판](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)의
+압축을 풀어 프로그램을 실행하고, 작업할 기관을 만들거나 선택하면 시작할 수 있습니다.
+
+> [!NOTE]
+> 이 작업 트리에 새로 추가된 **초보자 안내 모드와 Windows 실행 보완은 다음 portable
+> 릴리스에 포함될 예정**입니다. 현재 `releases/latest` 실행판에 첫 선택 화면이 보이지
+> 않으면 소스 실행으로 확인하거나, 새 portable 릴리스와 fresh-Windows 검증이 끝난 뒤
+> 다운로드하세요.
+
+첫 업로드 전에 화면의 **공식 MCP 품질 준비 확인**을 먼저 보세요. PDF·HWP·HWPX·DOCX 모두
+일반 본문과 조문 구조를 빠르게 읽는 전처리는 Kordoc 설치 전에도 시작할 수 있습니다. 다만 이 네
+지원 형식으로 **공식 MCP 파일 묶음을 만들 때는 Kordoc 표 파싱 품질 증거가 반드시 필요**합니다.
+준비되면 **Kordoc 사용 가능**, 없으면 **Kordoc 설치·검증 시작**이 표시됩니다. 설치 버튼은
+Node.js/npm을 이용한 사용자 전역 설치임을 설명하며, 동의해 버튼을 누른 경우에만
+설치를 시작합니다. 설치가 끝나면 앱을 완전히 종료하세요. Windows 실행판은
+`PR MCP Builder.exe`를 다시 더블클릭하고, 소스 실행은 `START_HERE.bat`을 다시 실행해
+**Kordoc 사용 가능** 표시를 확인하세요. Kordoc 없이 처리한 PDF·HWP·HWPX·DOCX는 ④ 전에
+Kordoc을 설치한 뒤 새 초안으로 다시 전처리·검수·승인해야 합니다. 이 재전처리는
+화면 진입만으로 시작되지 않으며, 예상 작업을 읽고 **안전 재전처리** 버튼을 직접 눌렀을 때만 시작됩니다.
+
+| 순서 | 화면에서 할 일 | 다음으로 넘어가는 신호 |
+| --- | --- | --- |
+| ① | `① 문서 올려서 전처리`에서 **문서 업로드**로 규정 파일을 고른 뒤 **전처리 시작**을 누름. 기본은 빠른 구조 전처리이며, 외부 AI 검수는 **AI로 의심 구간 추가 검수 (선택)**을 직접 선택한 경우에만 실행 | **전처리 완료** |
+| ② | `② 결과 확인`의 **정리된 내용(청크)** 탭에서 원문·결과를 좌우 비교하고 **이슈** 탭 확인 | 원문과 처리 결과가 일치하고 확인 필요 이슈를 읽음 |
+| ③ | `③ 검수하고 승인`에서 사람이 확인한 내용만 **승인하고 색인**. 제외할 청크만 사유·확인을 마친 뒤 **이 청크 반려** | **승인·색인 완료** 또는 명시 반려로 처리 방향 결정 |
+| ④ | `④ MCP 생성·AI 연결`에서 **AI 앱 선택 → 생성할 MCP 이름 (필수 입력) → MCP로 쓸 파일 묶음 만들기 → 연결 확인** 순서로 진행 | 실제 AI에서 `list_regulations`로 승인된 규정 목록을 확인하고, `search`·`fetch`가 승인 원문과 출처를 반환함 |
+
+첫 화면에서 **초보자 안내 시작**을 선택한 뒤 기관을 만들거나 선택하면,
+지금 눌러야 할 곳에 빨간 테두리·화살표·원형 단계 번호가 표시됩니다. 빨간 테두리는 오류가
+아니라 **현재 안내 대상**이라는 뜻입니다. 버튼을 누르기 전 짧은 설명을 읽고, 실제
+완료 상태를 확인한 뒤 다음 단계로 이동하세요. 안내가 필요 없으면 첫 선택 화면에서
+**일반 모드로 계속**을 누르면 됩니다. 기관을 이미 선택한 상태라면 사이드바의
+**초보자 안내 모드**를 켜도 됩니다.
+
+- 안내를 잠시 끄려면 **안내 건너뛰기**를 누르거나 사이드바에서 모드를 끕니다.
+- 다시 보려면 **처음부터 다시 보기**를 누릅니다.
+- **이전 단계**와 **다음 단계**는 설명 위치만 바꿉니다. 승인과 색인은 자동으로
+  실행하지 않으므로 반드시 사람이 원문을 확인해야 합니다.
+- 마지막의 **AI 앱에서 search와 fetch 도구 호출이 성공한 것을 확인했습니다**는 MCP 이름 입력과
+  파일 생성, 화면 아래의 앱별 등록·연결 진단까지 마친 뒤 실제 AI 대화에서 승인 원문과 출처가 반환됐을 때만
+  선택하세요. 문서 범위·저장 방식이 다른 묶음을 새로 만들면 새 묶음에서 다시 확인해야
+  완료로 표시됩니다.
+- 실제 AI 대화에서는 먼저 `list_regulations`로 승인된 규정 목록이 보이는지 확인한 다음,
+  필요한 규정을 `search`로 찾고 `fetch`로 승인 원문과 출처를 확인하세요.
+- 규정별 파일을 여러 개 올려도 되고, 여러 규정을 합친 규정집 한 개를 올려도 됩니다.
+  제목·조문 경계가 분명하면 MCP의 규정 목록·목차·조문 결과는 같게 만들어집니다. 합본에서
+  별표·붙임 뒤에 새 규정을 이어 넣을 때는 새 페이지의 편·장 제목처럼 분명한 경계를 두세요.
+
+처음 연결할 때는 실제 사용할 앱을 먼저 선택하면 됩니다. Codex·Claude의 같은-PC
+연결은 STDIO를 쓰지만, **ChatGPT는 같은 PC의 로컬 서버에도 직접 연결하지 않고 원격
+HTTPS 또는 OpenAI Secure MCP Tunnel을 사용합니다.** 상세 설정은 빠른 시작을 마친 뒤
+[방법 A~E 중 내 앱 하나 고르기](#2-다섯-방법-중-하나-선택하기)에서 실제로 사용할
+방법 하나만 펼쳐 보세요. 원격 서버가 꼭 필요한 경우에만 방법 D·E의 Vercel 안내로
+넘어가면 됩니다.
+
 ### 무엇을 할 수 있나요?
 
 | 필요한 일 | PR MCP Builder가 제공하는 방법 |
@@ -30,7 +178,7 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 | 자연어로 관련 규정 찾기 | `search`로 후보를 찾고 `fetch`로 승인 원문과 출처 확인 |
 | 최신 개정본 반영 | 같은 규정의 새 버전을 등록하고 해당 규정만 다시 처리·색인 |
 | 시행일에 맞는 현재본 조회 | 개정 이력과 효력 기간을 보존하고 조회 기준일에 맞는 버전 선택 |
-| 내 PC 또는 원격 AI에서 사용 | 같은 PC는 STDIO, 원격은 Vercel HTTPS `/mcp`로 연결 |
+| 내 PC 또는 원격 AI에서 사용 | Codex·Claude의 같은-PC 연결은 STDIO, ChatGPT와 원격 AI는 HTTPS `/mcp`로 연결 |
 
 ### 규정 한 건이 AI 도구가 되기까지
 
@@ -92,7 +240,7 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 - [새 규정과 개정본 관리하기](#새-규정과-개정본-관리하기)
 - [방법 A~E 중 내 앱 하나 고르기](#2-다섯-방법-중-하나-선택하기)
 - [방법 A: Claude Code 로컬 STDIO](#method-a)
-- [방법 B: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO](#method-b)
+- [방법 B: Codex CLI / Codex IDE 로컬 STDIO](#method-b)
 - [방법 C: Claude Desktop 로컬 STDIO](#method-c)
 - [방법 D: ChatGPT · Vercel HTTPS MCP](#method-d)
 - [방법 E: Claude · Vercel HTTPS MCP](#method-e)
@@ -105,7 +253,7 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 | --- | --- |
 | MCP | AI 프로그램이 이 규정 검색기에 질문할 수 있게 해 주는 연결 규칙 |
 | 번들 | 설정 파일, 실행 파일, 승인 검색 데이터를 한 폴더에 모은 것 |
-| STDIO | 같은 PC의 AI 프로그램이 Python 서버를 직접 켜고 대화하는 로컬 연결 |
+| STDIO | 같은 PC의 AI 프로그램이 서버를 직접 켜고 대화하는 로컬 연결. Windows 실행판은 포함된 EXE, 소스 실행은 Python을 사용 |
 | HTTPS | Vercel에 서버를 배포하고 `https://.../mcp` 주소로 접속하는 원격 연결 |
 
 MCP에는 두 종류의 읽기 도구가 함께 들어 있습니다.
@@ -121,19 +269,21 @@ MCP에는 두 종류의 읽기 도구가 함께 들어 있습니다.
 
 ## 0. 완전 처음이라면 여기부터
 
-처음에는 **로컬 STDIO부터 성공시킨 뒤**, 꼭 인터넷 주소가 필요할 때만 Vercel HTTPS로
-넘어가는 것을 권장합니다. 로컬 STDIO는 Vercel 계정, Node.js, 도메인과 공개 서버가
-필요하지 않아 문제 원인을 찾기 쉽습니다.
+Codex나 Claude를 쓴다면 **로컬 STDIO부터 성공시킨 뒤**, 꼭 인터넷 주소가 필요할 때만
+Vercel HTTPS로 넘어가는 것을 권장합니다. ChatGPT만 쓴다면 처음부터 방법 D의 원격
+HTTPS 경로를 선택합니다. 로컬 STDIO 연결 자체에는 Vercel 계정, 도메인과 공개 서버가
+필요하지 않습니다. 빠른 일반 구조 전처리는 Kordoc 설치 전에도 가능하지만, PDF·HWP·HWPX·DOCX
+네 지원 형식으로 공식 MCP 묶음을 만들려면 ④ 전에 Kordoc 표 파싱 품질 증거가 필요합니다.
+Kordoc 설치에는 Node.js/npm이 필요합니다.
 
 ### 0-1. 나에게 맞는 출발점
 
 | 지금 상황 | 먼저 읽을 곳 | 필요한 것 |
 | --- | --- | --- |
 | 같은 PC의 Claude Code에서 사용 | [방법 A](#method-a) | Claude Code CLI, 생성한 번들 폴더 |
-| 같은 PC의 ChatGPT Desktop에서 사용 | [방법 B](#method-b) | ChatGPT Desktop, 생성한 번들 폴더 |
 | 같은 PC의 Codex CLI 또는 IDE에서 사용 | [방법 B](#method-b) | Codex CLI 또는 IDE, 생성한 TOML |
 | Claude Desktop과 이 프로그램을 같은 PC에서 사용 | [방법 C](#method-c) | Claude Desktop, 생성한 번들 폴더 |
-| ChatGPT에서 Vercel 주소로 원격 사용 | 로컬 검색 성공 후 [방법 D](#method-d) | Vercel 계정, Node.js, 공개 승인 데이터 |
+| ChatGPT에서 사용 | [방법 D](#method-d) | ChatGPT 웹 Developer mode, 지원 플랜·관리자 권한, 원격 HTTPS MCP |
 | Claude에서 Vercel 주소로 원격 사용 | 로컬 검색 성공 후 [방법 E](#method-e) | Vercel 계정, Node.js, 공개 승인 데이터 |
 | 아직 규정 파일을 처리하지 않음 | [1장](#1-처음-설치하고-승인-데이터-만들기) | Windows PC, 규정 원문 |
 
@@ -194,7 +344,7 @@ Windows 실행판 설치
 | --- | --- | --- | --- | --- |
 | 1-1 | Release ZIP 압축 해제 후 `PR MCP Builder.exe` 실행 | 운영 화면 시작 | 기관 선택 화면 표시 | ZIP 안에서 바로 실행하지 않았는지 확인 |
 | 1-2 | 기관 생성 또는 기존 기관 선택 | 데이터와 승인을 기관 범위로 분리 | 선택한 기관의 대시보드 표시 | 잘못 골랐다면 파일을 올리기 전에 다시 선택 |
-| 1-3 | `① 파일 추가·전처리`에서 규정 파일 추가 | 문서를 규정·조문 구조로 변환 | 전처리 완료 표시 | 규정명·버전·날짜와 오류 단계 확인 |
+| 1-3 | `① 문서 올려서 전처리`에서 규정 파일 추가 | 문서를 규정·조문 구조로 변환 | 전처리 완료 표시 | 규정명·버전·날짜와 오류 단계 확인 |
 | 1-4 | `② 결과 확인`에서 원문과 결과 비교 | 잘못 나뉜 조문·표·별표를 승인 전에 발견 | 검토할 청크와 앞뒤 문맥 확인 | 원문과 다르면 수정 또는 재처리 |
 | 1-5 | 검토한 청크 승인 후 색인 | 승인된 근거만 RAG와 MCP에 포함 | **승인 완료 + 색인 완료** | [문제 해결표](#4-문제-해결표)에서 승인·색인 상태 확인 |
 
@@ -218,6 +368,10 @@ Windows 실행판 설치
 기관을 만들거나 기존 기관을 선택합니다. 문서와 승인 데이터는 선택한 기관 범위로
 분리됩니다.
 
+아래 이미지는 **초보자 안내 시작** 또는 **일반 모드로 계속**을 고른 다음 나타나는 기관
+선택 화면입니다. 현재 버전에서는 이 이미지보다 앞에 안내 모드 선택 화면이 한 번 더
+나옵니다.
+
 ![기관을 등록하거나 선택하는 시작 화면](docs/assets/readme-guide-01-start.png)
 
 선택 후 대시보드에서 현재 작업 상태와 다음 단계를 확인합니다.
@@ -229,7 +383,7 @@ Windows 실행판 설치
 
 ### 1-3. 규정 파일 올리기
 
-1. `① 파일 추가·전처리`로 이동합니다.
+1. `① 문서 올려서 전처리`로 이동합니다.
 2. PDF·HWP·HWPX·DOCX 규정 파일을 선택합니다.
 3. 여러 규정은 한 번에 올릴 수 있지만 처음이라면 한 파일로 연습하는 것이 쉽습니다.
 4. 자동 인식된 규정명, 버전과 개정일을 원문과 비교합니다.
@@ -282,7 +436,9 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 ![승인 데이터의 검색 색인이 완료된 화면](docs/assets/readme-guide-04-indexed.png)
 
 **성공 신호:** 승인 완료와 검색 색인 완료가 함께 표시됩니다. 승인만 끝나고 색인이
-실패했다면 MCP를 만들기 전에 색인 복구를 실행합니다.
+실패했다면 `③ 검수하고 승인`에서 **문서 색인 복구**를 실행합니다. 이는 승인 청크를
+검색에 넣는 문서 색인 작업입니다. `④ MCP 생성·AI 연결`에서 만드는 **계층 색인**은
+MCP 파일 묶음을 만들거나 갱신할 때 자동으로 생성되므로, 따로 복구하거나 다시 만들 필요가 없습니다.
 
 > [!WARNING]
 > 원문 업로드, 미승인 데이터, API 키, 비밀번호와 기관 내부 비밀 자료를 공개 저장소나
@@ -300,9 +456,37 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
       └─ 별표·서식·부칙
 ```
 
+> [!TIP]
+> 규정별 파일 여러 개와 여러 규정을 합친 통합 규정집 한 개는 모두 `④ MCP 생성·AI 연결`에서
+> 규정 단위로 자동 정규화됩니다. 따라서 `list_regulations` → `get_regulation_toc` →
+> `get_regulation_article`의 논리 결과는 같은 규정·목차·조문을 가리켜야 합니다. 계층 색인은
+> 번들을 만들거나 갱신할 때 자동 생성되므로 별도로 다시 만들 필요가 없습니다. 다만 출처 추적을
+> 위해 원본 `document_id`와 보관 파일 수는 다를 수 있습니다. 원문에 규정 제목이나 조문 번호가
+> 없어 규정 단위를 구분할 수 없으면 결과 확인 단계에서 검수가 필요합니다. 특히 별표·붙임 뒤의
+> 같은 페이지에서 새 규정이 시작한다면, 새 규정 제목과 제1조만 두지 말고 **번호가 있는 목차**나
+> **새 페이지의 편·장 제목**처럼 경계를 확인할 수 있는 표지를 남기세요. 경계가 불명확하면 일부
+> 규정만 잘못 만드는 대신 생성이 안전하게 멈춥니다.
+
+> [!IMPORTANT]
+> `④ MCP로 쓸 파일 묶음 만들기`는 선택한 규정의 **현재 청크가 모두 승인되었거나 명시적으로 거부된
+> 상태**여야 진행됩니다. 검토가 남은 청크가 하나라도 있으면 안전하게 멈춥니다. 이때는
+> `③ 검수하고 승인`으로 돌아가 원문과 비교해 승인 또는 거부를 결정하고, **문서 색인**까지
+> 완료한 뒤 다시 ④를 실행하세요. 한 규정의 현재 청크를 모두 명시적으로 거부했다면 그 규정은
+> MCP에서 제외되며, 다른 승인 규정의 생성을 막지 않습니다. 단, MCP에 넣을 승인·색인 규정이
+> 최소 한 건은 있어야 합니다. 반려는 사유·담당자·결정 시각과 결정 후 내용 해시가 검토 기록에
+> 남아야 하며, 파일의 상태 글자만 임의로 `rejected`로 바꾼 경우에는 생성기가 안전하게 멈춥니다.
+> 계층 색인을 사용자가 따로 만들 필요는 없습니다.
+> 거부·분할·병합으로 빠진 청크의 본문은 전달 ZIP에 넣지 않습니다. 대신 모든 현재 청크가 왜
+> 포함되거나 제외됐는지 확인할 수 있도록 결정 ID·시각·내용 해시·분류만 담은 봉인된 최소 감사
+> 스냅샷을 함께 만듭니다. 검토 사유, 담당자, 원문 경로와 원본 검토 저널은 전달 ZIP과 MCP
+> 답변에 포함하지 않습니다.
+> 전달 ZIP의 `approvals.jsonl` 역시 원본 검토 저널이 아니라 승인 ID·기관·문서·승인 시각·청크
+> ID·승인 내용 해시만 남긴 최소 결정 원장입니다. 담당자 이름, 메모, 검토 이벤트와 작업 PC
+> 경로는 포함하지 않습니다.
+
 ### 처음 보는 규정을 추가할 때
 
-1. `① 파일 추가·전처리`에서 파일을 올립니다.
+1. `① 문서 올려서 전처리`에서 파일을 올립니다.
 2. 자동 인식된 규정명, 규정 번호, 버전, 개정일과 시행일을 원문과 비교합니다.
 3. `② 결과 확인`에서 구조와 내용을 검수합니다.
 4. 사용할 청크를 승인하고 색인 완료를 확인합니다.
@@ -356,7 +540,7 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 | 방법 | Builder에서 누를 정확한 글자 | 연결되는 곳 | 최종적으로 옮길 값 |
 | --- | --- | --- | --- |
 | **A** | `Claude Code` | 같은 PC의 Claude Code CLI | 생성된 `claude_code_add_stdio.ps1` 실행 |
-| **B** | `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)` | 같은 PC의 ChatGPT Desktop 또는 Codex | ChatGPT는 각 칸의 값, Codex는 생성된 TOML 블록 |
+| **B** | `Codex CLI / Codex IDE` | 같은 PC의 Codex | 생성된 TOML 블록 |
 | **C** | `Claude Desktop` | 같은 PC의 Claude Desktop | Builder가 만든 전체 JSON 또는 서버 한 항목 |
 | **D** | `ChatGPT · Vercel HTTPS MCP` | ChatGPT의 원격 MCP | 검증을 통과한 고정 `https://...vercel.app/mcp` 주소 |
 | **E** | `Claude · Vercel HTTPS MCP` | Claude의 원격 Connector | 검증을 통과한 고정 `https://...vercel.app/mcp` 주소 |
@@ -368,15 +552,15 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 > - D·E에는 Vercel의 HTTPS `/mcp` URL만 사용합니다.
 > - Claude Desktop의 **개발자 > 구성 편집**과 Claude의 **Connectors**는 서로 다른
 >   화면입니다.
-> - ChatGPT Desktop의 **STDIO** 입력 화면과 **스트리밍 가능한 HTTP** 입력 화면도
->   서로 다른 화면입니다.
+> - ChatGPT는 로컬 STDIO에 직접 연결하지 않습니다. 방법 D의 ChatGPT 웹 Developer
+>   mode와 원격 HTTPS MCP를 사용하세요.
 > - `Claude Code`는 명령창에서 쓰는 Claude CLI인 방법 A이고, `Claude Desktop`은
 >   설정 JSON을 편집하는 데스크톱 앱인 방법 C입니다.
 
 아래 다섯 줄 중 **내가 실제로 쓸 앱 한 줄만** 고르면 됩니다.
 
 1. **Claude Code / Claude CLI**에 붙일 것 → **방법 A**
-2. **ChatGPT Desktop / Codex CLI / Codex IDE**에 붙일 것 → **방법 B**
+2. **Codex CLI / Codex IDE**에 붙일 것 → **방법 B**
 3. **Claude Desktop 앱의 JSON 설정 파일**에 붙일 것 → **방법 C**
 4. **ChatGPT의 HTTPS MCP URL 칸**에 붙일 것 → **방법 D**
 5. **Claude Connectors의 HTTPS URL 칸**에 붙일 것 → **방법 E**
@@ -403,31 +587,21 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 **성공 신호:** `claude mcp list`에 서버가 보이고 실제 승인 원문이 반환됩니다.
 **막히면:** 상세 절차의 `claude mcp get` 결과와 번들 진단 스크립트를 확인합니다.
 
-### 방법 B — ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO
+### 방법 B — Codex CLI / Codex IDE 로컬 STDIO
 
-**언제 선택하나요?** ChatGPT Desktop 또는 Codex를 Builder와 같은 PC에서 사용할 때
-선택합니다.
+**언제 선택하나요?** Codex CLI 또는 Codex IDE를 Builder와 같은 PC에서 사용할 때
+선택합니다. ChatGPT 사용자는 방법 D로 이동하세요.
 
-1. Builder에서
-   `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)` 왼쪽 동그라미를 누릅니다.
+1. Builder에서 `Codex CLI / Codex IDE` 왼쪽 동그라미를 누릅니다.
 2. 저장 폴더와 MCP 이름을 넣고 번들을 만듭니다.
-3. **ChatGPT Desktop**이라면 **설정 > 플러그인 > MCP > + 서버 추가 > STDIO**를
-   누릅니다.
-4. Builder의 `Name`, `Command`를 같은 이름의 칸에 붙여 넣습니다.
-5. Builder의 `Argument 1` 한 줄을 첫째 인자 칸에 붙여 넣고, **+ 인자 추가**를 누른
-   다음 `Argument 2` 한 줄을 둘째 칸에 붙여 넣습니다. 마지막 번호까지 한 칸에 한
-   줄씩 반복합니다.
-6. Builder의 `Environment`, `Environment passthrough`, `Working directory`도 같은
-   이름의 칸으로 옮겨 저장합니다.
-7. **Codex CLI 또는 Codex IDE**라면 생성된 `codex_config_snippet.toml`의 블록 전체를
+3. 생성된 `codex_config_snippet.toml`의 블록 전체를
    사용자 `~/.codex/config.toml`에 붙여 넣고 Codex를 다시 시작합니다.
-8. 새 대화에서 `search`와 `fetch`를 차례로 호출합니다.
+4. 새 대화에서 `search`와 `fetch`를 차례로 호출합니다.
 
 [방법 B 화면과 각 입력 칸을 그대로 따라가기](#method-b)
 
-**성공 신호:** ChatGPT의 MCP 서버가 켜지거나 Codex가 설정 블록을 읽고 도구 목록을
-표시합니다. **막히면:** `Command`와 `Arguments`를 한 칸에 합치지 않았는지, 번들
-폴더를 생성 뒤 옮기지 않았는지 확인합니다.
+**성공 신호:** Codex가 설정 블록을 읽고 도구 목록을 표시합니다. **막히면:** TOML 블록을
+기존 설정 아래에 별도 블록으로 붙였는지, 번들 폴더를 생성 뒤 옮기지 않았는지 확인합니다.
 
 ### 방법 C — Claude Desktop 로컬 STDIO
 
@@ -457,18 +631,18 @@ AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내�
 
 ### 방법 D — ChatGPT · Vercel HTTPS MCP
 
-Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다. 원격 선택지는 검증된
-`https://.../mcp` 주소가 있어야 생성 버튼이 켜집니다.
+Vercel 주소가 아직 없어도 D를 선택하고 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저
+만들 수 있습니다. 실제 ChatGPT 연결은 검증된 `https://.../mcp` 주소를 넣어 묶음을
+다시 만든 뒤 완료됩니다.
 
-1. 승인·색인된 데이터로 로컬 번들을 하나 만든 뒤
+1. Builder에서 `ChatGPT · Vercel HTTPS MCP`를 선택하고 배포 준비용 묶음을 만든 뒤
    [Vercel 공통 준비 V-1~V-7](#vercel-common)을
    따라 Production 배포와 검증을 끝냅니다.
-2. Builder로 돌아와 `ChatGPT · Vercel HTTPS MCP` 왼쪽 동그라미를 누릅니다.
-3. **배포된 Vercel HTTPS `/mcp` 주소** 칸에 V-7을 통과한 전체 주소를 붙여 넣습니다.
-4. 번들을 만든 뒤 ChatGPT의
-   **설정 > 플러그인 > MCP > + 서버 추가 > 스트리밍 가능한 HTTP**를 누릅니다.
-5. 이름을 넣고 URL 칸에 같은 `/mcp` 주소를 붙여 넣어 저장합니다.
-6. 새 대화에서 `search`와 `fetch`를 차례로 호출합니다.
+2. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 V-7을 통과한 전체 주소를 붙여 넣습니다.
+3. 묶음을 다시 만든 뒤 ChatGPT 웹에서
+   **Settings > Apps > Advanced settings > Developer mode**를 켭니다.
+4. Apps 설정에서 새 앱을 만들고 같은 `/mcp` 주소와 승인된 인증을 등록합니다.
+5. 새 대화에서 앱을 선택하고 `search`와 `fetch`를 차례로 호출합니다.
 
 [방법 D의 정확한 URL 입력 칸 보기](#method-d)
 
@@ -481,12 +655,11 @@ Vercel 주소가 아직 없다면 D를 먼저 누르는 것이 아닙니다. 원
 **언제 선택하나요?** Vercel에 배포한 하나의 HTTPS 주소를 Claude의 원격
 Connector로 사용할 때 선택합니다.
 
-1. 주소가 아직 없다면 먼저
-   [Vercel 공통 준비 V-1~V-7](#vercel-common)을
-   끝냅니다.
-2. Builder로 돌아와 `Claude · Vercel HTTPS MCP` 왼쪽 동그라미를 누릅니다.
-3. **배포된 Vercel HTTPS `/mcp` 주소** 칸에 V-7을 통과한 전체 주소를 붙여 넣고
-   번들을 만듭니다.
+1. Builder에서 `Claude · Vercel HTTPS MCP` 왼쪽 동그라미를 누릅니다.
+2. 주소가 아직 없다면 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저 만들고
+   [Vercel 공통 준비 V-1~V-7](#vercel-common)을 끝냅니다.
+3. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 V-7을 통과한 전체 주소를
+   붙여 넣고 묶음을 다시 만듭니다.
 4. Claude에서 **설정 또는 Customize > Connectors > 사용자 지정 커넥터 추가**를
    누릅니다.
 5. 이름을 넣고 URL 칸에 같은 `/mcp` 주소를 붙여 넣어 저장합니다.
@@ -509,10 +682,9 @@ Connector로 사용할 때 선택합니다.
 
 #### 실제 생성 완료 화면에서 확인할 곳
 
-아래는 MCP 파일 묶음을 실제로 생성한 직후의 화면입니다. 기관명, 문서 ID, 확인 해시,
-번들 이름과 실제 Vercel 도메인은 공개용으로 지웠습니다.
-
-![PR MCP Builder에서 MCP 파일 묶음 생성 완료, HTTP MCP 주소, 생성 파일과 선택한 AI 앱을 확인하는 실제 화면](docs/assets/readme-course-00b-real-completion.png)
+현재 생성 완료 화면의 값은 선택한 앱에 따라 달라집니다. ChatGPT는 웹 원격 HTTPS만,
+Codex·Claude의 같은-PC 연결은 로컬 STDIO로 표시됩니다. 이전 화면의 ChatGPT 로컬 설정
+파일은 현재 실행 설정이 아니라 지원 종료 경고 파일이므로 이 안내에서는 사용하지 않습니다.
 
 위에서 아래로 다음 다섯 곳을 확인합니다.
 
@@ -535,21 +707,26 @@ Connector로 사용할 때 선택합니다.
 등록 안내와 생성 설정 파일이 달라집니다. 캡처의 규정명, 저장 경로, ZIP 경로와 서버 이름은
 공개용으로 지웠습니다. **내 화면에서는 이 칸을 비우지 말고 실제 값을 입력해야 합니다.**
 
-##### ChatGPT Desktop 또는 Codex에 로컬 STDIO로 연결할 때
-
-![PR MCP Builder에서 ChatGPT Desktop과 Codex 공용 로컬 STDIO 설정, 저장 폴더와 MCP 이름을 선택하는 실제 화면](docs/assets/readme-course-00c-builder-chatgpt-stdio-selection.png)
+##### Codex CLI·IDE에 로컬 STDIO로 연결할 때
 
 위 화면에서는 다음 순서로만 움직입니다.
 
 1. 맨 위 **선택 규정 MCP 준비 상태**의 오른쪽 상태가 `준비 완료`인지 확인합니다.
 2. **연결할 AI 앱**에서
-   `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)` 왼쪽 동그라미를 누릅니다.
+   `Codex CLI / Codex IDE` 왼쪽 동그라미를 누릅니다.
 3. 바로 아래에 `선택된 연결 방식: 로컬 stdio`가 보이는지 확인합니다.
 4. **Windows 탐색기에서 저장 폴더 선택**을 누르고, 나중에 옮기지 않을 폴더를 고릅니다.
 5. 처음에는 **폴더 + 전달용 ZIP (권장)**을 그대로 선택합니다.
 6. **생성할 MCP 이름 (필수 입력)**에 앱에서 알아보기 쉬운 이름을 넣습니다.
    이 값은 폴더 경로나 실행 명령이 아니라 MCP 서버 목록에 표시될 이름입니다.
 7. 빨간 **MCP로 쓸 파일 묶음 만들기** 버튼을 한 번 누르고 100%가 될 때까지 기다립니다.
+
+> [!IMPORTANT]
+> 전달용 ZIP을 **다른 Windows PC**로 옮겨 로컬 STDIO MCP를 실행하려면 그 PC에
+> Python 3.11 이상이 필요합니다. ZIP을 푼 뒤 먼저 `install_local_package.ps1`을
+> 실행해 포함된 wheel을 설치하고, 그 다음 앱 등록·진단을 진행하세요. wheel은 Python
+> 자체가 아닙니다. `Python 설치 불필요` 안내는 원래 PC에서 생성 폴더를 그대로 사용하는 경우,
+> 즉 `PR MCP Builder.exe`가 함께 있는 경우에만 해당합니다.
 
 `Claude Desktop`, `ChatGPT · Vercel HTTPS MCP` 같은 다른 동그라미를 동시에 선택하는 것이
 아닙니다. 한 번 생성할 때 하나의 연결 앱만 고릅니다.
@@ -570,7 +747,7 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 > 저장 경로와 서버 이름이 회색 또는 흰색 빈칸처럼 보이는 것은 공개용 비식별 처리입니다.
 > 실제 사용자는 Builder가 표시한 경로와 자신이 입력한 서버 이름을 그대로 사용합니다.
 
-- **같은 Windows PC의 Claude Code·ChatGPT Desktop·Codex·Claude Desktop에서 쓸 것**이면
+- **같은 Windows PC의 Claude Code·Codex·Claude Desktop에서 쓸 것**이면
   방법 A·B·C 중 해당 앱의 로컬 STDIO 절차만 따라갑니다.
 - **ChatGPT 또는 Claude에서 Vercel 주소로 원격 사용할 것**이면 방법 D 또는 E로 갑니다.
 - 화면에 `command`, `args`, `env`가 보이면 로컬 STDIO 안내입니다. 이때는 URL을 넣지 않습니다.
@@ -578,8 +755,10 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
   `command`, `args`, `env`를 넣지 않습니다.
 - 어느 쪽이든 마지막은 서버 이름이 보이는 것에서 끝나지 않고 `search`와 `fetch`가 실제로
   성공해야 완료입니다.
-- **로컬 STDIO를 선택한 경우**: 생성된 실제 `command/args/env`, 앱별 설정 파일,
-  `doctor_mcp_connection.ps1`, `validate_mcp_smoke.ps1`, 완전 재시작 순서가 보입니다.
+- **로컬 STDIO를 선택한 경우**: 생성된 실제 `command/args/env`, 앱별 설정 파일과 완전
+  재시작 순서가 보입니다. Windows 실행판은 포함된 `PR MCP Builder.exe --mcp-server`를
+  사용하므로 Python 진단 스크립트를 실행하지 않습니다. 소스 실행에서만
+  `doctor_mcp_connection.ps1`과 `validate_mcp_smoke.ps1`가 표시됩니다.
 - **Vercel HTTPS를 선택한 경우**: 입력한 Production `/mcp` URL, staging 명령,
   `vercel --prod`, Connectors 등록, 원격 smoke 순서가 보입니다.
 - 번들 폴더에는 양쪽 연결 파일이 들어갈 수 있지만, **현재 선택한 방식의 절차부터**
@@ -608,7 +787,9 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 2. `로컬 STDIO`라면 `claude_desktop_config.json` 또는 해당 앱 설정 파일만 따라갑니다.
 3. `Vercel Streamable HTTP(HTTPS)`라면 로컬 명령은 무시하고 `vercel --prod` 뒤
    `Aliased:` 줄에서 복사한 실제 `/mcp` 주소만 사용합니다.
-4. `doctor_mcp_connection.ps1`, `validate_mcp_smoke.ps1`는 로컬 진단용입니다.
+4. `doctor_mcp_connection.ps1`, `validate_mcp_smoke.ps1`는 **소스 실행 전용** 로컬
+   진단입니다. Windows 실행판은 생성된 EXE 설정을 그대로 등록하고 앱을 완전히
+   재시작한 뒤 새 대화에서 `search`와 `fetch`를 확인합니다.
 5. `reg-rag-mcp-vercel-stage`, `vercel`, `reg-rag-mcp-client-config-smoke`는 원격 배포 및 검증용입니다.
 6. 마지막 줄의 `search then fetch` 예시까지 성공해야 끝입니다. 서버 이름만 보여도 아직 완료가 아닙니다.
 
@@ -673,203 +854,24 @@ claude mcp get test2
 <a id="method-b"></a>
 
 <details>
-<summary><strong>방법 B 상세 절차 펼치기 — ChatGPT Desktop / Codex 로컬 STDIO</strong></summary>
+<summary><strong>방법 B 상세 절차 펼치기 — Codex CLI·IDE 로컬 STDIO</strong></summary>
 
-## 방법 B 상세: ChatGPT Desktop / Codex CLI / Codex IDE 로컬 STDIO 연결
+## 방법 B 상세: Codex CLI / Codex IDE 로컬 STDIO 연결
 
-> [!IMPORTANT]
-> ChatGPT의 **인자**는 여러 줄을 한 칸에 붙여 넣는 것이 아닙니다.
-> Builder의 `Argument 1`을 첫 번째 칸에 넣고, **+ 인자 추가**를 눌러
-> `Argument 2`를 두 번째 칸에 넣습니다. 마지막 번호까지 한 줄씩 반복합니다.
+1. Builder의 `④ MCP 생성·AI 연결`에서 `Codex CLI / Codex IDE`를 선택합니다.
+2. 저장 폴더와 MCP 이름을 입력하고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
+3. `100%`와 **MCP 파일 묶음 생성 완료**가 보이면 아래 B-2로 이동합니다.
 
-### B-1. Builder에서 ChatGPT Desktop 또는 Codex 번들 만들기
+> [!WARNING]
+> ChatGPT는 로컬 STDIO MCP에 직접 연결하지 않습니다. 과거 화면에 ChatGPT용 STDIO
+> 입력란이 보이더라도 이 프로그램의 지원 경로로 사용하지 말고 [방법 D](#method-d)의
+> ChatGPT 웹 원격 MCP를 사용하세요.
 
-1. Builder의 `④ MCP 생성·AI 연결` 화면까지 내려갑니다.
-2. **연결할 AI 앱**에서
-   `ChatGPT Desktop / Codex CLI / Codex IDE (공용 설정)`을 누릅니다.
-3. **로컬 STDIO**가 선택되었는지 확인합니다.
-4. 저장할 폴더와 MCP 이름을 입력합니다.
-5. 빨간 **MCP로 쓸 파일 묶음 만들기** 버튼을 누릅니다.
-6. `100%`와 **MCP 파일 묶음 생성 완료**가 보일 때까지 기다립니다.
 
-![Builder에서 ChatGPT Desktop 로컬 STDIO를 선택하는 실제 화면](docs/assets/readme-course-00c-builder-chatgpt-stdio-selection.png)
+### B-2. Codex CLI·IDE에 생성된 TOML 넣기
 
-### B-2. Builder에서 복사할 값 찾기
-
-1. 생성 완료 화면을 아래로 내립니다.
-2. **ChatGPT/Codex Desktop에 등록하는 방법**을 찾습니다.
-3. 아래 순서로 값이 나오는지 확인합니다.
-
-```text
-Name 복사 상자
-Transport: STDIO 표시
-Command 복사 상자
-Argument 1부터 마지막 번호까지 각각의 복사 상자
-Environment 키·값 복사 상자
-Environment passthrough 복사 상자
-Working directory 복사 상자
-```
-
-4. `Transport: STDIO`는 복사 상자가 아닙니다. B-3에서 ChatGPT의 **STDIO** 버튼을
-   누르면 됩니다.
-5. 화면은 닫지 않습니다. 다음 단계에서 나머지 코드 상자를 하나씩 복사합니다.
-
-![PR MCP Builder의 ChatGPT Desktop STDIO 생성 결과에서 powershell.exe, args, cwd와 env를 확인하는 실제 화면](docs/assets/readme-course-01b-builder-chatgpt-stdio-output.png)
-
-이 캡처는 생성 결과가 나타나는 위치를 보여 주는 이전 버전 화면입니다. 현재 Builder는
-한 개의 긴 JSON 대신 `Name`, `Command`, `Argument 1/17`, `Argument 2/17`처럼
-각 값을 별도 복사 상자로 보여 줍니다. **긴 JSON을 해석하지 말고 현재 화면의 개별 복사
-상자를 사용하세요.**
-
-스크린샷에서 가린 서버 이름과 경로를 직접 입력하지 마세요. 내 Builder 화면에는 실제 값이
-들어 있습니다. **각 코드 상자의 복사 아이콘을 눌러 사용합니다.**
-
-### B-3. ChatGPT Desktop에서 MCP 추가 화면 열기
-
-#### 1. 플러그인 열기
-
-1. 설치된 **ChatGPT Desktop 앱**을 엽니다.
-2. 왼쪽 메뉴에서 **플러그인**을 누릅니다.
-
-![ChatGPT Desktop 왼쪽 메뉴에서 플러그인을 누르는 실제 화면](docs/assets/readme-course-06-chatgpt-plugin-home.png)
-
-#### 2. MCP 탭 열기
-
-1. 왼쪽 아래 계정 영역을 누릅니다.
-2. **설정**을 누릅니다.
-3. 설정 왼쪽 메뉴의 **플러그인**을 누릅니다.
-4. 화면 위쪽의 `플러그인 / 앱 / MCP / 스킬` 중 **MCP**를 누릅니다.
-
-![ChatGPT Desktop 설정에서 플러그인과 MCP 탭을 여는 실제 화면](docs/assets/readme-course-06-chatgpt-plugin-settings.png)
-
-#### 3. 새 서버 추가하기
-
-1. MCP 화면 오른쪽 위 **+ 서버 추가**를 누릅니다.
-
-![ChatGPT Desktop MCP 탭에서 서버 추가를 누르는 실제 화면](docs/assets/readme-course-06-chatgpt-mcp-tab.png)
-
-2. **맞춤형 MCP에 연결** 화면에서 유형 **STDIO**를 누릅니다.
-
-![ChatGPT Desktop 맞춤형 MCP에서 STDIO를 선택한 실제 화면](docs/assets/readme-course-06-chatgpt-stdio-form.png)
-
-영문 화면에서는 같은 경로가
-**Settings > MCP servers > Add server**로 보일 수 있습니다.
-
-화면의 `openai-dev-mcp serve-sqlite`, `~/code`, `MCP server name`은 앱이 회색으로
-보여 주는 예시입니다. 그대로 입력하지 말고 Builder의 복사 상자 값으로 바꿉니다.
-
-### B-4. Name과 Command 넣기
-
-#### Name 넣기
-
-1. Builder로 돌아갑니다.
-2. **Name** 아래 코드 상자의 복사 아이콘을 누릅니다.
-3. ChatGPT로 돌아옵니다.
-4. 맨 위 **이름** 칸을 클릭하고 `Ctrl+V`를 누릅니다.
-
-#### Command 넣기
-
-1. Builder의 **Command 복사** 아래 코드 상자를 복사합니다.
-2. ChatGPT의 **실행 명령** 칸을 클릭하고 `Ctrl+V`를 누릅니다.
-
-Command 칸에는 코드 상자 안의 **한 값만** 넣습니다. 생성 결과가 `powershell.exe`라면
-`powershell.exe`만 넣습니다. 서버 이름이나 Arguments를 Command 칸에 넣지 않습니다.
-
-### B-5. Arguments를 한 줄씩 서로 다른 칸에 넣기
-
-Builder에 `Arguments (17개)`라고 보인다면 ChatGPT에도 인자 칸이 17개 있어야 합니다.
-내 화면이 19개라고 표시되면 19칸을 만듭니다. **Builder에 표시된 숫자와 ChatGPT의
-인자 칸 수가 같아야 합니다.**
-
-#### Argument 1 넣기
-
-1. Builder의 첫 번째 제목을 찾습니다. 17개인 예시는
-   **Argument 1/17 — 아래 한 줄만 복사**로 보입니다.
-2. 바로 아래 코드 상자의 복사 아이콘을 누릅니다.
-3. ChatGPT의 첫 번째 **인자** 칸을 클릭합니다.
-4. `Ctrl+V`를 누릅니다.
-
-#### Argument 2 넣기
-
-1. ChatGPT에서 **+ 인자 추가**를 한 번 누릅니다.
-2. 두 번째 인자 칸이 생겼는지 확인합니다.
-3. Builder의 다음 제목을 찾습니다. 17개인 예시는
-   **Argument 2/17 — 아래 한 줄만 복사**로 보입니다.
-4. 바로 아래 코드 상자의 **복사 아이콘**을 누릅니다.
-5. ChatGPT의 두 번째 인자 칸을 클릭하고 `Ctrl+V`를 누릅니다.
-
-#### 마지막 Argument까지 반복하기
-
-1. ChatGPT에서 **+ 인자 추가**를 한 번 누릅니다.
-2. Builder에서 다음 번호의 Argument 코드 상자 **한 줄만** 복사합니다.
-3. ChatGPT에서 새로 생긴 다음 칸에 붙여 넣습니다.
-4. Builder에서 분자가 분모와 같은 마지막 제목까지 반복합니다.
-   17개인 예시는 `Argument 17/17`이 마지막입니다.
-5. 마지막에는 **Builder에 표시된 개수 = ChatGPT의 인자 칸 개수**인지 셉니다.
-
-> **한 인자 칸에는 한 줄만 넣습니다.**
-> 번호, 따옴표, 쉼표, 대괄호를 추가하지 않습니다. 여러 Argument를 한 칸에 한꺼번에
-> 붙여 넣지도 않습니다.
-
-![ChatGPT Desktop에서 powershell.exe와 Arguments를 서로 다른 칸에 넣은 실제 화면](docs/assets/readme-course-06b-chatgpt-stdio-filled.png)
-
-스크린샷에서 가린 경로와 ID 칸도 실제로는 비우면 안 됩니다. Builder의 같은 번호
-Argument 상자에 들어 있는 실제 경로 또는 ID를 그대로 붙여 넣습니다.
-
-### B-6. Environment와 Working directory 넣고 저장하기
-
-#### Environment
-
-1. Builder에 `Environment (0개)`와 `입력하지 않음`이 보이면 ChatGPT의 환경 변수 칸을
-   비워 둡니다.
-2. `Environment (1개)` 이상이면 ChatGPT에 이미 보이는 첫 번째 빈 키·값 행을
-   사용합니다. 첫 값부터 **+ 환경 변수 추가**를 누르지 않습니다.
-3. Builder의 **왼쪽 키 칸에 복사** 코드 상자를 복사해 첫 행의 왼쪽 **키** 칸에
-   붙여 넣습니다.
-4. Builder의 **오른쪽 값 칸에 복사** 코드 상자를 복사해 같은 행의 오른쪽 **값** 칸에
-   붙여 넣습니다.
-5. 두 번째 Environment가 보이면 **+ 환경 변수 추가**를 다시 누르고 같은 방식으로
-   다음 키와 값을 넣습니다.
-
-#### Environment passthrough
-
-1. Builder에 `Environment passthrough (0개)`와 `입력하지 않음`이 보이면 비워 둡니다.
-2. 1개 이상이면 ChatGPT에 이미 보이는 첫 번째 빈 패스스루 칸을 사용합니다.
-   첫 값부터 **+ 변수 추가**를 누르지 않습니다.
-3. Builder의 첫 번째 Passthrough 코드 상자 아래 한 줄을 그 첫 칸에 붙여 넣습니다.
-4. 다음 번호가 있으면 **+ 변수 추가**를 다시 누르고 다음 한 줄을 새 칸에 넣습니다.
-
-#### Working directory
-
-1. Builder의 **Working directory 복사** 아래 코드 상자를 복사합니다.
-2. ChatGPT의 **작업 중인 디렉터리** 칸에 보이는 `~/code` 예시를 지웁니다.
-3. 복사한 값을 붙여 넣습니다.
-4. 오른쪽 아래 **저장**을 누릅니다.
-
-### B-7. 서버 켜고 `search`와 `fetch` 확인하기
-
-1. ChatGPT Desktop을 완전히 종료했다가 다시 실행합니다.
-2. **설정 → 플러그인 → MCP**로 이동합니다.
-3. 방금 만든 서버가 목록에 있는지 확인합니다.
-4. 서버 오른쪽 스위치가 꺼져 있으면 눌러 켭니다.
-
-![ChatGPT Desktop MCP 목록에서 새 서버와 오른쪽 스위치를 확인하는 실제 화면](docs/assets/readme-course-06-chatgpt-mcp-tab.png)
-
-5. 새 대화를 엽니다.
-6. 아래 두 줄을 통째로 복사해 대화창에 붙여 넣고 전송합니다.
-
-```text
-연결한 규정 MCP의 search 도구로 복무를 검색해 줘.
-첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여 줘.
-```
-
-`search` 결과와 `fetch` 본문·출처가 모두 나오면 ChatGPT Desktop 로컬 STDIO 연결
-완료입니다.
-
-### B-8. Codex CLI·IDE에 생성된 TOML 넣기
-
-ChatGPT Desktop을 쓸 사람은 B-7에서 끝입니다. **Codex CLI 또는 Codex IDE를 쓸
-사람만** 아래 순서를 계속합니다. ChatGPT의 인자 입력 화면은 열지 않습니다.
+ChatGPT의 인자 입력 화면은 열지 않습니다. **Codex CLI 또는 Codex IDE**에서 아래
+순서를 계속합니다.
 
 1. Codex CLI와 Codex IDE를 완전히 종료합니다.
 2. Windows 파일 탐색기에서 Builder가 만든 번들 폴더를 엽니다.
@@ -888,7 +890,12 @@ notepad %USERPROFILE%\.codex\config.toml
 10. `Ctrl+S`로 저장하고 메모장을 닫습니다.
 11. Codex CLI 또는 Codex IDE를 다시 실행합니다.
 12. MCP 목록에서 방금 만든 서버가 보이는지 확인합니다.
-13. 새 대화에서 B-7의 두 문장을 보내 `search`와 `fetch`를 실제로 호출합니다.
+13. 새 대화에서 아래 두 문장을 보내 `search`와 `fetch`를 실제로 호출합니다.
+
+```text
+연결한 규정 MCP의 search 도구로 복무를 검색해 줘.
+첫 번째 검색 결과의 id를 fetch 도구에 넣어 원문과 출처를 보여 줘.
+```
 
 기존 파일이 아래처럼 다른 MCP 서버 하나를 가지고 있었다고 가정합니다.
 
@@ -1252,10 +1259,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\connect_mcp_client.ps
 
 새 서버를 파일 맨 아래에 붙이거나, `args` 대괄호 안에 넣거나, 두 번째
 `"mcpServers"`를 새로 만들면 안 됩니다. 저장하기 전에
-`python -m json.tool "$env:APPDATA\Claude\claude_desktop_config.json"`을 실행하면
-JSON 쉼표나 중괄호 오류를 먼저 찾을 수 있습니다.
+PowerShell에서 아래 명령을 실행하면 Python 없이도 JSON 쉼표나 중괄호 오류를 먼저
+찾을 수 있습니다.
+
+```powershell
+Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw | ConvertFrom-Json | Out-Null
+```
 
 ### C-9. `disconnected`일 때 진단하기
+
+> [!IMPORTANT]
+> 아래 두 스크립트는 **소스 실행 사용자 전용**입니다. Windows 실행판 사용자는 이
+> 스크립트를 실행하거나 Python을 설치하지 말고, Builder가 생성한
+> `PR MCP Builder.exe --mcp-server` 설정을 그대로 등록한 뒤 Claude Desktop을 완전히
+> 재시작하고 새 대화에서 `search`와 `fetch`를 확인하세요.
 
 1. Builder가 만든 번들 폴더를 엽니다.
 2. 탐색기 위쪽 주소 표시줄에 `powershell`을 입력하고 `Enter`를 누릅니다.
@@ -1282,8 +1299,10 @@ Vercel HTTPS는 승인된 MCP runtime을 인터넷에서 접속 가능한 서버
 Vercel 홈페이지는 계정·환경변수·로그를 관리하고, 처음 배포할 파일 준비와 업로드는 내
 PC의 PowerShell에서 진행합니다.
 
-처음이라면 방법 A, B 또는 C의 로컬 `search`와 `fetch`가 먼저 성공한 뒤 진행하세요. 로컬에서도
-검색되지 않는 데이터는 Vercel에 올린다고 검색되기 시작하지 않습니다.
+처음이라면 Builder에서 원문 검수·승인·색인과 규정 조회를 먼저 확인하세요. Codex나
+Claude를 함께 쓴다면 방법 A, B 또는 C의 로컬 `search`와 `fetch`까지 성공한 뒤 진행하는
+것이 가장 안전합니다. 로컬에서도 검색되지 않는 데이터는 Vercel에 올린다고 검색되기
+시작하지 않습니다.
 
 > [!WARNING]
 > Vercel로 전송한 MCP 응답은 외부 AI 서비스로 전달될 수 있습니다. 공개 자료 또는
@@ -1295,19 +1314,24 @@ PC의 PowerShell에서 진행합니다.
 - Vercel 계정: <https://vercel.com>에서 **Sign Up** 후 이메일 또는 GitHub 계정으로 가입
 - Node.js LTS와 npm: <https://nodejs.org>에서 **LTS** 설치판 사용
 - Python 3.11 이상
-- 사람 승인과 검색 색인이 끝난 MCP 번들의 `data` 폴더
-- 프로젝트 소스가 있는 이 저장소
+- 사람 승인과 검색 색인이 끝난 **배포 준비용 MCP 전달 ZIP**
+- 소스 실행자는 이 저장소를 그대로 사용할 수 있음
 
 Vercel 주소가 전혀 없는 첫 배포라면 아래 순서로 준비합니다.
 
-1. Builder에서 먼저 방법 A, B 또는 C의 **로컬 STDIO 번들**을 하나 만듭니다.
-2. 생성된 번들 안의 `data` 폴더를 V-2의 첫 번째 질문에 사용합니다.
-3. V-2부터 V-7까지 배포와 검증을 끝냅니다.
-4. 그다음 Builder로 돌아가 방법 D 또는 E를 누르고 검증된 `/mcp` 주소를 입력합니다.
+1. Builder에서 방법 D 또는 E를 선택하고 URL을 비운 채 **배포 준비용 MCP 묶음**을
+   만듭니다.
+2. 생성된 전달 ZIP을 새 폴더에 완전히 풉니다.
+3. 그 PC에 Python 3.11 이상이 없다면 먼저 설치합니다.
+4. 압축을 푼 폴더에서 `install_local_package.ps1`을 한 번 실행해 포함된 wheel과
+   `reg-rag-mcp-vercel-stage` 명령을 설치합니다.
+5. 같은 폴더의 `data`를 사용해 V-2부터 V-7까지 배포와 검증을 끝냅니다.
+6. Builder로 돌아가 같은 D 또는 E를 선택하고 검증된 `/mcp` 주소를 입력해 묶음을 다시
+   만듭니다.
 
-`④ MCP 생성·AI 연결`에서 방법 D 또는 E를 선택하면 앱별 안내를 볼 수 있지만, 실제
-Production URL을 입력하기 전에는 생성 버튼이 비활성화됩니다. 화면의 URL 예시를
-복사하지 말고 V-6에서 얻고 V-7에서 검증한 주소를 사용합니다.
+`④ MCP 생성·AI 연결`의 생성 버튼은 첫 배포 전에도 사용할 수 있습니다. 이때 만들어지는
+것은 **배포 준비용 파일**이며 실제 AI 연결 완료가 아닙니다. 화면의 URL 예시를 복사하지
+말고 V-6에서 얻고 V-7에서 검증한 주소를 넣어 묶음을 다시 만들어야 합니다.
 
 Node.js를 설치한 뒤 새 PowerShell을 열고 다음 두 명령을 실행합니다.
 
@@ -1321,9 +1345,27 @@ npm --version
 
 ### V-2. 배포 전용 폴더 만들기
 
-프로젝트 폴더, 즉 `README.md`, `app`, `scripts`가 함께 보이는 폴더에서 PowerShell을
-엽니다. 아래 블록 전체를 붙여 넣습니다. PowerShell이 두 경로를 차례로 물으면 파일
-탐색기에서 복사한 실제 경로를 붙여 넣고 `Enter`를 누릅니다.
+전달 ZIP을 푼 폴더에서 PowerShell을 열고 먼저 다음 명령을 실행합니다. Windows에서
+스크립트 실행을 묻거나 차단하면 파일을 이 저장소의 Release에서 받았는지 확인한 뒤
+전체 명령을 그대로 사용합니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_local_package.ps1
+```
+
+설치가 끝나면 같은 창에서 아래 명령을 실행합니다. 첫 번째 경로는 압축을 푼 폴더의
+`data`이고, 두 번째는 새 Vercel 배포 전용 폴더입니다.
+
+```powershell
+$RuntimeDataDir = (Resolve-Path ".\data").Path
+$StageDir = Read-Host "새 Vercel 배포 전용 폴더 전체 경로"
+reg-rag-mcp-vercel-stage `
+  --runtime-data-dir "$RuntimeDataDir" `
+  --out-dir "$StageDir"
+```
+
+소스 실행자는 프로젝트 폴더, 즉 `README.md`, `app`, `scripts`가 함께 보이는 폴더에서
+다음 명령을 대신 사용할 수 있습니다.
 
 ```powershell
 $RuntimeDataDir = Read-Host "생성 번들의 data 폴더 전체 경로"
@@ -1333,7 +1375,7 @@ python scripts\prepare_vercel_mcp_deployment.py `
   --out-dir "$StageDir"
 ```
 
-패키지를 설치해 CLI 명령을 사용할 수 있다면 같은 작업을 다음처럼 실행할 수 있습니다.
+패키지를 이미 설치해 CLI 명령을 사용할 수 있다면 같은 작업을 다음처럼 실행할 수 있습니다.
 
 ```powershell
 reg-rag-mcp-vercel-stage `
@@ -1531,46 +1573,48 @@ Vercel 항목을 먼저 처리합니다.
 
 ## 방법 D 상세: ChatGPT · Vercel HTTPS MCP 연결
 
-1. V-7의 네 가지 검증값이 모두 성공했는지 확인합니다.
-2. Builder의 `④ MCP 생성·AI 연결`로 돌아갑니다.
-3. `ChatGPT · Vercel HTTPS MCP` 왼쪽 동그라미를 누릅니다.
-4. **배포된 Vercel HTTPS `/mcp` 주소 (필수)** 칸에 V-7을 통과한 전체 URL을 붙여
-   넣습니다.
-5. **생성된 MCP HTTP URL**에도 같은 주소가 보이는지 확인하고 번들을 만듭니다.
-6. ChatGPT Desktop에서 **설정 > 플러그인 > MCP > + 서버 추가**를 누릅니다.
+> [!IMPORTANT]
+> ChatGPT는 로컬 MCP 서버에 직접 연결하지 않고 원격 MCP 서버에 연결합니다. 이 절차는
+> **ChatGPT 웹**의 Developer mode를 사용합니다. 현재 공식 안내상 Pro는 개발자 모드에서
+> read/fetch 도구를 연결할 수 있고, full MCP는 Business·Enterprise·Edu에서 제공됩니다.
+> 워크스페이스 관리자 승인·RBAC 설정에 따라 메뉴가 보이지 않을 수 있습니다.
+>
+> - [OpenAI 공식 ChatGPT Developer mode·MCP 지원 안내](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)
+> - [로컬·사설망 서버용 OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
-### D-1. ChatGPT 원격 MCP 화면의 각 칸에 넣을 정확한 값
+1. Builder의 `④ MCP 생성·AI 연결`에서 `ChatGPT · Vercel HTTPS MCP`를 선택합니다.
+2. 첫 배포 전이라 HTTPS 주소가 없으면 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저
+   만듭니다. 화면에 표시되는 staging·Vercel 배포 절차를 완료합니다.
+3. V-7의 네 가지 검증값이 모두 성공했는지 확인합니다.
+4. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 검증한 전체 URL을 붙여
+   넣고 묶음을 다시 만듭니다.
+5. **생성된 MCP HTTP URL**에도 같은 주소가 보이는지 확인합니다.
+6. ChatGPT 웹에서 **Settings > Apps > Advanced settings > Developer mode**를 켭니다.
+7. Apps 설정에서 새 앱을 만들고 검증한 원격 MCP URL을 등록합니다.
 
-ChatGPT Desktop 원격 MCP 입력 화면은 아래와 같습니다.
+### D-1. ChatGPT 웹에 원격 MCP 앱 등록
 
-![ChatGPT Desktop에서 Streamable HTTP 원격 MCP URL을 입력하는 실제 예시](docs/assets/readme-course-08-chatgpt-http-form.png)
-
-화면 위쪽의 유형에서 **스트리밍 가능한 HTTP**를 선택해야 `실행 명령` 대신 `URL` 칸이
-나타납니다. `STDIO`가 선택된 채라면 Vercel 주소를 넣을 수 없으므로 유형부터 바꾸세요.
+ChatGPT 웹의 Developer mode에서 **Apps** 설정을 열고 새 앱을 만듭니다. 화면 이름은
+플랜과 워크스페이스 정책에 따라 조금 다를 수 있습니다. 메뉴가 없으면 먼저 플랜과 관리자
+권한을 확인하세요.
 
 초보자 기준으로는 아래 순서만 그대로 따라가면 됩니다.
 
 1. **이름** 칸에 알아보기 쉬운 서버 이름을 넣습니다.
-2. 유형을 **스트리밍 가능한 HTTP**로 바꿉니다.
-3. 그다음 나타나는 **URL** 칸에 `https://.../mcp` 전체 주소를 넣습니다.
-4. 공개 read-only 배포라면 **기본 token 환경 변수**, **헤더**, **환경 변수의 헤더**는 비워 둡니다.
-5. 이 화면에는 `python.exe`, `powershell.exe`, `-m`, `PYTHONPATH`를 넣지 않습니다.
+2. MCP 서버 URL 칸에 `https://.../mcp` 전체 주소를 넣습니다.
+3. 비공개 endpoint라면 워크스페이스가 승인한 OAuth 인증 절차를 완료합니다.
+4. 이 화면에는 `python.exe`, `powershell.exe`, `-m`, `PYTHONPATH`를 넣지 않습니다.
 
-| 실제 화면의 원격 설정 칸 | 넣을 값 |
+| ChatGPT 웹 앱 설정 | 넣을 값 |
 | --- | --- |
 | **이름 (Name)** | 사용자가 알아볼 이름. 예: `기관 규정 MCP` |
-| **유형 (Transport / Type)** | `스트리밍 가능한 HTTP` 또는 `Streamable HTTP` |
 | **URL (MCP URL / Server URL)** | Vercel의 고정 `Aliased` 주소 끝에 `/mcp`를 붙인 전체 URL |
-| **기본 token 환경 변수** | 공개 read-only endpoint는 비워 둠. bearer 인증을 설정했다면 토큰 값 자체가 아니라 배포 지침의 환경 변수 이름(예: `MCP_AUTH_TOKEN`) |
-| **헤더** | 공개 read-only endpoint는 비워 둠. 승인된 별도 헤더 인증을 구성한 경우에만 키와 값을 입력 |
-| **환경 변수의 헤더** | 공개 read-only endpoint는 비워 둠. 헤더 값을 로컬 환경 변수에서 읽도록 구성한 경우에만 사용 |
-| **Command / Executable** | 넣지 않음 |
-| **Arguments / Working directory / PYTHONPATH** | 넣지 않음 |
+| **인증** | 공개가 승인된 read-only endpoint는 별도 인증 없음. 비공개 endpoint는 워크스페이스가 승인한 OAuth |
+| **로컬 Command / Arguments / Working directory** | 넣지 않음 |
 
-화면에 흐리게 보이는 `https://mcp.example.com/mcp`와 `MCP_BEARER_TOKEN`도
-앱이 보여 주는 **예시 문구**입니다. 복사하지 마세요. V-6에서 복사하고 V-7에서 검증한
-실제 Vercel 주소만 URL 칸에 붙여 넣습니다. 비밀 토큰 문자열 자체를 README나 URL 칸에
-붙여 넣으면 안 됩니다.
+화면의 예시 URL은 복사하지 마세요. V-6에서 복사하고 V-7에서 검증한 실제 Vercel
+주소만 URL 칸에 붙여 넣습니다. 비밀 토큰 문자열 자체를 README나 URL 칸에 붙여 넣으면
+안 됩니다.
 
 예를 들어 Vercel `Aliased` 주소가 다음이라면
 
@@ -1589,13 +1633,13 @@ https://my-regulation-mcp.vercel.app/mcp
 
 ### D-2. 저장하고 실제 도구 확인
 
-1. 이름을 입력합니다.
-2. 유형이 **스트리밍 가능한 HTTP**인지 다시 확인합니다.
-3. URL 칸에 V-7에서 검증한 전체 주소가 들어 있는지 확인합니다.
-4. 공개 read-only endpoint라면 토큰과 헤더 칸을 비워 둡니다.
-5. **저장**을 누르고 ChatGPT Desktop을 완전히 종료했다가 다시 엽니다.
-6. **설정 > 플러그인 > MCP**에서 방금 만든 서버의 스위치를 켭니다.
-7. [3장](#3-search와-fetch로-최종-확인하기)의 문장을 보내 `search`와 `fetch`를
+1. 이름과 설명을 입력합니다.
+2. URL 칸에 V-7에서 검증한 전체 주소가 들어 있는지 확인합니다.
+3. 공개 read-only endpoint라면 별도 인증값을 넣지 않습니다. 비공개 endpoint는 승인된
+   OAuth 또는 워크스페이스 인증 정책을 따릅니다.
+4. 저장한 뒤 새 ChatGPT 웹 대화를 엽니다.
+5. 새로 만든 앱을 현재 대화에서 사용할 수 있도록 선택합니다.
+6. [3장](#3-search와-fetch로-최종-확인하기)의 문장을 보내 `search`와 `fetch`를
    실제로 호출합니다.
 
 </details>
@@ -1607,12 +1651,14 @@ https://my-regulation-mcp.vercel.app/mcp
 
 ## 방법 E 상세: Claude · Vercel HTTPS MCP 연결
 
-1. V-7의 네 가지 검증값이 모두 성공했는지 확인합니다.
-2. Builder의 `④ MCP 생성·AI 연결`로 돌아갑니다.
-3. `Claude · Vercel HTTPS MCP` 왼쪽 동그라미를 누릅니다.
-4. **배포된 Vercel HTTPS `/mcp` 주소 (필수)** 칸에 V-7을 통과한 전체 URL을 붙여
-   넣습니다.
-5. **생성된 MCP HTTP URL**에도 같은 주소가 보이는지 확인하고 번들을 만듭니다.
+1. Builder의 `④ MCP 생성·AI 연결`에서 `Claude · Vercel HTTPS MCP` 왼쪽 동그라미를
+   누릅니다.
+2. 첫 배포 전이라 HTTPS 주소가 없으면 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저
+   만들고 [Vercel 공통 준비 V-1~V-7](#vercel-common)을 완료합니다.
+3. V-7의 네 가지 검증값이 모두 성공했는지 확인합니다.
+4. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 검증한 전체 URL을 붙여
+   넣고 묶음을 다시 만듭니다.
+5. **생성된 MCP HTTP URL**에도 같은 주소가 보이는지 확인합니다.
 6. Claude 웹 또는 Desktop을 엽니다.
 7. **설정 > 커넥터(Connectors)** 또는 **Customize > Connectors**를 엽니다.
 8. **사용자 지정 커넥터 추가(Add custom connector)**를 누릅니다.
@@ -1730,15 +1776,16 @@ list_regulation_reference_cycles로 현재 승인 규정 사이의 순환참조�
 | 보이는 현상 | 주된 원인 | 해결 |
 | --- | --- | --- |
 | Claude Desktop 서버가 목록에 없음 | JSON 문법 오류, 잘못된 설정 파일, 재시작 안 함 | **설정 > 개발자 > 구성 편집**에서 생성 항목을 확인하고 완전히 재시작 |
-| ChatGPT Desktop 서버가 목록에 없음 | 다른 MCP 화면에 입력했거나 저장 안 함 | **설정 > 플러그인 > MCP**에서 STDIO 또는 Streamable HTTP 유형과 저장 상태 확인 |
+| ChatGPT 웹에서 새 앱/MCP 메뉴가 안 보임 | 지원 플랜, Developer mode 또는 워크스페이스 관리자 권한 부족 | 공식 ChatGPT MCP 안내에서 플랜을 확인하고 관리자에게 앱·Developer mode 권한 요청 |
 | Claude Code 또는 Codex 서버가 목록에 없음 | 등록 스크립트 미실행 또는 TOML 미반영 | `claude mcp list` 또는 `~/.codex/config.toml`을 확인하고 앱을 다시 시작 |
-| Vercel 원격 서버가 목록에 없음 | 로컬 설정 화면에 URL을 입력했거나 Connector 저장 안 함 | 방법 D는 ChatGPT의 Streamable HTTP, 방법 E는 Claude Connectors에서 확인 |
+| Vercel 원격 서버가 목록에 없음 | 원격 smoke 실패, ChatGPT 앱/Claude Connector 미저장 | 방법 D는 ChatGPT 웹 Apps, 방법 E는 Claude Connectors에서 URL과 저장 상태 확인 |
 | Claude Desktop이 `disconnected` | `command`, `args`, `env` 일부 누락 | 생성 JSON의 한 서버 항목을 수정 없이 다시 병합 |
 | 연결 마법사 실행이 차단됨 | PowerShell 실행 정책 또는 명령 일부 누락 | README의 `powershell.exe -NoProfile -ExecutionPolicy Bypass ...` 전체 명령을 다시 복사 |
 | Claude가 JSON 편집 뒤 시작되지 않음 | 쉼표·중괄호 오류 | 최신 `claude_desktop_config.json.bak-...`를 원래 파일명으로 복사해 복구 |
-| `Python was not found` | 파일 없음 또는 wrapper probe 실패 | `doctor_mcp_connection.ps1`을 실행해 버전·marker·project root·import 진단 확인 |
-| Python은 있는데 import 실패 | Python 3.11 미만, 잘못된 프로젝트 Python, 의존성 누락 | 생성기가 검증한 프로젝트 Python을 사용하고 진단 stderr 확인 |
-| 도구가 0개 | 서버 미활성화 또는 시작 실패 | 새 대화에서 서버를 활성화하고 `validate_mcp_smoke.ps1` 실행 |
+| Windows 실행판에서 로컬 서버 시작 실패 | 생성 설정 수정, EXE 이동 또는 앱 재시작 누락 | 번들을 다시 만들고 생성된 `PR MCP Builder.exe --mcp-server` 설정을 수정 없이 등록한 뒤 AI 앱을 완전히 재시작 |
+| 소스 실행에서 `Python was not found` | 파일 없음 또는 wrapper probe 실패 | `doctor_mcp_connection.ps1`을 실행해 버전·marker·project root·import 진단 확인 |
+| 소스 실행에서 Python import 실패 | Python 3.11 미만, 잘못된 프로젝트 Python, 의존성 누락 | 생성기가 검증한 프로젝트 Python을 사용하고 진단 stderr 확인 |
+| 도구가 0개 | 서버 미활성화 또는 시작 실패 | Windows 실행판은 앱 완전 재시작 후 새 대화에서 확인하고, 소스 실행은 `validate_mcp_smoke.ps1`도 실행 |
 | 규정 목록이 예상보다 적음 | 첫 페이지만 봤거나 승인·색인이 끝나지 않은 규정이 있음 | `total_count`와 다음 페이지를 확인하고 각 규정의 승인·색인 상태 점검 |
 | 같은 규정이 목록에 반복됨 | 오래된 번들 또는 규정 계열·버전 식별이 잘못됨 | 최신 번들을 다시 만들고 규정명·번호·버전 연결을 검토 |
 | 목차에서 장·절·조가 끊김 | 전처리 구조가 잘못됐거나 필요한 청크가 미승인 | `② 결과 확인`에서 앞뒤 문맥과 계층을 다시 검수한 뒤 승인·색인 |
@@ -1747,7 +1794,7 @@ list_regulation_reference_cycles로 현재 승인 규정 사이의 순환참조�
 | 개정 후에도 이전 본문이 나옴 | 시행일 전이거나 버전·효력 기간·계보가 잘못됨 | 현재 날짜와 `as_of_date`를 확인하고 새 버전의 개정일·시행일·이전 버전 관계 검토 |
 | `search` 결과가 0개 | 검색어 불일치 또는 승인·색인된 데이터 없음 | 승인 및 색인 상태를 다시 확인하고 실제 규정 용어로 검색 |
 | `fetch` 실패 | 검색 결과의 `id`가 아닌 제목을 전달 | `search` 응답의 정확한 `id` 값을 사용 |
-| 전처리·색인이 오래 걸림 | 큰 HWP·표·다수 규정 처리 또는 색인 복구 진행 중 | 현재 단계, 처리 규정 수, 마지막 갱신 시각을 확인하고 같은 버튼을 반복해서 누르지 않기 |
+| 전처리·색인이 오래 걸림 | 큰 HWP·표·다수 규정 처리 또는 **문서 색인 복구** 진행 중 | 현재 단계, 처리 규정 수, 마지막 갱신 시각을 확인하고 같은 버튼을 반복해서 누르지 않기 |
 | 폴더를 옮긴 뒤 실패 | 설정의 절대경로가 이전 위치를 가리킴 | 새 위치에서 MCP 번들을 다시 생성 |
 | `node`, `npm`, `vercel`을 찾을 수 없음 | 설치 뒤 이전 PowerShell을 계속 사용하거나 PATH 미반영 | Node.js LTS와 Vercel CLI를 설치하고 모든 PowerShell을 닫은 뒤 새 창에서 버전 확인 |
 | Vercel 프로젝트가 안 보임 | 다른 Vercel 계정·팀으로 로그인 | `vercel whoami`와 Dashboard의 현재 계정·팀을 비교 |
@@ -1768,8 +1815,8 @@ list_regulation_reference_cycles로 현재 승인 규정 사이의 순환참조�
 | 관계 | 규정·조문 간 들어오는/나가는 참조와 순환참조 |
 | 개정 관리 | 규정 단위 갱신, 효력 기간에 따른 현재본과 승인 이력 |
 | 검색 데이터 | 사람이 승인한 규정 중 조회 기준일에 유효한 버전 |
-| 로컬 연결 | ChatGPT Desktop / Codex CLI / Codex IDE, Claude Desktop, Claude Code |
-| 원격 연결 | Vercel에 배포한 HTTPS `/mcp` |
+| 로컬 연결 | Codex CLI / Codex IDE, Claude Desktop, Claude Code |
+| 원격 연결 | ChatGPT 웹 또는 Claude가 사용하는 HTTPS `/mcp` |
 
 ### 꼭 지켜야 할 운영 원칙
 
@@ -1804,7 +1851,8 @@ list_regulation_reference_cycles로 현재 승인 규정 사이의 순환참조�
 - [MCP 도구 계약과 프로필](docs/mcp_tool_contract_ko.md)
 - [Vercel HTTPS MCP 배포 안내](docs/vercel_https_mcp_ko.md)
 - [MCP 로컬 서버 공식 문서](https://modelcontextprotocol.io/docs/develop/connect-local-servers)
-- [OpenAI MCP 공식 문서](https://learn.chatgpt.com/docs/extend/mcp)
+- [OpenAI ChatGPT Developer mode·MCP 공식 안내](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)
+- [OpenAI Secure MCP Tunnel 공식 안내](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 - [Claude Code MCP 공식 문서](https://code.claude.com/docs/en/mcp)
 - [Claude 원격 custom connector 공식 안내](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
 - [Vercel CLI 배포 공식 안내](https://vercel.com/docs/projects/deploy-from-cli)
@@ -1847,8 +1895,8 @@ README에는 현재 사용법만 유지합니다. 버전별 변경 내용과 다
 
 ## Kordoc 사용 고지
 
-HWP/HWPX 문서 구조와 표 추출 교차 검증에는
-[Kordoc](https://github.com/chrisryugj/kordoc)을 사용했습니다. 배포 번들에는
+PDF·HWP·HWPX·DOCX로 공식 MCP를 만들 때 필요한 표 파싱 품질 증거와 HWP/HWPX 문서 구조·표
+추출 교차 검증에는 [Kordoc](https://github.com/chrisryugj/kordoc)을 사용했습니다. 배포 번들에는
 Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이선스는
 [Kordoc LICENSE](https://github.com/chrisryugj/kordoc/blob/main/LICENSE)와
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에서 확인할 수 있습니다.

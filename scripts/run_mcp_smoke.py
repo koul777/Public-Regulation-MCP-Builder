@@ -179,6 +179,39 @@ def _run_smoke_with_data_dir(
         profile_id=profile_id,
         vector_offsets=_vector_record_offsets(vector_path),
     )
+    runtime_manifest_path = repository_settings.data_dir / "mcp_runtime_manifest.json"
+
+    def _write_runtime_manifest(
+        *,
+        generated_at: str | None = None,
+        record_count: int | None = None,
+    ) -> None:
+        runtime_manifest_path.write_text(
+            json.dumps(
+                {
+                    "report_type": "mcp_runtime_data_bundle",
+                    "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
+                    "tenant_id": tenant_id,
+                    "profile_id": profile_id,
+                    "document_ids": ["doc_mcp_smoke_v1", "doc_mcp_smoke_v2"],
+                    "record_count": record_count,
+                    "synthetic_runtime": True,
+                    "provenance": "run_mcp_smoke",
+                    "hierarchical_index_status": "ready",
+                    "files": {
+                        "hierarchical_index_sha256": hierarchy_summary["sha256"],
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    # The verified hierarchy path now requires the runtime manifest to exist
+    # before smoke queries run.
+    _write_runtime_manifest(record_count=len(vector_records))
 
     mcp_auth = mcp_auth_context(tenant_id=tenant_id)
     search = search_regulations(
@@ -188,6 +221,36 @@ def _run_smoke_with_data_dir(
         profile_id=profile_id,
         security_levels=["internal"],
     )
+    if search.get("results"):
+        JsonRepository(repository_settings).append_rag_trace(
+            {
+                "trace_id": str(search.get("metadata", {}).get("trace_id") or "smoke-trace"),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "action": "search",
+                "actor": mcp_auth.actor,
+                "tenant_id": tenant_id,
+                "auth_mode": mcp_auth.auth_mode,
+                "api_role": mcp_auth.role,
+                "query_hash": hashlib.sha256("Article".encode("utf-8")).hexdigest(),
+                "top_k": 5,
+                "security_levels": ["internal"],
+                "department_ids": [],
+                "requested_department_ids": [],
+                "result_count": len(search["results"]),
+                "result_refs": [
+                    {
+                        "document_id": str(result.get("document_id") or ""),
+                        "chunk_id": str(result.get("chunk_id") or ""),
+                        "approval_id": str(result.get("approval_id") or ""),
+                        "score": float(result.get("score") or 0.0),
+                    }
+                    for result in search["results"]
+                    if str(result.get("document_id") or "").strip()
+                    and str(result.get("chunk_id") or "").strip()
+                ],
+                "retrieval_strategy": str(search.get("metadata", {}).get("retrieval_strategy") or ""),
+            }
+        )
     fetched = fetch_regulation(
         settings=repository_settings,
         auth=mcp_auth,
@@ -301,28 +364,9 @@ def _run_smoke_with_data_dir(
             "component_manifest_hash": evidence.get("component_manifest_hash"),
         },
     }
-    runtime_manifest_path = repository_settings.data_dir / "mcp_runtime_manifest.json"
-    runtime_manifest_path.write_text(
-        json.dumps(
-            {
-                "report_type": "mcp_runtime_data_bundle",
-                "generated_at": report["generated_at"],
-                "tenant_id": tenant_id,
-                "profile_id": profile_id,
-                "document_ids": ["doc_mcp_smoke_v1", "doc_mcp_smoke_v2"],
-                "record_count": evidence.get("vector_record_count"),
-                "synthetic_runtime": True,
-                "provenance": "run_mcp_smoke",
-                "hierarchical_index_status": "ready",
-                "files": {
-                    "hierarchical_index_sha256": hierarchy_summary["sha256"],
-                },
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_runtime_manifest(
+        generated_at=report["generated_at"],
+        record_count=evidence.get("vector_record_count"),
     )
     if out_json:
         out_json.parent.mkdir(parents=True, exist_ok=True)

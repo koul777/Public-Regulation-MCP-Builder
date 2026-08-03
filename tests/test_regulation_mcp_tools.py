@@ -1344,7 +1344,7 @@ class RegulationMcpToolsTests(unittest.TestCase):
                     ("missing",),
                 ),
             ),
-            identity[5],
+            identity[-1],
         )
 
     def test_runtime_approval_identity_reuses_normal_chunk_lstat(
@@ -1897,6 +1897,186 @@ print(json.dumps({
                     security_levels=["internal"],
                 )
 
+    def test_hierarchy_catalog_tools_reject_mid_request_approval_drift(
+        self,
+    ) -> None:
+        settings = Settings(
+            data_dir=Path("synthetic-runtime"),
+            api_audit_enabled=False,
+        )
+        auth = mcp_auth_context(tenant_id="tenant-a")
+        paths = (Path("index.sqlite3"), Path("vector.jsonl"))
+        token = SimpleNamespace(
+            index_path=paths[0],
+            vector_path=paths[1],
+            index_identity=("index-stable",),
+            vector_identity=("vector-stable",),
+            is_current=lambda: True,
+        )
+        operations = (
+            (
+                "list_regulations",
+                "page_indexed_regulations",
+                ([], 0),
+                lambda: regulation_tools.list_regulations(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                ),
+            ),
+            (
+                "get_regulation_toc",
+                "load_regulation_toc",
+                ({"regulation": None, "nodes": []}),
+                lambda: regulation_tools.get_regulation_toc(
+                    settings=settings,
+                    auth=auth,
+                    regulation_unit_id="unit-a",
+                    profile_id="profile-a",
+                ),
+            ),
+            (
+                "get_regulation_references",
+                "load_regulation_references",
+                {
+                    "regulation": None,
+                    "references": [],
+                    "cycles": [],
+                    "total_count": 0,
+                    "page": 1,
+                    "page_size": 50,
+                },
+                lambda: regulation_tools.get_regulation_references(
+                    settings=settings,
+                    auth=auth,
+                    regulation_unit_id="unit-a",
+                    profile_id="profile-a",
+                ),
+            ),
+            (
+                "list_regulation_reference_cycles",
+                "page_reference_cycles",
+                ([], 0),
+                lambda: regulation_tools.list_regulation_reference_cycles(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                ),
+            ),
+        )
+
+        for operation_name, loader_name, loader_result, operation in operations:
+            with self.subTest(operation=operation_name):
+                with (
+                    patch.object(
+                        regulation_tools,
+                        "_resolve_mcp_profile_scope",
+                        return_value="profile-a",
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        "_verified_hierarchical_runtime_paths",
+                        return_value=paths,
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        "_verified_hierarchical_runtime_token",
+                        return_value=token,
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        "_hierarchical_authorization_source_identity",
+                        side_effect=[
+                            ("runtime_sidecar", ("approval-before",)),
+                            ("runtime_sidecar", ("approval-after",)),
+                        ],
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        "_fully_visible_regulation_units",
+                        return_value={"unit-a"},
+                    ),
+                    patch.object(
+                        regulation_tools,
+                        loader_name,
+                        return_value=loader_result,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "authorization source changed",
+                    ):
+                        operation()
+
+    def test_list_regulations_rejects_runtime_token_drift_after_materialization(
+        self,
+    ) -> None:
+        settings = Settings(
+            data_dir=Path("synthetic-runtime"),
+            api_audit_enabled=False,
+        )
+        auth = mcp_auth_context(tenant_id="tenant-a")
+        paths = (Path("index.sqlite3"), Path("vector.jsonl"))
+        token_checks = 0
+
+        def token_is_current() -> bool:
+            nonlocal token_checks
+            token_checks += 1
+            return token_checks == 1
+
+        token = SimpleNamespace(
+            index_path=paths[0],
+            vector_path=paths[1],
+            index_identity=("index-before",),
+            vector_identity=("vector-before",),
+            is_current=token_is_current,
+        )
+
+        def verified_token_for_paths(_paths: tuple[Path, Path]):
+            self.assertTrue(token.is_current())
+            return token
+
+        with (
+            patch.object(
+                regulation_tools,
+                "_resolve_mcp_profile_scope",
+                return_value="profile-a",
+            ),
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_paths",
+                return_value=paths,
+            ),
+            patch.object(
+                regulation_tools,
+                "_verified_hierarchical_runtime_token",
+                side_effect=verified_token_for_paths,
+            ),
+            patch.object(
+                regulation_tools,
+                "_hierarchical_authorization_source_identity",
+                return_value=("runtime_sidecar", ("approval-stable",)),
+            ),
+            patch.object(
+                regulation_tools,
+                "_fully_visible_regulation_units",
+                return_value={"unit-a"},
+            ),
+            patch.object(
+                regulation_tools,
+                "page_indexed_regulations",
+                return_value=([], 0),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "index .* changed"):
+                regulation_tools.list_regulations(
+                    settings=settings,
+                    auth=auth,
+                    profile_id="profile-a",
+                )
+
+        self.assertEqual(2, token_checks)
+
     def test_hierarchy_search_fails_closed_when_runtime_files_change_mid_query(self) -> None:
         query = SimpleNamespace(
             profile_id="profile-a",
@@ -2202,6 +2382,146 @@ print(json.dumps({
                     )
 
         flat_search.assert_not_called()
+
+    def test_chatgpt_data_search_fails_closed_without_verified_hierarchy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp) / "data",
+                api_audit_enabled=False,
+            )
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            for runtime_token in (None, object()):
+                with self.subTest(
+                    hierarchy_state=(
+                        "unavailable" if runtime_token is None else "degraded"
+                    )
+                ):
+                    with (
+                        patch.object(
+                            regulation_tools,
+                            "_resolve_mcp_profile_scope_with_runtime_token",
+                            return_value=("profile-a", runtime_token),
+                        ),
+                        patch.object(
+                            regulation_tools,
+                            "_search_hierarchical_runtime",
+                            return_value=None,
+                        ),
+                        patch.object(
+                            regulation_tools.routes_rag,
+                            "search_records",
+                            side_effect=AssertionError(
+                                "chatgpt-data must not use flat RAG"
+                            ),
+                        ) as flat_search,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "requires a verified MCP runtime hierarchy",
+                        ):
+                            regulation_tools.search_regulations(
+                                settings=settings,
+                                auth=auth,
+                                query="approved policy",
+                                profile_id="profile-a",
+                                metadata_profile="chatgpt-data",
+                            )
+
+                    flat_search.assert_not_called()
+
+    def test_full_search_retains_flat_fallback_when_hierarchy_is_unavailable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp) / "data",
+                api_audit_enabled=False,
+            )
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            with (
+                patch.object(
+                    regulation_tools,
+                    "_resolve_mcp_profile_scope_with_runtime_token",
+                    return_value=("profile-a", None),
+                ),
+                patch.object(
+                    regulation_tools,
+                    "_resolve_mcp_flat_fallback_profile_scope",
+                    return_value="profile-a",
+                ),
+                patch.object(
+                    regulation_tools.routes_rag,
+                    "search_records",
+                    return_value=(
+                        [],
+                        {
+                            "trace_id": "flat-trace",
+                            "retrieval_strategy": "flat_rag",
+                        },
+                    ),
+                ) as flat_search,
+            ):
+                result = regulation_tools.search_regulations(
+                    settings=settings,
+                    auth=auth,
+                    query="approved policy",
+                    profile_id="profile-a",
+                    metadata_profile="full",
+                )
+
+        flat_search.assert_called_once()
+        self.assertEqual("flat_rag", result["metadata"]["retrieval_strategy"])
+
+    def test_official_full_search_fails_closed_when_hierarchy_is_unavailable(
+        self,
+    ) -> None:
+        for runtime_marker in ("manifest", "hierarchy"):
+            with self.subTest(runtime_marker=runtime_marker):
+                with tempfile.TemporaryDirectory() as tmp:
+                    settings = Settings(
+                        data_dir=Path(tmp) / "data",
+                        api_audit_enabled=False,
+                    )
+                    if runtime_marker == "manifest":
+                        marker_path = (
+                            settings.data_dir / "mcp_runtime_manifest.json"
+                        )
+                    else:
+                        marker_path = hierarchical_index_path(
+                            settings.data_dir
+                        )
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    marker_path.write_bytes(b"generated-runtime-marker")
+                    auth = mcp_auth_context(tenant_id="tenant-a")
+                    with (
+                        patch.object(
+                            regulation_tools,
+                            "_resolve_mcp_profile_scope_with_runtime_token",
+                            return_value=("profile-a", None),
+                        ),
+                        patch.object(
+                            regulation_tools.routes_rag,
+                            "search_records",
+                            side_effect=AssertionError(
+                                "official runtime must not use flat RAG"
+                            ),
+                        ) as flat_search,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "official MCP runtime requires its generated hierarchy",
+                        ):
+                            regulation_tools.search_regulations(
+                                settings=settings,
+                                auth=auth,
+                                query="approved policy",
+                                profile_id="profile-a",
+                                metadata_profile="full",
+                            )
+
+                    flat_search.assert_not_called()
 
     def test_search_flat_fallback_rejects_profile_change_during_read(
         self,
@@ -2542,7 +2862,66 @@ print(json.dumps({
                 )
 
         self.assertFalse(result["metadata"]["hierarchical_index_ready"])
+        self.assertIn("automatically", result["metadata"]["message"])
+        self.assertNotIn("Regenerate", result["metadata"]["message"])
         self.assertEqual("profile-a", runtime_paths.call_args.kwargs["profile_id"])
+
+    def test_list_regulations_fails_closed_when_official_manifest_declares_hierarchy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "report_type": "mcp_runtime_data_bundle",
+                        "tenant_id": "tenant-a",
+                        "profile_id": "profile-a",
+                        "hierarchical_index_status": "ready",
+                        "files": {
+                            "hierarchical_index_sha256": "0" * 64,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                regulation_tools,
+                "_verified_hierarchical_catalog_read_context",
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "official MCP runtime requires its generated hierarchy",
+                ):
+                    list_regulations(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                    )
+
+    def test_reference_cycles_fail_closed_when_connector_requires_hierarchy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+
+            with patch.object(
+                regulation_tools,
+                "_verified_hierarchical_catalog_read_context",
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "chatgpt-data connector requires a verified MCP runtime hierarchy",
+                ):
+                    regulation_tools.list_regulation_reference_cycles(
+                        settings=settings,
+                        auth=auth,
+                        profile_id="profile-a",
+                        require_hierarchy=True,
+                    )
 
     def test_visible_records_uses_verified_runtime_profile_without_scope_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3501,6 +3880,40 @@ print(json.dumps({
             settings = Settings(data_dir=Path(tmp) / "data")
             _prepare_mcp_indexed_document(settings)
             mcp_auth = mcp_auth_context(tenant_id="tenant-a")
+            vector_path = routes_rag._local_vector_path(settings, mcp_auth)
+            records = [
+                json.loads(line)
+                for line in vector_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            hierarchy = build_hierarchical_runtime_index(
+                hierarchical_index_path(settings.data_dir),
+                records,
+                tenant_id="tenant-a",
+                profile_id="public_portal-test-profile",
+                vector_offsets=offsets,
+            )
+            _write_runtime_approval_snapshot_sidecar(
+                settings.data_dir,
+                records,
+                tenant_id="tenant-a",
+            )
+            manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "profile_id": "public_portal-test-profile",
+                    "hierarchical_index_status": "ready",
+                    "files": {
+                        "hierarchical_index_sha256": hierarchy["sha256"],
+                    },
+                }
+            )
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
 
             search = search_regulations(
                 settings=settings,
@@ -4830,6 +5243,26 @@ print(json.dumps({
             },
             set(tool_manager._tools),
         )
+
+    def test_chatgpt_data_catalog_fails_when_hierarchy_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = create_regulation_mcp_server(
+                data_dir=Path(tmp) / "data",
+                tenant_id="tenant-a",
+                tool_profile="chatgpt-data",
+                warm_cache=False,
+                background_tokenizer_warmup=False,
+            )
+            list_catalog = server._tool_manager._tools["list_regulations"].fn
+            list_cycles = server._tool_manager._tools["list_regulation_reference_cycles"].fn
+
+            for tool in (list_catalog, list_cycles):
+                with self.subTest(tool=tool.__name__):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "requires a verified MCP runtime hierarchy",
+                    ):
+                        tool()
 
     def test_chatgpt_data_tool_profile_uses_exact_openai_data_source_schemas(self) -> None:
         server = create_regulation_mcp_server(

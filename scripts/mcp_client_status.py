@@ -116,6 +116,8 @@ _LOCAL_TARGETS = frozenset(
     {"claude-code", "codex", "claude-desktop", "chatgpt-desktop-local"}
 )
 _REMOTE_TARGETS = frozenset({"chatgpt-remote", "claude-api"})
+_UNSUPPORTED_TARGETS = frozenset({"chatgpt-desktop-local"})
+CHATGPT_LOCAL_UNSUPPORTED = "chatgpt_local_unsupported"
 _SAFE_SERVER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:@+-]{1,256}")
 _SAFE_REASON = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
@@ -184,6 +186,7 @@ def begin_attempt(
 ) -> dict[str, Any]:
     """Begin one target attempt without clearing that target's effective baseline."""
 
+    _require_supported_target(target)
     answer = _status_copy(status)
     record = _client_record(answer, target)
     if record["last_attempt"].get("state") == "in_progress":
@@ -217,6 +220,7 @@ def commit_success(
 ) -> dict[str, Any]:
     """Commit current-attempt evidence and derive configured/connected conservatively."""
 
+    _require_supported_target(target)
     answer = _status_copy(status)
     record = _client_record(answer, target)
     attempt = _current_attempt(record, attempt_id)
@@ -493,6 +497,14 @@ def project_legacy(
         installation_state = "not_installed"
 
     projection = _empty_legacy_projection()
+    if target in _UNSUPPORTED_TARGETS:
+        projection["installation_state"] = "unsupported"
+        projection["connection_state"] = "not_configured"
+        answer.update(projection)
+        answer["connection_reason_code"] = CHATGPT_LOCAL_UNSUPPORTED
+        answer["legacy_projection_target"] = target
+        answer["legacy_projection_updated_at"] = timestamp
+        return answer
     projection.update(
         {
             "installation_attempt_id": attempt.get("id") or effective.get("attempt_id"),
@@ -557,6 +569,16 @@ def adapt_legacy_status(
         return answer
 
     record = _client_record(answer, selected_target)
+    if selected_target in _UNSUPPORTED_TARGETS:
+        record["last_attempt"]["state"] = "failed_unverified"
+        record["last_attempt"]["reason_code"] = CHATGPT_LOCAL_UNSUPPORTED
+        record["last_attempt"]["finished_at"] = timestamp
+        record["support_status"] = "unsupported"
+        record["support_reason_code"] = CHATGPT_LOCAL_UNSUPPORTED
+        _refresh_readiness(record)
+        answer["legacy_migration_state"] = CHATGPT_LOCAL_UNSUPPORTED
+        answer["updated_at"] = timestamp
+        return project_legacy(answer, selected_target, projected_at=timestamp)
     attempt_id = _identifier(
         legacy_status.get("installation_attempt_id") or "legacy-unattributed-attempt"
     )
@@ -618,13 +640,17 @@ def _empty_client_connection(
     bundle_fingerprint: str | None,
 ) -> dict[str, Any]:
     policy = _TARGET_POLICIES[target]
-    configuration_ready = target in _LOCAL_TARGETS
+    configuration_ready = target in _LOCAL_TARGETS and target not in _UNSUPPORTED_TARGETS
     return {
         "schema_version": CLIENT_SCHEMA_VERSION,
         "target": target,
         "server_name": server_name,
         "transport": policy["transport"],
         "config_resource_id": policy["config_resource_id"],
+        "support_status": "unsupported" if target in _UNSUPPORTED_TARGETS else "supported",
+        "support_reason_code": (
+            CHATGPT_LOCAL_UNSUPPORTED if target in _UNSUPPORTED_TARGETS else None
+        ),
         "last_attempt": {
             "id": None,
             "state": "not_started",
@@ -648,9 +674,9 @@ def _empty_client_connection(
         "stage_order": list(STAGE_ORDER),
         "stages": {name: _empty_stage() for name in STAGE_ORDER},
         "readiness": {
-            "artifact_ready": True,
+            "artifact_ready": target not in _UNSUPPORTED_TARGETS,
             "configuration_ready": configuration_ready,
-            "runtime_ready": bool(runtime_fingerprint),
+            "runtime_ready": bool(runtime_fingerprint) and target not in _UNSUPPORTED_TARGETS,
             "endpoint_verified": False,
             "registration_verified": False,
             "tool_discovery_verified": False,
@@ -790,6 +816,8 @@ def _invalidate_replaced_shared_config_siblings(
 
 
 def _derived_effective_state(record: Mapping[str, Any]) -> str:
+    if record.get("target") in _UNSUPPORTED_TARGETS:
+        return "not_configured"
     stages = record["stages"]
     required_for_connection = record["connection_required_stages"]
     required_for_configuration = record["configuration_required_stages"]
@@ -808,6 +836,20 @@ def _refresh_readiness(record: dict[str, Any]) -> None:
     stages = record["stages"]
     state = str(record["effective"].get("state") or "not_configured")
     readiness = record["readiness"]
+    if record.get("target") in _UNSUPPORTED_TARGETS:
+        readiness.update(
+            {
+                "artifact_ready": False,
+                "configuration_ready": False,
+                "runtime_ready": False,
+                "endpoint_verified": False,
+                "registration_verified": False,
+                "tool_discovery_verified": False,
+                "conversation_verified": False,
+                "manual_action_required": True,
+            }
+        )
+        return
     readiness["runtime_ready"] = bool(record["effective"].get("runtime_fingerprint"))
     readiness["endpoint_verified"] = record["target"] in _REMOTE_TARGETS and (
         stages["transport"].get("state") == "verified"
@@ -895,7 +937,98 @@ def _status_copy(status: Mapping[str, Any]) -> dict[str, Any]:
         or set(connections) != set(CLIENT_TARGETS)
     ):
         raise ValueError("status must contain every supported client_connections record")
+    _normalize_unsupported_client_record(answer)
     return answer
+
+
+def _normalize_unsupported_client_record(status: dict[str, Any]) -> None:
+    """Remove historical success claims from the retired local ChatGPT target."""
+
+    record = status["client_connections"].get("chatgpt-desktop-local")
+    if not isinstance(record, dict) or record.get("target") != "chatgpt-desktop-local":
+        return
+
+    record["support_status"] = "unsupported"
+    record["support_reason_code"] = CHATGPT_LOCAL_UNSUPPORTED
+    for field in ("supported", "configured", "connected"):
+        if field in record:
+            record[field] = False
+
+    attempt = record.get("last_attempt")
+    if isinstance(attempt, dict):
+        state = str(attempt.get("state") or "not_started")
+        if state not in {"not_started", "failed_unverified", "failed_rolled_back"}:
+            attempt["state"] = "failed_unverified"
+        if attempt.get("state") != "not_started":
+            attempt["reason_code"] = CHATGPT_LOCAL_UNSUPPORTED
+
+    effective = record.get("effective")
+    if not isinstance(effective, dict):
+        effective = {}
+        record["effective"] = effective
+    effective["state"] = "not_configured"
+    for field in (
+        "attempt_id",
+        "bundle_location_fingerprint",
+        "config_entry_fingerprint",
+        "config_container_fingerprint",
+        "runtime_fingerprint",
+        "verified_at",
+    ):
+        effective[field] = None
+    for field in ("configured", "connected"):
+        if field in effective:
+            effective[field] = False
+
+    stages = record.get("stages")
+    if isinstance(stages, dict):
+        success_states = {
+            "complete",
+            "completed",
+            "configured",
+            "connected",
+            "ok",
+            "success",
+            "verified",
+        }
+        for stage in stages.values():
+            if not isinstance(stage, dict):
+                continue
+            if str(stage.get("state") or "").casefold() in success_states:
+                stage.update(
+                    {
+                        "state": "not_checked",
+                        "attempt_id": None,
+                        "checked_at": None,
+                        "reason_code": CHATGPT_LOCAL_UNSUPPORTED,
+                        "config_entry_fingerprint": None,
+                        "runtime_fingerprint": None,
+                        "evidence": {},
+                    }
+                )
+            for field in ("verified", "configured", "connected", "ok"):
+                if field in stage:
+                    stage[field] = False
+
+    readiness = record.get("readiness")
+    if not isinstance(readiness, dict):
+        readiness = {}
+        record["readiness"] = readiness
+    for field, value in tuple(readiness.items()):
+        if isinstance(value, bool):
+            readiness[field] = False
+    readiness.update(
+        {
+            "artifact_ready": False,
+            "configuration_ready": False,
+            "runtime_ready": False,
+            "endpoint_verified": False,
+            "registration_verified": False,
+            "tool_discovery_verified": False,
+            "conversation_verified": False,
+            "manual_action_required": True,
+        }
+    )
 
 
 def _client_record(status: dict[str, Any], target: str) -> dict[str, Any]:
@@ -919,6 +1052,12 @@ def _current_attempt(record: Mapping[str, Any], attempt_id: object) -> dict[str,
 def _target(target: str) -> None:
     if target not in CLIENT_TARGETS:
         raise ValueError(f"Unsupported MCP client target: {target}")
+
+
+def _require_supported_target(target: str) -> None:
+    _target(target)
+    if target in _UNSUPPORTED_TARGETS:
+        raise ValueError(CHATGPT_LOCAL_UNSUPPORTED)
 
 
 def _server_name(value: object) -> str:
@@ -1392,6 +1531,14 @@ def main(argv: list[str] | None = None) -> int:
     action = _safe_action(cli_argv)
     try:
         args = _build_cli_parser().parse_args(cli_argv)
+        if getattr(args, "target", None) in _UNSUPPORTED_TARGETS:
+            _emit_cli_result(
+                target=args.target,
+                action=action,
+                ok=False,
+                state=CHATGPT_LOCAL_UNSUPPORTED,
+            )
+            return 1
         target, state = _run_cli_action(args)
     except Exception as exc:
         # Never reflect an exception, path, server, attempt, fingerprint, or
@@ -1408,6 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "CLIENT_SCHEMA_VERSION",
     "CLIENT_TARGETS",
+    "CHATGPT_LOCAL_UNSUPPORTED",
     "SCHEMA_VERSION",
     "STAGE_ORDER",
     "STATUS_MODEL",

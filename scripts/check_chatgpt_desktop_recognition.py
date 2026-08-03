@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -27,6 +26,7 @@ _DESKTOP_LOG_RELATIVE_PATHS = (
     Path("LocalCache") / "Local" / "ChatGPT" / "Logs",
 )
 _SAFE_PACKAGE_FAMILY = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+CHATGPT_LOCAL_UNSUPPORTED = "chatgpt_local_unsupported"
 
 
 @dataclass(frozen=True)
@@ -181,7 +181,7 @@ def evaluate_recognition_observation(
         "logs_loaded" if sessions else "not_checked"
     )
     observed_log_file_count = len(sessions) if log_file_count is None else max(0, int(log_file_count))
-    observation_ready = bool(
+    legacy_observation_ready = bool(
         registration_at is not None
         and post_registration_processes
         and not restart_required
@@ -189,32 +189,36 @@ def evaluate_recognition_observation(
         and status_list_observed_without_error
     )
     if registration_at is None:
-        observation_status = "registration_time_unknown"
+        legacy_observation_status = "registration_time_unknown"
     elif restart_required:
-        observation_status = "restart_required"
+        legacy_observation_status = "restart_required"
     elif not processes:
-        observation_status = "desktop_not_running"
+        legacy_observation_status = "desktop_not_running"
     elif normalized_log_discovery_status == "log_root_missing":
-        observation_status = "desktop_log_root_not_found"
+        legacy_observation_status = "desktop_log_root_not_found"
     elif normalized_log_discovery_status == "logs_not_found":
-        observation_status = "desktop_log_files_not_found"
+        legacy_observation_status = "desktop_log_files_not_found"
     elif normalized_log_discovery_status == "logs_unreadable":
-        observation_status = "desktop_log_files_unreadable"
+        legacy_observation_status = "desktop_log_files_unreadable"
     elif not new_session_observed:
-        observation_status = "post_registration_log_session_not_observed"
+        legacy_observation_status = "post_registration_log_session_not_observed"
     elif post_registration_errors > 0:
-        observation_status = "mcp_status_list_error_observed"
+        legacy_observation_status = "mcp_status_list_error_observed"
     elif not status_list_observed_without_error:
-        observation_status = "mcp_status_list_success_not_observed"
+        legacy_observation_status = "mcp_status_list_success_not_observed"
     else:
-        observation_status = "restart_and_mcp_status_list_observed"
+        legacy_observation_status = "restart_and_mcp_status_list_observed"
 
     generated = parse_timestamp(generated_at) or datetime.now(timezone.utc)
     report: dict[str, Any] = {
         "report_type": "chatgpt_desktop_recognition_observation",
         "generated_at": isoformat_utc(generated),
-        "observation_status": observation_status,
-        "recognition_observation_ready": observation_ready,
+        "observation_status": CHATGPT_LOCAL_UNSUPPORTED,
+        "recognition_observation_ready": False,
+        "support_status": "unsupported",
+        "reason_code": CHATGPT_LOCAL_UNSUPPORTED,
+        "legacy_observation_status": legacy_observation_status,
+        "legacy_observation_ready": legacy_observation_ready,
         "registration": {
             "observed": registration_at is not None,
             "occurred_at": isoformat_utc(registration_at),
@@ -261,6 +265,9 @@ def build_support_summary(report: dict[str, Any]) -> dict[str, Any]:
     registration = report.get("registration") if isinstance(report.get("registration"), dict) else {}
     summary = {
         "status": str(report.get("observation_status") or "unknown"),
+        "support_status": "unsupported",
+        "reason_code": CHATGPT_LOCAL_UNSUPPORTED,
+        "replacement_target": "chatgpt-remote",
         "registration_observed": bool(registration.get("observed")),
         "registration_source": str(registration.get("source") or "unknown"),
         "desktop_process_detected": bool(process.get("detected")),
@@ -505,71 +512,19 @@ def build_parser() -> argparse.ArgumentParser:
 def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> int:
     args = build_parser().parse_args(argv)
     output = stdout or sys.stdout
-    registration = load_registration_observation(
-        registration_time=args.registration_time,
-        bundle_status_path=args.bundle_status,
-        config_path=args.config_path,
-    )
-    process_times = (
-        [parsed for value in args.process_start_time if (parsed := parse_timestamp(value)) is not None]
-        if args.process_start_time
-        else discover_desktop_process_start_times()
-    )
-    if args.log_file:
-        candidate_log_roots: list[Path] = []
-        existing_log_roots: list[Path] = []
-        log_paths = list(args.log_file)
-        log_discovery_status = "explicit_log_files"
-    else:
-        candidate_log_roots = [args.log_root] if args.log_root is not None else discover_desktop_log_roots()
-        existing_log_roots = [path for path in candidate_log_roots if path.is_dir()]
-        log_paths = []
-        seen_log_paths: set[str] = set()
-        for root in existing_log_roots:
-            for path in discover_log_files(root):
-                key = os.path.normcase(str(path))
-                if key not in seen_log_paths:
-                    seen_log_paths.add(key)
-                    log_paths.append(path)
-        if not existing_log_roots:
-            log_discovery_status = "log_root_missing"
-        elif not log_paths:
-            log_discovery_status = "logs_not_found"
-        else:
-            log_discovery_status = "logs_discovered"
-    sessions = [session for path in log_paths if (session := load_log_session(path)) is not None]
-    if log_paths and not sessions:
-        log_discovery_status = "logs_unreadable"
-    elif sessions:
-        log_discovery_status = "logs_loaded"
     report = evaluate_recognition_observation(
-        registration=registration,
-        process_start_times=process_times,
-        log_sessions=sessions,
-        log_discovery_status=log_discovery_status,
-        log_root_candidate_count=len(candidate_log_roots),
-        log_root_existing_count=len(existing_log_roots),
-        log_file_count=len(log_paths),
+        registration=RegistrationObservation(None, "unsupported"),
+        process_start_times=[],
+        log_sessions=[],
+        log_discovery_status="not_checked",
     )
-    config_exists = bool(args.config_path is not None and args.config_path.is_file())
-    config_sha256 = None
-    if config_exists:
-        try:
-            config_sha256 = "sha256:" + hashlib.sha256(args.config_path.read_bytes()).hexdigest()
-        except OSError:
-            config_exists = False
-    report["config_observation"] = {
-        "exists": config_exists,
-        "content_sha256": config_sha256,
-    }
+    report["config_observation"] = {"exists": False, "content_sha256": None}
     rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.out_json is not None:
         args.out_json.parent.mkdir(parents=True, exist_ok=True)
         args.out_json.write_text(rendered, encoding="utf-8")
     output.write(rendered)
-    if args.fail_on_issue and not report["recognition_observation_ready"]:
-        return 2
-    return 0
+    return 2 if args.fail_on_issue else 1
 
 
 def main() -> int:

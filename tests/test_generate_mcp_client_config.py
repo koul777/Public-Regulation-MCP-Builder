@@ -19,6 +19,17 @@ from unittest.mock import patch
 
 from app.core.config import Settings
 from app.ingestion.vector_adapter import stable_content_hash
+from app.mcp_server.regulation_tools import (
+    fetch_regulation as fetch_mcp_regulation,
+    list_regulations as list_mcp_regulations,
+    search_regulations as search_mcp_regulations,
+)
+from app.retrieval.hierarchical_index import (
+    list_indexed_regulations,
+    load_article_records,
+    regulation_toc,
+    search_hierarchical_records,
+)
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.schemas.structure import StructureNode
@@ -41,9 +52,7 @@ from scripts.generate_mcp_client_config import (
     write_mcp_setup_bundle_zip,
 )
 from scripts.mcp_bundle_contract import (
-    ALL_SETUP_BUNDLE_FILES,
     REQUIRED_SETUP_BUNDLE_FILES,
-    SETUP_BUNDLE_FILES,
 )
 
 
@@ -496,7 +505,7 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                 if name == "project-venv":
                     project_python.write_bytes(b"test-python-placeholder")
 
-    def test_setup_bundle_embeds_separate_chatgpt_and_claude_fallback_configs(self) -> None:
+    def test_setup_bundle_embeds_separate_codex_and_claude_fallback_configs(self) -> None:
         config = build_mcp_client_config(
             server_name="product-source-mcp",
             client_profile="bundle",
@@ -505,27 +514,31 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
         config["claude_desktop"]["mcpServers"]["product-source-mcp"]["env"] = {
             "PRODUCT_SOURCE": "claude-desktop"
         }
-        config["chatgpt_desktop_local"]["mcpServers"]["product-source-mcp"]["env"] = {
-            "PRODUCT_SOURCE": "chatgpt-desktop"
-        }
 
         with tempfile.TemporaryDirectory() as tmp:
             files = write_mcp_setup_bundle(config, tmp, server_name="product-source-mcp")
             wizard = Path(files["connect"]).read_text(encoding="utf-8-sig")
+            legacy_artifact = json.loads(
+                Path(files["chatgpt_desktop_local"]).read_text(encoding="utf-8")
+            )
 
         embedded: dict[str, dict[str, object]] = {}
         for variable_name in (
             "EmbeddedClaudeDesktopConfigBase64",
-            "EmbeddedChatGptDesktopConfigBase64",
+            "EmbeddedCodexConfigBase64",
         ):
             match = re.search(rf'^\${variable_name} = "([A-Za-z0-9+/=]+)"$', wizard, re.MULTILINE)
             self.assertIsNotNone(match, variable_name)
             embedded[variable_name] = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
 
         claude_server = embedded["EmbeddedClaudeDesktopConfigBase64"]["mcpServers"]["product-source-mcp"]
-        chatgpt_server = embedded["EmbeddedChatGptDesktopConfigBase64"]["mcpServers"]["product-source-mcp"]
+        codex_server = embedded["EmbeddedCodexConfigBase64"]["mcpServers"]["product-source-mcp"]
         self.assertEqual("claude-desktop", claude_server["env"]["PRODUCT_SOURCE"])
-        self.assertEqual("chatgpt-desktop", chatgpt_server["env"]["PRODUCT_SOURCE"])
+        self.assertEqual("full", codex_server["args"][codex_server["args"].index("--tool-profile") + 1])
+        self.assertEqual("unsupported", legacy_artifact["support_status"])
+        self.assertFalse(legacy_artifact["direct_local_supported"])
+        self.assertNotIn("mcpServers", legacy_artifact)
+        self.assertNotIn("ui_fields", legacy_artifact)
 
     def test_runtime_identity_payloads_are_encoded_for_powershell_native_argv(self) -> None:
         builder_source = base64.b64decode(_runtime_identity_builder_base64()).decode("utf-8")
@@ -664,9 +677,9 @@ class GenerateMcpClientConfigTests(unittest.TestCase):
                     "mcp_initialized": True,
                     "tools_discovered": True,
                     "end_to_end_verified": True,
-                    "results": [{}, {}, {}],
+                    "results": [{}, {}],
                 },
-                "Client config smoke did not produce a fresh passing three-client report.",
+                "Client config smoke did not produce a fresh passing Codex and Claude Desktop report.",
             ),
         )
 
@@ -2378,6 +2391,21 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn('$ConsoleProbe = Start-Process', launcher)
         self.assertIn("stale console script", launcher)
 
+    def test_bundle_client_config_smoke_prefers_explicit_project_root_for_reg_rag_python(self) -> None:
+        script = mcp_config_generator._powershell_bundle_client_config_smoke_script(
+            server_name="regulation_mcp"
+        )
+
+        self.assertIn("$env:REG_RAG_PYTHON_PROJECT_ROOT", script)
+        self.assertIn(
+            'if ($env:REG_RAG_PYTHON -and (Test-BundlePythonModule $env:REG_RAG_PYTHON $ModuleName $EnvProjectRoot)) {',
+            script,
+        )
+        self.assertIn(
+            'if ($EnvProjectRoot) { $script:McpResolvedSourceProjectRoot = $EnvProjectRoot }',
+            script,
+        )
+
     def test_cli_accepts_explicit_wheel_dist_directory(self) -> None:
         with patch.object(
             sys,
@@ -2415,6 +2443,23 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 args = parse_args()
 
             self.assertEqual(profile, args.client_profile)
+
+    def test_legacy_chatgpt_local_profile_returns_warning_only_payload(self) -> None:
+        config = build_mcp_client_config(
+            server_name="legacy-chatgpt-local",
+            client_profile="chatgpt-desktop-local",
+            tenant_id="tenant-a",
+        )
+
+        self.assertEqual("chatgpt-desktop-local", config["profile"])
+        self.assertEqual("unsupported", config["support_status"])
+        self.assertFalse(config["direct_local_supported"])
+        self.assertFalse(config["chatgpt_direct_local_mcp_supported"])
+        self.assertIn("does not directly connect to a local MCP server", config["warning"])
+        self.assertIn("12584461", config["official_help_url"])
+        self.assertIn("secure-mcp-tunnels", config["secure_mcp_tunnel_url"])
+        for runnable_key in ("mcpServers", "ui_fields", "command", "args", "cwd", "env"):
+            self.assertNotIn(runnable_key, config)
 
     def test_committed_bundle_readmes_require_real_runtime_visibility_audit(self) -> None:
         reports_dir = Path(__file__).resolve().parents[1] / "reports"
@@ -2456,6 +2501,39 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 self.assertIn("--forbid-smoke-docs", readme)
                 self.assertIn("--require-indexed", readme)
                 self.assertIn(r"--data-dir .\data", readme)
+
+    def test_generated_readmes_separate_supported_local_clients_from_chatgpt_web(self) -> None:
+        config = build_mcp_client_config(
+            server_name="readme-chatgpt-policy",
+            client_profile="bundle",
+            tenant_id="tenant-a",
+            public_url="https://mcp.example.go.kr/mcp",
+        )
+
+        for renderer in (
+            mcp_config_generator._setup_bundle_readme,
+            mcp_config_generator._setup_bundle_readme_ko,
+        ):
+            with self.subTest(renderer=renderer.__name__):
+                readme = renderer(
+                    config=config,
+                    files={},
+                    server_name="readme-chatgpt-policy",
+                )
+                self.assertIn("ChatGPT web", readme)
+                self.assertIn("Developer mode", readme)
+                self.assertIn("Apps > Create", readme)
+                self.assertIn("support_status=unsupported", readme)
+                self.assertIn("direct_local_supported=false", readme)
+                self.assertIn("12584461", readme)
+                self.assertIn("secure-mcp-tunnels", readme)
+                self.assertIn("Pro", readme)
+                self.assertIn("Business", readme)
+                self.assertIn("Enterprise", readme)
+                self.assertIn("Edu", readme)
+                self.assertIn("Python 3.11+", readme)
+                self.assertIn("install_local_package.ps1", readme)
+                self.assertNotIn("ChatGPT Desktop | local", readme)
 
     def test_builds_stdio_config_with_tenant_isolation(self) -> None:
         config = build_mcp_client_config(
@@ -2521,6 +2599,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
 
         self.assertEqual(config["profile"], "chatgpt-remote")
+        self.assertEqual(config["surface"], "chatgpt_web")
+        self.assertTrue(config["web_only"])
         self.assertEqual(config["transport"], "streamable-http")
         self.assertEqual(config["connector_url"], "https://mcp.example.go.kr/govreg/mcp")
         self.assertTrue(config["ready"])
@@ -2529,10 +2609,18 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertTrue(config["chatgpt_setup"]["https_endpoint_ready"])
         self.assertEqual(
             config["chatgpt_setup"]["location"],
-            "ChatGPT Desktop Settings > MCP servers > Add server",
+            "ChatGPT web > Settings > Apps > Advanced settings > Developer mode; then Apps > Create",
         )
         self.assertEqual(config["chatgpt_setup"]["transport"], "streamable-http")
-        self.assertEqual(config["chatgpt_setup"]["shared_config_file"], "~/.codex/config.toml")
+        self.assertTrue(config["chatgpt_setup"]["web_only"])
+        self.assertFalse(config["chatgpt_setup"]["direct_local_supported"])
+        self.assertIn("12584461", config["chatgpt_setup"]["official_help_url"])
+        self.assertIn("secure-mcp-tunnels", config["chatgpt_setup"]["secure_mcp_tunnel_url"])
+        self.assertIn("Read/fetch", config["chatgpt_setup"]["plan_requirements"]["pro"])
+        self.assertIn(
+            "Full MCP",
+            config["chatgpt_setup"]["plan_requirements"]["business_enterprise_edu"],
+        )
         self.assertEqual(
             config["chatgpt_setup"]["authentication_modes"],
             ["bearer_token_env_var", "oauth", "approved_public_unauthenticated"],
@@ -2553,12 +2641,12 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertEqual(config["server_auth"]["mode"], "bearer-or-oauth-or-approved-public")
         self.assertEqual(config["server_auth"]["bearer_token_env_var"], "MCP_AUTH_TOKEN")
         self.assertTrue(config["server_auth"]["oauth_ready"])
-        self.assertTrue(config["server_auth"]["bearer_supported_by_chatgpt_desktop_and_codex"])
+        self.assertFalse(config["server_auth"]["bearer_supported_by_chatgpt_desktop_and_codex"])
         connection_steps = " ".join(config["connection_steps"])
         self.assertIn("reg-rag-mcp-vercel-stage", connection_steps)
-        self.assertIn("Streamable HTTP", connection_steps)
-        self.assertIn("bearer_token_env_var", connection_steps)
-        self.assertIn("OAuth", connection_steps)
+        self.assertIn("Developer mode", connection_steps)
+        self.assertIn("Settings > Apps > Advanced settings", connection_steps)
+        self.assertIn("Secure MCP Tunnel", connection_steps)
         self.assertIn("search", config["compatible_tools"])
         self.assertIn("fetch", config["compatible_tools"])
         self.assertEqual(
@@ -2688,7 +2776,6 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         )
         claude_desktop_args = config["claude_desktop"]["mcpServers"]["aks_mcp"]["args"]
         claude_code_args = config["claude_code"]["args"]
-        chatgpt_desktop_args = config["chatgpt_desktop_local"]["mcpServers"]["aks_mcp"]["args"]
         self.assertIn("--no-warm-cache", claude_desktop_args)
         self.assertIn("--no-warm-cache", claude_code_args)
         self.assertEqual(
@@ -2698,10 +2785,6 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertEqual(
             "full",
             claude_code_args[claude_code_args.index("--tool-profile") + 1],
-        )
-        self.assertEqual(
-            "chatgpt-data",
-            chatgpt_desktop_args[chatgpt_desktop_args.index("--tool-profile") + 1],
         )
         expected_chatgpt_tools = [
             "list_regulations",
@@ -2730,21 +2813,15 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             config["quickstart"]["chatgpt_remote"]["bearer_token_env_var"],
             "MCP_AUTH_TOKEN",
         )
-        self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["profile"], "chatgpt-desktop-local")
-        self.assertEqual(config["quickstart"]["chatgpt_desktop_local"]["tool_profile"], "chatgpt-data")
-        self.assertEqual(
-            config["quickstart"]["chatgpt_desktop_local"]["verification_tools"],
-            expected_chatgpt_tools,
-        )
-        self.assertEqual(
-            config["quickstart"]["chatgpt_desktop_local"]["connection_configuration_method"],
-            "direct_config",
-        )
-        self.assertNotIn(
-            "connection_prompt_required",
-            config["quickstart"]["chatgpt_desktop_local"],
-        )
-        self.assertTrue(config["quickstart"]["chatgpt_desktop_local"]["conversation_attachment_unverified"])
+        legacy_local = config["quickstart"]["chatgpt_desktop_local"]
+        self.assertEqual("chatgpt-desktop-local", legacy_local["profile"])
+        self.assertEqual("unsupported", legacy_local["support_status"])
+        self.assertFalse(legacy_local["direct_local_supported"])
+        self.assertFalse(legacy_local["chatgpt_direct_local_mcp_supported"])
+        self.assertIn("12584461", legacy_local["official_help_url"])
+        self.assertIn("secure-mcp-tunnels", legacy_local["secure_mcp_tunnel_url"])
+        for runnable_key in ("mcpServers", "ui_fields", "command", "args", "cwd", "env"):
+            self.assertNotIn(runnable_key, legacy_local)
         self.assertEqual(
             config["quickstart"]["vercel_https"],
             {
@@ -2752,7 +2829,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 "connector_url": "https://mcp.example.go.kr/mcp",
                 "mcp_path": "/mcp",
                 "shared_by_clients": [
-                    "ChatGPT Desktop",
+                    "ChatGPT web",
                     "Codex CLI",
                     "Codex IDE",
                     "Claude",
@@ -2818,6 +2895,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("reg-rag-mcp-index-visibility", copy_paste["audit_index_visibility_ps"])
         self.assertNotIn("--allow-local-only-bundle", copy_paste["doctor_ps"])
         self.assertNotIn("chatgpt-tunnel", copy_paste["connect_wizard_ps"])
+        self.assertNotIn("ChatGPT Desktop local MCP", copy_paste["connect_wizard_ps"])
+        self.assertIn("ChatGPT web remote HTTPS MCP", copy_paste["connect_wizard_ps"])
+        self.assertIn('"chatgpt-desktop-local" { Show-UnsupportedChatGptLocal }', copy_paste["connect_wizard_ps"])
         self.assertIn("Claude Desktop config updated", copy_paste["connect_wizard_ps"])
         self.assertIn("Claude Code CLI was not found", copy_paste["connect_wizard_ps"])
         self.assertIn("Streamable HTTP URL", copy_paste["connect_wizard_ps"])
@@ -2847,6 +2927,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             }
             legacy_plugin_exists = (bundle_dir / "chatgpt-desktop-local-plugin").exists()
             connect_script = Path(files["connect"]).read_text(encoding="utf-8-sig")
+            legacy_local_artifact = json.loads(
+                Path(files["chatgpt_desktop_local"]).read_text(encoding="utf-8")
+            )
 
         lowered_names = {name.casefold() for name in generated_names}
         self.assertFalse(any(name.endswith(".bat") for name in lowered_names))
@@ -2875,10 +2958,15 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         for retired_command in (
             "InstallChatGptDesktopPlugin",
             "plugin marketplace",
-            "secure mcp tunnel",
             "run_openai_secure_tunnel.ps1",
         ):
             self.assertNotIn(retired_command.casefold(), connect_script.casefold())
+        self.assertEqual("unsupported", legacy_local_artifact["support_status"])
+        self.assertFalse(legacy_local_artifact["direct_local_supported"])
+        self.assertNotIn("mcpServers", legacy_local_artifact)
+        self.assertNotIn("ui_fields", legacy_local_artifact)
+        self.assertIn("secure mcp tunnel", connect_script.casefold())
+        self.assertNotIn("ChatGPT Desktop local MCP", connect_script)
 
     def test_builds_claude_remote_connector_config(self) -> None:
         config = build_mcp_client_config(
@@ -3160,7 +3248,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                     "-File",
                     files["connect"],
                     "-Target",
-                    "chatgpt-desktop-direct",
+                    "codex",
+                    "-InstallCodex",
                     "-CodexConfigPath",
                     str(codex_config),
                 ],
@@ -3465,19 +3554,19 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 timeout=30,
             )
             self.assertNotEqual(0, disabled.returncode, disabled.stdout + disabled.stderr)
-            self.assertIn("disabled, stale, or contract-mismatched", disabled.stdout + disabled.stderr)
+            self.assertIn("ChatGPT local STDIO is unsupported", disabled.stdout + disabled.stderr)
             disabled_status = json.loads((moved_bundle_dir / "bundle_status.json").read_text(encoding="utf-8"))
             self.assertFalse(disabled_status["direct_config_loader_verified"])
             self.assertFalse(disabled_status["direct_stdio_verified"])
-            self.assertTrue(disabled_status["direct_config_rollback_performed"])
+            self.assertFalse(disabled_status["direct_config_rollback_performed"])
             self.assertEqual(
-                "failed_rolled_back",
+                "not_started",
                 disabled_status["client_connections"]["chatgpt-desktop-local"]["last_attempt"]["state"],
-                disabled.stdout + disabled.stderr,
             )
             self.assertNotIn("legacy_plugin_restored_after_direct_failure", disabled_status)
             self.assertNotIn("legacy_plugin_removed_for_direct_config", disabled_status)
             self.assertTrue(legacy_plugin_marker.exists())
+            self.assertFalse(plugin_list_called_marker.exists())
             self.assertEqual(original_codex_config, codex_config.read_text(encoding="utf-8"))
 
             env["CODEX_EXPECTED_ENABLED"] = "true"
@@ -3512,7 +3601,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertTrue(legacy_plugin_marker.exists())
             self.assertEqual(original_codex_config, codex_config.read_text(encoding="utf-8"))
 
-            env["CODEX_EXPECTED_TOOL_PROFILE"] = "chatgpt-data"
+            env["CODEX_EXPECTED_TOOL_PROFILE"] = "full"
 
             completed = subprocess.run(
                 [
@@ -3653,9 +3742,9 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 encoding="utf-8",
             )
 
-            generated_entry = json.loads(
-                (bundle_dir / "chatgpt_desktop_local_mcp.json").read_text(encoding="utf-8")
-            )["ui_fields"]
+            generated_entry = tomllib.loads(
+                (bundle_dir / "codex_config_snippet.toml").read_text(encoding="utf-8")
+            )["mcp_servers"]["aksmcp"]
             loader_payload = {
                 "name": "aksmcp",
                 "enabled": True,
@@ -3812,12 +3901,8 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 json.dumps(claude_bundle_config, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            desktop_config_path = Path(files["chatgpt_desktop_local"])
-            desktop_config = json.loads(desktop_config_path.read_text(encoding="utf-8"))
-            desktop_config["ui_fields"]["args"].append("--chatgpt-source-marker")
-            desktop_config_path.write_text(
-                json.dumps(desktop_config, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+            legacy_chatgpt_local = json.loads(
+                Path(files["chatgpt_desktop_local"]).read_text(encoding="utf-8")
             )
             appdata_dir = root / "AppData" / "Roaming"
             claude_config = appdata_dir / "Claude" / "claude_desktop_config.json"
@@ -3890,7 +3975,10 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                 self.assertIn(str((bundle_dir / "run_mcp_stdio_server.ps1").resolve()), aks_args)
             self.assertIn(str((bundle_dir / "data").resolve()), aks_args)
             self.assertIn("--claude-source-marker", aks_args)
-            self.assertNotIn("--chatgpt-source-marker", aks_args)
+            self.assertEqual("unsupported", legacy_chatgpt_local["support_status"])
+            self.assertFalse(legacy_chatgpt_local["direct_local_supported"])
+            self.assertNotIn("mcpServers", legacy_chatgpt_local)
+            self.assertNotIn("ui_fields", legacy_chatgpt_local)
             self.assertTrue(list(claude_config.parent.glob("claude_desktop_config.json.bak-*")))
             self.assertIn("claude-doctor-ok", completed.stdout)
             self.assertIn(
@@ -4377,52 +4465,31 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             self.assertFalse(status["claude_code_loader_verified"])
             self.assertFalse(status["claude_code_transport_verified"])
 
-    @unittest.skipUnless(os.name == "nt", "ChatGPT Desktop restart-state PowerShell test")
-    def test_chatgpt_desktop_restart_state_distinguishes_required_current_and_unknown(self) -> None:
+    def test_chatgpt_local_legacy_targets_are_fail_closed_and_not_menu_choices(self) -> None:
         config = build_mcp_client_config(server_name="aksmcp", client_profile="bundle")
         wizard = config["quickstart"]["copy_paste"]["connect_wizard_ps"]
-        start = wizard.index("function Get-ChatGptDesktopRestartState")
-        end = wizard.index("\nfunction Get-BundleDataDir", start)
-        function_source = wizard[start:end]
-        probe = r'''
-$Registration = [DateTimeOffset]::Parse("2026-07-20T09:00:00Z")
-$Cases = [ordered]@{
-  before = @([pscustomobject]@{ StartTime = [DateTimeOffset]::Parse("2026-07-20T08:00:00Z") })
-  after = @([pscustomobject]@{ StartTime = [DateTimeOffset]::Parse("2026-07-20T10:00:00Z") })
-  none = @()
-  unknown = @([pscustomobject]@{ Name = "missing-start-time" })
-}
-$Result = [ordered]@{}
-foreach ($Name in $Cases.Keys) {
-  $Result[$Name] = Get-ChatGptDesktopRestartState -RegistrationUpdatedAtUtc $Registration -Processes $Cases[$Name]
-}
-$Result | ConvertTo-Json -Depth 6
-'''
-        with tempfile.TemporaryDirectory() as tmp:
-            script_path = Path(tmp) / "restart-state.ps1"
-            script_path.write_text(function_source + "\n" + probe, encoding="utf-8-sig")
-            windows_dir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-            powershell_exe = windows_dir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-            completed = subprocess.run(
-                [str(powershell_exe), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
+        menu = wizard[wizard.index("function Show-Menu") : wizard.index("function Install-PackageIfRequested")]
 
-        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
-        result = json.loads(completed.stdout)
-        self.assertEqual("required", result["before"]["desktop_restart_status"])
-        self.assertTrue(result["before"]["desktop_restart_required"])
-        self.assertEqual("process_predates_mcp_registration", result["before"]["desktop_restart_reason_code"])
-        self.assertEqual("up_to_date", result["after"]["desktop_restart_status"])
-        self.assertFalse(result["after"]["desktop_restart_required"])
-        self.assertEqual("process_started_after_mcp_registration", result["after"]["desktop_restart_reason_code"])
-        self.assertEqual("not_running", result["none"]["desktop_restart_status"])
-        self.assertEqual("unknown", result["unknown"]["desktop_restart_status"])
-        self.assertIsNone(result["unknown"]["desktop_restart_required"])
+        self.assertIn("ChatGPT web remote HTTPS MCP", menu)
+        self.assertNotIn("ChatGPT Desktop", menu)
+        self.assertNotIn("ChatGPT local", menu)
+        self.assertNotIn("ForChatGptDesktop", wizard)
+        self.assertNotIn("ChatGPT Desktop", wizard)
+        for legacy_target in (
+            "chatgpt-desktop-direct",
+            "chatgpt-desktop-local",
+            "chatgpt-desktop",
+        ):
+            self.assertIn(
+                f'"{legacy_target}" {{ Show-UnsupportedChatGptLocal }}',
+                wizard,
+            )
+        self.assertIn(
+            '$LocalConnectionTargets = @("install", "claude-desktop", "claude-code", "codex")',
+            wizard,
+        )
+        self.assertIn("ChatGPT local STDIO is unsupported", wizard)
+        self.assertIn("secure-mcp-tunnels", wizard)
 
     @unittest.skipUnless(os.name == "nt", "Claude Desktop direct PowerShell damaged bundle JSON recovery test")
     def test_claude_desktop_direct_powershell_recovers_damaged_bundle_json_in_korean_path(self) -> None:
@@ -4619,7 +4686,6 @@ $Result | ConvertTo-Json -Depth 6
 
             claude_desktop = json.loads((output_dir / "claude_desktop_config.json").read_text(encoding="utf-8"))
             claude_args = claude_desktop["mcpServers"]["govreg-local"]["args"]
-            stdio_launcher = (output_dir / "run_mcp_stdio_server.ps1").read_text(encoding="utf-8")
             self.assertIn(str((output_dir / "data").resolve()), claude_args)
             self.assertNotIn(stale_data_dir, claude_args)
             bundle_config = json.loads((output_dir / "mcp_config.bundle.json").read_text(encoding="utf-8"))
@@ -5009,8 +5075,41 @@ $Result | ConvertTo-Json -Depth 6
                 + "\n",
                 encoding="utf-8",
             )
+            omission_projection = mcp_config_generator._runtime_omission_disposition_top_level(
+                [
+                    {
+                        "tenant_id": "tenant-a",
+                        "document_id": "doc-current",
+                        "chunk_id": "chunk-1",
+                        "content_hash": "approved-hash",
+                        "latest_decision_id": "approval-current",
+                        "latest_decision_status": "approved",
+                        "latest_decision_at": "2026-07-10T00:00:00+00:00",
+                        "disposition": "exported",
+                        "exported": True,
+                        "requested": True,
+                    }
+                ],
+                ["doc-current"],
+            )
+            omission_projection["generated_at"] = "2026-07-10T00:00:01+00:00"
+            (runtime_repository_dir / "omission_disposition_snapshot.json").write_text(
+                json.dumps(omission_projection, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
             (runtime_vector_dir / "approved_vectors.jsonl").write_text(
-                json.dumps({"document_id": "doc-current"}, ensure_ascii=False) + "\n",
+                json.dumps(
+                    {
+                        "document_id": "doc-current",
+                        "chunk_id": "chunk-1",
+                        "metadata": {
+                            "approval_id": "approval-current",
+                            "approved_content_hash": "approved-hash",
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
                 encoding="utf-8",
             )
             write_mcp_setup_bundle(config, output_dir, server_name="govreg-local")
@@ -5023,6 +5122,7 @@ $Result | ConvertTo-Json -Depth 6
             self.assertIn("data/vector_db/tenant-a/approved_vectors.jsonl", names)
             self.assertIn("data/repository/doc-current_chunks.json", names)
             self.assertIn("data/repository/approval_snapshot.json", names)
+            self.assertIn("data/repository/omission_disposition_snapshot.json", names)
 
     def test_zip_rejects_cross_tenant_runtime_vector_store_files(self) -> None:
         config = build_mcp_client_config(client_profile="bundle", tenant_id="tenant-a")
@@ -5156,6 +5256,25 @@ $Result | ConvertTo-Json -Depth 6
         self.assertIn("raw preprocessing artifacts", str(raised.exception))
         self.assertIn("doc-current_nodes.json", str(raised.exception))
 
+    def test_zip_rejects_review_decision_journal_instead_of_silently_omitting_it(self) -> None:
+        config = build_mcp_client_config(client_profile="bundle", tenant_id="tenant-a")
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "bundle"
+            runtime_repository_dir = output_dir / "data" / "repository"
+            journal_dir = runtime_repository_dir / "journals"
+            journal_dir.mkdir(parents=True)
+            _write_runtime_data_manifest(output_dir / "data", ["doc-current"])
+            _write_runtime_repository_manifest(runtime_repository_dir, ["doc-current"])
+            (runtime_repository_dir / "doc-current_chunks.json").write_text("[]\n", encoding="utf-8")
+            (journal_dir / "review_decisions.jsonl").write_text(
+                '{"reason":"must-not-ship"}\n',
+                encoding="utf-8",
+            )
+            write_mcp_setup_bundle(config, output_dir, server_name="govreg-local")
+
+            with self.assertRaisesRegex(ValueError, "review decisions or raw audit artifacts"):
+                write_mcp_setup_bundle_zip(output_dir, Path(tmp) / "bundle.zip")
+
     def test_runtime_bundle_requires_kordoc_table_parser_evidence_for_hwp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata={})
@@ -5201,9 +5320,15 @@ $Result | ConvertTo-Json -Depth 6
         ]
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "bundle"
-            with patch(
-                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
-                return_value=records,
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_omission_disposition_projection",
+                    side_effect=_project_export_records_without_source_repository,
+                ),
             ):
                 runtime_manifest = write_mcp_runtime_data_bundle(
                     source_data_dir=Path(tmp) / "source",
@@ -5239,6 +5364,10 @@ $Result | ConvertTo-Json -Depth 6
                 patch(
                     "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
                     side_effect=AssertionError("equivalent selected-document order must reuse"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_omission_disposition_projection",
+                    side_effect=_project_export_records_without_source_repository,
                 ),
             ):
                 reordered_manifest = write_mcp_runtime_data_bundle(
@@ -5694,6 +5823,9 @@ $Result | ConvertTo-Json -Depth 6
                 runtime_repository_dir / ".write.lock",
                 runtime_journal_dir / "rag_traces.jsonl",
                 runtime_journal_dir / "rag_feedback.jsonl",
+                runtime_data_dir
+                / "hierarchy"
+                / ".regulation_hierarchy.sqlite3.reg-rag.lock",
             ]
             self.assertEqual(
                 mcp_config_generator.RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES,
@@ -5761,12 +5893,162 @@ $Result | ConvertTo-Json -Depth 6
                 path.name: path.read_text(encoding="utf-8")
                 for path in mutable_paths
             }
+            setup_config = build_mcp_client_config(
+                server_name="mutable-runtime-files",
+                client_profile="bundle",
+                tenant_id="tenant-a",
+            )
+            write_mcp_setup_bundle(
+                setup_config,
+                output_dir,
+                server_name="mutable-runtime-files",
+            )
+            zip_path = Path(tmp) / "mutable-runtime-files.zip"
+            write_mcp_setup_bundle_zip(output_dir, zip_path)
+            with zipfile.ZipFile(zip_path) as archive:
+                archived_names = set(archive.namelist())
 
         self.assertEqual(first_manifest, created_files_reuse)
         self.assertEqual(first_manifest, changed_files_reuse)
         self.assertTrue(
             all("runtime_event_update" in contents for contents in mutable_contents.values())
         )
+        self.assertFalse(
+            {
+                archive_name
+                for archive_name in archived_names
+                if Path(archive_name).name
+                in mcp_config_generator.RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES
+            }
+        )
+
+    def test_runtime_bundle_integrity_validator_fails_closed_on_sealed_file_loss(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(
+                Path(tmp),
+                file_type="txt",
+                metadata={},
+            )
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            runtime_data_dir = output_dir / "data"
+            validated = (
+                mcp_config_generator.validate_mcp_runtime_data_bundle_integrity(
+                    runtime_data_dir,
+                    expected_logical_corpus_sha256=manifest[
+                        "logical_corpus_sha256"
+                    ],
+                )
+            )
+            self.assertEqual(
+                manifest["runtime_data_reuse"]["manifest_sha256"],
+                validated["runtime_data_reuse"]["manifest_sha256"],
+            )
+
+            approval_snapshot_path = (
+                runtime_data_dir / "repository" / "approval_snapshot.json"
+            )
+            approval_snapshot_path.unlink()
+            with self.assertRaisesRegex(ValueError, "sealed manifest"):
+                mcp_config_generator.validate_mcp_runtime_data_bundle_integrity(
+                    runtime_data_dir
+                )
+
+    def test_omission_disposition_integrity_rejects_resealed_tamper_remove_and_cross_tenant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(
+                Path(tmp),
+                file_type="txt",
+                metadata={},
+            )
+            output_dir = Path(tmp) / "bundle"
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[_runtime_export_record("doc-kordoc", "chunk-1")],
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            runtime_data_dir = output_dir / "data"
+            manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+            sidecar_path = (
+                runtime_data_dir / "repository" / "omission_disposition_snapshot.json"
+            )
+            original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            original_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            relative_sidecar = "repository/omission_disposition_snapshot.json"
+
+            def reseal(sidecar: dict | None) -> None:
+                manifest = json.loads(json.dumps(original_manifest))
+                if sidecar is None:
+                    sidecar_path.unlink(missing_ok=True)
+                    manifest["runtime_data_reuse"]["file_sha256"].pop(relative_sidecar)
+                else:
+                    sidecar_path.write_text(
+                        json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    manifest["runtime_data_reuse"]["file_sha256"][relative_sidecar] = (
+                        hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+                    )
+                manifest["runtime_data_reuse"]["manifest_sha256"] = (
+                    mcp_config_generator._runtime_manifest_content_sha256(manifest)
+                )
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+            def add_unaccounted_requested_document(payload: dict) -> None:
+                payload["requested_document_ids"] = sorted(
+                    [*payload["requested_document_ids"], "doc-fake"]
+                )
+                payload["requested_document_count"] += 1
+
+            mutations = {
+                "count": lambda payload: payload.__setitem__(
+                    "exported_chunk_count", payload["exported_chunk_count"] + 1
+                ),
+                "classification": lambda payload: payload["entries"][0].__setitem__(
+                    "exported", False
+                ),
+                "cross_tenant": lambda payload: payload["entries"][0].__setitem__(
+                    "tenant_id", "tenant-b"
+                ),
+                "requested_document_without_chunks": add_unaccounted_requested_document,
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    payload = json.loads(json.dumps(original_sidecar))
+                    mutate(payload)
+                    reseal(payload)
+                    with self.assertRaisesRegex(ValueError, "omission disposition"):
+                        mcp_config_generator.validate_mcp_runtime_data_bundle_integrity(
+                            runtime_data_dir
+                        )
+
+            reseal(None)
+            with self.assertRaisesRegex(ValueError, "omission disposition"):
+                mcp_config_generator.validate_mcp_runtime_data_bundle_integrity(
+                    runtime_data_dir
+                )
 
     def test_runtime_bundle_reuse_status_failure_rolls_back_auxiliary_files(self) -> None:
         metadata = {
@@ -5927,6 +6209,7 @@ $Result | ConvertTo-Json -Depth 6
             write_mcp_setup_bundle_zip(output_dir, zip_path)
 
             with zipfile.ZipFile(zip_path) as archive:
+                archived_names = set(archive.namelist())
                 portable_manifest = json.loads(
                     archive.read("data/mcp_runtime_manifest.json").decode("utf-8")
                 )
@@ -5939,6 +6222,14 @@ $Result | ConvertTo-Json -Depth 6
                     ]
                 }
 
+        self.assertIn(
+            "data/repository/omission_disposition_snapshot.json",
+            archived_names,
+        )
+        self.assertNotIn(
+            "data/repository/journals/review_decisions.jsonl",
+            archived_names,
+        )
         self.assertEqual(
             str(Path("<BUNDLE_DIR>") / "data"),
             portable_manifest["runtime_data_dir"],
@@ -6083,7 +6374,8 @@ $Result | ConvertTo-Json -Depth 6
         )
 
     def test_runtime_bundle_reuse_fingerprint_tracks_reference_graph_builder_source(self) -> None:
-        reference_graph_module = sys.modules["app.retrieval.regulation_reference_graph"]
+        from app.retrieval import regulation_reference_graph as reference_graph_module
+
         reference_graph_path = Path(reference_graph_module.__file__).resolve()
         hash_file = mcp_config_generator._sha256_file_content
         baseline = mcp_config_generator._runtime_data_builder_implementation_sha256()
@@ -6215,6 +6507,79 @@ $Result | ConvertTo-Json -Depth 6
         self.assertIn("documents", rebuilt_bm25)
         self.assertEqual(expected_digest, actual_digest)
 
+    def test_runtime_bundle_missing_hierarchy_rebuilds_full_runtime_and_refreshes_status(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                first_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            hierarchy_path = output_dir / "data" / "hierarchy" / "regulation_hierarchy.sqlite3"
+            hierarchy_path.unlink()
+            self.assertIn(
+                "missing hierarchy/regulation_hierarchy.sqlite3",
+                mcp_config_generator._runtime_hierarchy_index_issue(output_dir / "data") or "",
+            )
+
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    wraps=mcp_config_generator.write_vector_records_with_offsets,
+                ) as vector_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    wraps=mcp_config_generator.write_bm25_index,
+                ) as bm25_writer,
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    wraps=mcp_config_generator.build_hierarchical_runtime_index,
+                ) as hierarchy_writer,
+            ):
+                rebuilt_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            status = json.loads((output_dir / "bundle_status.json").read_text(encoding="utf-8"))
+            hierarchy_exists = hierarchy_path.is_file()
+            hierarchy_sha256 = hashlib.sha256(hierarchy_path.read_bytes()).hexdigest()
+
+        self.assertEqual(1, vector_writer.call_count)
+        self.assertEqual(1, bm25_writer.call_count)
+        self.assertEqual(1, hierarchy_writer.call_count)
+        self.assertEqual(first_manifest["runtime_data_reuse"]["input_sha256"], rebuilt_manifest["runtime_data_reuse"]["input_sha256"])
+        self.assertTrue(hierarchy_exists)
+        self.assertEqual("ready", rebuilt_manifest["hierarchical_index_status"])
+        self.assertEqual(
+            rebuilt_manifest["files"]["hierarchical_index_sha256"],
+            hierarchy_sha256,
+        )
+        self.assertTrue(status["runtime_data_ready"])
+        self.assertEqual(
+            mcp_config_generator._runtime_manifest_fingerprint(rebuilt_manifest),
+            status["runtime_fingerprint"],
+        )
+
     def test_runtime_bundle_rejects_forged_logical_corpus_reuse_claims(
         self,
     ) -> None:
@@ -6327,7 +6692,7 @@ $Result | ConvertTo-Json -Depth 6
             rebuilt_manifest["logical_corpus_sha256"],
         )
 
-    def test_runtime_bundle_failed_rebuild_preserves_corrupt_reuse_candidate(self) -> None:
+    def test_runtime_bundle_failed_hierarchy_rebuild_preserves_existing_bundle(self) -> None:
         metadata = {
             "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
             "kordoc_table_parser_status": "parsed",
@@ -6347,8 +6712,8 @@ $Result | ConvertTo-Json -Depth 6
                     tenant_id="tenant-a",
                     document_id="doc-kordoc",
                 )
-            bm25_path = output_dir / "data" / "vector_db" / "tenant-a" / "bm25_index.json"
-            bm25_path.write_bytes(b'{"corrupt":true}\r\n')
+            hierarchy_path = output_dir / "data" / "hierarchy" / "regulation_hierarchy.sqlite3"
+            hierarchy_path.unlink()
             stale_report = output_dir / "mcp_transport_smoke.json"
             stale_report.write_bytes(b'{"stale":true}\r\n')
             before = {
@@ -6363,12 +6728,12 @@ $Result | ConvertTo-Json -Depth 6
                     return_value=records,
                 ),
                 patch(
-                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
-                    side_effect=RuntimeError("forced-corrupt-cache-rebuild-failure"),
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    side_effect=RuntimeError("forced-missing-hierarchy-rebuild-failure"),
                 ),
                 self.assertRaisesRegex(
                     RuntimeError,
-                    "forced-corrupt-cache-rebuild-failure",
+                    "forced-missing-hierarchy-rebuild-failure",
                 ),
             ):
                 write_mcp_runtime_data_bundle(
@@ -6415,9 +6780,19 @@ $Result | ConvertTo-Json -Depth 6
                         },
                     )
                 ]
-                with patch(
-                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
-                    return_value=scoped_records,
+                with (
+                    patch(
+                        "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                        return_value=scoped_records,
+                    ),
+                    patch(
+                        "scripts.generate_mcp_client_config._runtime_export_latest_decision_allows_approval",
+                        return_value=True,
+                    ),
+                    patch(
+                        "scripts.generate_mcp_client_config._runtime_omission_disposition_projection",
+                        side_effect=_project_export_records_without_source_repository,
+                    ),
                 ):
                     return write_mcp_runtime_data_bundle(**options)
 
@@ -6547,6 +6922,7 @@ $Result | ConvertTo-Json -Depth 6
                 records.append(record)
 
             approval_reader = JsonRepository.list_approval_journal_records
+            review_reader = JsonRepository.list_review_journal_records
             indexing_reader = JsonRepository.list_indexing_jobs
             with (
                 patch(
@@ -6565,6 +6941,12 @@ $Result | ConvertTo-Json -Depth 6
                     autospec=True,
                     side_effect=indexing_reader,
                 ) as indexing_calls,
+                patch.object(
+                    JsonRepository,
+                    "list_review_journal_records",
+                    autospec=True,
+                    side_effect=review_reader,
+                ) as review_calls,
                 patch(
                     "scripts.generate_mcp_client_config._current_approved_chunks_for_runtime_export",
                     wraps=mcp_config_generator._current_approved_chunks_for_runtime_export,
@@ -6604,20 +6986,22 @@ $Result | ConvertTo-Json -Depth 6
             listed_jobs = exported_repository.list_indexing_jobs()
 
         self.assertEqual(1, approval_calls.call_count)
+        self.assertEqual(1, review_calls.call_count)
         self.assertEqual(1, indexing_calls.call_count)
         self.assertEqual(3, chunk_validator.call_count)
         self.assertTrue(all(len(call.args) == 1 for call in approval_calls.call_args_list))
+        self.assertTrue(all(len(call.args) == 1 for call in review_calls.call_args_list))
         self.assertTrue(all(len(call.args) == 1 for call in indexing_calls.call_args_list))
         self.assertEqual(["doc-a", "doc-b", "doc-c"], runtime_manifest["document_ids"])
         self.assertEqual({}, repository_manifest["approvals"])
         self.assertEqual({}, repository_manifest["indexing_jobs"])
         self.assertEqual(
-            ["approval-record-doc-a", "approval-record-doc-b", "approval-record-doc-c"],
-            [record["approval_record_id"] for record in exported_approvals],
+            ["approval-doc-a", "approval-doc-b", "approval-doc-c"],
+            [record["approval_id"] for record in exported_approvals],
         )
         self.assertEqual(
-            sorted(record["approval_record_id"] for record in exported_approvals),
-            sorted(record["approval_record_id"] for record in listed_approvals),
+            sorted(record["approval_id"] for record in exported_approvals),
+            sorted(record["approval_id"] for record in listed_approvals),
         )
         self.assertEqual(
             ["job-doc-a", "job-doc-b", "job-doc-c"],
@@ -6635,7 +7019,7 @@ $Result | ConvertTo-Json -Depth 6
                 {record["document_id"] for record in grouped_records},
             )
 
-    def test_runtime_bundle_preserves_bulk_approval_review_events(self) -> None:
+    def test_runtime_bundle_sanitizes_approval_decisions_without_breaking_retrieval(self) -> None:
         metadata = {
             "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 2, "tables": []},
             "kordoc_table_parser_status": "parsed",
@@ -6645,7 +7029,7 @@ $Result | ConvertTo-Json -Depth 6
             {
                 "event": "human_review_confirmed",
                 "timestamp": "2026-07-10T00:00:00+00:00",
-                "actor": "operator",
+                "actor": "SENSITIVE_REVIEWER_SENTINEL",
                 "chunk_id": "chunk-1",
                 "sequence": index,
             }
@@ -6653,7 +7037,8 @@ $Result | ConvertTo-Json -Depth 6
         ]
         with tempfile.TemporaryDirectory() as tmp:
             settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
-            JsonRepository(settings).append_approval_record(
+            repository = JsonRepository(settings)
+            repository.append_approval_record(
                 {
                     "approval_record_id": "approval-record-bulk-review-events",
                     "approval_id": "approval-bulk-review-events",
@@ -6665,17 +7050,59 @@ $Result | ConvertTo-Json -Depth 6
                         {
                             "chunk_id": "chunk-1",
                             "approved_content_hash": "approved-hash",
+                            "approved_by": "SENSITIVE_NESTED_REVIEWER_SENTINEL",
+                            "review_attention_reasons": ["SENSITIVE_REVIEW_REASON_SENTINEL"],
+                            "worklist_evidence": {
+                                "worklist_report_path": "C:/SENSITIVE_NESTED_WORKLIST_SENTINEL.json"
+                            },
                         }
                     ],
-                    "approved_by": "operator",
+                    "approved_by": "SENSITIVE_REVIEWER_SENTINEL",
                     "approved_at": "2026-07-10T00:00:01+00:00",
                     "human_review_confirmed": True,
                     "review_decision_events": bulk_events,
-                    "worklist_evidence": _approval_worklist_evidence(),
+                    "worklist_evidence": {
+                        **_approval_worklist_evidence(),
+                        "worklist_report_path": "C:/SENSITIVE_WORKLIST_SENTINEL.json",
+                        "review_batch_manifest_path": "C:/SENSITIVE_REVIEW_BATCH_SENTINEL.json",
+                    },
+                    "note": "SENSITIVE_NOTE_SENTINEL",
+                    "override_reason": "SENSITIVE_OVERRIDE_SENTINEL",
+                    "review_attention_flags": ["SENSITIVE_ATTENTION_SENTINEL"],
+                    "review_attention_samples": [
+                        {"chunk_id": "chunk-1", "reasons": ["SENSITIVE_SAMPLE_SENTINEL"]}
+                    ],
+                    "artifacts": {
+                        "review_report": "C:/SENSITIVE_ARTIFACT_SENTINEL.json"
+                    },
+                    "snapshot": "C:/SENSITIVE_SNAPSHOT_SENTINEL.json",
                 }
             )
+            current_chunk = repository.get_chunks("doc-kordoc")[0]
+            current_chunk = current_chunk.model_copy(
+                update={
+                    "approval_id": "approval-bulk-review-events",
+                    "metadata": {
+                        **current_chunk.metadata,
+                        "approval_id": "approval-bulk-review-events",
+                    },
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [current_chunk], [])
             output_dir = Path(tmp) / "bundle"
-            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            records = [
+                _runtime_export_record(
+                    "doc-kordoc",
+                    "chunk-1",
+                    metadata={
+                        "approval_id": "approval-bulk-review-events",
+                        "chunk_type": "article",
+                        "article_no": "Article 1",
+                        "article_title": "Purpose",
+                        "regulation_title": "Rules",
+                    },
+                )
+            ]
 
             with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
                 runtime_manifest = write_mcp_runtime_data_bundle(
@@ -6692,12 +7119,132 @@ $Result | ConvertTo-Json -Depth 6
                 .splitlines()
                 if line.strip()
             ]
+            journal_bytes = (
+                output_dir / "data" / "repository" / "journals" / "approvals.jsonl"
+            ).read_bytes()
+            hierarchy_path = output_dir / "data" / "hierarchy" / "regulation_hierarchy.sqlite3"
+            vector_path = (
+                output_dir
+                / "data"
+                / "vector_db"
+                / "tenant-a"
+                / "approved_vectors.jsonl"
+            )
+            catalog = list_indexed_regulations(hierarchy_path)
+            search_results, _ = search_hierarchical_records(
+                hierarchy_path,
+                vector_path,
+                query="approved text",
+                top_k=5,
+            )
+            article_records = load_article_records(
+                hierarchy_path,
+                vector_path,
+                regulation_unit_id=catalog[0]["regulation_unit_id"],
+                article_no="Article 1",
+            )
+            runtime_repository = JsonRepository(Settings(data_dir=output_dir / "data"))
+            runtime_auth = mcp_config_generator.mcp_auth_context(
+                tenant_id="tenant-a",
+                actor="runtime-test",
+                role="operator",
+                department_ids=None,
+            )
+            approval_snapshot = mcp_config_generator.routes_rag._load_cached_approval_snapshot(
+                runtime_repository,
+                records,
+                runtime_auth,
+            )
+            runtime_settings = mcp_config_generator.settings_for_mcp_project(
+                data_dir=output_dir / "data",
+                tenant_id="tenant-a",
+                tenant_storage_isolation=False,
+            )
+            mcp_catalog = list_mcp_regulations(
+                settings=runtime_settings,
+                auth=runtime_auth,
+                profile_id="public_portal-test-profile",
+                require_hierarchy=True,
+            )
+            mcp_search = search_mcp_regulations(
+                settings=runtime_settings,
+                auth=runtime_auth,
+                query="approved text",
+                profile_id="public_portal-test-profile",
+            )
+            mcp_fetch = fetch_mcp_regulation(
+                settings=runtime_settings,
+                auth=runtime_auth,
+                result_id=mcp_search["results"][0]["id"],
+                profile_id="public_portal-test-profile",
+            )
+
+            write_mcp_setup_bundle(
+                build_mcp_client_config(client_profile="bundle", tenant_id="tenant-a"),
+                output_dir,
+                server_name="govreg-local",
+            )
+            zip_path = Path(tmp) / "bundle.zip"
+            write_mcp_setup_bundle_zip(output_dir, zip_path)
+            with zipfile.ZipFile(zip_path) as archive:
+                archived_journal_bytes = archive.read(
+                    "data/repository/journals/approvals.jsonl"
+                )
 
         exported_bulk = next(
             record for record in journal_records if record.get("approval_id") == "approval-bulk-review-events"
         )
         self.assertEqual(2, runtime_manifest["approval_record_count"])
-        self.assertEqual(150, len(exported_bulk["review_decision_events"]))
+        self.assertEqual(
+            mcp_config_generator.RUNTIME_APPROVAL_DECISION_FIELDS,
+            set(exported_bulk),
+        )
+        self.assertEqual(["chunk-1"], exported_bulk["chunk_ids"])
+        self.assertEqual(
+            {"chunk-1": "approved-hash"},
+            exported_bulk["approved_content_hashes"],
+        )
+        self.assertEqual(1, len(catalog))
+        self.assertTrue(search_results)
+        self.assertEqual("approved text", search_results[0][1]["text"])
+        self.assertEqual(["approved text"], [record["text"] for record in article_records])
+        self.assertEqual(
+            "approval-bulk-review-events",
+            approval_snapshot[("doc-kordoc", "chunk-1")]["approval_id"],
+        )
+        self.assertEqual(1, len(mcp_catalog["regulations"]))
+        self.assertTrue(mcp_search["results"])
+        self.assertEqual("approved text", mcp_fetch["text"])
+        forbidden_keys = {
+            "approved_by",
+            "note",
+            "override_reason",
+            "worklist_evidence",
+            "review_decision_events",
+            "review_attention_flags",
+            "review_attention_samples",
+            "artifacts",
+            "snapshot",
+            "approved_chunks",
+            "human_review_confirmed",
+        }
+        self.assertFalse(forbidden_keys.intersection(exported_bulk))
+        for sentinel in (
+            b"SENSITIVE_REVIEWER_SENTINEL",
+            b"SENSITIVE_NESTED_REVIEWER_SENTINEL",
+            b"SENSITIVE_REVIEW_REASON_SENTINEL",
+            b"SENSITIVE_WORKLIST_SENTINEL",
+            b"SENSITIVE_REVIEW_BATCH_SENTINEL",
+            b"SENSITIVE_NESTED_WORKLIST_SENTINEL",
+            b"SENSITIVE_NOTE_SENTINEL",
+            b"SENSITIVE_OVERRIDE_SENTINEL",
+            b"SENSITIVE_ATTENTION_SENTINEL",
+            b"SENSITIVE_SAMPLE_SENTINEL",
+            b"SENSITIVE_ARTIFACT_SENTINEL",
+            b"SENSITIVE_SNAPSHOT_SENTINEL",
+        ):
+            self.assertNotIn(sentinel, journal_bytes)
+            self.assertNotIn(sentinel, archived_journal_bytes)
 
     def test_runtime_bundle_exports_recommended_smoke_query_from_article_metadata(self) -> None:
         metadata = {
@@ -6985,6 +7532,1559 @@ $Result | ConvertTo-Json -Depth 6
         self.assertIn("current repository chunks no longer match approved vector records", str(raised.exception))
         self.assertIn("chunk_not_approved", str(raised.exception))
 
+    def test_runtime_bundle_rejects_partial_document_with_unreviewed_remaining_chunk(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            chunks = repository.get_chunks("doc-kordoc")
+            pending_chunk = chunks[0].model_copy(
+                update={
+                    "chunk_id": "chunk-2",
+                    "text": "needs review text",
+                    "normalized_text": "needs review text",
+                    "retrieval_text": "needs review text",
+                    "metadata": {
+                        **chunks[0].metadata,
+                        "chunk_id": "chunk-2",
+                        "approval_status": "needs_review",
+                    },
+                    "approval_status": "needs_review",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [chunks[0], pending_chunk], [])
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("would be incomplete", str(raised.exception))
+        self.assertIn("chunk-2:needs_review", str(raised.exception))
+
+    def test_runtime_bundle_accepts_approved_chunk_with_explicitly_rejected_sibling(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            approved_chunk = repository.get_chunks("doc-kordoc")[0]
+            rejected_chunk = approved_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-2",
+                    "text": "operator rejected text",
+                    "normalized_text": "operator rejected text",
+                    "retrieval_text": "operator rejected text",
+                    "metadata": {
+                        **approved_chunk.metadata,
+                        "chunk_id": "chunk-2",
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc",
+                [],
+                [approved_chunk, rejected_chunk],
+                [],
+            )
+            _append_rejection_review_record(repository, "doc-kordoc", [rejected_chunk])
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                runtime_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=Path(tmp) / "bundle",
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            disposition_snapshot = json.loads(
+                (
+                    Path(tmp)
+                    / "bundle"
+                    / "data"
+                    / "repository"
+                    / "omission_disposition_snapshot.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(["doc-kordoc"], runtime_manifest["document_ids"])
+        self.assertEqual(1, runtime_manifest["record_count"])
+        entries = {entry["chunk_id"]: entry for entry in disposition_snapshot["entries"]}
+        self.assertEqual("exported", entries["chunk-1"]["disposition"])
+        self.assertEqual("omitted_rejected", entries["chunk-2"]["disposition"])
+        self.assertFalse(entries["chunk-2"]["exported"])
+        self.assertTrue(entries["chunk-2"]["requested"])
+        self.assertEqual(
+            mcp_config_generator.OMISSION_DISPOSITION_ENTRY_FIELDS,
+            set(entries["chunk-2"]),
+        )
+        serialized = json.dumps(disposition_snapshot, ensure_ascii=False)
+        for forbidden in (
+            "explicit test rejection",
+            "operator",
+            "test fixture",
+            "before_content_hashes",
+            "after_content_hashes",
+            "created_chunk_ids",
+            "source_path",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_runtime_bundle_rejects_stale_rejection_followed_by_later_approval(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            approved_chunk = repository.get_chunks("doc-kordoc")[0]
+            rejected_chunk = approved_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-rejected-before-later-approval",
+                    "metadata": {
+                        **approved_chunk.metadata,
+                        "chunk_id": "chunk-rejected-before-later-approval",
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc", [], [approved_chunk, rejected_chunk], []
+            )
+            _append_rejection_review_record(repository, "doc-kordoc", [rejected_chunk])
+            repository.append_approval_record(
+                {
+                    "approval_record_id": "approval-record-after-rejection",
+                    "approval_id": "approval-after-rejection",
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "chunk_ids": [rejected_chunk.chunk_id],
+                    "approved_content_hashes": {
+                        rejected_chunk.chunk_id: mcp_config_generator.approved_content_hash(
+                            rejected_chunk
+                        )
+                    },
+                    "approved_chunks": [
+                        {
+                            "chunk_id": rejected_chunk.chunk_id,
+                            "approved_content_hash": mcp_config_generator.approved_content_hash(
+                                rejected_chunk
+                            ),
+                        }
+                    ],
+                    "approved_by": "operator",
+                    "approved_at": "2026-07-10T00:10:00+00:00",
+                    "worklist_evidence": _approval_worklist_evidence(),
+                }
+            )
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[_runtime_export_record("doc-kordoc", "chunk-1")],
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("would be incomplete", str(raised.exception))
+        self.assertIn(rejected_chunk.chunk_id, str(raised.exception))
+
+    def test_omission_disposition_uses_later_current_approval_after_rejection(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            original = repository.get_chunks("doc-kordoc")[0]
+            rejected = original.model_copy(
+                update={
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                    "metadata": {
+                        **original.metadata,
+                        "approval_status": "rejected",
+                        "approval_id": None,
+                        "approved_content_hash": None,
+                    },
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [rejected], [])
+            _append_rejection_review_record(repository, "doc-kordoc", [rejected])
+            later_approval_id = "approval-after-rejection-current"
+            later_hash = "approved-after-rejection-current-hash"
+            approved = rejected.model_copy(
+                update={
+                    "approval_status": "approved",
+                    "approval_id": later_approval_id,
+                    "approved_content_hash": later_hash,
+                    "metadata": {
+                        **rejected.metadata,
+                        "approval_status": "approved",
+                        "approval_id": later_approval_id,
+                        "approved_content_hash": later_hash,
+                    },
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [approved], [])
+            repository.append_approval_record(
+                {
+                    "approval_record_id": "approval-record-after-current-rejection",
+                    "approval_id": later_approval_id,
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "chunk_ids": [approved.chunk_id],
+                    "approved_content_hashes": {approved.chunk_id: later_hash},
+                    "approved_chunks": [
+                        {"chunk_id": approved.chunk_id, "approved_content_hash": later_hash}
+                    ],
+                    "approved_by": "operator",
+                    "approved_at": "2026-07-10T00:10:00+00:00",
+                    "worklist_evidence": _approval_worklist_evidence(),
+                }
+            )
+            record = _runtime_export_record(
+                "doc-kordoc",
+                approved.chunk_id,
+                metadata={
+                    "approval_id": later_approval_id,
+                    "approved_content_hash": later_hash,
+                },
+            )
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[record],
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=Path(tmp) / "bundle",
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+            snapshot = json.loads(
+                (
+                    Path(tmp)
+                    / "bundle"
+                    / "data"
+                    / "repository"
+                    / "omission_disposition_snapshot.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        entry = snapshot["entries"][0]
+        self.assertEqual("exported", entry["disposition"])
+        self.assertEqual(later_approval_id, entry["latest_decision_id"])
+        self.assertEqual("2026-07-10T00:10:00+00:00", entry["latest_decision_at"])
+
+    def test_runtime_bundle_rejects_approval_followed_by_later_rejection(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            replayed_approved_chunk = repository.get_chunks("doc-kordoc")[0]
+            _append_rejection_review_record(
+                repository,
+                "doc-kordoc",
+                [replayed_approved_chunk],
+            )
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[_runtime_export_record("doc-kordoc", "chunk-1")],
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("latest_audit_decision_not_current_approval", str(raised.exception))
+
+    def test_runtime_export_latest_approval_decision_rejects_timestamp_tie(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            chunk = repository.get_chunks("doc-kordoc")[0]
+            approval_records = repository.list_approval_journal_records("doc-kordoc")
+            tied_record = {
+                **approval_records[0],
+                "approval_record_id": "approval-record-tied",
+            }
+
+            allowed = mcp_config_generator._runtime_export_latest_decision_allows_approval(
+                chunk=chunk,
+                tenant_id="tenant-a",
+                approval_records=[*approval_records, tied_record],
+                review_records=[],
+            )
+
+        self.assertFalse(allowed)
+
+    def test_omission_disposition_projection_rejects_tied_or_malformed_latest_decision(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            approvals = repository.list_approval_journal_records("doc-kordoc")
+            record = _runtime_export_record("doc-kordoc", "chunk-1")
+            tied = {**approvals[0], "approval_record_id": "approval-record-tied-sidecar"}
+            with self.assertRaisesRegex(ValueError, "tied latest decisions"):
+                mcp_config_generator._runtime_omission_disposition_projection(
+                    repository=repository,
+                    tenant_id="tenant-a",
+                    requested_document_ids=["doc-kordoc"],
+                    exported_records=[record],
+                    approval_records_by_document={"doc-kordoc": [*approvals, tied]},
+                    review_records_by_document={},
+                )
+
+            malformed = {**approvals[0], "approved_at": "not-an-iso-timestamp"}
+            with self.assertRaisesRegex(ValueError, "malformed decision timestamp"):
+                mcp_config_generator._runtime_omission_disposition_projection(
+                    repository=repository,
+                    tenant_id="tenant-a",
+                    requested_document_ids=["doc-kordoc"],
+                    exported_records=[record],
+                    approval_records_by_document={"doc-kordoc": [malformed]},
+                    review_records_by_document={},
+                )
+
+    def test_runtime_bundle_rejects_unaudited_rejected_sibling(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            approved_chunk = repository.get_chunks("doc-kordoc")[0]
+            rejected_chunk = approved_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-unaudited-rejection",
+                    "metadata": {
+                        **approved_chunk.metadata,
+                        "chunk_id": "chunk-unaudited-rejection",
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc",
+                [],
+                [approved_chunk, rejected_chunk],
+                [],
+            )
+            forged_manifest = json.loads(repository.manifest_path.read_text(encoding="utf-8"))
+            forged_manifest.setdefault("review_decisions", {})["forged-manifest-rejection"] = {
+                "review_id": "forged-manifest-rejection",
+                "document_id": "doc-kordoc",
+                "chunk_ids": [rejected_chunk.chunk_id],
+                "action": "reject",
+                "reviewed_by": "forged-operator",
+                "reviewed_at": "2026-07-10T00:05:00+00:00",
+                "tenant_id": "tenant-a",
+                "status": "rejected",
+                "reason": "manifest-only forged rejection",
+                "after_content_hashes": {
+                    rejected_chunk.chunk_id: mcp_config_generator.approved_content_hash(rejected_chunk)
+                },
+            }
+            repository.manifest_path.write_text(
+                json.dumps(forged_manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[_runtime_export_record("doc-kordoc", "chunk-1")],
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("would be incomplete", str(raised.exception))
+        self.assertIn("Record explicit rejection decisions", str(raised.exception))
+        self.assertIn("chunk-unaudited-rejection", str(raised.exception))
+
+    def test_runtime_bundle_rejects_rejected_chunk_changed_after_journal_decision(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            approved_chunk = repository.get_chunks("doc-kordoc")[0]
+            rejected_chunk = approved_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-rejected-then-changed",
+                    "text": "original rejected text",
+                    "normalized_text": "original rejected text",
+                    "retrieval_text": "original rejected text",
+                    "metadata": {
+                        **approved_chunk.metadata,
+                        "chunk_id": "chunk-rejected-then-changed",
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc", [], [approved_chunk, rejected_chunk], []
+            )
+            _append_rejection_review_record(repository, "doc-kordoc", [rejected_chunk])
+            changed_chunk = rejected_chunk.model_copy(
+                update={
+                    "text": "changed after rejection",
+                    "normalized_text": "changed after rejection",
+                    "retrieval_text": "changed after rejection",
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc", [], [approved_chunk, changed_chunk], []
+            )
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[_runtime_export_record("doc-kordoc", "chunk-1")],
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("would be incomplete", str(raised.exception))
+        self.assertIn("chunk-rejected-then-changed", str(raised.exception))
+
+    def test_runtime_bundle_rejected_only_selection_still_requires_visible_record(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            chunk = repository.get_chunks("doc-kordoc")[0]
+            rejected_chunk = chunk.model_copy(
+                update={
+                    "metadata": {
+                        **chunk.metadata,
+                        "canonical_regulation_title": "Personnel Regulation",
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [rejected_chunk], [])
+            _append_rejection_review_record(repository, "doc-kordoc", [rejected_chunk])
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[],
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        profile_id="public_portal-test-profile",
+                        document_ids=["doc-kordoc"],
+                        scope="selected_documents",
+                    )
+
+        message = str(raised.exception)
+        self.assertIn("No MCP-visible approved records are available", message)
+        self.assertIn("document_ids=doc-kordoc", message)
+
+    def test_runtime_bundle_accepts_fully_rejected_regulation_inside_combined_document(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            source_chunk = repository.get_chunks("doc-kordoc")[0]
+            approved_chunk = source_chunk.model_copy(
+                update={
+                    "metadata": {
+                        **source_chunk.metadata,
+                        "canonical_regulation_title": "Personnel Regulation",
+                        "canonical_regulation_no": "1-1",
+                    }
+                }
+            )
+            rejected_chunk = source_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-service-rejected",
+                    "text": "rejected service regulation text",
+                    "normalized_text": "rejected service regulation text",
+                    "retrieval_text": "rejected service regulation text",
+                    "metadata": {
+                        **source_chunk.metadata,
+                        "chunk_id": "chunk-service-rejected",
+                        "canonical_regulation_title": "Service Regulation",
+                        "canonical_regulation_no": "1-2",
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc",
+                [],
+                [approved_chunk, rejected_chunk],
+                [],
+            )
+            _append_rejection_review_record(repository, "doc-kordoc", [rejected_chunk])
+            records = [
+                _runtime_export_record(
+                    "doc-kordoc",
+                    "chunk-1",
+                    metadata={
+                        "canonical_regulation_title": "Personnel Regulation",
+                        "canonical_regulation_no": "1-1",
+                    },
+                )
+            ]
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                output_dir = Path(tmp) / "bundle"
+                manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    document_ids=["doc-kordoc"],
+                    scope="selected_documents",
+                )
+            exported_records = [
+                json.loads(line)
+                for line in (
+                    output_dir
+                    / "data"
+                    / "vector_db"
+                    / "tenant-a"
+                    / "approved_vectors.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(["doc-kordoc"], manifest["document_ids"])
+        self.assertEqual(1, manifest["record_count"])
+        self.assertEqual(["chunk-1"], [record["chunk_id"] for record in exported_records])
+
+    def test_selected_separate_and_combined_rejection_exports_have_same_logical_results(self) -> None:
+        source_metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        personnel_metadata = {
+            "canonical_regulation_title": "Personnel Regulation",
+            "canonical_regulation_no": "1-1",
+            "regulation_title": "Personnel Regulation",
+            "regulation_no": "1-1",
+            "chunk_type": "article",
+            "article_no": "Article 1",
+            "article_title": "Purpose",
+            "hierarchy_path": "Personnel Regulation > Article 1 Purpose",
+            "canonical_hierarchy_path": "Personnel Regulation > Article 1 Purpose",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            separate_settings = _seed_runtime_bundle_document(
+                root / "separate-source",
+                file_type="hwp",
+                metadata=source_metadata,
+            )
+            _add_runtime_bundle_document(
+                separate_settings,
+                document_id="doc-service-rejected",
+                metadata=source_metadata,
+            )
+            separate_repository = JsonRepository(separate_settings)
+            service_chunk = separate_repository.get_chunks("doc-service-rejected")[0]
+            rejected_service_chunk = service_chunk.model_copy(
+                update={
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                    "metadata": {
+                        **service_chunk.metadata,
+                        "canonical_regulation_title": "Service Regulation",
+                        "canonical_regulation_no": "1-2",
+                        "approval_status": "rejected",
+                    },
+                }
+            )
+            separate_repository.save_processing_result(
+                "doc-service-rejected",
+                [],
+                [rejected_service_chunk],
+                [],
+            )
+            _append_rejection_review_record(
+                separate_repository,
+                "doc-service-rejected",
+                [rejected_service_chunk],
+            )
+            service_document = separate_repository.get_document("doc-service-rejected")
+            self.assertIsNotNone(service_document)
+            separate_repository.upsert_document(
+                service_document.model_copy(update={"regulation_status": "pending_approval"})
+            )
+            separate_record = _runtime_export_record(
+                "doc-kordoc",
+                "chunk-1",
+                metadata=personnel_metadata,
+            )
+            separate_output = root / "separate-bundle"
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[separate_record],
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=separate_settings.data_dir,
+                    out_dir=separate_output,
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    document_ids=["doc-kordoc", "doc-service-rejected"],
+                    scope="selected_documents",
+                )
+
+            combined_settings = _seed_runtime_bundle_document(
+                root / "combined-source",
+                file_type="hwp",
+                metadata=source_metadata,
+            )
+            _add_runtime_bundle_document(
+                combined_settings,
+                document_id="doc-combined",
+                metadata=source_metadata,
+            )
+            combined_repository = JsonRepository(combined_settings)
+            combined_source_chunk = combined_repository.get_chunks("doc-combined")[0]
+            approved_combined_chunk = combined_source_chunk.model_copy(
+                update={
+                    "metadata": {
+                        **combined_source_chunk.metadata,
+                        **personnel_metadata,
+                    }
+                }
+            )
+            rejected_combined_chunk = combined_source_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-combined-service-rejected",
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                    "metadata": {
+                        **combined_source_chunk.metadata,
+                        "chunk_id": "chunk-combined-service-rejected",
+                        "canonical_regulation_title": "Service Regulation",
+                        "canonical_regulation_no": "1-2",
+                        "regulation_title": "Service Regulation",
+                        "regulation_no": "1-2",
+                        "approval_status": "rejected",
+                    },
+                }
+            )
+            combined_repository.save_processing_result(
+                "doc-combined",
+                [],
+                [approved_combined_chunk, rejected_combined_chunk],
+                [],
+            )
+            _append_rejection_review_record(
+                combined_repository,
+                "doc-combined",
+                [rejected_combined_chunk],
+            )
+            combined_record = _runtime_export_record(
+                "doc-combined",
+                "chunk-doc-combined",
+                metadata={
+                    **personnel_metadata,
+                    "approval_id": "approval-doc-combined",
+                    "approved_content_hash": "approved-hash-doc-combined",
+                    "regulation_id": "reg-doc-combined",
+                },
+            )
+            combined_output = root / "combined-bundle"
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[combined_record],
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=combined_settings.data_dir,
+                    out_dir=combined_output,
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    document_ids=["doc-combined"],
+                    scope="selected_documents",
+                )
+
+            def runtime_paths(output_dir: Path) -> tuple[Path, Path]:
+                return (
+                    output_dir / "data" / "hierarchy" / "regulation_hierarchy.sqlite3",
+                    output_dir / "data" / "vector_db" / "tenant-a" / "approved_vectors.jsonl",
+                )
+
+            separate_index, separate_vector = runtime_paths(separate_output)
+            combined_index, combined_vector = runtime_paths(combined_output)
+            separate_catalog = list_indexed_regulations(separate_index)
+            combined_catalog = list_indexed_regulations(combined_index)
+
+            self.assertEqual(1, len(separate_catalog))
+            self.assertEqual(1, len(combined_catalog))
+            self.assertEqual(
+                "Personnel Regulation",
+                separate_catalog[0]["regulation_title"],
+            )
+            self.assertEqual(
+                separate_catalog[0]["regulation_unit_id"],
+                combined_catalog[0]["regulation_unit_id"],
+            )
+            unit_id = separate_catalog[0]["regulation_unit_id"]
+            separate_toc = regulation_toc(
+                separate_index,
+                regulation_unit_id=unit_id,
+            )
+            combined_toc = regulation_toc(
+                combined_index,
+                regulation_unit_id=unit_id,
+            )
+            toc_fields = ("node_type", "number", "title", "hierarchy_path")
+            self.assertEqual(
+                [tuple(node.get(field) for field in toc_fields) for node in separate_toc["nodes"]],
+                [tuple(node.get(field) for field in toc_fields) for node in combined_toc["nodes"]],
+            )
+            article_fields = (
+                "canonical_regulation_title",
+                "article_no",
+                "article_title",
+            )
+            separate_articles = load_article_records(
+                separate_index,
+                separate_vector,
+                regulation_unit_id=unit_id,
+                article_no="Article 1",
+            )
+            combined_articles = load_article_records(
+                combined_index,
+                combined_vector,
+                regulation_unit_id=unit_id,
+                article_no="Article 1",
+            )
+            self.assertEqual(
+                [
+                    (record["text"], tuple(record["metadata"].get(field) for field in article_fields))
+                    for record in separate_articles
+                ],
+                [
+                    (record["text"], tuple(record["metadata"].get(field) for field in article_fields))
+                    for record in combined_articles
+                ],
+            )
+            separate_search, _ = search_hierarchical_records(
+                separate_index,
+                separate_vector,
+                query="Personnel Purpose approved",
+                top_k=5,
+            )
+            combined_search, _ = search_hierarchical_records(
+                combined_index,
+                combined_vector,
+                query="Personnel Purpose approved",
+                top_k=5,
+            )
+            self.assertTrue(separate_search)
+            self.assertEqual(
+                [
+                    (record["text"], record["metadata"].get("canonical_regulation_title"))
+                    for _score, record in separate_search
+                ],
+                [
+                    (record["text"], record["metadata"].get("canonical_regulation_title"))
+                    for _score, record in combined_search
+                ],
+            )
+
+    def test_selected_bundle_omits_fully_rejected_document_when_approved_peer_is_visible(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            _add_runtime_bundle_document(
+                settings,
+                document_id="doc-rejected-only",
+                metadata=metadata,
+            )
+            repository = JsonRepository(settings)
+            source_chunk = repository.get_chunks("doc-rejected-only")[0]
+            rejected_chunk = source_chunk.model_copy(
+                update={
+                    "metadata": {
+                        **source_chunk.metadata,
+                        "approval_status": "rejected",
+                    },
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-rejected-only",
+                [],
+                [rejected_chunk],
+                [],
+            )
+            _append_rejection_review_record(repository, "doc-rejected-only", [rejected_chunk])
+            rejected_document = repository.get_document("doc-rejected-only")
+            self.assertIsNotNone(rejected_document)
+            repository.upsert_document(
+                rejected_document.model_copy(update={"regulation_status": "pending_approval"})
+            )
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                output_dir = Path(tmp) / "bundle"
+                manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    document_ids=["doc-kordoc", "doc-rejected-only"],
+                    scope="selected_documents",
+                )
+            runtime_repository = JsonRepository(
+                Settings(data_dir=output_dir / "data")
+            )
+            exported_rejected_document = runtime_repository.get_document(
+                "doc-rejected-only"
+            )
+            exported_rejected_chunks = runtime_repository.get_chunks(
+                "doc-rejected-only"
+            )
+            exported_records = [
+                json.loads(line)
+                for line in (
+                    output_dir
+                    / "data"
+                    / "vector_db"
+                    / "tenant-a"
+                    / "approved_vectors.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(["doc-kordoc"], manifest["document_ids"])
+        self.assertEqual(1, manifest["record_count"])
+        self.assertIsNone(exported_rejected_document)
+        self.assertEqual([], exported_rejected_chunks)
+        self.assertEqual({"doc-kordoc"}, {record["document_id"] for record in exported_records})
+
+    def test_selected_bundle_does_not_waive_nonterminal_or_missing_approved_documents(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        for approval_status in ("needs_review", "draft", "security_blocked", "approved"):
+            with self.subTest(approval_status=approval_status), tempfile.TemporaryDirectory() as tmp:
+                settings = _seed_runtime_bundle_document(
+                    Path(tmp),
+                    file_type="hwp",
+                    metadata=metadata,
+                )
+                _add_runtime_bundle_document(
+                    settings,
+                    document_id="doc-not-visible",
+                    metadata=metadata,
+                )
+                repository = JsonRepository(settings)
+                source_chunk = repository.get_chunks("doc-not-visible")[0]
+                update = {
+                    "approval_status": approval_status,
+                    "metadata": {
+                        **source_chunk.metadata,
+                        "approval_status": approval_status,
+                    },
+                }
+                if approval_status != "approved":
+                    update.update(
+                        {
+                            "approval_id": None,
+                            "approved_content_hash": None,
+                        }
+                    )
+                repository.save_processing_result(
+                    "doc-not-visible",
+                    [],
+                    [source_chunk.model_copy(update=update)],
+                    [],
+                )
+                records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+                with patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ):
+                    with self.assertRaises(ValueError) as raised:
+                        write_mcp_runtime_data_bundle(
+                            source_data_dir=settings.data_dir,
+                            out_dir=Path(tmp) / "bundle",
+                            tenant_id="tenant-a",
+                            profile_id="public_portal-test-profile",
+                            document_ids=["doc-kordoc", "doc-not-visible"],
+                            scope="selected_documents",
+                        )
+
+                self.assertIn("not all MCP-visible", str(raised.exception))
+                self.assertIn("doc-not-visible", str(raised.exception))
+
+    def test_institution_bundle_keeps_rejected_only_pending_document_excluded(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            _add_runtime_bundle_document(
+                settings,
+                document_id="doc-rejected-only",
+                metadata=metadata,
+            )
+            repository = JsonRepository(settings)
+            source_chunk = repository.get_chunks("doc-rejected-only")[0]
+            rejected_chunk = source_chunk.model_copy(
+                update={
+                    "approval_status": "rejected",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                    "metadata": {
+                        **source_chunk.metadata,
+                        "approval_status": "rejected",
+                    },
+                }
+            )
+            repository.save_processing_result(
+                "doc-rejected-only",
+                [],
+                [rejected_chunk],
+                [],
+            )
+            _append_rejection_review_record(repository, "doc-rejected-only", [rejected_chunk])
+            rejected_document = repository.get_document("doc-rejected-only")
+            self.assertIsNotNone(rejected_document)
+            repository.upsert_document(
+                rejected_document.model_copy(update={"regulation_status": "pending_approval"})
+            )
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=Path(tmp) / "bundle",
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    scope="selected_institution",
+                )
+
+        self.assertEqual(["doc-kordoc"], manifest["document_ids"])
+        self.assertEqual(1, manifest["record_count"])
+
+    def test_runtime_bundle_rejects_one_of_two_approved_chunks_missing_from_export(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            first_chunk = repository.get_chunks("doc-kordoc")[0]
+            second_chunk = first_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-2",
+                    "metadata": {**first_chunk.metadata, "chunk_id": "chunk-2"},
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [first_chunk, second_chunk], [])
+            repository.append_approval_record(
+                {
+                    "approval_record_id": "approval-record-kordoc-2",
+                    "approval_id": "approval-kordoc",
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "chunk_ids": ["chunk-2"],
+                    "approved_content_hashes": {"chunk-2": "approved-hash"},
+                    "approved_chunks": [
+                        {"chunk_id": "chunk-2", "approved_content_hash": "approved-hash"}
+                    ],
+                    "approved_by": "operator",
+                    "approved_at": "2026-07-10T00:01:00+00:00",
+                    "worklist_evidence": _approval_worklist_evidence(),
+                }
+            )
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("would be incomplete", str(raised.exception))
+        self.assertIn("chunk-2", str(raised.exception))
+
+    def test_institution_runtime_bundle_rejects_approved_document_with_zero_export_records(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            _add_runtime_bundle_document(settings, document_id="doc-omitted", metadata=metadata)
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        profile_id="public_portal-test-profile",
+                        scope="selected_institution",
+                    )
+
+        self.assertIn("would omit approved or superseded source documents", str(raised.exception))
+        self.assertIn("doc-omitted", str(raised.exception))
+
+    def test_runtime_bundle_accepts_superseded_chunk_replaced_by_approved_chunk(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            document = repository.get_document("doc-kordoc")
+            self.assertIsNotNone(document)
+            repository.upsert_document(document.model_copy(update={"regulation_status": "superseded"}))
+            first_chunk = repository.get_chunks("doc-kordoc")[0]
+            superseded_chunk = first_chunk.model_copy(
+                update={
+                    "approval_status": "superseded",
+                }
+            )
+            replacement_chunk = first_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-2",
+                    "metadata": {
+                        **first_chunk.metadata,
+                        "chunk_id": "chunk-2",
+                        "regulation_status": "superseded",
+                    },
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc",
+                [],
+                [superseded_chunk, replacement_chunk],
+                [],
+            )
+            repository.append_review_record(
+                {
+                    "review_id": "review-split-kordoc-replacement",
+                    "document_id": "doc-kordoc",
+                    "chunk_ids": [superseded_chunk.chunk_id],
+                    "created_chunk_ids": [replacement_chunk.chunk_id],
+                    "action": "split",
+                    "reviewed_by": "operator",
+                    "reviewed_at": "2026-07-10T00:01:00+00:00",
+                    "tenant_id": "tenant-a",
+                    "status": "needs_review",
+                    "before_content_hashes": {
+                        superseded_chunk.chunk_id: mcp_config_generator.approved_content_hash(
+                            superseded_chunk
+                        )
+                    },
+                    "after_content_hashes": {
+                        replacement_chunk.chunk_id: mcp_config_generator.approved_content_hash(
+                            replacement_chunk
+                        )
+                    },
+                }
+            )
+            repository.append_approval_record(
+                {
+                    "approval_record_id": "approval-record-kordoc-replacement",
+                    "approval_id": "approval-kordoc",
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "chunk_ids": ["chunk-2"],
+                    "approved_content_hashes": {"chunk-2": "approved-hash"},
+                    "approved_chunks": [
+                        {"chunk_id": "chunk-2", "approved_content_hash": "approved-hash"}
+                    ],
+                    "approved_by": "operator",
+                    "approved_at": "2026-07-10T00:02:00+00:00",
+                    "worklist_evidence": _approval_worklist_evidence(),
+                }
+            )
+            records = [
+                _runtime_export_record(
+                    "doc-kordoc",
+                    "chunk-2",
+                    metadata={"regulation_status": "superseded"},
+                )
+            ]
+
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                runtime_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=Path(tmp) / "bundle",
+                    tenant_id="tenant-a",
+                    profile_id="public_portal-test-profile",
+                    scope="selected_institution",
+                )
+            disposition_snapshot = json.loads(
+                (
+                    Path(tmp)
+                    / "bundle"
+                    / "data"
+                    / "repository"
+                    / "omission_disposition_snapshot.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(["doc-kordoc"], runtime_manifest["document_ids"])
+        self.assertEqual(1, runtime_manifest["record_count"])
+        entries = {entry["chunk_id"]: entry for entry in disposition_snapshot["entries"]}
+        self.assertEqual("omitted_superseded", entries["chunk-1"]["disposition"])
+        self.assertEqual("superseded", entries["chunk-1"]["latest_decision_status"])
+        self.assertEqual("review-split-kordoc-replacement", entries["chunk-1"]["latest_decision_id"])
+
+    def test_runtime_bundle_rejects_superseded_chunk_without_split_or_merge_journal(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            first_chunk = repository.get_chunks("doc-kordoc")[0]
+            superseded_chunk = first_chunk.model_copy(update={"approval_status": "superseded"})
+            replacement_chunk = first_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-2",
+                    "metadata": {**first_chunk.metadata, "chunk_id": "chunk-2"},
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc", [], [superseded_chunk, replacement_chunk], []
+            )
+            repository.append_approval_record(
+                {
+                    "approval_record_id": "approval-record-unaudited-replacement",
+                    "approval_id": "approval-kordoc",
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "chunk_ids": [replacement_chunk.chunk_id],
+                    "approved_content_hashes": {replacement_chunk.chunk_id: "approved-hash"},
+                    "approved_chunks": [
+                        {
+                            "chunk_id": replacement_chunk.chunk_id,
+                            "approved_content_hash": "approved-hash",
+                        }
+                    ],
+                    "approved_by": "operator",
+                    "approved_at": "2026-07-10T00:02:00+00:00",
+                    "worklist_evidence": _approval_worklist_evidence(),
+                }
+            )
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=[_runtime_export_record("doc-kordoc", "chunk-2")],
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("Record split/merge decisions", str(raised.exception))
+        self.assertIn(superseded_chunk.chunk_id, str(raised.exception))
+
+    def test_runtime_bundle_completeness_failure_preserves_prior_good_bundle(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = _seed_runtime_bundle_document(root, file_type="hwp", metadata=metadata)
+            output_dir = root / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            before = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in output_dir.rglob("*")
+                if path.is_file()
+            }
+            repository = JsonRepository(settings)
+            first_chunk = repository.get_chunks("doc-kordoc")[0]
+            hidden_chunk = first_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-2",
+                    "metadata": {**first_chunk.metadata, "chunk_id": "chunk-2"},
+                }
+            )
+            repository.save_processing_result("doc-kordoc", [], [first_chunk, hidden_chunk], [])
+            repository.append_approval_record(
+                {
+                    "approval_record_id": "approval-record-kordoc-hidden",
+                    "approval_id": "approval-kordoc",
+                    "document_id": "doc-kordoc",
+                    "tenant_id": "tenant-a",
+                    "chunk_ids": ["chunk-2"],
+                    "approved_content_hashes": {"chunk-2": "approved-hash"},
+                    "approved_chunks": [
+                        {"chunk_id": "chunk-2", "approved_content_hash": "approved-hash"}
+                    ],
+                    "approved_by": "operator",
+                    "approved_at": "2026-07-10T00:03:00+00:00",
+                    "worklist_evidence": _approval_worklist_evidence(),
+                }
+            )
+
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                with self.assertRaises(ValueError):
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=output_dir,
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+            after = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in output_dir.rglob("*")
+                if path.is_file()
+            }
+
+        self.assertEqual(before, after)
+
+    def test_selected_needs_review_document_failure_preserves_prior_good_bundle(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {
+                "status": "parsed",
+                "parser": "kordoc",
+                "table_count": 1,
+                "tables": [],
+            },
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = _seed_runtime_bundle_document(root, file_type="hwp", metadata=metadata)
+            output_dir = root / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                )
+
+            before = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in output_dir.rglob("*")
+                if path.is_file()
+            }
+            repository = JsonRepository(settings)
+            _add_runtime_bundle_document(
+                settings,
+                document_id="doc-needs-review",
+                metadata=metadata,
+            )
+            source_chunk = repository.get_chunks("doc-needs-review")[0]
+            needs_review_chunk = source_chunk.model_copy(
+                update={
+                    "metadata": {
+                        **source_chunk.metadata,
+                        "approval_status": "needs_review",
+                    },
+                    "approval_status": "needs_review",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-needs-review",
+                [],
+                [needs_review_chunk],
+                [],
+            )
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=output_dir,
+                        tenant_id="tenant-a",
+                        profile_id="public_portal-test-profile",
+                        document_ids=["doc-kordoc", "doc-needs-review"],
+                        scope="selected_documents",
+                    )
+
+            after = {
+                path.relative_to(output_dir).as_posix(): path.read_bytes()
+                for path in output_dir.rglob("*")
+                if path.is_file()
+            }
+
+        self.assertIn("not all MCP-visible", str(raised.exception))
+        self.assertIn("doc-needs-review", str(raised.exception))
+        self.assertEqual(before, after)
+
+    def test_runtime_bundle_rejects_combined_document_with_unapproved_regulation_chunk(self) -> None:
+        metadata = {
+            "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
+            "kordoc_table_parser_status": "parsed",
+            "kordoc_table_count": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(Path(tmp), file_type="hwp", metadata=metadata)
+            repository = JsonRepository(settings)
+            approved_chunk = repository.get_chunks("doc-kordoc")[0]
+            approved_chunk = approved_chunk.model_copy(
+                update={
+                    "metadata": {
+                        **approved_chunk.metadata,
+                        "regulation_id": "combined-regulation-a",
+                        "regulation_title": "Regulation A",
+                    }
+                }
+            )
+            unapproved_chunk = approved_chunk.model_copy(
+                update={
+                    "chunk_id": "chunk-regulation-b",
+                    "text": "unapproved regulation B text",
+                    "normalized_text": "unapproved regulation B text",
+                    "retrieval_text": "unapproved regulation B text",
+                    "metadata": {
+                        **approved_chunk.metadata,
+                        "chunk_id": "chunk-regulation-b",
+                        "regulation_id": "combined-regulation-b",
+                        "regulation_title": "Regulation B",
+                        "approval_status": "needs_review",
+                    },
+                    "approval_status": "needs_review",
+                    "approval_id": None,
+                    "approved_content_hash": None,
+                }
+            )
+            repository.save_processing_result(
+                "doc-kordoc",
+                [],
+                [approved_chunk, unapproved_chunk],
+                [],
+            )
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch("scripts.generate_mcp_client_config._runtime_visible_records_for_export", return_value=records):
+                with self.assertRaises(ValueError) as raised:
+                    write_mcp_runtime_data_bundle(
+                        source_data_dir=settings.data_dir,
+                        out_dir=Path(tmp) / "bundle",
+                        tenant_id="tenant-a",
+                        document_id="doc-kordoc",
+                    )
+
+        self.assertIn("would be incomplete", str(raised.exception))
+        self.assertIn("chunk-regulation-b:needs_review", str(raised.exception))
+
     def test_runtime_bundle_does_not_export_raw_nodes_issues_or_quality_reports(self) -> None:
         metadata = {
             "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
@@ -7146,10 +9246,62 @@ $Result | ConvertTo-Json -Depth 6
             launcher = Path(tmp, "run_mcp_stdio_server.ps1").read_text(encoding="utf-8")
 
         self.assertIn(packaged_exe, launcher)
+        self.assertIn("$InstalledPackagedExe", launcher)
+        self.assertIn("$BundledPackagedExe = Join-Path $BundleDir 'PR MCP Builder.exe'", launcher)
         self.assertIn("& $PackagedExe --mcp-server @ServerArgs", launcher)
         self.assertLess(launcher.index("$PackagedExe"), launcher.index("function Find-ProjectRoot"))
 
-    def test_zip_can_include_built_wheel_for_self_contained_handoff(self) -> None:
+    def test_handoff_zip_declares_fresh_target_python_gate_and_scrubs_source_runtime_hints(
+        self,
+    ) -> None:
+        config = build_mcp_client_config(client_profile="bundle", tenant_id="tenant-a")
+        packaged_exe = r"C:\Program Files\PR MCP Builder\PR MCP Builder.exe"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "bundle"
+            zip_path = root / "handoff.zip"
+            with patch.dict(os.environ, {"REG_RAG_PACKAGED_EXE": packaged_exe}):
+                write_mcp_setup_bundle(
+                    config,
+                    output_dir,
+                    server_name="govreg-local",
+                    preferred_python=sys.executable,
+                    preferred_project_root=Path(__file__).resolve().parents[1],
+                )
+            write_mcp_setup_bundle_zip(output_dir, zip_path)
+
+            with zipfile.ZipFile(zip_path) as archive:
+                names = set(archive.namelist())
+                status = json.loads(archive.read("bundle_status.json").decode("utf-8"))
+                manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+                readme = archive.read("README.md").decode("utf-8")
+                readme_ko = archive.read("README.ko.md").decode("utf-8")
+                launcher = archive.read("run_mcp_stdio_server.ps1").decode("utf-8-sig")
+
+        self.assertFalse(any(name.lower().endswith(".exe") for name in names))
+        for payload in (status, manifest):
+            runtime = payload["portable_handoff_runtime"]
+            self.assertFalse(runtime["bundled_windows_executable"])
+            self.assertFalse(runtime["wheel_included"])
+            self.assertEqual("3.11", runtime["minimum_python_version"])
+            self.assertTrue(runtime["python_required_when_packaged_executable_absent"])
+            self.assertTrue(runtime["included_wheel_is_not_a_python_runtime"])
+            self.assertFalse(runtime["fresh_target_local_stdio_ready"])
+        self.assertIn("Windows executable included: no", readme)
+        self.assertIn("Python 3.11+", readme)
+        self.assertIn("install_local_package.ps1", readme)
+        self.assertIn("Windows 실행 파일 포함: 아니요", readme_ko)
+        self.assertIn("Python 3.11+", readme_ko)
+        self.assertNotIn(packaged_exe, launcher)
+        self.assertNotIn(str(Path(__file__).resolve().parents[1]), launcher)
+        self.assertIn("$InstalledPackagedExe = ''", launcher)
+        self.assertIn("$PreferredPython = ''", launcher)
+        self.assertIn("$PreferredProjectRoot = ''", launcher)
+        self.assertIn("$BundledPackagedExe = Join-Path $BundleDir 'PR MCP Builder.exe'", launcher)
+        self.assertIn("A handoff ZIP does not include the Windows application executable", launcher)
+
+    def test_zip_can_include_built_wheel_for_package_handoff(self) -> None:
         config = build_mcp_client_config(client_profile="bundle", tenant_id="tenant-a")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7166,9 +9318,17 @@ $Result | ConvertTo-Json -Depth 6
 
             with zipfile.ZipFile(zip_path) as archive:
                 names = set(archive.namelist())
+                status = json.loads(archive.read("bundle_status.json").decode("utf-8"))
+                readme = archive.read("README.md").decode("utf-8")
 
             self.assertIn("reg_rag_preprocessor-0.1.0-py3-none-any.whl", names)
             self.assertIn("install_local_package.ps1", names)
+            runtime = status["portable_handoff_runtime"]
+            self.assertTrue(runtime["wheel_included"])
+            self.assertFalse(runtime["bundled_windows_executable"])
+            self.assertTrue(runtime["python_required_when_packaged_executable_absent"])
+            self.assertIn("Wheel included: yes", readme)
+            self.assertIn("A wheel is a package installer payload, not a Python runtime", readme)
 
     def test_zip_include_wheel_can_run_outside_project_cwd(self) -> None:
         config = build_mcp_client_config(client_profile="bundle", tenant_id="tenant-a")
@@ -7295,6 +9455,69 @@ def _seed_runtime_bundle_document(root: Path, *, file_type: str, metadata: dict)
     return settings
 
 
+def _add_runtime_bundle_document(
+    settings: Settings,
+    *,
+    document_id: str,
+    metadata: dict,
+    regulation_status: str = "approved",
+) -> None:
+    repository = JsonRepository(settings)
+    source_document = repository.get_document("doc-kordoc")
+    if source_document is None:
+        raise AssertionError("The base runtime bundle document must be seeded first.")
+    regulation_id = f"reg-{document_id}"
+    document = source_document.model_copy(
+        update={
+            "document_id": document_id,
+            "filename": f"{document_id}.hwp",
+            "document_name": f"Rules {document_id}",
+            "file_hash": f"hash-{document_id}",
+            "regulation_id": regulation_id,
+            "regulation_status": regulation_status,
+        }
+    )
+    approval_id = f"approval-{document_id}"
+    approved_hash = f"approved-hash-{document_id}"
+    source_chunk = repository.get_chunks("doc-kordoc")[0]
+    chunk = source_chunk.model_copy(
+        update={
+            "chunk_id": f"chunk-{document_id}",
+            "document_id": document_id,
+            "metadata": {
+                **source_chunk.metadata,
+                **metadata,
+                "chunk_id": f"chunk-{document_id}",
+                "document_id": document_id,
+                "approval_id": approval_id,
+                "approved_content_hash": approved_hash,
+                "regulation_id": regulation_id,
+                "regulation_status": regulation_status,
+            },
+            "approval_id": approval_id,
+            "approved_content_hash": approved_hash,
+        }
+    )
+    repository.upsert_document(document)
+    repository.save_processing_result(document_id, [], [chunk], [])
+    repository.append_approval_record(
+        {
+            "approval_record_id": f"approval-record-{document_id}",
+            "approval_id": approval_id,
+            "document_id": document_id,
+            "tenant_id": "tenant-a",
+            "chunk_ids": [chunk.chunk_id],
+            "approved_content_hashes": {chunk.chunk_id: approved_hash},
+            "approved_chunks": [
+                {"chunk_id": chunk.chunk_id, "approved_content_hash": approved_hash}
+            ],
+            "approved_by": "operator",
+            "approved_at": "2026-07-10T00:04:00+00:00",
+            "worklist_evidence": _approval_worklist_evidence(),
+        }
+    )
+
+
 def _write_runtime_data_manifest(
     runtime_data_dir: Path,
     document_ids: list[str],
@@ -7309,6 +9532,13 @@ def _write_runtime_data_manifest(
                 "tenant_id": tenant_id,
                 "document_id": document_ids[0] if document_ids else None,
                 "document_ids": document_ids,
+                "files": {
+                    "omission_disposition_snapshot": str(
+                        runtime_data_dir
+                        / "repository"
+                        / "omission_disposition_snapshot.json"
+                    )
+                },
             },
             ensure_ascii=False,
         )
@@ -7360,6 +9590,75 @@ def _runtime_export_record(document_id: str, chunk_id: str, *, metadata: dict | 
         "metadata": metadata,
         "content_hash": stable_content_hash(text, metadata),
     }
+
+
+def _project_export_records_without_source_repository(
+    *,
+    tenant_id: str,
+    requested_document_ids: list[str],
+    exported_records: list[dict],
+    **_kwargs,
+) -> dict:
+    """Keep legacy vector-only fixture tests focused on ordering/fingerprint behavior."""
+
+    requested_ids = sorted(set(requested_document_ids))
+    entries = []
+    for record in sorted(
+        exported_records,
+        key=lambda item: (str(item.get("document_id") or ""), str(item.get("chunk_id") or "")),
+    ):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        document_id = str(record.get("document_id") or metadata.get("document_id") or "")
+        if document_id not in requested_ids:
+            continue
+        entries.append(
+            {
+                "tenant_id": tenant_id,
+                "document_id": document_id,
+                "chunk_id": str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
+                "content_hash": str(metadata.get("approved_content_hash") or ""),
+                "latest_decision_id": str(metadata.get("approval_id") or ""),
+                "latest_decision_status": "approved",
+                "latest_decision_at": "2026-07-10T00:00:00+00:00",
+                "disposition": "exported",
+                "exported": True,
+                "requested": True,
+            }
+        )
+    return mcp_config_generator._runtime_omission_disposition_top_level(
+        entries,
+        requested_ids,
+    )
+
+
+def _append_rejection_review_record(
+    repository: JsonRepository,
+    document_id: str,
+    chunks: list[Chunk],
+) -> None:
+    reviewed_at = "2026-07-10T00:05:00+00:00"
+    repository.append_review_record(
+        {
+            "review_id": f"review-reject-{document_id}-{'-'.join(chunk.chunk_id for chunk in chunks)}",
+            "document_id": document_id,
+            "chunk_ids": sorted(chunk.chunk_id for chunk in chunks),
+            "action": "reject",
+            "reviewed_by": "operator",
+            "reviewed_at": reviewed_at,
+            "tenant_id": "tenant-a",
+            "status": "rejected",
+            "reason": "explicit test rejection",
+            "before_content_hashes": {},
+            "after_content_hashes": {
+                chunk.chunk_id: mcp_config_generator.approved_content_hash(chunk)
+                for chunk in chunks
+            },
+            "note": "test fixture",
+            "snapshot": "reports/rejection-snapshot.json",
+            "artifacts": {},
+            "vector_sync": {},
+        }
+    )
 
 
 def _approval_worklist_evidence() -> dict[str, str]:

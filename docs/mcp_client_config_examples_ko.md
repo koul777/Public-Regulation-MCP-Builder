@@ -21,9 +21,11 @@ MCP 클라이언트가 필요한 값은 디렉터리명이 아니라 `command`, 
 }
 ```
 
-실제 생성물에서는 tenant, profile, tool profile, data 경로 인수가 추가됩니다. `chatgpt_desktop_local_mcp.json`의 `ui_fields`가 현재 번들의 완전한 입력값입니다.
+실제 생성물에서는 tenant, profile, tool profile, data 경로 인수가 추가됩니다. 로컬
+클라이언트에는 앱별 생성 파일의 전체 계약을 사용합니다. `chatgpt_desktop_local_mcp.json`은
+이전 버전 호환용 지원 종료 경고 파일이며 ChatGPT 등록에 사용하지 않습니다.
 
-### ChatGPT Desktop / Codex CLI / Codex IDE
+### Codex CLI / Codex IDE
 
 ```toml
 [mcp_servers.aks_mcp]
@@ -32,7 +34,9 @@ args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/MCP/aks_mcp/run
 cwd = "C:/MCP/aks_mcp"
 ```
 
-세 제품이 공유하는 `~/.codex/config.toml`에는 생성된 `codex_config_snippet.toml`을 사용합니다. 수동으로 축약한 예시를 운영 설정에 복사하지 않으며, 직접 MCP 등록 전에 플러그인 목록을 검사할 필요가 없습니다.
+`~/.codex/config.toml`에는 생성된 `codex_config_snippet.toml`을 사용합니다. 수동으로
+축약한 예시를 운영 설정에 복사하지 않으며, 직접 MCP 등록 전에 플러그인 목록을 검사할
+필요가 없습니다.
 
 ### Claude Desktop
 
@@ -64,9 +68,13 @@ cwd = "C:/MCP/aks_mcp"
 claude mcp get aks_mcp
 ```
 
-### ChatGPT Desktop
+### ChatGPT
 
-수동 입력이 필요하면 `chatgpt_desktop_local_mcp.json`의 `ui_fields`를 `Settings > MCP servers > Add server`에 그대로 입력합니다. 일부 argument만 넣거나 폴더만 지정하면 서버가 시작되지 않습니다.
+ChatGPT는 로컬 MCP에 직접 연결하지 않습니다. ChatGPT 웹의 Developer mode에서 원격
+HTTPS MCP 앱을 만들거나 사설망 서버에 OpenAI Secure MCP Tunnel을 별도로 구성합니다.
+[공식 지원 범위](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)와
+[Secure MCP Tunnel 안내](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)를
+먼저 확인하세요.
 
 ## Vercel HTTPS Streamable HTTP
 
@@ -84,7 +92,7 @@ Connector URL:
 https://<deployment>/mcp
 ```
 
-ChatGPT Desktop·Codex 공용 설정:
+Codex 원격 설정:
 
 ```toml
 [mcp_servers.aks_mcp]
@@ -98,10 +106,10 @@ Claude Code는 생성된 `claude_code_add_http.ps1`을 실행합니다. 이 파�
 `claude mcp add --transport http --scope user` 형식으로 같은 URL을 등록합니다.
 
 승인된 공개 read-only endpoint는 `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`를 명시하고
-`MCP_AUTH_TOKEN`을 비웁니다. 비공개 ChatGPT Desktop·Codex 연결은 Vercel Secret
+`MCP_AUTH_TOKEN`을 비웁니다. 비공개 Codex 연결은 Vercel Secret
 `MCP_AUTH_TOKEN`을 두고 공용 `config.toml`의 `bearer_token_env_var`에 환경변수 이름만
-등록하거나 OAuth를 사용합니다. ChatGPT Desktop에서는 `Settings > MCP servers > Add server`의
-Streamable HTTP URL로 같은 endpoint를 등록할 수도 있습니다. 필요하면 manifest와 일치하는
+등록합니다. ChatGPT 웹은 Developer mode의 Apps 설정에서 같은 원격 endpoint와 승인된
+OAuth 정책을 사용합니다. 필요하면 manifest와 일치하는
 `MCP_TENANT_ID`, `MCP_PROFILE_ID`, 사용자 도메인용 `MCP_ALLOWED_HTTP_HOSTS`를 설정합니다.
 로컬 전체 `data/`, raw upload, trace, export, 비밀값은 배포하지 않습니다.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import multiprocessing
 import tempfile
@@ -74,6 +75,47 @@ def _read_approval_journal(data_dir: str, reader_started, reader_done, result_qu
 
 
 class JsonRepositoryJournalIntegrityTests(unittest.TestCase):
+    def test_gzip_journal_base_and_jsonl_tail_are_read_together(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = JsonRepository(Settings(data_dir=Path(tmp)))
+            base_record = _approval_record(approved_by="gzip-base")
+            tail_record = dict(
+                _approval_record(approved_by="jsonl-tail"),
+                approval_record_id="approval-record-2",
+                approval_id="approval-2",
+            )
+            journal_path = repository.root / "journals" / "approvals.jsonl"
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(f"{journal_path}.gz", "wt", encoding="utf-8") as handle:
+                handle.write(json.dumps(base_record) + "\n")
+
+            repository.append_approval_record(tail_record)
+            repository.append_approval_record(dict(base_record))
+
+            self.assertTrue(journal_path.is_file())
+            self.assertEqual(
+                [base_record, tail_record],
+                repository.list_approval_journal_records(),
+            )
+            self.assertEqual(
+                {base_record["approval_record_id"], tail_record["approval_record_id"]},
+                {record["approval_record_id"] for record in repository.list_approval_records()},
+            )
+
+    def test_gzip_base_and_jsonl_tail_conflicting_identity_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = JsonRepository(Settings(data_dir=Path(tmp)))
+            base_record = _approval_record(approved_by="gzip-base")
+            conflicting_tail_record = _approval_record(approved_by="jsonl-tail")
+            journal_path = repository.root / "journals" / "approvals.jsonl"
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(f"{journal_path}.gz", "wt", encoding="utf-8") as handle:
+                handle.write(json.dumps(base_record) + "\n")
+            journal_path.write_text(json.dumps(conflicting_tail_record) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(JournalIntegrityError, "conflicting records"):
+                repository.list_approval_journal_records()
+
     def test_malformed_line_invalidates_whole_approval_journal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repository = JsonRepository(Settings(data_dir=Path(tmp)))

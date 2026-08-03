@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from app.agents.review_policy import AgentReviewPolicy
+from app.processors.chunker import CHUNKER_VERSION
 from app.processors.kordoc_table_parser import resolve_kordoc_command
 from app.schemas.chunk import ChunkOptions
 
 
-PREPROCESSOR_PIPELINE_VERSION = "2026.07.11-kordoc-table-mcp-1"
+PREPROCESSOR_PIPELINE_VERSION = "2026.08.03-canonical-regulation-parity-2"
 
 
 def processing_options_payload(
@@ -22,8 +23,9 @@ def processing_options_payload(
     settings: Any | None = None,
     quality_profiles_sha256: str | None = None,
 ) -> dict:
-    payload = options.model_dump(mode="json", exclude={"enable_agent_review"})
+    payload = options.model_dump(mode="json")
     payload["pipeline_version"] = PREPROCESSOR_PIPELINE_VERSION
+    payload["chunker_version"] = CHUNKER_VERSION
     payload["main_ai_review_stage"] = "parser_ai_review_draft"
     profile_hash = quality_profiles_sha256 or ""
     if settings is not None:
@@ -34,8 +36,12 @@ def processing_options_payload(
         if bool(getattr(settings, "quality_profiles_strict", False)):
             payload["quality_profiles_strict"] = True
         agent_review_policy = AgentReviewPolicy(settings)
+        request_enabled = bool(options.enable_agent_review)
+        provider_execution_ready = agent_review_policy.provider_execution_configured()
+        payload["agent_review_request_enabled"] = request_enabled
         payload["agent_review_cache_scope_hash"] = agent_review_policy.cache_scope_hash()
-        payload["agent_review_provider_execution_ready"] = agent_review_policy.provider_execution_configured()
+        payload["agent_review_provider_execution_ready"] = provider_execution_ready
+        payload["agent_review_provider_execution_enabled"] = request_enabled and provider_execution_ready
         payload["kordoc_table_parser_enabled"] = bool(getattr(settings, "enable_kordoc_table_parser", False))
         if bool(getattr(settings, "enable_kordoc_table_parser", False)):
             payload["kordoc_table_as_main"] = bool(getattr(settings, "kordoc_table_as_main", False))
@@ -79,12 +85,12 @@ def kordoc_table_command_status(command: str) -> dict[str, Any]:
     resolved = resolve_kordoc_command(label)
     if not resolved:
         return status
-    status["available"] = True
     # Preserve a stable evidence label even when a Windows path is inspected
     # by a non-Windows CI runner (and vice versa).
     status["resolved_name"] = str(resolved).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     version = _command_version(resolved)
     if version:
+        status["available"] = True
         status["version"] = version
     return status
 

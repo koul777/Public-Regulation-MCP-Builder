@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import errno
+import multiprocessing
 import tempfile
 import json
 import os
@@ -10,9 +12,13 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+import traceback
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
 from app.mcp_server import regulation_tools
 from app.retrieval import hierarchical_index as hierarchical_index_module
@@ -51,11 +57,76 @@ from app.retrieval.hierarchical_index import (
 )
 
 
+def _hold_hierarchical_index_build_lock(
+    index_path: str,
+    acquired,
+    release,
+) -> None:
+    with hierarchical_index._hierarchical_index_build_guard(
+        index_path,
+        timeout_seconds=10,
+    ):
+        acquired.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("hierarchical index lock holder was not released")
+
+
+def _build_hierarchical_index_in_process(
+    index_path: str,
+    records: list[dict],
+    *,
+    pause_hash: bool,
+    started,
+    hash_started,
+    release_hash,
+    finished,
+    results,
+) -> None:
+    try:
+        started.set()
+
+        def build() -> dict:
+            return build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+
+        if pause_hash:
+            original_sha256 = hierarchical_index._sha256_file
+
+            def paused_sha256(path: Path) -> str:
+                hash_started.set()
+                if not release_hash.wait(timeout=15):
+                    raise TimeoutError("hierarchical index hash was not released")
+                return original_sha256(path)
+
+            with patch.object(
+                hierarchical_index,
+                "_sha256_file",
+                side_effect=paused_sha256,
+            ):
+                result = build()
+        else:
+            result = build()
+        results.put(("ok", result))
+    except Exception:  # pragma: no cover - surfaced in the parent process
+        results.put(("error", traceback.format_exc()))
+    finally:
+        finished.set()
+
+
 class HierarchicalIndexTests(unittest.TestCase):
     def tearDown(self) -> None:
         with hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_LOCK:
             hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE.clear()
             hierarchical_index._VERIFIED_VECTOR_RECORD_CACHE_BYTES = 0
+        with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE.clear()
+            hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES = 0
+            hierarchical_index._INDEXED_CHUNK_TOPOLOGY_INFLIGHT.clear()
+            hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS.clear()
 
     def test_module_import_defers_reference_graph_builder(self) -> None:
         result = subprocess.run(
@@ -77,6 +148,89 @@ class HierarchicalIndexTests(unittest.TestCase):
         )
 
         self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_build_rejects_forged_approved_ambiguous_combined_book_record(self) -> None:
+        record = _record(
+            "doc-ambiguous",
+            "chunk-ambiguous",
+            regulation_no="",
+            regulation_title="통합규정집",
+            article_no="document",
+            article_title="통합규정집",
+            text="승인 상태가 위조된 모호한 통합 규정집",
+            revision_date="2026-08-03",
+            chunk_type="document",
+            metadata_updates={
+                "ambiguous_combined_book_boundary": True,
+                "warnings": ["ambiguous_combined_book_boundary_requires_reparse"],
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            with self.assertRaisesRegex(
+                ValueError,
+                "rejected ambiguous combined-book regulation boundaries: chunk-ambiguous",
+            ):
+                build_hierarchical_runtime_index(
+                    index_path,
+                    [record],
+                    tenant_id="tenant-a",
+                    profile_id="institution-a",
+                )
+
+            self.assertFalse(index_path.exists())
+
+    def test_supersedes_cycle_nodes_distinguishes_chain_cycle_and_branches(
+        self,
+    ) -> None:
+        self.assertEqual(
+            set(),
+            hierarchical_index._supersedes_cycle_nodes(
+                [(3, 2), (2, 1), (1, 0)]
+            ),
+        )
+        self.assertEqual(
+            {1, 2, 3},
+            hierarchical_index._supersedes_cycle_nodes(
+                [(1, 2), (2, 3), (3, 1)]
+            ),
+        )
+        self.assertEqual(
+            {2, 3, 7},
+            hierarchical_index._supersedes_cycle_nodes(
+                [
+                    (1, 2),
+                    (2, 3),
+                    (3, 2),
+                    (4, 3),
+                    (5, 4),
+                    (6, 4),
+                    (7, 7),
+                ]
+            ),
+        )
+
+    def test_supersedes_cycle_nodes_large_chain_uses_linear_hash_work(self) -> None:
+        class HashCountingInt(int):
+            hash_calls = 0
+
+            def __hash__(self) -> int:
+                type(self).hash_calls += 1
+                return super().__hash__()
+
+        node_count = 4_000
+        nodes = [HashCountingInt(index) for index in range(node_count + 1)]
+        edges = [
+            (nodes[index], nodes[index - 1])
+            for index in range(1, node_count + 1)
+        ]
+        HashCountingInt.hash_calls = 0
+
+        cycle_nodes = hierarchical_index._supersedes_cycle_nodes(edges)
+
+        self.assertEqual(set(), cycle_nodes)
+        self.assertLess(HashCountingInt.hash_calls, node_count * 20)
 
     def test_index_summary_stores_private_source_content_binding(self) -> None:
         records = [
@@ -1038,6 +1192,1106 @@ class HierarchicalIndexTests(unittest.TestCase):
         )
         self.assertEqual(2, readonly_connect.call_count)
 
+    def test_failed_rebuild_preserves_existing_index_and_removes_staging_file(
+        self,
+    ) -> None:
+        old_record = _record(
+            "doc-atomic-old",
+            "chunk-atomic-old",
+            regulation_no="3-4-1",
+            regulation_title="Atomic Rebuild Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="existing index content must survive a failed rebuild",
+            revision_date="2026-07-01",
+        )
+        new_record = _record(
+            "doc-atomic-new",
+            "chunk-atomic-new",
+            regulation_no="3-4-2",
+            regulation_title="Failed Replacement Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="this staged replacement must never become visible",
+            revision_date="2026-07-02",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            old_result = build_hierarchical_runtime_index(
+                index_path,
+                [old_record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            old_bytes = index_path.read_bytes()
+            old_summary = index_summary(index_path)
+
+            with patch(
+                "app.retrieval.regulation_reference_graph."
+                "build_regulation_reference_graph",
+                side_effect=RuntimeError("synthetic staged rebuild failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic staged rebuild failure",
+                ):
+                    build_hierarchical_runtime_index(
+                        index_path,
+                        [new_record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+
+            remaining_staging_files = list(
+                root.glob(f".{index_path.name}.*.tmp")
+            )
+            preserved_bytes = index_path.read_bytes()
+            preserved_sha256 = hierarchical_index._sha256_file(index_path)
+            preserved_document_ids = indexed_document_ids(
+                index_path,
+                profile_id="institution-a",
+            )
+            preserved_summary = index_summary(index_path)
+
+        self.assertEqual(old_bytes, preserved_bytes)
+        self.assertEqual(old_result["sha256"], preserved_sha256)
+        self.assertEqual(old_summary, preserved_summary)
+        self.assertEqual({"doc-atomic-old"}, preserved_document_ids)
+        self.assertEqual([], remaining_staging_files)
+
+    def test_generation_map_does_not_accumulate_for_distinct_built_paths(
+        self,
+    ) -> None:
+        record = _record(
+            "doc-generation-prune",
+            "chunk-generation-prune",
+            regulation_no="3-4-3",
+            regulation_title="Generation Prune Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="completed builds must not retain unused path generations",
+            revision_date="2026-07-01",
+        )
+        with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            initial_paths = set(
+                hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built_paths = [
+                root / f"{uuid4()}.sqlite3"
+                for _ in range(32)
+            ]
+            for index_path in built_paths:
+                build_hierarchical_runtime_index(
+                    index_path,
+                    [record],
+                    tenant_id="tenant-a",
+                    profile_id="institution-a",
+                )
+
+            resolved_built_paths = {path.resolve() for path in built_paths}
+            with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+                retained_paths = set(
+                    hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+                )
+
+        self.assertEqual(initial_paths, retained_paths)
+        self.assertTrue(resolved_built_paths.isdisjoint(retained_paths))
+
+    def test_generation_map_does_not_accumulate_for_distinct_failed_builds(
+        self,
+    ) -> None:
+        record = _record(
+            "doc-generation-failed-prune",
+            "chunk-generation-failed-prune",
+            regulation_no="3-4-3-failed",
+            regulation_title="Failed Generation Prune Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="failed builds must not retain unused path generations",
+            revision_date="2026-07-01",
+        )
+        with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            initial_paths = set(
+                hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            failed_paths = [root / f"{uuid4()}.sqlite3" for _ in range(8)]
+            with patch(
+                "app.retrieval.regulation_reference_graph."
+                "build_regulation_reference_graph",
+                side_effect=RuntimeError("synthetic distinct build failure"),
+            ):
+                for index_path in failed_paths:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "synthetic distinct build failure",
+                    ):
+                        build_hierarchical_runtime_index(
+                            index_path,
+                            [record],
+                            tenant_id="tenant-a",
+                            profile_id="institution-a",
+                        )
+
+            self.assertEqual([], list(root.glob(".*.tmp")))
+            with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+                retained_paths = set(
+                    hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+                )
+
+        self.assertEqual(initial_paths, retained_paths)
+
+    def test_connect_failure_cleans_partial_staging_and_generation(self) -> None:
+        record = _record(
+            "doc-connect-failure",
+            "chunk-connect-failure",
+            regulation_no="3-4-3-connect",
+            regulation_title="Connect Failure Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="a partial sqlite staging file must be removed",
+            revision_date="2026-07-01",
+        )
+        with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            initial_paths = set(
+                hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path = root / "regulation_hierarchy.sqlite3"
+
+            def fail_after_partial_create(path, *_args, **_kwargs):
+                Path(path).write_bytes(b"partial sqlite staging")
+                raise sqlite3.OperationalError("synthetic connect failure")
+
+            with patch.object(
+                hierarchical_index.sqlite3,
+                "connect",
+                side_effect=fail_after_partial_create,
+            ):
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "synthetic connect failure",
+                ):
+                    build_hierarchical_runtime_index(
+                        index_path,
+                        [record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+
+            self.assertFalse(index_path.exists())
+            self.assertEqual([], list(root.glob(".*.tmp")))
+            with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+                retained_paths = set(
+                    hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+                )
+
+        self.assertEqual(initial_paths, retained_paths)
+
+    def test_close_failure_cleans_completed_staging_and_generation(self) -> None:
+        record = _record(
+            "doc-close-failure",
+            "chunk-close-failure",
+            regulation_no="3-4-3-close",
+            regulation_title="Close Failure Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="a completed staging database must not publish after close fails",
+            revision_date="2026-07-01",
+        )
+        with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+            initial_paths = set(
+                hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            original_connect = sqlite3.connect
+
+            class CloseFailingConnection:
+                def __init__(self, connection) -> None:
+                    self._connection = connection
+
+                def __getattr__(self, name):
+                    return getattr(self._connection, name)
+
+                def close(self) -> None:
+                    self._connection.close()
+                    raise sqlite3.OperationalError("synthetic close failure")
+
+            def close_failing_connect(*args, **kwargs):
+                return CloseFailingConnection(original_connect(*args, **kwargs))
+
+            with patch.object(
+                hierarchical_index.sqlite3,
+                "connect",
+                side_effect=close_failing_connect,
+            ):
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "synthetic close failure",
+                ):
+                    build_hierarchical_runtime_index(
+                        index_path,
+                        [record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+
+            self.assertFalse(index_path.exists())
+            self.assertEqual([], list(root.glob(".*.tmp")))
+            with hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_LOCK:
+                retained_paths = set(
+                    hierarchical_index._INDEXED_CHUNK_TOPOLOGY_GENERATIONS
+                )
+
+        self.assertEqual(initial_paths, retained_paths)
+
+    def test_cross_process_build_lock_times_out_and_keeps_fixed_lockfile(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            holder_acquired = context.Event()
+            release_holder = context.Event()
+            holder = context.Process(
+                target=_hold_hierarchical_index_build_lock,
+                args=(str(index_path), holder_acquired, release_holder),
+            )
+            holder.start()
+            try:
+                self.assertTrue(holder_acquired.wait(timeout=10))
+                with self.assertRaisesRegex(
+                    TimeoutError,
+                    "hierarchical index lock",
+                ):
+                    with hierarchical_index._hierarchical_index_build_guard(
+                        index_path,
+                        timeout_seconds=0.1,
+                    ):
+                        self.fail("contending process unexpectedly acquired lock")
+                _target, lock_path = (
+                    hierarchical_index._confined_hierarchical_index_paths(
+                        index_path
+                    )
+                )
+                self.assertTrue(lock_path.is_file())
+                self.assertGreaterEqual(lock_path.stat().st_size, 1)
+            finally:
+                release_holder.set()
+                holder.join(timeout=10)
+                if holder.is_alive():
+                    holder.terminate()
+                    holder.join(timeout=5)
+            self.assertEqual(0, holder.exitcode)
+
+    def test_cross_process_build_lock_reacquires_after_owner_termination(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            holder_acquired = context.Event()
+            never_release = context.Event()
+            holder = context.Process(
+                target=_hold_hierarchical_index_build_lock,
+                args=(str(index_path), holder_acquired, never_release),
+            )
+            holder.start()
+            self.assertTrue(holder_acquired.wait(timeout=10))
+            holder.terminate()
+            holder.join(timeout=10)
+            self.assertFalse(holder.is_alive())
+
+            with hierarchical_index._hierarchical_index_build_guard(
+                index_path,
+                timeout_seconds=5,
+            ):
+                reacquired = True
+            _target, lock_path = (
+                hierarchical_index._confined_hierarchical_index_paths(index_path)
+            )
+
+        self.assertTrue(reacquired)
+        self.assertTrue(lock_path.name.endswith(".reg-rag.lock"))
+
+    def test_windows_lock_retryable_errno_times_out_instead_of_masking_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / ".regulation_hierarchy.sqlite3.reg-rag.lock"
+            file_descriptor = hierarchical_index._open_hierarchical_index_lock_file(
+                lock_path
+            )
+            lock_attempts = 0
+
+            def lock_contention(*_args) -> None:
+                nonlocal lock_attempts
+                lock_attempts += 1
+                raise PermissionError(errno.EACCES, "synthetic lock contention")
+
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, locking=lock_contention)
+            try:
+                with patch.object(hierarchical_index.os, "name", "nt"), patch.dict(
+                    sys.modules, {"msvcrt": fake_msvcrt}
+                ):
+                    with self.assertRaises(TimeoutError) as raised:
+                        hierarchical_index._acquire_hierarchical_index_file_lock(
+                            file_descriptor,
+                            lock_path,
+                            deadline=time.monotonic(),
+                        )
+            finally:
+                os.close(file_descriptor)
+
+        self.assertEqual(1, lock_attempts)
+        self.assertIsInstance(raised.exception.__cause__, PermissionError)
+        self.assertEqual(errno.EACCES, raised.exception.__cause__.errno)
+
+    def test_windows_lock_non_contention_oserror_propagates_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / ".regulation_hierarchy.sqlite3.reg-rag.lock"
+            file_descriptor = hierarchical_index._open_hierarchical_index_lock_file(
+                lock_path
+            )
+            lock_attempts = 0
+
+            def missing_lock_file(*_args) -> None:
+                nonlocal lock_attempts
+                lock_attempts += 1
+                raise FileNotFoundError(errno.ENOENT, "synthetic missing lock")
+
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, locking=missing_lock_file)
+            try:
+                with patch.object(hierarchical_index.os, "name", "nt"), patch.dict(
+                    sys.modules, {"msvcrt": fake_msvcrt}
+                ):
+                    with self.assertRaises(FileNotFoundError) as raised:
+                        hierarchical_index._acquire_hierarchical_index_file_lock(
+                            file_descriptor,
+                            lock_path,
+                            deadline=time.monotonic() + 60.0,
+                        )
+            finally:
+                os.close(file_descriptor)
+
+        self.assertEqual(1, lock_attempts)
+        self.assertEqual(errno.ENOENT, raised.exception.errno)
+
+    def test_cross_process_builders_hash_their_own_committed_generation(self) -> None:
+        first_records = [
+            _record(
+                "doc-process-writer-first",
+                "chunk-process-writer-first",
+                regulation_no="3-4-3-process-a",
+                regulation_title="Process Writer A Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="the first process hashes its own committed index",
+                revision_date="2026-07-01",
+            )
+        ]
+        second_records = [
+            *first_records,
+            _record(
+                "doc-process-writer-second",
+                "chunk-process-writer-second",
+                regulation_no="3-4-3-process-b",
+                regulation_title="Process Writer B Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="the second process commits after the first returns",
+                revision_date="2026-07-02",
+            ),
+        ]
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            first_started = context.Event()
+            first_hash_started = context.Event()
+            release_first_hash = context.Event()
+            first_finished = context.Event()
+            second_started = context.Event()
+            unused_second_hash = context.Event()
+            unused_second_release = context.Event()
+            second_finished = context.Event()
+            results = context.Queue()
+            first = context.Process(
+                target=_build_hierarchical_index_in_process,
+                args=(str(index_path), first_records),
+                kwargs={
+                    "pause_hash": True,
+                    "started": first_started,
+                    "hash_started": first_hash_started,
+                    "release_hash": release_first_hash,
+                    "finished": first_finished,
+                    "results": results,
+                },
+            )
+            second = context.Process(
+                target=_build_hierarchical_index_in_process,
+                args=(str(index_path), second_records),
+                kwargs={
+                    "pause_hash": False,
+                    "started": second_started,
+                    "hash_started": unused_second_hash,
+                    "release_hash": unused_second_release,
+                    "finished": second_finished,
+                    "results": results,
+                },
+            )
+            first.start()
+            try:
+                self.assertTrue(first_started.wait(timeout=10))
+                self.assertTrue(first_hash_started.wait(timeout=15))
+                second.start()
+                self.assertTrue(second_started.wait(timeout=10))
+                self.assertFalse(second_finished.wait(timeout=0.35))
+                release_first_hash.set()
+                outcomes = [results.get(timeout=20), results.get(timeout=20)]
+                first.join(timeout=10)
+                second.join(timeout=10)
+                self.assertEqual(0, first.exitcode)
+                self.assertEqual(0, second.exitcode)
+                self.assertFalse(any(outcome[0] == "error" for outcome in outcomes))
+                summaries = {
+                    outcome[1]["record_count"]: outcome[1]
+                    for outcome in outcomes
+                }
+                final_sha256 = hierarchical_index._sha256_file(index_path)
+                final_summary = index_summary(index_path)
+            finally:
+                release_first_hash.set()
+                for process in (first, second):
+                    if process.pid is not None and process.is_alive():
+                        process.terminate()
+                    if process.pid is not None:
+                        process.join(timeout=5)
+
+        self.assertEqual({1, 2}, set(summaries))
+        self.assertNotEqual(summaries[1]["sha256"], summaries[2]["sha256"])
+        self.assertEqual(summaries[2]["sha256"], final_sha256)
+        self.assertEqual(2, final_summary["record_count"])
+
+    def test_same_target_builders_return_their_own_committed_hashes(self) -> None:
+        first_records = [
+            _record(
+                "doc-writer-first",
+                "chunk-writer-first",
+                regulation_no="3-4-3-writer-a",
+                regulation_title="Writer A Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="the first writer must hash its own committed index",
+                revision_date="2026-07-01",
+            )
+        ]
+        second_records = [
+            *first_records,
+            _record(
+                "doc-writer-second",
+                "chunk-writer-second",
+                regulation_no="3-4-3-writer-b",
+                regulation_title="Writer B Regulation",
+                article_no="Article 1",
+                article_title="Purpose",
+                text="the second writer commits only after the first returns",
+                revision_date="2026-07-02",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            first_hash_started = threading.Event()
+            release_first_hash = threading.Event()
+            original_sha256 = hierarchical_index._sha256_file
+            hash_call_lock = threading.Lock()
+            hash_call_count = 0
+
+            def pause_first_hash(path: Path) -> str:
+                nonlocal hash_call_count
+                with hash_call_lock:
+                    hash_call_count += 1
+                    is_first = hash_call_count == 1
+                if is_first:
+                    first_hash_started.set()
+                    if not release_first_hash.wait(timeout=5):
+                        raise TimeoutError("timed out waiting to hash first build")
+                return original_sha256(path)
+
+            with patch.object(
+                hierarchical_index,
+                "_sha256_file",
+                side_effect=pause_first_hash,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    first_future = executor.submit(
+                        build_hierarchical_runtime_index,
+                        index_path,
+                        first_records,
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+                    try:
+                        self.assertTrue(first_hash_started.wait(timeout=5))
+                        second_future = executor.submit(
+                            build_hierarchical_runtime_index,
+                            index_path,
+                            second_records,
+                            tenant_id="tenant-a",
+                            profile_id="institution-a",
+                        )
+                        self.assertFalse(second_future.done())
+                    finally:
+                        release_first_hash.set()
+                    first_result = first_future.result(timeout=5)
+                    second_result = second_future.result(timeout=5)
+
+            final_sha256 = original_sha256(index_path)
+            final_summary = index_summary(index_path)
+            with hierarchical_index._HIERARCHICAL_INDEX_BUILD_LOCKS_GUARD:
+                retained_build_locks = dict(
+                    hierarchical_index._HIERARCHICAL_INDEX_BUILD_LOCKS
+                )
+
+        self.assertEqual(1, first_result["record_count"])
+        self.assertEqual(2, second_result["record_count"])
+        self.assertNotEqual(first_result["sha256"], second_result["sha256"])
+        self.assertEqual(second_result["sha256"], final_sha256)
+        self.assertEqual(2, final_summary["record_count"])
+        self.assertNotIn(index_path.resolve(), retained_build_locks)
+
+    def test_reader_sees_old_index_until_atomic_rebuild_commit(self) -> None:
+        old_record = _record(
+            "doc-reader-old",
+            "chunk-reader-old",
+            regulation_no="3-4-4",
+            regulation_title="Reader Old Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="readers may continue using the old committed index",
+            revision_date="2026-07-01",
+        )
+        new_record = _record(
+            "doc-reader-new",
+            "chunk-reader-new",
+            regulation_no="3-4-5",
+            regulation_title="Reader New Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="readers see this record only after atomic replacement",
+            revision_date="2026-07-02",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [old_record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            replace_started = threading.Event()
+            release_replace = threading.Event()
+            original_replace = os.replace
+
+            def pause_target_replace(source, destination) -> None:
+                if Path(destination) == index_path:
+                    replace_started.set()
+                    if not release_replace.wait(timeout=5):
+                        raise TimeoutError("timed out waiting to commit rebuild")
+                original_replace(source, destination)
+
+            with patch.object(
+                hierarchical_index.os,
+                "replace",
+                side_effect=pause_target_replace,
+            ):
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    rebuild = executor.submit(
+                        build_hierarchical_runtime_index,
+                        index_path,
+                        [new_record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+                    try:
+                        self.assertTrue(replace_started.wait(timeout=5))
+                        during_rebuild = indexed_document_ids(
+                            index_path,
+                            profile_id="institution-a",
+                        )
+                    finally:
+                        release_replace.set()
+                    rebuild.result(timeout=5)
+
+            after_commit = indexed_document_ids(
+                index_path,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual({"doc-reader-old"}, during_rebuild)
+        self.assertEqual({"doc-reader-new"}, after_commit)
+
+    def test_atomic_rebuild_retries_transient_windows_reader_lock(self) -> None:
+        old_record = _record(
+            "doc-retry-old",
+            "chunk-retry-old",
+            regulation_no="3-4-6",
+            regulation_title="Retry Old Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="old committed index",
+            revision_date="2026-07-01",
+        )
+        new_record = _record(
+            "doc-retry-new",
+            "chunk-retry-new",
+            regulation_no="3-4-7",
+            regulation_title="Retry New Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="new index after a transient reader lock",
+            revision_date="2026-07-02",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [old_record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            original_replace = os.replace
+            attempts = 0
+
+            def lock_twice_then_replace(source, destination) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 2:
+                    raise PermissionError("synthetic Windows reader lock")
+                original_replace(source, destination)
+
+            with patch.object(
+                hierarchical_index.os,
+                "replace",
+                side_effect=lock_twice_then_replace,
+            ), patch.object(hierarchical_index.time, "sleep", return_value=None):
+                build_hierarchical_runtime_index(
+                    index_path,
+                    [new_record],
+                    tenant_id="tenant-a",
+                    profile_id="institution-a",
+                )
+
+            document_ids = indexed_document_ids(
+                index_path,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(3, attempts)
+        self.assertEqual({"doc-retry-new"}, document_ids)
+
+    def test_atomic_rebuild_timeout_preserves_old_index_and_cleans_staging(self) -> None:
+        old_record = _record(
+            "doc-timeout-old",
+            "chunk-timeout-old",
+            regulation_no="3-4-8",
+            regulation_title="Timeout Old Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="old index survives replacement timeout",
+            revision_date="2026-07-01",
+        )
+        new_record = _record(
+            "doc-timeout-new",
+            "chunk-timeout-new",
+            regulation_no="3-4-9",
+            regulation_title="Timeout New Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="locked replacement is never published",
+            revision_date="2026-07-02",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path = root / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [old_record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            old_bytes = index_path.read_bytes()
+
+            with patch.object(
+                hierarchical_index,
+                "_INDEX_REPLACE_RETRY_SECONDS",
+                0.0,
+            ), patch.object(
+                hierarchical_index.os,
+                "replace",
+                side_effect=PermissionError("persistent Windows reader lock"),
+            ):
+                with self.assertRaisesRegex(PermissionError, "persistent Windows"):
+                    build_hierarchical_runtime_index(
+                        index_path,
+                        [new_record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+
+            document_ids = indexed_document_ids(
+                index_path,
+                profile_id="institution-a",
+            )
+            preserved_bytes = index_path.read_bytes()
+            staging_files = list(root.glob(f".{index_path.name}.*.tmp"))
+
+        self.assertEqual(old_bytes, preserved_bytes)
+        self.assertEqual({"doc-timeout-old"}, document_ids)
+        self.assertEqual([], staging_files)
+
+    def test_indexed_chunk_topology_cache_normalizes_profile_without_poisoning_scope(
+        self,
+    ) -> None:
+        record = _record(
+            "doc-profile-normalized",
+            "chunk-profile-normalized",
+            regulation_no="3-5",
+            regulation_title="Normalized Profile Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="normalized profile cache row",
+            revision_date="2026-07-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+
+            padded_result = indexed_document_ids(
+                index_path,
+                profile_id=" INSTITUTION-A ",
+            )
+            canonical_result = indexed_document_ids(
+                index_path,
+                profile_id="institution-a",
+            )
+            whitespace_only_result = indexed_document_ids(
+                index_path,
+                profile_id="   ",
+            )
+            unscoped_result = indexed_document_ids(index_path)
+
+        self.assertEqual({"doc-profile-normalized"}, padded_result)
+        self.assertEqual({"doc-profile-normalized"}, canonical_result)
+        self.assertEqual(set(), whitespace_only_result)
+        self.assertEqual({"doc-profile-normalized"}, unscoped_result)
+
+    def test_indexed_chunk_topology_cache_is_immutable_and_size_bounded(self) -> None:
+        record = _record(
+            "doc-cache-bounded",
+            "chunk-cache-bounded",
+            regulation_no="3-6",
+            regulation_title="Bounded Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="bounded topology cache row",
+            revision_date="2026-07-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            topology = hierarchical_index._indexed_chunk_topology(
+                index_path,
+                profile_id="institution-a",
+            )
+            with self.assertRaises(TypeError):
+                topology.unit_keys["mutated"] = frozenset()
+
+            with patch.object(
+                hierarchical_index,
+                "_INDEXED_CHUNK_TOPOLOGY_CACHE_MAX_ENTRY_BYTES",
+                1,
+            ):
+                hierarchical_index._evict_indexed_chunk_topology_cache(index_path)
+                uncached = hierarchical_index._indexed_chunk_topology(
+                    index_path,
+                    profile_id="institution-a",
+                )
+
+        self.assertGreater(uncached.estimated_size_bytes, 1)
+        self.assertEqual({}, hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE)
+        self.assertEqual(0, hierarchical_index._INDEXED_CHUNK_TOPOLOGY_CACHE_BYTES)
+
+    def test_indexed_chunk_topology_cache_single_flights_concurrent_cold_callers(
+        self,
+    ) -> None:
+        record = _record(
+            "doc-cache-concurrent",
+            "chunk-cache-concurrent",
+            regulation_no="3-7",
+            regulation_title="Concurrent Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="concurrent topology cache row",
+            revision_date="2026-07-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            original_scan = hierarchical_index._scan_indexed_chunk_topology
+
+            def slow_scan(*args, **kwargs):
+                time.sleep(0.05)
+                return original_scan(*args, **kwargs)
+
+            with patch.object(
+                hierarchical_index,
+                "_scan_indexed_chunk_topology",
+                side_effect=slow_scan,
+            ) as scan:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    results = list(
+                        executor.map(
+                            lambda _index: indexed_document_ids(
+                                index_path,
+                                profile_id="institution-a",
+                            ),
+                            range(8),
+                        )
+                    )
+
+        self.assertEqual([{"doc-cache-concurrent"}] * 8, results)
+        self.assertEqual(1, scan.call_count)
+        self.assertEqual({}, hierarchical_index._INDEXED_CHUNK_TOPOLOGY_INFLIGHT)
+
+    def test_indexed_chunk_topology_cache_retries_after_scan_failure(self) -> None:
+        record = _record(
+            "doc-cache-retry",
+            "chunk-cache-retry",
+            regulation_no="3-8",
+            regulation_title="Retry Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="retry topology cache row",
+            revision_date="2026-07-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            original_scan = hierarchical_index._scan_indexed_chunk_topology
+            attempts = 0
+
+            def fail_once(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("synthetic topology scan failure")
+                return original_scan(*args, **kwargs)
+
+            with patch.object(
+                hierarchical_index,
+                "_scan_indexed_chunk_topology",
+                side_effect=fail_once,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic topology"):
+                    indexed_document_ids(
+                        index_path,
+                        profile_id="institution-a",
+                    )
+                self.assertEqual(
+                    {},
+                    hierarchical_index._INDEXED_CHUNK_TOPOLOGY_INFLIGHT,
+                )
+                retry_result = indexed_document_ids(
+                    index_path,
+                    profile_id="institution-a",
+                )
+
+        self.assertEqual({"doc-cache-retry"}, retry_result)
+        self.assertEqual(2, attempts)
+
+    def test_indexed_chunk_topology_cache_retries_flight_overlapping_rebuild(
+        self,
+    ) -> None:
+        first_record = _record(
+            "doc-cache-first",
+            "chunk-cache-first",
+            regulation_no="3-9",
+            regulation_title="Rebuild Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="first topology row",
+            revision_date="2026-07-01",
+        )
+        second_record = _record(
+            "doc-cache-second",
+            "chunk-cache-second",
+            regulation_no="3-10",
+            regulation_title="New Rebuild Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="second topology row",
+            revision_date="2026-07-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [first_record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            original_scan = hierarchical_index._scan_indexed_chunk_topology
+            old_scan_ready = threading.Event()
+            release_old_scan = threading.Event()
+            attempts = 0
+
+            def pause_first_scan(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                result = original_scan(*args, **kwargs)
+                if attempts == 1:
+                    old_scan_ready.set()
+                    self.assertTrue(release_old_scan.wait(timeout=5))
+                return result
+
+            with patch.object(
+                hierarchical_index,
+                "_scan_indexed_chunk_topology",
+                side_effect=pause_first_scan,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    leader = executor.submit(
+                        indexed_document_ids,
+                        index_path,
+                        profile_id="institution-a",
+                    )
+                    self.assertTrue(old_scan_ready.wait(timeout=5))
+                    waiter = executor.submit(
+                        indexed_document_ids,
+                        index_path,
+                        profile_id="institution-a",
+                    )
+                    time.sleep(0.02)
+                    build_hierarchical_runtime_index(
+                        index_path,
+                        [first_record, second_record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+                    release_old_scan.set()
+                    leader_result = leader.result(timeout=5)
+                    waiter_result = waiter.result(timeout=5)
+
+        expected = {"doc-cache-first", "doc-cache-second"}
+        self.assertEqual(expected, leader_result)
+        self.assertEqual(expected, waiter_result)
+        self.assertEqual(2, attempts)
+        self.assertEqual({}, hierarchical_index._INDEXED_CHUNK_TOPOLOGY_INFLIGHT)
+
+    def test_indexed_chunk_topology_cache_retries_failed_scan_invalidated_by_rebuild(
+        self,
+    ) -> None:
+        first_record = _record(
+            "doc-cache-failed-old",
+            "chunk-cache-failed-old",
+            regulation_no="3-11",
+            regulation_title="Failed Old Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="old topology row",
+            revision_date="2026-07-01",
+        )
+        second_record = _record(
+            "doc-cache-failed-new",
+            "chunk-cache-failed-new",
+            regulation_no="3-12",
+            regulation_title="Failed New Cache Regulation",
+            article_no="Article 1",
+            article_title="Purpose",
+            text="new topology row",
+            revision_date="2026-07-01",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                [first_record],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            original_scan = hierarchical_index._scan_indexed_chunk_topology
+            first_scan_started = threading.Event()
+            release_failed_scan = threading.Event()
+            attempts = 0
+
+            def fail_invalidated_scan_once(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    first_scan_started.set()
+                    self.assertTrue(release_failed_scan.wait(timeout=5))
+                    raise FileNotFoundError("synthetic invalidated index scan")
+                return original_scan(*args, **kwargs)
+
+            with patch.object(
+                hierarchical_index,
+                "_scan_indexed_chunk_topology",
+                side_effect=fail_invalidated_scan_once,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    leader = executor.submit(
+                        indexed_document_ids,
+                        index_path,
+                        profile_id="institution-a",
+                    )
+                    self.assertTrue(first_scan_started.wait(timeout=5))
+                    waiter = executor.submit(
+                        indexed_document_ids,
+                        index_path,
+                        profile_id="institution-a",
+                    )
+                    time.sleep(0.02)
+                    build_hierarchical_runtime_index(
+                        index_path,
+                        [first_record, second_record],
+                        tenant_id="tenant-a",
+                        profile_id="institution-a",
+                    )
+                    release_failed_scan.set()
+                    leader_result = leader.result(timeout=5)
+                    waiter_result = waiter.result(timeout=5)
+
+        expected = {"doc-cache-failed-old", "doc-cache-failed-new"}
+        self.assertEqual(expected, leader_result)
+        self.assertEqual(expected, waiter_result)
+        self.assertEqual(2, attempts)
+        self.assertEqual({}, hierarchical_index._INDEXED_CHUNK_TOPOLOGY_INFLIGHT)
+
     def test_build_rejects_mixed_tenant_records(self) -> None:
         records = [
             _record(
@@ -1262,6 +2516,59 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual({"4-44", "44-4"}, {item["regulation_no"] for item in catalog})
         by_number = {item["regulation_no"]: item for item in catalog}
         self.assertEqual(3, by_number["4-44"]["chunk_count"])
+
+    def test_document_identity_reuses_title_match_for_repeated_unnumbered_chunks(self) -> None:
+        numbered_count = 100
+        repeated_count = 250
+        records = [
+            _record(
+                "doc-many-regulations",
+                f"numbered-{index}",
+                regulation_no=f"4-{index}",
+                regulation_title=f"테스트 규정 {index:03d}",
+                article_no="제1조",
+                article_title="목적",
+                text=f"테스트 규정 {index:03d}의 목적을 정한다.",
+                revision_date="2026-07-01",
+                metadata_updates={"document_name": "기관 규정집"},
+            )
+            for index in range(numbered_count)
+        ]
+        records.extend(
+            _record(
+                "doc-many-regulations",
+                f"unnumbered-{index}",
+                regulation_no="",
+                regulation_title="테스트 규정 050",
+                article_no=f"제{index + 2}조",
+                article_title="세부사항",
+                text="동일 규정에서 번호가 누락된 표와 조문이다.",
+                revision_date="2026-07-01",
+                metadata_updates={"document_name": "기관 규정집"},
+            )
+            for index in range(repeated_count)
+        )
+
+        original_match = hierarchical_index_module._regulation_titles_match
+        with patch.object(
+            hierarchical_index_module,
+            "_regulation_titles_match",
+            wraps=original_match,
+        ) as title_match:
+            identities = hierarchical_index_module._canonical_record_regulation_identities(
+                records,
+                fallback_profile_id="institution-a",
+            )
+
+        expected_unit_id = identities[("doc-many-regulations", "numbered-50")]["unit_id"]
+        self.assertEqual(
+            {expected_unit_id},
+            {
+                identities[("doc-many-regulations", f"unnumbered-{index}")]["unit_id"]
+                for index in range(repeated_count)
+            },
+        )
+        self.assertEqual(numbered_count, title_match.call_count)
 
     def test_stable_regulation_id_keeps_renamed_and_renumbered_revisions_in_one_unit(self) -> None:
         records = [
@@ -1591,6 +2898,289 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertIsNone(toc["nodes"][0]["parent_id"])
         self.assertEqual(toc["nodes"][0]["node_id"], toc["nodes"][1]["parent_id"])
         self.assertEqual(toc["nodes"][1]["node_id"], toc["nodes"][2]["parent_id"])
+
+    def test_canonical_title_unit_id_matches_numbered_combined_and_unnumbered_standalone(self) -> None:
+        combined = _record(
+            "doc-combined-unit",
+            "combined-unit-article",
+            regulation_no="4-1",
+            regulation_title="인사규정",
+            article_no="제1조",
+            article_title="목적",
+            text="제1조(목적) 인사 운영 기준을 정한다.",
+            revision_date="2026-07-01",
+            metadata_updates={
+                "canonical_regulation_title": "인사규정",
+                "canonical_regulation_no": "4-1",
+                "canonical_hierarchy_path": "인사규정 > 제1조 목적",
+            },
+        )
+        standalone = _record(
+            "doc-standalone-unit",
+            "standalone-unit-article",
+            regulation_no="",
+            regulation_title="인사규정",
+            article_no="제1조",
+            article_title="목적",
+            text="제1조(목적) 인사 운영 기준을 정한다.",
+            revision_date="2026-07-01",
+            metadata_updates={
+                "document_name": "인사규정",
+                "canonical_regulation_title": "인사규정",
+                "canonical_hierarchy_path": "인사규정 > 제1조 목적",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            combined_path = Path(tmp) / "combined.sqlite3"
+            standalone_path = Path(tmp) / "standalone.sqlite3"
+            combined_summary = build_hierarchical_runtime_index(
+                combined_path,
+                [combined],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            standalone_summary = build_hierarchical_runtime_index(
+                standalone_path,
+                [standalone],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            combined_catalog = list_indexed_regulations(
+                combined_path,
+                profile_id="institution-a",
+            )
+            standalone_catalog = list_indexed_regulations(
+                standalone_path,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(1, len(combined_catalog))
+        self.assertEqual(1, len(standalone_catalog))
+        self.assertEqual(
+            combined_catalog[0]["regulation_unit_id"],
+            standalone_catalog[0]["regulation_unit_id"],
+        )
+        self.assertEqual("인사규정", combined_catalog[0]["regulation_title"])
+        self.assertEqual("인사규정", standalone_catalog[0]["regulation_title"])
+        self.assertEqual("", combined_catalog[0]["regulation_no"])
+        self.assertEqual("", standalone_catalog[0]["regulation_no"])
+        self.assertEqual(
+            combined_summary["logical_corpus_sha256"],
+            standalone_summary["logical_corpus_sha256"],
+        )
+
+    def test_legacy_combined_and_standalone_records_have_same_logical_toc_and_search_score(self) -> None:
+        combined = _record(
+            "doc-combined-parity",
+            "combined-parity-article",
+            regulation_no="1",
+            regulation_title="인사규정",
+            article_no="제1조",
+            article_title="목적",
+            text=(
+                "[문서명] 기관 통합 규정집\n"
+                "[위치] 기관 통합 규정집 > 제1편 일반규정 > 제1장 인사 > 1. 인사규정 > 제1장 총칙 > 제1조 목적\n"
+                "[본문]\n제1조(목적) 인사 운영 기준을 정한다."
+            ),
+            revision_date="2026-07-01",
+            hierarchy_path="기관 통합 규정집 > 제1편 일반규정 > 제1장 인사 > 1. 인사규정 > 제1장 총칙 > 제1조 목적",
+            metadata_updates={
+                "document_name": "기관 통합 규정집",
+                "chunker_version": "0.1.8",
+                "part_no": "제1편",
+                "part_title": "기관 규정",
+                "source_page_start": 137,
+                "source_page_end": 137,
+                "order_index": 910,
+            },
+        )
+        standalone = _record(
+            "doc-standalone-parity",
+            "standalone-parity-article",
+            regulation_no="1",
+            regulation_title="인사규정",
+            article_no="제1조",
+            article_title="목적",
+            text=(
+                "[문서명] 인사규정\n"
+                "[위치] 인사규정 > 제1장 총칙 > 제1조 목적\n"
+                "[본문]\n제1조(목적) 인사 운영 기준을 정한다."
+            ),
+            revision_date="2026-07-01",
+            hierarchy_path="인사규정 > 제1장 총칙 > 제1조 목적",
+            metadata_updates={
+                "document_name": "인사규정",
+                "chunker_version": "0.1.8",
+                "source_page_start": 1,
+                "source_page_end": 1,
+                "order_index": 1,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            combined_vector = root / "combined.jsonl"
+            standalone_vector = root / "standalone.jsonl"
+            combined_offsets = write_vector_records_with_offsets(combined_vector, [combined])
+            standalone_offsets = write_vector_records_with_offsets(standalone_vector, [standalone])
+            combined_index = root / "combined.sqlite3"
+            standalone_index = root / "standalone.sqlite3"
+            combined_summary = build_hierarchical_runtime_index(
+                combined_index,
+                [combined],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=combined_offsets,
+            )
+            standalone_summary = build_hierarchical_runtime_index(
+                standalone_index,
+                [standalone],
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=standalone_offsets,
+            )
+            combined_unit_id = list_indexed_regulations(
+                combined_index,
+                profile_id="institution-a",
+            )[0]["regulation_unit_id"]
+            standalone_unit_id = list_indexed_regulations(
+                standalone_index,
+                profile_id="institution-a",
+            )[0]["regulation_unit_id"]
+            combined_toc = regulation_toc(
+                combined_index,
+                regulation_unit_id=combined_unit_id,
+            )
+            standalone_toc = regulation_toc(
+                standalone_index,
+                regulation_unit_id=standalone_unit_id,
+            )
+            combined_results, _ = search_hierarchical_records(
+                combined_index,
+                combined_vector,
+                query="인사 운영 목적",
+                top_k=1,
+                profile_id="institution-a",
+            )
+            standalone_results, _ = search_hierarchical_records(
+                standalone_index,
+                standalone_vector,
+                query="인사 운영 목적",
+                top_k=1,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(combined_unit_id, standalone_unit_id)
+        self.assertEqual(
+            combined_summary["logical_corpus_sha256"],
+            standalone_summary["logical_corpus_sha256"],
+        )
+        combined_nodes = [
+            {key: value for key, value in node.items() if key != "chunk_id"}
+            for node in combined_toc["nodes"]
+        ]
+        standalone_nodes = [
+            {key: value for key, value in node.items() if key != "chunk_id"}
+            for node in standalone_toc["nodes"]
+        ]
+        self.assertEqual(combined_nodes, standalone_nodes)
+        self.assertEqual(
+            ["인사규정", "제1장 총칙", "제1조 목적"],
+            [node["label"] for node in combined_nodes],
+        )
+        self.assertEqual(combined_results[0][0], standalone_results[0][0])
+
+    def test_legacy_short_regulation_number_does_not_attach_outer_binder_segments(self) -> None:
+        metadata = {
+            "regulation_no": "1",
+            "regulation_title": "인사규정",
+            "article_no": "제1조",
+            "article_title": "목적",
+            "hierarchy_path": (
+                "기관 통합 규정집 > 제1편 기본법령 > 제2장 인사 > "
+                "1 인사규정 > 제1장 총칙 > 제1조 목적"
+            ),
+        }
+
+        self.assertEqual(
+            "인사규정 > 제1장 총칙 > 제1조 목적",
+            hierarchical_index_module._canonical_hierarchy_path(metadata),
+        )
+
+    def test_canonical_same_title_siblings_remain_distinct_by_number(self) -> None:
+        records = [
+            _record(
+                f"doc-canonical-sibling-{number}",
+                f"chunk-canonical-sibling-{number}",
+                regulation_no=number,
+                regulation_title="운영규정",
+                article_no="제1조",
+                article_title="목적",
+                text=f"{number} 운영규정 본문",
+                revision_date="2026-07-01",
+                metadata_updates={
+                    "canonical_regulation_title": "운영규정",
+                    "canonical_regulation_no": number,
+                    "canonical_hierarchy_path": "운영규정 > 제1조 목적",
+                },
+            )
+            for number in ("4-1", "7-2")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "canonical-siblings.sqlite3"
+            summary = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            catalog = list_indexed_regulations(
+                index_path,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(2, summary["regulation_count"])
+        self.assertEqual(2, len({item["regulation_unit_id"] for item in catalog}))
+        self.assertEqual({"4-1", "7-2"}, {item["regulation_no"] for item in catalog})
+
+    def test_ambiguous_canonical_title_only_documents_fail_closed_as_distinct_units(self) -> None:
+        records = [
+            _record(
+                f"doc-ambiguous-title-{index}",
+                f"chunk-ambiguous-title-{index}",
+                regulation_no="",
+                regulation_title="운영규정",
+                article_no="제1조",
+                article_title="목적",
+                text=f"서로 다른 것으로 취급해야 하는 운영규정 본문 {index}",
+                revision_date="2026-07-01",
+                metadata_updates={
+                    "document_name": "운영규정",
+                    "canonical_regulation_title": "운영규정",
+                    "canonical_hierarchy_path": "운영규정 > 제1조 목적",
+                    "regulation_id": "",
+                },
+            )
+            for index in (1, 2)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "ambiguous-title-only.sqlite3"
+            summary = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            catalog = list_indexed_regulations(
+                index_path,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(2, summary["regulation_count"])
+        self.assertEqual(2, len({item["regulation_unit_id"] for item in catalog}))
 
     def test_catalog_keeps_same_title_distinct_by_number_and_hides_storage_ids(self) -> None:
         records = [
@@ -2206,6 +3796,54 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual(first["regulation_count"], second["regulation_count"])
         self.assertEqual(first["regulation_version_count"], second["regulation_version_count"])
         self.assertEqual(first["toc_node_count"], second["toc_node_count"])
+
+    def test_logical_corpus_fingerprint_orders_same_title_siblings_by_canonical_number(self) -> None:
+        def sibling(document_id: str, chunk_id: str, number: str) -> dict:
+            return _record(
+                document_id,
+                chunk_id,
+                regulation_no=number,
+                regulation_title="공통규정",
+                article_no="제1조",
+                article_title="목적",
+                text="제1조(목적) 동일한 본문을 둔다.",
+                revision_date="2026-07-01",
+                metadata_updates={
+                    "canonical_regulation_title": "공통규정",
+                    "canonical_regulation_no": number,
+                    "canonical_hierarchy_path": "공통규정 > 제1조 목적",
+                },
+            )
+
+        first_records = [
+            sibling("doc-a", "chunk-a", "4-1"),
+            sibling("doc-z", "chunk-z", "4-2"),
+        ]
+        second_records = [
+            sibling("doc-a", "chunk-reupload-a", "4-2"),
+            sibling("doc-z", "chunk-reupload-z", "4-1"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = build_hierarchical_runtime_index(
+                root / "first-siblings.sqlite3",
+                first_records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            second = build_hierarchical_runtime_index(
+                root / "second-siblings.sqlite3",
+                second_records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(2, first["regulation_count"])
+        self.assertEqual(
+            first["logical_corpus_sha256"],
+            second["logical_corpus_sha256"],
+        )
 
     def test_institution_catalog_links_internal_regulation_revisions(self) -> None:
         records = [

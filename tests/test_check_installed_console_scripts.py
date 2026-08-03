@@ -11,13 +11,53 @@ import tomllib
 import unittest
 from pathlib import Path
 
-from scripts.check_installed_console_scripts import DEFAULT_COMMANDS, check_installed_console_scripts, run
+from scripts.check_installed_console_scripts import (
+    APP_VERSION,
+    DEFAULT_COMMANDS,
+    _select_wheel,
+    check_installed_console_scripts,
+    run,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class CheckInstalledConsoleScriptsTests(unittest.TestCase):
+    def test_script_prefers_repository_version_over_external_pythonpath(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_site = root / "fake-site"
+            fake_app = fake_site / "app"
+            fake_app.mkdir(parents=True)
+            (fake_app / "__init__.py").write_text(
+                '__version__ = "0.0.0-external"\n',
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(fake_site)
+            script = ROOT / "scripts" / "check_installed_console_scripts.py"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import runpy; "
+                        f"namespace = runpy.run_path({str(script)!r}); "
+                        "print(namespace['APP_VERSION'])"
+                    ),
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(APP_VERSION, completed.stdout.strip())
+
     def test_reports_missing_console_script(self) -> None:
         report = check_installed_console_scripts(
             commands=["definitely-not-installed-reg-rag-command"],
@@ -51,6 +91,39 @@ class CheckInstalledConsoleScriptsTests(unittest.TestCase):
 
         self.assertEqual(1, exit_code)
         self.assertIn('"console-script-missing"', stdout.getvalue())
+
+    def test_wheel_mode_fails_closed_when_artifact_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            exit_code = run(
+                [
+                    "--wheel-dist-dir",
+                    tmp,
+                    "--skip-help",
+                    "--fail-on-issue",
+                    "--json",
+                ],
+                stdout=stdout,
+            )
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(1, exit_code)
+        self.assertEqual("built-wheel", report["check_scope"])
+        self.assertEqual("console-script-wheel-missing", report["issues"][0]["code"])
+
+    def test_wheel_selection_requires_the_exact_requested_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wheelhouse = Path(tmp)
+            old_wheel = wheelhouse / "reg_rag_preprocessor-1.2.15-py3-none-any.whl"
+            expected_wheel = wheelhouse / "reg_rag_preprocessor-1.2.16-py3-none-any.whl"
+            old_wheel.touch()
+            expected_wheel.touch()
+
+            selected = _select_wheel(wheelhouse, expected_version="1.2.16")
+
+            self.assertEqual(expected_wheel, selected)
+            with self.assertRaises(FileNotFoundError):
+                _select_wheel(wheelhouse, expected_version="9.9.9")
 
     def test_default_commands_cover_declared_console_scripts(self) -> None:
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))

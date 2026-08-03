@@ -8,6 +8,7 @@ import ctypes
 from datetime import date, datetime, timezone
 import errno
 import hashlib
+import hmac
 import importlib.util
 import inspect
 import json
@@ -29,27 +30,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.mcp_bundle_contract import (
+from scripts.mcp_bundle_contract import (  # noqa: E402
     ALL_SETUP_BUNDLE_FILES,
     LEGACY_CONNECTION_ARTIFACT_FILENAMES,
     SETUP_BUNDLE_FILES,
 )
-from scripts.mcp_client_status import (
+from scripts.mcp_client_status import (  # noqa: E402
     create_bundle_status as create_client_connection_status,
     invalidate_runtime as invalidate_client_connection_runtime,
 )
-from app.api import routes_rag
-from app.core.tenant_access import tenant_storage_key
-from app.ingestion.vector_adapter import stable_content_hash
-from app.mcp_server.regulation_tools import mcp_auth_context, settings_for_mcp_project
-from app.retrieval.bm25_index import (
+from app.api import routes_rag  # noqa: E402
+from app.core.tenant_access import resource_visible_to_tenant, tenant_storage_key  # noqa: E402
+from app.ingestion.vector_adapter import stable_content_hash  # noqa: E402
+from app.mcp_server.regulation_tools import mcp_auth_context, settings_for_mcp_project  # noqa: E402
+from app.retrieval.bm25_index import (  # noqa: E402
     BM25_INDEX_VERSION,
     BM25_STRUCTURED_METADATA_VERSION,
     load_bm25_index,
     source_content_hashes,
     write_bm25_index,
 )
-from app.retrieval.hierarchical_index import (
+from app.retrieval.hierarchical_index import (  # noqa: E402
     HIERARCHICAL_INDEX_SCHEMA_VERSION,
     REBUILD_FINGERPRINT_SCHEMA_VERSION,
     build_hierarchical_runtime_index,
@@ -59,9 +60,10 @@ from app.retrieval.hierarchical_index import (
     logical_corpus_sha256_for_records,
     write_vector_records_with_offsets,
 )
-from app.retrieval.tokenizer import tokenizer_name
-from app.services.regulation_catalog_service import filter_to_latest_active_versions
-from app.storage.repository import JsonRepository
+from app.retrieval.tokenizer import tokenizer_name  # noqa: E402
+from app.services.review_decision_service import approved_content_hash  # noqa: E402
+from app.services.regulation_catalog_service import filter_to_latest_active_versions  # noqa: E402
+from app.storage.repository import JsonRepository  # noqa: E402
 
 
 KORDOC_TABLE_REQUIRED_FILE_TYPES = {"hwp", "hwpx", "pdf", "docx"}
@@ -79,6 +81,7 @@ BUNDLE_DATA_DIR_ARG = "$BundleDataDir"
 RUNTIME_REPOSITORY_RESULT_SUFFIXES = ("_chunks.json", "_nodes.json", "_issues.json", "_quality.json")
 RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES = {
     ".api_audit.lock",
+    ".regulation_hierarchy.sqlite3.reg-rag.lock",
     ".write.lock",
     "api_audit.jsonl",
     "rag_traces.jsonl",
@@ -132,9 +135,51 @@ CHATGPT_DATA_TOOL_NAMES = (
     "search",
     "fetch",
 )
+CHATGPT_MCP_HELP_URL = (
+    "https://help.openai.com/en/articles/"
+    "12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta"
+)
+CHATGPT_SECURE_MCP_TUNNEL_URL = (
+    "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels"
+)
+CHATGPT_LOCAL_MCP_UNSUPPORTED_REASON = (
+    "ChatGPT does not directly connect to a local MCP server. Use a reachable "
+    "remote HTTPS MCP app in ChatGPT web, or use OpenAI Secure MCP Tunnel for "
+    "a private, on-premises, or developer-machine server."
+)
+PORTABLE_HANDOFF_MINIMUM_PYTHON_VERSION = "3.11"
 RUNTIME_PYTHON_MARKER_SCHEMA_VERSION = 2
 RUNTIME_IDENTITY_SCOPE = "mcp-command-modules-v1"
 RUNTIME_DATA_REUSE_SCHEMA_VERSION = "mcp-runtime-data-reuse-v1"
+OMISSION_DISPOSITION_SNAPSHOT_FILENAME = "omission_disposition_snapshot.json"
+OMISSION_DISPOSITION_SNAPSHOT_SCHEMA_VERSION = (
+    "mcp-runtime-omission-disposition-snapshot-v1"
+)
+OMISSION_DISPOSITION_ENTRY_FIELDS = frozenset(
+    {
+        "tenant_id",
+        "document_id",
+        "chunk_id",
+        "content_hash",
+        "latest_decision_id",
+        "latest_decision_status",
+        "latest_decision_at",
+        "disposition",
+        "exported",
+        "requested",
+    }
+)
+RUNTIME_APPROVAL_DECISION_FIELDS = frozenset(
+    {
+        "approval_id",
+        "tenant_id",
+        "document_id",
+        "approved_at",
+        "chunk_ids",
+        "approved_content_hashes",
+    }
+)
+RUNTIME_APPROVAL_DECISION_REQUIRED_FIELDS = RUNTIME_APPROVAL_DECISION_FIELDS
 RUNTIME_DATA_SWAP_SCHEMA_VERSION = "mcp-runtime-data-swap-v1"
 RUNTIME_DATA_SWAP_MARKER_FILENAME = ".data-swap-transaction.json"
 RUNTIME_DATA_STAGE_NAME = re.compile(r"\.data-stage-[a-f0-9]{32}")
@@ -773,22 +818,9 @@ def build_mcp_client_config(
         )
         claude_desktop = _with_bundle_stdio_fast_start(claude_desktop)
         claude_code = _with_bundle_stdio_fast_start(claude_code)
-        chatgpt_desktop_local = build_mcp_client_config(
-            server_name=server_name,
-            data_dir=data_dir,
-            tenant_id=tenant_id,
-            profile_id=profile_id,
-            tenant_storage_isolation=tenant_storage_isolation,
-            transport="stdio",
-            host=host,
-            port=port,
-            actor=actor,
-            role=role,
-            department_ids=department_ids,
-            client_profile="chatgpt-desktop-local",
-            remote_auth_token_env=remote_auth_token_env,
+        chatgpt_desktop_local = _unsupported_chatgpt_desktop_local_payload(
+            server_name=server_name
         )
-        chatgpt_desktop_local = _with_bundle_stdio_fast_start(chatgpt_desktop_local)
         chatgpt_remote = build_mcp_client_config(
             server_name=server_name,
             data_dir=data_dir,
@@ -884,6 +916,8 @@ def build_mcp_client_config(
             public_url=public_url,
             remote_auth_token_env=remote_auth_token_env,
         )
+    if normalized_profile == "chatgpt-desktop-local":
+        return _unsupported_chatgpt_desktop_local_payload(server_name=server_name)
     if normalized_profile == "claude-code":
         if normalized_transport == "stdio":
             return _stdio_server_config(
@@ -992,6 +1026,16 @@ def _write_mcp_setup_bundle_untransactional(
         bundle_data_dir=output_dir / "data",
     )
     json_config = _with_bundle_stdio_launcher(json_config, launcher_path=stdio_launcher_path, server_name=server_name)
+    # Preserve the supported Codex launcher form before the optional Claude
+    # Desktop source-runtime rewrite below.  Claude may deliberately use a
+    # direct Python module entry, while Codex must keep the portable bundle
+    # launcher contract.
+    codex_stdio_source_config: dict[str, Any] = {}
+    if isinstance(json_config.get("claude_desktop"), dict):
+        codex_stdio_source_config = _local_stdio_config_for_server(
+            json_config["claude_desktop"],
+            server_name=server_name,
+        )
     if claude_source_runtime is not None and isinstance(json_config.get("claude_desktop"), dict):
         direct_python, direct_project_root = claude_source_runtime
         json_config["claude_desktop"] = _with_direct_claude_source_runtime(
@@ -1045,7 +1089,7 @@ def _write_mcp_setup_bundle_untransactional(
 
     write_json("full_config", json_config)
     claude_desktop_stdio_config: dict[str, Any] = {}
-    chatgpt_codex_stdio_config: dict[str, Any] = {}
+    codex_stdio_config: dict[str, Any] = {}
     chatgpt_desktop_local_payload: dict[str, Any] = {}
     if "claude_desktop" in json_config:
         claude_desktop_stdio_config = _local_stdio_config_for_server(
@@ -1053,15 +1097,15 @@ def _write_mcp_setup_bundle_untransactional(
             server_name=server_name,
         )
         write_json("claude_desktop", claude_desktop_stdio_config)
-        chatgpt_codex_stdio_config = _local_stdio_config_for_server(
-            json_config.get("chatgpt_desktop_local") or json_config["claude_desktop"],
-            server_name=server_name,
-        )
-        codex_snippet = _codex_config_snippet(chatgpt_codex_stdio_config, server_name=server_name)
+        # Codex has its own supported local stdio path.  Do not source it from
+        # the retained ChatGPT-local compatibility artifact, which is
+        # deliberately warning-only and non-runnable.
+        codex_stdio_config = codex_stdio_source_config
+        codex_snippet = _codex_config_snippet(codex_stdio_config, server_name=server_name)
         if codex_snippet:
             write_text("codex_config", codex_snippet)
         chatgpt_desktop_local_payload = _chatgpt_desktop_local_config(
-            chatgpt_codex_stdio_config,
+            codex_stdio_config,
             server_name=server_name,
             bundle_dir=output_dir,
         )
@@ -1108,7 +1152,7 @@ def _write_mcp_setup_bundle_untransactional(
         connect_wizard = _with_product_embedded_mcp_configs(
             copy_paste["connect_wizard_ps"],
             claude_desktop_config=claude_desktop_stdio_config,
-            chatgpt_desktop_config=chatgpt_codex_stdio_config,
+            codex_config=codex_stdio_config,
         )
         write_text(
             "connect",
@@ -1145,6 +1189,9 @@ def _write_mcp_setup_bundle_untransactional(
             ),
             "claude_remote": bool((json_config.get("claude_remote") or {}).get("ready")),
         },
+        "portable_handoff_runtime": _portable_handoff_runtime_requirements(
+            wheel_included=None
+        ),
         "connections": _setup_bundle_connections(json_config),
     }
     write_json("manifest", manifest)
@@ -1366,6 +1413,13 @@ def _bundle_status_payload(
         "runtime_data_ready": runtime_ready,
         "runtime_fingerprint": runtime_fingerprint,
         "launcher_ready": (output_dir / SETUP_BUNDLE_FILES["stdio_launcher"]).is_file(),
+        "launcher_ready_note": (
+            "launcher_ready only confirms that the PowerShell file exists; it does not prove that a fresh "
+            "handoff target has a compatible packaged executable or Python 3.11+."
+        ),
+        "portable_handoff_runtime": _portable_handoff_runtime_requirements(
+            wheel_included=None
+        ),
         "process_started": False,
         "mcp_initialized": False,
         "tools_discovered": False,
@@ -1431,7 +1485,7 @@ def _bundle_status_payload(
         "tool_scan_unverified": True,
         "connection_state_notes": {
             "direct_config_registered": (
-                "The direct MCP entry was written to the local MCP configuration used by ChatGPT Desktop."
+                "The direct MCP entry was written to the local Codex configuration."
             ),
             "direct_config_loader_verified": (
                 "codex mcp get resolved the direct entry with this bundle's exact launcher and data paths."
@@ -1467,8 +1521,8 @@ def _bundle_status_payload(
                 "A Claude Desktop conversation successfully invoked a tool from this MCP server."
             ),
             "desktop_restart_required": (
-                "True when a running ChatGPT Desktop process predates the latest MCP registration; false means "
-                "not running or already current; null means not checked or unknown."
+                "Legacy compatibility field only. ChatGPT local MCP is unsupported and this value must not be "
+                "used as connection evidence."
             ),
             "desktop_restart_status": (
                 "One of not_checked, required, not_running, up_to_date, or unknown."
@@ -1486,16 +1540,16 @@ def _bundle_status_payload(
                 "The generated launcher passed initialize, tools/list, search, and fetch directly over stdio."
             ),
             "desktop_tool_scan_verified": (
-                "A ChatGPT Desktop tool scan exposed the expected MCP tools; direct stdio smoke does not set this."
+                "Legacy compatibility field only; ChatGPT local MCP is unsupported."
             ),
             "conversation_attachment_verified": (
                 "The registered MCP tools were observed in the current conversation."
             ),
             "conversation_attachment_unverified": (
-                "Restart Desktop and verify the direct server with /mcp in a new conversation."
+                "Legacy compatibility field only; use ChatGPT web with a remote HTTPS MCP app instead."
             ),
             "end_to_end_verified": (
-                "ChatGPT Desktop exposed the tools and the current conversation successfully invoked them."
+                "Legacy compatibility field only; it cannot establish unsupported ChatGPT local MCP support."
             ),
             "transport_end_to_end_verified": (
                 "The generated launcher passed the direct MCP protocol chain; this does not prove Desktop exposure."
@@ -1503,11 +1557,18 @@ def _bundle_status_payload(
         },
         "profiles": {
             "chatgpt-desktop-local": {
-                "transport": "stdio",
-                "surface": "chatgpt_desktop_mcp_settings",
-                "tool_profile": "chatgpt-data",
+                "support_status": "unsupported",
+                "direct_local_supported": False,
+                "transport": "unsupported",
+                "surface": "legacy_compatibility_artifact",
+                "official_help_url": CHATGPT_MCP_HELP_URL,
+                "secure_mcp_tunnel_url": CHATGPT_SECURE_MCP_TUNNEL_URL,
             },
-            "chatgpt-remote": {"transport": "streamable-http", "surface": "remote_mcp_app"},
+            "chatgpt-remote": {
+                "transport": "streamable-http",
+                "surface": "chatgpt_web_app",
+                "official_help_url": CHATGPT_MCP_HELP_URL,
+            },
             "claude-desktop": {"transport": "stdio"},
             "claude-code": {"transport": "stdio"},
         },
@@ -1638,6 +1699,10 @@ def _write_bundle_status(
             "runtime_data_ready",
             "runtime_fingerprint",
             "launcher_ready",
+            "launcher_ready_note",
+            "portable_handoff_runtime",
+            "profiles",
+            "connection_state_notes",
             "ui_fields",
             "tenant_id",
             "tenant_storage_isolation",
@@ -1983,106 +2048,64 @@ def _portable_bundle_doc_command(command: object) -> str:
     )
 
 
+def _unsupported_chatgpt_desktop_local_payload(
+    *,
+    server_name: str,
+    bundle_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return a compatibility artifact that cannot be mistaken for a runnable config."""
+
+    payload: dict[str, Any] = {
+        "profile": "chatgpt-desktop-local",
+        "client": "ChatGPT",
+        "surface": "legacy_compatibility_artifact",
+        "support_status": "unsupported",
+        "direct_local_supported": False,
+        # Retain the old field name for readers that consumed earlier bundles,
+        # but fail closed instead of advertising a runnable local contract.
+        "chatgpt_direct_local_mcp_supported": False,
+        "server_name": server_name,
+        "warning": CHATGPT_LOCAL_MCP_UNSUPPORTED_REASON,
+        "official_help_url": CHATGPT_MCP_HELP_URL,
+        "secure_mcp_tunnel_url": CHATGPT_SECURE_MCP_TUNNEL_URL,
+        "replacement_paths": {
+            "remote_https": {
+                "surface": "chatgpt_web",
+                "transport": "streamable-http",
+                "requires_reachable_https": True,
+                "official_help_url": CHATGPT_MCP_HELP_URL,
+            },
+            "private_network_or_developer_machine": {
+                "transport": "secure_mcp_tunnel",
+                "official_guide_url": CHATGPT_SECURE_MCP_TUNNEL_URL,
+            },
+        },
+        "operator_steps": [
+            "Do not enter a local command, arguments, working directory, or environment in ChatGPT.",
+            "For a reachable remote server, use ChatGPT web Developer mode and create an app with the final HTTPS /mcp endpoint.",
+            "For a private, on-premises, or developer-machine server, follow the OpenAI Secure MCP Tunnel guide.",
+        ],
+    }
+    if bundle_dir is not None:
+        payload["compatibility_artifact_path"] = str(
+            Path(bundle_dir).resolve() / SETUP_BUNDLE_FILES["chatgpt_desktop_local"]
+        )
+    return payload
+
+
 def _chatgpt_desktop_local_config(
     claude_desktop_config: dict[str, Any],
     *,
     server_name: str,
     bundle_dir: str | Path,
 ) -> dict[str, Any]:
-    mcp_servers = claude_desktop_config.get("mcpServers")
-    server = mcp_servers.get(server_name) if isinstance(mcp_servers, dict) else None
-    if not isinstance(server, dict):
-        server = {}
-    args = server.get("args")
-    if not isinstance(args, list):
-        args = []
-    return {
-        "profile": "chatgpt-desktop-local",
-        "client": "ChatGPT Desktop / Codex CLI / Codex IDE",
-        "surface": "chatgpt_desktop_mcp_settings",
-        "mode": "local_stdio",
-        "tool_profile": "chatgpt-data",
-        "verification_tools": list(CHATGPT_DATA_TOOL_NAMES),
-        "connection_configuration_method": "direct_config",
-        "secret_input_policy": "environment_or_oauth_only",
-        "chatgpt_direct_local_mcp_supported": True,
-        "primary_registration": "shared_codex_config",
-        "supported_runtime_note": (
-            "ChatGPT Desktop, Codex CLI, and the Codex IDE extension share ~/.codex/config.toml. "
-            "Register the local STDIO server once, restart the active surface, and verify it with /mcp."
-        ),
-        "server_name": server_name,
-        "direct_config_registered": False,
-        "direct_config_loader_verified": False,
-        "loader_verification_state": "not_checked",
-        "loader_verification_reason": "not_checked",
-        "direct_config_rollback_performed": False,
-        "direct_config_path": None,
-        "installed_config_fingerprint": None,
-        "installed_config_transport_verified": False,
-        "installed_config_transport_runtime_fingerprint": None,
-        "generated_client_configs_transport_verified": False,
-        "desktop_process_detected": False,
-        "desktop_process_started_at": None,
-        "desktop_mcp_registration_updated_at": None,
-        "desktop_restart_checked_at": None,
-        "desktop_restart_required": None,
-        "desktop_restart_status": "not_checked",
-        "desktop_restart_reason_code": "not_checked",
-        "desktop_app_server_loader_verified": False,
-        "fresh_codex_app_server_inventory_verified": False,
-        "fresh_codex_app_server_runtime_fingerprint": None,
-        "desktop_app_server_tool_count": 0,
-        "desktop_app_server_tool_names": [],
-        "desktop_app_server_server_info": None,
-        "desktop_app_server_error": None,
-        "desktop_recognition_observation_status": "not_checked",
-        "desktop_restarted_after_registration": False,
-        "desktop_post_registration_log_session_observed": False,
-        "desktop_status_scan_request_observed": False,
-        "direct_stdio_verified": False,
-        "desktop_tool_scan_verified": False,
-        "conversation_attachment_verified": False,
-        "conversation_attachment_unverified": True,
-        "transport_end_to_end_verified": False,
-        "end_to_end_verified": False,
-        "ui_fields": {
-            "name": server_name,
-            "transport": "stdio",
-            "command": str(server.get("command") or "powershell.exe"),
-            "args": [str(arg) for arg in args],
-            "cwd": str(Path(bundle_dir).resolve()),
-            "env": dict(server.get("env") or {}) if isinstance(server.get("env"), dict) else {},
-            "env_passthrough": [],
-        },
-        "operator_steps": [
-            "Apply codex_config_snippet.toml to the shared ~/.codex/config.toml, or use connect_mcp_client.ps1.",
-            "For manual Desktop entry, use only the name, command, working directory, arguments, and environment shown in ui_fields.",
-            "Keep local paths, tokens, and API keys only in the local configuration or environment.",
-            "Restart ChatGPT Desktop, Codex CLI, or the IDE extension after saving.",
-            f"Run /mcp first and verify that {server_name} is connected.",
-            "Invoke search and fetch to verify an actual MCP round trip.",
-        ],
-        "status_semantics": {
-            "desktop_restart_required": "True when a running ChatGPT Desktop process predates the latest MCP registration; false means not running or already current; null means not checked or unknown.",
-            "desktop_restart_status": "One of not_checked, required, not_running, up_to_date, or unknown.",
-            "desktop_app_server_loader_verified": "Compatibility alias for a fresh Codex app-server process inventory; it is not the running Desktop scan.",
-            "fresh_codex_app_server_inventory_verified": "A separate Codex app-server process returned the required tools with recorded provenance.",
-            "installed_config_transport_verified": "The exact installed config entry passed the direct MCP protocol contract.",
-            "desktop_status_scan_request_observed": "A restarted Desktop routed mcpServerStatus/list without error; this does not prove tool exposure.",
-            "direct_stdio_verified": "Direct initialize, tools/list, search, and fetch succeeded over stdio.",
-            "desktop_tool_scan_verified": "ChatGPT Desktop exposed the expected tools after its own tool scan.",
-            "conversation_attachment_verified": "The registered MCP tools were observed in the current conversation.",
-            "conversation_attachment_unverified": "A restarted Desktop and new conversation must still confirm the registered MCP with /mcp and an actual tool call.",
-            "transport_end_to_end_verified": "The generated launcher passed the direct MCP protocol chain; this does not prove Desktop exposure.",
-            "end_to_end_verified": "ChatGPT Desktop exposed the tools and the current conversation successfully invoked them.",
-        },
-        "troubleshooting": [
-            "입력창의 + 버튼 선택",
-            "더 보기 선택",
-            f"{server_name} 선택",
-        ],
-    }
+    """Write the legacy filename as a warning-only, non-runnable artifact."""
+
+    del claude_desktop_config
+    return _unsupported_chatgpt_desktop_local_payload(
+        server_name=server_name,
+        bundle_dir=bundle_dir,
+    )
 
 
 def _local_stdio_config_for_server(
@@ -2270,6 +2293,14 @@ def _prepare_mcp_runtime_data_bundle_inputs(
         profile_id=profile_id,
         document_id=document_id,
     )
+    source_repository = JsonRepository(source_settings)
+    expected_document_ids: set[str] | None = None
+    if resolved_scope in {"selected_institution", "institution_profile"}:
+        expected_document_ids = _institution_runtime_export_document_ids(
+            repository=source_repository,
+            tenant_id=tenant_id,
+            profile_id=str(profile_id or ""),
+        )
     if requested_document_ids:
         requested_document_id_set = set(requested_document_ids)
         records = [
@@ -2282,11 +2313,32 @@ def _prepare_mcp_runtime_data_bundle_inputs(
             str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "")
             for record in records
         }
-        missing_document_ids = sorted(requested_document_id_set - visible_document_ids)
+        missing_document_id_set = requested_document_id_set - visible_document_ids
+        explicitly_rejected_document_ids = _runtime_export_fully_rejected_document_ids(
+            repository=source_repository,
+            document_ids=missing_document_id_set,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+        )
+        missing_document_ids = sorted(
+            missing_document_id_set - explicitly_rejected_document_ids
+        )
         if missing_document_ids:
             raise ValueError(
                 "Selected regulations are not all MCP-visible. Approve and index these document IDs first: "
                 + ", ".join(missing_document_ids)
+            )
+    if resolved_scope in {"selected_institution", "institution_profile"}:
+        visible_document_ids = {
+            str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "")
+            for record in records
+        }
+        omitted_document_ids = sorted((expected_document_ids or set()) - visible_document_ids)
+        if omitted_document_ids:
+            raise ValueError(
+                "Institution-scoped MCP runtime export would omit approved or superseded source documents. "
+                "Ensure every current approved chunk is approval-journal-valid and indexed for these document IDs: "
+                + ", ".join(omitted_document_ids)
             )
     if not records:
         target = (
@@ -2307,7 +2359,13 @@ def _prepare_mcp_runtime_data_bundle_inputs(
             if str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "")
         }
     )
-    source_repository = JsonRepository(source_settings)
+    selected_source_document_ids = sorted(
+        set(requested_document_ids)
+        if requested_document_ids
+        else {str(document_id).strip()}
+        if str(document_id or "").strip()
+        else set(expected_document_ids or exported_document_ids)
+    )
     source_metadata_summary = _runtime_source_metadata_summary(
         records,
         source_repository,
@@ -2343,11 +2401,17 @@ def _prepare_mcp_runtime_data_bundle_inputs(
         records_by_document.setdefault(current_document_id, {})[current_chunk_id] = record
 
     selected_document_id_set = set(exported_document_ids)
+    audit_document_id_set = set(selected_source_document_ids)
     approval_records_by_document: dict[str, list[dict[str, Any]]] = {}
     for record in source_repository.list_approval_journal_records():
         current_document_id = record.get("document_id")
-        if isinstance(current_document_id, str) and current_document_id in selected_document_id_set:
+        if isinstance(current_document_id, str) and current_document_id in audit_document_id_set:
             approval_records_by_document.setdefault(current_document_id, []).append(record)
+    review_records_by_document: dict[str, list[dict[str, Any]]] = {}
+    for record in source_repository.list_review_journal_records():
+        current_document_id = record.get("document_id")
+        if isinstance(current_document_id, str) and current_document_id in audit_document_id_set:
+            review_records_by_document.setdefault(current_document_id, []).append(record)
     indexing_jobs_by_document: dict[str, list[dict[str, Any]]] = {}
     for record in source_repository.list_indexing_jobs():
         current_document_id = record.get("document_id")
@@ -2367,7 +2431,61 @@ def _prepare_mcp_runtime_data_bundle_inputs(
             document_id=current_document_id,
             visible_chunk_ids=set(records_by_chunk_id),
             records_by_chunk_id=records_by_chunk_id,
+            tenant_id=tenant_id,
+            approval_records=approval_records_by_document.get(current_document_id, []),
+            review_records=review_records_by_document.get(current_document_id, []),
         )
+        completeness_issue = _runtime_export_document_completeness_issue(
+            repository=source_repository,
+            document_id=current_document_id,
+            visible_chunk_ids=set(records_by_chunk_id),
+            tenant_id=tenant_id,
+            approval_records=approval_records_by_document.get(current_document_id, []),
+            review_records=review_records_by_document.get(current_document_id, []),
+        )
+        if completeness_issue is not None:
+            missing_chunk_ids = completeness_issue["missing_approved_chunk_ids"]
+            unresolved_chunks = completeness_issue["unresolved_chunks"]
+            missing_text = (
+                " Missing approved-but-unindexed chunks: "
+                + ", ".join(missing_chunk_ids[:5])
+                + "."
+                if missing_chunk_ids
+                else ""
+            )
+            unresolved_text = (
+                " Resolve remaining chunk reviews: "
+                + ", ".join(
+                    f"{item['chunk_id']}:{item['approval_status']}"
+                    for item in unresolved_chunks[:5]
+                )
+                + "."
+                if unresolved_chunks
+                else ""
+            )
+            unaudited_rejection_ids = completeness_issue["unaudited_rejection_chunk_ids"]
+            unaudited_rejection_text = (
+                " Record explicit rejection decisions for these chunks: "
+                + ", ".join(unaudited_rejection_ids[:5])
+                + "."
+                if unaudited_rejection_ids
+                else ""
+            )
+            unaudited_superseded_ids = completeness_issue["unaudited_superseded_chunk_ids"]
+            unaudited_superseded_text = (
+                " Record split/merge decisions for these superseded chunks: "
+                + ", ".join(unaudited_superseded_ids[:5])
+                + "."
+                if unaudited_superseded_ids
+                else ""
+            )
+            raise ValueError(
+                "MCP runtime export would be incomplete for document "
+                f"{current_document_id}. Approve or explicitly reject every current chunk, "
+                "then reindex before creating a handoff bundle."
+                f"{missing_text}{unresolved_text}{unaudited_rejection_text}"
+                f"{unaudited_superseded_text}"
+            )
         chunks_by_document[current_document_id] = [
             chunk.model_dump(mode="json")
             for chunk in chunks
@@ -2375,11 +2493,26 @@ def _prepare_mcp_runtime_data_bundle_inputs(
         approval_records.extend(approval_records_by_document.get(current_document_id, ()))
         indexing_jobs.extend(indexing_jobs_by_document.get(current_document_id, ()))
 
+    omission_disposition_projection = _runtime_omission_disposition_projection(
+        repository=source_repository,
+        tenant_id=tenant_id,
+        requested_document_ids=selected_source_document_ids,
+        exported_records=records,
+        approval_records_by_document=approval_records_by_document,
+        review_records_by_document=review_records_by_document,
+    )
+
     # Approval and indexing history is authoritative in append-only journals.
     # Keep the manifest keys for JsonRepository schema compatibility without
     # duplicating large journal payloads into repository/manifest.json.
     repository_manifest["approvals"] = {}
     repository_manifest["indexing_jobs"] = {}
+
+    # The source approval journal is an operator audit artifact and can contain
+    # reviewer identities, notes, local paths, review evidence, and event
+    # payloads.  The portable runtime needs only a deterministic decision
+    # ledger for latest-decision ordering and approval/content binding.
+    approval_records = _runtime_approval_decision_projection(approval_records)
 
     effective_department_ids = sorted(
         {
@@ -2425,12 +2558,14 @@ def _prepare_mcp_runtime_data_bundle_inputs(
         "chunks_by_document": chunks_by_document,
         "approval_records": approval_records,
         "indexing_jobs": indexing_jobs,
+        "omission_disposition_projection": omission_disposition_projection,
         "recommended_smoke_query": recommended_smoke_query,
         "source_metadata_summary": source_metadata_summary,
         "kordoc_table_parser_summary": kordoc_table_parser_summary,
     }
     return {
         "requested_document_ids": requested_document_ids,
+        "selected_source_document_ids": selected_source_document_ids,
         "resolved_scope": resolved_scope,
         "source_settings": source_settings,
         "auth": auth,
@@ -2440,6 +2575,7 @@ def _prepare_mcp_runtime_data_bundle_inputs(
         "chunks_by_document": chunks_by_document,
         "approval_records": approval_records,
         "indexing_jobs": indexing_jobs,
+        "omission_disposition_projection": omission_disposition_projection,
         "total_chunks": sum(len(chunks) for chunks in chunks_by_document.values()),
         "recommended_smoke_query": recommended_smoke_query,
         "source_metadata_summary": source_metadata_summary,
@@ -2607,6 +2743,10 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         records=records,
         auth=auth,
     )
+    omission_disposition_snapshot_path = _write_runtime_omission_disposition_sidecar(
+        runtime_repository_dir=runtime_repository_dir,
+        projection=prepared["omission_disposition_projection"],
+    )
     _report_runtime_progress(progress_callback, 97, "런타임 manifest 생성", len(records), len(records))
 
     runtime_manifest = {
@@ -2664,6 +2804,7 @@ def _write_mcp_runtime_data_bundle_uncommitted(
             "repository_manifest": str(manifest_path),
             "approval_journal": str(runtime_repository_dir / "journals" / "approvals.jsonl"),
             "approval_snapshot": str(approval_snapshot_path),
+            "omission_disposition_snapshot": str(omission_disposition_snapshot_path),
             "result_files": exported_result_files,
         },
     }
@@ -2725,6 +2866,75 @@ def _runtime_manifest_content_sha256(manifest: dict[str, Any]) -> str:
     if isinstance(reuse, dict):
         reuse.pop("manifest_sha256", None)
     return _canonical_content_sha256(payload)
+
+
+def validate_mcp_runtime_data_bundle_integrity(
+    runtime_data_dir: Path,
+    *,
+    expected_logical_corpus_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate an already-generated runtime bundle against its sealed manifest.
+
+    This check intentionally does not need access to the source repository.  It is
+    used by operator-facing readiness checks after generation, where a missing or
+    modified approval journal, snapshot, vector, or index must fail closed.
+    """
+
+    runtime_data_dir = Path(runtime_data_dir)
+    if runtime_data_dir.is_symlink() or not runtime_data_dir.is_dir():
+        raise ValueError("MCP runtime data directory is missing or is a symbolic link.")
+    manifest_path = runtime_data_dir / "mcp_runtime_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("MCP runtime manifest is missing or is a symbolic link.")
+    manifest = _load_strict_utf8_json_for_bundle(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ValueError("MCP runtime manifest must contain a JSON object.")
+    if manifest.get("report_type") != "mcp_runtime_data_bundle":
+        raise ValueError("MCP runtime manifest has the wrong report_type.")
+    if manifest.get("synthetic_runtime") is not False:
+        raise ValueError("Synthetic runtime data cannot satisfy an approved MCP bundle.")
+    if manifest.get("provenance") != "approved_runtime_bundle_export":
+        raise ValueError("MCP runtime data has invalid provenance.")
+    if int(manifest.get("record_count") or 0) <= 0:
+        raise ValueError("MCP runtime data does not contain approved vector records.")
+    document_ids = manifest.get("document_ids")
+    if not isinstance(document_ids, list) or not all(
+        str(document_id or "").strip() for document_id in document_ids
+    ):
+        raise ValueError("MCP runtime manifest does not identify its source documents.")
+
+    expected_corpus_hash = str(expected_logical_corpus_sha256 or "").strip().lower()
+    actual_corpus_hash = str(manifest.get("logical_corpus_sha256") or "").strip().lower()
+    if expected_corpus_hash and actual_corpus_hash != expected_corpus_hash:
+        raise ValueError("MCP runtime logical corpus fingerprint is stale.")
+
+    reuse = manifest.get("runtime_data_reuse")
+    if not isinstance(reuse, dict) or reuse.get("schema_version") != RUNTIME_DATA_REUSE_SCHEMA_VERSION:
+        raise ValueError("MCP runtime reuse metadata is missing or invalid.")
+    expected_manifest_sha256 = str(reuse.get("manifest_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_manifest_sha256):
+        raise ValueError("MCP runtime manifest fingerprint is missing or invalid.")
+    if _runtime_manifest_content_sha256(manifest) != expected_manifest_sha256:
+        raise ValueError("MCP runtime manifest content does not match its fingerprint.")
+
+    expected_file_sha256 = reuse.get("file_sha256")
+    if not isinstance(expected_file_sha256, dict) or not expected_file_sha256:
+        raise ValueError("MCP runtime file fingerprints are missing.")
+    normalized_file_sha256 = {
+        str(relative_path): str(digest).strip().lower()
+        for relative_path, digest in expected_file_sha256.items()
+    }
+    if any(
+        not relative_path
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+        for relative_path, digest in normalized_file_sha256.items()
+    ):
+        raise ValueError("MCP runtime file fingerprints are invalid.")
+    if _runtime_data_file_sha256(runtime_data_dir) != normalized_file_sha256:
+        raise ValueError("MCP runtime data files do not match the sealed manifest.")
+    _validate_runtime_data_bundle_consistency(runtime_data_dir)
+
+    return manifest
 
 
 def _runtime_manifest_reuse_input_sha256(manifest: dict[str, Any]) -> str | None:
@@ -2911,6 +3121,21 @@ def _validate_reusable_runtime_data_bundle(
     }
     if approval_snapshot.get("file_signatures") != current_file_signatures:
         raise ValueError("Reusable approval snapshot source signatures are stale.")
+
+    omission_snapshot = _load_strict_utf8_json_for_bundle(
+        repository_dir / OMISSION_DISPOSITION_SNAPSHOT_FILENAME
+    )
+    if not isinstance(omission_snapshot, dict):
+        raise ValueError("Reusable omission disposition snapshot must contain a JSON object.")
+    expected_omission_projection = prepared["omission_disposition_projection"]
+    if any(
+        omission_snapshot.get(field) != expected
+        for field, expected in expected_omission_projection.items()
+    ):
+        raise ValueError("Reusable omission disposition snapshot is stale.")
+    if _runtime_export_audit_timestamp(omission_snapshot.get("generated_at")) is None:
+        raise ValueError("Reusable omission disposition snapshot generated_at is invalid.")
+    _validate_runtime_omission_disposition_snapshot(runtime_data_dir, manifest)
 
     bm25_index = load_bm25_index(vector_dir / "bm25_index.json")
     expected_source_content_hashes = source_content_hashes(prepared["records"])
@@ -3115,6 +3340,9 @@ def _validate_reusable_runtime_data_bundle(
             final_runtime_data_dir / "repository" / "journals" / "approvals.jsonl"
         ),
         "approval_snapshot": str(final_runtime_data_dir / "repository" / "approval_snapshot.json"),
+        "omission_disposition_snapshot": str(
+            final_runtime_data_dir / "repository" / OMISSION_DISPOSITION_SNAPSHOT_FILENAME
+        ),
         "result_files": expected_result_files,
         "runtime_manifest": str(final_runtime_data_dir / "mcp_runtime_manifest.json"),
     }
@@ -3810,6 +4038,119 @@ def _write_runtime_approval_snapshot_sidecar(
     return sidecar_path
 
 
+def _write_runtime_omission_disposition_sidecar(
+    *,
+    runtime_repository_dir: Path,
+    projection: dict[str, Any],
+) -> Path:
+    sidecar_path = runtime_repository_dir / OMISSION_DISPOSITION_SNAPSHOT_FILENAME
+    payload = copy.deepcopy(projection)
+    payload["generated_at"] = datetime.now(timezone.utc).isoformat()
+    sidecar_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return sidecar_path
+
+
+def _runtime_approval_decision_projection(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project source approvals to the sealed runtime's minimal decision ledger.
+
+    In particular, never copy human identities, free text, workstation paths,
+    worklist/review evidence, nested chunk snapshots, security scan details, or
+    review event history into a portable handoff.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for source in records:
+        if not isinstance(source, dict):
+            raise ValueError("Runtime approval decisions must originate from JSON objects.")
+        chunk_ids = sorted(_runtime_export_audit_record_chunk_ids(source))
+        approved_content_hashes = {
+            chunk_id: approved_hash
+            for chunk_id in chunk_ids
+            if (approved_hash := _runtime_export_approval_record_hash(source, chunk_id))
+        }
+        record = {
+            "approval_id": str(source.get("approval_id") or "").strip(),
+            "tenant_id": str(source.get("tenant_id") or "").strip(),
+            "document_id": str(source.get("document_id") or "").strip(),
+            "approved_at": str(source.get("approved_at") or "").strip(),
+            "chunk_ids": chunk_ids,
+            "approved_content_hashes": approved_content_hashes,
+        }
+        _validate_runtime_approval_decision(record)
+        projected.append(record)
+    return sorted(
+        projected,
+        key=lambda record: (
+            str(record["document_id"]),
+            str(record["approved_at"]),
+            str(record["approval_id"]),
+        ),
+    )
+
+
+def _validate_runtime_approval_decision(record: dict[str, Any]) -> None:
+    fields = set(record)
+    if (
+        not RUNTIME_APPROVAL_DECISION_REQUIRED_FIELDS.issubset(fields)
+        or not fields.issubset(RUNTIME_APPROVAL_DECISION_FIELDS)
+    ):
+        raise ValueError("Runtime approval decision contains missing or unapproved fields.")
+    if any(
+        not isinstance(record.get(field), str) or not str(record.get(field) or "").strip()
+        for field in ("approval_id", "tenant_id", "document_id", "approved_at")
+    ):
+        raise ValueError("Runtime approval decision identity or timestamp is missing.")
+    if _runtime_export_audit_timestamp(record.get("approved_at")) is None:
+        raise ValueError("Runtime approval decision approved_at is invalid.")
+    chunk_ids = record.get("chunk_ids")
+    approved_hashes = record.get("approved_content_hashes")
+    if (
+        not isinstance(chunk_ids, list)
+        or any(not isinstance(chunk_id, str) or not chunk_id for chunk_id in chunk_ids)
+        or chunk_ids != sorted(set(chunk_ids))
+        or not isinstance(approved_hashes, dict)
+        or any(
+            not isinstance(chunk_id, str)
+            or chunk_id not in chunk_ids
+            or not isinstance(value, str)
+            or not value.strip()
+            for chunk_id, value in approved_hashes.items()
+        )
+        or set(approved_hashes) != set(chunk_ids)
+    ):
+        raise ValueError("Runtime approval decision chunk/hash binding is invalid.")
+
+
+def _validate_runtime_approval_decision_journal(
+    runtime_data_dir: Path,
+    manifest: dict[str, Any],
+) -> None:
+    journal_path = runtime_data_dir / "repository" / "journals" / "approvals.jsonl"
+    if journal_path.is_symlink() or not journal_path.is_file():
+        raise ValueError("Runtime approval decision journal is missing or is a symbolic link.")
+    try:
+        records = list(_iter_strict_jsonl_for_runtime_reuse(journal_path))
+    except (OSError, ValueError) as exc:
+        raise ValueError("Runtime approval decision journal is invalid.") from exc
+    if manifest.get("approval_record_count") != len(records):
+        raise ValueError("Runtime approval decision journal count does not match the manifest.")
+    tenant_id = str(manifest.get("tenant_id") or "").strip()
+    document_ids = {
+        str(value or "").strip()
+        for value in manifest.get("document_ids") or []
+        if str(value or "").strip()
+    }
+    for record in records:
+        _validate_runtime_approval_decision(record)
+        if record["tenant_id"] != tenant_id or record["document_id"] not in document_ids:
+            raise ValueError("Runtime approval decision is outside the sealed tenant/document scope.")
+
+
 def _prepare_runtime_data_export_dir(runtime_data_dir: Path, source_data_dir: str | Path) -> None:
     runtime_path = runtime_data_dir.resolve()
     source_path = Path(source_data_dir).resolve()
@@ -3928,6 +4269,560 @@ def _runtime_visible_records_for_export(
     ]
 
 
+def _institution_runtime_export_document_ids(
+    *,
+    repository: JsonRepository,
+    tenant_id: str,
+    profile_id: str,
+) -> set[str]:
+    """Return institution documents that a complete runtime export must represent."""
+
+    normalized_profile_id = str(profile_id or "").strip().casefold()
+    if not normalized_profile_id:
+        return set()
+    return {
+        str(document.document_id)
+        for document in repository.list_documents()
+        if resource_visible_to_tenant(document, tenant_id)
+        and str(getattr(document, "profile_id", "") or "").strip().casefold()
+        == normalized_profile_id
+        and str(getattr(document, "regulation_status", "") or "").strip().casefold()
+        in {"approved", "superseded"}
+    }
+
+
+def _runtime_export_fully_rejected_document_ids(
+    *,
+    repository: JsonRepository,
+    document_ids: set[str],
+    tenant_id: str,
+    profile_id: str | None,
+) -> set[str]:
+    """Return selected documents whose active chunks are terminally rejected."""
+
+    rejected_document_ids: set[str] = set()
+    for document_id in sorted(str(value or "").strip() for value in document_ids):
+        if not document_id:
+            continue
+        document = repository.get_document(document_id)
+        if document is None:
+            continue
+        if not resource_visible_to_tenant(document, tenant_id):
+            continue
+        if (
+            str(profile_id or "").strip()
+            and str(getattr(document, "profile_id", "") or "").strip().casefold()
+            != str(profile_id or "").strip().casefold()
+        ):
+            continue
+        active_chunks = [
+            chunk
+            for chunk in repository.get_chunks(document_id)
+            if str(getattr(chunk, "approval_status", "") or "").strip().lower()
+            != "superseded"
+        ]
+        if active_chunks and all(
+            str(getattr(chunk, "approval_status", "") or "").strip().lower()
+            == "rejected"
+            for chunk in active_chunks
+        ) and _runtime_export_rejection_journal_covers_chunks(
+            repository=repository,
+            document_id=document_id,
+            tenant_id=tenant_id,
+            chunks=active_chunks,
+        ):
+            rejected_document_ids.add(document_id)
+    return rejected_document_ids
+
+
+def _runtime_export_rejection_journal_covers_chunks(
+    *,
+    repository: JsonRepository,
+    document_id: str,
+    tenant_id: str,
+    chunks: list[Any],
+    review_records: list[dict[str, Any]] | None = None,
+    approval_records: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Verify that every terminal rejection is bound to an append-only decision.
+
+    A bare ``approval_status=rejected`` value is confidentiality-safe because
+    it cannot expose content, but accepting it would let a damaged or manually
+    edited repository silently omit a selected regulation.  Require the review
+    journal's post-decision content hash for completeness and auditability.
+    """
+
+    expected_chunk_ids = {
+        str(getattr(chunk, "chunk_id", "") or "").strip()
+        for chunk in chunks
+        if str(getattr(chunk, "chunk_id", "") or "").strip()
+    }
+    return len(expected_chunk_ids) == len(chunks) and (
+        _runtime_export_rejection_journal_covered_chunk_ids(
+            repository=repository,
+            document_id=document_id,
+            tenant_id=tenant_id,
+            chunks=chunks,
+            review_records=review_records,
+            approval_records=approval_records,
+        )
+        == expected_chunk_ids
+    )
+
+
+def _runtime_export_rejection_journal_covered_chunk_ids(
+    *,
+    repository: JsonRepository,
+    document_id: str,
+    tenant_id: str,
+    chunks: list[Any],
+    review_records: list[dict[str, Any]] | None = None,
+    approval_records: list[dict[str, Any]] | None = None,
+) -> set[str]:
+    if not chunks:
+        return set()
+    expected_hashes = {
+        str(getattr(chunk, "chunk_id", "") or "").strip(): approved_content_hash(chunk)
+        for chunk in chunks
+        if str(getattr(chunk, "chunk_id", "") or "").strip()
+    }
+    if len(expected_hashes) != len(chunks):
+        return set()
+
+    audit_events: dict[str, list[tuple[datetime, bool]]] = {
+        chunk_id: [] for chunk_id in expected_hashes
+    }
+    ambiguous_chunk_ids: set[str] = set()
+    current_review_records = (
+        repository.list_review_journal_records(document_id)
+        if review_records is None
+        else review_records
+    )
+    for record in current_review_records:
+        if str(record.get("tenant_id") or "").strip() != str(tenant_id or "").strip():
+            continue
+        record_chunk_ids = {
+            str(value or "").strip()
+            for value in record.get("chunk_ids") or []
+            if str(value or "").strip()
+        }.intersection(expected_hashes)
+        if not record_chunk_ids:
+            continue
+        reviewed_at = _runtime_export_audit_timestamp(record.get("reviewed_at"))
+        if reviewed_at is None:
+            ambiguous_chunk_ids.update(record_chunk_ids)
+            continue
+        after_hashes = record.get("after_content_hashes")
+        for chunk_id in record_chunk_ids:
+            actual_hash = (
+                str(after_hashes.get(chunk_id) or "").strip().lower()
+                if isinstance(after_hashes, dict)
+                else ""
+            )
+            valid_rejection = all(
+                (
+                    str(record.get("action") or "").strip().lower() == "reject",
+                    str(record.get("status") or "").strip().lower() == "rejected",
+                    bool(str(record.get("reason") or "").strip()),
+                    bool(str(record.get("reviewed_by") or "").strip()),
+                    bool(actual_hash),
+                    bool(
+                        actual_hash
+                        and hmac.compare_digest(actual_hash, expected_hashes[chunk_id].lower())
+                    ),
+                )
+            )
+            audit_events[chunk_id].append((reviewed_at, valid_rejection))
+
+    # A historical rejection must not authorize omission after the same chunk
+    # was approved later. Both sources are append-only journals; mutable
+    # manifest mirrors are deliberately excluded from this decision.
+    current_approval_records = (
+        repository.list_approval_journal_records(document_id)
+        if approval_records is None
+        else approval_records
+    )
+    for record in current_approval_records:
+        if str(record.get("tenant_id") or "").strip() != str(tenant_id or "").strip():
+            continue
+        record_chunk_ids = {
+            str(value or "").strip()
+            for value in record.get("chunk_ids") or []
+            if str(value or "").strip()
+        }
+        approved_chunks = record.get("approved_chunks")
+        if isinstance(approved_chunks, list):
+            record_chunk_ids.update(
+                str(item.get("chunk_id") or "").strip()
+                for item in approved_chunks
+                if isinstance(item, dict) and str(item.get("chunk_id") or "").strip()
+            )
+        record_chunk_ids.intersection_update(expected_hashes)
+        if not record_chunk_ids:
+            continue
+        approved_at = _runtime_export_audit_timestamp(record.get("approved_at"))
+        if approved_at is None:
+            ambiguous_chunk_ids.update(record_chunk_ids)
+            continue
+        for chunk_id in record_chunk_ids:
+            audit_events[chunk_id].append((approved_at, False))
+
+    covered_chunk_ids: set[str] = set()
+    for chunk_id, events in audit_events.items():
+        if chunk_id in ambiguous_chunk_ids or not events:
+            continue
+        latest_at = max(event[0] for event in events)
+        latest_events = [valid_rejection for event_at, valid_rejection in events if event_at == latest_at]
+        if len(latest_events) == 1 and latest_events[0]:
+            covered_chunk_ids.add(chunk_id)
+    return covered_chunk_ids
+
+
+def _runtime_export_audit_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _runtime_export_supersession_journal_covered_chunk_ids(
+    *,
+    tenant_id: str,
+    chunks: list[Any],
+    all_chunk_ids: set[str],
+    review_records: list[dict[str, Any]],
+    approval_records: list[dict[str, Any]],
+) -> set[str]:
+    """Bind superseded chunks to the latest append-only split/merge decision."""
+
+    expected_hashes = {
+        str(getattr(chunk, "chunk_id", "") or "").strip(): approved_content_hash(chunk)
+        for chunk in chunks
+        if str(getattr(chunk, "chunk_id", "") or "").strip()
+    }
+    events: dict[str, list[tuple[datetime, bool]]] = {
+        chunk_id: [] for chunk_id in expected_hashes
+    }
+    ambiguous: set[str] = set()
+    for record in review_records:
+        if str(record.get("tenant_id") or "").strip() != str(tenant_id or "").strip():
+            continue
+        affected = _runtime_export_audit_record_chunk_ids(record).intersection(expected_hashes)
+        if not affected:
+            continue
+        reviewed_at = _runtime_export_audit_timestamp(record.get("reviewed_at"))
+        if reviewed_at is None:
+            ambiguous.update(affected)
+            continue
+        before_hashes = record.get("before_content_hashes")
+        created_chunk_ids = {
+            str(value or "").strip()
+            for value in record.get("created_chunk_ids") or []
+            if str(value or "").strip()
+        }
+        action = str(record.get("action") or "").strip().lower()
+        for chunk_id in affected:
+            recorded_hash = (
+                str(before_hashes.get(chunk_id) or "").strip().lower()
+                if isinstance(before_hashes, dict)
+                else ""
+            )
+            valid_supersession = bool(
+                action in {"split", "merge"}
+                and created_chunk_ids
+                and created_chunk_ids.issubset(all_chunk_ids)
+                and recorded_hash
+                and hmac.compare_digest(recorded_hash, expected_hashes[chunk_id].lower())
+            )
+            events[chunk_id].append((reviewed_at, valid_supersession))
+
+    for record in approval_records:
+        if str(record.get("tenant_id") or "").strip() != str(tenant_id or "").strip():
+            continue
+        affected = _runtime_export_audit_record_chunk_ids(record).intersection(expected_hashes)
+        if not affected:
+            continue
+        approved_at = _runtime_export_audit_timestamp(record.get("approved_at"))
+        if approved_at is None:
+            ambiguous.update(affected)
+            continue
+        for chunk_id in affected:
+            events[chunk_id].append((approved_at, False))
+
+    covered: set[str] = set()
+    for chunk_id, chunk_events in events.items():
+        if chunk_id in ambiguous or not chunk_events:
+            continue
+        latest_at = max(timestamp for timestamp, _valid in chunk_events)
+        latest = [valid for timestamp, valid in chunk_events if timestamp == latest_at]
+        if len(latest) == 1 and latest[0]:
+            covered.add(chunk_id)
+    return covered
+
+
+def _runtime_omission_disposition_projection(
+    *,
+    repository: JsonRepository,
+    tenant_id: str,
+    requested_document_ids: list[str],
+    exported_records: list[dict[str, Any]],
+    approval_records_by_document: dict[str, list[dict[str, Any]]],
+    review_records_by_document: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Project only the sealed decision needed to account for every chunk.
+
+    The source journals contain reviewer identities, notes, paths, reasons, and
+    before/after maps.  None of those fields belong in a portable MCP bundle.
+    This projection deliberately retains only the identity, timestamp, status,
+    and content binding of the unique latest decision.
+    """
+
+    requested_ids = sorted(
+        {
+            str(document_id or "").strip()
+            for document_id in requested_document_ids
+            if str(document_id or "").strip()
+        }
+    )
+    if not requested_ids:
+        raise ValueError("MCP omission disposition snapshot has no requested documents.")
+
+    exported_pairs: set[tuple[str, str]] = set()
+    for record in exported_records:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        pair = (
+            str(record.get("document_id") or metadata.get("document_id") or "").strip(),
+            str(record.get("chunk_id") or metadata.get("chunk_id") or "").strip(),
+        )
+        if not all(pair) or pair in exported_pairs:
+            raise ValueError("MCP omission disposition snapshot found an invalid exported chunk identity.")
+        exported_pairs.add(pair)
+
+    entries: list[dict[str, Any]] = []
+    source_pairs: set[tuple[str, str]] = set()
+    for document_id in requested_ids:
+        document = repository.get_document(document_id)
+        if document is None or not resource_visible_to_tenant(document, tenant_id):
+            raise ValueError(
+                "MCP omission disposition snapshot cannot include a missing or cross-tenant document: "
+                + document_id
+            )
+        chunks = list(repository.get_chunks(document_id))
+        if not chunks:
+            raise ValueError(
+                "MCP omission disposition snapshot cannot account for a document without chunks: "
+                + document_id
+            )
+        all_chunk_ids = {
+            str(getattr(chunk, "chunk_id", "") or "").strip() for chunk in chunks
+        }
+        if "" in all_chunk_ids or len(all_chunk_ids) != len(chunks):
+            raise ValueError(
+                "MCP omission disposition snapshot found missing or duplicate chunk IDs for document: "
+                + document_id
+            )
+
+        approval_records = approval_records_by_document.get(document_id, [])
+        review_records = review_records_by_document.get(document_id, [])
+        for chunk in sorted(chunks, key=lambda item: str(getattr(item, "chunk_id", "") or "")):
+            chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+            if str(getattr(chunk, "document_id", "") or "").strip() != document_id:
+                raise ValueError(
+                    "MCP omission disposition snapshot found a cross-document chunk: "
+                    f"{document_id}/{chunk_id}"
+                )
+            pair = (document_id, chunk_id)
+            source_pairs.add(pair)
+            current_status = str(getattr(chunk, "approval_status", "") or "").strip().lower()
+            current_hash = (
+                str(getattr(chunk, "approved_content_hash", "") or "").strip().lower()
+                if current_status == "approved"
+                else approved_content_hash(chunk).strip().lower()
+            )
+            expected_disposition = {
+                "approved": "exported",
+                "rejected": "omitted_rejected",
+                "superseded": "omitted_superseded",
+            }.get(current_status)
+            if expected_disposition is None:
+                raise ValueError(
+                    "MCP omission disposition snapshot found an unresolved current chunk status: "
+                    f"{document_id}/{chunk_id}:{current_status or 'missing'}"
+                )
+            if (pair in exported_pairs) != (expected_disposition == "exported"):
+                raise ValueError(
+                    "MCP omission disposition snapshot classification does not match the exported corpus: "
+                    f"{document_id}/{chunk_id}"
+                )
+
+            events: list[tuple[datetime, str | None, str]] = []
+            for record in approval_records:
+                if str(record.get("tenant_id") or "").strip() != tenant_id:
+                    continue
+                if chunk_id not in _runtime_export_audit_record_chunk_ids(record):
+                    continue
+                approved_at = _runtime_export_audit_timestamp(record.get("approved_at"))
+                if approved_at is None:
+                    raise ValueError(
+                        "MCP omission disposition snapshot found a missing or malformed decision timestamp: "
+                        f"{document_id}/{chunk_id}"
+                    )
+                decision_id = str(record.get("approval_id") or "").strip()
+                record_hash = _runtime_export_approval_record_hash(record, chunk_id).strip().lower()
+                current_approval_id = str(getattr(chunk, "approval_id", "") or "").strip()
+                valid = bool(
+                    decision_id
+                    and current_approval_id
+                    and decision_id == current_approval_id
+                    and record_hash
+                    and hmac.compare_digest(record_hash, current_hash)
+                )
+                events.append((approved_at, "exported" if valid else None, decision_id))
+
+            for record in review_records:
+                if str(record.get("tenant_id") or "").strip() != tenant_id:
+                    continue
+                if chunk_id not in _runtime_export_audit_record_chunk_ids(record):
+                    continue
+                reviewed_at = _runtime_export_audit_timestamp(record.get("reviewed_at"))
+                if reviewed_at is None:
+                    raise ValueError(
+                        "MCP omission disposition snapshot found a missing or malformed decision timestamp: "
+                        f"{document_id}/{chunk_id}"
+                    )
+                action = str(record.get("action") or "").strip().lower()
+                decision_id = str(record.get("review_id") or "").strip()
+                disposition: str | None = None
+                if action == "reject":
+                    after_hashes = record.get("after_content_hashes")
+                    record_hash = (
+                        str(after_hashes.get(chunk_id) or "").strip().lower()
+                        if isinstance(after_hashes, dict)
+                        else ""
+                    )
+                    if all(
+                        (
+                            decision_id,
+                            str(record.get("status") or "").strip().lower() == "rejected",
+                            str(record.get("reason") or "").strip(),
+                            str(record.get("reviewed_by") or "").strip(),
+                            record_hash,
+                            record_hash and hmac.compare_digest(record_hash, current_hash),
+                        )
+                    ):
+                        disposition = "omitted_rejected"
+                elif action in {"split", "merge"}:
+                    before_hashes = record.get("before_content_hashes")
+                    record_hash = (
+                        str(before_hashes.get(chunk_id) or "").strip().lower()
+                        if isinstance(before_hashes, dict)
+                        else ""
+                    )
+                    created_chunk_ids = {
+                        str(value or "").strip()
+                        for value in record.get("created_chunk_ids") or []
+                        if str(value or "").strip()
+                    }
+                    if all(
+                        (
+                            decision_id,
+                            created_chunk_ids,
+                            created_chunk_ids.issubset(all_chunk_ids),
+                            record_hash,
+                            record_hash and hmac.compare_digest(record_hash, current_hash),
+                        )
+                    ):
+                        disposition = "omitted_superseded"
+                events.append((reviewed_at, disposition, decision_id))
+
+            if not events:
+                raise ValueError(
+                    "MCP omission disposition snapshot found no decision for current chunk: "
+                    f"{document_id}/{chunk_id}"
+                )
+            latest_at = max(timestamp for timestamp, _disposition, _decision_id in events)
+            latest = [event for event in events if event[0] == latest_at]
+            if len(latest) != 1:
+                raise ValueError(
+                    "MCP omission disposition snapshot found tied latest decisions: "
+                    f"{document_id}/{chunk_id}"
+                )
+            _timestamp, disposition, decision_id = latest[0]
+            if disposition != expected_disposition or not decision_id:
+                raise ValueError(
+                    "MCP omission disposition snapshot latest decision does not match current state: "
+                    f"{document_id}/{chunk_id}"
+                )
+            entries.append(
+                {
+                    "tenant_id": tenant_id,
+                    "document_id": document_id,
+                    "chunk_id": chunk_id,
+                    "content_hash": current_hash,
+                    "latest_decision_id": decision_id,
+                    "latest_decision_status": {
+                        "exported": "approved",
+                        "omitted_rejected": "rejected",
+                        "omitted_superseded": "superseded",
+                    }[disposition],
+                    "latest_decision_at": latest_at.isoformat(),
+                    "disposition": disposition,
+                    "exported": disposition == "exported",
+                    "requested": True,
+                }
+            )
+
+    extra_exported_pairs = sorted(exported_pairs - source_pairs)
+    if extra_exported_pairs:
+        raise ValueError(
+            "MCP omission disposition snapshot found exported chunks outside the requested documents: "
+            + ", ".join(f"{document_id}/{chunk_id}" for document_id, chunk_id in extra_exported_pairs[:5])
+        )
+    return _runtime_omission_disposition_top_level(entries, requested_ids)
+
+
+def _runtime_omission_disposition_top_level(
+    entries: list[dict[str, Any]],
+    requested_document_ids: list[str],
+) -> dict[str, Any]:
+    exported_entries = [entry for entry in entries if entry.get("disposition") == "exported"]
+    omitted_entries = [entry for entry in entries if str(entry.get("disposition") or "").startswith("omitted_")]
+    exported_document_ids = sorted({str(entry["document_id"]) for entry in exported_entries})
+    omitted_document_ids = sorted({str(entry["document_id"]) for entry in omitted_entries})
+    requested_chunk_ids = [str(entry["chunk_id"]) for entry in entries]
+    exported_chunk_ids = [str(entry["chunk_id"]) for entry in exported_entries]
+    omitted_chunk_ids = [str(entry["chunk_id"]) for entry in omitted_entries]
+    return {
+        "report_type": "mcp_runtime_omission_disposition_snapshot",
+        "schema_version": OMISSION_DISPOSITION_SNAPSHOT_SCHEMA_VERSION,
+        "tenant_id": str(entries[0]["tenant_id"]) if entries else "",
+        "requested_document_ids": list(requested_document_ids),
+        "exported_document_ids": exported_document_ids,
+        "omitted_document_ids": omitted_document_ids,
+        "requested_document_count": len(requested_document_ids),
+        "exported_document_count": len(exported_document_ids),
+        "omitted_document_count": len(omitted_document_ids),
+        "requested_chunk_ids": requested_chunk_ids,
+        "exported_chunk_ids": exported_chunk_ids,
+        "omitted_chunk_ids": omitted_chunk_ids,
+        "requested_chunk_count": len(requested_chunk_ids),
+        "exported_chunk_count": len(exported_chunk_ids),
+        "omitted_chunk_count": len(omitted_chunk_ids),
+        "disposition_counts": {
+            disposition: sum(entry.get("disposition") == disposition for entry in entries)
+            for disposition in ("exported", "omitted_rejected", "omitted_superseded")
+        },
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
 def _recommended_runtime_smoke_query(records: list[dict[str, Any]]) -> str:
     candidates: list[tuple[int, int, str]] = []
     for index, record in enumerate(records):
@@ -4014,6 +4909,9 @@ def _current_approved_chunks_for_runtime_export(
     document_id: str,
     visible_chunk_ids: set[str],
     records_by_chunk_id: dict[str, dict[str, Any]],
+    tenant_id: str,
+    approval_records: list[dict[str, Any]],
+    review_records: list[dict[str, Any]],
 ) -> list[Any]:
     chunks_by_id = {str(chunk.chunk_id): chunk for chunk in repository.get_chunks(document_id)}
     missing = sorted(chunk_id for chunk_id in visible_chunk_ids if chunk_id and chunk_id not in chunks_by_id)
@@ -4030,6 +4928,14 @@ def _current_approved_chunks_for_runtime_export(
         if reason:
             invalid.append(f"{chunk_id}:{reason}")
             continue
+        if not _runtime_export_latest_decision_allows_approval(
+            chunk=chunk,
+            tenant_id=tenant_id,
+            approval_records=approval_records,
+            review_records=review_records,
+        ):
+            invalid.append(f"{chunk_id}:latest_audit_decision_not_current_approval")
+            continue
         chunks.append(chunk)
     if invalid:
         sample = ", ".join(invalid[:5])
@@ -4038,6 +4944,177 @@ def _current_approved_chunks_for_runtime_export(
             f"{sample}. Reapprove and reindex before creating a handoff bundle."
         )
     return chunks
+
+
+def _runtime_export_latest_decision_allows_approval(
+    *,
+    chunk: Any,
+    tenant_id: str,
+    approval_records: list[dict[str, Any]],
+    review_records: list[dict[str, Any]],
+) -> bool:
+    """Require the latest append-only decision to match the current approval."""
+
+    chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+    current_approval_id = str(getattr(chunk, "approval_id", "") or "").strip()
+    current_hash = str(getattr(chunk, "approved_content_hash", "") or "").strip().lower()
+    if not chunk_id or not current_approval_id or not current_hash:
+        return False
+
+    events: list[tuple[datetime, bool]] = []
+    for record in approval_records:
+        if str(record.get("tenant_id") or "").strip() != str(tenant_id or "").strip():
+            continue
+        record_chunk_ids = _runtime_export_audit_record_chunk_ids(record)
+        if chunk_id not in record_chunk_ids:
+            continue
+        approved_at = _runtime_export_audit_timestamp(record.get("approved_at"))
+        if approved_at is None:
+            return False
+        record_hash = _runtime_export_approval_record_hash(record, chunk_id)
+        matches_current = (
+            str(record.get("approval_id") or "").strip() == current_approval_id
+            and bool(record_hash)
+            and hmac.compare_digest(record_hash.lower(), current_hash)
+        )
+        events.append((approved_at, matches_current))
+
+    for record in review_records:
+        if str(record.get("tenant_id") or "").strip() != str(tenant_id or "").strip():
+            continue
+        if chunk_id not in _runtime_export_audit_record_chunk_ids(record):
+            continue
+        reviewed_at = _runtime_export_audit_timestamp(record.get("reviewed_at"))
+        if reviewed_at is None:
+            return False
+        events.append((reviewed_at, False))
+
+    if not events:
+        return False
+    latest_at = max(event[0] for event in events)
+    latest_events = [matches_current for event_at, matches_current in events if event_at == latest_at]
+    return len(latest_events) == 1 and latest_events[0]
+
+
+def _runtime_export_audit_record_chunk_ids(record: dict[str, Any]) -> set[str]:
+    chunk_ids = {
+        str(value or "").strip()
+        for value in record.get("chunk_ids") or []
+        if str(value or "").strip()
+    }
+    approved_chunks = record.get("approved_chunks")
+    if isinstance(approved_chunks, list):
+        chunk_ids.update(
+            str(item.get("chunk_id") or "").strip()
+            for item in approved_chunks
+            if isinstance(item, dict) and str(item.get("chunk_id") or "").strip()
+        )
+    return chunk_ids
+
+
+def _runtime_export_approval_record_hash(record: dict[str, Any], chunk_id: str) -> str:
+    approved_hashes = record.get("approved_content_hashes")
+    if isinstance(approved_hashes, dict):
+        value = str(approved_hashes.get(chunk_id) or "").strip()
+        if value:
+            return value
+    approved_chunks = record.get("approved_chunks")
+    if isinstance(approved_chunks, list):
+        for item in approved_chunks:
+            if not isinstance(item, dict) or str(item.get("chunk_id") or "").strip() != chunk_id:
+                continue
+            return str(item.get("approved_content_hash") or "").strip()
+    return ""
+
+
+def _runtime_export_document_completeness_issue(
+    *,
+    repository: JsonRepository,
+    document_id: str,
+    visible_chunk_ids: set[str],
+    tenant_id: str,
+    approval_records: list[dict[str, Any]] | None = None,
+    review_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Return a fail-closed reason when runtime export would hide current chunks."""
+
+    source_chunks = list(repository.get_chunks(document_id))
+    superseded_chunks = [
+        chunk
+        for chunk in source_chunks
+        if str(getattr(chunk, "approval_status", "") or "").strip().lower() == "superseded"
+    ]
+    active_chunks = [
+        chunk
+        for chunk in source_chunks
+        if str(getattr(chunk, "approval_status", "") or "").strip().lower() != "superseded"
+    ]
+    approved_source_chunk_ids = {
+        str(chunk.chunk_id)
+        for chunk in active_chunks
+        if str(getattr(chunk, "approval_status", "") or "").strip().lower() == "approved"
+    }
+    missing_approved_chunk_ids = sorted(
+        chunk_id
+        for chunk_id in approved_source_chunk_ids
+        if chunk_id not in visible_chunk_ids
+    )
+    unresolved_chunks = [
+        {
+            "chunk_id": str(chunk.chunk_id),
+            "approval_status": str(getattr(chunk, "approval_status", "") or "").strip().lower() or "missing",
+        }
+        for chunk in active_chunks
+        if str(getattr(chunk, "approval_status", "") or "").strip().lower()
+        not in {"approved", "rejected"}
+    ]
+    rejected_chunks = [
+        chunk
+        for chunk in active_chunks
+        if str(getattr(chunk, "approval_status", "") or "").strip().lower() == "rejected"
+    ]
+    journal_covered_rejection_ids = _runtime_export_rejection_journal_covered_chunk_ids(
+        repository=repository,
+        document_id=document_id,
+        tenant_id=tenant_id,
+        chunks=rejected_chunks,
+        approval_records=approval_records,
+        review_records=review_records,
+    )
+    unaudited_rejection_chunk_ids = sorted(
+        str(chunk.chunk_id)
+        for chunk in rejected_chunks
+        if str(chunk.chunk_id) not in journal_covered_rejection_ids
+    )
+    journal_covered_superseded_ids = _runtime_export_supersession_journal_covered_chunk_ids(
+        tenant_id=tenant_id,
+        chunks=superseded_chunks,
+        all_chunk_ids={str(chunk.chunk_id) for chunk in source_chunks},
+        review_records=review_records or [],
+        approval_records=approval_records or [],
+    )
+    unaudited_superseded_chunk_ids = sorted(
+        str(chunk.chunk_id)
+        for chunk in superseded_chunks
+        if str(chunk.chunk_id) not in journal_covered_superseded_ids
+    )
+    if (
+        not missing_approved_chunk_ids
+        and not unresolved_chunks
+        and not unaudited_rejection_chunk_ids
+        and not unaudited_superseded_chunk_ids
+    ):
+        return None
+    return {
+        "document_id": document_id,
+        "active_chunk_count": len(active_chunks),
+        "approved_source_chunk_count": len(approved_source_chunk_ids),
+        "exported_record_count": len(visible_chunk_ids),
+        "missing_approved_chunk_ids": missing_approved_chunk_ids,
+        "unresolved_chunks": unresolved_chunks,
+        "unaudited_rejection_chunk_ids": unaudited_rejection_chunk_ids,
+        "unaudited_superseded_chunk_ids": unaudited_superseded_chunk_ids,
+    }
 
 
 def _runtime_export_chunk_mismatch_reason(chunk: Any, record: dict[str, Any], metadata: dict[str, Any]) -> str:
@@ -4324,6 +5401,17 @@ def write_mcp_setup_bundle_zip(
     )
     if runtime_data_dir.is_dir():
         _validate_runtime_data_bundle_consistency(runtime_data_dir)
+        runtime_manifest = _runtime_manifest_payload(runtime_data_dir)
+        reuse = (
+            runtime_manifest.get("runtime_data_reuse")
+            if isinstance(runtime_manifest, dict)
+            else None
+        )
+        if (
+            isinstance(reuse, dict)
+            and reuse.get("schema_version") == RUNTIME_DATA_REUSE_SCHEMA_VERSION
+        ):
+            validate_mcp_runtime_data_bundle_integrity(runtime_data_dir)
         archive_files.extend(
             (path, path.relative_to(source_dir).as_posix())
             for path in sorted(runtime_data_dir.rglob("*"))
@@ -4354,6 +5442,7 @@ def write_mcp_setup_bundle_zip(
                     path,
                     arcname=arcname,
                     source_dir=source_dir,
+                    wheel_included=wheel is not None,
                 )
                 if portable_payload is not None:
                     archive.writestr(info, portable_payload)
@@ -4382,15 +5471,106 @@ PORTABLE_HANDOFF_JSON_FILES = {
     "chatgpt_desktop_local_mcp.json",
     "claude_https_mcp.json",
     "claude_desktop_config.json",
+    "manifest.json",
     "mcp_config.bundle.json",
     "data/mcp_runtime_manifest.json",
 }
 
 
-def _portable_handoff_payload(path: Path, *, arcname: str, source_dir: Path) -> bytes | None:
+def _portable_handoff_runtime_requirements(
+    *,
+    wheel_included: bool | None,
+) -> dict[str, Any]:
+    """Describe the fail-closed runtime gate for a bundle copied to a new PC."""
+
+    return {
+        "applies_to": "fresh_target_local_stdio",
+        "bundled_windows_executable": False,
+        "wheel_included": wheel_included,
+        "minimum_python_version": PORTABLE_HANDOFF_MINIMUM_PYTHON_VERSION,
+        "python_required_when_packaged_executable_absent": True,
+        "included_wheel_is_not_a_python_runtime": True,
+        "fresh_target_local_stdio_ready": False,
+        "required_action": (
+            "On the target PC, place a compatible packaged executable beside the extracted bundle or install "
+            "Python 3.11+ and run install_local_package.ps1 with an included wheel or approved package source."
+        ),
+        "remote_https_client_requires_local_python": False,
+    }
+
+
+def _portable_handoff_readme_section(
+    *,
+    korean: bool,
+    wheel_included: bool,
+) -> str:
+    wheel_value = "예" if korean and wheel_included else "아니요" if korean else "yes" if wheel_included else "no"
+    if korean:
+        return f"""
+## 이 전달 ZIP의 대상 PC 실행 조건
+
+- Windows 실행 파일 포함: 아니요. 원 PC에 설치된 EXE의 절대 경로는 대상 PC 실행 근거가 아닙니다.
+- wheel 포함: {wheel_value}. wheel은 Python 실행 환경이 아니라 패키지 설치 파일입니다.
+- 새 대상 PC에서 지원되는 로컬 stdio를 쓰려면 번들 옆에 별도로 제공된 호환 EXE가 있거나 Python 3.11+가 설치되어 있어야 합니다.
+- 호환 EXE가 없으면 Python 3.11+를 설치한 뒤 `install_local_package.ps1`을 먼저 실행하세요. wheel이 포함되지 않았다면 승인된 wheel 또는 소스 패키지도 별도로 준비해야 합니다.
+- `launcher_ready=true`는 런처 파일 존재만 뜻하며 대상 PC 실행 준비 완료를 뜻하지 않습니다.
+"""
+    return f"""
+## This handoff ZIP: target-PC runtime gate
+
+- Windows executable included: no. An absolute path to an executable installed on the source PC is not target-PC runtime evidence.
+- Wheel included: {wheel_value}. A wheel is a package installer payload, not a Python runtime.
+- Supported local stdio on a fresh target PC requires either a separately supplied compatible executable beside the bundle or Python 3.11+.
+- Without that executable, install Python 3.11+ and run `install_local_package.ps1` first. If no wheel is included, separately provide an approved wheel or source package.
+- `launcher_ready=true` means only that the launcher file exists; it does not mean the target runtime is ready.
+"""
+
+
+def _portable_handoff_powershell_payload(text: str, *, source_dir: Path) -> bytes:
+    """Remove source-PC runtime hints from PowerShell copied into a handoff ZIP."""
+
+    portable = _replace_bundle_path_text(text, source_dir=source_dir)
+    for variable_name in (
+        "PreferredPython",
+        "PreferredProjectRoot",
+        "InstalledPackagedExe",
+        # Compatibility with launchers generated before InstalledPackagedExe
+        # and BundledPackagedExe were separated.
+        "PackagedExe",
+    ):
+        portable = re.sub(
+            rf"(?m)^\${variable_name}\s*=.*$",
+            f"${variable_name} = ''",
+            portable,
+        )
+    return (portable.rstrip() + "\n").encode("utf-8-sig")
+
+
+def _portable_handoff_payload(
+    path: Path,
+    *,
+    arcname: str,
+    source_dir: Path,
+    wheel_included: bool,
+) -> bytes | None:
     """Remove build-host bundle paths from handoff configuration templates."""
 
     normalized_arcname = arcname.replace("\\", "/")
+    if normalized_arcname in {
+        SETUP_BUNDLE_FILES["readme"],
+        SETUP_BUNDLE_FILES["readme_ko"],
+    }:
+        text = path.read_text(encoding="utf-8-sig")
+        text += _portable_handoff_readme_section(
+            korean=normalized_arcname == SETUP_BUNDLE_FILES["readme_ko"],
+            wheel_included=wheel_included,
+        )
+        return (text.rstrip() + "\n").encode("utf-8")
+    if normalized_arcname.lower().endswith(".ps1"):
+        return _portable_handoff_powershell_payload(
+            path.read_text(encoding="utf-8-sig"),
+            source_dir=source_dir,
+        )
     if normalized_arcname in PORTABLE_HANDOFF_JSON_FILES:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
         portable_source = _with_bundle_stdio_launcher(
@@ -4408,6 +5588,13 @@ def _portable_handoff_payload(path: Path, *, arcname: str, source_dir: Path) -> 
             else "regulation_mcp",
         )
         portable = _replace_bundle_path_with_placeholder(portable_source, source_dir=source_dir)
+        if normalized_arcname in {
+            SETUP_BUNDLE_FILES["bundle_status"],
+            SETUP_BUNDLE_FILES["manifest"],
+        } and isinstance(portable, dict):
+            portable["portable_handoff_runtime"] = _portable_handoff_runtime_requirements(
+                wheel_included=wheel_included
+            )
         if normalized_arcname == "data/mcp_runtime_manifest.json" and isinstance(portable, dict):
             reuse = portable.get("runtime_data_reuse")
             if isinstance(reuse, dict) and reuse.get("schema_version") == RUNTIME_DATA_REUSE_SCHEMA_VERSION:
@@ -4486,6 +5673,15 @@ def _validate_runtime_data_bundle_consistency(runtime_data_dir: Path) -> None:
             "Runtime data bundle contains raw preprocessing artifacts that must not be shipped in an MCP handoff zip: "
             + ", ".join(path.relative_to(runtime_data_dir).as_posix() for path in disallowed[:10])
         )
+    forbidden_audit_artifacts = _forbidden_runtime_audit_artifacts(runtime_data_dir)
+    if forbidden_audit_artifacts:
+        raise ValueError(
+            "Runtime data bundle contains review decisions or raw audit artifacts that must not be shipped: "
+            + ", ".join(
+                path.relative_to(runtime_data_dir).as_posix()
+                for path in forbidden_audit_artifacts[:10]
+            )
+        )
     unexpected_vectors = _unexpected_runtime_vector_store_files(runtime_data_dir)
     if unexpected_vectors:
         raise ValueError(
@@ -4511,6 +5707,170 @@ def _validate_runtime_data_bundle_consistency(runtime_data_dir: Path) -> None:
             "Runtime data bundle contains stale document artifacts outside mcp_runtime_manifest.document_ids: "
             + "; ".join(stale)
         )
+    manifest = _runtime_manifest_payload(runtime_data_dir)
+    reuse = manifest.get("runtime_data_reuse") if isinstance(manifest, dict) else None
+    approval_journal_path = (
+        runtime_data_dir / "repository" / "journals" / "approvals.jsonl"
+    )
+    if approval_journal_path.exists() or (
+        isinstance(reuse, dict)
+        and reuse.get("schema_version") == RUNTIME_DATA_REUSE_SCHEMA_VERSION
+    ):
+        _validate_runtime_approval_decision_journal(runtime_data_dir, manifest)
+    omission_path = runtime_data_dir / "repository" / OMISSION_DISPOSITION_SNAPSHOT_FILENAME
+    if omission_path.exists() or (
+        isinstance(reuse, dict)
+        and reuse.get("schema_version") == RUNTIME_DATA_REUSE_SCHEMA_VERSION
+    ):
+        _validate_runtime_omission_disposition_snapshot(runtime_data_dir, manifest)
+    if isinstance(reuse, dict) and reuse.get("schema_version") == RUNTIME_DATA_REUSE_SCHEMA_VERSION:
+        unexpected_files = [
+            path
+            for path in sorted(runtime_data_dir.rglob("*"))
+            if path.is_file()
+            and not _is_mutable_runtime_generated_file(path)
+            and not _include_runtime_data_file_in_zip(path, runtime_data_dir=runtime_data_dir)
+        ]
+        if unexpected_files:
+            raise ValueError(
+                "Sealed runtime data contains files outside the handoff allowlist: "
+                + ", ".join(
+                    path.relative_to(runtime_data_dir).as_posix()
+                    for path in unexpected_files[:10]
+                )
+            )
+
+
+def _validate_runtime_omission_disposition_snapshot(
+    runtime_data_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    sidecar_path = runtime_data_dir / "repository" / OMISSION_DISPOSITION_SNAPSHOT_FILENAME
+    if sidecar_path.is_symlink() or not sidecar_path.is_file():
+        raise ValueError("Runtime omission disposition snapshot is missing or is a symbolic link.")
+    payload = _load_strict_utf8_json_for_bundle(sidecar_path)
+    if not isinstance(payload, dict):
+        raise ValueError("Runtime omission disposition snapshot must contain a JSON object.")
+    generated_at = _runtime_export_audit_timestamp(payload.get("generated_at"))
+    if generated_at is None:
+        raise ValueError("Runtime omission disposition snapshot generated_at is missing or invalid.")
+    tenant_id = str(manifest.get("tenant_id") or "").strip()
+    if not tenant_id or payload.get("tenant_id") != tenant_id:
+        raise ValueError("Runtime omission disposition snapshot tenant does not match the runtime manifest.")
+    files = manifest.get("files")
+    declared_path = (
+        str(files.get("omission_disposition_snapshot") or "").replace("\\", "/")
+        if isinstance(files, dict)
+        else ""
+    )
+    expected_suffix = f"/data/repository/{OMISSION_DISPOSITION_SNAPSHOT_FILENAME}"
+    if not declared_path.endswith(expected_suffix):
+        raise ValueError("Runtime manifest does not declare the omission disposition snapshot path.")
+    requested_document_ids = payload.get("requested_document_ids")
+    if (
+        not isinstance(requested_document_ids, list)
+        or requested_document_ids != sorted(set(str(value or "").strip() for value in requested_document_ids))
+        or not requested_document_ids
+        or any(not str(value or "").strip() for value in requested_document_ids)
+    ):
+        raise ValueError("Runtime omission disposition requested document IDs are invalid.")
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Runtime omission disposition entries are missing.")
+
+    seen_pairs: set[tuple[str, str]] = set()
+    normalized_entries: list[dict[str, Any]] = []
+    expected_status = {
+        "exported": "approved",
+        "omitted_rejected": "rejected",
+        "omitted_superseded": "superseded",
+    }
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != OMISSION_DISPOSITION_ENTRY_FIELDS:
+            raise ValueError("Runtime omission disposition entries contain unapproved fields.")
+        document_id = str(entry.get("document_id") or "").strip()
+        chunk_id = str(entry.get("chunk_id") or "").strip()
+        pair = (document_id, chunk_id)
+        disposition = str(entry.get("disposition") or "").strip()
+        if (
+            entry.get("tenant_id") != tenant_id
+            or document_id not in requested_document_ids
+            or not chunk_id
+            or pair in seen_pairs
+            or not str(entry.get("content_hash") or "").strip()
+            or not str(entry.get("latest_decision_id") or "").strip()
+            or disposition not in expected_status
+            or entry.get("latest_decision_status") != expected_status.get(disposition)
+            or type(entry.get("exported")) is not bool
+            or entry.get("exported") is not (disposition == "exported")
+            or entry.get("requested") is not True
+            or _runtime_export_audit_timestamp(entry.get("latest_decision_at")) is None
+        ):
+            raise ValueError("Runtime omission disposition entry classification is invalid.")
+        seen_pairs.add(pair)
+        normalized_entries.append(entry)
+
+    entry_document_ids = {
+        str(entry["document_id"]) for entry in normalized_entries
+    }
+    if set(requested_document_ids) != entry_document_ids:
+        raise ValueError(
+            "Runtime omission disposition requested documents do not have complete chunk coverage."
+        )
+
+    expected_projection = _runtime_omission_disposition_top_level(
+        normalized_entries,
+        [str(value) for value in requested_document_ids],
+    )
+    expected_keys = set(expected_projection) | {"generated_at"}
+    if set(payload) != expected_keys or any(
+        payload.get(field) != expected
+        for field, expected in expected_projection.items()
+    ):
+        raise ValueError("Runtime omission disposition top-level counts or IDs are inconsistent.")
+
+    manifest_document_ids = manifest.get("document_ids")
+    if not isinstance(manifest_document_ids, list) or sorted(manifest_document_ids) != payload.get(
+        "exported_document_ids"
+    ):
+        raise ValueError("Runtime omission disposition exported documents do not match the manifest.")
+
+    vector_pairs: set[tuple[str, str]] = set()
+    vector_approval_bindings: dict[tuple[str, str], tuple[str, str]] = {}
+    vector_dir = runtime_data_dir / "vector_db" / tenant_storage_key(tenant_id)
+    vector_path = vector_dir / "approved_vectors.jsonl"
+    try:
+        vector_records = list(_iter_strict_jsonl_for_runtime_reuse(vector_path))
+    except (OSError, ValueError) as exc:
+        raise ValueError("Runtime omission disposition cannot verify approved vectors.") from exc
+    for record in vector_records:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        pair = (
+            str(record.get("document_id") or metadata.get("document_id") or "").strip(),
+            str(record.get("chunk_id") or metadata.get("chunk_id") or "").strip(),
+        )
+        if not all(pair) or pair in vector_pairs:
+            raise ValueError("Runtime omission disposition found invalid approved vector identities.")
+        vector_pairs.add(pair)
+        vector_approval_bindings[pair] = (
+            str(metadata.get("approval_id") or "").strip(),
+            str(metadata.get("approved_content_hash") or "").strip().lower(),
+        )
+    exported_entries = {
+        (str(entry["document_id"]), str(entry["chunk_id"])): entry
+        for entry in normalized_entries
+        if entry["exported"] is True
+    }
+    if set(exported_entries) != vector_pairs:
+        raise ValueError("Runtime omission disposition exported chunks do not match approved vectors.")
+    for pair, entry in exported_entries.items():
+        approval_id, content_hash = vector_approval_bindings[pair]
+        if (
+            approval_id != entry["latest_decision_id"]
+            or content_hash != str(entry["content_hash"]).strip().lower()
+        ):
+            raise ValueError("Runtime omission disposition approval binding does not match approved vectors.")
+    return payload
 
 
 def _runtime_data_files_requiring_manifest(runtime_data_dir: Path) -> list[Path]:
@@ -4518,7 +5878,11 @@ def _runtime_data_files_requiring_manifest(runtime_data_dir: Path) -> list[Path]
     repository_dir = runtime_data_dir / "repository"
     if repository_dir.is_dir():
         for path in sorted(repository_dir.glob("*.json")):
-            if path.name in {"manifest.json", "approval_snapshot.json"} or any(
+            if path.name in {
+                "manifest.json",
+                "approval_snapshot.json",
+                OMISSION_DISPOSITION_SNAPSHOT_FILENAME,
+            } or any(
                 path.name.endswith(suffix) for suffix in RUNTIME_REPOSITORY_RESULT_SUFFIXES
             ):
                 files.append(path)
@@ -4727,6 +6091,28 @@ def _disallowed_runtime_repository_result_files(runtime_data_dir: Path) -> list[
     )
 
 
+def _forbidden_runtime_audit_artifacts(runtime_data_dir: Path) -> list[Path]:
+    repository_dir = runtime_data_dir / "repository"
+    if not repository_dir.is_dir():
+        return []
+    forbidden_names = {
+        "review_decisions.jsonl",
+        "review_decisions.json",
+        "review_journal.jsonl",
+        "raw_review_artifacts.json",
+    }
+    return sorted(
+        path
+        for path in repository_dir.rglob("*")
+        if path.is_file()
+        and (
+            path.name.casefold() in forbidden_names
+            or "review_decision" in path.name.casefold()
+            or path.parent.name.casefold() in {"raw", "artifacts", "review_artifacts"}
+        )
+    )
+
+
 def _repository_result_file_document_ids(runtime_data_dir: Path) -> set[str]:
     repository_dir = runtime_data_dir / "repository"
     document_ids: set[str] = set()
@@ -4808,6 +6194,11 @@ def _include_runtime_data_file_in_zip(path: Path, *, runtime_data_dir: Path) -> 
         return True
     if path.name == "approval_snapshot.json" and path.parent.name == "repository":
         return True
+    if (
+        path.name == OMISSION_DISPOSITION_SNAPSHOT_FILENAME
+        and path.parent.name == "repository"
+    ):
+        return True
     if path.name.endswith("_chunks.json") and path.parent.name == "repository":
         return True
     if (
@@ -4879,20 +6270,19 @@ def _setup_bundle_connections(config: dict[str, Any]) -> list[dict[str, Any]]:
             "operator_action": "Run the generated PowerShell registration command, restart Claude Code, and verify the server.",
         },
         {
-            "client": "ChatGPT Desktop / Codex CLI / Codex IDE",
-            "profile": "codex-local-shared",
-            "tool_profile": "chatgpt-data",
+            "client": "Codex CLI / Codex IDE",
+            "profile": "codex-local",
+            "tool_profile": "full",
             "mode": "local_stdio",
             "ready": True,
             "primary_file": SETUP_BUNDLE_FILES["codex_config"],
             "config_file": SETUP_BUNDLE_FILES["codex_config"],
-            "desktop_ui_file": SETUP_BUNDLE_FILES["chatgpt_desktop_local"],
             "operator_action": (
-                "Apply the shared ~/.codex/config.toml entry or enter the same STDIO contract in Desktop Settings > MCP servers, restart the selected surface, and verify /mcp."
+                "Apply the generated server block to ~/.codex/config.toml, restart Codex, and verify search then fetch."
             ),
         },
         {
-            "client": "ChatGPT · Vercel HTTPS MCP",
+            "client": "ChatGPT web · remote HTTPS MCP",
             "profile": "chatgpt-remote",
             "mode": "streamable_http",
             "ready": False,
@@ -4902,9 +6292,11 @@ def _setup_bundle_connections(config: dict[str, Any]) -> list[dict[str, Any]]:
             "primary_file": SETUP_BUNDLE_FILES["chatgpt"],
             "config_file": SETUP_BUNDLE_FILES["chatgpt"],
             "operator_action": (
-                "Deploy the common Vercel server and register its final HTTPS /mcp URL in "
-                "ChatGPT Desktop Settings > MCP servers or the shared Codex config."
+                "Confirm Developer mode and workspace permission in ChatGPT web, create an app "
+                "with the final HTTPS /mcp URL, scan tools, then verify search and fetch."
             ),
+            "official_help_url": CHATGPT_MCP_HELP_URL,
+            "secure_mcp_tunnel_url": CHATGPT_SECURE_MCP_TUNNEL_URL,
         },
         {
             "client": "Claude · Vercel HTTPS MCP",
@@ -4923,9 +6315,9 @@ def _setup_bundle_connections(config: dict[str, Any]) -> list[dict[str, Any]]:
         for index, client in enumerate(
             (
                 "Claude Code",
-                "ChatGPT Desktop / Codex CLI / Codex IDE",
+                "Codex CLI / Codex IDE",
                 "Claude Desktop",
-                "ChatGPT · Vercel HTTPS MCP",
+                "ChatGPT web · remote HTTPS MCP",
                 "Claude · Vercel HTTPS MCP",
             )
         )
@@ -5231,20 +6623,34 @@ def _mcp_first_use_guide(server_name: str) -> str:
 
 등록된 MCP 이름: {server_name}
 
-지원하는 정식 연결 방식은 두 가지입니다.
+지원하는 정식 연결 방식은 세 가지입니다.
 
 1. 로컬 stdio
    - Codex CLI: `codex_config_snippet.toml`을 `~/.codex/config.toml`에 반영
    - Claude Code: `claude_code_add_stdio.ps1` 실행
    - Claude Desktop: `claude_desktop_config.json`의 `mcpServers` 병합
-   - ChatGPT Desktop: `chatgpt_desktop_local_mcp.json`의 `ui_fields`를 MCP 서버 설정에 입력
+   - 전달 ZIP에는 원 PC의 설치 EXE가 포함되지 않음
+   - 새 대상 PC에서 번들 옆 호환 EXE가 없으면 Python 3.11+ 설치 후 `install_local_package.ps1`을 먼저 실행
+   - ZIP에 wheel이 있어도 wheel은 Python 실행 환경이 아니라 패키지 설치 파일임
    - 등록 후 클라이언트를 완전히 종료·재실행하고 실제 도구 호출로 검증
 
-2. 공개 HTTPS Streamable HTTP
+2. ChatGPT 웹 원격 HTTPS MCP
    - 생성된 staging의 `api/index.py`와 승인된 runtime bundle을 Vercel에 배포
    - 공개 endpoint는 `https://<deployment>/mcp`
-   - `MCP_AUTH_TOKEN`, `MCP_ALLOWED_HTTP_HOSTS`와 tenant/profile 환경변수를 Vercel에 설정
-   - ChatGPT 또는 Claude Connector에는 HTTPS URL과 승인된 인증만 등록
+   - ChatGPT 웹에서 Developer mode 사용 가능 여부와 플랜·워크스페이스 권한을 먼저 확인
+   - Pro는 Developer mode에서 read/fetch MCP를 연결할 수 있고, full MCP는 Business·Enterprise·Edu 대상
+   - Settings > Apps > Advanced settings에서 Developer mode를 켠 뒤 Apps > Create에서 HTTPS URL과 승인된 인증만 등록
+   - ChatGPT는 로컬 MCP 서버에 직접 연결하지 않음
+   - 사설망·온프레미스·개발 PC 서버는 OpenAI Secure MCP Tunnel 안내를 따름
+   - 공식 조건: {CHATGPT_MCP_HELP_URL}
+   - Secure MCP Tunnel: {CHATGPT_SECURE_MCP_TUNNEL_URL}
+
+3. Claude 원격 HTTPS MCP
+   - Vercel에 배포한 같은 승인 endpoint를 Claude Connector에 URL과 승인된 인증으로 등록
+
+호환성 주의
+- `chatgpt_desktop_local_mcp.json`은 이전 번들 판독기용 경고 파일일 뿐 실행 설정이 아님
+- 이 파일의 `support_status=unsupported`, `direct_local_supported=false`를 확인하고 로컬 Command·Arguments를 ChatGPT에 입력하지 않음
 
 운영 파일
 - 로컬 서버: `run_mcp_stdio_server.ps1`
@@ -5377,7 +6783,7 @@ __FILE_SHA256_FUNCTION__
 $BundleDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerName = "__SERVER_NAME__"
 $EmbeddedClaudeDesktopConfigBase64 = "__EMBEDDED_CLAUDE_DESKTOP_CONFIG_BASE64__"
-$EmbeddedChatGptDesktopConfigBase64 = "__EMBEDDED_CHATGPT_DESKTOP_CONFIG_BASE64__"
+$EmbeddedCodexConfigBase64 = "__EMBEDDED_CODEX_CONFIG_BASE64__"
 $PreferredPython = ""
 $PreferredProjectRoot = ""
 $InstallationAttemptId = [Guid]::NewGuid().ToString("N")
@@ -5533,8 +6939,8 @@ function Read-ClaudeDesktopBundleServerConfig {
   }
 }
 
-function Read-ChatGptDesktopBundleServerConfig {
-  return Read-EmbeddedBundleServerConfig $EmbeddedChatGptDesktopConfigBase64 "ChatGPT Desktop"
+function Read-CodexBundleServerConfig {
+  return Read-EmbeddedBundleServerConfig $EmbeddedCodexConfigBase64 "Codex"
 }
 
 function Update-BundleStatus([hashtable]$Values) {
@@ -5700,7 +7106,7 @@ function Invoke-ClientConnectionStatusCli([object[]]$Arguments) {
       $StatusRequiresClientTracking = $false
     }
     if ($StatusRequiresClientTracking) {
-      throw "Client-specific MCP status tracking is required for this bundle, but its recorded Python runtime or scripts.mcp_client_status module is unavailable. Run the generated connection BAT with -InstallPackage, then retry."
+      throw "Client-specific MCP status tracking is required for this bundle, but its recorded Python runtime or scripts.mcp_client_status module is unavailable. Run install_local_package.ps1 with Python 3.11+, then retry connect_mcp_client.ps1."
     }
     Write-Warning "Client-specific status tracking is unavailable only because this is a pre-v5 legacy/source-only bundle; legacy verification will continue."
     return $false
@@ -6534,14 +7940,14 @@ function Normalize-TomlSectionName([string]$Value) {
 }
 
 function Get-BundleServerEntry {
-  $Source = Read-ChatGptDesktopBundleServerConfig
+  $Source = Read-CodexBundleServerConfig
   $Source = Set-McpBundlePaths $Source (Get-BundleDataDir) (BundlePath "run_mcp_stdio_server.ps1")
   if (-not $Source.PSObject.Properties["mcpServers"]) {
-    throw "Generated ChatGPT Desktop .mcp.json does not contain mcpServers."
+    throw "Generated Codex MCP configuration does not contain mcpServers."
   }
   $Server = $Source.mcpServers.PSObject.Properties[$ServerName]
   if (-not $Server) {
-    throw "Generated ChatGPT Desktop .mcp.json does not contain server $ServerName."
+    throw "Generated Codex MCP configuration does not contain server $ServerName."
   }
   return $Server.Value
 }
@@ -6859,44 +8265,24 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
     throw "$ConsumerName MCP config changed during installed-config stdio verification; the prior state will be restored."
   }
   if (-not $CodexCliAvailable) {
-    $DesktopRestartState = Get-ChatGptDesktopRestartState -RegistrationUpdatedAtUtc $DirectRegistrationUpdatedAtUtc
-    $PendingConnectionState = if ($DesktopRestartState.desktop_restart_status -eq "not_running") {
-      "pending_desktop_launch"
-    } else {
-      "pending_desktop_restart"
-    }
     Update-BundleStatus @{
       installation_attempt_id = $InstallationAttemptId
-      installation_state = "installed_pending_desktop_verification"
-      connection_state = $PendingConnectionState
+      installation_state = "installed_pending_codex_loader_verification"
+      connection_state = "configured_pending_codex_loader"
       direct_config_registered = $true
       direct_config_loader_verified = $false
       loader_verification_state = "blocked"
       loader_verification_reason = "codex_cli_unavailable"
       direct_config_rollback_performed = $false
       installed_config_fingerprint = $InstalledConfigFingerprint
-      desktop_process_detected = $DesktopRestartState.desktop_process_detected
-      desktop_process_started_at = $DesktopRestartState.desktop_process_started_at
-      desktop_mcp_registration_updated_at = $DirectRegistrationUpdatedAtUtc.ToString("o")
-      desktop_restart_checked_at = $DesktopRestartState.desktop_restart_checked_at
-      desktop_restart_required = $DesktopRestartState.desktop_restart_required
-      desktop_restart_status = $DesktopRestartState.desktop_restart_status
-      desktop_restart_reason_code = $DesktopRestartState.desktop_restart_reason_code
-      desktop_tool_scan_verified = $false
       conversation_attachment_verified = $false
       end_to_end_verified = $false
     }
     $script:CodexLoaderVerified = $false
     Write-Host "$ConsumerName MCP config updated: $TargetPath"
-    Write-Host "[CONFIGURED - DESKTOP VERIFICATION REQUIRED] MCP config readback and direct transport passed."
-    if ($ConsumerName -eq "ChatGPT Desktop") {
-      Write-Warning "Automatic loader verification is unavailable. The valid local MCP config was preserved; Desktop verification remains pending."
-      Write-Host "Fully quit ChatGPT Desktop, start it again, open a new conversation, run /mcp, and select the exact server name $ServerName."
-      Write-Host "Do not report this state as connected until the Desktop surface and an actual MCP tool call are verified."
-    } else {
-      Write-Warning "A trusted executable Codex host CLI was not found, so loader verification remains pending. The valid config was preserved instead of rolled back."
-      Write-Host "Restart Codex CLI and verify $ServerName with /mcp in a new task."
-    }
+    Write-Host "[CONFIGURED - CODEX LOADER VERIFICATION REQUIRED] MCP config readback and direct transport passed."
+    Write-Warning "A trusted executable Codex host CLI was not found, so loader verification remains pending. The valid config was preserved instead of rolled back."
+    Write-Host "Install or restart Codex CLI and verify $ServerName with /mcp in a new task."
     return
   }
   $LoaderResult = Invoke-CodexCli @("mcp", "get", $ServerName, "--json")
@@ -6931,11 +8317,10 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
     throw "codex mcp get resolved a disabled, stale, or contract-mismatched direct MCP entry for $ServerName."
   }
   $script:CodexLoaderVerified = $true
-  $DesktopRestartState = Get-ChatGptDesktopRestartState -RegistrationUpdatedAtUtc $DirectRegistrationUpdatedAtUtc
   Update-BundleStatus @{
     installation_attempt_id = $InstallationAttemptId
     installation_state = "installed_loader_verified"
-    connection_state = $(if ($DesktopRestartState.desktop_restart_required) { "pending_desktop_restart" } else { "pending_desktop_tool_scan" })
+    connection_state = "configured_pending_codex_conversation"
     direct_config_registered = $true
     direct_config_loader_verified = $true
     loader_verification_state = "verified"
@@ -6943,13 +8328,6 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
     direct_config_rollback_performed = $false
     direct_config_path = $TargetPath
     installed_config_fingerprint = $InstalledConfigFingerprint
-    desktop_process_detected = $DesktopRestartState.desktop_process_detected
-    desktop_process_started_at = $DesktopRestartState.desktop_process_started_at
-    desktop_mcp_registration_updated_at = $DirectRegistrationUpdatedAtUtc.ToString("o")
-    desktop_restart_checked_at = $DesktopRestartState.desktop_restart_checked_at
-    desktop_restart_required = $DesktopRestartState.desktop_restart_required
-    desktop_restart_status = $DesktopRestartState.desktop_restart_status
-    desktop_restart_reason_code = $DesktopRestartState.desktop_restart_reason_code
   }
   $RemovedDuplicates = @($RemovedNames | Where-Object { $_ -and $_ -ne $ServerName } | Select-Object -Unique)
   if ($RemovedDuplicates.Count -gt 0) {
@@ -6957,19 +8335,7 @@ function Install-CodexConfig([string]$ConsumerName = "Codex CLI") {
   }
   Write-Host "$ConsumerName MCP config updated: $TargetPath"
   Write-Host "Verified MCP server name and bundle paths: $ServerName"
-  switch ($DesktopRestartState.desktop_restart_status) {
-    "required" {
-      Write-Warning "[RESTART REQUIRED] ChatGPT Desktop started before this direct MCP registration. Fully quit every ChatGPT.exe process, restart the app, and open a new conversation."
-    }
-    "not_running" { Write-Host "[DESKTOP NOT RUNNING] The next launch will load the direct MCP config." }
-    "up_to_date" { Write-Host "[DESKTOP CURRENT] The running Desktop started after direct MCP registration." }
-    default { Write-Warning "[RESTART STATUS UNKNOWN] Fully restart ChatGPT Desktop before testing." }
-  }
-  if ($ConsumerName -eq "ChatGPT Desktop") {
-    Write-Host "Restart ChatGPT Desktop and verify $ServerName from /mcp in a new conversation."
-  } else {
-    Write-Host "Restart Codex CLI or reload MCP servers to pick up $ServerName."
-  }
+  Write-Host "Restart Codex CLI or reload MCP servers, then verify $ServerName with /mcp in a new task."
   } catch {
     $InstallError = $_
     $FailureReasonCode = [string]$script:DirectInstallFailureReason
@@ -7390,10 +8756,9 @@ function Register-ClaudeCode {
 }
 
 function Show-Codex {
-  param([switch]$ForChatGptDesktop)
   Show-Header
-  $InstallDirect = $InstallCodex -or $ForChatGptDesktop
-  $ConsumerName = if ($ForChatGptDesktop) { "ChatGPT Desktop" } else { "Codex CLI" }
+  $InstallDirect = $InstallCodex
+  $ConsumerName = "Codex CLI"
   if ($InstallDirect) {
     $DirectConfigMutex = New-Object System.Threading.Mutex($false, "Local\PRMCPBuilder-LocalMcpInstallation")
     $DirectConfigLockAcquired = $false
@@ -7408,7 +8773,6 @@ function Show-Codex {
         throw "Local MCP doctor failed; $ConsumerName configuration was not changed."
       }
       Install-CodexConfig $ConsumerName
-      Run-ChatGptDesktopRecognitionObservation (Get-CodexConfigPath)
       $DirectSmokeStatus = Read-JsonFile "bundle_status.json"
       if ([string]$DirectSmokeStatus.installation_attempt_id -ne $InstallationAttemptId) {
         throw "bundle_status.json does not belong to the current installation attempt."
@@ -7419,7 +8783,6 @@ function Show-Codex {
       Write-Host "Direct MCP protocol initialize/tools smoke passed."
       if ($script:CodexLoaderVerified) {
         Run-CodexAppServerMcpCheck
-        Run-ChatGptDesktopRecognitionObservation (Get-CodexConfigPath)
         $PostProbeStatus = Read-JsonFile "bundle_status.json"
         $CurrentConfigFingerprint = if (Test-Path -LiteralPath (Get-CodexConfigPath)) {
           "sha256:" + (Get-McpFileSha256 (Get-CodexConfigPath))
@@ -7435,11 +8798,7 @@ function Show-Codex {
         }
         Complete-ClientConnectionAttempt @("registration", "loader", "transport", "fresh_app_server") $CurrentConfigFingerprint ([string]$PostProbeStatus.runtime_fingerprint)
       } else {
-        if ($ForChatGptDesktop) {
-          Write-Warning "[DESKTOP VERIFICATION PENDING] The local MCP config and direct transport passed, but automatic Desktop loader verification was unavailable."
-        } else {
-          Write-Warning "[LOADER VERIFICATION PENDING] The config and direct transport passed, but a fresh Codex CLI loader inventory was not available."
-        }
+        Write-Warning "[LOADER VERIFICATION PENDING] The config and direct transport passed, but a fresh Codex CLI loader inventory was not available."
         $PendingDirectStatus = Read-JsonFile "bundle_status.json"
         Complete-ClientConnectionAttempt @("registration", "transport") ([string]$PendingDirectStatus.installed_config_fingerprint) ([string]$PendingDirectStatus.runtime_fingerprint)
       }
@@ -7468,23 +8827,36 @@ function Show-ChatGptHttps {
   Warn-IfCoreCommandsMissing | Out-Null
   $Connector = Read-JsonFile "chatgpt_connector.json"
   if (-not $Connector.connector_url) {
-    throw "No ChatGPT Desktop Streamable HTTP URL is ready. Regenerate with --public-url https://your-host.example/mcp."
+    throw "No ChatGPT web HTTPS MCP URL is ready. Regenerate with --public-url https://your-host.example/mcp."
   }
-  Write-Host "ChatGPT Desktop / Codex Streamable HTTP URL:"
+  Write-Host "ChatGPT web remote MCP URL:"
   Write-Host "  $($Connector.connector_url)"
   if (Get-Command Set-Clipboard -ErrorAction SilentlyContinue) {
     $Connector.connector_url | Set-Clipboard
     Write-Host "The connector URL was copied to the clipboard."
   }
   Write-Host ""
-  Write-Host "Deploy the approved runtime to Vercel, then open ChatGPT Desktop Settings > MCP servers > Add server."
-  Write-Host "Choose Streamable HTTP, enter this URL, save, and select Restart."
-  Write-Host "The same server can be configured in the shared ~/.codex/config.toml for Codex CLI and IDE."
-  Write-Host "For a private endpoint, keep MCP_AUTH_TOKEN in the environment and configure bearer_token_env_var, or use OAuth."
+  Write-Host "ChatGPT does not directly connect to a local MCP server."
+  Write-Host "Use ChatGPT web. Confirm that your plan, workspace role, and administrator settings allow Developer mode."
+  Write-Host "Pro supports read/fetch MCP connections in Developer mode; full MCP is for Business, Enterprise, and Edu."
+  Write-Host "Open Settings > Apps > Advanced settings, enable Developer mode, then create an app with this HTTPS /mcp URL."
+  Write-Host "Choose supported authentication, scan tools, and create the app."
+  Write-Host "Official requirements: https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta"
+  Write-Host "Private/on-premises/developer-machine server: https://developers.openai.com/api/docs/guides/secure-mcp-tunnels"
   Write-Host "Validate the deployed endpoint with:"
   Write-Host "  powershell -ExecutionPolicy Bypass -File `"$((BundlePath 'validate_chatgpt_remote_mcp.ps1'))`""
-  Write-Host "Open a new ChatGPT Desktop conversation and use /mcp to confirm $ServerName."
+  Write-Host "Open a new ChatGPT web chat, select the created app, and confirm $ServerName."
   Write-Host "Verification: call search, then call fetch with an id returned by search."
+}
+
+function Show-UnsupportedChatGptLocal {
+  Show-Header
+  Write-Error "ChatGPT local STDIO is unsupported. ChatGPT does not directly connect to a local MCP server."
+  Write-Host "Use -Target chatgpt-remote with a reachable HTTPS /mcp endpoint in ChatGPT web."
+  Write-Host "Official requirements: https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta"
+  Write-Host "For a private, on-premises, or developer-machine server, use OpenAI Secure MCP Tunnel:"
+  Write-Host "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels"
+  throw "Unsupported target: ChatGPT local STDIO"
 }
 
 function Show-ClaudeHttps {
@@ -7513,20 +8885,18 @@ function Show-Menu {
   Write-Host "  1. Claude Code local stdio"
   Write-Host "  2. Codex CLI local stdio"
   Write-Host "  3. Claude Desktop local stdio"
-  Write-Host "  4. ChatGPT Desktop local MCP (Settings-compatible stdio)"
-  Write-Host "  5. ChatGPT Desktop / Codex Vercel HTTPS MCP"
-  Write-Host "  6. Claude Vercel HTTPS MCP"
-  Write-Host "  7. Doctor/readiness check"
+  Write-Host "  4. ChatGPT web remote HTTPS MCP"
+  Write-Host "  5. Claude Vercel HTTPS MCP"
+  Write-Host "  6. Doctor/readiness check"
   $Choice = Read-Host "Target"
   switch ($Choice) {
     "0" { Invoke-WithLocalConnectionFlow { Install-LocalPackage } }
     "1" { Invoke-WithLocalConnectionFlow { Register-ClaudeCode } }
     "2" { Invoke-WithLocalConnectionFlow { Show-Codex } }
     "3" { Invoke-WithLocalConnectionFlow { Show-ClaudeDesktop } }
-    "4" { Invoke-WithLocalConnectionFlow { Show-Codex -ForChatGptDesktop } }
-    "5" { Show-ChatGptHttps }
-    "6" { Show-ClaudeHttps }
-    "7" { Run-Doctor }
+    "4" { Show-ChatGptHttps }
+    "5" { Show-ClaudeHttps }
+    "6" { Run-Doctor }
     default { throw "Unknown choice: $Choice" }
   }
 }
@@ -7553,10 +8923,10 @@ function Invoke-SelectedTarget {
     "claude-desktop" { Show-ClaudeDesktop }
     "claude-code" { Register-ClaudeCode }
     "codex" { Show-Codex }
-    "chatgpt-desktop-direct" { Show-Codex -ForChatGptDesktop }
-    "chatgpt-desktop-local" { Show-Codex -ForChatGptDesktop }
+    "chatgpt-desktop-direct" { Show-UnsupportedChatGptLocal }
+    "chatgpt-desktop-local" { Show-UnsupportedChatGptLocal }
     "chatgpt-remote" { Show-ChatGptHttps }
-    "chatgpt-desktop" { Show-Codex -ForChatGptDesktop }
+    "chatgpt-desktop" { Show-UnsupportedChatGptLocal }
     "chatgpt-https" { Show-ChatGptHttps }
     "claude-remote" { Show-ClaudeHttps }
     "claude-api" { Show-ClaudeHttps }
@@ -7564,7 +8934,7 @@ function Invoke-SelectedTarget {
   }
 }
 
-$LocalConnectionTargets = @("install", "claude-desktop", "claude-code", "codex", "chatgpt-desktop-direct", "chatgpt-desktop-local", "chatgpt-desktop")
+$LocalConnectionTargets = @("install", "claude-desktop", "claude-code", "codex")
 if ($LocalConnectionTargets -contains $Target) {
   # Keep installation, runtime marker creation, registration, and transport
   # verification in one serialized flow.  Releasing after pip alone allows a
@@ -7587,7 +8957,7 @@ if ($LocalConnectionTargets -contains $Target) {
     return (
         script.replace("__SERVER_NAME__", server_name)
         .replace("__EMBEDDED_CLAUDE_DESKTOP_CONFIG_BASE64__", embedded_config_base64)
-        .replace("__EMBEDDED_CHATGPT_DESKTOP_CONFIG_BASE64__", embedded_config_base64)
+        .replace("__EMBEDDED_CODEX_CONFIG_BASE64__", embedded_config_base64)
         .replace(
             "__FILE_SHA256_FUNCTION__",
             "\n".join(_powershell_file_sha256_function_lines()),
@@ -7607,14 +8977,14 @@ def _with_product_embedded_mcp_configs(
     script: str,
     *,
     claude_desktop_config: dict[str, Any],
-    chatgpt_desktop_config: dict[str, Any],
+    codex_config: dict[str, Any],
 ) -> str:
     """Bind each generated installer's fallback to its own client config."""
 
     rendered = script
     for variable_name, config in (
         ("EmbeddedClaudeDesktopConfigBase64", claude_desktop_config),
-        ("EmbeddedChatGptDesktopConfigBase64", chatgpt_desktop_config),
+        ("EmbeddedCodexConfigBase64", codex_config),
     ):
         if not isinstance(config, dict) or not isinstance(config.get("mcpServers"), dict):
             raise ValueError(f"Cannot embed missing product MCP config: {variable_name}")
@@ -7828,17 +9198,9 @@ def _bundle_quickstart(
             "command": "reg-rag-mcp-server",
             "args": stdio_args,
         },
-        "chatgpt_desktop_local": {
-            "profile": "chatgpt-desktop-local",
-            "tool_profile": "chatgpt-data",
-            "transport": "stdio",
-            "primary_registration": "chatgpt_desktop_settings_mcp_servers",
-            "connection_configuration_method": "direct_config",
-            "secret_input_policy": "environment_or_oauth_only",
-            "server": chatgpt_desktop_local,
-            "conversation_attachment_unverified": True,
-            "verification_tools": list(CHATGPT_DATA_TOOL_NAMES),
-        },
+        # Compatibility key retained for older readers.  Its payload contains
+        # no command, args, cwd, env, ui_fields, or mcpServers entry.
+        "chatgpt_desktop_local": dict(chatgpt_desktop_local),
         "claude_desktop": {
             "paste_json_section": "claude_desktop.mcpServers",
             "config_file_candidates": [
@@ -7852,6 +9214,8 @@ def _bundle_quickstart(
         },
         "chatgpt_remote": {
             "profile": "chatgpt-remote",
+            "surface": "chatgpt_web",
+            "web_only": True,
             "setup": chatgpt_remote["chatgpt_setup"]["location"],
             "connector_url": chatgpt_remote["connector_url"],
             "requires_reachable_https": chatgpt_remote["chatgpt_setup"]["requires_reachable_https"],
@@ -7867,13 +9231,16 @@ def _bundle_quickstart(
             ],
             "bearer_token_env_var": remote_auth_token_env,
             "connection_options": ["vercel_https_endpoint"],
+            "official_help_url": CHATGPT_MCP_HELP_URL,
+            "secure_mcp_tunnel_url": CHATGPT_SECURE_MCP_TUNNEL_URL,
+            "plan_requirements": chatgpt_remote["chatgpt_setup"]["plan_requirements"],
         },
         "vercel_https": {
             "stage_command": "reg-rag-mcp-vercel-stage",
             "connector_url": chatgpt_remote["connector_url"],
             "mcp_path": "/mcp",
             "shared_by_clients": [
-                "ChatGPT Desktop",
+                "ChatGPT web",
                 "Codex CLI",
                 "Codex IDE",
                 "Claude",
@@ -7943,6 +9310,8 @@ def _chatgpt_connector_config(
         config_toml["bearer_token_env_var"] = remote_auth_token_env
     return {
         "profile": "chatgpt-remote",
+        "surface": "chatgpt_web",
+        "web_only": True,
         "transport": "streamable-http",
         "connector_name": server_name,
         "connector_url": connector_url,
@@ -7954,10 +9323,14 @@ def _chatgpt_connector_config(
         "end_to_end_verified": False,
         "missing": missing,
         "chatgpt_setup": {
-            "location": "ChatGPT Desktop Settings > MCP servers > Add server",
+            "location": (
+                "ChatGPT web > Settings > Apps > Advanced settings > Developer mode; "
+                "then Apps > Create"
+            ),
+            "surface": "chatgpt_web",
+            "web_only": True,
             "connector_url": connector_url,
             "transport": "streamable-http",
-            "shared_config_file": "~/.codex/config.toml",
             "requires_reachable_https": True,
             "https_endpoint_ready": https_endpoint_ready,
             "authentication_modes": [
@@ -7970,10 +9343,20 @@ def _chatgpt_connector_config(
             "recommended_description": (
                 "Search and fetch approved local regulation evidence from the institution's MCP server."
             ),
+            "official_help_url": CHATGPT_MCP_HELP_URL,
+            "secure_mcp_tunnel_url": CHATGPT_SECURE_MCP_TUNNEL_URL,
+            "direct_local_supported": False,
+            "plan_requirements": {
+                "pro": "Read/fetch MCP connections require Developer mode.",
+                "business_enterprise_edu": (
+                    "Full MCP is available on ChatGPT web; administrator, owner, publishing, "
+                    "and RBAC requirements may apply."
+                ),
+                "mobile": "Custom MCP apps are not available on mobile.",
+            },
             "authentication_note": (
-                "ChatGPT Desktop and Codex support Streamable HTTP with bearer-token environment "
-                "variables or OAuth. Keep token values in the environment or secret manager, not in "
-                "the generated files."
+                "Choose the supported authentication mechanism while creating the ChatGPT web app. "
+                "For OAuth, make sure the provider issues refresh tokens. Keep secrets out of generated files."
             ),
         },
         "config_toml": config_toml,
@@ -7986,34 +9369,38 @@ def _chatgpt_connector_config(
             "mode": "bearer-or-oauth-or-approved-public",
             "oauth_ready": oauth_ready,
             "bearer_token_env_var": remote_auth_token_env,
-            "bearer_supported_by_chatgpt_desktop_and_codex": True,
+            "bearer_supported_by_chatgpt_desktop_and_codex": False,
+            "bearer_token_env_scope": "generated_remote_smoke_and_codex_clients_only",
             "note": (
-                "Use a bearer-token environment variable or OAuth for private endpoints. "
-                "Unauthenticated mode must be an explicit approved public read-only deployment."
+                "For ChatGPT web, select a supported authentication mechanism when creating the app. "
+                "Use OAuth for private remote endpoints when appropriate. Unauthenticated mode must "
+                "be an explicit approved public read-only deployment."
             ),
         },
         "compatible_tools": list(CHATGPT_DATA_TOOL_NAMES),
         "connection_steps": [
             "Stage the approved runtime with reg-rag-mcp-vercel-stage and deploy it to Vercel.",
-            "Open ChatGPT Desktop Settings > MCP servers > Add server.",
-            "Choose Streamable HTTP and enter connector_url.",
-            "For a private endpoint, configure bearer_token_env_var or complete MCP OAuth login.",
-            "Save the server and select Restart.",
+            "In ChatGPT web, confirm that your plan, workspace role, and administrator settings allow Developer mode.",
+            "Open Settings > Apps > Advanced settings, enable Developer mode, and create a new app.",
+            "Enter connector_url as the reachable HTTPS MCP endpoint and choose supported authentication.",
+            "For a private local or on-premises server, use OpenAI Secure MCP Tunnel instead of a direct local connection.",
+            "Scan tools and create the app.",
             "Verify the discovered tool list includes "
             f"{', '.join(CHATGPT_DATA_TOOL_NAMES)} before using the app.",
             "In a new chat, list the catalog, inspect one regulation TOC, article, and reference graph, "
             "review any reported reference cycles, then search and fetch evidence.",
         ],
         "notes": [
-            "ChatGPT Desktop, Codex CLI, and the IDE extension share the same Codex-host MCP configuration.",
-            "Register only the deployed HTTPS /mcp URL for Streamable HTTP; do not enter a local folder.",
+            "ChatGPT custom MCP apps use ChatGPT web and a reachable remote endpoint; ChatGPT does not directly connect to a local MCP server.",
+            "Register only the deployed HTTPS /mcp URL in ChatGPT; do not enter a local command, arguments, folder, or environment.",
             "The chatgpt-data profile keeps the exact search(query) and fetch(id) input signatures required for "
             "data-source compatibility and adds read-only catalog, TOC, exact-article, reference, and "
             "reference-cycle tools.",
             "Citation URLs are absolute user-openable HTTP(S) source URLs or empty when no such source exists.",
             "Do not expose streamable-http or SSE MCP without authentication or approved network controls.",
             "Use only public or separately approved data when routing MCP responses to an external cloud AI.",
-            "ChatGPT web hosted plugins are a separate product path and are not installed by this bundle.",
+            f"Official ChatGPT MCP requirements: {CHATGPT_MCP_HELP_URL}",
+            f"Private-server alternative: {CHATGPT_SECURE_MCP_TUNNEL_URL}",
         ],
     }
 
@@ -8183,35 +9570,67 @@ def _canonical_readme_index_visibility_command(config: dict[str, Any]) -> str:
 
 def _setup_bundle_readme(*, config: dict[str, Any], files: dict[str, str], server_name: str) -> str:
     """Return the canonical direct-connection guide shipped in new bundles."""
-    connection_rows = "\n".join(
+    connections = _setup_bundle_connections(config)
+    local_connection_rows = "\n".join(
         f"| {item['client']} | {item['mode']} | `{item['primary_file']}` | {item['operator_action']} |"
-        for item in _setup_bundle_connections(config)
+        for item in connections
+        if item["mode"] == "local_stdio"
+    )
+    remote_connection_rows = "\n".join(
+        f"| {item['client']} | {item['mode']} | `{item['primary_file']}` | {item['operator_action']} |"
+        for item in connections
+        if item["mode"] == "streamable_http"
     )
     index_visibility_command = _canonical_readme_index_visibility_command(config)
     return f"""# {server_name} MCP bundle
 
-This bundle uses direct MCP configuration only. It does not contain BAT launchers or agent prompts.
+This bundle separates supported local stdio clients from remote HTTPS clients. It does not contain BAT launchers or agent prompts.
 
-## Local stdio
+## Supported local stdio: Codex and Claude
 
 Register the generated `command`, `args`, and `cwd` with the client, plus `env` only when the server requires it. A directory name alone is not an MCP stdio configuration:
 
 | Client | Transport | Direct artifact | Action |
 | --- | --- | --- | --- |
-{connection_rows}
+{local_connection_rows}
 
 Core local files:
 
 - Codex CLI: `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`
 - Claude Code: `{files.get('claude_code_stdio', SETUP_BUNDLE_FILES['claude_code_stdio'])}`
 - Claude Desktop: `{files.get('claude_desktop', SETUP_BUNDLE_FILES['claude_desktop'])}`
-- ChatGPT Desktop: `{files.get('chatgpt_desktop_local', SETUP_BUNDLE_FILES['chatgpt_desktop_local'])}`
 - stdio server: `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`
 - diagnostics: `{files.get('doctor', SETUP_BUNDLE_FILES['doctor'])}`
 
 Restart the client after registration. Verify server discovery, then call `search` and `fetch`.
 
-## Vercel HTTPS MCP
+## Local runtime on a fresh target PC
+
+- An installed Windows app may use its installed executable on the same PC where this bundle was generated.
+- A handoff ZIP does not include that installed executable. An absolute source-PC executable path is not target-PC runtime evidence.
+- On a fresh target PC, supported local stdio requires either a separately supplied compatible executable beside the extracted bundle or Python 3.11+.
+- Without that executable, install Python 3.11+ and run `install_local_package.ps1` first. Include an approved wheel in the ZIP or provide an approved wheel/source package separately. A wheel does not include Python itself.
+- Remote HTTPS clients do not require Python on the client PC after the remote MCP endpoint has been deployed and approved.
+
+## ChatGPT web: remote HTTPS MCP only
+
+ChatGPT does not directly connect to a local MCP server. Do not enter a local command, arguments, working directory, or environment in ChatGPT. The retained `{files.get('chatgpt_desktop_local', SETUP_BUNDLE_FILES['chatgpt_desktop_local'])}` file is a warning-only compatibility artifact with `support_status=unsupported` and `direct_local_supported=false`; it is not a runnable config.
+
+Current OpenAI requirements:
+
+- Use ChatGPT **web**; custom MCP apps are not available on mobile.
+- Enable Developer mode before creating the app. Plan, workspace role, administrator approval, publishing, and RBAC requirements may apply.
+- Pro can connect read/fetch MCPs in Developer mode. Full MCP is available to Business, Enterprise, and Edu.
+- Official requirements: {CHATGPT_MCP_HELP_URL}
+- For a private, on-premises, or developer-machine server, use OpenAI Secure MCP Tunnel: {CHATGPT_SECURE_MCP_TUNNEL_URL}
+
+Remote connection artifacts:
+
+| Client | Transport | Direct artifact | Action |
+| --- | --- | --- | --- |
+{remote_connection_rows}
+
+## Prepare a reachable Vercel HTTPS endpoint
 
 Prepare a clean deployment directory from the repository root:
 
@@ -8225,7 +9644,7 @@ Deploy that staging directory to Vercel. The public Streamable HTTP endpoint is:
 https://<deployment>/mcp
 ```
 
-The same deployment and `/mcp` endpoint serve ChatGPT Desktop, Codex, and Claude; do not deploy separate client-specific MCP servers. For an approved public read-only endpoint, set `MCP_ALLOW_UNAUTHENTICATED_HTTP=true` and leave `MCP_AUTH_TOKEN` empty. For a private ChatGPT Desktop or Codex connection, keep `MCP_AUTH_TOKEN` in Vercel and the local environment, then configure `bearer_token_env_var`, or use OAuth. Configure matching `MCP_TENANT_ID`, `MCP_PROFILE_ID`, and any custom-domain `MCP_ALLOWED_HTTP_HOSTS` in Vercel. Register only the final HTTPS `/mcp` URL and approved authentication in each client.
+The same deployment and `/mcp` endpoint can serve ChatGPT web, Codex, and Claude; do not deploy separate client-specific MCP servers. For an approved public read-only endpoint, set `MCP_ALLOW_UNAUTHENTICATED_HTTP=true` and leave `MCP_AUTH_TOKEN` empty. For private remote data, use an approved authentication design such as OAuth; for a server that must remain private on-premises or on a developer machine, use Secure MCP Tunnel. Configure matching `MCP_TENANT_ID`, `MCP_PROFILE_ID`, and any custom-domain `MCP_ALLOWED_HTTP_HOSTS` in Vercel. In ChatGPT web, open Settings > Apps > Advanced settings, enable Developer mode, then use Apps > Create with the final HTTPS `/mcp` URL, choose supported authentication, scan tools, and create the app.
 
 ## Security
 
@@ -8244,35 +9663,67 @@ The same deployment and `/mcp` endpoint serve ChatGPT Desktop, Codex, and Claude
 
 def _setup_bundle_readme_ko(*, config: dict[str, Any], files: dict[str, str], server_name: str) -> str:
     """Return the Korean canonical direct-connection guide shipped in new bundles."""
-    connection_rows = "\n".join(
+    connections = _setup_bundle_connections(config)
+    local_connection_rows = "\n".join(
         f"| {item['client']} | {item['mode']} | `{item['primary_file']}` | {item['operator_action']} |"
-        for item in _setup_bundle_connections(config)
+        for item in connections
+        if item["mode"] == "local_stdio"
+    )
+    remote_connection_rows = "\n".join(
+        f"| {item['client']} | {item['mode']} | `{item['primary_file']}` | {item['operator_action']} |"
+        for item in connections
+        if item["mode"] == "streamable_http"
     )
     index_visibility_command = _canonical_readme_index_visibility_command(config)
     return f"""# {server_name} MCP 번들
 
-이 번들은 MCP 정식 직접 연결만 사용합니다. BAT 실행 파일과 에이전트 연결 프롬프트는 포함하지 않습니다.
+이 번들은 지원되는 로컬 stdio 클라이언트와 원격 HTTPS 클라이언트를 분리합니다. BAT 실행 파일과 에이전트 연결 프롬프트는 포함하지 않습니다.
 
-## 로컬 stdio
+## 지원되는 로컬 stdio: Codex와 Claude
 
 생성된 `command`, `args`, `cwd`를 클라이언트에 등록하고 서버가 요구할 때만 `env`를 추가합니다. 디렉터리명만 지정해서는 stdio MCP가 인식되지 않습니다.
 
 | 클라이언트 | 전송 | 직접 적용 파일 | 작업 |
 | --- | --- | --- | --- |
-{connection_rows}
+{local_connection_rows}
 
 핵심 파일:
 
 - Codex CLI: `{files.get('codex_config', SETUP_BUNDLE_FILES['codex_config'])}`
 - Claude Code: `{files.get('claude_code_stdio', SETUP_BUNDLE_FILES['claude_code_stdio'])}`
 - Claude Desktop: `{files.get('claude_desktop', SETUP_BUNDLE_FILES['claude_desktop'])}`
-- ChatGPT Desktop: `{files.get('chatgpt_desktop_local', SETUP_BUNDLE_FILES['chatgpt_desktop_local'])}`
 - stdio 서버: `{files.get('stdio_launcher', SETUP_BUNDLE_FILES['stdio_launcher'])}`
 - 연결 진단: `{files.get('doctor', SETUP_BUNDLE_FILES['doctor'])}`
 
 등록 후 클라이언트를 완전히 재시작하고 서버가 보이는지 확인한 뒤 `search`와 `fetch`를 실제 호출합니다.
 
-## Vercel HTTPS MCP
+## 새 대상 PC의 로컬 실행 조건
+
+- 이 번들을 만든 PC에서는 설치된 Windows 앱의 EXE를 사용할 수 있습니다.
+- 전달 ZIP에는 원 PC에 설치된 EXE가 포함되지 않으며, 원 PC EXE의 절대 경로는 대상 PC 실행 근거가 아닙니다.
+- 새 대상 PC에서 지원되는 로컬 stdio를 쓰려면 압축을 푼 번들 옆에 별도로 제공된 호환 EXE가 있거나 Python 3.11+가 설치되어 있어야 합니다.
+- 호환 EXE가 없으면 Python 3.11+를 설치한 뒤 `install_local_package.ps1`을 먼저 실행하세요. ZIP에 승인된 wheel을 포함하거나 승인된 wheel/소스 패키지를 별도로 제공해야 하며, wheel 자체에는 Python이 포함되지 않습니다.
+- 원격 MCP endpoint를 배포·승인한 뒤 사용하는 HTTPS 클라이언트에는 클라이언트 PC의 Python이 필요하지 않습니다.
+
+## ChatGPT 웹: 원격 HTTPS MCP만 지원
+
+ChatGPT는 로컬 MCP 서버에 직접 연결하지 않습니다. ChatGPT에 로컬 Command, Arguments, 작업 폴더 또는 환경변수를 입력하지 마세요. 남아 있는 `{files.get('chatgpt_desktop_local', SETUP_BUNDLE_FILES['chatgpt_desktop_local'])}`은 이전 판독기 호환용 경고 파일이며 `support_status=unsupported`, `direct_local_supported=false`인 실행 불가 파일입니다.
+
+현재 OpenAI 공식 조건:
+
+- ChatGPT **웹**을 사용합니다. 사용자 지정 MCP 앱은 모바일에서 사용할 수 없습니다.
+- 앱을 만들기 전에 Developer mode를 켭니다. 플랜, 워크스페이스 역할, 관리자 승인, 게시와 RBAC 조건이 적용될 수 있습니다.
+- Pro는 Developer mode에서 read/fetch MCP를 연결할 수 있습니다. full MCP는 Business·Enterprise·Edu 대상입니다.
+- 공식 조건: {CHATGPT_MCP_HELP_URL}
+- 사설망·온프레미스·개발 PC 서버는 OpenAI Secure MCP Tunnel을 사용합니다: {CHATGPT_SECURE_MCP_TUNNEL_URL}
+
+원격 연결 파일:
+
+| 클라이언트 | 전송 | 직접 적용 파일 | 작업 |
+| --- | --- | --- | --- |
+{remote_connection_rows}
+
+## 외부에서 접속 가능한 Vercel HTTPS endpoint 준비
 
 저장소 루트에서 승인 runtime만 포함하는 배포 디렉터리를 준비합니다.
 
@@ -8286,7 +9737,7 @@ reg-rag-mcp-vercel-stage --runtime-data-dir .\\data --out-dir .\\vercel-mcp-stag
 https://<deployment>/mcp
 ```
 
-같은 Vercel 배포와 `/mcp` endpoint를 ChatGPT Desktop·Codex·Claude가 공통으로 사용하므로 클라이언트별 서버를 따로 배포하지 않습니다. 승인된 공개 read-only endpoint는 `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`를 명시하고 `MCP_AUTH_TOKEN`을 비웁니다. 비공개 ChatGPT Desktop·Codex 연결은 `MCP_AUTH_TOKEN`을 Vercel과 로컬 환경변수에 보관하고 클라이언트 설정에 `bearer_token_env_var`를 지정하거나 OAuth를 사용합니다. Vercel에는 manifest와 일치하는 `MCP_TENANT_ID`, `MCP_PROFILE_ID`, 사용자 도메인의 `MCP_ALLOWED_HTTP_HOSTS`를 설정합니다. 각 클라이언트에는 같은 최종 HTTPS `/mcp` 주소와 승인된 인증만 등록합니다.
+같은 Vercel 배포와 `/mcp` endpoint를 ChatGPT 웹·Codex·Claude가 공통으로 사용할 수 있으므로 클라이언트별 서버를 따로 배포하지 않습니다. 승인된 공개 read-only endpoint는 `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`를 명시하고 `MCP_AUTH_TOKEN`을 비웁니다. 비공개 원격 데이터에는 OAuth 같은 승인된 인증 방식을 사용하고, 서버를 사설망·온프레미스·개발 PC에 비공개로 유지해야 하면 Secure MCP Tunnel을 사용합니다. Vercel에는 manifest와 일치하는 `MCP_TENANT_ID`, `MCP_PROFILE_ID`, 사용자 도메인의 `MCP_ALLOWED_HTTP_HOSTS`를 설정합니다. ChatGPT 웹에서는 Settings > Apps > Advanced settings에서 Developer mode를 켜고, Apps > Create에서 최종 HTTPS `/mcp` URL과 지원되는 인증을 선택한 뒤 도구 스캔을 완료합니다.
 
 ## 보안
 
@@ -8347,7 +9798,6 @@ def _doctor_index_visibility_args(
 
 def _powershell_doctor_bundle_script(args: list[object]) -> str:
     doctor_args = list(args) + ["--bundle-dir", "$BundleDir", "--json", "--out-json", "$DoctorReport"]
-    raw_value_indexes = {len(args) + 1, len(args) + 4}
     lines: list[str] = [
         '$ErrorActionPreference = "Stop"',
         *_powershell_bundle_data_dir_lines(),
@@ -8413,7 +9863,6 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '$SmokeReport = Join-Path $BundleDir "mcp_client_config_smoke.json"',
         '$CodexConfig = Join-Path $BundleDir "codex_config_snippet.toml"',
         '$ClaudeDesktopConfig = Join-Path $BundleDir "claude_desktop_config.json"',
-        '$ChatGptDesktopConfig = Join-Path $BundleDir "chatgpt_desktop_local_mcp.json"',
         '$BundleStatus = Join-Path $BundleDir "bundle_status.json"',
         '$StdioLauncher = Join-Path $BundleDir "run_mcp_stdio_server.ps1"',
         'if (Test-Path -LiteralPath $SmokeReport) { Remove-Item -LiteralPath $SmokeReport -Force }',
@@ -8459,33 +9908,19 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         '  Write-JsonUtf8NoBom $ClaudeDesktopConfig $Claude 40',
         '  return @($Server.args)',
         '}',
-        'function Update-ChatGptDesktopBundleConfig {',
-        '  $Desktop = Get-Content -LiteralPath $ChatGptDesktopConfig -Raw -Encoding UTF8 | ConvertFrom-Json',
-        '  if (-not $Desktop.ui_fields) { throw "Generated ChatGPT Desktop config is missing ui_fields." }',
-        '  if ([string]$Desktop.ui_fields.name -ne $ServerName) { throw "Generated ChatGPT Desktop config has the wrong MCP server name." }',
-        '  $Desktop.ui_fields.command = "powershell.exe"',
-        '  $Desktop.ui_fields.transport = "stdio"',
-        '  $Desktop.ui_fields.cwd = $BundleDir',
-        '  $Desktop.ui_fields.args = @(Set-McpBundlePaths @($Desktop.ui_fields.args))',
-        '  Write-JsonUtf8NoBom $ChatGptDesktopConfig $Desktop 40',
-        '  return @($Desktop.ui_fields.args)',
-        '}',
         'if (-not (Test-Path -LiteralPath $CodexConfig)) { throw "Missing generated Codex config snippet: $CodexConfig" }',
         'if (-not (Test-Path -LiteralPath $ClaudeDesktopConfig)) { throw "Missing generated Claude Desktop config: $ClaudeDesktopConfig" }',
-        'if (-not (Test-Path -LiteralPath $ChatGptDesktopConfig)) { throw "Missing generated ChatGPT Desktop direct config: $ChatGptDesktopConfig" }',
         'if (-not (Test-Path -LiteralPath $StdioLauncher)) { throw "Missing generated stdio launcher: $StdioLauncher" }',
         '$ClaudeDesktopArgs = Update-ClaudeDesktopBundleConfig',
-        '$ChatGptDesktopArgs = Update-ChatGptDesktopBundleConfig',
-        '# ChatGPT Desktop and Codex share the same local stdio launch contract.',
-        'Write-CodexBundleConfig $ChatGptDesktopArgs',
-        '$SmokeArgs = @("--server-name", $ServerName, "--codex-config", $CodexConfig, "--claude-desktop-config", $ClaudeDesktopConfig, "--chatgpt-desktop-config", $ChatGptDesktopConfig, "--out-json", $SmokeReport, "--fail-on-issue")',
+        'Write-CodexBundleConfig $ClaudeDesktopArgs',
+        '$SmokeArgs = @("--server-name", $ServerName, "--codex-config", $CodexConfig, "--claude-desktop-config", $ClaudeDesktopConfig, "--out-json", $SmokeReport, "--fail-on-issue")',
         '$McpPython = Resolve-BundleModulePython "scripts.run_mcp_client_config_smoke"',
         '$SmokeExitCode = Invoke-BundlePythonModule $McpPython "scripts.run_mcp_client_config_smoke" $SmokeArgs',
         '$SmokeResult = $null',
         'if (Test-Path -LiteralPath $SmokeReport) { try { $SmokeResult = Get-Content -LiteralPath $SmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $SmokeResult = $null } }',
-        '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.launcher_ready -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and @($SmokeResult.results).Count -eq 3',
+        '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.launcher_ready -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and @($SmokeResult.results).Count -eq 2',
         'Write-Host "Client config smoke report: $SmokeReport"',
-        'if (-not $SmokeVerified) { throw "Client config smoke did not produce a fresh passing three-client report." }',
+        'if (-not $SmokeVerified) { throw "Client config smoke did not produce a fresh passing Codex and Claude Desktop report." }',
     ]
     return "\n".join(lines).replace("__SERVER_NAME__", server_name)
 
@@ -8509,7 +9944,7 @@ def _powershell_chatgpt_remote_validation_script(
         '$BundleStatus = Join-Path $BundleDir "bundle_status.json"',
         'function Write-Utf8NoBom([string]$LiteralPath, [string]$Value) { $Utf8NoBom = New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($LiteralPath, $Value, $Utf8NoBom) }',
         'function Write-JsonUtf8NoBom([string]$LiteralPath, [object]$Value, [int]$Depth = 50) { Write-Utf8NoBom $LiteralPath (($Value | ConvertTo-Json -Depth $Depth) + [Environment]::NewLine) }',
-        'if ([string]::IsNullOrWhiteSpace($RemoteUrl)) { throw "No ChatGPT Desktop/Codex HTTPS endpoint is configured. Regenerate with --public-url https://your-host.example/mcp." }',
+        'if ([string]::IsNullOrWhiteSpace($RemoteUrl)) { throw "No ChatGPT web HTTPS MCP endpoint is configured. Regenerate with --public-url https://your-host.example/mcp." }',
         'if (-not $RemoteUrl.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) { throw "ChatGPT remote MCP requires an https:// endpoint." }',
         '$SmokeArgs = @("--server-name", $ServerName, "--remote-url", $RemoteUrl, "--out-json", $SmokeReport, "--fail-on-issue")',
         'if ($TokenEnv) { $SmokeArgs += @("--remote-token-env", $TokenEnv) }',
@@ -8521,7 +9956,7 @@ def _powershell_chatgpt_remote_validation_script(
         '$RemoteResults = if ($SmokeResult -and $SmokeResult.results) { @($SmokeResult.results | Where-Object { [string]$_.label -eq "chatgpt_remote" }) } else { @() }',
         '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and $RemoteResults.Count -eq 1 -and $RemoteResults[0].auth_wire_verified -eq $true -and $RemoteResults[0].contract_verified -eq $true',
         'Write-Host "Remote MCP validation report: $SmokeReport"',
-        'Write-Host "Protocol validation does not replace ChatGPT Desktop Settings > MCP servers registration, Restart, /mcp discovery, or an actual tool call."',
+        'Write-Host "Protocol validation does not replace ChatGPT web Developer mode permission, Apps > Create tool scan, app selection in a new chat, or an actual tool call."',
         'if (-not $SmokeVerified) { throw "Remote MCP validation did not produce a fresh passing authenticated protocol report." }',
     ]
     return "\n".join(lines)
@@ -8707,12 +10142,17 @@ def _powershell_stdio_launcher_script(
     ]
     if packaged_executable:
         escaped_executable = packaged_executable.replace("'", "''")
+        escaped_executable_name = Path(packaged_executable).name.replace("'", "''")
         lines.extend(
             [
-                f"$PackagedExe = '{escaped_executable}'",
-                'if (Test-Path -LiteralPath $PackagedExe) {',
-                '  & $PackagedExe --mcp-server @ServerArgs',
-                '  exit $LASTEXITCODE',
+                f"$InstalledPackagedExe = '{escaped_executable}'",
+                f"$BundledPackagedExe = Join-Path $BundleDir '{escaped_executable_name}'",
+                'foreach ($PackagedExe in @($BundledPackagedExe, $InstalledPackagedExe)) {',
+                '  if ([string]::IsNullOrWhiteSpace([string]$PackagedExe)) { continue }',
+                '  if (Test-Path -LiteralPath $PackagedExe -PathType Leaf) {',
+                '    & $PackagedExe --mcp-server @ServerArgs',
+                '    exit $LASTEXITCODE',
+                '  }',
                 '}',
             ]
         )
@@ -8894,7 +10334,7 @@ def _powershell_stdio_launcher_script(
             '  }',
             '  throw "The installed MCP console command is not importable. Install the bundle wheel or set REG_RAG_PYTHON to its Python executable before reconnecting."',
             '}',
-            'throw "No usable MCP Python runtime or reg-rag-mcp-server command is available. Review the stderr diagnostics above, run install_local_package.ps1 if needed, then restart the MCP client."',
+            'throw "No usable local MCP runtime is available. A handoff ZIP does not include the Windows application executable. On a fresh target PC, place a compatible packaged executable beside this bundle or install Python 3.11+, then run install_local_package.ps1 with an included wheel or approved package source before reconnecting."',
         ]
     )
     return "\n".join(lines)
@@ -8961,7 +10401,14 @@ def _powershell_bundle_runtime_module_resolver_lines() -> list[str]:
         '    $script:McpResolvedSourceProjectRoot = $script:McpPreferredProjectRoot',
         '    return (Resolve-Path -LiteralPath $script:McpPreferredPython).Path',
         '  }',
-        '  if ($env:REG_RAG_PYTHON -and (Test-BundlePythonModule $env:REG_RAG_PYTHON $ModuleName)) { return (Resolve-Path -LiteralPath $env:REG_RAG_PYTHON).Path }',
+        '  $EnvProjectRoot = ""',
+        '  if ($env:REG_RAG_PYTHON_PROJECT_ROOT -and (Test-Path -LiteralPath $env:REG_RAG_PYTHON_PROJECT_ROOT -PathType Container)) {',
+        '    $EnvProjectRoot = (Resolve-Path -LiteralPath $env:REG_RAG_PYTHON_PROJECT_ROOT).Path',
+        '  }',
+        '  if ($env:REG_RAG_PYTHON -and (Test-BundlePythonModule $env:REG_RAG_PYTHON $ModuleName $EnvProjectRoot)) {',
+        '    if ($EnvProjectRoot) { $script:McpResolvedSourceProjectRoot = $EnvProjectRoot }',
+        '    return (Resolve-Path -LiteralPath $env:REG_RAG_PYTHON).Path',
+        '  }',
         '  throw "No recorded or explicitly selected Python 3.11+ runtime can import $ModuleName. Run install_local_package.ps1 once, then retry."',
         '}',
         'function Invoke-BundlePythonModule([string]$PythonPath, [string]$ModuleName, [object[]]$Arguments) {',
@@ -9155,9 +10602,10 @@ def parse_args() -> argparse.Namespace:
         ],
         default="generic",
         help=(
-            "Output shape for the target client. Use chatgpt-desktop-local for the local stdio contract, "
-            "chatgpt-remote or claude-remote for reachable HTTPS Streamable HTTP, or bundle for all "
-            "supported clients. The chatgpt and claude-api values remain legacy aliases."
+            "Output shape for the target client. chatgpt-desktop-local is an accepted legacy input "
+            "that emits an explicit unsupported warning and no runnable config. Use chatgpt-remote "
+            "for ChatGPT web with a reachable HTTPS MCP endpoint, claude-remote for Claude HTTPS, "
+            "or bundle for supported clients. The chatgpt and claude-api values remain legacy aliases."
         ),
     )
     parser.add_argument(
@@ -9169,8 +10617,8 @@ def parse_args() -> argparse.Namespace:
         "--remote-auth-token-env",
         default="MCP_AUTH_TOKEN",
         help=(
-            "Environment variable used for remote HTTP bearer auth. ChatGPT Desktop and Codex "
-            "store the variable name as bearer_token_env_var; keep the token value out of generated files."
+            "Environment variable used by generated remote validation and compatible clients for bearer auth. "
+            "ChatGPT web authentication is selected when creating the app; keep token values out of generated files."
         ),
     )
     parser.add_argument(
@@ -9214,7 +10662,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-wheel",
         action="store_true",
-        help="Include the latest dist/reg_rag_preprocessor-*.whl in the setup bundle zip.",
+        help=(
+            "Include the latest dist/reg_rag_preprocessor-*.whl in the setup bundle zip. "
+            "The wheel is package payload only; a fresh target still needs Python 3.11+ unless a "
+            "compatible packaged executable is supplied beside the bundle."
+        ),
     )
     parser.add_argument(
         "--wheel-path",

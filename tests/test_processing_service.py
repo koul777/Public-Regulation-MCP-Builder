@@ -12,7 +12,7 @@ from app.core.pipeline import processing_options_payload
 from app.core.pipeline import quality_profile_config_hash
 from app.parsers.base import parser_uncertainty_metadata
 from app.schemas.chunk import Chunk, ChunkOptions
-from app.schemas.document import Document
+from app.schemas.document import Document, ProcessingJob
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 from app.schemas.quality import QualityReport
 from app.schemas.run import ProcessingRun
@@ -166,6 +166,85 @@ class ProcessingServiceTests(unittest.TestCase):
 
         self.assertTrue(service.quality_gate.strict_profile_ids)
 
+    def test_process_agent_review_request_false_skips_provider_and_records_reason(self) -> None:
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="Review opt-out rule",
+                    file_type="pdf",
+                    pages=[
+                        ParsedPage(
+                            page_no=1,
+                            blocks=[ParsedBlock(type="table", text="table text requiring review")],
+                        )
+                    ],
+                    raw_text="table text requiring review",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_model="review-model",
+            )
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_review_opt_out",
+                filename="review-opt-out.pdf",
+                document_name="Review opt-out rule",
+                file_type="pdf",
+                file_hash="review-opt-out-hash",
+                tenant_id="tenant-a",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            service = ProcessingService(settings=settings, repository=repo)
+            provider_calls: list[tuple] = []
+            service.agent_review_executor.http_post = (
+                lambda *args: provider_calls.append(args) or {}
+            )
+            progress_events: list[tuple[int, str]] = []
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={"status": "disabled", "table_count": 0, "tables": []},
+            ), patch.object(
+                service,
+                "_agent_review_content_hash_cache",
+                wraps=service._agent_review_content_hash_cache,
+            ) as content_hash_cache:
+                job = service.process(
+                    document.document_id,
+                    ChunkOptions(enable_agent_review=False),
+                    progress_callback=lambda current_job: progress_events.append(
+                        (current_job.progress, current_job.message)
+                    ),
+                )
+
+            completed_run = repo.latest_completed_run(document.document_id)
+
+        self.assertEqual("completed", job.status)
+        self.assertEqual([], provider_calls)
+        content_hash_cache.assert_not_called()
+        self.assertIsNotNone(completed_run)
+        agent_review = completed_run.stats["agent_review"]
+        self.assertFalse(agent_review["enabled"])
+        self.assertFalse(agent_review["request_enabled"])
+        self.assertTrue(agent_review["provider_execution_ready"])
+        self.assertFalse(agent_review["provider_execution_enabled"])
+        self.assertEqual("skipped", agent_review["status"])
+        self.assertEqual("agent_review_not_requested", agent_review["skip_reason"])
+        self.assertEqual(0, agent_review["api_call_count"])
+        self.assertIn((85, "전처리 결과 검증을 마무리하는 중"), progress_events)
+        self.assertFalse(any("AI 검수" in message for _, message in progress_events))
+
     def test_process_propagates_document_apba_id_into_chunk_metadata(self) -> None:
         class Parser:
             def parse(self, path: Path, document_id: str) -> ParsedDocument:
@@ -211,7 +290,10 @@ class ProcessingServiceTests(unittest.TestCase):
             service = ProcessingService(settings=settings, repository=repo)
             progress_events: list[tuple[int, str]] = []
 
-            with patch("app.services.processing_service.get_parser", return_value=Parser()), patch.object(
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch.object(
                 service.kordoc_table_parser,
                 "parse_file",
                 return_value={
@@ -224,7 +306,14 @@ class ProcessingServiceTests(unittest.TestCase):
                     "kordoc_input_extension": ".pdf",
                     "kordoc_timeout_seconds": 120,
                 },
-            ):
+            ), patch.object(
+                repo,
+                "list_documents",
+                wraps=repo.list_documents,
+            ) as list_documents, patch(
+                "app.services.processing_service.processing_options_payload",
+                wraps=processing_options_payload,
+            ) as options_payload:
                 job = service.process(
                     document.document_id,
                     ChunkOptions(include_context_header=False),
@@ -234,8 +323,16 @@ class ProcessingServiceTests(unittest.TestCase):
                 )
 
             chunks = repo.get_chunks(document.document_id)
+            completed_run = repo.latest_completed_run(document.document_id)
 
         self.assertEqual(job.status, "completed")
+        self.assertEqual(1, list_documents.call_count)
+        self.assertEqual(1, options_payload.call_count)
+        self.assertIsNotNone(completed_run)
+        self.assertGreaterEqual(
+            completed_run.stats["phase_timings_ms"]["metadata_inference_and_staging"],
+            0.0,
+        )
         self.assertIn((15, "원본 파일에서 텍스트를 추출하는 중"), progress_events)
         self.assertIn((35, "텍스트 추출 완료 · 통합 규정 구조를 분석하는 중"), progress_events)
         self.assertIn((60, "문서 구조 분석 완료 · 청크를 만드는 중"), progress_events)
@@ -400,6 +497,48 @@ class ProcessingServiceTests(unittest.TestCase):
             self.assertIn("skipped", job.message)
             self.assertEqual(len(repo.list_runs(document.document_id)), 1)
 
+    def test_process_returns_live_job_instead_of_starting_second_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc-live-processing-claim",
+                filename="missing.pdf",
+                file_type="pdf",
+                file_hash="same-hash",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            active_job = ProcessingJob(
+                job_id="job-live-processing-claim",
+                document_id=document.document_id,
+                status="processing",
+                progress=42,
+                message="Parsing",
+            )
+            claim = repo.begin_processing_claim(
+                document_id=document.document_id,
+                run_id="run-live-processing-claim",
+                job_id=active_job.job_id,
+            )
+            self.assertTrue(claim.acquired)
+            repo.upsert_job(active_job)
+            service = ProcessingService(settings=settings, repository=repo)
+
+            with patch("app.services.processing_service.get_parser") as get_parser:
+                returned = service.process(document.document_id, ChunkOptions())
+
+            get_parser.assert_not_called()
+            self.assertEqual(active_job.job_id, returned.job_id)
+            self.assertEqual("processing", returned.status)
+            self.assertEqual(42, returned.progress)
+            self.assertEqual(1, len(list(repo.job_progress_root.glob("*.json"))))
+            repo.finish_processing_claim(
+                document_id=document.document_id,
+                run_id=claim.run_id,
+                owner_run_id=None,
+            )
+
     def test_process_does_not_skip_completed_run_with_missing_outputs(self) -> None:
         class ParserExpected:
             def parse(self, *args, **kwargs):
@@ -541,6 +680,57 @@ class ProcessingServiceTests(unittest.TestCase):
             with patch("app.services.processing_service.get_parser", return_value=ParserExpected()) as get_parser:
                 with self.assertRaisesRegex(RuntimeError, "parse attempted"):
                     service.process(document.document_id, options)
+
+            get_parser.assert_called_once()
+
+    def test_process_does_not_reuse_completed_run_when_agent_review_request_changes(self) -> None:
+        class ParserExpected:
+            def parse(self, *args, **kwargs):
+                raise RuntimeError("parse attempted")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp) / "data",
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_model="model-a",
+            )
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_agent_request_change",
+                filename="missing.pdf",
+                file_type="pdf",
+                file_hash="same-hash",
+                status="completed",
+            )
+            repo.upsert_document(document)
+            artifacts = _save_reusable_outputs(settings, repo, document.document_id)
+            repo.upsert_run(
+                ProcessingRun(
+                    run_id="run_agent_request_disabled",
+                    document_id=document.document_id,
+                    job_id="job_agent_request_disabled",
+                    status="completed",
+                    started_at=datetime.now(timezone.utc),
+                    elapsed_seconds=1.0,
+                    options=processing_options_payload(
+                        ChunkOptions(enable_agent_review=False),
+                        settings=settings,
+                    ),
+                    artifacts=artifacts,
+                )
+            )
+            service = ProcessingService(settings=settings, repository=repo)
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=ParserExpected(),
+            ) as get_parser:
+                with self.assertRaisesRegex(RuntimeError, "parse attempted"):
+                    service.process(
+                        document.document_id,
+                        ChunkOptions(enable_agent_review=True),
+                    )
 
             get_parser.assert_called_once()
 

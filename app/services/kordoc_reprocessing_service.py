@@ -201,7 +201,11 @@ def _reprocessing_chunk_options(
     values = {key: value for key, value in prior_options.items() if key in allowed_fields}
     values.setdefault("max_chunk_chars", settings.default_max_chunk_chars)
     values.setdefault("overlap_chars", settings.default_overlap_chars)
-    values["enable_agent_review"] = True
+    # Kordoc recovery is a parser-quality repair, not implicit consent to send
+    # regulation text to an external AI provider.  Preserve an explicit prior
+    # choice when the newer run manifest recorded it; legacy/no-run recovery
+    # defaults to the local-only path and still requires human review.
+    values.setdefault("enable_agent_review", False)
     return ChunkOptions.model_validate(values)
 
 

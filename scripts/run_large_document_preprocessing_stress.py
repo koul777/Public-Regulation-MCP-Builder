@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
+import platform
 import sys
 import time
 import tracemalloc
@@ -83,6 +86,7 @@ def run_large_document_preprocessing_stress(
 
     started_at = datetime.now(timezone.utc)
     started_perf = time.perf_counter()
+    started_process_cpu = time.process_time()
     tracemalloc.start()
     try:
         job = processing_service.process(document.document_id, options, progress_callback=_record_progress)
@@ -90,6 +94,11 @@ def run_large_document_preprocessing_stress(
     finally:
         tracemalloc.stop()
     elapsed_seconds = round(time.perf_counter() - started_perf, 3)
+    process_cpu_seconds = round(time.process_time() - started_process_cpu, 3)
+    host_runtime_evidence = build_host_runtime_evidence(
+        wall_seconds=elapsed_seconds,
+        process_cpu_seconds=process_cpu_seconds,
+    )
     processed_document = document_service.get(document.document_id)
     quality_report = repository.get_quality_report(document.document_id)
     chunks = repository.get_chunks(document.document_id)
@@ -114,6 +123,7 @@ def run_large_document_preprocessing_stress(
         max_peak_tracemalloc_mb=max_peak_tracemalloc_mb,
         min_pages_per_second=min_pages_per_second,
     )
+    benchmark_validity = build_benchmark_validity(performance_gate)
     passed = functional_passed and bool(performance_gate["passed"])
     report = {
         "report_type": "large_document_preprocessing_stress",
@@ -144,6 +154,8 @@ def run_large_document_preprocessing_stress(
         "peak_tracemalloc_mb": peak_tracemalloc_mb,
         "current_tracemalloc_bytes": current_bytes,
         "performance_gate": performance_gate,
+        "host_runtime_evidence": host_runtime_evidence,
+        "benchmark_validity": benchmark_validity,
         "progress_events": progress_events,
         "latest_run": latest_run.model_dump(mode="json") if latest_run else None,
         "interpretation": _interpretation(
@@ -166,7 +178,7 @@ def run_large_document_preprocessing_stress(
 
 def generate_synthetic_regulation_pdf(path: Path, *, page_count: int, include_table_rows: bool = True) -> None:
     try:
-        import fitz
+        from app.utils.fitz_compat import fitz
     except ImportError as exc:
         raise RuntimeError("PyMuPDF is required to generate the synthetic stress PDF.") from exc
 
@@ -217,8 +229,36 @@ def _count_by(chunks: list[Any], field_name: str) -> dict[str, int]:
 
 
 def _validate_positive_optional(name: str, value: float | None) -> None:
-    if value is not None and value <= 0:
-        raise ValueError(f"{name} must be greater than zero when provided.")
+    if value is not None and (not math.isfinite(value) or value <= 0):
+        raise ValueError(f"{name} must be a finite value greater than zero when provided.")
+
+
+def build_host_runtime_evidence(*, wall_seconds: float, process_cpu_seconds: float) -> dict[str, Any]:
+    """Return factual, non-attributive runtime diagnostics for one processing measurement."""
+    return {
+        "wall_seconds": wall_seconds,
+        "process_cpu_seconds": process_cpu_seconds,
+        "wall_minus_process_cpu_seconds": max(0.0, wall_seconds - process_cpu_seconds),
+        "process_cpu_to_wall_ratio": process_cpu_seconds / wall_seconds if wall_seconds > 0 else None,
+        "os_cpu_count": os.cpu_count(),
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "python_implementation": sys.implementation.name,
+        "python_major_minor": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
+
+
+def build_benchmark_validity(performance_gate: dict[str, Any]) -> dict[str, Any]:
+    """Preserve SLA gate observations while preventing diagnostic causal claims."""
+    return {
+        "gate_status": performance_gate["status"],
+        "observed_sla": performance_gate["observed"],
+        "diagnostic_evidence_changes_pass_fail": False,
+        "host_contention_assessment": "not_established",
+        "causal_attribution_note": (
+            "Without a same-bytes reference benchmark, the cause of a performance result cannot be established."
+        ),
+    }
 
 
 def _performance_gate(
@@ -330,6 +370,8 @@ def _markdown(report: dict[str, Any]) -> str:
     quality = report.get("quality") or {}
     interpretation = report.get("interpretation") or {}
     performance_gate = report.get("performance_gate") or {}
+    host_runtime_evidence = report.get("host_runtime_evidence") or {}
+    benchmark_validity = report.get("benchmark_validity") or {}
     lines = [
         "# Large Document Preprocessing Stress",
         "",
@@ -349,6 +391,10 @@ def _markdown(report: dict[str, Any]) -> str:
         f"- Issue count: {quality.get('issue_count')}",
         f"- Performance gate: `{performance_gate.get('status')}`",
         f"- Performance violations: {len(performance_gate.get('violations') or [])}",
+        f"- Gate preservation: diagnostics change pass/fail: `{str(benchmark_validity.get('diagnostic_evidence_changes_pass_fail')).lower()}`",
+        f"- Runtime evidence wall/process CPU seconds: {host_runtime_evidence.get('wall_seconds')} / {host_runtime_evidence.get('process_cpu_seconds')}",
+        f"- Runtime evidence process CPU-to-wall ratio: {host_runtime_evidence.get('process_cpu_to_wall_ratio')}",
+        f"- Host contention assessment: `{benchmark_validity.get('host_contention_assessment')}`",
         "",
         "## Interpretation",
         "",

@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class BeginnerQuickstartDocsTests(unittest.TestCase):
+    def test_readme_keeps_today_and_prior_update_summaries_above_product(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        today_heading = "# 최근 업데이트: 2026년 8월 3일"
+        prior_heading = "# 이전 업데이트: 2026년 7월 29일~8월 1일"
+        product_heading = "# PR MCP Builder"
+
+        self.assertTrue(readme.startswith(today_heading))
+        self.assertLess(readme.index(today_heading), readme.index(prior_heading))
+        self.assertLess(readme.index(prior_heading), readme.index(product_heading))
+        for phrase in (
+            "초보자 안내 모드 추가",
+            "개별 규정 파일과 합본 규정집의 결과 통일",
+            "계층 색인을 자동 생성",
+            "list_regulations",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme[: readme.index(prior_heading)])
+        self.assertLess(readme.index("## 7월 29일"), readme.index(product_heading))
+        self.assertLess(readme.index("## 7월 31일"), readme.index(product_heading))
+        self.assertLess(readme.index("## 8월 1일"), readme.index(product_heading))
+        self.assertIn("비전공자도 이해하기 쉽도록", readme[: readme.index(product_heading)])
+
+    def test_readme_puts_beginner_flow_before_connection_details(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        beginner_start = readme.index("## 처음 사용자를 위한 5분 빠른 시작")
+        connection_details = readme.index("## 2. 다섯 방법 중 하나 선택하기")
+        self.assertLess(readme.index("# PR MCP Builder"), beginner_start)
+        self.assertLess(beginner_start, readme.index("### 무엇을 할 수 있나요?"))
+        self.assertLess(beginner_start, connection_details)
+
+        positions = [
+            readme.index(label, beginner_start, connection_details)
+            for label in (
+                "① 문서 올려서 전처리",
+                "② 결과 확인",
+                "③ 검수하고 승인",
+                "④ MCP 생성·AI 연결",
+            )
+        ]
+        self.assertEqual(sorted(positions), positions)
+
+        for phrase in (
+            "문서 업로드",
+            "전처리 시작",
+            "AI로 의심 구간 추가 검수 (선택)",
+            "초보자 안내 시작",
+            "일반 모드로 계속",
+            "초보자 안내 모드",
+            "빨간 테두리",
+            "화살표",
+            "안내 건너뛰기",
+            "처음부터 다시 보기",
+            "승인과 색인은 자동으로",
+            "공식 MCP 품질 준비 확인",
+            "Node.js/npm",
+            "동의해 버튼을 누른 경우에만",
+            "Kordoc 사용 가능",
+            "안전 재전처리",
+            "화면 진입만으로 시작되지 않으며",
+            "정리된 내용(청크)",
+            "이슈",
+            "생성할 MCP 이름 (필수 입력)",
+            "MCP로 쓸 파일 묶음 만들기",
+            "승인하고 색인",
+            "이 청크 반려",
+            "앱별 등록·연결 진단",
+            "AI 앱에서 search와 fetch 도구 호출이 성공한 것을 확인했습니다",
+            "search",
+            "fetch",
+            "list_regulations",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme[beginner_start:connection_details])
+
+    def test_operator_quickstart_matches_safe_beginner_guide(self) -> None:
+        quickstart = (REPO_ROOT / "docs" / "operator_quickstart_ko.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(quickstart.split())
+
+        positions = [
+            quickstart.index(label)
+            for label in (
+                "① 문서 올려서 전처리",
+                "② 결과 확인",
+                "③ 검수하고 승인",
+                "④ MCP 생성·AI 연결",
+            )
+        ]
+        self.assertEqual(sorted(positions), positions)
+        for phrase in (
+            "문서 업로드",
+            "전처리 시작",
+            "AI로 의심 구간 추가 검수 (선택)",
+            "품질 통과 표시는 자동 승인이 아니며",
+            "승인·색인 완료",
+            "초보자 안내 모드",
+            "일반 모드로 계속",
+            "오류가 아니라 현재 안내 대상 표시",
+            "승인이나 색인을 자동 실행하지 않는다",
+            "MCP 이름 입력이나 파일 생성만으로 선택하지 않는다",
+            "Kordoc 설치·검증 시작",
+            "사용자 전역 설치",
+            "Kordoc 사용 가능",
+            "안전 재전처리",
+            "들어가기만 해서는 시작되지 않고",
+            "정리된 내용(청크)",
+            "이슈",
+            "생성할 MCP 이름 (필수 입력)",
+            "MCP로 쓸 파일 묶음 만들기",
+            "승인하고 색인",
+            "이 청크 반려",
+            "앱별 등록·연결 진단",
+            "list_regulations",
+            ".\\START_HERE.bat",
+            "별도의 PowerShell 창",
+            "로컬 Streamlit 운영 화면과 함께 설정하지 않는다",
+            "README의 방법 A~E",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, normalized)
+
+    def test_beginner_labels_match_streamlit_controls(self) -> None:
+        ui_source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        documented = "\n".join(
+            (
+                (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
+                (REPO_ROOT / "docs" / "operator_quickstart_ko.md").read_text(encoding="utf-8"),
+            )
+        )
+
+        for label in (
+            "문서 업로드",
+            "전처리 시작",
+            "AI로 의심 구간 추가 검수 (선택)",
+            "승인하고 색인",
+            "이 청크 반려",
+            "생성할 MCP 이름 (필수 입력)",
+            "MCP로 쓸 파일 묶음 만들기",
+        ):
+            with self.subTest(label=label):
+                self.assertIn(label, ui_source)
+                self.assertIn(label, documented)
+
+    def test_combined_book_guidance_promises_logical_parity_and_fails_closed(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        quickstart = (REPO_ROOT / "docs" / "operator_quickstart_ko.md").read_text(
+            encoding="utf-8"
+        )
+        combined = " ".join((readme + "\n" + quickstart).split())
+
+        for phrase in (
+            "규정별 파일 여러 개",
+            "여러 규정을 합친 통합 규정집 한 개",
+            "같은 규정·목차·조문",
+            "계층 색인은",
+            "자동 생성",
+            "별표·붙임",
+            "경계가 불명확하면",
+            "생성이 안전하게 멈춥니다",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, combined)
+
+    def test_readme_separates_portable_and_source_connection_diagnostics(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.split())
+
+        for phrase in (
+            "Windows 실행판은 포함된 EXE",
+            "소스 실행 전용",
+            "PR MCP Builder.exe --mcp-server",
+            "ConvertFrom-Json",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, normalized)
+        self.assertNotIn('python -m json.tool "$env:APPDATA\\Claude', normalized)
+
+    def test_readme_routes_chatgpt_to_supported_remote_path(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        rendered_source = re.sub(r"<!--.*?-->", "", readme, flags=re.DOTALL)
+
+        self.assertIn("방법 B — Codex CLI / Codex IDE 로컬 STDIO", rendered_source)
+        self.assertIn("ChatGPT 웹의 Developer mode", rendered_source)
+        self.assertIn("ChatGPT는 로컬 MCP 서버에 직접 연결하지 않고", rendered_source)
+        self.assertIn("OpenAI Secure MCP Tunnel", rendered_source)
+        self.assertNotIn("ChatGPT Desktop 로컬 STDIO", rendered_source)
+        self.assertNotIn("ChatGPT Desktop / Codex CLI / Codex IDE", rendered_source)
+
+    def test_connection_docs_do_not_advertise_chatgpt_local_stdio(self) -> None:
+        quickconnect = (REPO_ROOT / "docs" / "mcp_quickconnect_ko.md").read_text(
+            encoding="utf-8"
+        )
+        examples = (
+            REPO_ROOT / "docs" / "mcp_client_config_examples_ko.md"
+        ).read_text(encoding="utf-8")
+        combined = quickconnect + "\n" + examples
+
+        self.assertIn("ChatGPT는 로컬 MCP 서버에 직접 연결하지 않습니다", combined)
+        self.assertIn("ChatGPT 웹", combined)
+        self.assertIn("Secure MCP Tunnel", combined)
+        self.assertNotIn("ChatGPT Desktop / Codex CLI / Codex IDE", combined)
+        self.assertNotIn("ChatGPT Desktop·Codex 공용 설정", combined)
+        self.assertNotIn("Settings > MCP servers > Add server", combined)
+
+
+if __name__ == "__main__":
+    unittest.main()
