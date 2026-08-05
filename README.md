@@ -1,5 +1,7 @@
 # 최근 업데이트: 2026년 8월 3일
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fkoul777%2FPublic-Regulation-MCP-Builder.svg)](https://mcptoplist.com/server/glama%2Fkoul777%2FPublic-Regulation-MCP-Builder)
+
 오늘은 처음 사용하는 사람도 규정 파일을 올려 MCP를 만들 수 있도록 화면 안내를
 보완하고, 규정을 각각 올렸을 때와 합본 규정집으로 올렸을 때의 결과가 같도록 처리
 기준을 강화했습니다.
