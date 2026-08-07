@@ -7,6 +7,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.mcp_server.regulation_server import create_regulation_mcp_server
 
@@ -99,7 +101,53 @@ def create_vercel_mcp_app(environ: Mapping[str, str]) -> Starlette:
     )
     server._reg_rag_scope["deployment_runtime"] = "vercel"
     server._reg_rag_scope["read_only_runtime"] = True
-    return server.streamable_http_app()
+    mcp_path = str(
+        environ.get("MCP_STREAMABLE_HTTP_PATH") or DEFAULT_VERCEL_MCP_PATH
+    ).strip()
+    app = server.streamable_http_app()
+    app.add_middleware(_RefuseServerInitiatedStream, mcp_path=mcp_path)
+    return app
+
+
+class _RefuseServerInitiatedStream:
+    """Answer Streamable HTTP GET with 405 instead of an empty SSE stream.
+
+    The Vercel runtime is stateless, so the server never sends a message the client
+    did not ask for. Opening the standalone SSE stream anyway leaves the client
+    waiting for a first byte that can never arrive, which remote MCP connectors
+    report as a connection timeout, and holds the serverless invocation open until
+    maxDuration. The Streamable HTTP transport allows 405 when a server offers no
+    server-initiated stream, so clients fall back to POST and connect immediately.
+    """
+
+    def __init__(self, app: ASGIApp, *, mcp_path: str) -> None:
+        self._app = app
+        self._mcp_path = "/" + mcp_path.strip("/")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and "/" + str(scope.get("path", "")).strip("/") == self._mcp_path
+        ):
+            response = JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32000,
+                        "message": (
+                            "This MCP server is stateless and offers no server-initiated "
+                            "stream. Send JSON-RPC requests with POST."
+                        ),
+                    },
+                },
+                status_code=405,
+                headers={"Allow": "POST"},
+            )
+            await response(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
 
 
 def _load_runtime_manifest(data_dir: Path) -> dict[str, Any]:

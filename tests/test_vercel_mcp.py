@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.mcp_server.vercel_app import create_vercel_mcp_app
+from starlette.applications import Starlette
+
+from app.mcp_server.vercel_app import _RefuseServerInitiatedStream, create_vercel_mcp_app
 from scripts.prepare_vercel_mcp_deployment import prepare_vercel_mcp_deployment
 
 
 class _FakeMcpServer:
     def __init__(self) -> None:
         self._reg_rag_scope = {}
-        self.app = object()
+        self.app = Starlette()
 
     def streamable_http_app(self):
         return self.app
@@ -38,6 +41,10 @@ class VercelMcpAppTests(unittest.TestCase):
                 )
 
         self.assertIs(fake_server.app, app)
+        self.assertIn(
+            _RefuseServerInitiatedStream,
+            [middleware.cls for middleware in app.user_middleware],
+        )
         kwargs = create_server.call_args.kwargs
         self.assertEqual("tenant-a", kwargs["tenant_id"])
         self.assertEqual("profile-a", kwargs["profile_id"])
@@ -133,6 +140,75 @@ class VercelMcpAppTests(unittest.TestCase):
                         "VERCEL_URL": "preview.example.vercel.app",
                     }
                 )
+
+
+class RefuseServerInitiatedStreamTests(unittest.TestCase):
+    def test_answers_mcp_get_with_405_instead_of_empty_stream(self) -> None:
+        status, headers, body = _call_asgi(
+            _RefuseServerInitiatedStream(_unreachable_app, mcp_path="/mcp"),
+            method="GET",
+            path="/mcp",
+        )
+
+        self.assertEqual(405, status)
+        self.assertEqual(b"POST", headers[b"allow"])
+        self.assertEqual(-32000, json.loads(body)["error"]["code"])
+
+    def test_ignores_trailing_slash(self) -> None:
+        status, _, _ = _call_asgi(
+            _RefuseServerInitiatedStream(_unreachable_app, mcp_path="/mcp"),
+            method="GET",
+            path="/mcp/",
+        )
+
+        self.assertEqual(405, status)
+
+    def test_passes_post_through_to_the_transport(self) -> None:
+        seen: list[str] = []
+
+        async def inner(scope, receive, send):
+            seen.append(scope["method"])
+
+        _call_asgi(
+            _RefuseServerInitiatedStream(inner, mcp_path="/mcp"), method="POST", path="/mcp"
+        )
+
+        self.assertEqual(["POST"], seen)
+
+    def test_passes_other_paths_through_to_the_transport(self) -> None:
+        seen: list[str] = []
+
+        async def inner(scope, receive, send):
+            seen.append(scope["path"])
+
+        _call_asgi(
+            _RefuseServerInitiatedStream(inner, mcp_path="/mcp"), method="GET", path="/healthz"
+        )
+
+        self.assertEqual(["/healthz"], seen)
+
+
+async def _unreachable_app(scope, receive, send):  # pragma: no cover - must not run
+    raise AssertionError("GET on the MCP path must not reach the transport")
+
+
+def _call_asgi(app, *, method: str, path: str) -> tuple[int, dict[bytes, bytes], bytes]:
+    messages: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        messages.append(message)
+
+    asyncio.run(
+        app({"type": "http", "method": method, "path": path, "headers": []}, receive, send)
+    )
+    start = next((m for m in messages if m["type"] == "http.response.start"), None)
+    if start is None:
+        return 0, {}, b""
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], {k.lower(): v for k, v in start.get("headers", [])}, body
 
 
 class PrepareVercelMcpDeploymentTests(unittest.TestCase):
