@@ -3092,6 +3092,21 @@ def _beginner_preprocess_stage_text(message: object) -> str:
     return text or "문서를 처리하는 중"
 
 
+def _monotonic_percent(floor: dict[str, int], key: str, measured: int) -> int:
+    """Clamp a rendered progress gauge so it never moves backwards.
+
+    Preprocessing reports progress per stage, and some paths report a low value
+    after a higher one has already been shown: ``ProcessingService`` announces an
+    already-active document at ``progress=5``, and each stage restarts its own unit
+    counter. Drawing those directly rewinds the gauge, which reads as the work
+    having been undone. Keep the highest value reached for each gauge instead.
+    """
+    safe = max(0, min(100, int(measured)))
+    reached = max(int(floor.get(key, 0)), safe)
+    floor[key] = reached
+    return reached
+
+
 def _render_upload_file_progress(container, rows: list[dict[str, object]]) -> None:
     table_rows = []
     for row in rows:
@@ -8002,6 +8017,20 @@ def _page_preprocess() -> None:
             file_status_box = st.empty()
             _render_upload_file_progress(file_status_box, file_status_rows)
 
+            progress_floor: dict[str, int] = {}
+
+            def _overall_percent(file_index: int, file_fraction: float) -> int:
+                return _monotonic_percent(
+                    progress_floor,
+                    "overall",
+                    int(((file_index + file_fraction) / total_files) * 100),
+                )
+
+            def _file_percent(file_index: int, file_fraction: float) -> int:
+                return _monotonic_percent(
+                    progress_floor, f"file-{file_index}", int(file_fraction * 100)
+                )
+
             def _update_file_progress(
                 file_index: int,
                 filename: str,
@@ -8011,8 +8040,8 @@ def _page_preprocess() -> None:
                 status_label: str = "처리 중",
             ) -> None:
                 safe_fraction = max(0.0, min(1.0, float(file_fraction)))
-                safe_progress = max(0, min(100, int(((file_index + safe_fraction) / total_files) * 100)))
-                file_percent = max(0, min(100, int(safe_fraction * 100)))
+                safe_progress = _overall_percent(file_index, safe_fraction)
+                file_percent = _file_percent(file_index, safe_fraction)
                 file_status_rows[file_index] = {
                     "filename": filename,
                     "status": status_label,
@@ -8083,17 +8112,27 @@ def _page_preprocess() -> None:
                             continue
                         received_progress = True
                         last_update_at = datetime.now().astimezone().strftime("%H:%M:%S")
-                        last_fraction = 0.2 + (0.8 * max(0, min(100, current.progress)) / 100)
+                        reported_fraction = 0.2 + (0.8 * max(0, min(100, current.progress)) / 100)
+                        last_fraction = max(last_fraction, reported_fraction)
                         last_message = str(current.message or "Preprocessing")
                         current_unit = int(getattr(current, "current_unit", 0) or 0)
                         total_units = int(getattr(current, "total_units", 0) or 0)
                         unit_label = str(getattr(current, "unit_label", "") or "규정")
                     if received_progress:
+                        # 이 막대는 전체 진행이 아니라 '지금 단계'의 낱개 진행이다.
+                        # 단계가 바뀌면 0부터 다시 세는 것이 정상이므로 단계 이름을
+                        # 같이 적어 되돌아간 것처럼 보이지 않게 한다. 낱개를 셀 수 없는
+                        # 단계로 넘어가면 이전 단계 숫자가 남지 않도록 지운다.
                         if total_units > 0:
                             regulation_progress_box.progress(
                                 min(100, int((current_unit / total_units) * 100)),
-                                text=f"작업 진행 · {unit_label} {current_unit}/{total_units}",
+                                text=(
+                                    f"{_beginner_preprocess_stage_text(last_message)} 단계 진행 "
+                                    f"· {unit_label} {current_unit}/{total_units}"
+                                ),
                             )
+                        else:
+                            regulation_progress_box.empty()
                         _update_file_progress(
                             file_index,
                             filename,
@@ -8103,8 +8142,8 @@ def _page_preprocess() -> None:
                         )
                     if not received_progress:
                         elapsed = _format_elapsed_seconds(time.monotonic() - started)
-                        safe_progress = max(0, min(100, int(((file_index + last_fraction) / total_files) * 100)))
-                        file_percent = max(0, min(100, int(last_fraction * 100)))
+                        safe_progress = _overall_percent(file_index, last_fraction)
+                        file_percent = _file_percent(file_index, last_fraction)
                         file_status_rows[file_index] = {
                             "filename": filename,
                             "status": f"전처리 중 {elapsed}",

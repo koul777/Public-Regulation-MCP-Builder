@@ -764,5 +764,41 @@ class StreamlitResultsStepVisibilityTests(unittest.TestCase):
         )
 
 
+class PreprocessProgressGaugeTests(unittest.TestCase):
+    def test_gauge_holds_the_highest_value_reached(self) -> None:
+        floor: dict[str, int] = {}
+
+        self.assertEqual(40, streamlit_app._monotonic_percent(floor, "overall", 40))
+        # 단계가 바뀌며 낮은 값이 보고돼도 게이지는 뒤로 감기지 않는다.
+        self.assertEqual(40, streamlit_app._monotonic_percent(floor, "overall", 5))
+        self.assertEqual(61, streamlit_app._monotonic_percent(floor, "overall", 61))
+
+    def test_each_gauge_keeps_its_own_floor(self) -> None:
+        floor: dict[str, int] = {}
+
+        streamlit_app._monotonic_percent(floor, "overall", 80)
+
+        self.assertEqual(10, streamlit_app._monotonic_percent(floor, "file-1", 10))
+
+    def test_clamps_out_of_range_reports(self) -> None:
+        floor: dict[str, int] = {}
+
+        self.assertEqual(0, streamlit_app._monotonic_percent(floor, "overall", -20))
+        self.assertEqual(100, streamlit_app._monotonic_percent(floor, "overall", 140))
+
+    def test_preprocess_loop_routes_every_gauge_through_the_floor(self) -> None:
+        source = Path(streamlit_app.__file__).read_text(encoding="utf-8")
+        start = source.index('progress_bar = st.progress(0, text="Saving uploaded file")')
+        end = source.index("document = completed_documents[-1]", start)
+        loop_source = source[start:end]
+
+        # 하트비트 경로가 공식을 따로 계산해 바닥값을 우회하면 안 된다.
+        self.assertNotIn("int(((file_index + last_fraction) / total_files) * 100)", loop_source)
+        self.assertIn("safe_progress = _overall_percent(file_index, last_fraction)", loop_source)
+        self.assertIn("last_fraction = max(last_fraction, reported_fraction)", loop_source)
+        # 낱개를 셀 수 없는 단계로 넘어가면 이전 단계 숫자를 남기지 않는다.
+        self.assertIn("regulation_progress_box.empty()", loop_source)
+
+
 if __name__ == "__main__":
     unittest.main()
