@@ -350,7 +350,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             and node.func.attr == "status"
         ]
         self.assertEqual(3, len(direct_status_calls))
-        self.assertGreaterEqual(source.count("_long_operation_status("), 11)
+        self.assertGreaterEqual(source.count("_long_operation_status("), 7)
         batch_start = source.index('batch_status = st.status("선택한 규정별 승인·색인 중…')
         batch_end = source.index("if workflow_ready_count < workflow_pending_count:", batch_start)
         self.assertIn("_update_long_operation_error(", source[batch_start:batch_end])
@@ -1017,18 +1017,22 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('st.tabs(["직전 청크", "현재 청크", "다음 청크"])', source)
         self.assertIn("previous_chunk = chunks[selected_chunk_index - 1]", source)
         self.assertIn("next_chunk = chunks[selected_chunk_index + 1]", source)
-        self.assertIn("선택한 규정 {len(selected_document_ids):,}개 일괄 처리", source)
-        self.assertIn("전체 규정 자료 AI 검수 완료 (선택 {len(selected_document_ids):,}개)", source)
-        self.assertIn("전체 규정 자료 사람 확인 완료 (선택 {len(selected_document_ids):,}개)", source)
-        self.assertIn("나머지 부분 AI 점검 전체 완료 (선택 {len(selected_document_ids):,}개)", source)
-        self.assertIn("나머지 부분 사람 점검 전체 완료 (선택 {len(selected_document_ids):,}개)", source)
-        self.assertGreaterEqual(source.count("or beginner_bulk_review_disabled"), 8)
-        self.assertIn("초보자 안내 모드에서는 일괄 검수 버튼을 사용할 수 없습니다", source)
-        bulk_skip_start = source.index('key=f"ai-bulk-skip-{document_id}"')
+        self.assertIn("전체 규정 확인 (선택 {len(selected_document_ids):,}개)", source)
+        self.assertIn("전체 규정 확인 열기 · 선택한 {len(selected_document_ids):,}개를 한꺼번에 검수·확정", source)
+        # 나머지 규정의 청크는 '전체 규정 승인'을 실제로 쓸 때만 읽는다.
+        self.assertIn("선택한 규정 {len(selected_document_ids):,}개 상태 불러오기", source)
+        self.assertIn("bulk_review_requested and not batch_loaded", source)
+        self.assertIn("bulk_review_requested and batch_loaded", source)
+        # Bulk "AI 검수 완료" / "사람 확인 완료" buttons are gone — the multi-doc
+        # summary auto-confirms every pending chunk instead.
+        self.assertIn("AI·사람 확인은 자동으로 완료 표시됩니다", source)
+        # 초보자 모드에서도 전체 규정 승인을 쓸 수 있되, 확인란을 거쳐야 버튼이 열린다.
+        self.assertIn("규정 {len(selected_document_ids):,}개를 한 번에 승인·색인하는 것에 동의합니다.", source)
         self.assertIn(
-            "disabled=beginner_bulk_review_disabled",
-            source[bulk_skip_start : bulk_skip_start + 250],
+            "beginner_bulk_review_disabled = beginner_bulk_mode_active and not beginner_bulk_confirmed",
+            source,
         )
+        self.assertGreaterEqual(source.count("beginner_bulk_review_disabled"), 2)
         self.assertIn("_prepare_reviewed_document_approval_plan", source)
         self.assertIn("_execute_reviewed_document_approval_plan", source)
         self.assertIn("규정별 문서 ID·규정 ID·목차 계층", source)
@@ -1069,9 +1073,14 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Review batch ID to load", source)
         self.assertIn("Load approval evidence from review batch manifest", source)
         self.assertIn("Approval evidence loaded. Review the batch before approving; acknowledgement was not auto-checked.", source)
-        self.assertIn("AI 검증 확인", source)
-        self.assertIn("사람 검증 확인", source)
-        self.assertIn("원본과 전처리 결과를 확인했습니다.", source)
+        # 승인·색인되는 본문은 언제나 가운데 전처리본 칸이다. AI는 오른쪽에서
+        # 볼 곳을 짚어 줄 뿐 본문을 쓰지 않으므로 최종본 배지가 옮겨 다니지 않는다.
+        self.assertIn('header_cols[1].markdown("**전처리본 · ✅ 최종본**")', source)
+        self.assertIn('header_cols[2].markdown("**AI 검수 의견**")', source)
+        self.assertIn("_render_agent_review_findings(", source)
+        self.assertIn("AI는 어디를 봐야 하는지 짚어 줄 뿐 본문을 고치지 않습니다.", source)
+        self.assertIn("✅ 최종본 칸의 내용이 승인·색인되어 MCP에 들어갑니다.", source)
+        self.assertIn("_approval_auto_confirm_pending_chunks(", source)
         self.assertIn("승인하고 색인", source)
         self.assertIn("확인 생략 승인 사유", source)
         self.assertIn("review_decision_events", source)
@@ -1129,6 +1138,13 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("_render_pipeline_stages(PIPELINE_STAGE_AI_REVIEW)", source)
         self.assertIn("_render_pipeline_stages(PIPELINE_STAGE_HUMAN_APPROVAL)", source)
 
+        # 색은 지금 서 있는 칸 하나에만 준다. 세 칸이 모두 칠해지면 색으로는 현재 단계를 못 읽는다.
+        self.assertIn('state, badge = "active", "▶ 지금 단계"', source)
+        self.assertIn('state, badge = "done", "✓ 완료"', source)
+        self.assertIn('state, badge = "upcoming", "예정"', source)
+        self.assertIn(".rr-stage.active {", source)
+        self.assertIn(".rr-stage.upcoming {", source)
+
         # AI 검수 결과가 숨은 비용 익스팬더가 아니라 결과 화면의 정식 패널로 노출돼야 한다.
         self.assertIn("AI 검수 결과", source)
         self.assertIn("def _ai_review_status_text", source)
@@ -1138,11 +1154,45 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         # 기술 상세(비용 가드)는 유지하되 전산 담당자용으로 접어 둔다.
         self.assertIn("AI review API and cost guard", source)
 
+    def test_results_hides_ai_metrics_when_ai_review_was_not_requested(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        # AI를 켜지 않았는데 후보 0 / 선정 0 지표를 보여주면 "AI가 보고 아무것도 못 찾았다"로 읽힌다.
+        self.assertIn("def _agent_review_requested", source)
+        self.assertIn("ai_review_requested = _agent_review_requested(agent_review_summary)", source)
+        self.assertIn("elif not ai_review_requested:", source)
+        self.assertIn("agent_review_not_requested", source)
+        # AI를 켰을 때는 왜 사람이 볼 조항이 남는지 범위·한도를 함께 설명한다.
+        self.assertIn("def _ai_review_scope_caption", source)
+        self.assertIn("st.caption(_ai_review_scope_caption(agent_review_summary))", source)
+
+    def test_preprocess_offers_bulk_pending_selection_and_filename_based_naming(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        # 대기 규정을 한 번에 골라 일괄 전처리할 수 있어야 한다.
+        self.assertIn('key="pending-upload-select-all"', source)
+        self.assertIn('key="pending-upload-clear-all"', source)
+        self.assertIn("전체 규정 선택", source)
+        # 규정 이름은 올린 파일 이름을 기본으로 쓰고, 파일마다 자기 이름을 적용한다.
+        self.assertIn("PREPROCESS_DOCUMENT_NAME_MODE_KEY", source)
+        self.assertIn('"올린 파일 이름 그대로 사용"', source)
+        self.assertIn(
+            'if document_name_mode == "filename" and not file_upload_metadata.get("document_name"):',
+            source,
+        )
+        self.assertIn('file_upload_metadata["document_name"] = Path(filename).stem', source)
+
     def test_preprocess_ai_review_is_opt_in_while_official_gates_remain(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
 
-        self.assertIn("AI로 의심 구간 추가 검수 (선택)", source)
-        self.assertIn('key="preprocess-enable-agent-review"', source)
+        # 켜고 끄는 곳은 사이드바 하나뿐이고, ① 화면은 그 상태를 그대로 따른다.
+        self.assertNotIn('key="preprocess-enable-agent-review"', source)
+        self.assertIn('"AI 검수 사용"', source)
+        self.assertIn(
+            "ai_review_requested = bool(settings.enable_agent_review)"
+            " and not _ai_review_setup_blocker(settings)",
+            source,
+        )
         self.assertIn("enable_agent_review=ai_review_requested", source)
         self.assertNotIn("enable_agent_review=True", source)
         self.assertIn("휴먼리뷰 후 공식 RAG/MCP 사용", source)
@@ -1200,8 +1250,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("reject_review_chunks", source)
         self.assertIn("_chunk_rejection_ready", source)
         self.assertIn("반려 사유 (필수)", source)
-        self.assertIn("현재 화면에서 선택한 청크 1개만 반려", source)
-        self.assertIn("chunk_ids=[str(compare_chunk.chunk_id)]", source)
+        self.assertIn("선택한 조항만 반려하여 MCP에서 제외", source)
+        self.assertIn("chunk_ids=list(reject_targets)", source)
         self.assertIn("disabled=not rejection_ready", source)
         self.assertIn("최종 제외(terminal exclusion)", source)
         self.assertIn("_invalidate_document_context_cache(document_id)", source)
@@ -1925,6 +1975,115 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             self.assertIn("vercel --prod --cwd", remote_output)
             self.assertIn("reg-rag-mcp-client-config-smoke", remote_output)
             self.assertIn("Claude/ChatGPT 원격 커넥터에는 URL만 넣습니다", remote_output)
+
+    def _exec_streamlit_functions(self, names: tuple[str, ...], extra_namespace: dict) -> dict:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        nodes = [
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        self.assertEqual(len(names), len(nodes))
+        namespace = dict(extra_namespace)
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), "<streamlit-helpers>", "exec"),
+            namespace,
+        )
+        return namespace
+
+    def test_only_the_current_pipeline_stage_is_coloured(self):
+        """세 칸이 다 칠해져 있으면 색으로는 지금 단계를 읽을 수 없다."""
+        rendered: list[str] = []
+
+        class Recorder:
+            def __getattr__(self, _name):
+                def record(*args, **_kwargs):
+                    rendered.extend(str(value) for value in args)
+
+                return record
+
+        namespace = self._exec_streamlit_functions(
+            ("_render_pipeline_stages",),
+            {
+                "st": Recorder(),
+                "PIPELINE_STAGES": [
+                    ("파서 초안", "1차 정리"),
+                    ("(선택) AI 추가 검수", "AI 검토 초안"),
+                    ("사람 승인", "최종 확인"),
+                ],
+            },
+        )
+        render = namespace["_render_pipeline_stages"]
+
+        render(2)
+        strip = "\n".join(rendered)
+
+        self.assertEqual(1, strip.count('class="rr-stage active"'))
+        self.assertEqual(1, strip.count('class="rr-stage done"'))
+        self.assertEqual(1, strip.count('class="rr-stage upcoming"'))
+        self.assertIn("1단계 · ✓ 완료", strip)
+        self.assertIn("2단계 · ▶ 지금 단계", strip)
+        self.assertIn("3단계 · 예정", strip)
+
+        rendered.clear()
+        render(3)
+        last_strip = "\n".join(rendered)
+        self.assertEqual(1, last_strip.count('class="rr-stage active"'))
+        self.assertEqual(2, last_strip.count('class="rr-stage done"'))
+        self.assertNotIn("upcoming", last_strip)
+
+        # 흐름 설명용 호출(현재 단계 없음)은 어떤 칸도 현재로 표시하지 않는다.
+        rendered.clear()
+        render(0)
+        preview_strip = "\n".join(rendered)
+        self.assertNotIn("rr-stage active", preview_strip)
+        self.assertNotIn("지금 단계", preview_strip)
+
+    def test_results_step_can_be_left_without_opening_a_regulation(self):
+        """규정을 하나 눌러야만 다음 단계로 갈 수 있는 것은 확인이 아니라 통행세다."""
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        results_start = source.index("def _page_results(")
+        results_source = source[results_start : source.index("\ndef ", results_start + 10)]
+        self.assertIn(
+            "_render_workflow_directory_open_prompt(document_id, blocking=False)",
+            results_source,
+        )
+        self.assertIn("_render_results_step_exit_without_open(selected_document_ids)", results_source)
+
+        next_button_calls: list[dict] = []
+
+        class Recorder:
+            def __getattr__(self, _name):
+                def record(*args, **_kwargs):
+                    return None
+
+                return record
+
+        namespace = self._exec_streamlit_functions(
+            ("_render_results_step_exit_without_open",),
+            {
+                "st": Recorder(),
+                "NAV_APPROVAL": "③ 검수하고 승인",
+                "_render_workflow_next_button": lambda label, target, **kwargs: next_button_calls.append(
+                    {"label": label, "target": target, **kwargs}
+                ),
+            },
+        )
+        render = namespace["_render_results_step_exit_without_open"]
+
+        render(["doc-a", "doc-b"])
+
+        self.assertEqual(1, len(next_button_calls))
+        self.assertEqual("③ 검수하고 승인", next_button_calls[0]["target"])
+        self.assertFalse(next_button_calls[0]["disabled"])
+        self.assertIn("2개 규정", next_button_calls[0]["label"])
+
+        # 선택한 규정이 하나도 없으면 넘길 것이 없으므로 그때만 막는다.
+        next_button_calls.clear()
+        render([])
+        self.assertTrue(next_button_calls[0]["disabled"])
 
     def test_streamlit_exposes_parsing_goldset_review_gate(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")

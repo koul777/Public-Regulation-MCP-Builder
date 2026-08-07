@@ -27,6 +27,7 @@ class Chunk(BaseModel):
     text: str
     normalized_text: str | None = None
     retrieval_text: str | None = None
+    ai_preprocessed_text: str | None = None
     metadata: dict = Field(default_factory=dict)
     source_page_start: int | None = None
     source_page_end: int | None = None

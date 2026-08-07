@@ -2783,5 +2783,65 @@ class ChunkerTests(unittest.TestCase):
         self.assertNotIn("temporal_metadata_ambiguous_fields", target.metadata)
 
 
+class ChunkerTablePromotionKeepsProseTests(unittest.TestCase):
+    """Kordoc 표를 승격할 때 표 바깥의 규정 문장을 버리지 않는다.
+
+    실제 문서에서 별표의 심사 기준("※ … 평균 90점 이상이 된 후보자를 인사위원회
+    심의 대상자로 선정함.")이 색인 본문에서 통째로 사라져 MCP가 인용할 수 없었다.
+    표본 14개 문서 통제 비교에서 11건 개선·악화 0건.
+    """
+
+    def _rows(self, rows: list[list[str]]) -> list[dict]:
+        return [{"row_index": index, "cells": cells, "raw": " ".join(cells)} for index, cells in enumerate(rows)]
+
+    def test_prose_around_the_table_survives_promotion(self) -> None:
+        body = (
+            "[별표 1]\n"
+            "심사 항목 및 배점\n"
+            "항 목\n배 점\n"
+            "공적 사항\n80점\n"
+            "※ 심사에 참여하는 심사위원 전원으로부터 80점 이상의 점수를 받고, "
+            "평균 90점 이상이 된 후보자를 인사위원회 심의 대상자로 선정함."
+        )
+        markdown = "| 항  목 | 배  점 |\n| --- | --- |\n| 공적 사항 | 80점 |"
+        rows = self._rows([["항 목", "배 점"], ["공적 사항", "80점"]])
+
+        result = Chunker._body_with_table_prose(body, markdown, rows)
+
+        self.assertIn("[별표 1]", result)
+        self.assertIn("심사 항목 및 배점", result)
+        self.assertIn("평균 90점 이상이 된 후보자를 인사위원회 심의 대상자로 선정함.", result)
+        self.assertIn(markdown, result)
+
+    def test_lines_already_inside_the_table_are_not_duplicated(self) -> None:
+        body = "항 목\n배 점\n공적 사항\n80점"
+        markdown = "| 항  목 | 배  점 |\n| --- | --- |\n| 공적 사항 | 80점 |"
+        rows = self._rows([["항 목", "배 점"], ["공적 사항", "80점"]])
+
+        result = Chunker._body_with_table_prose(body, markdown, rows)
+
+        # 표가 담고 있는 값만 있으면 마크다운 하나로 충분하다.
+        self.assertEqual(markdown, result)
+
+    def test_prose_comes_before_the_table(self) -> None:
+        body = "[별표 1]\n항 목"
+        markdown = "| 항  목 |\n| --- |"
+        result = Chunker._body_with_table_prose(body, markdown, self._rows([["항 목"]]))
+
+        self.assertTrue(result.startswith("[별표 1]"))
+        self.assertTrue(result.rstrip().endswith("| --- |"))
+
+    def test_empty_body_falls_back_to_the_table(self) -> None:
+        markdown = "| 항  목 |\n| --- |"
+        self.assertEqual(markdown, Chunker._body_with_table_prose("", markdown, []))
+        self.assertEqual(markdown, Chunker._body_with_table_prose("   \n  ", markdown, []))
+
+    def test_whitespace_differences_still_count_as_table_content(self) -> None:
+        # 원문은 "항  목", 셀은 "항 목"처럼 공백만 다른 경우가 흔하다.
+        result = Chunker._body_with_table_prose("항  목", "| 항 목 |", self._rows([["항 목"]]))
+
+        self.assertEqual("| 항 목 |", result)
+
+
 if __name__ == "__main__":
     unittest.main()

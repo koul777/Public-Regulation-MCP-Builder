@@ -11,15 +11,46 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.processors.mojibake import (
+    HWP_ARTIFACT_PATTERN,
+    MOJIBAKE_REMOVED_BLOCKS_KEY,
+    MOJIBAKE_REMOVED_CHARS_KEY,
+    PRIVATE_USE_PATTERN,
+    has_mojibake_artifacts,
+    mojibake_artifact_char_count,
+    mojibake_artifact_spans,
+)
 from app.schemas.chunk import Chunk
 from app.schemas.quality import QualityCheck, QualityReport
 from app.schemas.structure import StructureNode
 from app.schemas.validation import ValidationIssue
 
 
+# 깨짐 판정은 app/processors/mojibake.py 한 곳에만 둔다. 정규화 단계가 같은 판정으로
+# 본문을 지우고, 품질 검사가 같은 판정으로 경고하기 때문이다.
+# 아래 이름들은 기존 호출부와 테스트를 위해 그대로 다시 내보낸다.
+__all__ = [
+    "HWP_ARTIFACT_PATTERN",
+    "PRIVATE_USE_PATTERN",
+    "QualityGate",
+    "QualityGateProfile",
+    "REQUIRED_METADATA",
+    "has_mojibake_artifacts",
+    "mojibake_artifact_char_count",
+    "mojibake_artifact_spans",
+]
+
 REQUIRED_METADATA = ["document_name", "source_file", "hierarchy_path", "chunk_type"]
-HWP_ARTIFACT_PATTERN = re.compile(r"(捤獥|汤捯|氠瑢|湰灧|桤灧|灳瑣|湯慴|湯湷|†普)")
-PRIVATE_USE_PATTERN = re.compile(r"[\ue000-\uf8ff]")
+
+# 표를 마크다운으로 담을 때 붙는 칸막이·괘선. 규정 내용이 아니라 서식이라 커버리지에서 뺀다.
+TABLE_SCAFFOLD_PATTERN = re.compile(r"[|+\-─-╿]+")
+
+# 줄 단위 누락 검사에서 볼 최소 길이(공백 제거 후). 이보다 짧으면 다른 조문에
+# 우연히 들어 있기 쉬워 누락 신호가 되지 않는다.
+SOURCE_LINE_MIN_CHARS = 12
+
+# 청크마다 앞에 붙는 위치 머리말. 원문 대조에서는 본문만 이어 붙여야 한다.
+CONTEXT_HEADER_PATTERN = re.compile(r"\A.*?\[본문\]\s*", re.S)
 
 
 @dataclass(frozen=True)
@@ -249,6 +280,7 @@ class QualityGate:
         document_id: str,
         source_text: str | None = None,
         profile_id: str | None = None,
+        normalizer_metadata: dict | None = None,
     ) -> QualityReport:
         profile = self._profile(profile_id)
         issue_counts = Counter(issue.severity for issue in issues)
@@ -268,6 +300,9 @@ class QualityGate:
         table_metrics = self._table_metrics(chunks)
         structure_metrics = self._structure_metrics(nodes, chunks)
         text_quality_metrics = self._text_quality_metrics(chunks)
+        # 정규화 단계가 이미 지운 깨진 글자. 청크만 봐서는 흔적이 남지 않으므로
+        # 여기에 실어 두지 않으면 손상된 원본이 조용히 통과한다.
+        text_quality_metrics.update(self._normalizer_mojibake_metrics(normalizer_metadata))
         coverage_metrics = self._coverage_metrics(source_text, chunks)
         if source_text and self._compact_text(source_text) and not nodes:
             structure_metrics["nonempty_source_without_structure"] = 1
@@ -326,10 +361,13 @@ class QualityGate:
                 "no_hwp_mojibake_artifacts",
                 "warning",
                 text_quality_metrics["hwp_mojibake_artifact_chunks"] == 0
-                and text_quality_metrics["suspicious_regulation_metadata_count"] == 0,
-                text_quality_metrics["hwp_mojibake_artifact_chunks"],
+                and text_quality_metrics["suspicious_regulation_metadata_count"] == 0
+                and text_quality_metrics["mojibake_removed_char_count"] == 0,
+                text_quality_metrics["hwp_mojibake_artifact_chunks"]
+                + text_quality_metrics["mojibake_removed_block_count"],
                 0,
-                "HWP artifact text such as mojibake markers should be removed before chunking.",
+                "HWP artifact text such as mojibake markers should be removed before chunking. "
+                "Text removed during normalization still means the source file was damaged.",
             ),
             self._check(
                 "structured_nodes_present",
@@ -359,6 +397,15 @@ class QualityGate:
                 coverage_metrics.get("chunk_to_source_char_ratio"),
                 profile.coverage_threshold_label,
                 "Chunk normalized text should preserve most source text without large duplication.",
+            ),
+            self._check(
+                "source_lines_reach_indexed_text",
+                "warning",
+                int(coverage_metrics.get("source_lines_missing_count") or 0) == 0,
+                coverage_metrics.get("source_lines_missing_count"),
+                0,
+                "Every source line must appear in indexed chunk text. Missing lines are usually "
+                "appendix or form prose (○/※ notes, form titles) dropped while keeping only the table.",
             ),
             self._check(
                 "regulation_boundary_duplication",
@@ -416,6 +463,11 @@ class QualityGate:
             missing_required_metadata_count=missing_required_metadata_count,
             replacement_char_chunks=int(text_quality_metrics["replacement_char_chunks"]),
             table_like_without_cell_rows=int(table_metrics["table_like_without_cell_rows"]),
+            mojibake_artifact_chunks=int(text_quality_metrics["hwp_mojibake_artifact_chunks"])
+            + int(text_quality_metrics["mojibake_removed_block_count"]),
+            suspicious_regulation_metadata_count=int(
+                text_quality_metrics["suspicious_regulation_metadata_count"]
+            ),
         )
         passed = all(check.passed for check in checks if check.severity == "error")
         recommendations = self._recommendations(checks, metadata_coverage, table_metrics, structure_metrics)
@@ -691,6 +743,18 @@ class QualityGate:
                     current_id = node.parent_id
         return owner_ids
 
+    def _normalizer_mojibake_metrics(self, normalizer_metadata: dict | None) -> dict[str, int]:
+        """정규화 단계가 지운 깨진 글자 수를 품질 지표로 옮긴다.
+
+        정규화가 청크보다 먼저 돌기 때문에, 지운 뒤에는 청크를 아무리 뒤져도
+        원본이 손상됐다는 사실이 남지 않는다. 그래서 지운 쪽 기록을 그대로 읽는다.
+        """
+        metadata = normalizer_metadata if isinstance(normalizer_metadata, dict) else {}
+        return {
+            "mojibake_removed_char_count": max(0, int(metadata.get(MOJIBAKE_REMOVED_CHARS_KEY) or 0)),
+            "mojibake_removed_block_count": max(0, int(metadata.get(MOJIBAKE_REMOVED_BLOCKS_KEY) or 0)),
+        }
+
     def _text_quality_metrics(self, chunks: list[Chunk]) -> dict[str, int | float]:
         control_pattern = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
         texts = [chunk.text for chunk in chunks]
@@ -704,11 +768,11 @@ class QualityGate:
             "replacement_char_chunks": sum(1 for text in texts if "\ufffd" in text),
             "control_char_chunks": sum(1 for text in texts if control_pattern.search(text)),
             "context_header_chunks": sum(1 for text in texts if text.startswith("[위치]")),
-            "hwp_mojibake_artifact_chunks": sum(1 for text in normalized_texts if HWP_ARTIFACT_PATTERN.search(text)),
-            "hwp_mojibake_artifact_char_count": sum(len(HWP_ARTIFACT_PATTERN.findall(text)) for text in normalized_texts),
+            "hwp_mojibake_artifact_chunks": sum(1 for text in normalized_texts if has_mojibake_artifacts(text)),
+            "hwp_mojibake_artifact_char_count": sum(mojibake_artifact_char_count(text) for text in normalized_texts),
             "private_use_char_chunks": sum(1 for text in normalized_texts if PRIVATE_USE_PATTERN.search(text)),
             "private_use_char_count": sum(len(PRIVATE_USE_PATTERN.findall(text)) for text in normalized_texts),
-            "suspicious_regulation_metadata_count": sum(1 for value in metadata_values if HWP_ARTIFACT_PATTERN.search(value)),
+            "suspicious_regulation_metadata_count": sum(1 for value in metadata_values if has_mojibake_artifacts(value)),
         }
 
     def _coverage_metrics(self, source_text: str | None, chunks: list[Chunk]) -> dict[str, int | float]:
@@ -721,6 +785,17 @@ class QualityGate:
         exempt_chunk_chars = max(0, raw_chunk_chars - source_coverage_chunk_chars)
         ratio = round(source_coverage_chunk_chars / source_chars, 3) if source_chars else 0.0
         raw_ratio = round(raw_chunk_chars / source_chars, 3) if source_chars else 0.0
+        # 표 서식(``|``·괘선)을 뺀 내용만의 비율. 관측용이며 통과 판정에는 쓰지 않는다.
+        # ``raw_chunk_to_source_char_ratio``는 서식 문자 때문에 실측 228건에서 100~119%로
+        # 부풀어 있어, 본문이 빠져도 그 완충재가 손실을 가려 준다. 기준을 바로 조이면
+        # 표 내용이 ``table_cell_rows``에만 있는 문서를 오탐으로 반려하므로, 먼저 관측만 한다.
+        content_chunk_chars = len(
+            self._coverage_text("\n".join(chunk.normalized_text or chunk.text for chunk in chunks))
+        )
+        content_source_chars = len(self._coverage_text(source_text or ""))
+        content_ratio = (
+            round(content_chunk_chars / content_source_chars, 3) if content_source_chars else 0.0
+        )
         return {
             "source_compact_chars": source_chars,
             "chunk_compact_chars": raw_chunk_chars,
@@ -729,6 +804,24 @@ class QualityGate:
             "source_coverage_exempt_chunk_count": len(chunks) - len(source_coverage_chunks),
             "source_coverage_exempt_chunk_compact_chars": exempt_chunk_chars,
             "chunk_to_source_char_ratio": ratio,
+            "content_source_compact_chars": content_source_chars,
+            "content_chunk_compact_chars": content_chunk_chars,
+            "content_to_source_char_ratio": content_ratio,
+            **self._source_line_metrics(source_text, chunks),
+        }
+
+    def _source_line_metrics(self, source_text: str | None, chunks: list[Chunk]) -> dict[str, int | float]:
+        source = str(source_text or "")
+        checked = sum(
+            1 for line in source.splitlines() if len(self._compact_text(line)) >= SOURCE_LINE_MIN_CHARS
+        )
+        missing = self._missing_source_lines(source_text, chunks)
+        return {
+            "source_lines_checked": checked,
+            "source_lines_missing_count": len(missing),
+            "source_line_coverage_ratio": (
+                round((checked - len(missing)) / checked, 3) if checked else 1.0
+            ),
         }
 
     @staticmethod
@@ -738,6 +831,51 @@ class QualityGate:
 
     def _compact_text(self, value: str) -> str:
         return re.sub(r"\s+", "", value or "")
+
+    def _coverage_text(self, value: str) -> str:
+        """표 서식 문자를 뺀 '내용만' 텍스트. 원문·청크 양쪽에 똑같이 적용한다."""
+        return TABLE_SCAFFOLD_PATTERN.sub("", self._compact_text(value))
+
+    @staticmethod
+    def _chunk_body_without_context_header(chunk: Chunk) -> str:
+        """청크에 붙는 "[위치] … [본문]" 머리말을 뗀 본문."""
+        text = str(chunk.normalized_text or chunk.text or "")
+        return CONTEXT_HEADER_PATTERN.sub("", text, count=1)
+
+    def _missing_source_lines(self, source_text: str | None, chunks: list[Chunk]) -> list[str]:
+        """원문에는 있는데 색인될 본문 어디에도 없는 줄을 찾는다.
+
+        글자 수 비율만 보면 표 서식이 완충재가 되어 누락을 가린다. 실제로 별표의
+        심사 기준 문장("※ … 평균 90점 이상이 된 후보자를 …")이 통째로 빠졌는데도
+        비율 검사는 92점으로 통과시켰다. 줄 단위로 대조해야 그 손실이 드러난다.
+
+        비교 대상은 ``retrieval_text``다. 색인되어 MCP가 실제로 인용할 수 있는 글이
+        그것이라, 그 안에 없으면 사람이 화면에서 봤든 말든 답변 근거로는 없는 것이다.
+        """
+        source = str(source_text or "")
+        if not source.strip():
+            return []
+        # 원문 한 줄이 두 청크로 나뉘면(조문이 ①에서 갈릴 때) 그 사이에 청크마다 붙는
+        # "[위치] … [본문]" 머리말이 끼어들어, 멀쩡히 색인된 줄이 누락으로 잡혔다.
+        # 머리말을 걷어낸 본문끼리 이어 붙인 것과, 머리말까지 포함한 원래 색인 본문을
+        # 둘 다 본다. 어느 쪽에 있어도 색인된 것이므로 누락이 아니다.
+        haystack = "\n".join(
+            (
+                self._compact_text("\n".join(self._chunk_body_without_context_header(chunk) for chunk in chunks)),
+                self._compact_text(
+                    "\n".join(chunk.retrieval_text or chunk.normalized_text or chunk.text for chunk in chunks)
+                ),
+            )
+        )
+        missing: list[str] = []
+        for line in source.splitlines():
+            compact_line = self._compact_text(line)
+            # 짧은 줄은 다른 조문에 우연히 들어 있기 쉬워 신호가 되지 않는다.
+            if len(compact_line) < SOURCE_LINE_MIN_CHARS:
+                continue
+            if compact_line not in haystack:
+                missing.append(line.strip())
+        return missing
 
     def _profile(self, profile_id: str | None) -> QualityGateProfile:
         if profile_id:
@@ -829,6 +967,8 @@ class QualityGate:
         missing_required_metadata_count: int,
         replacement_char_chunks: int,
         table_like_without_cell_rows: int,
+        mojibake_artifact_chunks: int = 0,
+        suspicious_regulation_metadata_count: int = 0,
     ) -> float:
         score = 100.0
         score -= min(60, error_count * 20)
@@ -838,6 +978,10 @@ class QualityGate:
         score -= min(20, missing_page_count * 0.5)
         score -= min(20, missing_required_metadata_count * 0.5)
         score -= min(20, replacement_char_chunks * 2)
+        # 깨진 글자는 사람이 원문과 대조하지 않으면 고칠 수 없는 손상이라 점수에 직접 반영한다.
+        score -= min(20, mojibake_artifact_chunks * 2)
+        # 규정 번호·제목이 깨지면 목록과 인용이 통째로 어긋나므로 본문보다 무겁게 본다.
+        score -= min(15, suspicious_regulation_metadata_count * 5)
         score -= min(10, table_like_without_cell_rows * 0.02)
         return round(max(0.0, score), 1)
 

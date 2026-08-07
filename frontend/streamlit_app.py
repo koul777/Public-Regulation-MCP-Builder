@@ -72,6 +72,11 @@ from app.processors.quality_gate import (
 )
 from app.schemas.chunk import ChunkOptions
 from app.services.document_service import DocumentService
+from app.services.institution_purge_service import (
+    InstitutionPurgePlan,
+    InstitutionPurgeResult,
+    InstitutionPurgeService,
+)
 from app.services.kordoc_reprocessing_service import (
     KordocReprocessingError,
     KordocReprocessingResult,
@@ -242,6 +247,7 @@ ADVANCED_NAV_PAGES = [NAV_GOLDSET, NAV_ADMIN]
 BEGINNER_GUIDE_CHOICE_KEY = "beginner_guide_choice_made"
 BEGINNER_GUIDE_ENABLED_KEY = "beginner_guide_enabled"
 BEGINNER_GUIDE_STEP_KEY = "beginner_guide_step"
+BEGINNER_GUIDE_SUBSTEP_KEY = "beginner_guide_substep"
 BEGINNER_GUIDE_PREPROCESS_SELECTION_KEY = "beginner_guide_preprocess_selection"
 BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY = "beginner_guide_preprocess_info_confirmed"
 BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY = "beginner_guide_preprocess_ai_choice_confirmed"
@@ -289,7 +295,6 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
         "Kordoc 준비 상태 확인",
         "규정 파일 선택",
         "자동 인식한 규정 정보 확인",
-        "AI 추가 검수 사용 여부 결정",
         "전처리 완료 확인",
     ),
     (
@@ -299,12 +304,9 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
         "결과 확인 완료 표시",
     ),
     (
-        "AI 제안 항목별 판단",
-        "AI 검증 결과 확인",
-        "각 청크의 원문·전처리 결과 비교",
-        "각 청크 사람 검증 결과 확인",
-        "모든 청크 승인 또는 반려 결정",
-        "승인하고 색인 실행",
+        "규정 스크롤하며 원본·전처리·AI 검수본 비교",
+        "필요한 부분 직접 수정",
+        "미승인 조항 모두 확인 후 승인하고 색인",
         "현재 규정 색인 완료 상태 확인",
         "다음 미완료 규정으로 이동해 같은 검수 반복",
         "선택한 모든 규정의 검수·승인·색인 완료 확인",
@@ -323,6 +325,8 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
         "fetch 원문·출처 조회 확인",
     ),
 )
+# The six external connection confirmations start at procedure 4-6 in the list above.
+BEGINNER_CONNECTION_FIRST_SUBSTEP = 6
 
 # 전처리 기본 로직: 파서 초안 → (선택) AI 추가 검수 → 사람 승인.
 PIPELINE_STAGES: list[tuple[str, str]] = [
@@ -346,22 +350,112 @@ AI_REVIEW_STATUS_MESSAGES: dict[tuple[str, str], str] = {
     ("api_configuration_needed", "openai_compatible_base_url_missing"): "OpenAI 호환 API 주소를 입력해야 AI 검수를 실행할 수 있습니다.",
     ("api_configuration_needed", "agent_review_provider_not_supported"): "지원하는 AI 공급자를 다시 선택하세요.",
     ("api_configuration_needed", "agent_review_model_missing"): "AGENT_REVIEW_MODEL을 설정하면 AI 검수 초안이 전처리 중 자동 생성됩니다.",
-    ("api_configuration_needed", "agent_review_api_disabled"): "AI 검수 기능이 꺼져 있어 외부 API 호출 없이 로컬 파서 결과와 사람 검수로 진행합니다.",
+    ("api_configuration_needed", "agent_review_api_disabled"): (
+        "AI 추가 검수를 켜고 전처리했지만, AI 검수 기능 자체가 꺼져 있어 실행되지 않았습니다. "
+        "이 규정은 파서 전처리본이 최종본입니다. "
+        "'⚙️ 관리자 설정 → AI 연결'에서 AI 검수를 켜고 API 키를 넣은 뒤 다시 전처리하면 실행됩니다. "
+        "그대로 두어도 '③ 검수하고 승인'에서 사람이 확인해 승인·색인할 수 있습니다."
+    ),
     ("skipped", "quality_gate_clean"): "품질 검사가 깨끗해 AI가 추가로 볼 부분이 없었습니다.",
     ("skipped", "no_review_candidates"): "AI가 따로 짚어야 할 의심 구간이 없었습니다.",
     ("skipped", "review_candidates_cached"): "같은 내용을 이전에 이미 AI가 검토해 그 결과를 재사용했습니다.",
     ("skipped", "review_budget_exhausted"): "확인이 필요한 부분이 예산 한도를 넘어, 일부만 검토 대상으로 올랐습니다.",
+    ("skipped", "agent_review_not_requested"): (
+        "이 규정은 AI 추가 검수를 켜지 않고 전처리했습니다. AI는 아무것도 보지 않았고, "
+        "파서 전처리본이 최종본입니다. AI에게 맡기려면 ① 단계에서 'AI로 의심 구간 추가 검수'를 켜고 다시 전처리하세요."
+    ),
 }
 
 
+def _ai_review_scope_caption(agent_review_summary: dict | None) -> str:
+    """AI 검수가 이 문서에서 어디까지 도는지 한 줄로 설명한다.
+
+    한도가 걸려 있으면 문서의 일부만 검수되고 나머지는 'AI 검수 대상 아님'으로
+    남는다. 한도를 숨기면 'AI를 켰는데 왜 사람이 다 봐야 하냐'는 오해가 남으므로
+    한도가 있을 때는 반드시 숫자를 밝히고, 없을 때는 전체를 본다고 밝힌다.
+    """
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    limits = summary.get("limits") if isinstance(summary.get("limits"), dict) else {}
+    max_chunks = int(limits.get("max_chunks_per_document") or 0)
+    if max_chunks > 0:
+        return (
+            "AI 검수는 품질 검사와 파서 경고에 걸린 의심 구간만 골라 검토 초안을 만듭니다. "
+            f"한 문서에서 최대 {max_chunks:,}개까지만 실행하므로 그 뒤 조항은 'AI 검수 대상 아님'으로 "
+            "남습니다. 나머지 조항과 최종 승인·색인은 '③ 검수하고 승인' 단계에서 사람이 결정합니다."
+        )
+    return (
+        "AI 검수는 조항 수 제한 없이 이 문서의 모든 조항을 대상으로 검토 초안을 만듭니다. "
+        "초안일 뿐이므로 최종 승인·색인은 '③ 검수하고 승인' 단계에서 사람이 결정합니다."
+    )
+
+
+def _ai_review_setup_blocker(settings_snapshot) -> str:
+    """AI 검수를 지금 실행할 수 없는 이유를 한 문단으로 돌려준다(가능하면 빈 문자열).
+
+    화면의 체크박스는 '이번 전처리에서 AI를 쓰겠다'는 요청일 뿐이고, 실제 실행은
+    관리자 설정의 기능 스위치와 API 키가 모두 갖춰져야 한다. 셋 중 하나라도
+    비어 있으면 전처리는 조용히 건너뛴다. 그 사실을 누르기 전에 알려 준다.
+    """
+    where = "'⚙️ 관리자 설정 → AI 연결'에서 설정합니다."
+    if not getattr(settings_snapshot, "enable_agent_review", False):
+        return (
+            "AI 추가 검수 기능이 꺼져 있어, 이대로 전처리하면 AI는 아무것도 보지 않고 넘어갑니다. "
+            + where
+            + " (환경 변수로는 ENABLE_AGENT_REVIEW=true)"
+        )
+    reason = agent_review_configuration_reason(settings_snapshot)
+    if not reason:
+        return ""
+    reason_messages = {
+        "agent_review_provider_not_supported": "AI 공급자가 선택되지 않았습니다.",
+        "agent_review_model_missing": "검수 모델(또는 Azure 배포 이름)이 비어 있습니다.",
+        "openai_api_key_missing": "OpenAI API 키가 비어 있습니다.",
+        "azure_openai_endpoint_missing": "Azure OpenAI 엔드포인트가 비어 있습니다.",
+        "azure_openai_api_key_missing": "Azure OpenAI API 키가 비어 있습니다.",
+        "anthropic_api_key_missing": "Anthropic API 키가 비어 있습니다.",
+        "openai_compatible_base_url_missing": "OpenAI 호환 API 주소가 비어 있습니다.",
+        "agent_review_api_disabled": "AI 검수 기능이 꺼져 있습니다.",
+    }
+    detail = reason_messages.get(reason, f"AI 검수 설정을 확인해야 합니다({reason}).")
+    return (
+        f"{detail} 이대로 전처리하면 AI는 아무것도 보지 않고 넘어갑니다. "
+        + where
+        + " 지금 그대로 진행해도 파서 전처리본과 사람 검수만으로 승인·색인할 수 있습니다."
+    )
+
+
+def _agent_review_requested(agent_review_summary: dict | None) -> bool:
+    """이 문서를 전처리할 때 AI 추가 검수를 실제로 켰는지."""
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    if not summary:
+        # 실행 기록 자체가 없으면 켰다고 주장할 근거가 없다(fail-closed).
+        return False
+    if "request_enabled" in summary:
+        return bool(summary.get("request_enabled"))
+    return str(summary.get("skip_reason") or "").strip() != "agent_review_not_requested"
+
+
 def _render_pipeline_stages(active: int) -> None:
-    """파서 초안 → (선택) AI 추가 검수 → 사람 승인 진행 띠. active는 1~3(현재 단계)."""
+    """파서 초안 → (선택) AI 추가 검수 → 사람 승인 진행 띠. active는 1~3(현재 단계).
+
+    색은 지금 서 있는 단계 하나에만 쓴다. 세 칸이 모두 칠해져 있으면 어디까지
+    왔는지 색으로는 알 수 없어서, 결국 제목을 하나씩 읽어야 했다. 완료·예정은
+    색을 빼고 글자로 구분해, 색을 못 보는 화면에서도 지금 단계가 남는다.
+    """
     cells: list[str] = []
     for index, (title, desc) in enumerate(PIPELINE_STAGES, start=1):
-        state = "done" if index < active else ("active" if index == active else "")
+        if active <= 0:
+            # 흐름 설명용(현재 단계 없음). 아무 칸도 현재로 표시하지 않는다.
+            state, badge = "preview", ""
+        elif index < active:
+            state, badge = "done", "✓ 완료"
+        elif index == active:
+            state, badge = "active", "▶ 지금 단계"
+        else:
+            state, badge = "upcoming", "예정"
         cells.append(
             f'<div class="rr-stage {state}">'
-            f'<div class="rr-stage-k">{index}단계</div>'
+            f'<div class="rr-stage-k">{index}단계{f" · {badge}" if badge else ""}</div>'
             f'<div class="rr-stage-t">{title}</div>'
             f'<div class="rr-stage-d">{desc}</div>'
             "</div>"
@@ -380,9 +474,256 @@ def _ai_review_status_text(agent_review_summary: dict | None) -> tuple[str, str,
     if message is None:
         message = AI_REVIEW_STATUS_MESSAGES.get((status, ""))
     if message is None:
-        message = "AI 검수 단계가 실행됐습니다. 자세한 내용은 아래 상세를 확인하세요."
-    tag = "AI 검수 초안 완료" if executed else "AI 검수 준비/설정 확인"
+        # 실행됐다고 단정하지 않는다. 요약이 비어 있으면 AI가 돌았다는 근거가 없다.
+        message = (
+            "이 규정에서는 AI 추가 검수 실행 기록을 찾지 못했습니다. "
+            "파서 전처리본이 최종본이며, 확인은 '③ 검수하고 승인' 단계에서 사람이 합니다."
+        )
+    if executed:
+        tag = "AI 검수 초안 완료"
+    elif not _agent_review_requested(summary):
+        tag = "AI 검수 사용 안 함"
+    else:
+        tag = "AI 검수 준비/설정 확인"
     return tag, message, executed
+
+
+def _agent_review_candidate_chunk_ids(agent_review_summary: dict | None, key: str) -> set[str]:
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    candidates = summary.get(key)
+    if not isinstance(candidates, list):
+        return set()
+    return {
+        str(candidate.get("chunk_id") or "")
+        for candidate in candidates
+        if isinstance(candidate, dict) and str(candidate.get("chunk_id") or "").strip()
+    }
+
+
+def _agent_review_selected_chunk_ids(agent_review_summary: dict | None) -> set[str]:
+    """AI 검수 대상으로 실제 선정된 조항 ID.
+
+    선정은 됐는데 API 호출이 0회인 경우가 있어, 화면에서 '대상 아님'과
+    '대상이었지만 실행 안 됨'을 구분하려면 이 목록이 필요하다.
+
+    같은 내용을 이전에 검수해 결과를 재사용한 조항도 대상이다. 이번 실행에서
+    제공자를 부르지 않았을 뿐, 그 조항에는 검수 결과가 붙어 있다.
+    """
+
+    return _agent_review_candidate_chunk_ids(
+        agent_review_summary, "selected_candidates"
+    ) | _agent_review_candidate_chunk_ids(agent_review_summary, "reused_candidates")
+
+
+def _agent_review_reviewed_chunk_ids(agent_review_summary: dict | None) -> set[str]:
+    """AI가 실제로 본 조항 ID.
+
+    골라 놓고 호출이 실패한 조항까지 '검수 완료'로 세면, 아무도 보지 않은 조항이
+    확인된 것처럼 남는다. 실행이 끝난 경우에만, 그리고 실패 묶음에 들어간 조항은
+    빼고 센다.
+    """
+
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    reviewed = _agent_review_candidate_chunk_ids(summary, "reused_candidates")
+    if str(summary.get("status") or "").strip() == "executed":
+        unreviewed = {
+            str(chunk_id or "").strip() for chunk_id in summary.get("unreviewed_chunk_ids") or []
+        }
+        reviewed |= _agent_review_candidate_chunk_ids(summary, "selected_candidates") - unreviewed
+    return reviewed
+
+
+def _render_ai_review_sidebar(ctx: dict | None) -> None:
+    """AI 검수를 켜고 API 키를 넣는 일을 사이드바 한 곳에서 끝낸다.
+
+    예전에는 기능 스위치와 API 키는 관리자 설정에, '이번에 쓸지' 체크박스는 ① 화면
+    중간에, 실행 결과는 ② 화면 요약 탭에 흩어져 있었다. 그래서 체크박스만 켜고
+    전처리하면 API 호출 없이 조용히 넘어가는데도 어디를 봐야 하는지 알 수 없었다.
+
+    켜져 있다는 것과 실제로 실행할 수 있다는 것이 어긋나지 않도록, 저장은 연결
+    설정이 갖춰졌을 때만 통과시킨다. 켜면 ① 전처리에서 자동으로 함께 실행되고,
+    ③ 검수 화면 오른쪽 칸에 AI 검수 의견이 붙는다. AI는 본문을 다시 쓰지 않으므로
+    승인·색인되는 최종본은 언제나 가운데 전처리본 칸이다.
+    """
+
+    feature_enabled = bool(getattr(settings, "enable_agent_review", False))
+    setup_blocker = _ai_review_setup_blocker(settings)
+    ready = feature_enabled and not setup_blocker
+    title = "AI 검수 · 켜짐" if ready else ("AI 검수 · 설정 필요" if feature_enabled else "AI 검수 · 꺼짐")
+
+    with st.expander(title, expanded=not ready):
+        st.caption(
+            "여기서 켜면 ① 전처리에 자동으로 함께 실행되고, ③ 검수 화면 오른쪽에 "
+            "'AI 검수 의견' 칸이 채워집니다. ① 화면에서 따로 고르지 않아도 됩니다. "
+            "AI는 볼 곳을 짚어 줄 뿐 본문을 다시 쓰지 않으므로, 승인·색인되는 "
+            "✅ 최종본은 검수를 켜도 가운데 전처리본 칸입니다."
+        )
+        enable_choice = st.toggle(
+            "AI 검수 사용",
+            value=feature_enabled,
+            key="sidebar-ai-review-enabled",
+            help="켜면 품질 검사·파서 경고에 걸린 의심 구간만 외부 AI로 보내 검수 초안을 만듭니다.",
+        )
+
+        if not enable_choice:
+            if feature_enabled and st.button(
+                "끄고 저장",
+                key="sidebar-ai-review-disable",
+                width="stretch",
+            ):
+                _apply_ai_connection_settings(
+                    _ai_connection_overrides(
+                        settings,
+                        enabled=False,
+                        provider=normalize_agent_review_provider(settings.llm_provider),
+                        model=str(settings.agent_review_model or ""),
+                        api_key=_review_provider_key(
+                            settings, normalize_agent_review_provider(settings.llm_provider)
+                        ),
+                        base_url=str(settings.agent_review_api_base_url or ""),
+                    )
+                )
+                st.rerun()
+            st.caption("꺼져 있으면 외부 전송 없이 파서 전처리본이 최종본입니다.")
+        else:
+            configured_provider = normalize_agent_review_provider(settings.llm_provider)
+            if configured_provider not in SUPPORTED_AGENT_REVIEW_PROVIDERS:
+                configured_provider = "openai"
+            provider = st.selectbox(
+                "AI 공급자",
+                options=list(SUPPORTED_AGENT_REVIEW_PROVIDERS),
+                index=list(SUPPORTED_AGENT_REVIEW_PROVIDERS).index(configured_provider),
+                format_func=lambda value: AI_REVIEW_PROVIDER_LABELS.get(value, value),
+                key="sidebar-ai-review-provider",
+            )
+            presets = list(AI_REVIEW_MODEL_PRESETS.get(provider, ()))
+            configured_model = str(settings.agent_review_model or "").strip()
+            if provider != configured_provider:
+                configured_model = presets[0][0] if presets else ""
+            if presets:
+                model_ids = [model_id for model_id, _label in presets]
+                labels = dict(presets)
+                options = [*model_ids, "__custom__"]
+                current = configured_model if configured_model in model_ids else "__custom__"
+                choice = st.selectbox(
+                    "검수 모델",
+                    options=options,
+                    index=options.index(current),
+                    format_func=lambda value: labels.get(value, "직접 입력"),
+                    key=f"sidebar-ai-review-model-{provider}",
+                )
+                model = (
+                    st.text_input(
+                        "모델 ID",
+                        value=configured_model if configured_model not in model_ids else "",
+                        key=f"sidebar-ai-review-model-custom-{provider}",
+                    )
+                    if choice == "__custom__"
+                    else choice
+                )
+            else:
+                model = st.text_input(
+                    "Azure 배포 이름" if provider == "azure-openai" else "모델 ID",
+                    value=configured_model,
+                    key=f"sidebar-ai-review-model-direct-{provider}",
+                )
+            api_key = st.text_input(
+                "API 키",
+                value=_review_provider_key(settings, provider),
+                type="password",
+                key=f"sidebar-ai-review-key-{provider}",
+                help="현재 실행 중인 세션 메모리에만 저장됩니다. 재시작 후에도 쓰려면 .env에 넣으세요.",
+            )
+            if provider == "azure-openai":
+                base_url_label, base_url_default = "Azure 엔드포인트", ""
+            elif provider == "anthropic":
+                base_url_label, base_url_default = "API 주소", "https://api.anthropic.com"
+            elif provider == "openai-compatible":
+                base_url_label, base_url_default = "API 주소", "http://127.0.0.1:11434/v1"
+            else:
+                base_url_label, base_url_default = "API 주소", "https://api.openai.com"
+            base_url = st.text_input(
+                base_url_label,
+                value=(
+                    str(settings.agent_review_api_base_url or base_url_default)
+                    if provider == configured_provider and provider != "azure-openai"
+                    else str(settings.azure_openai_endpoint or "")
+                    if provider == "azure-openai" and provider == configured_provider
+                    else base_url_default
+                ),
+                key=f"sidebar-ai-review-base-url-{provider}",
+            )
+
+            # 한도를 환경 변수에만 숨겨 두면 "AI를 켰는데 왜 20개만 보냐"를 화면에서 고칠 방법이 없다.
+            max_chunks = int(
+                st.number_input(
+                    "문서당 최대 조항 수 (0 = 제한 없음)",
+                    min_value=0,
+                    max_value=20000,
+                    value=int(settings.agent_review_max_chunks_per_document),
+                    step=10,
+                    key="sidebar-ai-review-max-chunks",
+                    help=(
+                        "0이면 문서의 모든 조항을 검수합니다. 1 이상으로 두면 앞에서부터 그 개수까지만 "
+                        "보고 나머지는 'AI 검수 대상 아님'으로 남습니다. 올릴수록 비용이 비례해 늘어납니다."
+                    ),
+                )
+            )
+            max_input_tokens = int(
+                st.number_input(
+                    "문서당 입력 토큰 한도 (0 = 제한 없음)",
+                    min_value=0,
+                    max_value=20000000,
+                    value=int(settings.agent_review_max_input_tokens_per_document),
+                    step=5000,
+                    key="sidebar-ai-review-max-input-tokens",
+                    help="조항 수 한도와 토큰 한도 중 먼저 걸리는 쪽에서 멈춥니다. 둘 다 0이면 멈추지 않습니다.",
+                )
+            )
+
+            if st.button("저장하고 AI 검수 켜기", type="primary", key="sidebar-ai-review-save", width="stretch"):
+                overrides = _ai_connection_overrides(
+                    settings,
+                    enabled=True,
+                    provider=provider,
+                    model=model,
+                    api_key=api_key,
+                    base_url=base_url,
+                )
+                overrides["agent_review_max_chunks_per_document"] = max_chunks
+                overrides["agent_review_max_input_tokens_per_document"] = max_input_tokens
+                # 켰다고 표시해 놓고 실제로는 실행 못 하는 상태를 만들지 않는다.
+                candidate = replace(settings, **overrides)
+                blocker_after_save = _ai_review_setup_blocker(candidate)
+                if blocker_after_save:
+                    st.error(blocker_after_save)
+                else:
+                    _apply_ai_connection_settings(overrides)
+                    st.rerun()
+
+            if setup_blocker:
+                st.warning(setup_blocker)
+            elif feature_enabled:
+                st.success("이제 ① 전처리에서 AI 검수가 함께 실행됩니다.")
+
+        summary = dict((ctx or {}).get("agent_review_summary") or {})
+        if not ctx:
+            return
+        st.divider()
+        st.markdown("**열어 둔 규정의 실행 결과**")
+        tag, message, _executed = _ai_review_status_text(summary)
+        st.caption(f"상태: {tag}")
+        selected_count = int(summary.get("selected_count") or 0)
+        api_call_count = int(summary.get("api_call_count") or 0)
+        if selected_count and not api_call_count:
+            # 대상만 고르고 호출이 0회면 화면에는 'AI 검수 대상 아님'만 남는다. 그 차이를 여기서 밝힌다.
+            st.caption(
+                f"AI 검수 대상으로 {selected_count:,}개를 골랐지만 API 호출은 0회였습니다. "
+                "AI 검수 의견이 없는 것은 이 때문이며, 지금 켜도 이 규정은 다시 전처리해야 반영됩니다."
+            )
+        elif selected_count:
+            st.caption(f"검수 대상 {selected_count:,}개 · API 호출 {api_call_count:,}회")
+        st.caption(message)
 
 
 AI_REVIEW_REASON_LABELS = {
@@ -398,6 +739,7 @@ AI_REVIEW_REASON_LABELS = {
     "hwpx_parser_review_flag": ("HWPX 구조 경고 확인", "중간", "HWPX 표·각주·캡션 구조가 원문과 맞는지 확인합니다."),
     "hwpx_complex_structure": ("복잡 구조 확인", "중간", "중첩 표·병합 셀 같은 복잡 구조가 검색 본문에서 보존됐는지 확인합니다."),
     "document_inventory_boundary_review": ("문서 경계 확인", "중간", "조문·별표·부칙 경계가 잘못 합쳐지거나 빠지지 않았는지 확인합니다."),
+    "full_document_review": ("전체 조항 검수", "낮음", "위험 신호가 붙지는 않았지만 문서 전체 검수 대상이라 원문과 대조합니다."),
 }
 
 
@@ -519,95 +861,6 @@ def _approval_ai_review_items(chunk, review_reasons: list[str], agent_review_sum
     return items
 
 
-def _approval_set_bulk_ai_decisions(
-    *,
-    document_id: str,
-    chunks: list[object],
-    review_attention: dict,
-    agent_review_summary: dict | None,
-    decision: str,
-    only_remaining: bool = False,
-    progress_callback: Callable[[int, int], None] | None = None,
-) -> dict[str, int]:
-    if decision not in {"reflect", "skip"}:
-        raise ValueError("decision must be reflect or skip.")
-    changed_chunk_count = 0
-    changed_item_count = 0
-    total = len(chunks)
-    for position, chunk in enumerate(chunks, start=1):
-        if progress_callback is not None:
-            progress_callback(position, total)
-        if not _is_chunk_pending_approval(chunk):
-            continue
-        chunk_id = str(getattr(chunk, "chunk_id", "") or "")
-        if not chunk_id:
-            continue
-        review_reasons = review_attention.get(chunk_id) or chunk_review_attention_reasons(chunk)
-        review_items = _approval_ai_review_items(chunk, review_reasons, agent_review_summary)
-        if not review_items:
-            continue
-        ai_decisions_key = _approval_chunk_state_key(document_id, chunk_id, "ai_decisions")
-        ai_logged_key = _approval_chunk_state_key(document_id, chunk_id, "ai_logged")
-        existing_decisions = {
-            str(item_id): str(existing_decision)
-            for item_id, existing_decision in dict(st.session_state.get(ai_decisions_key) or {}).items()
-            if str(existing_decision) in {"reflect", "skip"}
-        }
-        item_ids = [
-            str(item["item_id"])
-            for item in review_items
-            if str(item.get("item_id") or "").strip()
-        ]
-        pending_item_ids = [item_id for item_id in item_ids if item_id not in existing_decisions]
-        if only_remaining and not pending_item_ids:
-            continue
-        if only_remaining:
-            st.session_state[ai_decisions_key] = {
-                **existing_decisions,
-                **{item_id: decision for item_id in pending_item_ids},
-            }
-            changed_item_count += len(pending_item_ids)
-        else:
-            st.session_state[ai_decisions_key] = {item_id: decision for item_id in item_ids}
-            changed_item_count += len(item_ids)
-        st.session_state[ai_logged_key] = False
-        changed_chunk_count += 1
-    return {"chunk_count": changed_chunk_count, "item_count": changed_item_count}
-
-
-def _approval_set_bulk_human_confirmations(
-    *,
-    document_id: str,
-    chunks: list[object],
-    confirmed: bool = True,
-    only_remaining: bool = False,
-    progress_callback: Callable[[int, int], None] | None = None,
-) -> dict[str, int]:
-    changed_chunk_count = 0
-    total = len(chunks)
-    for position, chunk in enumerate(chunks, start=1):
-        if progress_callback is not None:
-            progress_callback(position, total)
-        if not _is_chunk_pending_approval(chunk):
-            continue
-        chunk_id = str(getattr(chunk, "chunk_id", "") or "")
-        if not chunk_id:
-            continue
-        human_confirmed_key = _approval_chunk_state_key(document_id, chunk_id, "human_confirmed")
-        human_confirmed_widget_key = _approval_chunk_state_key(document_id, chunk_id, "human_confirmed_widget")
-        human_logged_key = _approval_chunk_state_key(document_id, chunk_id, "human_logged")
-        if only_remaining and bool(st.session_state.get(human_confirmed_key)):
-            continue
-        st.session_state[human_confirmed_key] = bool(confirmed)
-        # Streamlit removes state for widgets that are not rendered after the
-        # operator opens another chunk.  Keep the approval decision in the
-        # durable key above and let each checkbox be rebuilt from it.
-        st.session_state.pop(human_confirmed_widget_key, None)
-        st.session_state[human_logged_key] = False
-        changed_chunk_count += 1
-    return {"chunk_count": changed_chunk_count}
-
-
 def _approval_sync_human_confirmation_from_widget(
     *,
     human_confirmed_key: str,
@@ -720,6 +973,39 @@ def _approval_chunk_review_state_from_session(
     }
 
 
+def _approval_auto_confirm_pending_chunks(
+    document_id: str,
+    chunks: list,
+    *,
+    review_attention: dict | None = None,
+    agent_review_summary: dict | None = None,
+) -> None:
+    """Fill in the AI/human sign-off bookkeeping automatically for every pending chunk.
+
+    The operator only reads/edits the proposed text; approve_enabled should not require
+    a separate manual click per AI item or per chunk.
+    """
+
+    review_attention = review_attention or {}
+    for chunk in chunks:
+        if not _is_chunk_pending_approval(chunk):
+            continue
+        cid = str(getattr(chunk, "chunk_id", "") or "")
+        chunk_reasons = review_attention.get(cid) or chunk_review_attention_reasons(chunk)
+        review_items = _approval_ai_review_items(chunk, chunk_reasons, agent_review_summary)
+        item_ids = [str(item["item_id"]) for item in review_items]
+        ai_decisions_key = _approval_chunk_state_key(document_id, cid, "ai_decisions")
+        ai_result_confirmed_key = _approval_chunk_state_key(document_id, cid, "ai_result_confirmed")
+        human_confirmed_key = _approval_chunk_state_key(document_id, cid, "human_confirmed")
+        auto_ai_decisions = {item_id: "reflect" for item_id in item_ids}
+        st.session_state[ai_decisions_key] = auto_ai_decisions
+        st.session_state[ai_result_confirmed_key] = _approval_ai_result_signature(
+            item_ids, auto_ai_decisions
+        )
+        st.session_state[human_confirmed_key] = True
+        _approval_edited_text_from_session(document_id, chunk)
+
+
 def _approval_source_file_path(document) -> Path:
     return DocumentService(settings=settings, repository=repository).path_for(document)
 
@@ -772,6 +1058,13 @@ def _approval_edited_text_widget_key(document_id: str, chunk_id: str) -> str:
 
 
 def _approval_edited_text_from_session(document_id: str, chunk: object) -> str:
+    """승인 대상 본문의 기본값. 항상 파서 전처리본이며 AI가 쓴 글이 아니다.
+
+    한때 AI 교정본을 기본값으로 삼았는데, 그 교정본이 ``2012. 6. 14.``를
+    ``2012. 06. 14.``로 바꾸는 식으로 규정 원문에 없는 표기를 만들어 냈다.
+    기본값이 곧 승인·색인될 본문이라, AI가 쓴 글이 사람 손을 거치지 않고
+    법적 근거로 굳는 경로가 된다. 고칠 곳은 사람이 편집 칸에서 직접 고친다.
+    """
     key = _approval_edited_text_key(document_id, str(getattr(chunk, "chunk_id", "") or ""))
     if key not in st.session_state:
         st.session_state[key] = str(getattr(chunk, "text", "") or "")
@@ -895,8 +1188,14 @@ WORKFLOW_DOCUMENT_IDS_KEY = "workflow_document_ids"
 WORKFLOW_SELECTED_DOCUMENT_IDS_KEY = "workflow_selected_document_ids"
 WORKFLOW_MCP_GATE_CACHE_KEY = "workflow_mcp_gate_cache"
 DOCUMENT_CONTEXT_CACHE_KEY = "document_context_cache"
+# 규정 이름을 올린 파일 이름에서 가져올지, 본문에서 찾은 제목에서 가져올지.
+PREPROCESS_DOCUMENT_NAME_MODE_KEY = "preprocess-document-name-mode"
 SELECTED_APPROVAL_CONTEXT_CACHE_KEY = "selected_approval_context_cache"
 SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES = 4
+# 디렉터리에서 명시적으로 연 규정 1개만 상세 렌더링한다(전체 규정 동시 렌더링 방지).
+WORKFLOW_OPENED_DOCUMENT_KEY = "workflow_opened_document_id"
+# 검증 시트는 조항 수가 수천 개까지 가므로 한 화면에 이만큼씩만 그린다.
+APPROVAL_SHEET_PAGE_SIZE = 25
 KORDOC_REPROCESS_NOTICE_KEY = "kordoc_reprocess_notice"
 DOCUMENT_CONTEXT_NAV_PAGES = {NAV_HOME, NAV_RESULTS, NAV_APPROVAL, NAV_MCP}
 
@@ -1347,20 +1646,23 @@ def _render_beginner_connection_confirmation(
         item: _beginner_connection_item_key(confirmation_key, item)
         for item, _label, _help in checks
     }
+    # These six external confirmations are procedures 4-6 … 4-11 in the sidebar list.
+    first_external_substep = BEGINNER_CONNECTION_FIRST_SUBSTEP
     first_incomplete = next(
         (
-            (item, label, help_text)
-            for item, label, help_text in checks
+            (index, item, label, help_text)
+            for index, (item, label, help_text) in enumerate(checks)
             if not bool(st.session_state.get(item_keys[item]))
         ),
         None,
     )
     if first_incomplete is not None:
-        incomplete_item, incomplete_label, incomplete_help = first_incomplete
+        incomplete_index, incomplete_item, incomplete_label, incomplete_help = first_incomplete
         _render_beginner_action_marker(
             4,
             incomplete_label,
             incomplete_help,
+            substep=first_external_substep + incomplete_index,
             control_key_prefix=item_keys[incomplete_item],
         )
     previous_complete = True
@@ -1413,6 +1715,10 @@ def _beginner_guide_completed_steps(
             document_id
             and st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
         )
+    # ②를 건너뛰는 규정에서는 '결과 확인'을 누를 화면 자체가 없다.
+    # 전처리가 끝난 시점에 이 단계를 끝난 것으로 본다(안 그러면 안내가 영영 2단계에 멈춘다).
+    if not _results_step_is_used(ctx):
+        results_confirmed = True
     results_complete = bool(preprocessing_complete and (results_confirmed or approval_complete))
     if mcp_bundle_created is None:
         mcp_bundle_created = _mcp_bundle_created(ctx)
@@ -1456,8 +1762,6 @@ def _beginner_guide_procedure_states(
             bool(st.session_state.get(BEGINNER_GUIDE_KORDOC_CHECKED_KEY)) or preprocessing_complete,
             source_selected,
             bool(st.session_state.get(BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY))
-            or preprocessing_complete,
-            bool(st.session_state.get(BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY))
             or preprocessing_complete,
             preprocessing_complete,
         )
@@ -1504,9 +1808,6 @@ def _beginner_guide_procedure_states(
                 )
             )
         return (
-            decisions_complete,
-            decisions_complete,
-            decisions_complete,
             decisions_complete,
             decisions_complete,
             decisions_complete,
@@ -1687,12 +1988,22 @@ def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
         mcp_bundle_created=mcp_bundle_created,
     )
     st.markdown("**세부 확인 절차**")
+    current_substep = next(
+        (index for index, done in enumerate(procedure_states, start=1) if not done),
+        0,
+    )
+    # The sidebar runs before the page body, so markers can show only this one.
+    st.session_state[BEGINNER_GUIDE_SUBSTEP_KEY] = current_substep
     for index, (procedure, completed) in enumerate(
         zip(BEGINNER_GUIDE_PROCEDURES[active_step - 1], procedure_states),
         start=1,
     ):
-        icon = "✅" if completed else "⬜"
-        st.caption(f"{icon} {active_step}-{index}. {procedure}")
+        if completed:
+            st.caption(f"✅ {active_step}-{index}. {procedure}")
+        elif index == current_substep:
+            st.caption(f"👉 **{active_step}-{index}. {procedure} — 지금 할 차례**")
+        else:
+            st.caption(f"⬜ {active_step}-{index}. {procedure}")
 
     previous_col, next_col = st.columns(2)
     previous_col.button(
@@ -1735,11 +2046,21 @@ def _streamlit_key_css_fragment(value: object) -> str:
     )
 
 
+def _beginner_marker_label(step: int, substep: int) -> str:
+    """Number a marker exactly like the sidebar procedure list (`3-2`)."""
+
+    if substep <= 0:
+        return str(int(step))
+    return f"{int(step)}-{int(substep)}"
+
+
 def _render_beginner_action_marker(
     step: int,
     title: str,
     description: str,
     *,
+    substep: int = 0,
+    prerequisite: bool = False,
     control_key_prefix: str = "",
     control_keys: tuple[str, ...] = (),
 ) -> None:
@@ -1802,11 +2123,31 @@ def _render_beginner_action_marker(
             """,
             unsafe_allow_html=True,
         )
+    procedure_total = len(BEGINNER_GUIDE_PROCEDURES[int(step) - 1])
+    if prerequisite:
+        # A blocker that must be cleared on an earlier screen: it is not one of this
+        # step's numbered procedures, so it must not borrow a procedure number.
+        marker_label = "!"
+        progress_note = f"{int(step)}단계를 시작하기 전에 먼저 끝내야 하는 준비 작업"
+    else:
+        marker_label = _beginner_marker_label(step, substep)
+        procedure_name = ""
+        if 0 < substep <= procedure_total:
+            procedure_name = BEGINNER_GUIDE_PROCEDURES[int(step) - 1][int(substep) - 1]
+        progress_note = f"{int(step)}단계 세부 절차 {int(substep)}/{procedure_total}"
+        if procedure_name:
+            progress_note = f"{progress_note} · {procedure_name}"
+        if int(st.session_state.get(BEGINNER_GUIDE_SUBSTEP_KEY) or 0) == int(substep):
+            progress_note = f"{progress_note} · 지금 할 차례"
     st.markdown(
         f"""
-        <div class="rr-beginner-marker" role="note" aria-label="초보자 안내 {int(step)}단계">
-          <span class="rr-beginner-marker-number" aria-hidden="true">{int(step)}</span>
-          <div><strong>{html.escape(title)}</strong><p>{html.escape(description)}</p></div>
+        <div class="rr-beginner-marker" role="note" aria-label="초보자 안내 {html.escape(progress_note)}">
+          <span class="rr-beginner-marker-number" aria-hidden="true">{html.escape(marker_label)}</span>
+          <div>
+            <strong>{html.escape(title)}</strong>
+            <p>{html.escape(description)}</p>
+            <p class="rr-beginner-marker-progress">{html.escape(progress_note)}</p>
+          </div>
           <span class="rr-beginner-marker-arrow" aria-hidden="true">↓</span>
         </div>
         """,
@@ -2194,6 +2535,7 @@ def _render_institution_registration_form(registry: InstitutionProfileRegistry) 
             "먼저 작업할 기관을 등록하세요",
             "기관명을 입력하고 기관 생성 버튼을 누르세요. 규정과 승인 데이터는 이 기관 범위로 분리됩니다.",
             control_key_prefix="institution-name",
+            substep=1,
         )
     institution_name = st.text_input(
         "기관명",
@@ -2206,6 +2548,7 @@ def _render_institution_registration_form(registry: InstitutionProfileRegistry) 
             "입력한 기관을 생성하세요",
             "기관명을 확인한 뒤 바로 아래 기관 생성 버튼을 누르세요.",
             control_key_prefix="create-institution",
+            substep=1,
         )
     submitted = st.button("기관 생성", type="primary", key="create-institution")
     if not submitted:
@@ -2238,11 +2581,60 @@ def _render_institution_registration_form(registry: InstitutionProfileRegistry) 
         st.error(str(exc))
 
 
-def _delete_registered_institution(registry: InstitutionProfileRegistry, profile_id: str) -> None:
-    """Delete only an institution profile; regulation documents remain untouched."""
+def _institution_purge_service() -> InstitutionPurgeService:
+    return InstitutionPurgeService(settings=settings, repository=repository)
+
+
+def _institution_purge_plan(profile_id: str) -> InstitutionPurgePlan:
+    return _institution_purge_service().plan(profile_id)
+
+
+def _purge_institution_documents(profile_id: str) -> InstitutionPurgeResult:
+    """기관에 속한 규정·승인·색인 데이터를 실제로 지운다. 되돌릴 수 없다."""
+    return _institution_purge_service().purge(profile_id)
+
+
+def _orphan_institution_data_plans() -> list[InstitutionPurgePlan]:
+    """등록된 기관이 없는데 데이터만 남아 있는 기관 ID들.
+
+    기관 ID는 기관명 해시라, 프로필만 지운 뒤 같은 이름으로 다시 등록하면 남아 있던
+    규정이 그대로 붙는다. 지워지지 않은 것처럼 보이는 원인이므로 화면에 드러낸다.
+    """
+    known_profile_ids = set()
+    try:
+        current_registry = load_institution_profile_registry_from_bytes(
+            st.session_state[REGISTRY_STATE_KEY]
+        ) if st.session_state.get(REGISTRY_STATE_KEY) else None
+    except (OSError, ValueError):
+        current_registry = None
+    if current_registry is None:
+        current_registry = institution_registry
+    if current_registry is not None:
+        known_profile_ids = {
+            str(profile_id or "").strip().lower() for profile_id in current_registry.profiles
+        }
+    service = _institution_purge_service()
+    orphan_ids = sorted(service.profile_ids_with_stored_data() - known_profile_ids)
+    # 목록에서는 조항 수를 세지 않는다. 규정 300개의 조항까지 세면 첫 화면이 멈춘다.
+    plans = service.plan_many(orphan_ids, count_chunks=False)
+    return sorted(plans, key=lambda plan: (-plan.document_count, plan.profile_id))
+
+
+def _delete_registered_institution(
+    registry: InstitutionProfileRegistry,
+    profile_id: str,
+    *,
+    purge_documents: bool = False,
+) -> InstitutionPurgeResult | None:
+    """Delete an institution profile, optionally with all of its regulation data."""
     registry_path = _institution_profiles_storage_path(settings)
     if not registry_path:
         raise ValueError("INSTITUTION_PROFILES_PATH가 설정되지 않아 기관을 삭제할 수 없습니다.")
+    purge_result = None
+    if purge_documents:
+        # 규정 데이터를 먼저 지운다. 프로필을 먼저 지우면 중간에 실패했을 때 어느 기관
+        # 데이터였는지 화면에서 다시 찾을 수 없다.
+        purge_result = _purge_institution_documents(profile_id)
     updated_registry = delete_institution_profile(registry, profile_id)
     save_institution_profile_registry(registry_path, updated_registry)
     st.session_state[REGISTRY_STATE_KEY] = institution_profile_registry_to_bytes(updated_registry)
@@ -2252,6 +2644,200 @@ def _delete_registered_institution(registry: InstitutionProfileRegistry, profile
         st.session_state.pop(SELECTED_INSTITUTION_PROFILE_KEY, None)
         st.session_state.pop("document_id", None)
         st.session_state.pop(SELECTED_APPROVAL_CONTEXT_CACHE_KEY, None)
+    return purge_result
+
+
+def _institution_purge_plan_summary(plan: InstitutionPurgePlan) -> str:
+    """무엇이 사라지는지 숫자로만 적는다. 지운 뒤에는 확인할 방법이 없다."""
+    parts = [f"규정 {plan.document_count:,}개"]
+    if not plan.counted_chunks:
+        # 세지 않은 값을 0으로 적으면 '조항이 없다'는 거짓말이 된다.
+        if plan.source_file_count:
+            parts.append(f"업로드 원본 파일 {plan.source_file_count:,}개")
+        if plan.export_file_count:
+            parts.append(f"내보내기 파일 {plan.export_file_count:,}개")
+        parts.extend(_institution_purge_leftover_parts(plan))
+        return " · ".join(parts)
+    parts.append(f"조항 {plan.chunk_count:,}개")
+    if plan.approved_chunk_count:
+        parts.append(f"이 중 승인·색인된 조항 {plan.approved_chunk_count:,}개")
+    if plan.indexed_record_count:
+        parts.append(f"MCP 색인 기록 {plan.indexed_record_count:,}건")
+    if plan.source_file_count:
+        parts.append(f"업로드 원본 파일 {plan.source_file_count:,}개")
+    if plan.export_file_count:
+        parts.append(f"내보내기 파일 {plan.export_file_count:,}개")
+    parts.extend(_institution_purge_leftover_parts(plan))
+    return " · ".join(parts)
+
+
+def _institution_purge_leftover_parts(plan: InstitutionPurgePlan) -> list[str]:
+    """전처리하지 않은 대기 규정 파일과 저장한 작업. 문서가 없어도 남아 있을 수 있다."""
+    parts: list[str] = []
+    if plan.pending_file_count:
+        parts.append(f"전처리 대기 규정 파일 {plan.pending_file_count:,}개")
+    if plan.saved_project_count:
+        parts.append(f"저장한 작업 {plan.saved_project_count:,}개")
+    return parts
+
+
+def _render_institution_purge_result(display_name: str, purge_result) -> None:
+    if purge_result is None:
+        return
+    st.success(
+        f"'{display_name}' 기관과 규정 데이터를 삭제했습니다. "
+        f"규정 {purge_result.deleted_document_count:,}개 · "
+        f"색인 기록 {purge_result.deindexed_record_count:,}건 · "
+        f"원본 파일 {purge_result.deleted_source_file_count:,}개를 지웠습니다."
+    )
+    for failure in purge_result.failures[:5]:
+        st.warning(f"일부 항목을 지우지 못했습니다: {failure}")
+
+
+def _render_institution_delete_confirmation(registry, profile, display_name: str) -> None:
+    """기관을 지우기 전에 무엇이 사라지는지 보여 주고 기관명을 직접 받아 확인한다.
+
+    되돌릴 수 없는 삭제라, 버튼 한 번으로 끝나면 안 된다. 예전에는 프로필만 지우고
+    규정 데이터는 남겨 뒀는데, 기관 ID가 기관명 해시라서 같은 이름으로 다시 만들면
+    남아 있던 규정이 전부 되살아났다. 운영자에게는 삭제가 안 된 것으로 보였다.
+    """
+    plan = _institution_purge_plan(profile.profile_id)
+    st.warning(
+        f"'{display_name}' 기관을 삭제합니다. 함께 삭제되는 데이터: "
+        + (_institution_purge_plan_summary(plan) if not plan.is_empty else "저장된 규정 데이터 없음")
+    )
+    if not plan.is_empty:
+        st.caption(
+            "되돌릴 수 없습니다. 승인·색인된 조항은 MCP 답변 근거에서도 함께 빠집니다. "
+            "기관 프로필만 남기고 규정은 보관하려면 아래 '규정 데이터는 남기기'를 켜세요. "
+            "다만 같은 기관명으로 다시 등록하면 기관 ID가 똑같이 계산되어 남긴 규정이 다시 붙습니다."
+        )
+    keep_documents = st.checkbox(
+        "규정 데이터는 남기기 (기관 프로필만 삭제)",
+        key=f"keep-documents-institution-{profile.profile_id}",
+        value=False,
+        disabled=plan.is_empty,
+    )
+    typed_name = ""
+    if not keep_documents and not plan.is_empty:
+        typed_name = st.text_input(
+            f"확인을 위해 기관명 '{display_name}'을(를) 그대로 입력하세요",
+            key=f"confirm-name-institution-{profile.profile_id}",
+            placeholder=display_name,
+        )
+    name_confirmed = (
+        keep_documents
+        or plan.is_empty
+        or str(typed_name or "").strip() == str(display_name or "").strip()
+    )
+    confirm_delete_col, cancel_delete_col = st.columns(2)
+    with confirm_delete_col:
+        if st.button(
+            "삭제 확인",
+            key=f"confirm-delete-institution-{profile.profile_id}",
+            type="primary",
+            width="stretch",
+            disabled=not name_confirmed,
+        ):
+            try:
+                purge_result = _delete_registered_institution(
+                    registry,
+                    profile.profile_id,
+                    purge_documents=not keep_documents and not plan.is_empty,
+                )
+                st.session_state.pop(f"keep-documents-institution-{profile.profile_id}", None)
+                st.session_state.pop(f"confirm-name-institution-{profile.profile_id}", None)
+                if purge_result is None:
+                    st.success(
+                        f"'{display_name}' 기관 프로필을 삭제했습니다. 규정 데이터는 남아 있습니다."
+                    )
+                else:
+                    _render_institution_purge_result(display_name, purge_result)
+                st.rerun()
+            except (OSError, ValueError) as exc:
+                st.error(str(exc))
+    with cancel_delete_col:
+        if st.button(
+            "취소",
+            key=f"cancel-delete-institution-{profile.profile_id}",
+            width="stretch",
+        ):
+            st.session_state.pop(PENDING_INSTITUTION_DELETE_KEY, None)
+            st.rerun()
+
+
+def _render_orphan_institution_data_cleanup() -> None:
+    """등록된 기관은 없는데 남아 있는 규정 데이터를 지울 수 있게 한다.
+
+    프로필만 지운 뒤 남은 데이터는 화면 어디에도 나타나지 않는다. 그러다 같은
+    기관명으로 다시 등록하는 순간 한꺼번에 되살아나므로, 여기서 보이게 만든다.
+    """
+    plans = [plan for plan in _orphan_institution_data_plans() if not plan.is_empty]
+    if not plans:
+        return
+    total_documents = sum(plan.document_count for plan in plans)
+    total_pending = sum(plan.pending_file_count for plan in plans)
+    leftover_label = (
+        f"규정 데이터 {total_documents:,}개"
+        if total_documents
+        else f"전처리 대기 규정 파일 {total_pending:,}개"
+    )
+    with st.expander(f"등록된 기관 없이 남아 있는 {leftover_label} 정리", expanded=False):
+        st.caption(
+            "예전에 기관 프로필만 지웠을 때 남은 데이터입니다. 같은 기관명으로 다시 등록하면 "
+            "기관 ID가 똑같이 계산되어 아래 규정이 그대로 다시 보입니다."
+        )
+        options = {
+            f"{plan.profile_id} · 규정 {plan.document_count:,}개"
+            + (
+                f" · 대기 파일 {plan.pending_file_count:,}개"
+                if plan.pending_file_count
+                else ""
+            )
+            + (
+                f" · 예: {plan.document_names[0][:20]}"
+                if plan.document_names and plan.document_names[0]
+                else ""
+            ): plan
+            for plan in plans
+        }
+        selected_labels = st.multiselect(
+            "삭제할 기관 데이터",
+            options=list(options),
+            key="orphan-institution-data-selection",
+        )
+        selected_plans = [options[label] for label in selected_labels]
+        if selected_plans:
+            service = _institution_purge_service()
+            # 고른 것만 정확히 센다. 목록 전체를 세면 화면이 멈춘다.
+            detailed_plans = [service.plan(plan.profile_id) for plan in selected_plans]
+            st.warning(
+                "되돌릴 수 없습니다. 함께 삭제되는 데이터: "
+                + " / ".join(_institution_purge_plan_summary(plan) for plan in detailed_plans)
+            )
+        confirmed = st.checkbox(
+            "위 데이터를 영구 삭제하는 데 동의합니다",
+            key="orphan-institution-data-confirm",
+            value=False,
+        )
+        if st.button(
+            "선택한 기관 데이터 삭제",
+            key="orphan-institution-data-delete",
+            disabled=not selected_plans or not confirmed,
+        ):
+            service = _institution_purge_service()
+            deleted_documents = 0
+            failures: list[str] = []
+            for plan in selected_plans:
+                result = service.purge(plan.profile_id)
+                deleted_documents += result.deleted_document_count
+                failures.extend(result.failures)
+            st.session_state.pop("orphan-institution-data-selection", None)
+            st.session_state.pop("orphan-institution-data-confirm", None)
+            st.success(f"규정 {deleted_documents:,}개와 관련 기록을 삭제했습니다.")
+            for failure in failures[:5]:
+                st.warning(f"일부 항목을 지우지 못했습니다: {failure}")
+            st.rerun()
 
 
 def _page_institution_select(registry) -> None:
@@ -2280,6 +2866,9 @@ def _page_institution_select(registry) -> None:
     )
     if not profiles:
         st.warning("등록된 기관이 없습니다. 위에 기관명을 입력하고 '기관 생성'을 눌러 주세요.")
+        # 기관이 하나도 없어도 데이터는 남아 있을 수 있다. 같은 이름으로 다시 등록하는
+        # 순간 되살아나므로, 지울 기회를 여기서 준다.
+        _render_orphan_institution_data_cleanup()
         # Bare-mode imports used by helpers/tests swallow ``st.stop``; return
         # as well so an empty registry never reaches ``st.columns(0)``.
         return
@@ -2289,6 +2878,7 @@ def _page_institution_select(registry) -> None:
         "작업할 기관을 선택하세요",
         "규정을 올릴 기관 카드의 '이 기관으로 시작' 버튼을 누르세요.",
         control_key_prefix="select-institution-",
+        substep=1,
     )
     columns = st.columns(min(3, len(profiles)))
     for index, profile in enumerate(profiles):
@@ -2327,32 +2917,9 @@ def _page_institution_select(registry) -> None:
                     st.rerun()
 
             if st.session_state.get(PENDING_INSTITUTION_DELETE_KEY) == profile.profile_id:
-                st.warning(
-                    f"'{display_name}' 기관 프로필을 삭제합니다. "
-                    "업로드한 규정·승인 데이터는 자동 삭제하지 않습니다."
-                )
-                confirm_delete_col, cancel_delete_col = st.columns(2)
-                with confirm_delete_col:
-                    if st.button(
-                        "삭제 확인",
-                        key=f"confirm-delete-institution-{profile.profile_id}",
-                        type="primary",
-                        width="stretch",
-                    ):
-                        try:
-                            _delete_registered_institution(registry, profile.profile_id)
-                            st.success(f"'{display_name}' 기관을 삭제했습니다.")
-                            st.rerun()
-                        except (OSError, ValueError) as exc:
-                            st.error(str(exc))
-                with cancel_delete_col:
-                    if st.button(
-                        "취소",
-                        key=f"cancel-delete-institution-{profile.profile_id}",
-                        width="stretch",
-                    ):
-                        st.session_state.pop(PENDING_INSTITUTION_DELETE_KEY, None)
-                        st.rerun()
+                _render_institution_delete_confirmation(registry, profile, display_name)
+
+    _render_orphan_institution_data_cleanup()
 
 
 def _apply_operator_deep_link() -> None:
@@ -3618,6 +4185,7 @@ def _render_mcp_bundle_blocking_guidance(
                 "남은 규정을 검수하고 승인하세요",
                 "아래 버튼을 누르면 첫 번째 남은 규정의 ③ 검수 화면으로 바로 이동합니다.",
                 control_keys=(button_key,),
+                substep=5,
             )
         _render_workflow_next_button(
             "③ 검수하고 승인으로 이동",
@@ -5089,17 +5657,25 @@ def _render_operator_theme() -> None:
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            flex: 0 0 2rem;
-            width: 2rem;
+            flex: 0 0 auto;
+            min-width: 2rem;
             height: 2rem;
-            border-radius: 50%;
+            padding: 0 .55rem;
+            border-radius: 1rem;
             background: #c62828;
             color: #fff;
             font-weight: 800;
             font-size: 1rem;
+            white-space: nowrap;
         }
         .rr-beginner-marker strong {display: block; color: #8e1b1b; line-height: 1.4;}
         .rr-beginner-marker p {margin: .15rem 0 0 0; color: #543737; font-size: .9rem; line-height: 1.5;}
+        .rr-beginner-marker .rr-beginner-marker-progress {
+            margin-top: .3rem;
+            font-size: .78rem;
+            font-weight: 700;
+            color: #8e1b1b;
+        }
         .rr-beginner-marker-arrow {
             position: absolute;
             right: .9rem;
@@ -5109,19 +5685,28 @@ def _render_operator_theme() -> None:
             font-weight: 900;
         }
         .rr-stages {display: flex; align-items: stretch; flex-wrap: wrap; gap: .3rem; margin: .2rem 0 1.1rem 0;}
+        /* 기본값은 '지금 단계가 아님'. 색은 아래 .active 한 칸에만 준다. */
         .rr-stage {
             flex: 1 1 0; min-width: 9rem;
-            border: 1px solid #e3ddc9; border-radius: .8rem;
-            padding: .55rem .8rem; background: #fffdf7;
+            border: 1px solid #e4e6e4; border-radius: .8rem;
+            padding: .55rem .8rem; background: #fafafa;
         }
-        .rr-stage .rr-stage-k {font-size: .72rem; font-weight: 700; color: #8a8f8b;}
-        .rr-stage .rr-stage-t {font-size: .96rem; font-weight: 700; margin: .12rem 0; color: #2b322e;}
-        .rr-stage .rr-stage-d {font-size: .78rem; color: #6b726c; line-height: 1.45;}
-        .rr-stage.done {border-color: #1f6f5b; background: #f2faf6;}
-        .rr-stage.done .rr-stage-k {color: #1f6f5b;}
-        .rr-stage.active {border: 2px solid #e6b857; background: #fffaf0;}
-        .rr-stage.active .rr-stage-k {color: #b8860b;}
-        .rr-stage-arrow {align-self: center; color: #c9c1a6; font-weight: 700; padding: 0 .15rem;}
+        .rr-stage .rr-stage-k {font-size: .72rem; font-weight: 700; color: #9aa09b;}
+        .rr-stage .rr-stage-t {font-size: .96rem; font-weight: 700; margin: .12rem 0; color: #737a74;}
+        .rr-stage .rr-stage-d {font-size: .78rem; color: #8b918c; line-height: 1.45;}
+        /* 끝난 단계: 색 없이 톤만 낮춘다. 지나온 곳이지 지금 볼 곳이 아니다. */
+        .rr-stage.done {background: #f2f3f2; border-color: #dcdfdc;}
+        /* 아직 오지 않은 단계: 점선으로 '비어 있음'을 드러낸다. */
+        .rr-stage.upcoming {background: #ffffff; border-style: dashed; border-color: #dfe2df;}
+        /* 지금 단계: 화면에서 색이 있는 유일한 칸. */
+        .rr-stage.active {
+            border: 2px solid #c62828; background: #fdecea;
+            box-shadow: 0 0 0 3px rgba(198, 40, 40, .12);
+        }
+        .rr-stage.active .rr-stage-k {color: #c62828; font-weight: 800; letter-spacing: .01em;}
+        .rr-stage.active .rr-stage-t {color: #8f1d1d; font-size: 1.02rem; text-decoration: none;}
+        .rr-stage.active .rr-stage-d {color: #6d4b49;}
+        .rr-stage-arrow {align-self: center; color: #c9cdc9; font-weight: 700; padding: 0 .15rem;}
         .rr-ai-panel {
             border: 1px solid #cfe0d8; border-radius: 1rem;
             padding: .9rem 1.1rem; background: #f4faf7; margin: .3rem 0 1rem 0;
@@ -5866,6 +6451,7 @@ def _render_kordoc_preprocess_preflight() -> bool:
             "Kordoc 없이도 일반 조문·항·호의 빠른 구조 전처리는 할 수 있습니다. "
             "다만 공식 MCP 파일 묶음에는 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요하므로, 설치 범위를 읽고 동의한 뒤 바로 아래 설치·검증 시작 버튼을 누르세요.",
             control_key_prefix="preprocess-kordoc-install-run",
+            substep=2,
         )
     else:
         _render_beginner_action_marker(
@@ -5873,6 +6459,7 @@ def _render_kordoc_preprocess_preflight() -> bool:
             "먼저 Node.js LTS 설치 페이지를 여세요",
             "Node.js LTS를 설치한 뒤 앱을 완전히 재시작하면 Kordoc 설치 버튼을 누를 수 있습니다.",
             control_key_prefix="preprocess-nodejs-link",
+            substep=2,
         )
     st.warning(
         "Kordoc는 PDF·HWP·HWPX·DOCX 문서의 표·별표·복잡한 서식을 확인하는 품질 도구입니다. "
@@ -6208,6 +6795,32 @@ def _mcp_bundle_created(
     return False
 
 
+def _results_step_is_used(ctx: dict | None) -> bool:
+    """'② 결과 확인' 단계를 이 문서에 보여 줄지.
+
+    AI 추가 검수를 켜지 않았으면 ②에서 볼 것이 사실상 없다. 파서 전처리본이
+    최종본이고, 확인은 원본과 나란히 놓는 ③에서 해야 제대로 된다. 그래서
+    AI 검수를 쓴 문서에서만 ②를 단계로 세운다(그때는 AI가 짚은 초안이 있다).
+
+    품질 경고와 기술 상세는 ② 대신 ③ 화면에서 이어서 볼 수 있다.
+    """
+    if not ctx:
+        # 아직 문서가 없으면 기본 순서를 유지한다(감췄다 나타났다 하면 더 헷갈린다).
+        return True
+    return _agent_review_requested(ctx.get("agent_review_summary"))
+
+
+def _primary_nav_pages(ctx: dict | None, current_nav_page: str = "") -> list[str]:
+    """왼쪽 기본 메뉴에 세울 단계 목록.
+
+    지금 ② 화면을 보고 있다면 감추지 않는다. 라디오 선택값이 목록에서
+    빠지면 화면이 통째로 튕겨 나가기 때문이다.
+    """
+    if _results_step_is_used(ctx) or current_nav_page == NAV_RESULTS:
+        return list(PRIMARY_NAV_PAGES)
+    return [page for page in PRIMARY_NAV_PAGES if page != NAV_RESULTS]
+
+
 def _workflow_states(ctx: dict | None) -> list[bool]:
     """Return the fail-closed completion state for the four operator cards."""
 
@@ -6238,7 +6851,9 @@ def _workflow_states(ctx: dict | None) -> list[bool]:
     results_complete = bool(
         preprocessing_complete
         and (
-            bool(ctx.get("quality_report") and ctx["quality_report"].passed)
+            # ②를 건너뛰는 규정은 확인할 화면이 없으므로 전처리 완료로 갈음한다.
+            not _results_step_is_used(ctx)
+            or bool(ctx.get("quality_report") and ctx["quality_report"].passed)
             or results_confirmed
             or approval_evidence_complete
         )
@@ -6340,6 +6955,128 @@ def _selected_workflow_document_ids() -> list[str]:
     return [document_id for document_id in candidate_ids if document_id in selected_ids]
 
 
+def _document_regulation_units(chunks: list) -> list[dict[str, object]]:
+    """규정집 통합본 한 파일 안에 들어 있는 개별 규정들을 등장 순서대로 묶는다.
+
+    파서가 regulation 노드를 잡아두어 청크마다 regulation_no/regulation_title이 붙는다.
+    통합본은 이 단위가 수백 개라, 한 규정씩 열어야 검수가 가능하다.
+    """
+    units: dict[str, dict[str, object]] = {}
+    for chunk in chunks:
+        metadata = getattr(chunk, "metadata", None) or {}
+        title = str(metadata.get("regulation_title") or "").strip()
+        number = str(metadata.get("regulation_no") or "").strip()
+        key = f"{number}|{title}"
+        unit = units.get(key)
+        if unit is None:
+            unit = {
+                "key": key,
+                "number": number,
+                "title": title or "(규정명 미확인)",
+                "chunk_ids": [],
+                "pending": 0,
+                "approved": 0,
+            }
+            units[key] = unit
+        unit["chunk_ids"].append(str(getattr(chunk, "chunk_id", "") or ""))
+        if _is_chunk_pending_approval(chunk):
+            unit["pending"] = int(unit["pending"]) + 1
+        if _approval_status(chunk) == "approved":
+            unit["approved"] = int(unit["approved"]) + 1
+    return list(units.values())
+
+
+def _regulation_unit_label(unit: dict[str, object]) -> str:
+    number = str(unit.get("number") or "").strip()
+    title = str(unit.get("title") or "").strip()
+    return f"{number}. {title}" if number else title
+
+
+def _render_document_regulation_directory(
+    document_id: str, units: list[dict[str, object]]
+) -> str:
+    """통합본 안의 규정 목록을 보여주고 클릭한 규정의 key를 돌려준다('' = 전체)."""
+    state_key = f"approval-regulation-unit-{document_id}"
+    selected_key = str(st.session_state.get(state_key) or "")
+    valid_keys = {str(unit["key"]) for unit in units}
+    if selected_key not in valid_keys:
+        selected_key = ""
+
+    st.markdown(f"### 이 파일 안의 규정 {len(units):,}개")
+    st.caption(
+        "올리신 파일은 규정집 통합본이라 규정이 여러 개 들어 있습니다. "
+        "아래 표에서 **규정 행을 클릭**하면 그 규정의 조항만 검수합니다. "
+        "전체를 한 번에 펼치지 않으므로 화면이 느려지지 않습니다."
+    )
+    rows = [
+        {
+            "규정번호": str(unit.get("number") or ""),
+            "규정명": str(unit.get("title") or ""),
+            "조항": len(list(unit.get("chunk_ids") or [])),
+            "미승인": int(unit.get("pending") or 0),
+            "승인됨": int(unit.get("approved") or 0),
+            "상태": (
+                "승인 완료"
+                if not int(unit.get("pending") or 0)
+                else "검수 필요"
+            ),
+        }
+        for unit in units
+    ]
+    selection = st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"approval-regulation-table-{document_id}",
+    )
+    selected_rows = list(getattr(selection, "selection", {}).get("rows") or [])
+    if selected_rows:
+        clicked_key = str(units[int(selected_rows[0])]["key"])
+        if clicked_key != selected_key:
+            st.session_state[state_key] = clicked_key
+            st.rerun()
+        selected_key = clicked_key
+
+    if selected_key:
+        opened = next(unit for unit in units if str(unit["key"]) == selected_key)
+        st.success(
+            f"'{_regulation_unit_label(opened)}' 규정을 열었습니다. "
+            "아래 비교 화면과 최종 확정은 이 규정 조항만 대상으로 합니다."
+        )
+        if st.button(
+            "이 파일의 전체 규정 한꺼번에 확인 (규정 선택 해제)",
+            key=f"approval-regulation-clear-{document_id}",
+        ):
+            st.session_state[state_key] = ""
+            st.rerun()
+    else:
+        st.info(
+            "위 표에서 규정을 하나 클릭하면 그 규정만 검수합니다. "
+            "클릭하지 않으면 이 파일의 전체 규정 조항을 순서대로 한꺼번에 검수합니다."
+        )
+    return selected_key
+
+
+def _workflow_document_opened(document_id: str) -> bool:
+    """디렉터리에서 이 규정을 실제로 열었는지. 열기 전에는 상세 화면을 그리지 않는다."""
+    opened = str(st.session_state.get(WORKFLOW_OPENED_DOCUMENT_KEY) or "").strip()
+    return bool(opened) and opened == str(document_id or "").strip()
+
+
+def _render_workflow_directory_open_prompt(document_id: str, *, blocking: bool = True) -> None:
+    label = _workflow_document_label(repository.get_document(document_id)) if document_id else ""
+    st.info(
+        "위 규정 디렉터리에서 **'규정 열기'** 를 누르면 그 규정의 상세 화면을 불러옵니다."
+        + (f" 마지막으로 보던 규정은 '{label}'입니다." if label else "")
+        + ("" if blocking else " 열지 않고 다음 단계로 넘어가도 됩니다.")
+    )
+    st.caption(
+        "선택한 규정을 한꺼번에 펼치지 않고 연 규정 1개만 불러옵니다. 규정 수가 많아도 화면이 느려지지 않습니다."
+    )
+
+
 def _render_workflow_document_directory(*, page_key: str) -> list[str]:
     """Keep one upload batch together while loading only the opened document in detail."""
     documents = _workflow_documents()
@@ -6347,6 +7084,9 @@ def _render_workflow_document_directory(*, page_key: str) -> list[str]:
         return []
 
     candidate_ids = [str(getattr(document, "document_id", "") or "") for document in documents]
+    if len(candidate_ids) == 1:
+        # 규정이 하나뿐이면 고를 것이 없으므로 디렉터리 클릭을 요구하지 않는다.
+        st.session_state[WORKFLOW_OPENED_DOCUMENT_KEY] = candidate_ids[0]
     raw_selected_ids = st.session_state.get(WORKFLOW_SELECTED_DOCUMENT_IDS_KEY)
     selected_ids = (
         {str(value or "").strip() for value in raw_selected_ids}
@@ -6359,7 +7099,8 @@ def _render_workflow_document_directory(*, page_key: str) -> list[str]:
 
     st.markdown("### 함께 처리할 규정 디렉터리")
     st.caption(
-        "올린 규정은 모두 기본 선택됩니다. 규정 열기를 누르면 해당 규정의 청크와 원문·전처리 결과, 개정 이력을 확인합니다."
+        "올린 규정은 모두 기본 선택됩니다. 규정 열기를 누르면 그 규정 **한 개만** 불러옵니다. "
+        "선택은 '전체 규정 승인'과 MCP 생성 범위에 쓰입니다."
     )
     for document in documents:
         document_id = str(getattr(document, "document_id", "") or "")
@@ -6374,17 +7115,18 @@ def _render_workflow_document_directory(*, page_key: str) -> list[str]:
             )
         if included:
             current_selected_ids.append(document_id)
+        is_open = document_id == active_document_id and _workflow_document_opened(document_id)
         with open_col:
             if st.button(
-                f"규정 열기 · {label}",
+                f"{'📂' if is_open else '📁'} 규정 열기 · {label}",
                 key=f"workflow-document-open-{page_key}-{document_id}",
                 width="stretch",
-                type="primary" if document_id == active_document_id else "secondary",
+                type="primary" if is_open else "secondary",
                 disabled=not included,
             ):
                 clicked_document_id = document_id
         with state_col:
-            st.caption("현재 상세 보기" if document_id == active_document_id else "함께 처리")
+            st.caption("열림" if is_open else ("선택됨" if included else "제외됨"))
 
     st.session_state[WORKFLOW_DOCUMENT_IDS_KEY] = candidate_ids
     st.session_state[WORKFLOW_SELECTED_DOCUMENT_IDS_KEY] = current_selected_ids
@@ -6392,16 +7134,23 @@ def _render_workflow_document_directory(*, page_key: str) -> list[str]:
         st.warning("다음 단계로 넘길 규정을 한 개 이상 선택해 주세요.")
         return []
 
-    target_document_id = clicked_document_id
-    if active_document_id not in current_selected_ids:
-        target_document_id = current_selected_ids[0]
-    if target_document_id and target_document_id != active_document_id:
-        st.session_state["document_id"] = target_document_id
+    if clicked_document_id:
+        # 명시적으로 연 규정만 상세 렌더링 대상이 된다. 같은 규정을 다시 눌러도 열림 상태를 갱신한다.
+        st.session_state[WORKFLOW_OPENED_DOCUMENT_KEY] = clicked_document_id
+        if clicked_document_id != active_document_id:
+            st.session_state["document_id"] = clicked_document_id
+            _invalidate_document_context_cache()
+            _queue_workflow_navigation(
+                st.session_state.get("nav_page", NAV_RESULTS),
+                label=f"{_workflow_document_label(repository.get_document(clicked_document_id))} 불러오기",
+            )
+        st.rerun()
+
+    if active_document_id and active_document_id not in current_selected_ids:
+        # 선택에서 빠진 규정이 열려 있으면 상세를 닫고 선택 목록의 첫 규정으로 되돌린다.
+        st.session_state["document_id"] = current_selected_ids[0]
+        st.session_state.pop(WORKFLOW_OPENED_DOCUMENT_KEY, None)
         _invalidate_document_context_cache()
-        _queue_workflow_navigation(
-            st.session_state.get("nav_page", NAV_RESULTS),
-            label=f"{_workflow_document_label(repository.get_document(target_document_id))} 불러오기",
-        )
         st.rerun()
 
     st.caption(f"선택된 규정 {len(current_selected_ids):,}개 / 작업 묶음 {len(documents):,}개")
@@ -6556,16 +7305,27 @@ def _page_home(ctx: dict | None) -> None:
     st.markdown("### 작업 순서")
     states = _workflow_states(ctx)
     current_index = next((i for i, done in enumerate(states) if not done), None)
+    all_steps = [
+        ("문서 올려서 전처리", "규정 파일을 올리면 파서가 조문 단위로 1차 정리합니다. AI 추가 검수는 직접 선택한 경우에만 실행됩니다.", NAV_PREPROCESS),
+        ("결과 확인", "AI 추가 검수가 짚은 부분과 품질 검사를 확인합니다.", NAV_RESULTS),
+        ("검수하고 승인", "원본과 전처리본을 나란히 놓고 확인한 뒤, 승인한 내용만 AI에 등록(색인)합니다.", NAV_APPROVAL),
+        ("MCP 생성·AI 연결", "Claude, ChatGPT, 내부 AI에 붙일 MCP 설정 JSON과 setup bundle을 생성합니다.", NAV_MCP),
+    ]
+    # AI 추가 검수를 쓰지 않았으면 '결과 확인'을 빼고 번호를 다시 매긴다.
+    # 볼 것이 없는 단계를 세워 두면 초보자는 자기가 뭘 놓쳤나 싶어 멈춘다.
+    visible_steps = [
+        (title, desc, nav, index)
+        for index, (title, desc, nav) in enumerate(all_steps)
+        if nav != NAV_RESULTS or _results_step_is_used(ctx)
+    ]
     steps = [
-        ("1단계", "문서 올려서 전처리", "규정 파일을 올리면 파서가 조문 단위로 1차 정리합니다. AI 추가 검수는 직접 선택한 경우에만 실행됩니다.", NAV_PREPROCESS),
-        ("2단계", "결과 확인", "정리 결과와 품질 검사를 확인하고, AI 추가 검수를 선택했다면 AI가 짚은 부분도 함께 봅니다.", NAV_RESULTS),
-        ("3단계", "검수하고 승인", "사람이 최종 확인을 마친 내용에만 '승인'을 하고 AI에 등록(색인)합니다.", NAV_APPROVAL),
-        ("4단계", "MCP 생성·AI 연결", "Claude, ChatGPT, 내부 AI에 붙일 MCP 설정 JSON과 setup bundle을 생성합니다.", NAV_MCP),
+        (f"{position + 1}단계", title, desc, nav, index)
+        for position, (title, desc, nav, index) in enumerate(visible_steps)
     ]
     cols = st.columns(len(steps))
-    for i, (num, title, desc, nav) in enumerate(steps):
-        done = states[i]
-        current = current_index == i
+    for i, (num, title, desc, nav, state_index) in enumerate(steps):
+        done = states[state_index]
+        current = current_index == state_index
         card_class = "done" if done else ("current" if current else "")
         state_class = "done" if done else ("current" if current else "todo")
         state_text = "✅ 완료" if done else ("🟡 지금 할 차례" if current else "대기")
@@ -6594,13 +7354,48 @@ def _page_home(ctx: dict | None) -> None:
 # 페이지: ① 문서 올려서 전처리
 # ---------------------------------------------------------------------------
 
+def _preprocess_start_checklist(
+    *,
+    files_selected: bool,
+    info_confirmed: bool,
+) -> list[tuple[str, bool]]:
+    """'전처리 시작'을 누르기까지 남은 준비 항목.
+
+    ① 화면은 세로로 길고, 선택 하나에 설명 블록이 붙었다 떨어졌다 한다. 그때마다
+    아래에 있던 버튼이 스크롤 밖으로 밀려 "방금 보던 버튼이 사라졌다"가 된다.
+    남은 준비 항목을 한자리에 고정해 두면, 화면이 어떻게 늘어나도 지금 몇 개가
+    끝났고 다음에 뭘 눌러야 하는지가 같은 위치에 남는다.
+    """
+
+    return [
+        ("규정 파일 선택", bool(files_selected)),
+        ("문서 정보 확인", bool(info_confirmed)),
+    ]
+
+
+def _preprocess_next_action_text(
+    checklist: list[tuple[str, bool]],
+    *,
+    poc_review_needs_ack: bool,
+) -> str:
+    """준비 항목 중 지금 손댈 것 하나만 골라 문장으로 돌려준다."""
+
+    if poc_review_needs_ack:
+        return "지금 할 일: 위 전문가 설정에서 '미검수 미리보기' 확인란에 체크하세요."
+    for label, done in checklist:
+        if not done:
+            return f"지금 할 일: {label}"
+    return "지금 할 일: 바로 아래 '전처리 시작' 버튼을 누르세요."
+
+
 def _page_preprocess() -> None:
     st.markdown("## ① 문서 올려서 전처리")
     _render_operator_project_controls(NAV_PREPROCESS)
     _render_pipeline_stages(PIPELINE_STAGE_PARSER)
     st.markdown(
         '<div class="rr-help">규정 파일을 올리고 문서 정보를 확인한 뒤 <b>전처리 시작</b> 버튼만 누르면 됩니다. '
-        "기본은 <b>빠른 구조 전처리</b>로 조문·항·호를 먼저 정리합니다. AI 추가 검수는 필요할 때만 직접 선택하세요.</div>",
+        "기본은 <b>빠른 구조 전처리</b>로 조문·항·호를 먼저 정리합니다. "
+        "AI 추가 검수가 필요하면 왼쪽 사이드바 <b>AI 검수</b>에서 한 번만 켜 두세요.</div>",
         unsafe_allow_html=True,
     )
 
@@ -6619,6 +7414,7 @@ def _page_preprocess() -> None:
             "먼저 규정 파일을 선택하세요",
             "바로 아래 영역에 PDF·HWP·HWPX·DOCX 파일을 끌어놓거나 파일 찾기를 누르세요.",
             control_key_prefix="regulation_document_upload",
+            substep=3,
         )
     uploaded = st.file_uploader(
         "문서 업로드",
@@ -6672,6 +7468,9 @@ def _page_preprocess() -> None:
     institution_name = str(profile_defaults.get("institution_name") or "")
     st.caption(f"기관명: {institution_name or '선택한 기관 프로필에서 자동 적용'}")
     document_name = ""
+    document_name_mode = str(
+        st.session_state.get(PREPROCESS_DOCUMENT_NAME_MODE_KEY) or "filename"
+    )
 
     upload_sources: list[dict[str, object]] = []
     pending_paths: list[Path] = []
@@ -6692,10 +7491,31 @@ def _page_preprocess() -> None:
             ]
             if pending_only:
                 st.markdown("#### 저장된 대기 파일")
-                for path in pending_only:
+                pending_checkbox_keys = [
+                    f"pending-upload-{hashlib.sha256(str(path).encode('utf-8')).hexdigest()[:16]}"
+                    for path in pending_only
+                ]
+                # 대기 파일을 하나씩 체크하게 두면 규정 수십 개를 한 번에 전처리할 방법이 없다.
+                select_all_cols = st.columns(2)
+                if select_all_cols[0].button(
+                    f"전체 규정 선택 ({len(pending_only):,}개)",
+                    key="pending-upload-select-all",
+                    help="저장된 대기 파일을 모두 골라 한 번에 전처리합니다.",
+                ):
+                    for checkbox_key in pending_checkbox_keys:
+                        st.session_state[checkbox_key] = True
+                    st.rerun()
+                if select_all_cols[1].button(
+                    "전체 선택 해제",
+                    key="pending-upload-clear-all",
+                ):
+                    for checkbox_key in pending_checkbox_keys:
+                        st.session_state[checkbox_key] = False
+                    st.rerun()
+                for path, checkbox_key in zip(pending_only, pending_checkbox_keys):
                     if st.checkbox(
                         f"{_pending_upload_display_name(path)} · {_format_upload_mb(path.stat().st_size)}",
-                        key=f"pending-upload-{hashlib.sha256(str(path).encode('utf-8')).hexdigest()[:16]}",
+                        key=checkbox_key,
                     ):
                         selected_pending_paths.append(path)
                 delete_options = {
@@ -6821,6 +7641,35 @@ def _page_preprocess() -> None:
             "같은 규정의 승인된 이전 버전이 있으면 자동으로 개정 관계를 연결합니다."
         )
 
+        # 지금까지는 본문에서 찾은 제목이 항상 이겨서, 사용자가 저장한 파일 이름이 목록에서 사라졌다.
+        document_name_mode = st.radio(
+            "규정 이름 (목록·디렉터리에 표시될 이름)",
+            ["filename", "content"],
+            format_func=lambda value: {
+                "filename": "올린 파일 이름 그대로 사용",
+                "content": "문서 본문에서 찾은 제목 사용",
+            }[value],
+            horizontal=True,
+            key=PREPROCESS_DOCUMENT_NAME_MODE_KEY,
+        )
+        if document_name_mode == "filename":
+            st.caption(
+                "파일을 저장할 때 쓴 이름이 그대로 규정 이름이 됩니다(확장자는 뺍니다). "
+                "규정 안의 조항 제목은 본문에서 찾은 값을 그대로 씁니다."
+            )
+            if len(upload_sources) == 1:
+                document_name = st.text_input(
+                    "규정 이름 직접 수정 (선택)",
+                    value=Path(str(upload_sources[0]["filename"])).stem,
+                    key="preprocess-document-name-override",
+                    help="비워 두면 파일 이름을 그대로 씁니다.",
+                )
+        else:
+            st.caption(
+                "본문 첫 부분에서 찾은 규정 제목을 씁니다. 통합본처럼 제목이 여러 개인 파일에서는 "
+                "파일 이름을 쓰는 편이 목록에서 찾기 쉽습니다."
+            )
+
     regulation_id = ""
     regulation_version = ""
     revision_date = ""
@@ -6907,24 +7756,22 @@ def _page_preprocess() -> None:
                     help="개정본인 경우 이전 문서의 ID를 기록합니다.",
                 )
 
-    ai_review_requested = st.checkbox(
-        "AI로 의심 구간 추가 검수 (선택)",
-        value=False,
-        key="preprocess-enable-agent-review",
-        help=(
-            "기본 빠른 구조 전처리에는 외부 AI 호출이 없습니다. 켜면 처리 시간과 API 사용 비용이 늘 수 있으며, "
-            "선택된 의심 구간을 AI가 추가로 살펴봅니다."
-        ),
-    )
+    # AI 검수를 쓸지는 왼쪽 사이드바 'AI 검수'에서 한 번만 정한다. 이 화면에서 또 묻지 않는다.
+    # 켜져 있으면 전처리에 자동으로 함께 실행되고, ③에서 AI 검수본이 최종본이 된다.
+    ai_review_requested = bool(settings.enable_agent_review) and not _ai_review_setup_blocker(settings)
+    ai_review_max_chunks = int(settings.agent_review_max_chunks_per_document)
+    ai_review_max_input_tokens = int(settings.agent_review_max_input_tokens_per_document)
     if ai_review_requested:
-        st.info(
-            "AI 추가 검수를 선택했습니다. 처리 시간과 API 사용 비용이 늘 수 있습니다. "
-            "AI 결과도 최종 결정이 아니며, 다음 검토 화면에서 사람이 확인·보완해야 공식 RAG/MCP에 사용할 수 있습니다."
+        st.caption(
+            f"🤖 AI 검수 켜짐 — 이번 전처리에 함께 실행됩니다. 규정 전체가 아니라 품질 검사·파서 경고에 걸린 "
+            f"의심 구간만 문서당 최대 {ai_review_max_chunks:,}개까지 외부 AI로 보내며, 처리 시간과 API 비용이 늘 수 있습니다. "
+            "끄거나 한도를 바꾸려면 왼쪽 사이드바 'AI 검수'를 여세요."
         )
     else:
         st.caption(
-            "기본값: 빠른 구조 전처리. 외부 AI 호출 없이 조문·항·호를 정리합니다. "
-            "나중에 검토 화면에서 사람이 내용을 보완할 수 있으며, 공식 승인·보안 확인은 그대로 진행됩니다."
+            "빠른 구조 전처리 — 외부 AI 호출 없이 조문·항·호를 정리합니다. "
+            "AI 검수를 함께 돌리려면 왼쪽 사이드바 'AI 검수'에서 켜세요. "
+            "공식 승인·보안 확인은 그대로 진행됩니다."
         )
 
     beginner_preprocess_confirmations_complete = True
@@ -6939,31 +7786,15 @@ def _page_preprocess() -> None:
                 "자동 인식한 규정 정보를 확인하세요",
                 "파일명·규정명·버전·날짜가 맞는지 보고, 틀리면 직접 수정한 뒤 아래 확인란을 선택하세요.",
                 control_key_prefix=BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY,
+                substep=4,
             )
         info_confirmed = st.checkbox(
             "자동 인식한 규정 정보와 필요한 수정값을 확인했습니다.",
             key=BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY,
             help="규정명·버전·개정일·시행일이 맞는지 확인한 뒤 선택하세요.",
         )
-        ai_choice_confirmed = bool(
-            st.session_state.get(BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY)
-        )
-        if info_confirmed and not ai_choice_confirmed:
-            _render_beginner_action_marker(
-                1,
-                "AI 추가 검수 사용 여부를 결정하세요",
-                "위 선택값을 확인하세요. 빠른 전처리는 체크하지 않은 상태이며, 외부 AI 검수가 필요할 때만 켭니다.",
-                control_key_prefix=BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY,
-            )
-        ai_choice_confirmed = st.checkbox(
-            "AI 추가 검수를 사용할지 여부를 결정했습니다.",
-            key=BEGINNER_GUIDE_PREPROCESS_AI_CHOICE_CONFIRMED_KEY,
-            disabled=not info_confirmed,
-            help="AI 추가 검수 체크박스를 켤지 결정한 뒤 이 확인란을 선택하세요.",
-        )
-        beginner_preprocess_confirmations_complete = bool(
-            info_confirmed and ai_choice_confirmed
-        )
+        # AI 검수 사용 여부는 왼쪽 사이드바에서 한 번만 정한다. 여기서 다시 묻지 않는다.
+        beginner_preprocess_confirmations_complete = bool(info_confirmed)
 
     with st.expander("전문가 설정 (기본값 사용을 권장합니다)", expanded=False):
         max_chunk_chars = st.number_input("최대 청크 글자 수", min_value=500, max_value=10000, value=1800, step=100)
@@ -7001,6 +7832,32 @@ def _page_preprocess() -> None:
 
     st.markdown("### 3. 전처리 시작")
     poc_review_needs_ack = bool(upload_sources and not official_review_required and not unreviewed_poc_review_acknowledged)
+    # 초보자 안내를 끄면 별도 확인란 자체가 없으므로 그 항목은 처음부터 끝난 것으로 센다.
+    beginner_mode_confirmations_apply = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+    start_checklist = _preprocess_start_checklist(
+        files_selected=bool(upload_sources),
+        info_confirmed=(
+            bool(st.session_state.get(BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY))
+            if beginner_mode_confirmations_apply
+            else True
+        ),
+    )
+    start_checklist_done = sum(1 for _label, done in start_checklist if done)
+    st.progress(
+        start_checklist_done / len(start_checklist),
+        text=f"전처리 시작 준비 {start_checklist_done}/{len(start_checklist)}",
+    )
+    st.caption(
+        " · ".join(
+            f"{'✅' if done else '⬜'} {label}" for label, done in start_checklist
+        )
+    )
+    st.caption(
+        _preprocess_next_action_text(
+            start_checklist,
+            poc_review_needs_ack=poc_review_needs_ack,
+        )
+    )
     if poc_review_needs_ack:
         st.warning("미검수 미리보기(Unreviewed PoC Review) 확인란에 체크해야 전처리를 시작할 수 있습니다.")
     if not upload_sources:
@@ -7014,6 +7871,7 @@ def _page_preprocess() -> None:
             "선택한 파일의 전처리를 시작하세요",
             "문서 정보가 맞는지 확인한 뒤 바로 아래 전처리 시작 버튼을 누르세요.",
             control_key_prefix="preprocess-start",
+            substep=5,
         )
     if upload_sources and st.button(
         "전처리 시작",
@@ -7062,6 +7920,13 @@ def _page_preprocess() -> None:
                 st.stop()
             if profile is not None and profile.max_upload_mb:
                 upload_settings = replace(settings, max_upload_mb=profile.max_upload_mb)
+        if ai_review_requested:
+            # 화면에서 정한 AI 검수 한도를 이번 전처리에 그대로 적용한다.
+            upload_settings = replace(
+                upload_settings,
+                agent_review_max_chunks_per_document=ai_review_max_chunks,
+                agent_review_max_input_tokens_per_document=ai_review_max_input_tokens,
+            )
         if not upload_metadata.get("source_system"):
             upload_metadata["source_system"] = "LOCAL_UPLOAD"
 
@@ -7203,6 +8068,12 @@ def _page_preprocess() -> None:
                 tick = 0
                 while thread.is_alive() or not progress_events.empty():
                     received_progress = False
+                    current_unit = 0
+                    total_units = 0
+                    unit_label = "규정"
+                    # 전처리는 쪽·줄·검수 묶음 단위로 자주 보고한다. 들어온 보고마다
+                    # 화면을 다시 그리면 그리는 값이 실제 작업보다 비싸진다.
+                    # 한 번 훑어 가장 최근 상태만 남기고 한 번만 그린다.
                     while True:
                         try:
                             current = progress_events.get_nowait()
@@ -7217,6 +8088,7 @@ def _page_preprocess() -> None:
                         current_unit = int(getattr(current, "current_unit", 0) or 0)
                         total_units = int(getattr(current, "total_units", 0) or 0)
                         unit_label = str(getattr(current, "unit_label", "") or "규정")
+                    if received_progress:
                         if total_units > 0:
                             regulation_progress_box.progress(
                                 min(100, int((current_unit / total_units) * 100)),
@@ -7287,6 +8159,9 @@ def _page_preprocess() -> None:
                     )
 
                 file_upload_metadata = dict(upload_metadata)
+                if document_name_mode == "filename" and not file_upload_metadata.get("document_name"):
+                    # 파일마다 자기 파일 이름을 쓴다. 한 이름을 여러 규정에 공통 적용하지 않는다.
+                    file_upload_metadata["document_name"] = Path(filename).stem
                 _update_file_progress(file_index, filename, 0.0, "Saving uploaded file", status_label="탑재 중")
                 pending_stream = None
                 if source["kind"] == "pending":
@@ -7347,7 +8222,11 @@ def _page_preprocess() -> None:
             st.session_state[f"workflow-document-selected-{completed_document_id}"] = True
         st.session_state["document_id"] = document.document_id
         st.session_state["unreviewed_preview_requested"] = not official_review_required
-        st.success(f"{len(completed_documents)}개 문서 전처리가 끝났습니다. 이제 '② 결과 확인' 화면에서 내용을 확인하세요.")
+        next_step_label = "② 결과 확인" if ai_review_requested else "③ 검수하고 승인"
+        st.success(
+            f"{len(completed_documents)}개 문서 전처리가 끝났습니다. "
+            f"이제 '{next_step_label}' 화면에서 내용을 확인하세요."
+        )
 
     current_document_id = str(st.session_state.get("document_id") or "").strip()
     current_document_ctx = (
@@ -7362,19 +8241,28 @@ def _page_preprocess() -> None:
         and _beginner_guide_completed_steps(current_document_ctx)[0]
     )
     if preprocessing_complete:
+        # AI 추가 검수를 쓰지 않았으면 ②에 볼 것이 없으므로 곧바로 ③으로 보낸다.
+        results_step_used = _results_step_is_used(current_document_ctx)
+        next_nav = NAV_RESULTS if results_step_used else NAV_APPROVAL
+        next_label = "② 결과 확인으로 이동" if results_step_used else "③ 검수하고 승인으로 이동"
+        # 위쪽 선택 하나에 화면 길이가 바뀌면 이 버튼만 스크롤 밖으로 나가서
+        # 사라진 것처럼 보인다. 제목을 달아 두면 어디까지 내려가면 되는지 보인다.
+        st.markdown("### 4. 다음 단계로 이동")
         _render_beginner_action_marker(
             1,
             "전처리 결과를 확인하세요",
             "전처리가 끝났습니다. 바로 아래 버튼을 눌러 원문과 정리 결과를 비교하세요.",
             control_key_prefix="preprocess-goto-results",
+            substep=5,
         )
-        _render_workflow_next_button("② 결과 확인으로 이동", NAV_RESULTS, key="preprocess-goto-results")
+        _render_workflow_next_button(next_label, next_nav, key="preprocess-goto-results")
     elif current_document_id:
         _render_beginner_action_marker(
             1,
             "전처리가 끝날 때까지 기다리세요",
             "아직 완료된 결과가 없습니다. 전처리 시작 또는 진행 상태를 확인한 뒤 완료되면 결과 확인으로 이동하세요.",
             control_key_prefix="preprocess-start",
+            substep=5,
         )
 
 
@@ -7400,13 +8288,149 @@ def _require_document_context(ctx: dict | None) -> bool:
     return True
 
 
+def _quality_mojibake_counts(quality_report) -> tuple[int, int, int]:
+    """(깨진 글자가 남은 조항 수, 규정번호·제목이 깨진 건수, 자동으로 지운 글자 수)."""
+    metrics = getattr(quality_report, "text_quality_metrics", None) or {}
+    if not isinstance(metrics, dict):
+        return 0, 0, 0
+    return (
+        int(metrics.get("hwp_mojibake_artifact_chunks") or 0),
+        int(metrics.get("suspicious_regulation_metadata_count") or 0),
+        int(metrics.get("mojibake_removed_char_count") or 0),
+    )
+
+
 def _render_quality_banner(quality_report) -> None:
+    mojibake_chunks, mojibake_metadata, mojibake_removed = _quality_mojibake_counts(quality_report)
+    if mojibake_chunks or mojibake_metadata:
+        # 글자가 깨진 문서에 "통과했으니 넘어가도 된다"고 말하면 안 된다.
+        details = []
+        if mojibake_chunks:
+            details.append(f"조항 {mojibake_chunks:,}개 본문")
+        if mojibake_metadata:
+            details.append(f"규정번호·제목 {mojibake_metadata:,}건")
+        st.warning(
+            "원본 파일에서 글자가 깨진 채로 읽힌 부분이 있습니다(" + ", ".join(details) + "). "
+            "같은 규정을 PDF로 바꿔 ① 단계에서 다시 올리면 대부분 해결됩니다. "
+            "그대로 진행하려면 '③ 검수하고 승인'에서 해당 조항을 원문과 대조해 고친 뒤 승인하세요."
+        )
+        return
+    if mojibake_removed:
+        # 지워서 화면은 깨끗해졌지만, 원본이 손상됐다는 사실까지 지우면 안 된다.
+        # 표·수식처럼 내용이 통째로 빠진 자리가 남아 있을 수 있다.
+        st.warning(
+            f"원본 파일에서 글자가 깨진 채로 읽힌 부분 {mojibake_removed:,}자를 자동으로 걷어냈습니다. "
+            "전처리본에는 한글이 정상으로 보이지만, 원본이 손상돼 있었다는 뜻입니다. "
+            "표·수식·서명란처럼 내용이 통째로 빠진 자리가 있을 수 있으니, "
+            "'③ 검수하고 승인'에서 원문과 나란히 놓고 확인한 뒤 승인해 주세요. "
+            "같은 규정을 PDF로 바꿔 ① 단계에서 다시 올리면 더 많이 살아납니다."
+        )
+        return
     if quality_report and quality_report.passed:
         st.success("품질 검사를 통과했습니다. '③ 검수하고 승인' 단계로 넘어가셔도 됩니다.")
     elif quality_report:
         st.warning("품질 검사에서 확인이 필요한 항목이 있습니다. 아래 '이슈' 탭에서 내용을 확인해 주세요.")
     else:
         st.info("아직 이 문서의 품질 검사 결과가 없습니다.")
+
+
+def _beginner_plain_preview_text(text: str, *, limit: int = 800) -> str:
+    """청크 본문에서 기계용 표시([위치]/[본문])를 걷어낸 초보자 확인용 미리보기."""
+    lines = [line for line in str(text or "").splitlines() if line.strip() != "[본문]"]
+    if lines and lines[0].startswith("[위치]"):
+        lines = lines[1:]
+    return "\n".join(lines).strip()[:limit]
+
+
+def _render_results_chunk_tab(ctx: dict, *, preview_limit: int) -> None:
+    """청크 원본 지표와 조각별 원문·전처리 비교(일반 모드 전용)."""
+    document_id = ctx["document_id"]
+    chunks = ctx["chunks"]
+    st.markdown("### 청크 미리보기")
+    st.caption("청크는 AI가 검색하기 좋게 나눈 문서 조각입니다. '경고' 칸에 내용이 있으면 검수 때 눈여겨보세요.")
+    chunk_rows = [
+        {
+            "청크 ID": chunk.chunk_id,
+            "청크 유형": chunk.chunk_type,
+            "문서 내 위치": chunk.metadata.get("hierarchy_path"),
+            "원문 페이지": chunk.source_page_start,
+            "본문 미리보기": chunk.text[:180],
+            "신뢰도": chunk.confidence,
+            "경고": ", ".join(chunk.warnings),
+        }
+        for chunk in chunks
+    ]
+    st.caption(f"청크 {len(chunk_rows):,}개 중 앞에서 {min(preview_limit, len(chunk_rows)):,}개 표시")
+    st.dataframe(pd.DataFrame(chunk_rows[:preview_limit]), width="stretch")
+    if not chunks:
+        return
+
+    st.markdown("### 선택 청크 원문·전처리 결과")
+    chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    selected_chunk_id = st.selectbox(
+        "상세 확인할 청크",
+        list(chunk_by_id),
+        format_func=lambda chunk_id: (
+            f"{chunk_by_id[chunk_id].metadata.get('hierarchy_path') or '위치 미지정'} · "
+            f"{chunk_by_id[chunk_id].source_page_start or '-'}쪽 · {chunk_id[:12]}"
+        ),
+        key=f"results-detail-chunk-{document_id}",
+    )
+    selected_chunk = chunk_by_id[selected_chunk_id]
+    detail_cols = st.columns(4)
+    detail_cols[0].metric("청크 유형", selected_chunk.chunk_type)
+    detail_cols[1].metric("원문 페이지", selected_chunk.source_page_start or "-")
+    detail_cols[2].metric("신뢰도", f"{selected_chunk.confidence:.3f}")
+    detail_cols[3].metric("경고", len(selected_chunk.warnings))
+    original_col, processed_col = st.columns(2)
+    with original_col:
+        _render_original_source_preview(ctx["document"], selected_chunk)
+    with processed_col:
+        _render_processed_result_preview(selected_chunk, selected_chunk.text)
+
+    selected_chunk_index = next(
+        index for index, chunk in enumerate(chunks) if chunk.chunk_id == selected_chunk_id
+    )
+    previous_chunk = chunks[selected_chunk_index - 1] if selected_chunk_index > 0 else None
+    next_chunk = chunks[selected_chunk_index + 1] if selected_chunk_index + 1 < len(chunks) else None
+    st.markdown("#### 선택 청크 전후 문맥")
+    st.caption("현재 청크가 규정의 어느 흐름에 놓였는지 직전·현재·다음 청크를 이어서 확인합니다.")
+    context_tabs = st.tabs(["직전 청크", "현재 청크", "다음 청크"])
+    for context_tab, context_chunk, empty_message in (
+        (context_tabs[0], previous_chunk, "문서의 첫 청크이므로 직전 청크가 없습니다."),
+        (context_tabs[1], selected_chunk, ""),
+        (context_tabs[2], next_chunk, "문서의 마지막 청크이므로 다음 청크가 없습니다."),
+    ):
+        with context_tab:
+            if context_chunk is None:
+                st.info(empty_message)
+                continue
+            st.caption(
+                f"{context_chunk.metadata.get('hierarchy_path') or '위치 미지정'} · "
+                f"{context_chunk.source_page_start or '-'}쪽 · {context_chunk.chunk_id}"
+            )
+            st.code(context_chunk.text[:2400], language="text")
+
+
+def _render_results_step_exit_without_open(selected_document_ids: list[str]) -> None:
+    """규정을 열지 않은 상태에서도 ②를 끝내고 ③으로 넘어갈 수 있게 한다.
+
+    ②는 결과를 '읽는' 화면이고, 승인·색인은 ③에서만 일어난다. 그래서 여기서
+    규정을 열지 않고 지나가도 승인 경계는 그대로다. 조항을 원문과 나란히 놓고
+    확인하는 일은 어차피 ③에서 규정별로 다시 한다.
+    """
+
+    st.caption(
+        "규정을 열지 않아도 다음 단계로 넘어갈 수 있습니다. 여기서 규정을 열면 그 규정의 "
+        "품질·이슈 요약을 미리 볼 수 있고, 조항을 원문과 나란히 비교하고 승인하는 일은 "
+        "'③ 검수하고 승인'에서 규정별로 진행합니다."
+    )
+    _render_workflow_next_button(
+        f"선택한 {len(selected_document_ids):,}개 규정을 ③ 검수하고 승인으로 이동",
+        NAV_APPROVAL,
+        key="results-goto-approval",
+        disabled=not selected_document_ids,
+    )
 
 
 def _page_results(ctx: dict | None) -> None:
@@ -7417,6 +8441,13 @@ def _page_results(ctx: dict | None) -> None:
         return
     selected_document_ids = _render_workflow_document_directory(page_key="results")
     document_id = ctx["document_id"]
+    if not _workflow_document_opened(document_id):
+        # 상세 화면은 연 규정 1개만 그린다(규정 수가 많아도 느려지지 않게).
+        # 그렇다고 화면을 여기서 끊으면, 볼 것이 없는 사람도 다음 단계로 가려고
+        # 아무 규정이나 한 번 눌러야 했다. 그건 확인이 아니라 통행세다.
+        _render_workflow_directory_open_prompt(document_id, blocking=False)
+        _render_results_step_exit_without_open(selected_document_ids)
+        return
     kordoc_notice = st.session_state.get(KORDOC_REPROCESS_NOTICE_KEY)
     if isinstance(kordoc_notice, dict) and kordoc_notice.get("document_id") == document_id:
         st.session_state.pop(KORDOC_REPROCESS_NOTICE_KEY, None)
@@ -7429,6 +8460,7 @@ def _page_results(ctx: dict | None) -> None:
     nodes = ctx["nodes"]
     quality_report = ctx["quality_report"]
     preview_limit = 500
+    beginner_mode = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
 
     st.markdown(
         '<div class="rr-help">프로그램이 문서를 어떻게 정리했는지 확인하는 화면입니다. '
@@ -7436,13 +8468,35 @@ def _page_results(ctx: dict | None) -> None:
         unsafe_allow_html=True,
     )
 
-    summary_cols = st.columns(5)
-    summary_cols[0].metric("문서 ID", document_id[:12], help="문서를 구별하는 번호입니다.")
-    summary_cols[1].metric("품질", "통과" if quality_report and quality_report.passed else "검토 필요")
-    summary_cols[2].metric("점수", f"{quality_report.score:.3f}" if quality_report else "-")
-    summary_cols[3].metric("청크", f"{len(chunks):,}", help="청크 = AI가 검색하기 좋게 나눈 문서 조각입니다.")
-    summary_cols[4].metric("이슈", f"{len(issues):,}", help="자동 검사에서 발견된 확인 필요 항목 수입니다.")
+    if beginner_mode:
+        # 초보자에게는 청크·구조 노드 같은 내부 단위 대신 결과 판단에 필요한 값만 남긴다.
+        summary_cols = st.columns(3)
+        summary_cols[0].metric("품질", "통과" if quality_report and quality_report.passed else "검토 필요")
+        summary_cols[1].metric(
+            "정리된 조항",
+            f"{len(chunks):,}",
+            help="규정을 조·항 단위로 나눈 개수입니다. 다음 단계에서 이 조항들을 하나씩 비교합니다.",
+        )
+        summary_cols[2].metric(
+            "확인 필요 항목",
+            f"{len(issues):,}",
+            help="자동 검사에서 사람이 살펴봐야 한다고 표시한 항목 수입니다.",
+        )
+    else:
+        summary_cols = st.columns(5)
+        summary_cols[0].metric("문서 ID", document_id[:12], help="문서를 구별하는 번호입니다.")
+        summary_cols[1].metric("품질", "통과" if quality_report and quality_report.passed else "검토 필요")
+        summary_cols[2].metric("점수", f"{quality_report.score:.3f}" if quality_report else "-")
+        summary_cols[3].metric("청크", f"{len(chunks):,}", help="청크 = AI가 검색하기 좋게 나눈 문서 조각입니다.")
+        summary_cols[4].metric("이슈", f"{len(issues):,}", help="자동 검사에서 발견된 확인 필요 항목 수입니다.")
     _render_quality_banner(quality_report)
+    _render_beginner_action_marker(
+        2,
+        "전처리가 끝났는지 위 숫자로 확인하세요",
+        "바로 위의 품질·조항·확인 필요 항목 숫자가 보이면 전처리가 끝난 것입니다. 아직 누를 버튼은 없고, "
+        "이어서 아래 탭에서 내용을 확인하면 됩니다.",
+        substep=1,
+    )
     if _unreviewed_preview_requested():
         st.warning(UNREVIEWED_PREVIEW_WARNING_KO + "\n\n" + UNREVIEWED_PREVIEW_WARNING)
 
@@ -7452,18 +8506,28 @@ def _page_results(ctx: dict | None) -> None:
 
     _render_beginner_action_marker(
         2,
-        "'정리된 내용(청크)'와 '이슈' 탭을 확인하세요",
-        "먼저 청크 탭에서 원문과 전처리 결과를 좌우로 비교하고, 이어서 이슈 탭의 확인 필요 항목을 읽으세요.",
+        "'요약'과 '이슈' 탭만 확인하세요",
+        "요약 탭에서 전처리된 글자가 깨지지 않았는지 보고, 이어서 이슈 탭의 확인 필요 항목을 읽으세요. "
+        "조항을 하나씩 원문과 비교하는 일은 다음 '③ 검수하고 승인' 단계에서 합니다.",
+        substep=2,
     )
 
-    summary_tab, structure_tab, chunks_tab, tables_tab, issues_tab, downloads_tab = st.tabs(
-        ["요약", "문서 구조", "정리된 내용(청크)", "표·별표", "이슈", "내려받기"]
-    )
+    if beginner_mode:
+        # 초보자 모드에서는 청크 탭을 감춘다. 같은 원문·전처리 비교를 ③ 검증 시트에서 다시 하므로 중복이다.
+        summary_tab, structure_tab, tables_tab, issues_tab, downloads_tab = st.tabs(
+            ["요약", "문서 차례", "표·별표", "이슈", "내려받기"]
+        )
+        chunks_tab = None
+    else:
+        summary_tab, structure_tab, chunks_tab, tables_tab, issues_tab, downloads_tab = st.tabs(
+            ["요약", "문서 구조", "정리된 내용(청크)", "표·별표", "이슈", "내려받기"]
+        )
 
     with summary_tab:
         agent_review_summary = ctx.get("agent_review_summary") or {}
         review_attention = ctx.get("review_attention") or {}
         ai_tag, ai_message, ai_executed = _ai_review_status_text(agent_review_summary)
+        ai_review_requested = _agent_review_requested(agent_review_summary)
         ai_tag_class = "ok" if ai_executed else "draft"
         st.markdown(
             f'<div class="rr-ai-panel">'
@@ -7473,43 +8537,80 @@ def _page_results(ctx: dict | None) -> None:
             "</div>",
             unsafe_allow_html=True,
         )
-        ai_cols = st.columns(3)
-        ai_cols[0].metric(
-            "AI가 살펴본 후보",
-            f"{int(agent_review_summary.get('candidate_count') or 0):,}",
-            help="품질 검사에서 확인이 필요하다고 본, AI 검토 후보 청크 수입니다.",
-        )
-        ai_cols[1].metric(
-            "AI가 검토 대상으로 고른 청크",
-            f"{int(agent_review_summary.get('selected_count') or 0):,}",
-            help="예산 한도 안에서 실제 AI 검토 초안 대상으로 선정된 청크 수입니다.",
-        )
-        ai_cols[2].metric(
-            "사람이 꼭 볼 청크",
-            f"{len(review_attention):,}",
-            help="경고가 있어 다음 ③ 검수·승인 단계에서 사람이 반드시 확인해야 하는 청크 수입니다.",
-        )
-        st.caption(
-            "AI 검수는 파서 초안에서 확인이 필요한 부분을 골라 검토 초안을 만드는 단계입니다. "
-            "실제 승인·색인은 다음 '③ 검수하고 승인' 단계에서 사람이 결정합니다."
-        )
+        if beginner_mode:
+            # 후보/선정 청크 수는 초보자가 판단에 쓸 수 없는 내부 예산 지표라 감춘다.
+            attention_all = bool(chunks) and len(review_attention) >= len(chunks)
+            st.caption(
+                (
+                    "이 규정은 모든 조항을 사람이 직접 확인해야 합니다. "
+                    if attention_all
+                    else f"이 규정은 조항 {len(review_attention):,}개를 사람이 직접 확인해야 합니다. "
+                )
+                + "확인은 다음 '③ 검수하고 승인' 단계에서 원본과 나란히 놓고 진행합니다."
+            )
+        elif not ai_review_requested:
+            # AI를 켜지 않았는데 후보 0 / 선정 0 숫자를 늘어놓으면 "AI가 봤는데 아무것도 없다"로 읽힌다.
+            st.caption(
+                f"이 규정은 사람이 확인해야 하는 조항이 {len(review_attention):,}개입니다. "
+                "확인은 '③ 검수하고 승인' 단계에서 원본·전처리본을 나란히 놓고 진행합니다."
+            )
+        else:
+            ai_cols = st.columns(3)
+            ai_cols[0].metric(
+                "AI가 살펴본 후보",
+                f"{int(agent_review_summary.get('candidate_count') or 0):,}",
+                help="품질 검사에서 확인이 필요하다고 본, AI 검토 후보 청크 수입니다.",
+            )
+            # 같은 내용을 이전에 검수했으면 이번에는 제공자를 부르지 않고 그 결과를
+            # 가져다 쓴다. 선정 수만 보여 주면 그런 규정이 '0개 검수'로 읽힌다.
+            reused_chunk_count = int(agent_review_summary.get("reused_chunk_count") or 0)
+            ai_cols[1].metric(
+                "AI가 검토 대상으로 고른 청크",
+                f"{int(agent_review_summary.get('selected_count') or 0) + reused_chunk_count:,}",
+                help=(
+                    "예산 한도 안에서 실제 AI 검토 초안 대상으로 선정된 청크 수입니다."
+                    + (
+                        f" 이 중 {reused_chunk_count:,}개는 같은 내용을 이전에 검수한 결과를 재사용했습니다."
+                        if reused_chunk_count
+                        else ""
+                    )
+                ),
+            )
+            ai_cols[2].metric(
+                "사람이 꼭 볼 청크",
+                f"{len(review_attention):,}",
+                help="경고가 있어 다음 ③ 검수·승인 단계에서 사람이 반드시 확인해야 하는 청크 수입니다.",
+            )
+            st.caption(_ai_review_scope_caption(agent_review_summary))
 
-        st.markdown("### 문서 요약")
-        st.write(
-            {
-                "문서 ID": document_id,
-                "구조 노드 수": len(nodes),
-                "청크 수": len(chunks),
-                "이슈 수": len(issues),
-                "품질 점수": quality_report.score if quality_report else None,
-                "품질 통과": quality_report.passed if quality_report else None,
-            }
-        )
-        if chunks:
-            st.markdown("#### 첫 번째 청크 미리보기")
-            st.caption("문서 맨 앞부분이 어떻게 정리됐는지 보여줍니다.")
+        if not beginner_mode:
+            st.markdown("### 문서 요약")
+            st.write(
+                {
+                    "문서 ID": document_id,
+                    "구조 노드 수": len(nodes),
+                    "청크 수": len(chunks),
+                    "이슈 수": len(issues),
+                    "품질 점수": quality_report.score if quality_report else None,
+                    "품질 통과": quality_report.passed if quality_report else None,
+                }
+            )
+        if chunks and beginner_mode:
+            st.markdown("#### 전처리된 글자 확인")
+            st.caption(
+                "규정 맨 앞부분을 전처리한 결과입니다. 아래 글자가 원본 규정과 같은 한글로 보이면 정상입니다. "
+                "뜻을 알 수 없는 한자나 기호가 섞여 있으면 파일이 제대로 읽히지 않은 것이니, "
+                "①단계에서 같은 규정을 PDF로 바꿔 다시 올려 주세요."
+            )
+            st.code(_beginner_plain_preview_text(chunks[0].text), language="text")
+        elif chunks:
+            st.markdown("#### 전처리 결과 미리보기 (문서 맨 앞부분)")
+            st.caption(
+                "글자가 깨지지 않고 원본과 같은 한글로 보이는지만 확인하는 자리입니다. "
+                "조항을 원본과 하나씩 나란히 비교하는 화면은 '③ 검수하고 승인'에 있습니다."
+            )
             st.code(chunks[0].text[:1200], language="text")
-        if agent_review_summary:
+        if agent_review_summary and not beginner_mode:
             with st.expander("AI 검수 비용·설정 상세 (전산 담당자용)", expanded=False):
                 st.markdown("#### AI review API and cost guard")
                 st.write(
@@ -7546,69 +8647,9 @@ def _page_results(ctx: dict | None) -> None:
         st.caption(f"구조 노드 {len(tree_rows):,}개 중 앞에서 {min(preview_limit, len(tree_rows)):,}개 표시")
         st.dataframe(pd.DataFrame(tree_rows[:preview_limit]), width="stretch")
 
-    with chunks_tab:
-        st.markdown("### 청크 미리보기")
-        st.caption("청크는 AI가 검색하기 좋게 나눈 문서 조각입니다. '경고' 칸에 내용이 있으면 검수 때 눈여겨보세요.")
-        chunk_rows = [
-            {
-                "청크 ID": chunk.chunk_id,
-                "청크 유형": chunk.chunk_type,
-                "문서 내 위치": chunk.metadata.get("hierarchy_path"),
-                "원문 페이지": chunk.source_page_start,
-                "본문 미리보기": chunk.text[:180],
-                "신뢰도": chunk.confidence,
-                "경고": ", ".join(chunk.warnings),
-            }
-            for chunk in chunks
-        ]
-        st.caption(f"청크 {len(chunk_rows):,}개 중 앞에서 {min(preview_limit, len(chunk_rows)):,}개 표시")
-        st.dataframe(pd.DataFrame(chunk_rows[:preview_limit]), width="stretch")
-        if chunks:
-            st.markdown("### 선택 청크 원문·전처리 결과")
-            chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
-            selected_chunk_id = st.selectbox(
-                "상세 확인할 청크",
-                list(chunk_by_id),
-                format_func=lambda chunk_id: (
-                    f"{chunk_by_id[chunk_id].metadata.get('hierarchy_path') or '위치 미지정'} · "
-                    f"{chunk_by_id[chunk_id].source_page_start or '-'}쪽 · {chunk_id[:12]}"
-                ),
-                key=f"results-detail-chunk-{document_id}",
-            )
-            selected_chunk = chunk_by_id[selected_chunk_id]
-            detail_cols = st.columns(4)
-            detail_cols[0].metric("청크 유형", selected_chunk.chunk_type)
-            detail_cols[1].metric("원문 페이지", selected_chunk.source_page_start or "-")
-            detail_cols[2].metric("신뢰도", f"{selected_chunk.confidence:.3f}")
-            detail_cols[3].metric("경고", len(selected_chunk.warnings))
-            original_col, processed_col = st.columns(2)
-            with original_col:
-                _render_original_source_preview(ctx["document"], selected_chunk)
-            with processed_col:
-                _render_processed_result_preview(selected_chunk, selected_chunk.text)
-
-            selected_chunk_index = next(
-                index for index, chunk in enumerate(chunks) if chunk.chunk_id == selected_chunk_id
-            )
-            previous_chunk = chunks[selected_chunk_index - 1] if selected_chunk_index > 0 else None
-            next_chunk = chunks[selected_chunk_index + 1] if selected_chunk_index + 1 < len(chunks) else None
-            st.markdown("#### 선택 청크 전후 문맥")
-            st.caption("현재 청크가 규정의 어느 흐름에 놓였는지 직전·현재·다음 청크를 이어서 확인합니다.")
-            context_tabs = st.tabs(["직전 청크", "현재 청크", "다음 청크"])
-            for context_tab, context_chunk, empty_message in (
-                (context_tabs[0], previous_chunk, "문서의 첫 청크이므로 직전 청크가 없습니다."),
-                (context_tabs[1], selected_chunk, ""),
-                (context_tabs[2], next_chunk, "문서의 마지막 청크이므로 다음 청크가 없습니다."),
-            ):
-                with context_tab:
-                    if context_chunk is None:
-                        st.info(empty_message)
-                        continue
-                    st.caption(
-                        f"{context_chunk.metadata.get('hierarchy_path') or '위치 미지정'} · "
-                        f"{context_chunk.source_page_start or '-'}쪽 · {context_chunk.chunk_id}"
-                    )
-                    st.code(context_chunk.text[:2400], language="text")
+    if chunks_tab is not None:
+        with chunks_tab:
+            _render_results_chunk_tab(ctx, preview_limit=preview_limit)
 
     with tables_tab:
         st.markdown("### 표/별표 검토")
@@ -7756,9 +8797,11 @@ def _page_results(ctx: dict | None) -> None:
         if not structure_confirmed:
             _render_beginner_action_marker(
                 2,
-                "원문·조문 구조·청크를 먼저 확인하세요",
-                "'문서 구조'와 '정리된 내용(청크)' 탭에서 원문과 전처리 결과를 비교한 뒤 첫 번째 확인란을 선택하세요.",
+                "전처리된 글자가 깨지지 않았는지 확인하세요",
+                "'요약' 탭의 '전처리된 글자 확인'에 나온 내용이 원본 규정과 같은 한글로 보이는지 살펴본 뒤 "
+                "첫 번째 확인란을 선택하세요.",
                 control_key_prefix=structure_confirmation_key,
+                substep=2,
             )
         elif not issues_confirmed:
             _render_beginner_action_marker(
@@ -7766,12 +8809,16 @@ def _page_results(ctx: dict | None) -> None:
                 "품질 경고와 이슈를 확인하세요",
                 "'이슈' 탭과 표·별표 검토 결과를 살펴본 뒤 두 번째 확인란을 선택하세요.",
                 control_key_prefix=issues_confirmation_key,
+                substep=3,
             )
-        st.caption("초보자 모드에서는 '청크·이슈를 확인했습니다'를 아래 두 절차로 나누어 기록합니다.")
+        st.caption(
+            "초보자 모드에서는 조항을 하나씩 원문과 비교하는 일을 여기서 하지 않습니다. "
+            "여기서는 아래 두 가지만 확인하고, 조항 비교는 다음 '③ 검수하고 승인' 단계에서 합니다."
+        )
         structure_confirmed = st.checkbox(
-            "원문·조문 구조·청크를 확인했습니다.",
+            "전처리된 글자가 원본 규정과 같은 한글로 보입니다.",
             key=structure_confirmation_key,
-            help="원문과 전처리 결과, 조문 구조, 청크 위치를 확인한 뒤 선택하세요.",
+            help="'요약' 탭의 '전처리된 글자 확인'을 보고, 뜻을 알 수 없는 한자·기호가 섞여 있지 않으면 선택하세요.",
         )
         issues_confirmed = st.checkbox(
             "품질 경고·이슈와 표·별표 결과를 확인했습니다.",
@@ -7787,6 +8834,7 @@ def _page_results(ctx: dict | None) -> None:
             "결과 확인을 마쳤다면 검수 화면으로 이동하세요",
             "품질·이슈·원문과 전처리 결과를 살펴본 뒤 바로 아래 버튼을 누르세요.",
             control_key_prefix="results-goto-approval",
+            substep=4,
         )
     _render_workflow_next_button(
         (
@@ -7807,14 +8855,371 @@ def _page_results(ctx: dict | None) -> None:
 # 페이지: ③ 검수하고 승인
 # ---------------------------------------------------------------------------
 
+def _render_approval_regulation_lifecycle(
+    current_document: object,
+    *,
+    document_id: str,
+    local_auth: object,
+    beginner_mode_active: bool,
+) -> None:
+    """규정 버전 표와 생명주기 전환은 기록관리 업무라 검수 흐름 밖(접힌 상세)에 둔다."""
+    if not getattr(current_document, "regulation_id", None) or beginner_mode_active:
+        return
+    st.markdown("#### 규정 버전 상태")
+    lifecycle_cols = st.columns(4)
+    lifecycle_cols[0].metric("규정 ID", str(current_document.regulation_id))
+    lifecycle_cols[1].metric("버전", current_document.regulation_version or "미지정")
+    lifecycle_cols[2].metric("상태", current_document.regulation_status)
+    lifecycle_cols[3].metric("효력 시작", current_document.effective_from or "미지정")
+    version_history = repository.find_documents_by_regulation(
+        current_document.regulation_id,
+        profile_id=current_document.profile_id,
+        tenant_id=current_document.tenant_id,
+    )
+    if version_history:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "문서 ID": item.document_id,
+                        "버전": item.regulation_version or "미지정",
+                        "상태": item.regulation_status,
+                        "개정일": item.revision_date or "",
+                        "효력 시작": item.effective_from or "",
+                        "효력 종료": item.effective_to or "",
+                        "폐지일": item.repealed_at or "",
+                    }
+                    for item in version_history
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    current_regulation_status = str(getattr(current_document, "regulation_status", "") or "draft").strip().lower()
+    lifecycle_targets = {
+        "approved": ("superseded", "repealed"),
+        "superseded": ("repealed",),
+    }.get(current_regulation_status, ())
+    if current_document.regulation_version and lifecycle_targets:
+        st.markdown("#### 규정 생명주기 수동 전환")
+        st.caption("버전이 확정된 규정만 전환할 수 있으며, 전환 사유는 감사 기록에 남습니다.")
+        lifecycle_labels = {
+            "superseded": "대체됨 (superseded)",
+            "repealed": "폐지됨 (repealed)",
+        }
+        with st.form(f"regulation-lifecycle-form-{document_id}"):
+            lifecycle_target = st.selectbox(
+                "전환 상태",
+                lifecycle_targets,
+                format_func=lambda value: lifecycle_labels.get(value, value),
+            )
+            lifecycle_reason = st.text_area(
+                "전환 사유",
+                placeholder="예: 신규 개정본 v2.0 시행으로 기존 버전을 대체함",
+                help="superseded 또는 repealed 전환에는 사유가 필요합니다.",
+            )
+            lifecycle_submitted = st.form_submit_button("규정 상태 전환", type="secondary")
+        if lifecycle_submitted:
+            lifecycle_reason_text = str(lifecycle_reason or "").strip()
+            if not lifecycle_reason_text:
+                st.error("규정 상태를 전환하려면 사유를 입력해 주세요.")
+            else:
+                try:
+                    transition_result = transition_regulation_status(
+                        document_id,
+                        RegulationLifecycleRequest(
+                            status=lifecycle_target,
+                            reason=lifecycle_reason_text,
+                        ),
+                        local_auth,
+                    )
+                    updated_status = (
+                        transition_result.get("document", {}).get("regulation_status")
+                        if isinstance(transition_result, dict)
+                        else lifecycle_target
+                    ) or lifecycle_target
+                    st.success(f"규정 상태를 {lifecycle_labels.get(updated_status, updated_status)}로 전환했습니다.")
+                    lifecycle_event = transition_result.get("lifecycle_event", {}) if isinstance(transition_result, dict) else {}
+                    vector_sync = lifecycle_event.get("vector_sync", {}) if isinstance(lifecycle_event, dict) else {}
+                    if vector_sync.get("status") == "failed":
+                        st.error("규정 상태는 전환됐지만 색인 동기화에 실패했습니다. 승인 화면에서 다시 색인해 주세요.")
+                    else:
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"규정 상태 전환에 실패했습니다: {exc}")
+
+
+# 검수 방식: 연 규정 하나만 볼 것인지, 선택한 규정 전체를 이어서 볼 것인지.
+APPROVAL_MODE_SINGLE = "single"
+APPROVAL_MODE_BULK = "bulk"
+
+
+def _approval_compare_row(
+    document: object,
+    chunk: object,
+    *,
+    attention: bool,
+    document_label: str,
+) -> dict[str, object]:
+    """검증 시트 한 줄(= 조항 하나)에 필요한 것만 모은다."""
+    return {
+        "document": document,
+        "document_id": str(getattr(document, "document_id", "") or ""),
+        "document_label": document_label,
+        "chunk": chunk,
+        "attention": bool(attention),
+    }
+
+
+def _agent_review_executed(agent_review_summary: dict | None) -> bool:
+    """이 규정에서 AI 검수가 실제로 실행됐는지.
+
+    실행됐으면 AI 검수본이 ✅ 최종본, 아니면 전처리본이 ✅ 최종본이다. 사이드바
+    토글은 '앞으로 켜겠다'는 뜻이라, 이미 전처리를 마친 규정에 소급 적용하면
+    비어 있는 칸을 최종본이라고 부르게 된다. 그래서 규정별 실행 기록으로 정한다.
+    """
+
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    return str(summary.get("status") or "").strip() == "executed"
+
+
+AGENT_REVIEW_RISK_MARKS = {"high": "🔴 높음", "medium": "🟡 중간", "low": "🟢 낮음"}
+
+
+def _agent_review_findings(chunk) -> dict[str, object]:
+    """이 조항에 대해 AI가 실제로 남긴 지적. 없으면 빈 dict."""
+    metadata = getattr(chunk, "metadata", None) or {}
+    findings = metadata.get("agent_review_findings")
+    return findings if isinstance(findings, dict) else {}
+
+
+def _render_agent_review_findings(chunk, *, selected_for_review: bool, reviewed: bool = False) -> None:
+    """AI 검수 의견 칸. AI는 본문을 고치지 않고 볼 곳만 짚어 준다.
+
+    본문 재작성을 시켜 봤더니 되돌아온 교정본의 77%가 원문과 완전히 같았고,
+    바뀐 것들은 규정 원문에 없는 날짜 표기를 만들어 내는 쪽이었다. 그래서 이 칸은
+    편집 칸이 아니라 읽는 칸이다.
+
+    지적이 없을 때 세 경우를 구분한다. AI가 보고 깨끗하다고 한 것, 대상이었지만
+    실행이 끝나지 못한 것, 애초에 대상이 아니었던 것. 셋을 같은 문구로 묶으면
+    검수를 켠 운영자가 화면만 보고는 AI가 돌았는지조차 알 수 없다.
+    """
+    findings = _agent_review_findings(chunk)
+    issues = [str(issue) for issue in (findings.get("issues") or []) if str(issue).strip()]
+    recommended = str(findings.get("recommended_human_check") or "").strip()
+    if not issues and not recommended:
+        if reviewed:
+            st.caption("✅ AI 검수 완료 · 지적 없음")
+        elif selected_for_review:
+            st.caption(
+                "⚠️ AI 검수 대상이었지만 의견이 저장되지 않았습니다. "
+                "왼쪽 사이드바 'AI 검수'에서 실행 상태를 확인하세요."
+            )
+        else:
+            st.caption("AI 검수 대상 아님")
+        return
+    risk = str(findings.get("risk_level") or "medium").strip().lower()
+    st.caption(f"위험도 {AGENT_REVIEW_RISK_MARKS.get(risk, '🟡 중간')}")
+    for issue in issues:
+        st.markdown(f"- {issue}")
+    if recommended:
+        st.caption(f"사람이 확인할 것: {recommended}")
+
+
+def _approval_sheet_ai_review_note(agent_review_summary: dict | None) -> str:
+    """전처리본이 최종본인 '이유'를 사실대로 적는다.
+
+    AI 검수를 켜고 돌렸는데 호출이 끝나지 못한 규정까지 '켜지 않았으므로'라고 적으면
+    화면이 거짓말을 한다. 같은 파일이 실행할 때마다 성공/실패로 갈리던 시기에,
+    실패한 규정을 두고 검수를 끈 줄로 오해하게 만든 문구가 정확히 이것이었다.
+
+    실행에 성공한 규정도 같은 함정에 빠져 있었다. 조항 수백 개를 실제로 검수하고
+    비용까지 쓴 규정에 "AI 추가 검수 결과가 없어"라고 적히니, 운영자가 보기에는
+    검수가 통째로 무시된 화면이 된다. 그래서 실행된 경우를 먼저 갈라 낸다.
+    """
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    tail = "고칠 곳은 가운데 전처리본 칸에 직접 입력하세요."
+    if not _agent_review_requested(summary):
+        return f"AI 추가 검수를 켜지 않았으므로 전처리본이 최종본입니다. {tail}"
+    selected_count = int(summary.get("selected_count") or 0)
+    api_call_count = int(summary.get("api_call_count") or 0)
+    reused_count = int(summary.get("reused_chunk_count") or 0)
+    reviewed_count = len(_agent_review_reviewed_chunk_ids(summary))
+    if reviewed_count and api_call_count:
+        # AI가 실제로 본 규정이다. 최종본 칸이 옮겨 가지 않는 것은 검수가 무시돼서가
+        # 아니라, AI가 본문을 쓰지 않기로 정해져 있기 때문이다. 그 차이를 여기서 밝힌다.
+        return (
+            f"AI 추가 검수는 이 규정의 조항 {reviewed_count:,}개를 실제로 검수했고, 그 결과가 오른쪽 "
+            "'AI 검수 의견' 칸입니다. AI는 본문을 다시 쓰지 않고 볼 곳만 짚어 주므로, 승인·색인되는 "
+            "✅ 최종본은 검수를 켜든 끄든 언제나 가운데 전처리본 칸이며, 의견을 반영할지는 사람이 정합니다. "
+            f"{tail}"
+        )
+    if reused_count and not selected_count:
+        # 같은 규정을 다시 올리면 제공자를 다시 부르지 않는다. 그때 '결과가 없다'고만
+        # 적으면 검수를 켠 운영자가 AI가 아무것도 안 봤다고 오해한다.
+        finding_count = int(summary.get("reused_finding_count") or 0)
+        return (
+            f"이 규정은 같은 내용을 이전에 이미 AI가 검수해, 조항 {reused_count:,}개의 검수 결과를 "
+            f"그대로 재사용했습니다(지적이 있는 조항 {finding_count:,}개). "
+            f"오른쪽 칸의 의견은 그 재사용 결과입니다. {tail}"
+        )
+    if selected_count and not api_call_count:
+        status = str(summary.get("status") or "").strip() or "기록 없음"
+        return (
+            f"⚠️ AI 추가 검수를 켜고 조항 {selected_count:,}개를 대상으로 골랐지만 실행이 끝나지 "
+            f"못했습니다(상태: {status}). AI 검수본이 비어 있는 것은 이 때문이며 검수를 끈 것이 "
+            f"아닙니다. 지금은 전처리본이 최종본이고, AI 검수본을 채우려면 이 규정을 다시 "
+            f"전처리해야 합니다. {tail}"
+        )
+    return f"AI 추가 검수 결과가 없어 전처리본이 최종본입니다. {tail}"
+
+
+def _render_approval_compare_sheet(
+    *,
+    rows: list[dict[str, object]],
+    page_state_key: str,
+    show_document_label: bool = False,
+    read_only: bool = False,
+    ai_selected_chunk_ids: set[str] | None = None,
+    ai_reviewed_chunk_ids: set[str] | None = None,
+    agent_review_summary: dict | None = None,
+) -> None:
+    """조항마다 원본 · 전처리본 · AI 검수 의견을 나란히 놓고, 전처리본을 직접 고치게 한다.
+
+    조항 수가 수천 개인 규정이 있어 한 번에 다 그리면 화면이 멈춘다. 한 쪽씩만 그린다.
+
+    승인·색인되는 본문은 언제나 가운데 전처리본 칸이다. AI는 오른쪽에서 볼 곳을
+    짚어 줄 뿐 본문을 쓰지 않는다.
+
+    ``read_only``는 이미 승인·색인이 끝난 규정을 다시 펼쳐 볼 때 쓴다. 승인된 조항을
+    편집 칸으로 내주면 화면의 글자와 실제로 색인된 근거가 조용히 갈라지므로,
+    이때는 승인된 최종본을 읽기 전용으로만 보여 준다.
+    """
+    if not rows:
+        return
+    ai_selected_chunk_ids = ai_selected_chunk_ids or set()
+    ai_reviewed_chunk_ids = ai_reviewed_chunk_ids or set()
+    sheet_page_count = max(
+        1, (len(rows) + APPROVAL_SHEET_PAGE_SIZE - 1) // APPROVAL_SHEET_PAGE_SIZE
+    )
+    sheet_page = int(st.session_state.get(page_state_key) or 1)
+    sheet_page = min(max(sheet_page, 1), sheet_page_count)
+    st.session_state[page_state_key] = sheet_page
+    sheet_start = (sheet_page - 1) * APPROVAL_SHEET_PAGE_SIZE
+    visible_rows = rows[sheet_start : sheet_start + APPROVAL_SHEET_PAGE_SIZE]
+
+    if sheet_page_count > 1:
+        scope_label = "승인된 조항" if read_only else "미승인 조항"
+        st.number_input(
+            f"검증 시트 쪽 (전체 {sheet_page_count:,}쪽 · {scope_label} {len(rows):,}개)",
+            min_value=1,
+            max_value=sheet_page_count,
+            step=1,
+            key=page_state_key,
+            help=(
+                f"한 쪽에 조항 {APPROVAL_SHEET_PAGE_SIZE}개씩 보여줍니다."
+                if read_only
+                else f"한 쪽에 조항 {APPROVAL_SHEET_PAGE_SIZE}개씩 보여줍니다. "
+                "최종 확정 버튼은 보고 있는 쪽만이 아니라 미승인 조항 전체를 처리합니다."
+            ),
+        )
+        st.caption(
+            f"{sheet_start + 1:,}~{sheet_start + len(visible_rows):,}번째 조항을 표시하고 있습니다."
+        )
+
+    header_cols = st.columns(3)
+    header_cols[0].markdown("**원본**")
+    header_cols[1].markdown("**전처리본 · ✅ 최종본**")
+    header_cols[2].markdown("**AI 검수 의견**")
+    if read_only:
+        st.caption(
+            "이미 승인·색인이 끝난 조항입니다. ✅ 최종본 칸의 내용이 지금 MCP가 근거로 쓰는 본문이며, "
+            "여기서는 편집할 수 없습니다. 내용을 고쳐야 하면 같은 원본을 새 버전으로 다시 전처리해 승인하세요."
+        )
+    else:
+        # 마무리 문장('고칠 곳은 …')은 아래 안내가 이미 달고 있다. 여기서 한 번 더 쓰면
+        # 같은 문장이 한 줄 안에 두 번 나온다.
+        st.caption(
+            "✅ 최종본 칸의 내용이 승인·색인되어 MCP에 들어갑니다. "
+            "AI는 어디를 봐야 하는지 짚어 줄 뿐 본문을 고치지 않습니다. "
+            + _approval_sheet_ai_review_note(agent_review_summary)
+        )
+    st.divider()
+
+    for row in visible_rows:
+        row_document = row["document"]
+        chunk = row["chunk"]
+        row_document_id = str(row["document_id"])
+        cid = str(getattr(chunk, "chunk_id", "") or "")
+        edited_text_key = _approval_edited_text_key(row_document_id, cid)
+        edited_text_widget_key = _approval_edited_text_widget_key(row_document_id, cid)
+        if not read_only:
+            # 읽기 전용으로 볼 때는 편집 세션 상태를 만들지 않는다. 만들어 두면 나중에
+            # 같은 조항이 승인 대기로 돌아왔을 때 저장된 적 없는 값이 기본값으로 살아난다.
+            _approval_edited_text_from_session(row_document_id, chunk)
+            if edited_text_widget_key not in st.session_state:
+                st.session_state[edited_text_widget_key] = st.session_state[edited_text_key]
+
+        location = chunk.metadata.get("hierarchy_path") or chunk.chunk_type
+        attention_mark = " · ⚠️ 검수 주의" if bool(row.get("attention")) else ""
+        regulation_mark = (
+            f"{row['document_label']} · " if show_document_label and row.get("document_label") else ""
+        )
+        st.markdown(f"**{regulation_mark}{location}**{attention_mark}")
+        row_cols = st.columns(3)
+        with row_cols[0]:
+            _render_original_source_preview(row_document, chunk)
+        # 편집 칸은 언제나 가운데다. AI 결과에 따라 칸이 좌우로 옮겨 다니면
+        # 조항마다 어디를 고쳐야 하는지 알 수 없다.
+        edit_col = row_cols[1]
+        with row_cols[2]:
+            _render_agent_review_findings(
+                chunk,
+                selected_for_review=cid in ai_selected_chunk_ids,
+                reviewed=cid in ai_reviewed_chunk_ids,
+            )
+        with edit_col:
+            if read_only:
+                st.code(str(getattr(chunk, "text", "") or ""), language="text")
+            else:
+                st.text_area(
+                    "제안 내용 수정",
+                    key=edited_text_widget_key,
+                    height=220,
+                    label_visibility="collapsed",
+                    on_change=_approval_sync_edited_text_from_widget,
+                    kwargs={"edited_text_key": edited_text_key, "widget_key": edited_text_widget_key},
+                )
+        st.divider()
+
+
+def _render_approval_screen_guide() -> None:
+    """이 화면에서 무엇을 하는지 세 줄로만 설명한다(메뉴 이름만 보고는 알 수 없으므로)."""
+    st.markdown(
+        '<div class="rr-help">이 화면에서 하는 일은 세 가지뿐입니다.<br>'
+        "<b>1단계</b> 아래 규정 디렉터리에서 <b>검수할 규정을 엽니다</b>.<br>"
+        "<b>2단계</b> 그 규정의 <b>원본 · 전처리본 · AI 검수본</b>을 나란히 비교하고, "
+        "✅ 최종본 칸을 직접 고칩니다.<br>"
+        "<b>3단계</b> <b>최종 확정</b>을 누르면 승인과 AI 등록(색인)이 한 번에 끝납니다.<br>"
+        "규정이 여러 개면 3단계 아래 <b>'전체 규정 확인'</b>을 켜서 "
+        "선택한 규정을 한 화면에서 이어서 검수하고 한 번에 확정할 수 있습니다.</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _page_approval(ctx: dict | None) -> None:
     st.markdown("## ③ 검수하고 승인")
     _render_operator_project_controls(NAV_APPROVAL)
     _render_pipeline_stages(PIPELINE_STAGE_HUMAN_APPROVAL)
     if not _require_document_context(ctx):
         return
+    _render_approval_screen_guide()
+    st.caption("Secure RAG review gate — 승인·색인된 내용만 AI가 답변 근거로 사용합니다.")
     selected_document_ids = _render_workflow_document_directory(page_key="approval")
     document_id = ctx["document_id"]
+    if not _workflow_document_opened(document_id):
+        _render_workflow_directory_open_prompt(document_id)
+        return
     chunks = ctx["chunks"]
     approval_counts = ctx["approval_counts"]
     approved_count = ctx["approved_count"]
@@ -7824,14 +9229,25 @@ def _page_approval(ctx: dict | None) -> None:
     mcp_connection_gate = ctx["mcp_connection_gate"]
     local_auth = ctx["local_auth"]
 
-    st.markdown(
-        '<div class="rr-help">사람이 확인을 마친 내용에만 <b>승인</b>을 하고, 승인한 내용을 <b>색인</b>(AI에 등록)하는 화면입니다. '
-        "순서: 검수 증빙 불러오기 → 승인 → 색인.</div>",
-        unsafe_allow_html=True,
-    )
-    st.caption("Secure RAG review gate — 승인·색인된 내용만 AI가 답변 근거로 사용합니다.")
+    # AI 추가 검수를 쓰지 않은 규정은 '② 결과 확인'을 건너뛰므로, 품질 경고를
+    # 여기서 보여 주지 않으면 깨진 글자를 아무도 못 보고 승인하게 된다.
+    if not _results_step_is_used(ctx):
+        _render_quality_banner(ctx.get("quality_report"))
 
-    selected_approval_contexts = _selected_approval_contexts(selected_document_ids, ctx)
+    # 선택한 규정 전부의 청크를 미리 읽으면 규정 수에 비례해 화면이 느려진다.
+    # 전체 규정 승인을 실제로 쓸 때만 나머지 규정을 불러온다(미로딩 규정은 fail-closed로 '미완료' 취급).
+    batch_loaded_key = f"approval-batch-loaded-{document_id}"
+    bulk_open_key = f"approval-bulk-open-{document_id}"
+    multi_selected = len(selected_document_ids) > 1
+    # '전체 규정 확인'을 열어 둔 동안에만 나머지 규정을 읽는다(체크박스는 아래에서 그리므로 직전 값을 본다).
+    bulk_section_open = multi_selected and bool(st.session_state.get(bulk_open_key))
+    batch_loaded = not multi_selected or (
+        bulk_section_open and bool(st.session_state.get(batch_loaded_key))
+    )
+    if batch_loaded:
+        selected_approval_contexts = _selected_approval_contexts(selected_document_ids, ctx)
+    else:
+        selected_approval_contexts = [ctx]
     selected_pending_document_ids = _selected_documents_pending_approval(
         selected_document_ids,
         selected_approval_contexts,
@@ -7844,15 +9260,17 @@ def _page_approval(ctx: dict | None) -> None:
     beginner_current_results_confirmed = bool(
         st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
     )
-    if beginner_mode_active and not beginner_current_results_confirmed:
+    # ②를 건너뛰는 규정에서 이 관문을 그대로 두면, 갈 수 없는 화면을 요구하며 막힌다.
+    if beginner_mode_active and _results_step_is_used(ctx) and not beginner_current_results_confirmed:
         _render_beginner_action_marker(
             3,
             "현재 규정의 결과 두 곳을 먼저 확인하세요",
             "'② 결과 확인'으로 돌아가 문서 구조·정리된 내용(청크)을 확인하고, 이어서 품질 경고·이슈·표/별표를 확인한 뒤 두 확인란을 차례로 선택하세요.",
             control_key_prefix="approval-goto-current-results",
+            prerequisite=True,
         )
         st.warning(
-            "초보자 안내 모드에서는 규정마다 결과 확인을 끝낸 뒤에만 AI 검증과 사람 검증을 시작할 수 있습니다."
+            "초보자 안내 모드에서는 규정마다 결과 확인을 끝낸 뒤에만 원본·전처리·AI 검수 내용을 검토할 수 있습니다."
         )
         _render_workflow_next_button(
             "현재 규정의 결과 두 곳 확인하러 가기",
@@ -7860,8 +9278,632 @@ def _page_approval(ctx: dict | None) -> None:
             key="approval-goto-current-results",
         )
         return
-    if len(selected_document_ids) > 1:
-        st.markdown(f"### 선택한 규정 {len(selected_document_ids):,}개 일괄 처리")
+    if not chunks:
+        st.info(
+            "이 문서에는 승인할 청크가 없습니다. 위 규정 디렉터리에서 다른 규정을 열거나, "
+            "① 단계에서 전처리를 다시 실행해 주세요."
+        )
+        return
+
+    current_document = ctx["document"]
+    total_chunks = len(chunks)
+    current_scope_state = _mcp_scope_document_state(chunks, mcp_connection_gate)
+
+    # 승인·색인 수치와 버전 이력은 '무엇을 할지' 결정하는 데 필요한 정보가 아니라 확인용 기록이다.
+    # 기본으로 접어 두고, 화면에는 비교(2단계) → 확정(3단계)만 남긴다.
+    with st.expander("이 규정의 상태 자세히 보기 (승인·색인 수치, 버전 이력)", expanded=False):
+        st.markdown("#### 현재 상태")
+        status_cols = st.columns(4)
+        status_cols[0].metric("전체 청크", f"{total_chunks:,}")
+        status_cols[1].metric("승인된 청크 (Approved chunks)", f"{approved_count:,}")
+        status_cols[2].metric("검수 주의 청크", f"{len(review_attention):,}", help="파서·표 관련 경고가 있어 사람이 꼭 봐야 하는 청크입니다.")
+        if index_status_error:
+            status_cols[3].metric("색인 상태", "확인 불가")
+            st.warning(f"MCP index status could not be checked: {index_status_error}")
+        else:
+            status_cols[3].metric(
+                "AI에 보이는 기록 (MCP-visible records)",
+                f"{int(mcp_connection_gate.get('mcp_visible_count') or 0):,}",
+            )
+            if index_status and index_status.get("validation_error"):
+                st.warning(f"Index validation: {index_status['validation_error']}")
+        if not beginner_mode_active:
+            st.markdown("#### 승인 상태 상세 (전산 담당자용)")
+            st.write({"approval_status_counts": approval_counts})
+            st.write(
+                {
+                    "indexing_status": mcp_connection_gate.get("indexing_status"),
+                    "stale_count": mcp_connection_gate.get("stale_count"),
+                    "gate_reason": mcp_connection_gate.get("reason"),
+                }
+            )
+        # AI 추가 검수를 쓰지 않은 규정은 '② 결과 확인'을 건너뛰므로 여기서 열 수 있게 둔다.
+        if not _results_step_is_used(ctx):
+            st.markdown("#### 전처리 상세 (구조·표·이슈·다운로드)")
+            st.caption(
+                "일반 승인 작업에는 필요하지 않습니다. 전산 담당자가 파서 결과를 직접 뜯어볼 때 씁니다."
+            )
+            if st.button(
+                "② 결과 확인 화면 열기",
+                key="approval-open-results",
+                help="문서 구조·표·품질 이슈·다운로드를 모아 둔 화면입니다.",
+            ):
+                _queue_workflow_navigation(NAV_RESULTS)
+                st.rerun()
+        _render_approval_regulation_lifecycle(
+            current_document,
+            document_id=document_id,
+            local_auth=local_auth,
+            beginner_mode_active=beginner_mode_active,
+        )
+
+    if review_attention:
+        st.warning(
+            f"검수 주의 청크가 {len(review_attention):,}개 있습니다. "
+            "아래 비교 화면에서 ⚠️ 표시가 붙은 조항을 특히 주의해서 확인해 주세요."
+        )
+
+    worklist_path_key = f"approval-worklist-path-{document_id}"
+    worklist_sha_key = f"approval-worklist-sha256-{document_id}"
+    batch_manifest_path_key = f"approval-review-batch-manifest-path-{document_id}"
+    batch_manifest_sha_key = f"approval-review-batch-manifest-sha256-{document_id}"
+    batch_id_key = f"approval-review-batch-{document_id}"
+    batch_fingerprint_key = f"approval-review-batch-fingerprint-{document_id}"
+    review_strategy_key = f"approval-review-strategy-{document_id}"
+    security_level_key = f"security-level-{document_id}"
+    review_ack_key = f"review-flags-ack-{document_id}"
+    approval_chunk_ids_key = f"approval-selected-chunk-ids-{document_id}"
+    for state_key in (
+        worklist_path_key,
+        worklist_sha_key,
+        batch_manifest_path_key,
+        batch_manifest_sha_key,
+        batch_id_key,
+        batch_fingerprint_key,
+    ):
+        st.session_state.setdefault(state_key, "")
+    st.session_state.setdefault(security_level_key, "internal")
+    selected_approval_chunk_ids = [
+        str(chunk_id)
+        for chunk_id in st.session_state.get(approval_chunk_ids_key, [])
+        if str(chunk_id).strip()
+    ]
+
+    document = ctx["document"]
+    agent_review_summary = ctx.get("agent_review_summary") or {}
+
+    # 규정을 파일별로 올렸든 통합본 한 파일로 올렸든 같은 '규정 단위'로 고를 수 있어야 한다.
+    # 파일이 규정 하나만 담고 있으면 이 단계는 스스로 사라진다.
+    regulation_units = _document_regulation_units(chunks)
+    selected_regulation_key = (
+        _render_document_regulation_directory(document_id, regulation_units)
+        if len(regulation_units) > 1
+        else ""
+    )
+    scoped_chunk_ids: set[str] | None = None
+    opened_regulation_label = _workflow_document_label(ctx["document"])
+    if selected_regulation_key:
+        opened_unit = next(
+            unit for unit in regulation_units if str(unit["key"]) == selected_regulation_key
+        )
+        opened_regulation_label = _regulation_unit_label(opened_unit)
+        scoped_chunk_ids = {str(chunk_id) for chunk_id in list(opened_unit.get("chunk_ids") or [])}
+
+    st.markdown(f"### 2단계 · '{opened_regulation_label}' 원본 · 전처리본 · AI 검수본 비교")
+    st.caption(
+        "아래로 스크롤하며 조항마다 세 칸을 비교하고, ✅ 최종본 칸에서 직접 고치세요. "
+        "확인 버튼은 없습니다. 고친 내용은 3단계에서 확정할 때 함께 저장됩니다."
+    )
+    chunk_by_id = {str(chunk.chunk_id): chunk for chunk in chunks}
+    attention_ids = {str(chunk_id) for chunk_id in review_attention}
+    ai_selected_chunk_ids = _agent_review_selected_chunk_ids(agent_review_summary)
+    ai_reviewed_chunk_ids = _agent_review_reviewed_chunk_ids(agent_review_summary)
+    original_order = {cid: index for index, cid in enumerate(chunk_by_id)}
+    ordered_compare_ids = sorted(
+        chunk_by_id,
+        key=lambda cid: (
+            not _is_chunk_pending_approval(chunk_by_id[cid]),
+            cid not in attention_ids,
+            original_order[cid],
+        ),
+    )
+    pending_compare_ids = [cid for cid in ordered_compare_ids if _is_chunk_pending_approval(chunk_by_id[cid])]
+    # 승인이 끝나면 비교 화면이 통째로 비어 버려서, 방금 무엇을 승인했는지 다시 볼 방법이
+    # 없었다. 위쪽 '검수 주의 청크가 N개 있습니다' 안내와도 정면으로 어긋난다.
+    # 미승인이 없으면 승인된 조항을 읽기 전용으로 이어서 보여 준다.
+    approved_compare_ids = [
+        cid for cid in ordered_compare_ids if not _is_chunk_pending_approval(chunk_by_id[cid])
+    ]
+    # 통합본 안의 규정을 전부 한 번에 확정하는 버튼이 쓸 목록. 바로 아래에서
+    # pending_compare_ids가 열어 둔 규정으로 좁혀지므로 좁히기 전에 잡아 둔다.
+    document_pending_compare_ids = list(pending_compare_ids)
+    if scoped_chunk_ids is not None:
+        # 규정을 하나 열었으면 검수도 승인도 그 규정 조항으로만 한정한다.
+        pending_compare_ids = [cid for cid in pending_compare_ids if cid in scoped_chunk_ids]
+        approved_compare_ids = [cid for cid in approved_compare_ids if cid in scoped_chunk_ids]
+
+    if pending_compare_ids:
+        _render_beginner_action_marker(
+            3,
+            "세 칸을 위에서 아래로 훑어보세요",
+            "아래 표는 왼쪽부터 원본 · 전처리본 · AI 검수본입니다. 스크롤하면서 전처리 결과가 "
+            "원본과 같은 내용인지 조항마다 눈으로 비교하세요. 아직 누를 버튼은 없습니다.",
+            substep=1,
+        )
+        _render_beginner_action_marker(
+            3,
+            "틀린 부분은 편집 칸에서 직접 고치세요",
+            "AI 검수본이 있으면 오른쪽 칸을, 없으면 가운데 전처리본 칸을 직접 타이핑해 고칠 수 있습니다. "
+            "고친 내용은 승인할 때 자동으로 저장되며, 따로 확인 버튼을 누를 필요는 없습니다.",
+            substep=2,
+        )
+
+    audit_preview_key = _approval_chunk_state_key(document_id, "batch", "audit_preview")
+    st.session_state.setdefault(audit_preview_key, [])
+
+    if not pending_compare_ids:
+        if approved_compare_ids:
+            st.success(
+                f"이 규정의 조항 {len(approved_compare_ids):,}개는 모두 승인이 끝나 새로 검수할 조항이 없습니다. "
+                "아래에 승인된 최종본을 원본과 나란히 펼쳐 두었으니 그대로 확인하세요."
+            )
+        else:
+            st.success("이 규정은 검수할 미승인 청크가 없습니다.")
+
+    _approval_auto_confirm_pending_chunks(
+        document_id,
+        [chunk_by_id[cid] for cid in pending_compare_ids],
+        review_attention=review_attention,
+        agent_review_summary=agent_review_summary,
+    )
+
+    if bulk_section_open:
+        # 같은 조항을 두 시트에 두 번 그리면 편집 칸이 중복된다. 전체 규정 확인을 켠 동안에는
+        # 이 규정 조항도 아래 '전체 규정 확인' 목록에서 규정 순서대로 이어서 보여 준다.
+        st.info(
+            "'전체 규정 확인'을 켜 두었습니다. 이 규정의 조항은 아래 전체 목록에서 "
+            "다른 규정과 이어서 비교·수정할 수 있습니다."
+        )
+    else:
+        sheet_compare_ids = pending_compare_ids or approved_compare_ids
+        _render_approval_compare_sheet(
+            rows=[
+                _approval_compare_row(
+                    document,
+                    chunk_by_id[cid],
+                    attention=cid in attention_ids,
+                    document_label=opened_regulation_label,
+                )
+                for cid in sheet_compare_ids
+            ],
+            page_state_key=(
+                f"approval-sheet-page-{document_id}"
+                if pending_compare_ids
+                else f"approval-sheet-approved-page-{document_id}"
+            ),
+            read_only=not pending_compare_ids,
+            ai_selected_chunk_ids=ai_selected_chunk_ids,
+            ai_reviewed_chunk_ids=ai_reviewed_chunk_ids,
+            agent_review_summary=agent_review_summary,
+        )
+
+    if pending_compare_ids:
+        with st.expander("조항을 MCP에서 제외해야 하는 경우 (선택)", expanded=False):
+            st.caption(
+                "반려는 승인이나 색인이 아닙니다. 선택한 조항만 더 이상 승인 대기로 남지 않는 "
+                "최종 제외(terminal exclusion) 상태가 되어 MCP 검색에 들어가지 않습니다."
+            )
+            reject_targets_key = f"approval-reject-targets-{document_id}"
+            reject_reason_key = _approval_chunk_state_key(document_id, "batch", "reject_reason")
+            reject_confirm_key = _approval_chunk_state_key(document_id, "batch", "reject_confirm")
+            reject_button_key = f"approval-reject-{document_id}"
+            reject_targets = st.multiselect(
+                "제외할 조항 선택",
+                options=pending_compare_ids,
+                key=reject_targets_key,
+            )
+            rejection_reason = st.text_area(
+                "반려 사유 (필수)",
+                key=reject_reason_key,
+                max_chars=1000,
+                placeholder="예: 다른 규정의 조문이 잘못 합쳐져 MCP 검색에서 제외해야 함",
+            )
+            rejection_confirmed = st.checkbox(
+                "선택한 조항만 반려하여 MCP에서 제외하는 것을 확인했습니다.",
+                key=reject_confirm_key,
+            )
+            rejection_ready = _chunk_rejection_ready(
+                reason=str(rejection_reason or ""),
+                confirmed=bool(rejection_confirmed),
+                approvable=bool(reject_targets),
+            )
+            if st.button(
+                "선택한 조항 반려",
+                key=reject_button_key,
+                disabled=not rejection_ready,
+            ):
+                try:
+                    reject_review_chunks(
+                        document_id,
+                        RejectRequest(
+                            chunk_ids=list(reject_targets),
+                            reason=str(rejection_reason).strip(),
+                            note="streamlit_scroll_review_multi_chunk_rejection",
+                        ),
+                        local_auth,
+                    )
+                    st.session_state.pop(reject_reason_key, None)
+                    st.session_state.pop(reject_confirm_key, None)
+                    st.session_state.pop(reject_targets_key, None)
+                    st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
+                    _invalidate_document_context_cache(document_id)
+                    st.success("선택한 조항을 반려했습니다. 승인·색인하지 않았으며 MCP 검색에서 제외됩니다.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"청크를 반려하지 못했습니다: {redact_sensitive_paths(str(exc))}")
+
+    pending_review_entries = [
+        _approval_chunk_review_state_from_session(
+            document_id=document_id,
+            chunk=chunk_by_id[cid],
+            review_attention=review_attention,
+            agent_review_summary=agent_review_summary,
+        )
+        for cid in pending_compare_ids
+    ]
+    reviewed_approval_entries = [
+        entry for entry in pending_review_entries if bool(dict(entry["state"]).get("approve_enabled"))
+    ]
+
+    st.markdown(f"### 3단계 · '{opened_regulation_label}' 최종 확정")
+    st.caption(
+        f"이 규정 조항 {total_chunks:,}개 중 승인 {approved_count:,}개 · 남은 미승인 "
+        f"{len(pending_compare_ids):,}개. 최종 확정을 누르면 고친 내용 저장 → 승인 → AI 등록(색인)이 "
+        "한 번에 실행됩니다."
+    )
+    if len(regulation_units) > 1:
+        st.caption(
+            f"규정을 하나씩 열기 어려우면 옆의 **'이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정'** "
+            f"버튼으로 이 파일의 미승인 조항 {len(document_pending_compare_ids):,}개를 한 번에 승인·색인할 수 있습니다."
+        )
+    # 색인까지 끝났는지는 확정 버튼 바로 옆에서 알려 줘야 다음 행동을 정할 수 있다.
+    if not index_status_error:
+        if current_scope_state["state"] == "terminal-excluded":
+            st.info(
+                "이 규정의 모든 활성 청크는 명시적으로 반려되어 MCP에서 제외됩니다. "
+                "검토 미완료가 아니지만, 이 규정만으로는 MCP를 만들 수 없습니다."
+            )
+        elif not mcp_connection_gate.get("ready"):
+            st.warning(
+                "AI는 '승인 후 색인된' 내용만 볼 수 있습니다. 승인과 색인을 마친 뒤에도 숫자가 맞지 않으면 아래 '다시 색인하기'를 눌러 주세요.\n\n"
+                "Claude/MCP can answer only from approved chunks that are currently indexed. "
+                "If Claude sees smoke-test documents or fewer records than expected, approve the intended chunks "
+                "and run Reindex approved chunks with the same data directory and tenant."
+            )
+        else:
+            st.success("승인된 모든 청크가 색인되어 AI에서 사용할 수 있습니다.")
+    if reviewed_approval_entries:
+        st.info(
+            f"위에서 확인한 미승인 조항 {len(reviewed_approval_entries):,}/{len(pending_review_entries):,}개가 "
+            "아래 '최종 확정' 버튼 한 번으로 한꺼번에 저장·승인·색인됩니다."
+        )
+
+    approve_enabled = bool(pending_review_entries) and len(reviewed_approval_entries) == len(pending_review_entries)
+
+    # Kept only as a fallback target for the manual-override approval path below;
+    # nothing above renders a chunk picker any more.
+    compare_id = pending_compare_ids[0] if pending_compare_ids else (ordered_compare_ids[0] if ordered_compare_ids else "")
+    compare_chunk = chunk_by_id.get(str(compare_id)) if compare_id else None
+    compare_chunk_approvable = _is_chunk_pending_approval(compare_chunk) if compare_chunk is not None else False
+
+    override_reason_key = _approval_chunk_state_key(document_id, "batch", "override_reason")
+    override_reason = ""
+    if approve_enabled:
+        st.success("모든 조항이 확인 완료 상태입니다. 아래에서 최종 확정할 수 있습니다.")
+    elif pending_compare_ids:
+        st.warning("확인이 끝나지 않은 조항이 있습니다. 필요하면 사유를 남기고 확인 없이 승인할 수 있습니다.")
+        with st.expander("확인 없이 승인해야 하는 경우", expanded=False):
+            override_reason = st.text_area(
+                "확인 생략 승인 사유",
+                key=override_reason_key,
+                placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
+            )
+
+    approve_index_button_key = f"approval-approve-index-{document_id}"
+    approve_all_index_button_key = f"approval-approve-index-all-{document_id}"
+    if approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
+        _render_beginner_action_marker(
+            3,
+            "승인된 내용을 AI 검색에 등록하세요",
+            "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
+            control_key_prefix="quick-index-only-",
+            substep=4,
+        )
+    elif approved_count < total_chunks and approve_enabled:
+        _render_beginner_action_marker(
+            3,
+            "확인한 내용을 최종 확정하세요",
+            "위에서 비교한 내용을 바로 아래 '이 규정 최종 확정' 버튼으로 저장·승인·색인하세요.",
+            control_keys=(approve_index_button_key,),
+            substep=3,
+        )
+
+    # 통합본은 규정이 수백 개라 한 규정씩 확정하면 끝나지 않는다. 규정이 둘 이상일 때만
+    # '이 규정' 버튼 옆에 파일 전체를 한 번에 확정하는 버튼을 같이 둔다.
+    show_approve_all = len(regulation_units) > 1
+    if show_approve_all:
+        approve_col, approve_all_col, index_col = st.columns([2, 2, 2])
+    else:
+        approve_col, index_col = st.columns([2, 2])
+        approve_all_col = None
+
+    override_reason_text = str(override_reason or "").strip()
+    approval_target_entries = reviewed_approval_entries
+    if (
+        not approval_target_entries
+        and compare_chunk_approvable
+        and (approve_enabled or override_reason_text)
+    ):
+        approval_target_entries = [
+            _approval_chunk_review_state_from_session(
+                document_id=document_id,
+                chunk=compare_chunk,
+                review_attention=review_attention,
+                agent_review_summary=agent_review_summary,
+            )
+        ]
+    can_approve = bool(approval_target_entries) and (
+        all(bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries)
+        or bool(override_reason_text)
+    )
+
+    def _execute_final_approval(
+        approval_target_entries: list[dict[str, object]],
+        *,
+        vector_sync_batch_suffix: str = "guided-approval",
+    ) -> None:
+        """고친 내용 저장 → 승인 → 색인을 한 번에 실행한다.
+
+        '이 규정'과 '이 파일의 전체 규정' 버튼이 대상 조항 목록만 다르고 나머지 절차는
+        같아서, 증빙 생성·승인 묶음·색인 순서가 두 갈래로 갈라지지 않도록 한 곳에 둔다.
+        """
+        selected_security_level = str(st.session_state.get(security_level_key) or "internal")
+        edited_chunk_total = _approval_save_text_edits(
+            document_id=document_id,
+            chunks=chunks,
+            entries=approval_target_entries,
+            target_repository=repository,
+        )
+        evidence, templates = _build_current_document_approval_templates(
+            ctx,
+            security_level=selected_security_level,
+            candidate_chunk_ids=[str(entry["chunk_id"]) for entry in approval_target_entries],
+        )
+        review_events = []
+        for entry in approval_target_entries:
+            target_chunk = entry["chunk"]
+            target_chunk_id = str(entry["chunk_id"])
+            target_hold_events_key = _approval_chunk_state_key(document_id, target_chunk_id, "hold_events")
+            review_events.extend(list(st.session_state.get(target_hold_events_key) or []))
+            review_events.extend(
+                build_approval_review_events(
+                    chunk_id=target_chunk_id,
+                    actor=local_auth.actor,
+                    item_ids=list(entry["item_ids"]),
+                    ai_decisions=dict(entry["ai_decisions"]),
+                    human_confirmed=bool(entry["human_confirmed"]),
+                    table_source=str(target_chunk.metadata.get("table_source") or ""),
+                    kordoc_table_promoted=bool(target_chunk.metadata.get("kordoc_table_promoted")),
+                    approve_event="approved",
+                    override_reason=override_reason_text or None,
+                )
+            )
+        approved_chunk_total = 0
+        guided_vector_sync_batch_id = (
+            f"streamlit-{document_id}-{vector_sync_batch_suffix}"
+        )[:200]
+        guided_defer_vector_sync = not bool(
+            str(getattr(document, "supersedes_document_id", "") or "").strip()
+        )
+        approval_index_result: dict[str, object] | None = None
+        approval_progress = st.progress(0, text="승인 0%")
+        approval_detail = st.empty()
+        for template_index, template in enumerate(templates, start=1):
+            segment_start = int((template_index - 1) * 58 / max(len(templates), 1))
+            segment_end = int(template_index * 58 / max(len(templates), 1))
+            approval_progress.progress(
+                segment_start,
+                text=f"승인 묶음 {template_index - 1:,}/{len(templates):,}",
+            )
+            chunk_ids = [str(chunk_id) for chunk_id in template["chunk_ids"]]
+            template_chunk_ids = set(chunk_ids)
+            template_review_events = [
+                event for event in review_events
+                if str(event.get("chunk_id") or "") in template_chunk_ids
+            ]
+            approval_request = ApprovalRequest(
+                    chunk_ids=chunk_ids,
+                    security_level=selected_security_level,
+                    review_flags_acknowledged=all(
+                        bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries
+                    ),
+                    worklist_report_path=str(template["worklist_report_path"]),
+                    worklist_report_sha256=str(template["worklist_report_sha256"]),
+                    review_batch_manifest_path=str(template["review_batch_manifest_path"]),
+                    review_batch_manifest_sha256=str(template["review_batch_manifest_sha256"]),
+                    review_batch_id=str(template["review_batch_id"]),
+                    review_batch_chunk_fingerprint=str(template["review_batch_chunk_fingerprint"]),
+                    review_strategy=str(template["review_strategy"]),
+                    review_decision_events=template_review_events,
+                    approval_override_reason=override_reason_text or None,
+                    note="approval_screen_tabs",
+                    defer_vector_sync=guided_defer_vector_sync,
+                    vector_sync_batch_id=(
+                        guided_vector_sync_batch_id
+                        if guided_defer_vector_sync
+                        else None
+                    ),
+            )
+            approval_response = _run_background_operation_with_progress(
+                lambda _report, request=approval_request: approve_review_chunks(
+                    document_id,
+                    request,
+                    local_auth,
+                ),
+                progress_bar=approval_progress,
+                detail_box=approval_detail,
+                start_percent=segment_start,
+                end_percent=segment_end,
+                label=f"승인 묶음 {template_index:,}/{len(templates):,}",
+                estimated_seconds=max(5.0, len(chunk_ids) / 70.0),
+            )
+            vector_sync = (
+                approval_response.get("vector_sync")
+                if isinstance(approval_response, dict)
+                else None
+            )
+            if isinstance(vector_sync, dict) and vector_sync.get("status") == "indexed":
+                approval_index_result = dict(vector_sync)
+            approved_chunk_total += len(chunk_ids)
+        if approval_index_result is None:
+            result = _run_background_operation_with_progress(
+                lambda _report: index_document(
+                    document_id,
+                    IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                    local_auth,
+                ),
+                progress_bar=approval_progress,
+                detail_box=approval_detail,
+                start_percent=58,
+                end_percent=100,
+                label="승인 내용 검색 색인",
+                estimated_seconds=max(8.0, approved_chunk_total / 65.0),
+            )
+        else:
+            result = approval_index_result
+            approval_progress.progress(100, text="승인 내용 검색 색인 완료 · 100%")
+            approval_detail.caption("개정 승인 전에 생성한 검증된 검색 색인을 재사용했습니다.")
+        _invalidate_document_context_cache(document_id)
+        st.success(
+            f"승인 {approved_chunk_total:,}개, 수정 저장 {edited_chunk_total:,}개, "
+            f"AI 등록 {result.get('record_count', 0):,}개가 완료됐습니다."
+        )
+        st.caption(f"자동 생성된 증빙: {evidence.get('artifacts', {}).get('review_batches_json', '')}")
+        st.rerun()
+
+    if approve_col.button(
+        "이 규정 최종 확정 · 승인하고 색인",
+        type="primary",
+        key=approve_index_button_key,
+        disabled=not can_approve or approved_count >= total_chunks,
+        help=(
+            f"'{opened_regulation_label}'의 미승인 조항 {len(pending_compare_ids):,}개를 한 번에 승인·색인합니다. "
+            "보고 있는 쪽만 처리하는 것이 아닙니다."
+        ),
+    ):
+        try:
+            _execute_final_approval(approval_target_entries)
+        except Exception as exc:
+            st.error(str(exc))
+
+    if approve_all_col is not None and approve_all_col.button(
+        f"이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정 · 승인하고 색인",
+        key=approve_all_index_button_key,
+        disabled=not document_pending_compare_ids,
+        help=(
+            f"규정을 하나씩 열지 않고, 이 파일에 들어 있는 규정 {len(regulation_units):,}개의 "
+            f"미승인 조항 {len(document_pending_compare_ids):,}개를 한 번에 승인·색인합니다. "
+            "열어 둔 규정만 처리하는 것이 아닙니다."
+        ),
+    ):
+        try:
+            # 열지 않은 규정의 조항은 검수 표시가 세션에 없다. 화면을 그릴 때마다 문서 전체를
+            # 채우면 통합본에서 느려지므로, 버튼을 누른 이 순간에만 대상 전체를 채운다.
+            document_pending_chunks = [chunk_by_id[cid] for cid in document_pending_compare_ids]
+            _approval_auto_confirm_pending_chunks(
+                document_id,
+                document_pending_chunks,
+                review_attention=review_attention,
+                agent_review_summary=agent_review_summary,
+            )
+            _execute_final_approval(
+                [
+                    _approval_chunk_review_state_from_session(
+                        document_id=document_id,
+                        chunk=chunk,
+                        review_attention=review_attention,
+                        agent_review_summary=agent_review_summary,
+                    )
+                    for chunk in document_pending_chunks
+                ],
+                vector_sync_batch_suffix="guided-approval-all",
+            )
+        except Exception as exc:
+            st.error(str(exc))
+
+    if index_col.button(
+        "이미 승인된 내용 AI에 등록만 실행",
+        key=f"quick-index-only-{document_id}",
+        disabled=approved_count <= 0,
+    ):
+        try:
+            with _long_operation_status(
+                "승인된 내용 검색 색인 중…",
+                failure_stage="승인 내용 검색 인덱스 생성",
+                failure_regulation=_workflow_document_label(document),
+                failure_policy="현재 규정 색인을 중단했습니다. 승인 기록은 유지되므로 다시 실행할 수 있습니다.",
+            ) as quick_index_status:
+                quick_index_progress = st.progress(0, text="색인 준비 · 0%")
+                quick_index_detail = st.empty()
+                result = _run_background_operation_with_progress(
+                    lambda _report: index_document(
+                        document_id,
+                        IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                        local_auth,
+                    ),
+                    progress_bar=quick_index_progress,
+                    detail_box=quick_index_detail,
+                    start_percent=0,
+                    end_percent=100,
+                    label="승인 내용 검색 색인",
+                    estimated_seconds=max(8.0, approved_count / 65.0),
+                )
+                quick_index_status.update(label="검색 색인 완료", state="complete")
+            _invalidate_document_context_cache(document_id)
+            st.success(f"승인된 청크 {result.get('record_count', 0):,}개를 AI에 등록했습니다.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    # 규정을 하나씩 열지 않고 선택한 규정 전체를 한 화면에서 확인·확정하고 싶을 때만 연다.
+    bulk_review_requested = False
+    if multi_selected:
+        st.divider()
+        st.markdown(f"### 전체 규정 확인 (선택 {len(selected_document_ids):,}개)")
+        st.caption(
+            "규정을 하나씩 여는 대신, 선택한 규정 전체를 한 화면에서 이어서 검수하고 한 번에 확정합니다."
+        )
+        bulk_review_requested = st.checkbox(
+            f"전체 규정 확인 열기 · 선택한 {len(selected_document_ids):,}개를 한꺼번에 검수·확정",
+            key=bulk_open_key,
+            help="켜면 선택한 규정의 상태 표와 전체 조항 비교 화면, 일괄 최종 확정 버튼이 나타납니다.",
+        )
+
+    if bulk_review_requested and not batch_loaded:
+        st.caption(
+            "선택한 규정을 한꺼번에 승인·색인하려면 먼저 각 규정의 검수 상태를 불러와야 합니다. "
+            "규정 수가 많으면 불러오는 데 시간이 걸리므로, 필요할 때만 누르세요."
+        )
+        if st.button(
+            f"선택한 규정 {len(selected_document_ids):,}개 상태 불러오기",
+            key=f"approval-batch-load-{document_id}",
+            width="stretch",
+        ):
+            st.session_state[batch_loaded_key] = True
+            st.rerun()
+        st.divider()
+
+    if bulk_review_requested and batch_loaded:
         st.caption(
             "청크를 한 문서로 합치지 않습니다. 규정별 문서 ID·규정 ID·목차 계층을 유지한 채 "
             "각 규정을 차례로 검수·승인·색인합니다."
@@ -7873,6 +9915,12 @@ def _page_approval(ctx: dict | None) -> None:
             "approval_vector_sync_outcome"
         )
         for approval_ctx in selected_approval_contexts:
+            _approval_auto_confirm_pending_chunks(
+                str(approval_ctx["document_id"]),
+                list(approval_ctx["chunks"]),
+                review_attention=dict(approval_ctx.get("review_attention") or {}),
+                agent_review_summary=dict(approval_ctx.get("agent_review_summary") or {}),
+            )
             pending_entries = _approval_pending_entries(approval_ctx)
             approval_ctx_document_id = str(approval_ctx["document_id"])
             pending_sync_batch_ids = pending_deferred_vector_sync_batch_ids(
@@ -7931,16 +9979,6 @@ def _page_approval(ctx: dict | None) -> None:
             )
 
         workflow_pending_count = sum(len(entries) for _, entries in workflow_review_entries)
-        workflow_ai_complete_count = sum(
-            bool(dict(entry["state"]).get("ai_confirmed"))
-            for _, entries in workflow_review_entries
-            for entry in entries
-        )
-        workflow_human_complete_count = sum(
-            bool(entry.get("human_confirmed"))
-            for _, entries in workflow_review_entries
-            for entry in entries
-        )
         workflow_ready_count = sum(
             bool(dict(entry["state"]).get("approve_enabled"))
             for _, entries in workflow_review_entries
@@ -7950,167 +9988,99 @@ def _page_approval(ctx: dict | None) -> None:
         workflow_contexts_complete = len(selected_approval_contexts) == len(selected_document_ids) and all(
             approval_ctx.get("chunks") for approval_ctx in selected_approval_contexts
         )
-        workflow_review_task_total = workflow_pending_count * 2
-        workflow_review_task_complete = workflow_ai_complete_count + workflow_human_complete_count
-        st.progress(
-            100
-            if workflow_review_task_total == 0
-            else int(workflow_review_task_complete * 100 / workflow_review_task_total),
-            text=(
-                f"선택 규정 전체 검수 {workflow_review_task_complete:,}/{workflow_review_task_total:,} · "
-                f"AI {workflow_ai_complete_count:,}/{workflow_pending_count:,} · "
-                f"사람 {workflow_human_complete_count:,}/{workflow_pending_count:,}"
-            ),
-        )
+
+        # 규정을 하나씩 열지 않고도 선택한 규정 전체의 미승인 조항을 이어서 볼 수 있어야 한다.
+        # 규정 경계는 유지한 채(규정명 표시) 규정 순서대로 이어 붙인다.
+        if st.checkbox(
+            "선택한 모든 규정의 미승인 조항을 이어서 비교하기 (원본 · 전처리본 · AI 검수본)",
+            key=f"approval-bulk-sheet-{document_id}",
+            help="규정별 조항을 한 화면에서 순서대로 확인하고 고칠 수 있습니다. 고친 내용은 아래 최종 확정에서 함께 저장됩니다.",
+        ):
+            workflow_sheet_rows = [
+                _approval_compare_row(
+                    approval_ctx["document"],
+                    entry["chunk"],
+                    attention=str(entry["chunk_id"])
+                    in {str(cid) for cid in (approval_ctx.get("review_attention") or {})},
+                    document_label=_workflow_document_label(approval_ctx["document"]),
+                )
+                for approval_ctx, pending_entries in workflow_review_entries
+                for entry in pending_entries
+            ]
+            if workflow_sheet_rows:
+                st.caption(
+                    f"선택한 규정 {len(selected_approval_contexts):,}개의 미승인 조항 "
+                    f"{len(workflow_sheet_rows):,}개를 규정 순서대로 보여줍니다."
+                )
+                # 규정마다 AI 검수 선정 목록이 따로 있으므로 합쳐서 넘긴다.
+                workflow_ai_selected_chunk_ids: set[str] = set()
+                workflow_ai_reviewed_chunk_ids: set[str] = set()
+                for approval_ctx, _pending_entries in workflow_review_entries:
+                    workflow_ai_selected_chunk_ids |= _agent_review_selected_chunk_ids(
+                        approval_ctx.get("agent_review_summary")
+                    )
+                    workflow_ai_reviewed_chunk_ids |= _agent_review_reviewed_chunk_ids(
+                        approval_ctx.get("agent_review_summary")
+                    )
+                # 한 시트에 여러 규정을 이어 붙이므로, 전부 AI 검수를 돌린 경우에만
+                # AI 검수본 칸을 최종본으로 세운다. 섞여 있으면 칸 위치가 규정마다
+                # 달라져 어디를 고쳐야 하는지 알 수 없다.
+                # 여러 규정 중 하나라도 '켰는데 실행이 끝나지 못한' 것이 있으면 그 쪽을
+                # 안내에 쓴다. 성공한 규정만 보고 '검수를 끈 것'이라고 적으면 안 된다.
+                workflow_summaries = [
+                    dict(approval_ctx.get("agent_review_summary") or {})
+                    for approval_ctx, _pending_entries in workflow_review_entries
+                ]
+                workflow_review_summary = next(
+                    (
+                        summary
+                        for summary in workflow_summaries
+                        if int(summary.get("selected_count") or 0)
+                        and not int(summary.get("api_call_count") or 0)
+                    ),
+                    workflow_summaries[0] if workflow_summaries else {},
+                )
+                _render_approval_compare_sheet(
+                    rows=workflow_sheet_rows,
+                    page_state_key=f"approval-bulk-sheet-page-{document_id}",
+                    show_document_label=True,
+                    ai_selected_chunk_ids=workflow_ai_selected_chunk_ids,
+                    ai_reviewed_chunk_ids=workflow_ai_reviewed_chunk_ids,
+                    agent_review_summary=workflow_review_summary,
+                )
+            else:
+                st.success("선택한 규정에는 검수할 미승인 조항이 없습니다.")
+
         workflow_security_level = st.selectbox(
             "선택 규정 일괄 보안 등급",
             ["internal", "public", "sensitive", "confidential"],
             key=f"workflow-security-level-{document_id}",
             format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
         )
-        beginner_bulk_review_disabled = bool(
-            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
-        )
-        if beginner_bulk_review_disabled:
-            st.info(
-                "초보자 안내 모드에서는 일괄 검수·승인·색인 버튼을 사용할 수 없습니다. "
-                "아래에서 청크별 원문과 전처리 결과를 비교한 뒤 AI 판단과 사람 확인을 각각 완료하세요."
+        # 초보자 모드에서도 전체 규정 승인을 쓸 수 있게 열되, 확인 한 단계를 반드시 거치게 한다.
+        # (승인한 내용은 곧바로 AI 답변 근거가 되므로 실수로 눌리면 되돌리기 번거롭다.)
+        beginner_bulk_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+        beginner_bulk_confirmed = True
+        if beginner_bulk_mode_active:
+            st.warning(
+                f"'전체 규정 최종 확정'은 선택한 규정 {len(selected_document_ids):,}개의 "
+                f"미승인 조항 {workflow_pending_count:,}개를 한 번에 승인하고 색인합니다. "
+                "승인한 내용은 AI가 답변 근거로 그대로 씁니다. "
+                "규정을 하나씩 열어 확인한 뒤 사용하시길 권합니다."
             )
-        st.caption("전체 완료는 기존 개별 결정을 다시 일괄 적용합니다.")
-        batch_review_cols = st.columns(2)
-        if batch_review_cols[0].button(
-            f"전체 규정 자료 AI 검수 완료 (선택 {len(selected_document_ids):,}개)",
-            key=f"workflow-ai-review-{document_id}",
-            disabled=(
-                not workflow_contexts_complete
-                or workflow_pending_count == 0
-                or beginner_bulk_review_disabled
-            ),
-            width="stretch",
-        ):
-            batch_progress = st.progress(0, text="선택 규정 AI 검수 0%")
-            completed_chunks = 0
-            total_chunks = sum(len(approval_ctx["chunks"]) for approval_ctx, _ in workflow_review_entries)
-            changed_chunks = 0
-            for approval_ctx, _ in workflow_review_entries:
-                current_total = len(approval_ctx["chunks"])
-                summary = _approval_set_bulk_ai_decisions(
-                    document_id=str(approval_ctx["document_id"]),
-                    chunks=list(approval_ctx["chunks"]),
-                    review_attention=dict(approval_ctx.get("review_attention") or {}),
-                    agent_review_summary=dict(approval_ctx.get("agent_review_summary") or {}),
-                    decision="reflect",
-                    progress_callback=lambda current, _total, offset=completed_chunks: batch_progress.progress(
-                        min(100, int((offset + current) * 100 / max(total_chunks, 1))),
-                        text=f"선택 규정 AI 검수 {offset + current:,}/{total_chunks:,}",
-                    ),
-                )
-                changed_chunks += int(summary["chunk_count"])
-                completed_chunks += current_total
-            st.success(f"선택한 규정 전체에서 미승인 청크 {changed_chunks:,}개의 AI 검수를 완료했습니다.")
-            st.rerun()
-        if batch_review_cols[1].button(
-            f"전체 규정 자료 사람 확인 완료 (선택 {len(selected_document_ids):,}개)",
-            key=f"workflow-human-review-{document_id}",
-            disabled=(
-                not workflow_contexts_complete
-                or workflow_pending_count == 0
-                or beginner_bulk_review_disabled
-            ),
-            width="stretch",
-        ):
-            batch_progress = st.progress(0, text="선택 규정 사람 확인 0%")
-            completed_chunks = 0
-            total_chunks = sum(len(approval_ctx["chunks"]) for approval_ctx, _ in workflow_review_entries)
-            changed_chunks = 0
-            for approval_ctx, _ in workflow_review_entries:
-                current_total = len(approval_ctx["chunks"])
-                summary = _approval_set_bulk_human_confirmations(
-                    document_id=str(approval_ctx["document_id"]),
-                    chunks=list(approval_ctx["chunks"]),
-                    confirmed=True,
-                    progress_callback=lambda current, _total, offset=completed_chunks: batch_progress.progress(
-                        min(100, int((offset + current) * 100 / max(total_chunks, 1))),
-                        text=f"선택 규정 사람 확인 {offset + current:,}/{total_chunks:,}",
-                    ),
-                )
-                changed_chunks += int(summary["chunk_count"])
-                completed_chunks += current_total
-            st.success(f"선택한 규정 전체에서 미승인 청크 {changed_chunks:,}개의 사람 확인을 완료했습니다.")
-            st.rerun()
-
-        st.caption("나머지 부분 완료는 이미 사람이 체크·수정한 결정은 유지하고 아직 미확인인 부분만 처리합니다.")
-        batch_remaining_cols = st.columns(2)
-        if batch_remaining_cols[0].button(
-            f"나머지 부분 AI 점검 전체 완료 (선택 {len(selected_document_ids):,}개)",
-            key=f"workflow-ai-remaining-review-{document_id}",
-            disabled=(
-                not workflow_contexts_complete
-                or workflow_pending_count == 0
-                or workflow_ai_complete_count >= workflow_pending_count
-                or beginner_bulk_review_disabled
-            ),
-            width="stretch",
-        ):
-            batch_progress = st.progress(0, text="선택 규정 남은 AI 점검 0%")
-            completed_chunks = 0
-            total_chunks = sum(len(approval_ctx["chunks"]) for approval_ctx, _ in workflow_review_entries)
-            changed_items = 0
-            for approval_ctx, _ in workflow_review_entries:
-                current_total = len(approval_ctx["chunks"])
-                summary = _approval_set_bulk_ai_decisions(
-                    document_id=str(approval_ctx["document_id"]),
-                    chunks=list(approval_ctx["chunks"]),
-                    review_attention=dict(approval_ctx.get("review_attention") or {}),
-                    agent_review_summary=dict(approval_ctx.get("agent_review_summary") or {}),
-                    decision="skip",
-                    only_remaining=True,
-                    progress_callback=lambda current, _total, offset=completed_chunks: batch_progress.progress(
-                        min(100, int((offset + current) * 100 / max(total_chunks, 1))),
-                        text=f"선택 규정 남은 AI 점검 {offset + current:,}/{total_chunks:,}",
-                    ),
-                )
-                changed_items += int(summary["item_count"])
-                completed_chunks += current_total
-            st.success(f"기존 결정을 유지하고 아직 미확인인 AI 제안 {changed_items:,}개를 확인했습니다.")
-            st.rerun()
-        if batch_remaining_cols[1].button(
-            f"나머지 부분 사람 점검 전체 완료 (선택 {len(selected_document_ids):,}개)",
-            key=f"workflow-human-remaining-review-{document_id}",
-            disabled=(
-                not workflow_contexts_complete
-                or workflow_pending_count == 0
-                or workflow_human_complete_count >= workflow_pending_count
-                or beginner_bulk_review_disabled
-            ),
-            width="stretch",
-        ):
-            batch_progress = st.progress(0, text="선택 규정 남은 사람 점검 0%")
-            completed_chunks = 0
-            total_chunks = sum(len(approval_ctx["chunks"]) for approval_ctx, _ in workflow_review_entries)
-            changed_chunks = 0
-            for approval_ctx, _ in workflow_review_entries:
-                current_total = len(approval_ctx["chunks"])
-                summary = _approval_set_bulk_human_confirmations(
-                    document_id=str(approval_ctx["document_id"]),
-                    chunks=list(approval_ctx["chunks"]),
-                    confirmed=True,
-                    only_remaining=True,
-                    progress_callback=lambda current, _total, offset=completed_chunks: batch_progress.progress(
-                        min(100, int((offset + current) * 100 / max(total_chunks, 1))),
-                        text=f"선택 규정 남은 사람 점검 {offset + current:,}/{total_chunks:,}",
-                    ),
-                )
-                changed_chunks += int(summary["chunk_count"])
-                completed_chunks += current_total
-            st.success(f"기존 확인을 유지하고 아직 미확인인 청크 {changed_chunks:,}개를 확인했습니다.")
-            st.rerun()
+            beginner_bulk_confirmed = st.checkbox(
+                f"규정 {len(selected_document_ids):,}개를 한 번에 승인·색인하는 것에 동의합니다.",
+                key=f"workflow-beginner-bulk-ack-{document_id}",
+                help="이 확인란을 선택해야 아래 '전체 규정 최종 확정' 버튼이 열립니다.",
+            )
+        beginner_bulk_review_disabled = beginner_bulk_mode_active and not beginner_bulk_confirmed
+        st.caption("AI·사람 확인은 자동으로 완료 표시됩니다. 아래에서 실제 승인·색인만 진행하세요.")
 
         if st.button(
             (
                 f"색인 복구 {workflow_deferred_sync_count:,}개 실행"
                 if workflow_pending_count == 0 and workflow_deferred_sync_count
-                else f"선택한 규정 {len(selected_document_ids):,}개 승인·색인"
+                else f"전체 규정 최종 확정 · 선택한 {len(selected_document_ids):,}개 승인·색인"
             ),
             type="primary",
             key=f"workflow-approve-index-{document_id}",
@@ -8289,1047 +10259,27 @@ def _page_approval(ctx: dict | None) -> None:
         if workflow_ready_count < workflow_pending_count:
             st.info("선택한 모든 규정의 AI 검수와 사람 확인을 완료하면 규정별 일괄 승인·색인 버튼이 활성화됩니다.")
 
-    if not chunks:
-        st.info("이 문서에는 승인할 청크가 없습니다. 전처리를 다시 실행해 주세요.")
-        return
-
-    current_document = ctx["document"]
-    if getattr(current_document, "regulation_id", None):
-        st.markdown("### 규정 버전 상태")
-        lifecycle_cols = st.columns(4)
-        lifecycle_cols[0].metric("규정 ID", str(current_document.regulation_id))
-        lifecycle_cols[1].metric("버전", current_document.regulation_version or "미지정")
-        lifecycle_cols[2].metric("상태", current_document.regulation_status)
-        lifecycle_cols[3].metric("효력 시작", current_document.effective_from or "미지정")
-        version_history = repository.find_documents_by_regulation(
-            current_document.regulation_id,
-            profile_id=current_document.profile_id,
-            tenant_id=current_document.tenant_id,
-        )
-        if version_history:
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "문서 ID": item.document_id,
-                            "버전": item.regulation_version or "미지정",
-                            "상태": item.regulation_status,
-                            "개정일": item.revision_date or "",
-                            "효력 시작": item.effective_from or "",
-                            "효력 종료": item.effective_to or "",
-                            "폐지일": item.repealed_at or "",
-                        }
-                        for item in version_history
-                    ]
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-        current_regulation_status = str(getattr(current_document, "regulation_status", "") or "draft").strip().lower()
-        lifecycle_targets = {
-            "approved": ("superseded", "repealed"),
-            "superseded": ("repealed",),
-        }.get(current_regulation_status, ())
-        if current_document.regulation_version and lifecycle_targets:
-            st.markdown("#### 규정 생명주기 수동 전환")
-            st.caption("버전이 확정된 규정만 전환할 수 있으며, 전환 사유는 감사 기록에 남습니다.")
-            lifecycle_labels = {
-                "superseded": "대체됨 (superseded)",
-                "repealed": "폐지됨 (repealed)",
-            }
-            with st.form(f"regulation-lifecycle-form-{document_id}"):
-                lifecycle_target = st.selectbox(
-                    "전환 상태",
-                    lifecycle_targets,
-                    format_func=lambda value: lifecycle_labels.get(value, value),
-                )
-                lifecycle_reason = st.text_area(
-                    "전환 사유",
-                    placeholder="예: 신규 개정본 v2.0 시행으로 기존 버전을 대체함",
-                    help="superseded 또는 repealed 전환에는 사유가 필요합니다.",
-                )
-                lifecycle_submitted = st.form_submit_button("규정 상태 전환", type="secondary")
-            if lifecycle_submitted:
-                lifecycle_reason_text = str(lifecycle_reason or "").strip()
-                if not lifecycle_reason_text:
-                    st.error("규정 상태를 전환하려면 사유를 입력해 주세요.")
-                else:
-                    try:
-                        transition_result = transition_regulation_status(
-                            document_id,
-                            RegulationLifecycleRequest(
-                                status=lifecycle_target,
-                                reason=lifecycle_reason_text,
-                            ),
-                            local_auth,
-                        )
-                        updated_status = (
-                            transition_result.get("document", {}).get("regulation_status")
-                            if isinstance(transition_result, dict)
-                            else lifecycle_target
-                        ) or lifecycle_target
-                        st.success(f"규정 상태를 {lifecycle_labels.get(updated_status, updated_status)}로 전환했습니다.")
-                        lifecycle_event = transition_result.get("lifecycle_event", {}) if isinstance(transition_result, dict) else {}
-                        vector_sync = lifecycle_event.get("vector_sync", {}) if isinstance(lifecycle_event, dict) else {}
-                        if vector_sync.get("status") == "failed":
-                            st.error("규정 상태는 전환됐지만 색인 동기화에 실패했습니다. 승인 화면에서 다시 색인해 주세요.")
-                        else:
-                            st.rerun()
-                    except Exception as exc:
-                        st.error(f"규정 상태 전환에 실패했습니다: {exc}")
-
-    st.markdown("### 현재 상태")
-    total_chunks = len(chunks)
-    status_cols = st.columns(4)
-    status_cols[0].metric("전체 청크", f"{total_chunks:,}")
-    status_cols[1].metric("승인된 청크 (Approved chunks)", f"{approved_count:,}")
-    status_cols[2].metric("검수 주의 청크", f"{len(review_attention):,}", help="파서·표 관련 경고가 있어 사람이 꼭 봐야 하는 청크입니다.")
-    current_scope_state = _mcp_scope_document_state(chunks, mcp_connection_gate)
-    if index_status_error:
-        status_cols[3].metric("색인 상태", "확인 불가")
-        st.warning(f"MCP index status could not be checked: {index_status_error}")
-    else:
-        status_cols[3].metric(
-            "AI에 보이는 기록 (MCP-visible records)",
-            f"{int(mcp_connection_gate.get('mcp_visible_count') or 0):,}",
-        )
-        if index_status and index_status.get("validation_error"):
-            st.warning(f"Index validation: {index_status['validation_error']}")
-        if current_scope_state["state"] == "terminal-excluded":
-            st.info(
-                "이 규정의 모든 활성 청크는 명시적으로 반려되어 MCP에서 제외됩니다. "
-                "검토 미완료가 아니지만, 이 규정만으로는 MCP를 만들 수 없습니다."
-            )
-        elif not mcp_connection_gate.get("ready"):
-            st.warning(
-                "AI는 '승인 후 색인된' 내용만 볼 수 있습니다. 승인과 색인을 마친 뒤에도 숫자가 맞지 않으면 아래 '다시 색인하기'를 눌러 주세요.\n\n"
-                "Claude/MCP can answer only from approved chunks that are currently indexed. "
-                "If Claude sees smoke-test documents or fewer records than expected, approve the intended chunks "
-                "and run Reindex approved chunks with the same data directory and tenant."
-            )
-        else:
-            st.success("승인된 모든 청크가 색인되어 AI에서 사용할 수 있습니다.")
-    with st.expander("승인 상태 상세 (전산 담당자용)", expanded=False):
-        st.write({"approval_status_counts": approval_counts})
-        st.write(
-            {
-                "indexing_status": mcp_connection_gate.get("indexing_status"),
-                "stale_count": mcp_connection_gate.get("stale_count"),
-                "gate_reason": mcp_connection_gate.get("reason"),
-            }
-        )
-    if review_attention:
-        st.warning(
-            f"검수 주의 청크가 {len(review_attention):,}개 있습니다. 승인 전에 반드시 내용을 확인하고 아래 확인란에 체크해 주세요."
-        )
-
-    worklist_path_key = f"approval-worklist-path-{document_id}"
-    worklist_sha_key = f"approval-worklist-sha256-{document_id}"
-    batch_manifest_path_key = f"approval-review-batch-manifest-path-{document_id}"
-    batch_manifest_sha_key = f"approval-review-batch-manifest-sha256-{document_id}"
-    batch_id_key = f"approval-review-batch-{document_id}"
-    batch_fingerprint_key = f"approval-review-batch-fingerprint-{document_id}"
-    review_strategy_key = f"approval-review-strategy-{document_id}"
-    security_level_key = f"security-level-{document_id}"
-    review_ack_key = f"review-flags-ack-{document_id}"
-    approval_chunk_ids_key = f"approval-selected-chunk-ids-{document_id}"
-    for state_key in (
-        worklist_path_key,
-        worklist_sha_key,
-        batch_manifest_path_key,
-        batch_manifest_sha_key,
-        batch_id_key,
-        batch_fingerprint_key,
-    ):
-        st.session_state.setdefault(state_key, "")
-    st.session_state.setdefault(security_level_key, "internal")
-    selected_approval_chunk_ids = [
-        str(chunk_id)
-        for chunk_id in st.session_state.get(approval_chunk_ids_key, [])
-        if str(chunk_id).strip()
-    ]
-
-    document = ctx["document"]
-    agent_review_summary = ctx.get("agent_review_summary") or {}
-
-    st.markdown("### 검증 시트")
-    st.caption("AI 제안은 반영 여부만 결정하고, 최종 승인은 사람이 별도로 누릅니다. 탭 이동 순서는 자유입니다.")
-    chunk_by_id = {str(chunk.chunk_id): chunk for chunk in chunks}
-    attention_ids = {str(chunk_id) for chunk_id in review_attention}
-    original_order = {cid: index for index, cid in enumerate(chunk_by_id)}
-    ordered_compare_ids = sorted(
-        chunk_by_id,
-        key=lambda cid: (
-            not _is_chunk_pending_approval(chunk_by_id[cid]),
-            cid not in attention_ids,
-            original_order[cid],
-        ),
-    )
-    pending_compare_ids = [cid for cid in ordered_compare_ids if _is_chunk_pending_approval(chunk_by_id[cid])]
-
-    pending_review_states = [
-        _approval_chunk_review_state_from_session(
-            document_id=document_id,
-            chunk=chunk_by_id[cid],
-            review_attention=review_attention,
-            agent_review_summary=agent_review_summary,
-        )
-        for cid in pending_compare_ids
-    ]
-    ai_complete_count = sum(bool(dict(entry["state"]).get("ai_confirmed")) for entry in pending_review_states)
-    human_complete_count = sum(bool(entry.get("human_confirmed")) for entry in pending_review_states)
-    review_task_total = len(pending_review_states) * 2
-    review_task_complete = ai_complete_count + human_complete_count
-    st.markdown("### 현재 연 규정 한 번에 검수")
-    st.caption("현재 규정 디렉터리에서 열어 둔 규정 한 개의 모든 미승인 청크에만 적용됩니다.")
-    beginner_bulk_review_disabled = bool(
-        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
-    )
-    if beginner_bulk_review_disabled:
-        st.info(
-            "초보자 안내 모드에서는 일괄 검수 버튼을 사용할 수 없습니다. "
-            "아래에서 청크별 원문과 전처리 결과를 비교한 뒤 AI 판단과 사람 확인을 각각 완료하세요."
-        )
-    st.progress(
-        100 if review_task_total == 0 else int((review_task_complete / review_task_total) * 100),
-        text=(
-            f"전체 검수 {review_task_complete}/{review_task_total} · "
-            f"AI {ai_complete_count}/{len(pending_review_states)} · "
-            f"사람 {human_complete_count}/{len(pending_review_states)}"
-        ),
-    )
-    full_review_cols = st.columns(2)
-    if full_review_cols[0].button(
-        "현재 규정 AI 검수 완료",
-        type="primary",
-        key=f"ai-full-review-{document_id}",
-        disabled=not pending_review_states or beginner_bulk_review_disabled,
-        width="stretch",
-    ):
-        with _long_operation_status(
-            "전체 규정 AI 검수 완료 처리 중…",
-            failure_stage="AI 검수 결정 저장",
-            failure_regulation=_workflow_document_label(document),
-            failure_policy="현재 규정의 일괄 검수를 중단했습니다. 저장 상태를 확인한 뒤 다시 실행할 수 있습니다.",
-        ) as bulk_status:
-            bulk_status.write(f"{len(chunks):,}개 청크를 순회하는 중입니다.")
-            bulk_progress = st.progress(0, text="AI 검수 0%")
-            summary = _approval_set_bulk_ai_decisions(
-                document_id=document_id,
-                chunks=chunks,
-                review_attention=review_attention,
-                agent_review_summary=agent_review_summary,
-                decision="reflect",
-                progress_callback=lambda current, total: bulk_progress.progress(
-                    min(100, int(current * 100 / max(total, 1))),
-                    text=f"AI 검수 {current:,}/{total:,}",
-                ),
-            )
-            bulk_status.update(label="전체 AI 검수 완료", state="complete")
-        st.session_state.pop(approval_chunk_ids_key, None)
-        st.success(
-            f"전체 AI 검수 완료: {summary['chunk_count']:,}개 규정·조항, 제안 {summary['item_count']:,}개를 반영으로 표시했습니다."
-        )
-        st.rerun()
-    if full_review_cols[1].button(
-        "현재 규정 사람 확인 완료",
-        type="primary",
-        key=f"human-full-review-{document_id}",
-        disabled=not pending_review_states or beginner_bulk_review_disabled,
-        width="stretch",
-    ):
-        with _long_operation_status(
-            "전체 규정 사람 확인 처리 중…",
-            failure_stage="사람 확인 결정 저장",
-            failure_regulation=_workflow_document_label(document),
-            failure_policy="현재 규정의 일괄 확인을 중단했습니다. 저장 상태를 확인한 뒤 다시 실행할 수 있습니다.",
-        ) as bulk_status:
-            bulk_status.write(f"{len(chunks):,}개 청크를 확인 완료로 표시하는 중입니다.")
-            bulk_progress = st.progress(0, text="사람 확인 0%")
-            summary = _approval_set_bulk_human_confirmations(
-                document_id=document_id,
-                chunks=chunks,
-                confirmed=True,
-                progress_callback=lambda current, total: bulk_progress.progress(
-                    min(100, int(current * 100 / max(total, 1))),
-                    text=f"사람 확인 {current:,}/{total:,}",
-                ),
-            )
-            bulk_status.update(label="전체 사람 확인 완료", state="complete")
-        st.session_state.pop(approval_chunk_ids_key, None)
-        st.success(f"전체 사람 확인 완료: {summary['chunk_count']:,}개 미승인 규정·조항을 확인 완료로 표시했습니다.")
-        st.rerun()
-
-    st.caption(
-        "일부 항목을 먼저 검수했다면 아래 버튼을 사용하세요. 기존 결정은 유지하고 아직 미확인인 항목만 완료합니다."
-    )
-    remaining_review_cols = st.columns(2)
-    if remaining_review_cols[0].button(
-        "나머지 부분 AI 점검 전체 완료",
-        key=f"ai-remaining-review-{document_id}",
-        disabled=(
-            not pending_review_states
-            or ai_complete_count >= len(pending_review_states)
-            or beginner_bulk_review_disabled
-        ),
-        width="stretch",
-    ):
-        with _long_operation_status(
-            "남은 AI 점검 처리 중…",
-            failure_stage="남은 AI 검수 결정 저장",
-            failure_regulation=_workflow_document_label(document),
-            failure_policy="현재 규정의 남은 항목 처리를 중단했습니다. 완료된 결정은 유지됩니다.",
-        ) as bulk_status:
-            bulk_status.write("기존 반영·미반영 결정은 유지하고 미결정 제안만 확인 완료로 표시합니다.")
-            bulk_progress = st.progress(0, text="남은 AI 점검 0%")
-            summary = _approval_set_bulk_ai_decisions(
-                document_id=document_id,
-                chunks=chunks,
-                review_attention=review_attention,
-                agent_review_summary=agent_review_summary,
-                decision="skip",
-                only_remaining=True,
-                progress_callback=lambda current, total: bulk_progress.progress(
-                    min(100, int(current * 100 / max(total, 1))),
-                    text=f"남은 AI 점검 {current:,}/{total:,}",
-                ),
-            )
-            bulk_status.update(label="나머지 AI 점검 완료", state="complete")
-        st.session_state.pop(approval_chunk_ids_key, None)
-        st.success(
-            f"나머지 AI 점검 완료: 기존 결정을 유지하고 미결정 제안 {summary['item_count']:,}개를 확인했습니다."
-        )
-        st.rerun()
-    if remaining_review_cols[1].button(
-        "나머지 부분 사람 점검 전체 완료",
-        key=f"human-remaining-review-{document_id}",
-        disabled=(
-            not pending_review_states
-            or human_complete_count >= len(pending_review_states)
-            or beginner_bulk_review_disabled
-        ),
-        width="stretch",
-    ):
-        with _long_operation_status(
-            "남은 사람 점검 처리 중…",
-            failure_stage="남은 사람 확인 결정 저장",
-            failure_regulation=_workflow_document_label(document),
-            failure_policy="현재 규정의 남은 항목 처리를 중단했습니다. 완료된 확인은 유지됩니다.",
-        ) as bulk_status:
-            bulk_status.write("이미 확인한 청크는 유지하고 미확인 청크만 확인 완료로 표시합니다.")
-            bulk_progress = st.progress(0, text="남은 사람 점검 0%")
-            summary = _approval_set_bulk_human_confirmations(
-                document_id=document_id,
-                chunks=chunks,
-                confirmed=True,
-                only_remaining=True,
-                progress_callback=lambda current, total: bulk_progress.progress(
-                    min(100, int(current * 100 / max(total, 1))),
-                    text=f"남은 사람 점검 {current:,}/{total:,}",
-                ),
-            )
-            bulk_status.update(label="나머지 사람 점검 완료", state="complete")
-        st.session_state.pop(approval_chunk_ids_key, None)
-        st.success(
-            f"나머지 사람 점검 완료: 기존 확인을 유지하고 미확인 규정·조항 {summary['chunk_count']:,}개를 확인했습니다."
-        )
-        st.rerun()
-
-    compare_key = f"approval-compare-chunk-{document_id}"
-    selected_compare_id = str(st.session_state.get(compare_key) or "")
-    if ordered_compare_ids and selected_compare_id not in chunk_by_id:
-        st.session_state[compare_key] = pending_compare_ids[0] if pending_compare_ids else ordered_compare_ids[0]
-    elif pending_compare_ids and selected_compare_id and not _is_chunk_pending_approval(chunk_by_id[selected_compare_id]):
-        st.session_state[compare_key] = pending_compare_ids[0]
-
-    def _compare_chunk_label(cid: str) -> str:
-        chunk = chunk_by_id[cid]
-        location = chunk.metadata.get("hierarchy_path") or chunk.chunk_type
-        mark = " ⚠️ 검수 주의" if cid in attention_ids else ""
-        return f"{cid} · {location}{mark}"
-
-    compare_id = st.selectbox(
-        "검수할 청크 선택",
-        options=ordered_compare_ids,
-        format_func=_compare_chunk_label,
-        key=compare_key,
-    )
-    compare_chunk = chunk_by_id[str(compare_id)]
-    compare_chunk_approvable = _is_chunk_pending_approval(compare_chunk)
-    if not compare_chunk_approvable:
-        st.info(
-            "Selected chunk is already finalized or blocked "
-            f"(status={_approval_status(compare_chunk)}). Choose a pending review chunk to approve."
-        )
-    compare_reasons = review_attention.get(compare_chunk.chunk_id) or chunk_review_attention_reasons(compare_chunk)
-    review_items = _approval_ai_review_items(compare_chunk, compare_reasons, agent_review_summary)
-    item_ids = [str(item["item_id"]) for item in review_items]
-    ai_decisions_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "ai_decisions")
-    ai_result_confirmed_key = _approval_chunk_state_key(
-        document_id,
-        compare_chunk.chunk_id,
-        "ai_result_confirmed",
-    )
-    human_confirmed_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "human_confirmed")
-    human_confirmed_widget_key = _approval_chunk_state_key(
-        document_id,
-        compare_chunk.chunk_id,
-        "human_confirmed_widget",
-    )
-    ai_logged_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "ai_logged")
-    human_logged_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "human_logged")
-    audit_preview_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "audit_preview")
-    hold_events_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "hold_events")
-    override_reason_key = _approval_chunk_state_key(document_id, compare_chunk.chunk_id, "override_reason")
-    st.session_state.setdefault(ai_decisions_key, {})
-    st.session_state.setdefault(human_confirmed_key, False)
-    st.session_state.setdefault(audit_preview_key, [])
-    st.session_state.setdefault(hold_events_key, [])
-
-    ai_decisions = {
-        str(item_id): str(decision)
-        for item_id, decision in dict(st.session_state.get(ai_decisions_key) or {}).items()
-        if str(decision) in {"reflect", "skip"}
-    }
-    review_state = _approval_review_completion_with_beginner_confirmation(
-        document_id=document_id,
-        chunk_id=str(compare_chunk.chunk_id),
-        item_ids=item_ids,
-        ai_decisions=ai_decisions,
-        human_confirmed=bool(st.session_state.get(human_confirmed_key)),
-    )
-
-    if approved_count < total_chunks and not bool(review_state["ai_confirmed"]):
-        pending_ai_item_id = next(
-            (item_id for item_id in item_ids if item_id not in ai_decisions),
-            "",
-        )
-        _render_beginner_action_marker(
-            3,
-            "AI 검증 항목을 먼저 판단하세요",
-            "아래 첫 번째 탭에서 각 항목을 반영하거나 반영하지 않을지 선택하세요. 이 판단만으로 승인되지는 않습니다.",
-            control_keys=(
-                _approval_ai_decision_control_keys(pending_ai_item_id)
-                if pending_ai_item_id
-                else ()
-            ),
-        )
-    elif (
-        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
-        and approved_count < total_chunks
-        and not bool(review_state["ai_result_confirmed"])
-    ):
-        ai_result_widget_key = _approval_chunk_state_key(
-            document_id,
-            compare_chunk.chunk_id,
-            f"ai_result_confirmed_widget_{review_state['ai_result_signature']}",
-        )
-        _render_beginner_action_marker(
-            3,
-            "AI 검증 결과를 확인했다고 표시하세요",
-            "AI 제안별 판단이 모두 끝났습니다. 첫 번째 탭 아래의 AI 검증 결과 확인란을 선택하세요.",
-            control_key_prefix=ai_result_widget_key,
-        )
-    elif (
-        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
-        and approved_count < total_chunks
-        and not bool(review_state["human_confirmed"])
-    ):
-        st.info(
-            "다음으로 바로 아래 '2. 사람 검증 확인' 탭을 여세요. "
-            "원문과 전처리 결과를 비교하면 선택해야 할 확인란이 빨간색으로 표시됩니다."
-        )
-    ai_tab, human_tab = st.tabs(
-        [
-            f"1. AI 검증 확인 {_approval_tab_badge(bool(review_state['ai_result_confirmed']))}",
-            f"2. 사람 검증 확인 {_approval_tab_badge(bool(review_state['human_confirmed']))}",
-        ]
-    )
-
-    with ai_tab:
-        st.markdown("#### AI가 확인이 필요하다고 표시한 부분")
-        counter_cols = st.columns(3)
-        if st.button(
-            "전체 AI 제안 반영 안 함",
-            key=f"ai-bulk-skip-{document_id}",
-            disabled=beginner_bulk_review_disabled,
-            help=(
-                "초보자 안내 모드에서는 각 제안을 직접 확인하세요."
-                if beginner_bulk_review_disabled
-                else None
-            ),
-        ):
-            summary = _approval_set_bulk_ai_decisions(
-                document_id=document_id,
-                chunks=chunks,
-                review_attention=review_attention,
-                agent_review_summary=agent_review_summary,
-                decision="skip",
-            )
-            st.success(
-                f"AI 제안 {summary['item_count']:,}개를 {summary['chunk_count']:,}개 청크에 모두 반영 안 함으로 표시했습니다."
-            )
-            st.rerun()
-        counter_cols[0].metric("표시", f"{int(review_state['total']):,}")
-        counter_cols[1].metric("반영", f"{int(review_state['reflected']):,}")
-        counter_cols[2].metric("남음", f"{int(review_state['remaining']):,}")
-        if not review_items:
-            st.success("AI가 따로 제안한 항목이 없습니다. 이 탭은 확인 완료 상태입니다.")
-        for item in review_items:
-            item_id = str(item["item_id"])
-            severity = str(item.get("severity") or "중간")
-            current_decision = ai_decisions.get(item_id)
-            with st.container(border=True):
-                top_cols = st.columns([4, 1])
-                top_cols[0].markdown(f"**{item.get('title')}**")
-                top_cols[0].caption(str(item.get("location") or ""))
-                top_cols[1].markdown(f"**위험도: {severity}**")
-                st.info(f"AI 제안: {item.get('suggestion')}")
-                action_cols = st.columns([1, 1, 3])
-                reflect_button_key, skip_button_key = _approval_ai_decision_control_keys(item_id)
-                if action_cols[0].button("반영", key=reflect_button_key):
-                    ai_decisions[item_id] = "reflect"
-                    st.session_state[ai_decisions_key] = ai_decisions
-                    st.rerun()
-                if action_cols[1].button("반영 안 함", key=skip_button_key):
-                    ai_decisions[item_id] = "skip"
-                    st.session_state[ai_decisions_key] = ai_decisions
-                    st.rerun()
-                if current_decision == "reflect":
-                    action_cols[2].success("반영함")
-                elif current_decision == "skip":
-                    action_cols[2].caption("반영 안 함")
-                else:
-                    action_cols[2].warning("아직 결정하지 않음")
-
-        current_ai_decisions = {
-            str(item_id): str(decision)
-            for item_id, decision in dict(
-                st.session_state.get(ai_decisions_key) or {}
-            ).items()
-            if str(decision) in {"reflect", "skip"}
-        }
-        current_ai_state = _approval_review_completion_with_beginner_confirmation(
-            document_id=document_id,
-            chunk_id=str(compare_chunk.chunk_id),
-            item_ids=item_ids,
-            ai_decisions=current_ai_decisions,
-            human_confirmed=bool(st.session_state.get(human_confirmed_key)),
-        )
-        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
-            ai_result_widget_key = _approval_chunk_state_key(
-                document_id,
-                compare_chunk.chunk_id,
-                f"ai_result_confirmed_widget_{current_ai_state['ai_result_signature']}",
-            )
-            if ai_result_widget_key not in st.session_state:
-                st.session_state[ai_result_widget_key] = bool(
-                    current_ai_state["ai_result_confirmed"]
-                )
-            st.checkbox(
-                "AI 검증 결과와 제안별 반영 여부를 확인했습니다.",
-                key=ai_result_widget_key,
-                disabled=not bool(current_ai_state["ai_confirmed"]),
-                help="모든 AI 제안에 반영 또는 반영 안 함을 결정한 뒤 결과를 다시 확인하세요.",
-                on_change=_approval_sync_ai_result_confirmation_from_widget,
-                kwargs={
-                    "durable_key": ai_result_confirmed_key,
-                    "widget_key": ai_result_widget_key,
-                    "signature": str(current_ai_state["ai_result_signature"]),
-                },
-            )
-
-        st.markdown("#### AI 표시 부분 수정 전·후 비교")
-        st.caption("왼쪽은 저장된 전처리 원문이며, 오른쪽 내용은 직접 고칠 수 있습니다. 수정본은 승인할 때 저장됩니다.")
-        edit_cols = st.columns(2)
-        with edit_cols[0]:
-            st.markdown("**수정 전**")
-            st.code(str(compare_chunk.text or ""), language="text")
-        with edit_cols[1]:
-            st.markdown("**수정 후**")
-            _approval_edited_text_from_session(document_id, compare_chunk)
-            edited_text_key = _approval_edited_text_key(document_id, compare_chunk.chunk_id)
-            edited_text_widget_key = _approval_edited_text_widget_key(document_id, compare_chunk.chunk_id)
-            if edited_text_widget_key not in st.session_state:
-                st.session_state[edited_text_widget_key] = st.session_state[edited_text_key]
-            st.text_area(
-                "수정 후 내용",
-                key=edited_text_widget_key,
-                height=320,
-                disabled=not compare_chunk_approvable,
-                label_visibility="collapsed",
-                on_change=_approval_sync_edited_text_from_widget,
-                kwargs={"edited_text_key": edited_text_key, "widget_key": edited_text_widget_key},
-            )
-
-    ai_decisions = {
-        str(item_id): str(decision)
-        for item_id, decision in dict(st.session_state.get(ai_decisions_key) or {}).items()
-        if str(decision) in {"reflect", "skip"}
-    }
-    review_state = _approval_review_completion_with_beginner_confirmation(
-        document_id=document_id,
-        chunk_id=str(compare_chunk.chunk_id),
-        item_ids=item_ids,
-        ai_decisions=ai_decisions,
-        human_confirmed=bool(st.session_state.get(human_confirmed_key)),
-    )
-    if review_state["ai_result_confirmed"] and not st.session_state.get(ai_logged_key):
-        st.session_state[audit_preview_key].append(
-            _approval_audit_preview_entry(
-                f"AI 검증 확인 완료 — 반영 {review_state['reflected']} / 반영 안 함 {review_state['skipped']}"
-            )
-        )
-        st.session_state[ai_logged_key] = True
-
-    processed_preview_text = _approval_edited_text_from_session(document_id, compare_chunk)
-    with human_tab:
-        st.markdown("#### 실제 규정 ↔ 전처리 결과 비교")
-        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
-            st.info(
-                "**왼쪽의 원본 규정**과 **오른쪽의 전처리·수정 결과**를 같은 위치끼리 비교하세요. "
-                "빠진 문장, 잘못 합쳐진 조문, 표·별표 오류가 없는지 확인한 뒤 아래 사람 검증 확인란을 선택합니다."
-            )
-        compare_cols = st.columns(2)
-        with compare_cols[0]:
-            st.markdown("**왼쪽: 원본 규정**")
-            _render_original_source_preview(document, compare_chunk)
-        with compare_cols[1]:
-            st.markdown("**오른쪽: 전처리·수정 결과**")
-            _render_processed_result_preview(compare_chunk, processed_preview_text)
-        if compare_reasons:
-            st.warning("이 청크의 검수 주의 사유: " + ", ".join(str(reason) for reason in compare_reasons))
-        elif compare_chunk.warnings:
-            st.caption("이 청크의 경고: " + ", ".join(compare_chunk.warnings))
-        if human_confirmed_widget_key not in st.session_state:
-            st.session_state[human_confirmed_widget_key] = bool(st.session_state.get(human_confirmed_key))
-        if (
-            approved_count < total_chunks
-            and bool(review_state["ai_result_confirmed"])
-            and not bool(st.session_state.get(human_confirmed_key))
-        ):
-            _render_beginner_action_marker(
-                3,
-                "사람 검증 결과를 직접 확인하세요",
-                "왼쪽 원본 규정과 오른쪽 전처리·수정 결과를 비교한 뒤 바로 아래 확인란을 선택하세요. "
-                "남은 청크까지 모두 확인하면 승인하고 색인 버튼을 누르도록 다음 안내가 표시됩니다.",
-                control_key_prefix=human_confirmed_widget_key,
-            )
-        st.checkbox(
-            "사람 검증 결과: 원본과 전처리 결과를 확인했습니다.",
-            key=human_confirmed_widget_key,
-            disabled=not bool(review_state["ai_result_confirmed"]),
-            on_change=_approval_sync_human_confirmation_from_widget,
-            kwargs={
-                "human_confirmed_key": human_confirmed_key,
-                "human_confirmed_widget_key": human_confirmed_widget_key,
-            },
-        )
-
-    review_state = _approval_review_completion_with_beginner_confirmation(
-        document_id=document_id,
-        chunk_id=str(compare_chunk.chunk_id),
-        item_ids=item_ids,
-        ai_decisions=ai_decisions,
-        human_confirmed=bool(st.session_state.get(human_confirmed_key)),
-    )
-    if review_state["human_confirmed"] and not st.session_state.get(human_logged_key):
-        st.session_state[audit_preview_key].append(
-            _approval_audit_preview_entry("사람 검증 확인 — 원본과 전처리 결과 좌우 비교 완료")
-        )
-        st.session_state[human_logged_key] = True
-
-    if approved_count >= total_chunks:
-        st.info("이 문서는 이미 모든 청크가 승인되어 있습니다. 아래 '이미 승인된 내용 AI에 등록만 실행' 버튼을 사용하세요.")
-
-    st.markdown("### 승인")
-    pending_review_entries = [
-        _approval_chunk_review_state_from_session(
-            document_id=document_id,
-            chunk=chunk,
-            review_attention=review_attention,
-            agent_review_summary=agent_review_summary,
-        )
-        for chunk in chunks
-        if _is_chunk_pending_approval(chunk)
-    ]
-    reviewed_approval_entries = [
-        entry for entry in pending_review_entries if bool(dict(entry["state"]).get("approve_enabled"))
-    ]
-    beginner_review_navigation = _beginner_pending_review_navigation(
-        pending_review_entries,
-        current_chunk_id=str(compare_chunk.chunk_id),
-        enabled=beginner_bulk_review_disabled,
-    )
-    beginner_all_pending_reviewed = bool(
-        beginner_review_navigation["all_reviewed"]
-    )
-    if beginner_review_navigation["enabled"]:
-        reviewed_count = int(beginner_review_navigation["reviewed_count"])
-        pending_count = int(beginner_review_navigation["total_count"])
-        st.progress(
-            100 if pending_count == 0 else int(reviewed_count * 100 / pending_count),
-            text=f"검수 완료 {reviewed_count}/{pending_count}",
-        )
-        next_pending_chunk_id = str(
-            beginner_review_navigation["next_chunk_id"] or ""
-        )
-        if next_pending_chunk_id:
-            next_pending_button_key = f"approval-next-pending-{document_id}"
-            _render_beginner_action_marker(
-                3,
-                "다음 미검수 청크로 이동하세요",
-                "현재 청크 검수가 끝났습니다. 승인 전에 남은 청크도 같은 순서로 확인하세요.",
-                control_keys=(next_pending_button_key,),
-            )
-            if st.button(
-                "다음 미검수 청크",
-                type="primary",
-                key=next_pending_button_key,
-                width="stretch",
-            ):
-                st.session_state[compare_key] = next_pending_chunk_id
-                st.rerun()
-        elif not beginner_all_pending_reviewed and pending_count:
-            st.info("현재 청크의 AI 판단과 사람 확인을 모두 마치면 다음 청크로 이동할 수 있습니다.")
-    if reviewed_approval_entries and (
-        not beginner_review_navigation["enabled"]
-        or beginner_all_pending_reviewed
-    ):
-        st.info(
-            f"현재 선택한 조항과 관계없이 검수 완료된 전체 미승인 규정·조항 "
-            f"{len(reviewed_approval_entries):,}개가 한 번에 승인·색인됩니다."
-        )
-    approve_enabled = bool(review_state["approve_enabled"])
-    override_reason = ""
-    if beginner_review_navigation["enabled"] and not beginner_all_pending_reviewed:
-        st.warning("모든 미승인 청크를 검수한 뒤에 승인·색인 버튼이 활성화됩니다.")
-    elif approve_enabled:
-        st.success("두 검증 시트를 모두 확인했습니다. 승인하고 색인할 수 있습니다.")
-    else:
-        st.warning("두 검증 시트가 아직 모두 확인되지 않았습니다. 필요하면 사유를 남기고 확인 없이 승인할 수 있습니다.")
-        if not beginner_review_navigation["enabled"]:
-            with st.expander("확인 없이 승인해야 하는 경우", expanded=False):
-                override_reason = st.text_area(
-                    "확인 생략 승인 사유",
-                    key=override_reason_key,
-                    placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
-                )
-    approve_index_button_key = f"approval-approve-index-{document_id}"
-    if approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
-        _render_beginner_action_marker(
-            3,
-            "승인된 내용을 AI 검색에 등록하세요",
-            "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
-            control_key_prefix="quick-index-only-",
-        )
-    elif (
-        approved_count < total_chunks
-        and bool(review_state["approve_enabled"])
-        and (
-            not beginner_review_navigation["enabled"]
-            or beginner_all_pending_reviewed
-        )
-    ):
-        _render_beginner_action_marker(
-            3,
-            "검수한 내용만 승인하고 색인하세요",
-            "두 검증 시트의 확인 상태를 다시 보고 바로 아래 승인하고 색인 버튼을 누르세요.",
-            control_keys=(approve_index_button_key,),
-        )
-    reject_reason_key = _approval_chunk_state_key(
-        document_id,
-        str(compare_chunk.chunk_id),
-        "reject_reason",
-    )
-    reject_confirm_key = _approval_chunk_state_key(
-        document_id,
-        str(compare_chunk.chunk_id),
-        "reject_confirm",
-    )
-    reject_button_key = f"approval-reject-{document_id}-{compare_chunk.chunk_id}"
-    with st.expander("이 청크를 MCP에서 제외해야 하는 경우 (선택)", expanded=False):
-        st.caption(
-            "반려는 승인이나 색인이 아닙니다. 현재 선택한 청크만 더 이상 승인 대기로 남지 않는 "
-            "최종 제외(terminal exclusion) 상태가 되어 MCP 검색에 들어가지 않습니다. "
-            "규정의 모든 활성 청크를 반려하면 그 규정 전체가 MCP에서 제외됩니다."
-        )
-        _render_beginner_action_marker(
-            3,
-            "이 청크를 제외할 때만 사유와 확인을 입력하세요",
-            "반려할 이유를 적고 현재 선택 청크 1개가 맞는지 확인한 뒤, 아래 '이 청크 반려' 버튼을 누르세요.",
-            control_keys=(reject_reason_key, reject_confirm_key, reject_button_key),
-        )
-        rejection_reason = st.text_area(
-            "반려 사유 (필수)",
-            key=reject_reason_key,
-            max_chars=1000,
-            placeholder="예: 다른 규정의 조문이 잘못 합쳐져 MCP 검색에서 제외해야 함",
-            disabled=not compare_chunk_approvable,
-        )
-        rejection_confirmed = st.checkbox(
-            "현재 화면에서 선택한 청크 1개만 반려하여 MCP에서 제외하는 것을 확인했습니다.",
-            key=reject_confirm_key,
-            disabled=not compare_chunk_approvable,
-        )
-    rejection_ready = _chunk_rejection_ready(
-        reason=str(rejection_reason or ""),
-        confirmed=bool(rejection_confirmed),
-        approvable=compare_chunk_approvable,
-    )
-    hold_col, reject_col, approve_col, index_col = st.columns([1, 1.4, 2, 2])
-    if hold_col.button("보류", key=f"approval-hold-{document_id}-{compare_chunk.chunk_id}"):
-        hold_event = {
-            "event": "held",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "actor": local_auth.actor,
-            "chunk_id": compare_chunk.chunk_id,
-        }
-        st.session_state[hold_events_key].append(hold_event)
-        st.session_state[audit_preview_key].append(_approval_audit_preview_entry("보류 — 추가 확인 필요"))
-        st.info("보류로 기록했습니다. 승인 전 미리보기 감사 기록에 남습니다.")
-    if reject_col.button(
-        "이 청크 반려",
-        key=reject_button_key,
-        disabled=not rejection_ready,
-        help="사유 입력과 현재 청크 1개 반려 확인을 모두 마쳐야 누를 수 있습니다.",
-    ):
-        try:
-            reject_review_chunks(
-                document_id,
-                RejectRequest(
-                    chunk_ids=[str(compare_chunk.chunk_id)],
-                    reason=str(rejection_reason).strip(),
-                    note="streamlit_explicit_single_chunk_rejection",
-                ),
-                local_auth,
-            )
-            st.session_state.pop(reject_reason_key, None)
-            st.session_state.pop(reject_confirm_key, None)
-            st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
-            _invalidate_document_context_cache(document_id)
-            st.success(
-                "현재 선택한 청크 1개를 반려했습니다. 승인·색인하지 않았으며 MCP 검색에서 제외됩니다."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error(f"청크를 반려하지 못했습니다: {redact_sensitive_paths(str(exc))}")
-
-    override_reason_text = str(override_reason or "").strip()
-    approval_target_entries = (
-        reviewed_approval_entries
-        if not beginner_review_navigation["enabled"]
-        or beginner_all_pending_reviewed
-        else []
-    )
-    if (
-        not approval_target_entries
-        and compare_chunk_approvable
-        and (approve_enabled or override_reason_text)
-        and (
-            not beginner_review_navigation["enabled"]
-            or beginner_all_pending_reviewed
-        )
-    ):
-        approval_target_entries = [
-            _approval_chunk_review_state_from_session(
-                document_id=document_id,
-                chunk=compare_chunk,
-                review_attention=review_attention,
-                agent_review_summary=agent_review_summary,
-            )
-        ]
-    can_approve = (
-        (
-            not beginner_review_navigation["enabled"]
-            or beginner_all_pending_reviewed
-        )
-        and bool(approval_target_entries)
-        and (
-            all(bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries)
-            or bool(override_reason_text)
-        )
-    )
-    if approve_col.button(
-        "승인하고 색인",
-        type="primary",
-        key=approve_index_button_key,
-        disabled=not can_approve or approved_count >= total_chunks,
-    ):
-        try:
-            selected_security_level = str(st.session_state.get(security_level_key) or "internal")
-            edited_chunk_total = _approval_save_text_edits(
-                document_id=document_id,
-                chunks=chunks,
-                entries=approval_target_entries,
-                target_repository=repository,
-            )
-            evidence, templates = _build_current_document_approval_templates(
-                ctx,
-                security_level=selected_security_level,
-                candidate_chunk_ids=[str(entry["chunk_id"]) for entry in approval_target_entries],
-            )
-            review_events = []
-            for entry in approval_target_entries:
-                target_chunk = entry["chunk"]
-                target_chunk_id = str(entry["chunk_id"])
-                target_hold_events_key = _approval_chunk_state_key(document_id, target_chunk_id, "hold_events")
-                review_events.extend(list(st.session_state.get(target_hold_events_key) or []))
-                review_events.extend(
-                    build_approval_review_events(
-                        chunk_id=target_chunk_id,
-                        actor=local_auth.actor,
-                        item_ids=list(entry["item_ids"]),
-                        ai_decisions=dict(entry["ai_decisions"]),
-                        human_confirmed=bool(entry["human_confirmed"]),
-                        table_source=str(target_chunk.metadata.get("table_source") or ""),
-                        kordoc_table_promoted=bool(target_chunk.metadata.get("kordoc_table_promoted")),
-                        approve_event="approved",
-                        override_reason=override_reason_text or None,
-                    )
-                )
-            approved_chunk_total = 0
-            guided_vector_sync_batch_id = (
-                f"streamlit-{document_id}-guided-approval"
-            )[:200]
-            guided_defer_vector_sync = not bool(
-                str(getattr(document, "supersedes_document_id", "") or "").strip()
-            )
-            approval_index_result: dict[str, object] | None = None
-            approval_progress = st.progress(0, text="승인 0%")
-            approval_detail = st.empty()
-            for template_index, template in enumerate(templates, start=1):
-                segment_start = int((template_index - 1) * 58 / max(len(templates), 1))
-                segment_end = int(template_index * 58 / max(len(templates), 1))
-                approval_progress.progress(
-                    segment_start,
-                    text=f"승인 묶음 {template_index - 1:,}/{len(templates):,}",
-                )
-                chunk_ids = [str(chunk_id) for chunk_id in template["chunk_ids"]]
-                template_chunk_ids = set(chunk_ids)
-                template_review_events = [
-                    event for event in review_events
-                    if str(event.get("chunk_id") or "") in template_chunk_ids
-                ]
-                approval_request = ApprovalRequest(
-                        chunk_ids=chunk_ids,
-                        security_level=selected_security_level,
-                        review_flags_acknowledged=all(
-                            bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries
-                        ),
-                        worklist_report_path=str(template["worklist_report_path"]),
-                        worklist_report_sha256=str(template["worklist_report_sha256"]),
-                        review_batch_manifest_path=str(template["review_batch_manifest_path"]),
-                        review_batch_manifest_sha256=str(template["review_batch_manifest_sha256"]),
-                        review_batch_id=str(template["review_batch_id"]),
-                        review_batch_chunk_fingerprint=str(template["review_batch_chunk_fingerprint"]),
-                        review_strategy=str(template["review_strategy"]),
-                        review_decision_events=template_review_events,
-                        approval_override_reason=str(override_reason or "").strip() or None,
-                        note="approval_screen_tabs",
-                        defer_vector_sync=guided_defer_vector_sync,
-                        vector_sync_batch_id=(
-                            guided_vector_sync_batch_id
-                            if guided_defer_vector_sync
-                            else None
-                        ),
-                )
-                approval_response = _run_background_operation_with_progress(
-                    lambda _report, request=approval_request: approve_review_chunks(
-                        document_id,
-                        request,
-                        local_auth,
-                    ),
-                    progress_bar=approval_progress,
-                    detail_box=approval_detail,
-                    start_percent=segment_start,
-                    end_percent=segment_end,
-                    label=f"승인 묶음 {template_index:,}/{len(templates):,}",
-                    estimated_seconds=max(5.0, len(chunk_ids) / 70.0),
-                )
-                vector_sync = (
-                    approval_response.get("vector_sync")
-                    if isinstance(approval_response, dict)
-                    else None
-                )
-                if isinstance(vector_sync, dict) and vector_sync.get("status") == "indexed":
-                    approval_index_result = dict(vector_sync)
-                approved_chunk_total += len(chunk_ids)
-            if approval_index_result is None:
-                result = _run_background_operation_with_progress(
-                    lambda _report: index_document(
-                        document_id,
-                        IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
-                        local_auth,
-                    ),
-                    progress_bar=approval_progress,
-                    detail_box=approval_detail,
-                    start_percent=58,
-                    end_percent=100,
-                    label="승인 내용 검색 색인",
-                    estimated_seconds=max(8.0, approved_chunk_total / 65.0),
-                )
-            else:
-                result = approval_index_result
-                approval_progress.progress(100, text="승인 내용 검색 색인 완료 · 100%")
-                approval_detail.caption("개정 승인 전에 생성한 검증된 검색 색인을 재사용했습니다.")
-            _invalidate_document_context_cache(document_id)
-            st.success(
-                f"승인 {approved_chunk_total:,}개, 수정 저장 {edited_chunk_total:,}개, "
-                f"AI 등록 {result.get('record_count', 0):,}개가 완료됐습니다."
-            )
-            st.caption(f"자동 생성된 증빙: {evidence.get('artifacts', {}).get('review_batches_json', '')}")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-    if index_col.button(
-        "이미 승인된 내용 AI에 등록만 실행",
-        key=f"quick-index-only-{document_id}",
-        disabled=approved_count <= 0,
-    ):
-        try:
-            with _long_operation_status(
-                "승인된 내용 검색 색인 중…",
-                failure_stage="승인 내용 검색 인덱스 생성",
-                failure_regulation=_workflow_document_label(document),
-                failure_policy="현재 규정 색인을 중단했습니다. 승인 기록은 유지되므로 다시 실행할 수 있습니다.",
-            ) as quick_index_status:
-                quick_index_progress = st.progress(0, text="색인 준비 · 0%")
-                quick_index_detail = st.empty()
-                result = _run_background_operation_with_progress(
-                    lambda _report: index_document(
-                        document_id,
-                        IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
-                        local_auth,
-                    ),
-                    progress_bar=quick_index_progress,
-                    detail_box=quick_index_detail,
-                    start_percent=0,
-                    end_percent=100,
-                    label="승인 내용 검색 색인",
-                    estimated_seconds=max(8.0, approved_count / 65.0),
-                )
-                quick_index_status.update(label="검색 색인 완료", state="complete")
-            _invalidate_document_context_cache(document_id)
-            st.success(f"승인된 청크 {result.get('record_count', 0):,}개를 AI에 등록했습니다.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-
-    st.markdown("### 감사 기록(미리보기)")
-    audit_preview = list(st.session_state.get(audit_preview_key) or [])
-    if not audit_preview:
-        st.caption("아직 기록된 결정이 없습니다.")
-    else:
-        for event in audit_preview[-10:]:
-            st.caption(f"{event.get('timestamp')} · {event.get('message')}")
-
+    st.divider()
     beginner_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+    if not beginner_mode_active:
+        st.markdown("### 전산 담당자용 도구 (검수·확정에는 필요 없습니다)")
+        with st.expander("감사 기록(미리보기)", expanded=False):
+            audit_preview = list(st.session_state.get(audit_preview_key) or [])
+            if not audit_preview:
+                st.caption("아직 기록된 결정이 없습니다.")
+            else:
+                for event in audit_preview[-10:]:
+                    st.caption(f"{event.get('timestamp')} · {event.get('message')}")
+
     show_advanced_approval = st.checkbox(
         "전산 담당자용 고급 승인 절차 보기",
         value=False,
         key=f"show-advanced-approval-{document_id}",
         disabled=beginner_mode_active,
+        help=(
+            "검수 증빙 파일 직접 입력, 수동 승인, 색인·재색인 도구를 엽니다. "
+            "위 1~3단계로 검수·확정할 때는 필요하지 않습니다."
+        ),
     )
     if beginner_mode_active:
         show_advanced_approval = False
@@ -9378,8 +10328,9 @@ def _page_approval(ctx: dict | None) -> None:
             _render_beginner_action_marker(
                 3,
                 "다음 미완료 규정을 하나씩 계속 확인하세요",
-                f"바로 아래 '{next_document_label}' 버튼을 누르세요. 결과 확인 두 곳부터 AI 검증, 왼쪽·오른쪽 사람 비교, 승인 또는 반려, 색인까지 같은 순서로 반복합니다.",
+                f"바로 아래 '{next_document_label}' 버튼을 누르세요. 결과 확인 두 곳부터 원본·전처리·AI 검수본 비교, 승인 또는 반려, 색인까지 같은 순서로 반복합니다.",
                 control_keys=(next_document_button_key,),
+                substep=5,
             )
             if st.button(
                 f"다음 미완료 규정 결과 확인 · {next_document_label}",
@@ -9405,6 +10356,7 @@ def _page_approval(ctx: dict | None) -> None:
                 "승인·색인을 마쳤다면 MCP 생성으로 이동하세요",
                 "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
                 control_key_prefix="approval-goto-connect-simple",
+                substep=6,
             )
         _render_workflow_next_button(
             "④ MCP 생성·AI 연결로 이동",
@@ -9691,6 +10643,7 @@ def _page_approval(ctx: dict | None) -> None:
         "승인·색인을 마쳤다면 MCP 생성으로 이동하세요",
         "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
         control_key_prefix="approval-goto-connect",
+        substep=6,
     )
     _render_workflow_next_button(
         f"선택한 {len(selected_document_ids):,}개 규정을 ④ MCP 생성·AI 연결로 이동",
@@ -9732,6 +10685,60 @@ def _review_provider_key(settings_snapshot, provider: str) -> str:
     if provider == "openai-compatible":
         return str(settings_snapshot.openai_compatible_api_key or "")
     return str(settings_snapshot.openai_api_key or "")
+
+
+def _ai_connection_overrides(
+    settings_snapshot,
+    *,
+    enabled: bool,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> dict[str, object]:
+    """AI 연결 입력값을 Settings 오버라이드 한 벌로 만든다.
+
+    사이드바와 관리자 설정 두 곳에서 같은 값을 저장하므로, 공급자별 키 배치가
+    갈라지면 한쪽에서 켠 설정이 다른 쪽에서 안 먹는다. 만드는 곳을 하나로 둔다.
+    """
+
+    overrides: dict[str, object] = {
+        "enable_agent_review": bool(enabled),
+        "llm_provider": provider,
+        "agent_review_model": str(model or ""),
+        "openai_api_key": str(settings_snapshot.openai_api_key or ""),
+        "openai_compatible_api_key": str(settings_snapshot.openai_compatible_api_key or ""),
+        "azure_openai_api_key": str(settings_snapshot.azure_openai_api_key or ""),
+        "azure_openai_endpoint": str(settings_snapshot.azure_openai_endpoint or ""),
+        "anthropic_api_key": str(settings_snapshot.anthropic_api_key or ""),
+        "anthropic_api_base_url": str(
+            settings_snapshot.anthropic_api_base_url or "https://api.anthropic.com"
+        ),
+        "agent_review_api_base_url": str(
+            settings_snapshot.agent_review_api_base_url or "https://api.openai.com"
+        ),
+    }
+    if provider == "openai":
+        overrides["openai_api_key"] = str(api_key or "")
+        overrides["agent_review_api_base_url"] = _blank_to_none(base_url) or "https://api.openai.com"
+    elif provider == "azure-openai":
+        overrides["azure_openai_api_key"] = str(api_key or "")
+        overrides["azure_openai_endpoint"] = str(base_url or "")
+    elif provider == "anthropic":
+        overrides["anthropic_api_key"] = str(api_key or "")
+        overrides["anthropic_api_base_url"] = _blank_to_none(base_url) or "https://api.anthropic.com"
+    else:
+        overrides["openai_compatible_api_key"] = str(api_key or "")
+        overrides["agent_review_api_base_url"] = str(base_url or "")
+    return overrides
+
+
+def _apply_ai_connection_settings(overrides: dict[str, object]) -> None:
+    """오버라이드를 세션에 남기고 즉시 Settings에 반영한다."""
+
+    st.session_state[AI_CONNECTION_STATE_KEY] = overrides
+    st.session_state.pop(OPEN_API_KEY_DIALOG_KEY, None)
+    set_runtime_settings_overrides(**overrides)
 
 
 def _review_api_connection_status(s) -> tuple[str, str]:
@@ -9909,34 +10916,16 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
         connection_saved = st.form_submit_button("API 연결 저장하기", type="primary")
 
     if connection_saved:
-        overrides = {
-            "enable_agent_review": bool(review_enabled),
-            "llm_provider": review_provider,
-            "agent_review_model": str(review_model or ""),
-            "openai_api_key": str(settings_snapshot.openai_api_key or ""),
-            "openai_compatible_api_key": str(settings_snapshot.openai_compatible_api_key or ""),
-            "azure_openai_api_key": str(settings_snapshot.azure_openai_api_key or ""),
-            "azure_openai_endpoint": str(settings_snapshot.azure_openai_endpoint or ""),
-            "anthropic_api_key": str(settings_snapshot.anthropic_api_key or ""),
-            "anthropic_api_base_url": str(settings_snapshot.anthropic_api_base_url or "https://api.anthropic.com"),
-            "agent_review_api_base_url": str(settings_snapshot.agent_review_api_base_url or "https://api.openai.com"),
-        }
-        if review_provider == "openai":
-            overrides["openai_api_key"] = str(review_api_key or "")
-            overrides["agent_review_api_base_url"] = _blank_to_none(review_base_url) or "https://api.openai.com"
-        elif review_provider == "azure-openai":
-            overrides["azure_openai_api_key"] = str(review_api_key or "")
-            overrides["azure_openai_endpoint"] = str(review_base_url or "")
-        elif review_provider == "anthropic":
-            overrides["anthropic_api_key"] = str(review_api_key or "")
-            overrides["anthropic_api_base_url"] = _blank_to_none(review_base_url) or "https://api.anthropic.com"
-        else:
-            overrides["openai_compatible_api_key"] = str(review_api_key or "")
-            overrides["agent_review_api_base_url"] = str(review_base_url or "")
-        st.session_state[AI_CONNECTION_STATE_KEY] = overrides
-        st.session_state.pop(OPEN_API_KEY_DIALOG_KEY, None)
-        set_runtime_settings_overrides(**overrides)
-        st.success("AI 검수 연결 정보를 저장했습니다. 전처리에서 AI 추가 검수를 선택한 경우에만 이 설정으로 검수 초안을 만듭니다.")
+        overrides = _ai_connection_overrides(
+            settings_snapshot,
+            enabled=bool(review_enabled),
+            provider=review_provider,
+            model=review_model,
+            api_key=review_api_key,
+            base_url=review_base_url,
+        )
+        _apply_ai_connection_settings(overrides)
+        st.success("AI 검수 연결 정보를 저장했습니다. 켜 두면 전처리에서 자동으로 이 설정으로 검수 초안을 만듭니다.")
         st.rerun()
 
     if st.button("연결 초기화 (.env 값으로 되돌리기)", key="ai-connection-reset"):
@@ -10115,6 +11104,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "MCP가 작동하고 변환되는 원리를 먼저 확인하세요",
                     "아래 설명에서 승인된 조문이 계층 색인·실행 데이터·AI 도구로 바뀌는 순서와 로컬 STDIO/원격 HTTPS 차이를 읽은 뒤 확인란을 선택하세요.",
                     control_key_prefix=principle_confirmation_key,
+                    substep=1,
                 )
             st.markdown("#### 먼저 이해할 것: MCP는 어떻게 작동하나요?")
             st.info(
@@ -10268,6 +11258,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "MCP에 넣을 규정 범위를 확인하세요",
                     "현재 규정만, 선택한 규정, 기관 전체 중 원하는 범위가 맞는지 확인한 뒤 아래 확인란을 선택하세요.",
                     control_key_prefix=scope_confirmation_key,
+                    substep=2,
                 )
             beginner_scope_confirmed = st.checkbox(
                 "MCP에 포함할 규정 범위를 확인했습니다.",
@@ -10583,6 +11574,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 "먼저 실제 사용할 AI 앱을 고르세요",
                 "Claude Code, Codex CLI·IDE, Claude Desktop, ChatGPT 원격 또는 Claude 원격 중 하나를 직접 선택하세요.",
                 control_key_prefix=mcp_connection_target_key,
+                substep=3,
             )
         mcp_connection_target = st.radio(
             "연결할 AI 앱",
@@ -10817,6 +11809,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "이 이름이 실제 AI 앱의 MCP 목록에 표시됩니다."
                 ),
                 control_key_prefix=mcp_server_name_key,
+                substep=4,
             )
         mcp_server_name = st.text_input(
             "생성할 MCP 이름 (필수 입력)",
@@ -10864,6 +11857,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "저장 위치·방식과 MCP 이름을 확인하세요",
                     "저장 폴더, ZIP 포함 여부, MCP 이름과 연결 대상을 확인한 뒤 아래 확인란을 선택하세요.",
                     control_key_prefix=output_confirmation_key,
+                    substep=4,
                 )
             beginner_output_confirmed = st.checkbox(
                 "저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.",
@@ -10961,12 +11955,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "MCP 파일 묶음을 만드세요",
                     "연결할 AI와 저장 위치를 확인한 뒤 바로 아래 버튼을 누르세요.",
                     control_key_prefix="write-mcp-bundle-",
+                    substep=5,
                 )
             else:
                 _render_beginner_action_marker(
                     4,
                     "MCP 생성 조건을 먼저 확인하세요",
                     "바로 위 경고의 미완료 항목을 해결하면 MCP 파일 묶음 만들기 버튼이 활성화됩니다.",
+                    substep=5,
                 )
         if st.button(
             "MCP로 쓸 파일 묶음 만들기",
@@ -11471,6 +12467,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "연결 상태를 확인하세요",
                     "AI 프로그램에서 MCP를 켠 뒤 바로 아래 새로고침 버튼으로 설정·서버 상태를 다시 확인하세요.",
                     control_key_prefix="refresh-mcp-connection-diagnostic-",
+                    substep=8,
                 )
                 diagnostic_refreshed = st.button(
                     "MCP 연결 상태 새로고침",
@@ -12335,27 +13332,36 @@ with st.sidebar:
     st.markdown("### 공공기관 규정 MCP 빌더")
     st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
     _render_beginner_guide_sidebar(ctx, current_nav_page)
+    _render_ai_review_sidebar(ctx)
     st.divider()
+    # AI 추가 검수를 쓰지 않은 문서에서는 ②를 빼고 ①→③ 2단계로 보여 준다.
+    primary_nav_pages = _primary_nav_pages(ctx, current_nav_page)
     stored_primary_page = str(st.session_state.get("primary_nav_page") or "")
     desired_primary_page = (
         current_nav_page
-        if current_nav_page in PRIMARY_NAV_PAGES
-        else stored_primary_page if stored_primary_page in PRIMARY_NAV_PAGES else NAV_HOME
+        if current_nav_page in primary_nav_pages
+        else stored_primary_page if stored_primary_page in primary_nav_pages else NAV_HOME
     )
     if stored_primary_page != desired_primary_page:
         st.session_state["primary_nav_page"] = desired_primary_page
     st.radio(
         "기본 작업 순서",
-        PRIMARY_NAV_PAGES,
+        primary_nav_pages,
         key="primary_nav_page",
         on_change=_go_primary_nav,
     )
-    with st.expander("고급 기능·관리자 메뉴", expanded=current_nav_page in ADVANCED_NAV_PAGES):
-        st.caption("일반 작업에서는 열 필요가 없습니다.")
-        for advanced_page in ADVANCED_NAV_PAGES:
-            if st.button(advanced_page, key=f"advanced-nav-{advanced_page}", width="stretch"):
-                _queue_workflow_navigation(advanced_page)
-                st.rerun()
+    if NAV_RESULTS not in primary_nav_pages:
+        st.caption(
+            "이 규정은 AI 추가 검수를 쓰지 않아 '② 결과 확인'을 건너뜁니다. "
+            "품질 경고와 상세 정보는 '③ 검수하고 승인' 화면에서 볼 수 있습니다."
+        )
+    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) or current_nav_page in ADVANCED_NAV_PAGES:
+        with st.expander("고급 기능·관리자 메뉴", expanded=current_nav_page in ADVANCED_NAV_PAGES):
+            st.caption("일반 작업에서는 열 필요가 없습니다.")
+            for advanced_page in ADVANCED_NAV_PAGES:
+                if st.button(advanced_page, key=f"advanced-nav-{advanced_page}", width="stretch"):
+                    _queue_workflow_navigation(advanced_page)
+                    st.rerun()
     nav_page = current_nav_page
     st.divider()
     if ctx:

@@ -626,7 +626,7 @@ class Chunker:
             updated["kordoc_source_page_fallback"] = "primary_parser"
         # Rebuild the served body and retrieval text from the Kordoc table.
         hierarchy_path = updated.get("hierarchy_path", document_name)
-        body = markdown
+        body = self._body_with_table_prose(chunk.normalized_text or chunk.text, markdown, cell_rows)
         answer_profile = build_answer_profile(body, updated)
         updated.update(answer_profile)
         retrieval_text = self._retrieval_text(document_name, hierarchy_path, body, markdown)
@@ -639,6 +639,39 @@ class Chunker:
             if options.include_context_header
             else body
         )
+
+    @staticmethod
+    def _body_with_table_prose(original_body: str, markdown: str, cell_rows: list[dict]) -> str:
+        """표 마크다운 앞에 원래 본문의 산문을 되살린다.
+
+        Kordoc 표를 승격하면서 본문을 마크다운으로 통째로 갈아끼우면, 별표·별지에서
+        표 바깥에 있던 글이 색인 본문에서 사라진다. 실제로 ``[별표 1]``, ``○ 특별공로상``,
+        그리고 심사 기준인 ``※ … 평균 90점 이상이 된 후보자를 인사위원회 심의 대상자로
+        선정함.``이 통째로 빠져 MCP가 인용할 수 없었다. 표본 20개 문서 중 19개에서
+        같은 손실이 있었고 최대 26.7%가 사라졌다.
+
+        표 안에 이미 들어 있는 값은 마크다운이 담고 있으므로 중복해서 남기지 않는다.
+        """
+        body = str(original_body or "")
+        table = str(markdown or "")
+        if not body.strip():
+            return table
+        cell_values = {
+            re.sub(r"\s+", "", str(cell))
+            for row in cell_rows
+            if isinstance(row, dict)
+            for cell in (row.get("cells") or [])
+            if re.sub(r"\s+", "", str(cell))
+        }
+        prose: list[str] = []
+        for line in body.splitlines():
+            compact = re.sub(r"\s+", "", line)
+            if not compact or compact in cell_values:
+                continue
+            prose.append(line.strip())
+        if not prose:
+            return table
+        return "\n".join(prose + ([table] if table.strip() else []))
 
     @staticmethod
     def _primary_parser_table_source(parsed: ParsedDocument) -> str:

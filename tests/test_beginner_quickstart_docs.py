@@ -54,7 +54,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         for phrase in (
             "문서 업로드",
             "전처리 시작",
-            "AI로 의심 구간 추가 검수 (선택)",
+            "AI 검수",
             "초보자 안내 시작",
             "일반 모드로 계속",
             "초보자 안내 모드",
@@ -74,7 +74,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
             "승인하고 색인",
-            "이 청크 반려",
+            "선택한 조항 반려",
             "앱별 등록·연결 진단",
             "AI 앱 등록",
             "앱 재시작 또는 새 대화",
@@ -105,7 +105,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         for phrase in (
             "문서 업로드",
             "전처리 시작",
-            "AI로 의심 구간 추가 검수 (선택)",
+            "AI 검수",
             "품질 통과 표시는 자동 승인이 아니며",
             "승인·색인 완료",
             "초보자 안내 모드",
@@ -123,7 +123,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
             "승인하고 색인",
-            "이 청크 반려",
+            "선택한 조항 반려",
             "앱별 등록·연결 진단",
             "list_regulations",
             ".\\START_HERE.bat",
@@ -146,9 +146,9 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         for label in (
             "문서 업로드",
             "전처리 시작",
-            "AI로 의심 구간 추가 검수 (선택)",
+            "AI 검수",
             "승인하고 색인",
-            "이 청크 반려",
+            "선택한 조항 반려",
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
         ):

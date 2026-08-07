@@ -27,6 +27,21 @@ HWP_LEGACY_EXTRACTION_MODE = "legacy_ole_para_text_only"
 HWPML_EXTRACTION_MODE = "hwpml_xml_text_only"
 HWP_TRUNCATED_RECORD_DIAGNOSTIC = "hwp_truncated_record_count"
 HWP_UTF16_DECODE_DIAGNOSTIC = "hwp_utf16_decode_error_count"
+HWP_INLINE_OBJECT_DIAGNOSTIC = "hwp_inline_object_count"
+HWP_DROPPED_EQUATION_DIAGNOSTIC = "hwp_dropped_equation_count"
+
+# 문단 중간 개체 중 '내용'을 담은 것. 나머지(tbl·cold·gso·head·secd·pgnp)는 배치용이라
+# 본문에서 빠져도 잃는 뜻이 없다. 실측 26건에서 배치용은 26건 전부에 있었지만
+# 수식(eqed)은 1건뿐이었고, 그 1건이 "기본연봉 × 지급률"의 곱셈 기호였다.
+HWP_CONTENT_CONTROL_IDS = frozenset({"eqed"})
+
+# HWP5 문단 텍스트 안의 제어 문자 분류(한글문서파일형식 5.0).
+# 확장·인라인 컨트롤은 8글자 한 덩어리다: 시작 표시 + 컨트롤 ID 2글자 + 정보 4글자 + 끝 표시.
+# 이 덩어리를 글자로 읽으면 ID가 본문에 새어 나온다. 실제로 성과급 세칙의
+# "기본연봉 × 지급률"에서 곱셈 기호 자리에 있던 수식 개체(EQED)가 ``敤敱``로 찍혔다.
+HWP_CHAR_CONTROLS = frozenset({0, 10, 13, 24, 25, 26, 27, 28, 29, 30, 31})
+HWP_BLOCK_CONTROLS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23})
+HWP_BLOCK_CONTROL_LENGTH = 8
 DEFAULT_HWP_MAX_DECOMPRESSED_SECTION_BYTES = 256 * 1024 * 1024
 DEFAULT_HWP_MAX_DECOMPRESSED_DOCUMENT_BYTES = 512 * 1024 * 1024
 HWP_ARTIFACT_TOKENS = (
@@ -356,9 +371,55 @@ class HwpParser(BaseParser):
             except UnicodeDecodeError:
                 self._increment_diagnostic(diagnostics, HWP_UTF16_DECODE_DIAGNOSTIC)
                 continue
+            text, inline_objects, dropped_equations = self._strip_control_records(text)
+            for _ in range(inline_objects):
+                self._increment_diagnostic(diagnostics, HWP_INLINE_OBJECT_DIAGNOSTIC)
+            for _ in range(dropped_equations):
+                self._increment_diagnostic(diagnostics, HWP_DROPPED_EQUATION_DIAGNOSTIC)
             if text.strip():
                 texts.append(text)
         return texts
+
+    @staticmethod
+    def _control_id(text: str, index: int) -> str:
+        """컨트롤 레코드의 4바이트 ID를 읽는다(저장은 뒤집힌 순서다)."""
+        marker = text[index + 1 : index + 3]
+        if len(marker) < 2:
+            return ""
+        return marker.encode("utf-16-le")[::-1].decode("ascii", errors="replace")
+
+    @classmethod
+    def _strip_control_records(cls, text: str) -> tuple[str, int, int]:
+        """문단 텍스트에서 컨트롤 레코드를 걷어내고 (개체 수, 수식 수)를 함께 돌려준다.
+
+        문단 중간의 개체(수식·그림·필드 등)는 8글자짜리 레코드로 들어간다. 이걸
+        글자로 읽으면 컨트롤 ID가 본문에 섞인다. 성과급 세칙에서 곱셈 기호 자리의
+        수식 개체가 ``敤敱``(=eqed)로 찍혀, 지우고 나면 곱한다는 사실이 사라졌다.
+
+        개체 자리는 공백 하나로 둔다. 원래 무엇이었는지 지어내면 규정 본문을
+        고치는 셈이라, 사라졌다는 사실은 개수로만 남긴다.
+        """
+        pieces: list[str] = []
+        removed = 0
+        dropped_content = 0
+        index = 0
+        length = len(text)
+        while index < length:
+            code = ord(text[index])
+            if code in HWP_BLOCK_CONTROLS:
+                pieces.append(" ")
+                removed += 1
+                if cls._control_id(text, index) in HWP_CONTENT_CONTROL_IDS:
+                    dropped_content += 1
+                index += HWP_BLOCK_CONTROL_LENGTH
+                continue
+            if code in HWP_CHAR_CONTROLS:
+                pieces.append("\n" if code in (10, 13) else " ")
+                index += 1
+                continue
+            pieces.append(text[index])
+            index += 1
+        return "".join(pieces), removed, dropped_content
 
     def _table_inventory_from_section(self, section_data: bytes, stream_name: str) -> dict:
         table_controls: list[dict] = []
@@ -729,10 +790,19 @@ class HwpParser(BaseParser):
             flags.append("hwp_malformed_record")
         if diagnostics.get(HWP_UTF16_DECODE_DIAGNOSTIC):
             flags.append("hwp_utf16_decode_error")
+        if diagnostics.get(HWP_DROPPED_EQUATION_DIAGNOSTIC):
+            # 수식은 "기본연봉 × 지급률"의 곱셈 기호처럼 뜻을 바꾸는 것이 빠진 자리다.
+            # 배치용 개체(표·단·머리말)는 26건 전부에 있어 신호가 되지 않으므로 세지 않는다.
+            flags.append("hwp_equation_dropped")
         return flags
 
     def _diagnostic_metadata(self, diagnostics: dict[str, int]) -> dict[str, int]:
-        allowed = {HWP_TRUNCATED_RECORD_DIAGNOSTIC, HWP_UTF16_DECODE_DIAGNOSTIC}
+        allowed = {
+            HWP_TRUNCATED_RECORD_DIAGNOSTIC,
+            HWP_UTF16_DECODE_DIAGNOSTIC,
+            HWP_INLINE_OBJECT_DIAGNOSTIC,
+            HWP_DROPPED_EQUATION_DIAGNOSTIC,
+        }
         return {
             key: int(value)
             for key, value in diagnostics.items()

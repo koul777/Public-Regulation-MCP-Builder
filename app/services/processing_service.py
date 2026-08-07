@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -36,6 +37,79 @@ from app.services.regulation_metadata_service import (
     infer_regulation_metadata,
     is_generic_regulation_title,
 )
+
+
+AGENT_REVIEW_FINDINGS_KEY = "agent_review_findings"
+
+# 지적이 아닌데 지적 자리에 들어오는 문구. 실제 실행 기록에서 600건 중
+# "No parsing risks identified." 18건, "Spacing and line break consistency" 15건처럼
+# 같은 빈 말이 반복됐다. 이런 줄이 화면에 200개 쌓이면 진짜 지적까지 안 읽게 된다.
+#
+# "제3조 본문이 없음"처럼 '없음'으로 끝나는 진짜 지적을 지우면 안 되므로, 한국어 쪽은
+# 정해진 짧은 관용구 전체와 일치할 때만 걸러낸다.
+_AGENT_REVIEW_NON_FINDING = re.compile(
+    r"(?i)^\W*(?:"
+    r"no\s+(?:parsing\s+)?(?:risks?|issues?|problems?)\b.*"
+    r"|none|n/?a"
+    r"|spacing\s+and\s+line\s+break\s+consistency"
+    r"|(?:지적\s*사항|문제점?|이상|위험\s*요소?|특이\s*사항|해당)?\s*없(?:음|습니다)"
+    r")\W*$"
+)
+
+
+def _agent_review_finding_texts(raw_issues: object) -> list[str]:
+    """지적으로 볼 수 있는 줄만 남긴다."""
+    if not isinstance(raw_issues, list):
+        return []
+    kept: list[str] = []
+    for issue in raw_issues:
+        text = str(issue or "").strip()
+        if not text or _AGENT_REVIEW_NON_FINDING.match(text):
+            continue
+        kept.append(text)
+    return kept
+
+
+def _apply_ai_review_findings(chunks: list, agent_review_plan: dict) -> None:
+    """AI가 낸 지적을 조항 메타데이터에 붙인다. 본문은 건드리지 않는다.
+
+    본문을 AI가 다시 쓰게 했을 때, 되돌아온 교정본의 77%가 원문과 완전히 같았고
+    실제로 바뀐 것들은 ``2012. 6. 14.``를 ``2012. 06. 14.``로 고치는 식으로 규정
+    원문에 없는 표기를 만들어 냈다. 저장된 본문은 MCP가 인용할 법적 근거라
+    사람이 승인 화면에서 직접 고쳐야 하고, AI는 어디를 볼지 짚어 주는 데까지만 쓴다.
+    """
+
+    review_json = agent_review_plan.get("provider_review_json") if isinstance(agent_review_plan, dict) else None
+    items = review_json.get("items") if isinstance(review_json, dict) else None
+    if not isinstance(items, list):
+        return
+    chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        chunk = chunks_by_id.get(str(item.get("chunk_id") or ""))
+        if chunk is None:
+            continue
+        issues = _agent_review_finding_texts(item.get("issues"))
+        recommended = str(item.get("recommended_human_check") or "").strip()
+        if _AGENT_REVIEW_NON_FINDING.match(recommended):
+            recommended = ""
+        risk_level = str(item.get("risk_level") or "").strip().lower()
+        if not issues and not recommended:
+            continue
+        chunk.metadata = {
+            **dict(getattr(chunk, "metadata", {}) or {}),
+            AGENT_REVIEW_FINDINGS_KEY: {
+                "risk_level": risk_level or "medium",
+                "issues": issues,
+                "recommended_human_check": recommended,
+            },
+        }
+
+
+def _agent_review_findings_of(chunk) -> dict:
+    findings = (getattr(chunk, "metadata", None) or {}).get(AGENT_REVIEW_FINDINGS_KEY)
+    return dict(findings) if isinstance(findings, dict) else {}
 
 
 class ProcessingService:
@@ -169,7 +243,12 @@ class ProcessingService:
             # Kordoc can take a while on large integrated HWP books; expose this
             # separately so the operator does not mistake the wait for a hang.
             job.progress = 22
-            job.message = "대용량 문서 표 구조를 분석하는 중입니다 (Kordoc)…"
+            # 표 분석은 외부 프로세스라 중간 숫자를 셀 수 없다. 대신 이 기다림에
+            # 정해진 한계가 있다는 사실만은 알려 준다.
+            job.message = (
+                "대용량 문서 표 구조를 분석하는 중입니다 (Kordoc · 최대 "
+                f"{max(1, int(self.settings.kordoc_table_timeout_seconds))}초 대기)…"
+            )
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
             phase_started = time.perf_counter()
@@ -201,7 +280,9 @@ class ProcessingService:
             del existing_documents
             old_regulation_id = document.regulation_id
             old_regulation_version = document.regulation_version
-            auto_named_upload = (
+            # 올린 사람이 규정 이름을 직접 정했으면 본문에서 찾은 제목으로 덮어쓰지 않는다.
+            user_named_upload = str(getattr(document, "document_name_source", "auto") or "auto") == "user"
+            auto_named_upload = not user_named_upload and (
                 is_generic_regulation_title(document.document_name)
                 or str(document.document_name or "").strip() == filename_detected.document_name
             )
@@ -291,9 +372,41 @@ class ProcessingService:
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
 
+            # 정리와 구조 분석은 규정 수십 개짜리 통합본에서 몇 분씩 걸린다.
+            # 예전에는 그동안 35%에 멈춰 있어 죽은 화면처럼 보였다. 실제로 훑은
+            # 쪽 수와 줄 수를 세어 알린다. 남은 시간은 추정하지 않는다.
+            structure_phase_bounds = {
+                "normalize": (35, 42, "본문 정리"),
+                "scan": (42, 50, "조문 표시 찾기"),
+                "assemble": (50, 58, "조문 계층 조립"),
+            }
+
+            def _structure_progress(phase: str, current: int, total: int) -> None:
+                bounds = structure_phase_bounds.get(phase)
+                if bounds is None:
+                    # 모르는 단계 이름 때문에 전처리 자체가 죽으면 안 된다.
+                    return
+                start_percent, end_percent, label = bounds
+                safe_total = max(int(total), 1)
+                safe_current = max(0, min(int(current), safe_total))
+                measured = start_percent + int(
+                    (end_percent - start_percent) * safe_current / safe_total
+                )
+                job.progress = max(int(job.progress), measured)
+                job.current_unit = safe_current
+                job.total_units = safe_total
+                job.unit_label = label
+                job.message = f"{label} {safe_current:,}/{safe_total:,}"
+                self._notify_progress(job, progress_callback)
+
             phase_started = time.perf_counter()
-            normalized = self.normalizer.normalize_document(parsed)
-            nodes = self.detector.detect(normalized)
+            normalized = self.normalizer.normalize_document(
+                parsed,
+                progress_callback=lambda current, total: _structure_progress(
+                    "normalize", current, total
+                ),
+            )
+            nodes = self.detector.detect(normalized, progress_callback=_structure_progress)
             record_phase("normalize_and_structure_detect", phase_started)
             regulation_nodes = [node for node in nodes if node.node_type == "regulation"]
             regulation_total = len(regulation_nodes)
@@ -334,6 +447,7 @@ class ProcessingService:
                 document_id,
                 normalized.raw_text,
                 profile_id=document.profile_id,
+                normalizer_metadata=normalized.metadata,
             )
             record_phase("chunk_validate_quality", phase_started)
             job.progress = 75
@@ -346,19 +460,44 @@ class ProcessingService:
             self._notify_progress(job, progress_callback)
 
             phase_started = time.perf_counter()
-            cached_content_hashes = (
-                self._agent_review_content_hash_cache(
+            review_cache_index = (
+                self._agent_review_cache_index(
                     document.tenant_id,
                     cache_scope_hash=self.agent_review_policy.cache_scope_hash(),
                 )
                 if options.enable_agent_review
-                else set()
+                else {}
             )
             agent_review_plan = self.agent_review_policy.plan(
                 chunks,
                 quality_report,
                 options,
-                cached_content_hashes=cached_content_hashes,
+                cached_content_hashes=set(review_cache_index),
+            )
+            # 재사용은 '부르지 않는다'가 아니라 '이전 결과를 그대로 가져온다'는 뜻이다.
+            # 가져오지 못한 조항은 캐시에서 빼고 다시 계획해, 이번 실행에서 검수한다.
+            reused_candidates = self._reuse_cached_review_findings(
+                chunks,
+                agent_review_plan,
+                review_cache_index,
+            )
+            if len(reused_candidates) != int(agent_review_plan.get("cached_candidate_count") or 0):
+                agent_review_plan = self.agent_review_policy.plan(
+                    chunks,
+                    quality_report,
+                    options,
+                    cached_content_hashes={
+                        str(candidate["content_hash"]) for candidate in reused_candidates
+                    },
+                )
+            agent_review_plan.update(
+                {
+                    "reused_candidates": reused_candidates,
+                    "reused_chunk_count": len(reused_candidates),
+                    "reused_finding_count": sum(
+                        1 for candidate in reused_candidates if candidate["has_findings"]
+                    ),
+                }
             )
             job.progress = 85
             job.message = (
@@ -368,12 +507,29 @@ class ProcessingService:
             )
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
+            # AI 응답을 기다리는 동안이 전처리에서 가장 오래 멈춰 보이는 구간이다.
+            # 끝난 요청 묶음 수를 세어 그동안에도 게이지가 실제로 올라가게 한다.
+            def _agent_review_progress(completed: int, total: int) -> None:
+                safe_total = max(int(total), 1)
+                safe_completed = max(0, min(int(completed), safe_total))
+                job.progress = max(
+                    int(job.progress),
+                    85 + int(6 * safe_completed / safe_total),
+                )
+                job.current_unit = safe_completed
+                job.total_units = safe_total
+                job.unit_label = "AI 검수 묶음"
+                job.message = f"AI 검수 묶음 {safe_completed:,}/{safe_total:,} 완료"
+                self._notify_progress(job, progress_callback)
+
             agent_review_plan = self.agent_review_executor.execute(
                 document_id=document_id,
                 run_id=run_id,
                 plan=agent_review_plan,
                 chunks=chunks,
+                progress_callback=_agent_review_progress,
             )
+            _apply_ai_review_findings(chunks, agent_review_plan)
             record_phase("agent_review", phase_started)
             job.progress = 92
             job.message = "전처리 결과와 저장 파일을 작성하는 중"
@@ -450,7 +606,8 @@ class ProcessingService:
             )
 
             document.page_count = normalized.page_count
-            document.document_name = normalized.document_name
+            if not user_named_upload:
+                document.document_name = normalized.document_name
             document.status = "completed"
             document.processed_at = datetime.now(timezone.utc)
 
@@ -681,12 +838,25 @@ class ProcessingService:
             "phase_timings_ms": dict(phase_timings_ms or {}),
         }
 
-    def _agent_review_content_hash_cache(self, tenant_id: str | None, *, cache_scope_hash: str) -> set[str]:
+    def _agent_review_cache_index(
+        self,
+        tenant_id: str | None,
+        *,
+        cache_scope_hash: str,
+    ) -> dict[str, tuple[str, str]]:
+        """이미 검수한 내용 해시 → 그 결과가 남아 있는 (문서, 청크).
+
+        같은 규정을 다시 올리면 내용 해시가 그대로라 제공자를 다시 부르지 않는다.
+        예전에는 여기서 해시만 모아 호출을 건너뛰었는데, 그러면 새 문서에는 지적이
+        하나도 붙지 않아 검수를 켠 운영자가 조항마다 'AI 검수 의견 없음'만 보게 됐다.
+        결과를 가져오려면 어디에 남아 있는지까지 기억해야 한다.
+        """
         tenant_key = str(tenant_id or "").strip()
         expected_scope = str(cache_scope_hash or "").strip()
         if not expected_scope:
-            return set()
-        hashes: set[str] = set()
+            return {}
+        # list_runs()는 시작 시각 오름차순이라, 같은 해시는 나중 실행 결과가 이긴다.
+        index: dict[str, tuple[str, str]] = {}
         for run in self.repository.list_runs():
             if run.status != "completed":
                 continue
@@ -697,13 +867,87 @@ class ProcessingService:
                 continue
             if not self._agent_review_has_provider_result(agent_review):
                 continue
+            # 호출이 실패해 끝내 검토되지 못한 조항은 재사용 대상이 아니다.
+            # 재사용하면 아무도 보지 않은 조항이 '검토 완료'로 남는다.
+            unreviewed = {
+                str(chunk_id or "").strip()
+                for chunk_id in agent_review.get("unreviewed_chunk_ids") or []
+            }
             for candidate in agent_review.get("selected_candidates") or []:
                 if not isinstance(candidate, dict):
                     continue
                 content_hash = str(candidate.get("content_hash") or "").strip()
-                if content_hash.startswith("sha256:"):
-                    hashes.add(content_hash)
-        return hashes
+                chunk_id = str(candidate.get("chunk_id") or "").strip()
+                if not content_hash.startswith("sha256:") or not chunk_id:
+                    continue
+                if chunk_id in unreviewed:
+                    continue
+                index[content_hash] = (run.document_id, chunk_id)
+        return index
+
+    def _reuse_cached_review_findings(
+        self,
+        chunks: list,
+        agent_review_plan: dict,
+        cache_index: dict[str, tuple[str, str]],
+    ) -> list[dict]:
+        """재사용 대상 조항에 이전 지적을 붙이고, 실제로 재사용한 목록을 돌려준다.
+
+        결과가 남아 있던 문서가 지워졌으면 재사용할 근거가 없다. 그런 조항은 목록에서
+        빠지고, 호출하는 쪽이 다시 계획을 세워 이번 실행에서 검수한다.
+        """
+        reused_targets = [
+            candidate
+            for candidate in agent_review_plan.get("candidates") or []
+            if isinstance(candidate, dict) and candidate.get("cache_status") == "reused"
+        ]
+        if not reused_targets:
+            return []
+        chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        source_findings: dict[str, dict[str, dict] | None] = {}
+        reused: list[dict] = []
+        for candidate in reused_targets:
+            content_hash = str(candidate.get("content_hash") or "").strip()
+            source = cache_index.get(content_hash)
+            chunk = chunks_by_id.get(str(candidate.get("chunk_id") or ""))
+            if not source or chunk is None:
+                continue
+            source_document_id, source_chunk_id = source
+            if source_document_id not in source_findings:
+                source_findings[source_document_id] = self._agent_review_findings_by_chunk(
+                    source_document_id
+                )
+            findings_by_chunk = source_findings[source_document_id]
+            if not findings_by_chunk or source_chunk_id not in findings_by_chunk:
+                continue
+            findings = findings_by_chunk[source_chunk_id]
+            if findings:
+                chunk.metadata = {
+                    **dict(getattr(chunk, "metadata", {}) or {}),
+                    AGENT_REVIEW_FINDINGS_KEY: findings,
+                }
+            reused.append(
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "content_hash": content_hash,
+                    "source_document_id": source_document_id,
+                    "source_chunk_id": source_chunk_id,
+                    # 지적 없이 깨끗하다고 판정된 것도 검수 결과다. 그 사실을 남겨야
+                    # 승인 화면이 '검수 완료 · 지적 없음'과 '검수 안 됨'을 구분한다.
+                    "has_findings": bool(findings),
+                }
+            )
+        return reused
+
+    def _agent_review_findings_by_chunk(self, document_id: str) -> dict[str, dict] | None:
+        """이전 문서의 조항별 AI 지적. 문서를 더 읽을 수 없으면 None."""
+        try:
+            source_chunks = self.repository.get_chunks(document_id)
+        except Exception:
+            return None
+        if not source_chunks:
+            return None
+        return {chunk.chunk_id: _agent_review_findings_of(chunk) for chunk in source_chunks}
 
     def _agent_review_has_provider_result(self, agent_review: dict) -> bool:
         if int(agent_review.get("api_call_count") or 0) > 0:
