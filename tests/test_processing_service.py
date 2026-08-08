@@ -217,8 +217,8 @@ class ProcessingServiceTests(unittest.TestCase):
                 return_value={"status": "disabled", "table_count": 0, "tables": []},
             ), patch.object(
                 service,
-                "_agent_review_content_hash_cache",
-                wraps=service._agent_review_content_hash_cache,
+                "_agent_review_cache_index",
+                wraps=service._agent_review_cache_index,
             ) as content_hash_cache:
                 job = service.process(
                     document.document_id,
@@ -244,6 +244,276 @@ class ProcessingServiceTests(unittest.TestCase):
         self.assertEqual(0, agent_review["api_call_count"])
         self.assertIn((85, "전처리 결과 검증을 마무리하는 중"), progress_events)
         self.assertFalse(any("AI 검수" in message for _, message in progress_events))
+
+    def test_structure_analysis_fills_the_gauge_between_extraction_and_chunking(self) -> None:
+        """예전에는 본문 정리와 구조 분석 내내 35%에 멈춰 있어 멈춘 화면처럼 보였다.
+
+        지금은 실제로 끝낸 쪽 수와 줄 수만큼 게이지가 오른다. 시간으로 추정한
+        값은 여전히 쓰지 않는다.
+        """
+
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                pages = [
+                    ParsedPage(
+                        page_no=index,
+                        blocks=[ParsedBlock(type="text", text=f"제{index}조(목적{index}) 본문 {index}")],
+                    )
+                    for index in range(1, 61)
+                ]
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="구조 분석 진행률 규정",
+                    file_type="pdf",
+                    pages=pages,
+                    raw_text="\n".join(
+                        f"제{index}조(목적{index}) 본문 {index}" for index in range(1, 61)
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_structure_progress",
+                filename="structure-progress.pdf",
+                document_name="구조 분석 진행률 규정",
+                file_type="pdf",
+                file_hash="structure-progress-hash",
+                tenant_id="tenant-a",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            service = ProcessingService(settings=settings, repository=repo)
+            progress_events: list[tuple[int, str]] = []
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={"status": "disabled", "table_count": 0, "tables": []},
+            ):
+                job = service.process(
+                    document.document_id,
+                    ChunkOptions(enable_agent_review=False),
+                    progress_callback=lambda current_job: progress_events.append(
+                        (current_job.progress, current_job.message)
+                    ),
+                )
+
+        self.assertEqual("completed", job.status)
+        structure_labels = ("본문 정리", "조문 표시 찾기", "조문 계층 조립")
+        structure_events = [
+            (percent, message)
+            for percent, message in progress_events
+            if message.startswith(structure_labels)
+        ]
+        self.assertEqual(
+            set(structure_labels),
+            {message.rsplit(" ", 1)[0] for _percent, message in structure_events},
+        )
+        structure_percents = [percent for percent, _message in structure_events]
+        # 35%에서 60%로 건너뛰지 않고 그 사이가 실제로 채워져야 한다.
+        self.assertLess(35, max(structure_percents))
+        self.assertGreater(60, max(structure_percents))
+        self.assertLess(2, len(set(structure_percents)), structure_events)
+        self.assertTrue(
+            all(
+                previous <= current
+                for (previous, _), (current, _) in zip(progress_events, progress_events[1:])
+            ),
+            progress_events,
+        )
+        self.assertTrue(
+            any(message.endswith(" 60/60") for _percent, message in structure_events),
+            structure_events,
+        )
+
+    def test_ai_review_reports_finished_batches_while_waiting_for_the_provider(self) -> None:
+        """AI 응답 대기는 전처리에서 가장 길다. 끝난 묶음 수만큼 게이지가 올라야 한다."""
+
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="AI 검수 진행률 규정",
+                    file_type="pdf",
+                    pages=[
+                        ParsedPage(
+                            page_no=1,
+                            blocks=[ParsedBlock(type="table", text="제1조(목적) 표로 된 본문")],
+                        )
+                    ],
+                    raw_text="제1조(목적) 표로 된 본문",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_model="review-model",
+            )
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+
+            def _fake_post(url, headers, payload, timeout):
+                sent = json.loads(payload["messages"][1]["content"])
+                items = [
+                    {
+                        "chunk_id": item["chunk_id"],
+                        "risk_level": "high",
+                        "issues": ["제1조 본문이 표에 갇혀 있습니다."],
+                        "recommended_human_check": "제1조 표 경계를 확인하세요.",
+                    }
+                    for item in sent["items"]
+                ]
+                return {
+                    "id": "req_1",
+                    "choices": [{"message": {"content": json.dumps({"items": items})}}],
+                }
+
+            service.agent_review_executor.http_post = _fake_post
+            document = Document(
+                document_id="doc_review_progress",
+                filename="review-progress.pdf",
+                document_name="AI 검수 진행률 규정",
+                file_type="pdf",
+                file_hash="review-progress-hash",
+                tenant_id="tenant-a",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            progress_events: list[tuple[int, str]] = []
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={"status": "disabled", "table_count": 0, "tables": []},
+            ):
+                job = service.process(
+                    document.document_id,
+                    ChunkOptions(enable_agent_review=True),
+                    progress_callback=lambda current_job: progress_events.append(
+                        (current_job.progress, current_job.message)
+                    ),
+                )
+
+        self.assertEqual("completed", job.status)
+        review_events = [
+            (percent, message)
+            for percent, message in progress_events
+            if message.startswith("AI 검수 묶음 ")
+        ]
+        self.assertTrue(review_events, progress_events)
+        self.assertTrue(all(85 <= percent <= 91 for percent, _message in review_events), review_events)
+        self.assertTrue(
+            any(message.endswith("1/1 완료") for _percent, message in review_events),
+            review_events,
+        )
+
+    def test_reuploading_the_same_regulation_keeps_the_ai_review_visible(self) -> None:
+        """같은 규정을 두 번 올리면 두 번째 문서에도 검수 의견이 남아야 한다.
+
+        운영자가 신고한 증상이 정확히 이것이다. 검수를 켜고 다시 올렸는데 내용 해시가
+        같아 호출을 건너뛰었고, 그 결과 두 번째 문서에는 지적이 하나도 붙지 않아
+        승인 화면이 조항마다 'AI 검수 의견 없음'이었다.
+        """
+
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="강사임용 등에 관한 규정",
+                    file_type="pdf",
+                    pages=[
+                        ParsedPage(
+                            page_no=1,
+                            blocks=[ParsedBlock(type="table", text="제1조(목적) 표로 된 본문")],
+                        )
+                    ],
+                    raw_text="제1조(목적) 표로 된 본문",
+                )
+
+        finding_template = {
+            "risk_level": "high",
+            "issues": ["제1조 본문이 표에 갇혀 있습니다."],
+            "recommended_human_check": "제1조 표 경계를 확인하세요.",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_model="review-model",
+            )
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+            provider_calls: list[tuple] = []
+
+            def _fake_post(url, headers, payload, timeout):
+                provider_calls.append(url)
+                # 응답은 요청에 실린 청크 ID로 돌려줘야 그 조항에 붙는다.
+                sent = json.loads(payload["messages"][1]["content"])
+                items = [
+                    {**finding_template, "chunk_id": item["chunk_id"]} for item in sent["items"]
+                ]
+                return {
+                    "id": "req_1",
+                    "choices": [{"message": {"content": json.dumps({"items": items})}}],
+                }
+
+            service.agent_review_executor.http_post = _fake_post
+
+            findings_per_run: list[int] = []
+            for index in (1, 2):
+                document = Document(
+                    document_id=f"doc_reupload_{index}",
+                    filename="regulation.pdf",
+                    document_name="강사임용 등에 관한 규정",
+                    file_type="pdf",
+                    file_hash="same-regulation-hash",
+                    tenant_id="tenant-a",
+                    status="uploaded",
+                )
+                repo.upsert_document(document)
+                with patch(
+                    "app.services.processing_service.get_parser",
+                    return_value=Parser(),
+                ), patch.object(
+                    service.kordoc_table_parser,
+                    "parse_file",
+                    return_value={"status": "disabled", "table_count": 0, "tables": []},
+                ):
+                    service.process(
+                        document.document_id,
+                        ChunkOptions(enable_agent_review=True),
+                    )
+                chunks = repo.get_chunks(document.document_id)
+                findings_per_run.append(
+                    sum(1 for chunk in chunks if (chunk.metadata or {}).get("agent_review_findings"))
+                )
+
+            second_run = repo.latest_completed_run("doc_reupload_2")
+
+        self.assertGreater(findings_per_run[0], 0)
+        # 두 번째 문서에도 같은 수의 의견이 남아야 한다. 재사용은 결과를 버리는 것이 아니다.
+        self.assertEqual(findings_per_run[0], findings_per_run[1])
+        agent_review = second_run.stats["agent_review"]
+        self.assertEqual("review_candidates_cached", agent_review["skip_reason"])
+        self.assertGreater(int(agent_review["reused_chunk_count"]), 0)
+        self.assertEqual(findings_per_run[1], int(agent_review["reused_finding_count"]))
+        # 재사용했으므로 두 번째 실행에서는 제공자를 다시 부르지 않는다.
+        self.assertEqual(1, len({call for call in provider_calls}))
 
     def test_process_propagates_document_apba_id_into_chunk_metadata(self) -> None:
         class Parser:
@@ -372,6 +642,125 @@ class ProcessingServiceTests(unittest.TestCase):
                 "tables_truncated": True,
             },
         )
+
+    def test_process_keeps_a_user_supplied_document_name_over_the_body_title(self) -> None:
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="본문에서 찾은 제목",
+                    file_type="pdf",
+                    pages=[
+                        ParsedPage(page_no=1, blocks=[ParsedBlock(type="text", text="제1조 목적")])
+                    ],
+                    raw_text="제1조 목적",
+                )
+
+        content_guess = RegulationMetadataGuess(
+            document_name="본문에서 찾은 제목",
+            regulation_id="reg-body-title",
+            regulation_version="rev-20240101",
+            revision_date="2024-01-01",
+            effective_from="2024-01-01",
+            supersedes_document_id=None,
+            title_source="content",
+            revision_date_source="content",
+            effective_from_source="content",
+            version_source="content",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_user_named",
+                filename="인사규정_2024개정.pdf",
+                document_name="인사규정_2024개정",
+                document_name_source="user",
+                file_type="pdf",
+                file_hash="hash-user-named",
+                regulation_id="reg-body-title",
+                regulation_version="rev-20240101",
+                tenant_id="default",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            service = ProcessingService(settings=settings, repository=repo)
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch(
+                "app.services.processing_service.infer_regulation_metadata",
+                return_value=content_guess,
+            ):
+                job = service.process(document.document_id, ChunkOptions(include_context_header=False))
+
+            stored = repo.get_document(document.document_id)
+            chunks = repo.get_chunks(document.document_id)
+
+        self.assertEqual("completed", job.status)
+        # 올린 사람이 정한 이름은 본문 제목이 이겨서는 안 된다.
+        self.assertEqual("인사규정_2024개정", stored.document_name)
+        self.assertEqual("인사규정_2024개정", chunks[0].metadata["document_name"])
+
+    def test_process_still_upgrades_an_auto_named_upload_from_the_body_title(self) -> None:
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="scan_0001",
+                    file_type="pdf",
+                    pages=[
+                        ParsedPage(page_no=1, blocks=[ParsedBlock(type="text", text="제1조 목적")])
+                    ],
+                    raw_text="제1조 목적",
+                )
+
+        content_guess = RegulationMetadataGuess(
+            document_name="본문에서 찾은 제목",
+            regulation_id="reg-body-title",
+            regulation_version="rev-20240101",
+            revision_date="2024-01-01",
+            effective_from="2024-01-01",
+            supersedes_document_id=None,
+            title_source="content",
+            revision_date_source="content",
+            effective_from_source="content",
+            version_source="content",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_auto_named",
+                filename="scan_0001.pdf",
+                document_name="scan_0001",
+                file_type="pdf",
+                file_hash="hash-auto-named",
+                regulation_id="reg-body-title",
+                regulation_version="rev-20240101",
+                tenant_id="default",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            service = ProcessingService(settings=settings, repository=repo)
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch(
+                "app.services.processing_service.infer_regulation_metadata",
+                return_value=content_guess,
+            ):
+                service.process(document.document_id, ChunkOptions(include_context_header=False))
+
+            stored = repo.get_document(document.document_id)
+
+        self.assertEqual("본문에서 찾은 제목", stored.document_name)
 
     def test_process_does_not_infer_supersedes_for_unapproved_reprocessing_draft(self) -> None:
         class Parser:
@@ -745,6 +1134,7 @@ class ProcessingServiceTests(unittest.TestCase):
             other_tenant_hash = "sha256:" + "c" * 64
             stale_scope_hash = "sha256:" + "d" * 64
             stale_scope_candidate_hash = "sha256:" + "e" * 64
+            unreviewed_hash = "sha256:" + "f" * 64
             now = datetime.now(timezone.utc)
             for run_id, tenant_id, agent_review in (
                 (
@@ -754,7 +1144,11 @@ class ProcessingServiceTests(unittest.TestCase):
                         "status": "planned",
                         "api_call_count": 1,
                         "cache_scope_hash": cache_scope_hash,
-                        "selected_candidates": [{"content_hash": executed_hash}],
+                        "selected_candidates": [
+                            {"content_hash": executed_hash, "chunk_id": "chunk_executed"},
+                            {"content_hash": unreviewed_hash, "chunk_id": "chunk_unreviewed"},
+                        ],
+                        "unreviewed_chunk_ids": ["chunk_unreviewed"],
                     },
                 ),
                 (
@@ -764,7 +1158,9 @@ class ProcessingServiceTests(unittest.TestCase):
                         "status": "planned",
                         "api_call_count": 0,
                         "cache_scope_hash": cache_scope_hash,
-                        "selected_candidates": [{"content_hash": plan_only_hash}],
+                        "selected_candidates": [
+                            {"content_hash": plan_only_hash, "chunk_id": "chunk_plan_only"}
+                        ],
                     },
                 ),
                 (
@@ -773,7 +1169,9 @@ class ProcessingServiceTests(unittest.TestCase):
                     {
                         "status": "reviewed",
                         "cache_scope_hash": cache_scope_hash,
-                        "selected_candidates": [{"content_hash": other_tenant_hash}],
+                        "selected_candidates": [
+                            {"content_hash": other_tenant_hash, "chunk_id": "chunk_other_tenant"}
+                        ],
                     },
                 ),
                 (
@@ -782,7 +1180,9 @@ class ProcessingServiceTests(unittest.TestCase):
                     {
                         "status": "reviewed",
                         "cache_scope_hash": stale_scope_hash,
-                        "selected_candidates": [{"content_hash": stale_scope_candidate_hash}],
+                        "selected_candidates": [
+                            {"content_hash": stale_scope_candidate_hash, "chunk_id": "chunk_stale"}
+                        ],
                     },
                 ),
             ):
@@ -800,9 +1200,87 @@ class ProcessingServiceTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                service._agent_review_content_hash_cache("tenant-a", cache_scope_hash=cache_scope_hash),
-                {executed_hash},
+                service._agent_review_cache_index("tenant-a", cache_scope_hash=cache_scope_hash),
+                {executed_hash: ("doc_run_executed", "chunk_executed")},
             )
+
+    def _chunk_with_findings(self, chunk_id: str, text: str, findings: dict | None):
+        return Chunk(
+            chunk_id=chunk_id,
+            document_id="doc_source",
+            chunk_type="article",
+            text=text,
+            normalized_text=text,
+            retrieval_text=text,
+            metadata={"agent_review_findings": findings} if findings else {},
+        )
+
+    def test_cached_review_reuses_previous_findings_on_the_new_document(self) -> None:
+        """같은 규정을 다시 올려 검수를 건너뛰어도 지적은 그대로 따라와야 한다.
+
+        예전에는 캐시가 호출만 건너뛰고 결과를 옮기지 않아, 검수를 켠 운영자가
+        조항마다 'AI 검수 의견 없음'만 보게 됐다.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+            findings = {
+                "risk_level": "medium",
+                "issues": ["제3조 본문이 앞 조항에 붙어 있습니다."],
+                "recommended_human_check": "제3조 경계를 확인하세요.",
+            }
+            source_chunks = [
+                self._chunk_with_findings("source_1", "제1조(목적) 본문", findings),
+                self._chunk_with_findings("source_2", "제2조(적용) 본문", None),
+            ]
+            repo.save_chunks("doc_source", source_chunks)
+            new_chunks = [
+                self._chunk_with_findings("new_1", "제1조(목적) 본문", None),
+                self._chunk_with_findings("new_2", "제2조(적용) 본문", None),
+            ]
+            plan = {
+                "candidates": [
+                    {"chunk_id": "new_1", "content_hash": "sha256:aa", "cache_status": "reused"},
+                    {"chunk_id": "new_2", "content_hash": "sha256:bb", "cache_status": "reused"},
+                    {"chunk_id": "new_3", "content_hash": "sha256:cc", "cache_status": "reused"},
+                ]
+            }
+            cache_index = {
+                "sha256:aa": ("doc_source", "source_1"),
+                "sha256:bb": ("doc_source", "source_2"),
+                "sha256:cc": ("doc_missing", "source_9"),
+            }
+
+            reused = service._reuse_cached_review_findings(new_chunks, plan, cache_index)
+
+            self.assertEqual(
+                [(item["chunk_id"], item["has_findings"]) for item in reused],
+                [("new_1", True), ("new_2", False)],
+            )
+            self.assertEqual(new_chunks[0].metadata.get("agent_review_findings"), findings)
+            self.assertNotIn("agent_review_findings", new_chunks[1].metadata)
+
+    def test_unreusable_candidates_are_reviewed_again(self) -> None:
+        """결과가 남아 있지 않은 조항은 캐시에서 빠지고 이번 실행에서 다시 검수한다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+            new_chunks = [self._chunk_with_findings("new_1", "제1조(목적) 본문", None)]
+            plan = {
+                "candidates": [
+                    {"chunk_id": "new_1", "content_hash": "sha256:aa", "cache_status": "reused"}
+                ]
+            }
+
+            reused = service._reuse_cached_review_findings(
+                new_chunks,
+                plan,
+                {"sha256:aa": ("doc_missing", "source_1")},
+            )
+
+            self.assertEqual(reused, [])
 
 
 if __name__ == "__main__":

@@ -5,9 +5,16 @@ import tempfile
 import json
 from pathlib import Path
 
+from app.processors.mojibake import (
+    MOJIBAKE_REMOVED_BLOCKS_KEY,
+    MOJIBAKE_REMOVED_CHARS_KEY,
+    strip_mojibake_artifacts,
+)
 from app.processors.quality_gate import (
     QualityGate,
     QualityGateProfile,
+    has_mojibake_artifacts,
+    mojibake_artifact_char_count,
     load_quality_gate_profile_config,
     load_quality_gate_profile_config_from_bytes,
     load_quality_gate_profiles,
@@ -546,6 +553,472 @@ class QualityGateTests(unittest.TestCase):
             QualityGateProfile(coverage_ratio_min=1.2, coverage_ratio_max=0.8)
         with self.assertRaisesRegex(ValueError, "between 0 and 1"):
             QualityGateProfile(table_false_positive_attention_max_ratio=1.5)
+
+
+class MojibakeDetectionTests(unittest.TestCase):
+    """UTF-16 바이트쌍 깨짐과 불가능한 문자 계열만 잡고, 정상 한자는 건드리지 않는지."""
+
+    def test_detects_utf16_byte_pair_mojibake_runs(self) -> None:
+        # "edeq" 가 UTF-16 으로 잘못 읽혀 한자로 굳은 실제 사례.
+        self.assertTrue(has_mojibake_artifacts("강사임용 등에 관한 규정 敤敱"))
+
+    def test_universal_hwp_export_boilerplate_is_not_counted_as_damage(self) -> None:
+        """慤桥·漠杳는 보관 문서 26건 전부에 있었다. 모두가 걸리는 신호는 신호가 아니다.
+
+        지우기는 그대로 지우되, "이 원본은 손상됐다"는 경고에서는 뺀다.
+        """
+        for boilerplate in ("慤桥", "漠杳"):
+            with self.subTest(boilerplate=boilerplate):
+                self.assertFalse(has_mojibake_artifacts("강사임용 등에 관한 규정 " + boilerplate))
+                # 지우는 대상에서는 빠지지 않는다.
+                cleaned, damaged, skipped = strip_mojibake_artifacts("강사임용 등에 관한 규정 " + boilerplate)
+                self.assertNotIn(boilerplate, cleaned)
+                self.assertEqual(0, damaged)
+                self.assertEqual(2, skipped)
+
+    def test_real_damage_next_to_the_boilerplate_is_still_counted(self) -> None:
+        self.assertTrue(has_mojibake_artifacts("강사임용 등에 관한 규정 慤桥 敤敱"))
+
+    def test_keeps_legitimate_hanja_out_of_the_mojibake_count(self) -> None:
+        # 단일 한자는 UTF-16 바이트가 ASCII 로 풀려도 정상 표기이므로 세지 않는다.
+        for legitimate in (
+            "학위(學位) 수여에 관한 규정",
+            "사업(業) 예산",
+            "인(印) 날인",
+            "무(無) 기명",
+            # 괄호 없이 단독으로 쓰이는 한자 표기. 정규화 단계가 이제 실제로 지우기
+            # 때문에 여기서 놓치면 옛 규정문의 제목과 기관명이 사라진다.
+            "제1장 總則",
+            "細則",
+            "本則",
+            "韓國學中央研究院",
+            "改正 2024. 1. 1.",
+        ):
+            with self.subTest(legitimate=legitimate):
+                self.assertFalse(has_mojibake_artifacts(legitimate))
+
+    def test_detects_impossible_scripts_in_regulation_titles(self) -> None:
+        # 실제로 저장된 규정 제목에서 나온 깨짐. 지우는 대상에는 그대로 들어간다.
+        for corrupted in ("지출예산집행 및 관리규정 杈 Ȁ", "학위수여 규정 Ā"):
+            with self.subTest(corrupted=corrupted):
+                cleaned, _damaged, cleaned_chars = strip_mojibake_artifacts(corrupted)
+                self.assertNotIn("Ā", cleaned)
+                self.assertGreater(cleaned_chars, 0)
+
+    def test_layout_coordinate_leaks_are_cleaned_but_not_called_damage(self) -> None:
+        """배치 좌표가 새어 나온 것은 군더더기다. 지우면 끝나므로 사람이 볼 일이 없다.
+
+        실측 26건에서 이 부류가 5건이었고, 모두 서명란·양식 칸 옆이었다.
+        """
+        signature_line = "소속 : ྠ Ā ྠ Ā 성명 : (서명)"
+
+        self.assertFalse(has_mojibake_artifacts(signature_line))
+        cleaned, damaged, cleaned_chars = strip_mojibake_artifacts(signature_line)
+        self.assertNotIn("ྠ", cleaned)
+        self.assertEqual(0, damaged)
+        self.assertEqual(4, cleaned_chars)
+
+    def test_an_object_name_standing_in_for_content_is_damage(self) -> None:
+        """수식 개체가 제 내용 대신 내부 이름으로 읽히면 원래 있던 것이 사라진다.
+
+        실제 성과급 세칙에서 "기본연봉 敤敱 지급률"처럼 곱셈 기호가 없어져,
+        지우고 나면 곱한다는 사실 자체가 남지 않았다.
+        """
+        formula = "1. 원장: 기본연봉 敤敱 경영평가 결과에 따른 지급률"
+
+        self.assertTrue(has_mojibake_artifacts(formula))
+        _cleaned, damaged, _cleaned_chars = strip_mojibake_artifacts(formula)
+        self.assertEqual(2, damaged)
+
+    def test_leaves_normal_korean_regulation_text_alone(self) -> None:
+        for clean in (
+            "제1조(목적) 이 규정은 인사에 관한 사항을 정함을 목적으로 한다.",
+            "① 면적은 100㎡ 이하로 한다.",
+            "α·β 계수를 적용한다.",
+            "㈜ 상임위원회",
+        ):
+            with self.subTest(clean=clean):
+                self.assertFalse(has_mojibake_artifacts(clean))
+                self.assertEqual(0, mojibake_artifact_char_count(clean))
+
+    def test_mojibake_lowers_the_quality_score_directly(self) -> None:
+        def _report(text: str):
+            node = StructureNode(
+                node_id="n1",
+                document_id="doc-mojibake",
+                node_type="article",
+                number="1",
+                title="목적",
+                text=text,
+                order_index=0,
+                page_start=1,
+            )
+            chunk = Chunk(
+                chunk_id="c1",
+                document_id="doc-mojibake",
+                source_node_ids=["n1"],
+                chunk_type="article",
+                text=text,
+                normalized_text=text,
+                source_page_start=1,
+                metadata={
+                    "document_name": "인사규정",
+                    "source_file": "인사규정.hwp",
+                    "hierarchy_path": "인사규정 > 제1조",
+                    "chunk_type": "article",
+                },
+            )
+            return QualityGate().evaluate([node], [chunk], [], "doc-mojibake", source_text=text)
+
+        base = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다."
+        clean = _report(base)
+        # 문서마다 다른 진짜 깨짐만 점수에 반영한다(慤桥·漠杳는 모든 문서에 있는 상용구).
+        corrupted = _report(base + " 敤敱 ྠĀ")
+
+        self.assertEqual(0, clean.text_quality_metrics["hwp_mojibake_artifact_chunks"])
+        self.assertEqual(1, corrupted.text_quality_metrics["hwp_mojibake_artifact_chunks"])
+        # 敤敱(대체형 2자)만 손상으로 센다. ྠĀ는 지우면 끝나는 군더더기다.
+        self.assertEqual(2, corrupted.text_quality_metrics["hwp_mojibake_artifact_char_count"])
+        self.assertLess(corrupted.score, clean.score)
+
+    def test_export_boilerplate_alone_does_not_lower_the_score(self) -> None:
+        def _report(text: str):
+            node = StructureNode(
+                node_id="n1", document_id="doc-b", node_type="article", number="1",
+                title="목적", text=text, order_index=0, page_start=1,
+            )
+            chunk = Chunk(
+                chunk_id="c1", document_id="doc-b", source_node_ids=["n1"], chunk_type="article",
+                text=text, normalized_text=text, retrieval_text=text, source_page_start=1,
+                metadata={"document_name": "인사규정", "source_file": "인사규정.hwp",
+                          "hierarchy_path": "인사규정 > 제1조", "chunk_type": "article"},
+            )
+            return QualityGate().evaluate([node], [chunk], [], "doc-b", source_text=text)
+
+        base = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다."
+
+        self.assertEqual(_report(base).score, _report(base + " 慤桥 漠杳").score)
+
+
+    def test_keeps_warning_after_the_normalizer_already_removed_the_damage(self) -> None:
+        """정규화가 깨진 글자를 지운 뒤에도 손상 사실이 남아야 한다.
+
+        정규화는 청크보다 먼저 돌기 때문에, 지우고 나면 청크를 아무리 뒤져도
+        원본이 손상됐다는 근거가 없다. 표·수식처럼 내용이 통째로 빠진 자리를
+        사람이 확인해야 하므로 여기서 조용히 통과시키면 안 된다.
+        """
+        text = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다."
+        node = StructureNode(
+            node_id="n1",
+            document_id="doc-cleaned",
+            node_type="article",
+            number="1",
+            title="목적",
+            text=text,
+            order_index=0,
+            page_start=1,
+        )
+        chunk = Chunk(
+            chunk_id="c1",
+            document_id="doc-cleaned",
+            source_node_ids=["n1"],
+            chunk_type="article",
+            text=text,
+            normalized_text=text,
+            source_page_start=1,
+            metadata={
+                "document_name": "인사규정",
+                "source_file": "인사규정.hwp",
+                "hierarchy_path": "인사규정 > 제1조",
+                "chunk_type": "article",
+            },
+        )
+
+        def _check(report):
+            return next(c for c in report.checks if c.name == "no_hwp_mojibake_artifacts")
+
+        clean = QualityGate().evaluate([node], [chunk], [], "doc-cleaned", source_text=text)
+        cleaned_up = QualityGate().evaluate(
+            [node],
+            [chunk],
+            [],
+            "doc-cleaned",
+            source_text=text,
+            normalizer_metadata={
+                MOJIBAKE_REMOVED_CHARS_KEY: 12,
+                MOJIBAKE_REMOVED_BLOCKS_KEY: 3,
+            },
+        )
+
+        # 본문에는 깨진 글자가 남아 있지 않다.
+        self.assertEqual(0, cleaned_up.text_quality_metrics["hwp_mojibake_artifact_chunks"])
+        # 그래도 지운 기록이 남아 경고가 살아 있다.
+        self.assertEqual(12, cleaned_up.text_quality_metrics["mojibake_removed_char_count"])
+        self.assertEqual(3, cleaned_up.text_quality_metrics["mojibake_removed_block_count"])
+        self.assertTrue(_check(clean).passed)
+        self.assertFalse(_check(cleaned_up).passed)
+        self.assertLess(cleaned_up.score, clean.score)
+
+    def test_reports_no_removals_when_the_normalizer_metadata_is_absent(self) -> None:
+        # 예전 실행 기록에는 이 값이 없다. 없다고 해서 손상됐다고 단정하면 안 된다.
+        text = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다."
+        node = StructureNode(
+            node_id="n1",
+            document_id="doc-legacy",
+            node_type="article",
+            number="1",
+            title="목적",
+            text=text,
+            order_index=0,
+            page_start=1,
+        )
+        chunk = Chunk(
+            chunk_id="c1",
+            document_id="doc-legacy",
+            source_node_ids=["n1"],
+            chunk_type="article",
+            text=text,
+            normalized_text=text,
+            source_page_start=1,
+            metadata={
+                "document_name": "인사규정",
+                "source_file": "인사규정.hwp",
+                "hierarchy_path": "인사규정 > 제1조",
+                "chunk_type": "article",
+            },
+        )
+
+        report = QualityGate().evaluate([node], [chunk], [], "doc-legacy", source_text=text)
+
+        self.assertEqual(0, report.text_quality_metrics["mojibake_removed_char_count"])
+        self.assertEqual(0, report.text_quality_metrics["mojibake_removed_block_count"])
+        self.assertTrue(
+            next(c for c in report.checks if c.name == "no_hwp_mojibake_artifacts").passed
+        )
+
+
+class QualityGateContentCoverageTests(unittest.TestCase):
+    """표 서식 문자가 커버리지를 부풀려 본문 누락을 가리는 문제를 관측한다.
+
+    실측 228건에서 청크 글자 수가 원문 대비 100~119%로 나왔는데, 그 초과분이
+    ``|``·괘선 같은 표 서식이었다. 부풀린 만큼이 완충재가 되어 본문이 빠져도
+    비율이 떨어지지 않는다.
+    """
+
+    def _report(self, chunk_text: str, source_text: str):
+        node = StructureNode(
+            node_id="n1",
+            document_id="doc-cov",
+            node_type="article",
+            number="1",
+            title="목적",
+            text=source_text,
+            order_index=0,
+            page_start=1,
+        )
+        chunk = Chunk(
+            chunk_id="c1",
+            document_id="doc-cov",
+            source_node_ids=["n1"],
+            chunk_type="article",
+            text=chunk_text,
+            normalized_text=chunk_text,
+            source_page_start=1,
+            metadata={
+                "document_name": "인사규정",
+                "source_file": "인사규정.hwp",
+                "hierarchy_path": "인사규정 > 제1조",
+                "chunk_type": "article",
+            },
+        )
+        return QualityGate().evaluate([node], [chunk], [], "doc-cov", source_text=source_text)
+
+    def test_table_scaffolding_no_longer_counts_as_covered_content(self) -> None:
+        source = "제1조(목적) 구분 내용 가 나"
+        # 같은 내용을 마크다운 표로 담으면 서식 문자가 잔뜩 붙는다.
+        chunked = "제1조(목적)\n| 구분 | 내용 |\n| --- | --- |\n| 가 | 나 |"
+        report = self._report(chunked, source)
+        metrics = report.coverage_metrics
+
+        # 기존 지표는 서식 문자까지 세어 원문보다 많다고 본다.
+        self.assertGreater(metrics["raw_chunk_to_source_char_ratio"], 1.0)
+        # 새 지표는 내용만 세므로 부풀지 않는다.
+        self.assertLessEqual(metrics["content_to_source_char_ratio"], 1.0)
+
+    def test_content_ratio_drops_when_body_text_is_actually_lost(self) -> None:
+        source = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다. 제2조(적용) 모든 직원에게 적용한다."
+        # 제2조가 통째로 빠졌는데, 표 서식이 그 자리를 채워 글자 수만 맞춘 경우.
+        chunked = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다.\n|---|---|---|---|---|---|---|---|"
+        metrics = self._report(chunked, source)
+
+        self.assertGreater(metrics.coverage_metrics["raw_chunk_to_source_char_ratio"], 0.9)
+        self.assertLess(metrics.coverage_metrics["content_to_source_char_ratio"], 0.7)
+
+    def test_plain_text_document_is_unaffected(self) -> None:
+        text = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다."
+        metrics = self._report(text, text).coverage_metrics
+
+        self.assertEqual(
+            metrics["raw_chunk_to_source_char_ratio"], metrics["content_to_source_char_ratio"]
+        )
+
+
+class QualitySourceLineCoverageTests(unittest.TestCase):
+    """별표·별지의 산문이 통째로 빠져도 글자 수 비율은 통과시켰다.
+
+    실제 문서에서 "※ … 평균 90점 이상이 된 후보자를 인사위원회 심의 대상자로
+    선정함." 같은 심사 기준이 색인 본문에서 사라졌는데 품질 점수는 92점이었다.
+    줄 단위로 대조해야 이 손실이 드러난다.
+    """
+
+    def _report(self, chunk_texts: list[str], source_text: str):
+        node = StructureNode(
+            node_id="n1",
+            document_id="doc-line",
+            node_type="article",
+            number="1",
+            title="목적",
+            text=source_text,
+            order_index=0,
+            page_start=1,
+        )
+        chunks = [
+            Chunk(
+                chunk_id=f"c{index}",
+                document_id="doc-line",
+                source_node_ids=["n1"],
+                chunk_type="appendix",
+                text=text,
+                normalized_text=text,
+                retrieval_text=text,
+                source_page_start=1,
+                metadata={
+                    "document_name": "표창세칙",
+                    "source_file": "표창세칙.hwp",
+                    "hierarchy_path": "표창세칙 > 별표1",
+                    "chunk_type": "appendix",
+                },
+            )
+            for index, text in enumerate(chunk_texts, start=1)
+        ]
+        return QualityGate().evaluate([node], chunks, [], "doc-line", source_text=source_text)
+
+    def _check(self, report):
+        return next(c for c in report.checks if c.name == "source_lines_reach_indexed_text")
+
+    def test_appendix_prose_dropped_beside_the_table_is_reported(self) -> None:
+        source = (
+            "[별표 1]\n"
+            "| 항목 | 배점 |\n"
+            "※ 심사에 참여하는 심사위원 전원으로부터 80점 이상의 점수를 받고, "
+            "평균 90점 이상이 된 후보자를 인사위원회 심의 대상자로 선정함.\n"
+        )
+        # 표만 남기고 ※ 단서를 버린 청크.
+        report = self._report(["[본문]\n| 항목 | 배점 |"], source)
+
+        self.assertFalse(self._check(report).passed)
+        self.assertEqual(1, report.coverage_metrics["source_lines_missing_count"])
+        self.assertLess(report.coverage_metrics["source_line_coverage_ratio"], 1.0)
+
+    def test_a_document_that_keeps_every_line_passes(self) -> None:
+        source = "제1조(목적) 이 규정은 표창에 관한 사항을 정한다.\n제2조(적용) 모든 교직원에게 적용한다."
+        report = self._report([source], source)
+
+        self.assertTrue(self._check(report).passed)
+        self.assertEqual(0, report.coverage_metrics["source_lines_missing_count"])
+        self.assertEqual(1.0, report.coverage_metrics["source_line_coverage_ratio"])
+
+    def test_line_split_across_two_chunks_is_not_a_false_alarm(self) -> None:
+        source = "제1조(목적) 이 규정은 교직원 표창에 관한 사항을 정함을 목적으로 한다."
+        report = self._report(["제1조(목적) 이 규정은 교직원 표창에", "관한 사항을 정함을 목적으로 한다."], source)
+
+        self.assertTrue(self._check(report).passed)
+
+    def test_missing_lines_do_not_block_approval(self) -> None:
+        """경고이지 오류가 아니다. 사람이 보고 판단할 일이지 자동 반려할 일이 아니다."""
+        source = "제1조(목적) 이 규정은 표창에 관한 사항을 정한다.\n※ 심사 기준은 별표와 같다. 평균 90점 이상."
+        report = self._report(["제1조(목적) 이 규정은 표창에 관한 사항을 정한다."], source)
+
+        self.assertFalse(self._check(report).passed)
+        self.assertEqual("warning", self._check(report).severity)
+        self.assertTrue(report.passed)
+
+    def test_a_line_split_across_chunks_by_the_context_header_is_not_a_false_alarm(self) -> None:
+        """조문이 ①에서 갈리면 청크 사이에 "[위치] … [본문]" 머리말이 끼어든다.
+
+        멀쩡히 색인된 줄을 누락으로 신고하면 운영자가 이 경고를 믿지 않게 된다.
+        """
+        source = "제31조(가족수당) ① 부양가족이 있는 교직원에게는 월 40,000원의 가족수당을 지급한다."
+        report = self._report(
+            [
+                "[위치] 보수규정 > 제31조\n[본문]\n제31조(가족수당)",
+                "[위치] 보수규정 > 제31조 > ①\n[본문]\n① 부양가족이 있는 교직원에게는 월 40,000원의 가족수당을 지급한다.",
+            ],
+            source,
+        )
+
+        self.assertTrue(self._check(report).passed)
+        self.assertEqual(0, report.coverage_metrics["source_lines_missing_count"])
+
+    def test_content_only_in_the_context_header_still_counts_as_indexed(self) -> None:
+        source = "교직원 보수규정 시행세칙 전문"
+        report = self._report(["[위치] 교직원 보수규정 시행세칙 전문\n[본문]\n제1조(목적) 보수를 정한다."], source)
+
+        self.assertTrue(self._check(report).passed)
+
+    def test_a_table_row_promoted_to_markdown_is_not_reported_missing(self) -> None:
+        """원문의 표 한 줄은 맨 글자, 색인 본문은 "| 값 | 값 |" 형태로 저장된다.
+
+        구분선을 남겨 둔 채 대조하면 멀쩡히 색인된 표 줄이 전부 누락으로 잡혀, 별표·서식이
+        있는 문서마다 없는 손실을 경고하고 점수까지 깎는다. 비율 검사와 같은 기준으로
+        표 서식을 걷어내고 비교해야 한다.
+        """
+        source = (
+            "수상종류 표창대상 포상금액 비고란\n"
+            "장기근속상 20년 이상 근무한 직원 금 300만원 해당 없음"
+        )
+        markdown = (
+            "| 수상종류 | 표창대상 | 포상금액 | 비고란 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 장기근속상 | 20년 이상 근무한 직원 | 금 300만원 | 해당 없음 |"
+        )
+        report = self._report([markdown], source)
+
+        self.assertTrue(self._check(report).passed)
+        self.assertEqual(0, report.coverage_metrics["source_lines_missing_count"])
+
+    def test_prose_lost_beside_a_markdown_table_is_still_reported(self) -> None:
+        """표 서식을 걷어내느라 표 바깥의 진짜 누락까지 놓치면 안 된다."""
+        source = (
+            "수상종류 표창대상 포상금액 비고란\n"
+            "※ 심사위원 전원의 평균 90점 이상인 자를 대상자로 선정함."
+        )
+        report = self._report(["| 수상종류 | 표창대상 | 포상금액 | 비고란 |"], source)
+
+        self.assertFalse(self._check(report).passed)
+        self.assertEqual(1, report.coverage_metrics["source_lines_missing_count"])
+
+    def test_real_loss_is_still_caught_after_the_false_alarm_fix(self) -> None:
+        """오탐을 줄이느라 진짜 누락까지 놓치면 검사가 무의미해진다."""
+        source = (
+            "제31조(가족수당) ① 부양가족이 있는 교직원에게는 월 40,000원을 지급한다.\n"
+            "※ 심사위원 전원으로부터 80점 이상을 받은 후보자를 심의 대상자로 선정함."
+        )
+        report = self._report(
+            ["[위치] 보수규정 > 제31조\n[본문]\n제31조(가족수당) ① 부양가족이 있는 교직원에게는 월 40,000원을 지급한다."],
+            source,
+        )
+
+        self.assertFalse(self._check(report).passed)
+        self.assertEqual(1, report.coverage_metrics["source_lines_missing_count"])
+
+    def test_short_lines_are_not_counted(self) -> None:
+        # 짧은 줄은 다른 조문에 우연히 들어 있기 쉬워 신호가 되지 않는다.
+        source = "제1조(목적) 이 규정은 표창에 관한 사항을 정한다.\n20 . . .\n(인)"
+        report = self._report(["제1조(목적) 이 규정은 표창에 관한 사항을 정한다."], source)
+
+        self.assertEqual(1, report.coverage_metrics["source_lines_checked"])
+        self.assertTrue(self._check(report).passed)
 
 
 if __name__ == "__main__":

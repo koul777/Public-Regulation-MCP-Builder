@@ -52,6 +52,12 @@ class VercelMcpEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     transport=transport,
                     base_url="http://mcp.e2e.test",
                 ) as http_client:
+                    refused_stream = await http_client.get(
+                        "/mcp", headers={"Accept": "text/event-stream"}
+                    )
+                    self.assertEqual(405, refused_stream.status_code)
+                    self.assertEqual("POST", refused_stream.headers["allow"])
+
                     async with streamable_http_client(
                         "http://mcp.e2e.test/mcp",
                         http_client=http_client,

@@ -1720,5 +1720,108 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertIn("Unnumbered introduction", nodes[1].text)
 
 
+class RevisionHistoryNumberTests(unittest.TestCase):
+    """개정 이력의 규정 번호를 조문 항목으로 끊지 않는다.
+
+    "제정 1991. 3. 18. 세칙 제 52호"에서 제52호를 항목으로 보고 끊으면, 호수가
+    다음 줄로 넘어가 그 줄의 날짜와 묶인다. 실제 문서에서 제52호가 1991년 제정이
+    아니라 2001년 개정에 붙어 개정 이력 전체가 한 칸씩 밀렸다.
+    """
+
+    def test_revision_history_lines_stay_with_their_own_date(self) -> None:
+        text = "\n".join(
+            [
+                "4-2-15. 명예교수 추대에 관한 세칙",
+                "제정 1991. 3. 18. 세칙 제 52호",
+                "개정 2001. 11. 16. 세칙 제108호",
+                "개정 2002. 3. 28. 세칙 제111호",
+                "제1조(목적) 이 세칙은 명예교수 추대에 관한 사항을 규정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulation = next(node for node in nodes if node.node_type == "regulation")
+
+        # 호수와 날짜가 같은 줄에 그대로 남아야 한다.
+        self.assertIn("제정 1991. 3. 18. 세칙 제 52호", regulation.text)
+        self.assertIn("개정 2001. 11. 16. 세칙 제108호", regulation.text)
+        # 개정 이력이 별도 item 노드로 쪼개지지 않는다.
+        self.assertFalse([node for node in nodes if node.node_type == "item" and "호" in str(node.number or "")])
+
+    def test_a_real_enumeration_item_is_still_split(self) -> None:
+        """억제 규칙이 조문 안의 진짜 제N호 항목까지 삼키면 안 된다."""
+        text = "\n".join(
+            [
+                "제3조(구성) 위원회는 다음 각 호의 사람으로 구성한다.",
+                "제1호 위원장은 원장이 된다.",
+                "제2호 부위원장은 부원장이 된다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        items = [node for node in nodes if node.node_type == "item"]
+
+        self.assertTrue(items)
+        self.assertTrue(any("위원장은 원장이 된다" in (node.text or "") for node in items))
+
+    def test_other_regulation_kinds_are_covered(self) -> None:
+        text = "\n".join(
+            [
+                "1-1-1. 정관",
+                "개정 2020. 5. 1. 규정 제300호",
+                "개정 2021. 6. 2. 규칙 제310호",
+                "제1조(목적) 이 정관은 법인의 조직을 정한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        regulation = next(node for node in nodes if node.node_type == "regulation")
+
+        self.assertIn("개정 2020. 5. 1. 규정 제300호", regulation.text)
+        self.assertIn("개정 2021. 6. 2. 규칙 제310호", regulation.text)
+
+    def test_reports_measured_line_progress_for_both_detection_passes(self) -> None:
+        # 조문 계층 분석은 통합본에서 가장 오래 걸린다. 그동안 화면이 멈춘 것으로
+        # 보이지 않도록, 실제로 훑은 줄 수를 단계별로 알려야 한다.
+        text = "\n".join(f"제{index}조(목적{index}) 본문 {index}" for index in range(1, 1201))
+        parsed = ParsedDocument(
+            document_id="doc-progress",
+            source_file="regulation.md",
+            document_name="regulation",
+            file_type="text",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+        events: list[tuple[str, int, int]] = []
+
+        nodes = StructureDetector().detect(
+            parsed,
+            progress_callback=lambda phase, current, total: events.append((phase, current, total)),
+        )
+
+        self.assertTrue(nodes)
+        scan = [(current, total) for phase, current, total in events if phase == "scan"]
+        assemble = [(current, total) for phase, current, total in events if phase == "assemble"]
+        self.assertEqual((0, 1200), scan[0])
+        self.assertEqual((1200, 1200), scan[-1])
+        self.assertEqual((0, 1200), assemble[0])
+        self.assertEqual((1200, 1200), assemble[-1])
+        self.assertLess(2, len(scan), scan)
+        self.assertLess(2, len(assemble), assemble)
+        for phase_events in (scan, assemble):
+            self.assertTrue(
+                all(
+                    previous <= current
+                    for (previous, _), (current, _) in zip(phase_events, phase_events[1:])
+                ),
+                phase_events,
+            )
+
+    def test_detecting_without_a_progress_callback_still_works(self) -> None:
+        nodes = StructureDetector().detect_from_text("제1조(목적) 본문")
+
+        self.assertEqual(["article"], [node.node_type for node in nodes])
+
+
 if __name__ == "__main__":
     unittest.main()

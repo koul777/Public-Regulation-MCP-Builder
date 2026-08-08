@@ -11,13 +11,33 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class BeginnerQuickstartDocsTests(unittest.TestCase):
     def test_readme_keeps_today_and_prior_update_summaries_above_product(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        today_heading = "# 최근 업데이트: 2026년 8월 3일"
-        prior_heading = "# 이전 업데이트: 2026년 7월 29일~8월 1일"
+        today_heading = "# 최근 업데이트: 2026년 8월 8일"
+        # 새 절을 맨 위에 얹을 때마다 이전 절은 순서대로 아래로 내려가야 한다. 위에서
+        # 아래로 최신순이 아니면 무엇이 지금 버전인지 읽는 사람이 알 수 없다.
+        prior_headings = (
+            "# 이전 업데이트: 2026년 8월 3일",
+            "# 이전 업데이트: 2026년 7월 29일~8월 1일",
+        )
+        prior_heading = prior_headings[-1]
         product_heading = "# PR MCP Builder"
 
         self.assertTrue(readme.startswith(today_heading))
-        self.assertLess(readme.index(today_heading), readme.index(prior_heading))
-        self.assertLess(readme.index(prior_heading), readme.index(product_heading))
+        previous_index = readme.index(today_heading)
+        for heading in prior_headings:
+            self.assertLess(previous_index, readme.index(heading))
+            previous_index = readme.index(heading)
+        self.assertLess(previous_index, readme.index(product_heading))
+        # 이번 절이 실제로 무엇을 고쳤는지 남긴다. 날짜만 바꾸고 내용을 비워 두면
+        # 업데이트 내역이 있으나 마나 해진다.
+        for phrase in (
+            "Request timeout",
+            "전처리 진행 막대가 뒤로 되돌아가던 문제",
+            "깨진 HWP 글자 복구",
+            "AI 검수 의견이 화면에 보이지 않던 문제",
+            "기관을 지우면 정말 지워지도록",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme[: readme.index(prior_headings[0])])
         for phrase in (
             "초보자 안내 모드 추가",
             "개별 규정 파일과 합본 규정집의 결과 통일",
@@ -54,7 +74,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         for phrase in (
             "문서 업로드",
             "전처리 시작",
-            "AI로 의심 구간 추가 검수 (선택)",
+            "AI 검수",
             "초보자 안내 시작",
             "일반 모드로 계속",
             "초보자 안내 모드",
@@ -74,7 +94,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
             "승인하고 색인",
-            "이 청크 반려",
+            "선택한 조항 반려",
             "앱별 등록·연결 진단",
             "AI 앱 등록",
             "앱 재시작 또는 새 대화",
@@ -105,7 +125,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         for phrase in (
             "문서 업로드",
             "전처리 시작",
-            "AI로 의심 구간 추가 검수 (선택)",
+            "AI 검수",
             "품질 통과 표시는 자동 승인이 아니며",
             "승인·색인 완료",
             "초보자 안내 모드",
@@ -123,7 +143,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
             "승인하고 색인",
-            "이 청크 반려",
+            "선택한 조항 반려",
             "앱별 등록·연결 진단",
             "list_regulations",
             ".\\START_HERE.bat",
@@ -146,9 +166,9 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         for label in (
             "문서 업로드",
             "전처리 시작",
-            "AI로 의심 구간 추가 검수 (선택)",
+            "AI 검수",
             "승인하고 색인",
-            "이 청크 반려",
+            "선택한 조항 반려",
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
         ):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
@@ -9,6 +10,9 @@ from app.schemas.structure import StructureNode
 
 
 ARTICLE_TITLE_DELIMITER_PATTERN = r"(?:\([^\)\n]{1,80}\)|\[[^\]\n]{1,80}\]|【[^】\n]{1,80}】)"
+
+# 줄마다 화면을 갱신하면 진행 표시가 구조 분석보다 비싸진다.
+DETECT_PROGRESS_LINE_STEP = 500
 
 # Keep this set aligned with the internal-regulation title vocabulary used by
 # MetadataExtractor and the regulation metadata service.  The extra governance
@@ -90,6 +94,11 @@ INLINE_STRUCTURE_MARKER_PATTERN = re.compile(
     r"|제\s*\d+\s*호(?!\s*(?:서식|전문개정|일부개정|개정|시행|삭제|신설|변경))(?=\s|$|[\(<【\[:.])"
     r")"
 )
+# 개정 이력 줄에서 규정 번호 앞에 오는 규정 종류. "세칙 제52호"의 제52호는
+# 조문 안의 항목 번호가 아니라 그 개정을 가리키는 규정 번호다.
+REVISION_REGULATION_KIND_PATTERN = re.compile(
+    r"(?:규정|내규|정관|세칙|규칙|기준|요령|지침|편람|훈령|예규|고시)\s*$"
+)
 INLINE_ARTICLE_MARKER_PATTERN = re.compile(
     rf"(?<!\S)제\s*\d+\s*조(?:의\s*\d+)?(?=\s*{ARTICLE_TITLE_DELIMITER_PATTERN})"
 )
@@ -131,13 +140,28 @@ class SourceLine:
 
 
 class StructureDetector:
-    def detect(self, parsed: ParsedDocument) -> list[StructureNode]:
+    def detect(
+        self,
+        parsed: ParsedDocument,
+        *,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> list[StructureNode]:
+        """조문 계층을 찾는다. 규정 수십 개짜리 통합본에서 가장 오래 걸리는 구간이다.
+
+        ``progress_callback``은 실제로 훑은 줄 수만 알린다. 남은 시간을 추정해
+        게이지를 밀어 올리지 않는다.
+        """
+
         parsed.metadata.pop(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY, None)
         lines = self._extract_lines(parsed)
-        detected_lines = [
-            self._detect_line(line, parsed.document_id, 0)
-            for line in lines
-        ]
+        line_total = len(lines)
+        report = progress_callback or (lambda _phase, _current, _total: None)
+        report("scan", 0, line_total)
+        detected_lines = []
+        for line_index, line in enumerate(lines, start=1):
+            detected_lines.append(self._detect_line(line, parsed.document_id, 0))
+            if line_index == line_total or line_index % DETECT_PROGRESS_LINE_STEP == 0:
+                report("scan", line_index, line_total)
         title_only_regulation_boundaries = self._title_only_regulation_boundaries(
             lines,
             parsed.document_id,
@@ -175,7 +199,10 @@ class StructureDetector:
         }
         seen_regulation_keys: set[tuple[str | None, str]] = set()
 
+        report("assemble", 0, line_total)
         for line_index, line in enumerate(lines):
+            if line_index + 1 == line_total or (line_index + 1) % DETECT_PROGRESS_LINE_STEP == 0:
+                report("assemble", line_index + 1, line_total)
             if line_index in navigation_line_indexes:
                 continue
             detected = title_only_regulation_boundaries.get(line_index)
@@ -1229,6 +1256,11 @@ class StructureDetector:
         if re.search(r"(?:및|또는|내지|과|와|·|ㆍ|각각|종전의)$", before):
             return True
         if re.search(r"(?:따라|관련|준용|의한다|정한다|개정|삭제|신설|변경|중)\s*$", before):
+            return True
+        # 개정 이력의 규정 번호("제정 1991. 3. 18. 세칙 제 52호")는 항목 번호가 아니다.
+        # 여기서 끊으면 호수가 다음 줄로 넘어가 그 줄의 날짜와 묶인다. 실제로 제52호가
+        # 1991년 제정이 아니라 2001년 개정에 붙어, 개정 이력 전체가 한 칸씩 밀렸다.
+        if REVISION_REGULATION_KIND_PATTERN.search(before):
             return True
         return False
 

@@ -43,7 +43,14 @@ class Settings:
     rag_trace_enabled: bool = _env_bool("RAG_TRACE_ENABLED", True)
     agent_review_model: str = os.getenv("AGENT_REVIEW_MODEL", "gpt-4.1-mini")
     agent_review_api_base_url: str = os.getenv("AGENT_REVIEW_API_BASE_URL", "https://api.openai.com")
-    agent_review_timeout_seconds: int = int(os.getenv("AGENT_REVIEW_TIMEOUT_SECONDS", "60"))
+    # 한 번에 20개를 보내면 교정본 출력이 1만 토큰을 넘겨 응답이 늦고, 늦으면 그 20개가
+    # 통째로 사라졌다. 작게 나눠 여러 번 부르고 실패한 묶음만 다시 부른다.
+    agent_review_timeout_seconds: int = int(os.getenv("AGENT_REVIEW_TIMEOUT_SECONDS", "180"))
+    agent_review_chunks_per_request: int = int(os.getenv("AGENT_REVIEW_CHUNKS_PER_REQUEST", "4"))
+    agent_review_max_attempts: int = int(os.getenv("AGENT_REVIEW_MAX_ATTEMPTS", "3"))
+    # 묶음을 동시에 부르는 수. 1이면 순차. 문서 전체를 검수하면 묶음이 수십 개라
+    # 순차 실행은 검수 하나에 수십 분이 걸린다.
+    agent_review_max_parallel_requests: int = int(os.getenv("AGENT_REVIEW_MAX_PARALLEL_REQUESTS", "6"))
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_compatible_api_key: str = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
     azure_openai_endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
@@ -51,8 +58,12 @@ class Settings:
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     anthropic_api_base_url: str = os.getenv("ANTHROPIC_API_BASE_URL", "https://api.anthropic.com")
     agent_review_trigger_score_below: float = float(os.getenv("AGENT_REVIEW_TRIGGER_SCORE_BELOW", "100.0"))
-    agent_review_max_chunks_per_document: int = int(os.getenv("AGENT_REVIEW_MAX_CHUNKS_PER_DOCUMENT", "20"))
-    agent_review_max_input_tokens_per_document: int = int(os.getenv("AGENT_REVIEW_MAX_INPUT_TOKENS_PER_DOCUMENT", "15000"))
+    # 0 = 제한 없음(문서 전체를 검수). 20으로 잘라 두면 197개짜리 규정에서 20개만 검수되고
+    # 나머지는 화면에 'AI 검수 대상 아님'으로 남아, 검수를 켠 것과 끈 것을 구분할 수 없다.
+    agent_review_max_chunks_per_document: int = int(os.getenv("AGENT_REVIEW_MAX_CHUNKS_PER_DOCUMENT", "0"))
+    agent_review_max_input_tokens_per_document: int = int(os.getenv("AGENT_REVIEW_MAX_INPUT_TOKENS_PER_DOCUMENT", "0"))
+    # 위험 신호가 붙지 않은 조항까지 포함해 문서의 모든 조항을 검수 대상으로 삼는다.
+    agent_review_all_chunks: bool = _env_bool("AGENT_REVIEW_ALL_CHUNKS", True)
     agent_review_max_documents_per_batch: int = int(os.getenv("AGENT_REVIEW_MAX_DOCUMENTS_PER_BATCH", "0"))
     agent_review_max_input_tokens_per_batch: int = int(os.getenv("AGENT_REVIEW_MAX_INPUT_TOKENS_PER_BATCH", "0"))
     agent_review_max_total_tokens_per_batch: int = int(os.getenv("AGENT_REVIEW_MAX_TOTAL_TOKENS_PER_BATCH", "0"))

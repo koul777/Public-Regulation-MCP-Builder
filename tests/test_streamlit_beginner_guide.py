@@ -423,14 +423,12 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('[data-testid="stCheckbox"]', source)
         self.assertIn('[data-testid="stTextInput"]', source)
         self.assertNotIn('control_key_prefix="ai-"', source)
-        self.assertIn("_approval_ai_decision_control_keys(pending_ai_item_id)", source)
         self.assertIn('div[class~="st-key-{safe_control_key}"] button', source)
-        self.assertIn("control_key_prefix=human_confirmed_widget_key", source)
         self.assertNotIn("'2. 사람 검증 확인' 탭을 누르세요", source)
-        self.assertIn("사람 검증 결과를 직접 확인하세요", source)
-        self.assertIn("청크·이슈를 확인했습니다", source)
+        self.assertNotIn("control_key_prefix=human_confirmed_widget_key", source)
+        self.assertIn("조항 비교는 다음 '③ 검수하고 승인' 단계에서 합니다", source)
         self.assertIn("먼저 MCP 이름을 입력하세요", source)
-        self.assertIn("'정리된 내용(청크)'와 '이슈' 탭을 확인하세요", source)
+        self.assertIn("'요약'과 '이슈' 탭만 확인하세요", source)
         self.assertIn('control_key_prefix="institution-name"', source)
         self.assertIn('control_key_prefix=mcp_connection_target_key', source)
         self.assertIn('index=None if beginner_target_choice_required else 0', source)
@@ -487,8 +485,19 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             control_keys("chunk-1:warning:1"),
         )
         self.assertNotIn('control_key_prefix="ai-"', source)
-        self.assertIn("key=reflect_button_key", source)
-        self.assertIn("key=skip_button_key", source)
+        # Per-item reflect/skip buttons are gone — the program marks every AI-flagged
+        # item as reflected automatically so the operator only edits the proposed text.
+        page_source = ast.get_source_segment(source, _function(module, "_page_approval")) or ""
+        self.assertNotIn("key=reflect_button_key", page_source)
+        self.assertNotIn("key=skip_button_key", page_source)
+        auto_confirm_source = ast.get_source_segment(
+            source, _function(module, "_approval_auto_confirm_pending_chunks")
+        ) or ""
+        self.assertIn(
+            'auto_ai_decisions = {item_id: "reflect" for item_id in item_ids}',
+            auto_confirm_source,
+        )
+        self.assertIn("_approval_auto_confirm_pending_chunks(", page_source)
         self.assertIn('div[class~="st-key-{safe_control_key}"] button', source)
 
     def test_beginner_multi_chunk_review_moves_then_unlocks_single_approval(self) -> None:
@@ -546,33 +555,29 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertEqual("", general_mode["next_chunk_id"])
 
         page = _function(module, "_page_approval")
-        next_button_if = next(
-            node
-            for node in ast.walk(page)
-            if isinstance(node, ast.If)
-            and any(
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "button"
-                and call.args
-                and isinstance(call.args[0], ast.Constant)
-                and call.args[0].value == "다음 미검수 청크"
-                for call in ast.walk(node.test)
-            )
+        page_source = ast.get_source_segment(source, page) or ""
+        # There is no more per-chunk "next pending" navigation: every pending chunk
+        # renders in one continuous scroll, and confirmation bookkeeping is filled in
+        # automatically instead of requiring a click to unlock the next one.
+        self.assertNotIn("다음 미검수 청크", page_source)
+        # 조항이 수천 개인 규정이 있어 한 쪽씩만 그리되, 승인 대상은 여전히 미승인 조항 전체다.
+        sheet_source = (
+            ast.get_source_segment(source, _function(module, "_render_approval_compare_sheet")) or ""
         )
-        next_button_calls = {
-            call.func.id
-            for statement in next_button_if.body
-            for call in ast.walk(statement)
-            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-        }
-        self.assertNotIn("approve_review_chunks", next_button_calls)
-        self.assertNotIn("index_document", next_button_calls)
-        self.assertIn("검수 완료 {reviewed_count}/{pending_count}", source)
+        self.assertIn("for row in visible_rows:", sheet_source)
+        self.assertIn("visible_rows = rows[sheet_start", sheet_source)
+        self.assertIn("APPROVAL_SHEET_PAGE_SIZE", sheet_source)
+        self.assertIn("_render_approval_compare_sheet(", page_source)
+        self.assertIn("_approval_auto_confirm_pending_chunks(", page_source)
+        auto_confirm_source = ast.get_source_segment(
+            source, _function(module, "_approval_auto_confirm_pending_chunks")
+        ) or ""
         self.assertIn(
-            "if not beginner_review_navigation[\"enabled\"]\n        or beginner_all_pending_reviewed",
-            source,
+            'st.session_state[human_confirmed_key] = True',
+            auto_confirm_source,
         )
+        # 승인 대상은 확인이 끝난 미승인 조항 전체이며, 별도의 청크 이동 관문은 없다.
+        self.assertNotIn("beginner_review_navigation", page_source)
 
         approval_if = next(
             node
@@ -584,19 +589,66 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 and call.func.attr == "button"
                 and call.args
                 and isinstance(call.args[0], ast.Constant)
-                and call.args[0].value == "승인하고 색인"
+                and call.args[0].value == "이 규정 최종 확정 · 승인하고 색인"
                 for call in ast.walk(node.test)
             )
         )
+        # 버튼을 누르면 승인과 색인이 한 번에 끝나야 한다. 두 버튼('이 규정' / '이 파일의 전체 규정')이
+        # 같은 절차를 쓰도록 실행 본문을 _execute_final_approval 한 곳에 모아 두었으므로,
+        # 버튼은 그 함수를 부르고 색인 호출은 그 함수 안에 있어야 한다.
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_execute_final_approval"
+                for statement in approval_if.body
+                for call in ast.walk(statement)
+            )
+        )
+        execute_final_approval = next(
+            node
+            for node in ast.walk(page)
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_final_approval"
+        )
         direct_index_calls = [
             call
-            for statement in approval_if.body
-            for call in ast.walk(statement)
+            for call in ast.walk(execute_final_approval)
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Name)
             and call.func.id == "index_document"
         ]
         self.assertEqual(1, len(direct_index_calls))
+        # 옆에 붙은 '이 파일의 전체 규정' 버튼도 같은 절차를 그대로 쓴다.
+        approve_all_if = next(
+            node
+            for node in ast.walk(page)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "button"
+                and call.args
+                and isinstance(call.args[0], ast.JoinedStr)
+                for call in ast.walk(node.test)
+            )
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_execute_final_approval"
+                for statement in node.body
+                for call in ast.walk(statement)
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_approval_auto_confirm_pending_chunks"
+                for statement in approve_all_if.body
+                for call in ast.walk(statement)
+            ),
+            "전체 규정 확정은 열지 않은 규정의 검수 표시를 눌린 순간에 채워야 한다.",
+        )
 
         approval_target_fallback = next(
             node
@@ -615,10 +667,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             and "compare_chunk_approvable" in ast.unparse(node.test)
         )
         fallback_condition = ast.unparse(approval_target_fallback.test)
-        self.assertIn(
-            "not beginner_review_navigation['enabled'] or beginner_all_pending_reviewed",
-            fallback_condition,
-        )
+        self.assertIn("approve_enabled or override_reason_text", fallback_condition)
 
         can_approve_assignment = next(
             node
@@ -630,7 +679,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             )
         )
         self.assertIn(
-            "not beginner_review_navigation['enabled'] or beginner_all_pending_reviewed",
+            "bool(approval_target_entries)",
             ast.unparse(can_approve_assignment.value),
         )
         approval_button_call = next(
@@ -772,13 +821,14 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             for group in assignment.value.elts
         ]
 
-        self.assertEqual([6, 4, 9, 11], [len(group) for group in procedure_groups])
+        self.assertEqual([5, 4, 6, 11], [len(group) for group in procedure_groups])
         flattened = [item for group in procedure_groups for item in group]
+        # AI 검수 사용 여부는 사이드바에서 한 번만 정하므로 ① 단계 절차에서 빠졌다.
+        self.assertNotIn("AI 추가 검수 사용 여부 결정", flattened)
         for required in (
             "자동 인식한 규정 정보 확인",
-            "AI 추가 검수 사용 여부 결정",
             "품질 경고·이슈 확인",
-            "각 청크 사람 검증 결과 확인",
+            "규정 스크롤하며 원본·전처리·AI 검수본 비교",
             "다음 미완료 규정으로 이동해 같은 검수 반복",
             "선택한 모든 규정의 검수·승인·색인 완료 확인",
             "MCP 원리와 변환 과정 확인",
@@ -789,14 +839,121 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         ):
             self.assertIn(required, flattened)
 
+    def _beginner_procedure_groups(self, module) -> list[list[str]]:
+        assignment = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "BEGINNER_GUIDE_PROCEDURES"
+        )
+        return [[item.value for item in group.elts] for group in assignment.value.elts]
+
+    def _beginner_marker_calls(self, module) -> list[tuple[int, object, int, bool]]:
+        """(step, substep, lineno, prerequisite) for every rendered beginner marker."""
+        calls = []
+        for node in ast.walk(module):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_render_beginner_action_marker"
+                and node.args
+            ):
+                continue
+            step = node.args[0].value if isinstance(node.args[0], ast.Constant) else None
+            substep: object = None
+            prerequisite = False
+            for keyword in node.keywords:
+                if keyword.arg == "substep":
+                    substep = (
+                        keyword.value.value
+                        if isinstance(keyword.value, ast.Constant)
+                        else "dynamic"
+                    )
+                elif keyword.arg == "prerequisite":
+                    prerequisite = bool(getattr(keyword.value, "value", False))
+            calls.append((step, substep, node.lineno, prerequisite))
+        return calls
+
+    def test_every_beginner_marker_is_numbered_within_its_step(self) -> None:
+        _source, module = _source_and_module()
+        groups = self._beginner_procedure_groups(module)
+
+        calls = self._beginner_marker_calls(module)
+        self.assertTrue(calls)
+        for step, substep, lineno, prerequisite in calls:
+            with self.subTest(line=lineno):
+                self.assertIn(step, (1, 2, 3, 4))
+                if prerequisite:
+                    # Blockers cleared on an earlier screen carry no procedure number.
+                    self.assertIsNone(substep)
+                    continue
+                self.assertIsNotNone(
+                    substep,
+                    f"marker at line {lineno} has no substep number",
+                )
+                if substep != "dynamic":
+                    self.assertGreaterEqual(substep, 1)
+                    self.assertLessEqual(substep, len(groups[step - 1]))
+
+    def test_every_beginner_procedure_has_a_marker(self) -> None:
+        _source, module = _source_and_module()
+        groups = self._beginner_procedure_groups(module)
+        first_connection_substep = next(
+            node.value.value
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "BEGINNER_CONNECTION_FIRST_SUBSTEP"
+                for target in node.targets
+            )
+        )
+        numbered = {
+            (step, substep)
+            for step, substep, _lineno, _prereq in self._beginner_marker_calls(module)
+            if substep not in ("dynamic", None)
+        }
+        has_dynamic_connection_marker = any(
+            substep == "dynamic" and step == 4
+            for step, substep, _lineno, _prereq in self._beginner_marker_calls(module)
+        )
+        self.assertTrue(has_dynamic_connection_marker)
+
+        missing = []
+        for step_index, group in enumerate(groups, start=1):
+            for procedure_index, name in enumerate(group, start=1):
+                if (step_index, procedure_index) in numbered:
+                    continue
+                # 4-6 … 4-11 are the six external connection confirmations, which the
+                # loop in _render_beginner_connection_confirmation numbers at runtime.
+                if step_index == 4 and procedure_index >= first_connection_substep:
+                    continue
+                missing.append(f"{step_index}-{procedure_index} {name}")
+        self.assertEqual([], missing)
+
+    def test_marker_label_uses_step_and_substep_numbering(self) -> None:
+        _source, module = _source_and_module()
+        helper = _function(module, "_beginner_marker_label")
+        namespace: dict[str, object] = {}
+        exec(
+            compile(ast.Module(body=[helper], type_ignores=[]), "<marker-label>", "exec"),
+            namespace,
+        )
+        label = namespace["_beginner_marker_label"]
+
+        self.assertEqual("3-2", label(3, 2))
+        self.assertEqual("4-11", label(4, 11))
+        self.assertEqual("1", label(1, 0))
+
     def test_beginner_preprocess_requires_sequential_manual_confirmations(self) -> None:
         source, module = _source_and_module()
         page_source = ast.get_source_segment(source, _function(module, "_page_preprocess")) or ""
 
         self.assertIn("_reset_beginner_preprocess_confirmations_for_selection(upload_sources)", page_source)
         self.assertIn("자동 인식한 규정 정보와 필요한 수정값을 확인했습니다.", page_source)
-        self.assertIn("AI 추가 검수를 사용할지 여부를 결정했습니다.", page_source)
-        self.assertIn("disabled=not info_confirmed", page_source)
+        # AI 검수 사용 여부는 사이드바에서만 정한다. ① 화면은 다시 묻지 않는다.
+        self.assertNotIn("AI 추가 검수를 사용할지 여부를 결정했습니다.", page_source)
         self.assertIn(
             "disabled=poc_review_needs_ack or not beginner_preprocess_confirmations_complete",
             page_source,
@@ -902,6 +1059,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 }
             ),
             "_beginner_scope_approval_ready": lambda _ctx: True,
+            "_results_step_is_used": lambda ctx: bool(
+                (ctx or {}).get("results_step_used", True)
+            ),
         }
         exec(compile(ast.Module(body=[helper], type_ignores=[]), "<guide-completion>", "exec"), namespace)
         completed_steps = namespace["_beginner_guide_completed_steps"]
@@ -1071,7 +1231,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
 
         self.assertIn("beginner_results_confirmation_required", page_source)
         self.assertIn("results_confirmation_key = _beginner_guide_results_confirmed_key(document_id)", page_source)
-        self.assertIn("청크·이슈를 확인했습니다", page_source)
+        self.assertIn("조항 비교는 다음 '③ 검수하고 승인' 단계에서 합니다", page_source)
         self.assertIn("structure_confirmation_key", page_source)
         self.assertIn("issues_confirmation_key", page_source)
         self.assertIn("control_key_prefix=structure_confirmation_key", page_source)
@@ -1085,32 +1245,79 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertNotIn("beginner_results_document_id", page_source)
         self.assertNotIn("_mark_beginner_guide_results_confirmed", source)
 
+    def test_results_hides_chunk_internals_in_beginner_mode(self) -> None:
+        source, module = _source_and_module()
+        page = _function(module, "_page_results")
+        page_source = ast.get_source_segment(source, page) or ""
+
+        # 초보자 모드에서는 청크 탭 자체를 만들지 않는다(같은 비교를 ③에서 다시 하므로).
+        self.assertIn('["요약", "문서 차례", "표·별표", "이슈", "내려받기"]', page_source)
+        self.assertIn("chunks_tab = None", page_source)
+        self.assertIn("if chunks_tab is not None:", page_source)
+
+        # 청크 ID·신뢰도 같은 내부 지표는 일반 모드 전용 함수로만 렌더링한다.
+        chunk_tab = _function(module, "_render_results_chunk_tab")
+        chunk_tab_source = ast.get_source_segment(source, chunk_tab) or ""
+        for internal in ("청크 ID", "신뢰도", "상세 확인할 청크"):
+            self.assertNotIn(internal, page_source)
+            self.assertIn(internal, chunk_tab_source)
+
+        # AI 예산 지표와 원시 문서 요약은 초보자 모드에서 건너뛴다.
+        self.assertIn("if beginner_mode:", page_source)
+        self.assertIn("if not beginner_mode:", page_source)
+        self.assertIn("if agent_review_summary and not beginner_mode:", page_source)
+
+        # 초보자에게는 깨진 글자를 직접 판단할 수 있는 미리보기를 제공한다.
+        self.assertIn("_beginner_plain_preview_text(chunks[0].text)", page_source)
+        self.assertIn("전처리된 글자 확인", page_source)
+
     def test_human_review_marker_targets_confirmation_control_not_tab(self) -> None:
         source, module = _source_and_module()
         page = _function(module, "_page_approval")
         page_source = ast.get_source_segment(source, page) or ""
 
+        # There is no "사람 검증 확인" tab left to click at all — human sign-off is
+        # filled in automatically per pending chunk instead of via a separate control.
         self.assertNotIn("사람 검증 확인' 탭을 누르세요", page_source)
-        self.assertIn("다음으로 바로 아래 '2. 사람 검증 확인' 탭을 여세요", page_source)
-        self.assertIn("확인란이 빨간색으로 표시됩니다", page_source)
-        self.assertIn("control_key_prefix=human_confirmed_widget_key", page_source)
-        self.assertIn("key=human_confirmed_widget_key", page_source)
+        self.assertNotIn("'2. 사람 검증 확인' 탭을 여세요", page_source)
+        self.assertNotIn("control_key_prefix=human_confirmed_widget_key", page_source)
+        self.assertNotIn("key=human_confirmed_widget_key", page_source)
+        self.assertIn("_approval_auto_confirm_pending_chunks(", page_source)
+        auto_confirm_source = ast.get_source_segment(
+            source, _function(module, "_approval_auto_confirm_pending_chunks")
+        ) or ""
+        self.assertIn("st.session_state[human_confirmed_key] = True", auto_confirm_source)
 
     def test_approval_guides_ai_result_human_comparison_and_index_separately(self) -> None:
         source, module = _source_and_module()
         page_source = ast.get_source_segment(source, _function(module, "_page_approval")) or ""
+        # 원본·전처리본·AI 검수 의견 세 칸은 규정 하나 검수와 전체 규정 검수가 함께 쓰는 시트에서 그린다.
+        sheet_source = (
+            ast.get_source_segment(source, _function(module, "_render_approval_compare_sheet")) or ""
+        )
 
         for text in (
-            "AI 검증 결과와 제안별 반영 여부를 확인했습니다.",
-            "왼쪽: 원본 규정",
-            "오른쪽: 전처리·수정 결과",
-            "사람 검증 결과: 원본과 전처리 결과를 확인했습니다.",
+            "_render_original_source_preview(row_document, chunk)",
+            'header_cols[1].markdown("**전처리본 · ✅ 최종본**")',
+            'header_cols[2].markdown("**AI 검수 의견**")',
+            "_render_agent_review_findings(",
+        ):
+            self.assertIn(text, sheet_source)
+        # 승인·색인되는 본문은 언제나 가운데 전처리본 칸이다. AI 결과에 따라 편집 칸이
+        # 좌우로 옮겨 다니면 조항마다 어디를 고쳐야 하는지 알 수 없다.
+        self.assertIn("edit_col = row_cols[1]", sheet_source)
+        self.assertNotIn("edit_col = row_cols[2]", sheet_source)
+        # AI가 다시 쓴 본문을 승인 대상으로 삼는 경로가 남아 있으면 안 된다.
+        self.assertNotIn("ai_preprocessed_text", sheet_source)
+        for text in (
+            "_render_approval_compare_sheet(",
             "승인하고 색인",
             "이미 승인된 내용 AI에 등록만 실행",
         ):
             self.assertIn(text, page_source)
-        self.assertIn("not bool(review_state[\"ai_result_confirmed\"])", page_source)
-        self.assertIn("disabled=not bool(review_state[\"ai_result_confirmed\"])", page_source)
+        # AI/human confirmation is auto-filled per pending chunk instead of gated
+        # behind a manual "ai_result_confirmed" checkbox.
+        self.assertNotIn("disabled=not bool(review_state[\"ai_result_confirmed\"])", page_source)
         self.assertIn("control_keys=(approve_index_button_key,)", page_source)
         self.assertIn('control_key_prefix="quick-index-only-"', page_source)
 
@@ -1352,6 +1559,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "_beginner_guide_results_confirmed_key": lambda document_id: (
                 f"results-confirmed:{document_id}"
             ),
+            "_results_step_is_used": lambda ctx: bool(
+                (ctx or {}).get("results_step_used", True)
+            ),
             "st": SimpleNamespace(session_state={}),
         }
         exec(
@@ -1439,6 +1649,15 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             [True, True, True, True],
             workflow_states(actual_bundle_ready),
         )
+
+        # AI 추가 검수를 쓰지 않아 ②를 건너뛰는 규정은, 누를 화면이 없으므로
+        # 전처리가 끝난 시점에 '결과 확인'을 끝난 것으로 본다.
+        # (안 그러면 초보자 안내가 갈 수 없는 화면을 가리키며 영영 멈춘다.)
+        results_step_skipped = {
+            **completed,
+            "results_step_used": False,
+        }
+        self.assertEqual([True, True, False, False], workflow_states(results_step_skipped))
 
     def test_guide_helpers_never_call_approval_or_index_actions(self) -> None:
         _source, module = _source_and_module()
@@ -2247,9 +2466,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         for text in (
             "현재 규정의 결과 두 곳을 먼저 확인하세요",
             "현재 규정의 결과 두 곳 확인하러 가기",
-            "규정마다 결과 확인을 끝낸 뒤에만 AI 검증과 사람 검증을 시작",
+            "규정마다 결과 확인을 끝낸 뒤에만 원본·전처리·AI 검수 내용을 검토",
             "다음 미완료 규정을 하나씩 계속 확인하세요",
-            "결과 확인 두 곳부터 AI 검증, 왼쪽·오른쪽 사람 비교, 승인 또는 반려, 색인까지",
+            "결과 확인 두 곳부터 원본·전처리·AI 검수본 비교, 승인 또는 반려, 색인까지",
             "다음 미완료 규정 결과 확인",
         ):
             self.assertIn(text, page_source)
@@ -2292,7 +2511,13 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         page = _function(module, "_page_approval")
         page_source = "\n".join(source.splitlines()[page.lineno - 1 : page.end_lineno])
 
-        self.assertIn("일괄 검수·승인·색인 버튼을 사용할 수 없습니다", page_source)
+        # 전체 규정 승인은 열되, 초보자에게는 명시적 동의 한 단계를 요구한다.
+        self.assertIn("한 번에 승인하고 색인합니다", page_source)
+        self.assertIn('key=f"workflow-beginner-bulk-ack-{document_id}"', page_source)
+        self.assertIn(
+            "beginner_bulk_review_disabled = beginner_bulk_mode_active and not beginner_bulk_confirmed",
+            page_source,
+        )
         self.assertIn(
             "beginner_bulk_review_disabled\n                or not workflow_contexts_complete",
             page_source,
@@ -2568,30 +2793,38 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         source, module = _source_and_module()
 
         self.assertIn("기본은 <b>빠른 구조 전처리</b>", source)
-        self.assertIn("AI로 의심 구간 추가 검수 (선택)", source)
-        self.assertIn('key="preprocess-enable-agent-review"', source)
         self.assertIn("외부 AI 호출 없이 조문·항·호를 정리합니다.", source)
-        self.assertIn("처리 시간과 API 사용 비용이 늘 수 있습니다.", source)
-        self.assertIn("다음 검토 화면에서 사람이 확인·보완", source)
         self.assertIn("공식 승인·보안 확인은 그대로 진행됩니다.", source)
         self.assertIn("사람 승인과 보안 게이트를 대신하지 않습니다.", source)
 
+        # AI 검수 사용 여부는 사이드바에서 한 번만 정한다. ① 화면에는 묻는 위젯이 없어야 한다.
+        self.assertNotIn('key="preprocess-enable-agent-review"', source)
         preprocess = _function(module, "_page_preprocess")
-        opt_in_checkbox = next(
-            call
+        preprocess_widget_labels = {
+            call.args[0].value
             for call in ast.walk(preprocess)
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
             and isinstance(call.func.value, ast.Name)
             and call.func.value.id == "st"
-            and call.func.attr == "checkbox"
+            and call.func.attr in {"checkbox", "toggle"}
             and call.args
             and isinstance(call.args[0], ast.Constant)
-            and call.args[0].value == "AI로 의심 구간 추가 검수 (선택)"
+        }
+        self.assertNotIn("AI로 의심 구간 추가 검수 (선택)", preprocess_widget_labels)
+
+        # 사이드바 패널이 켜기·API 키·모델·한도를 모두 책임진다.
+        sidebar = _function(module, "_render_ai_review_sidebar")
+        sidebar_source = "\n".join(
+            source.splitlines()[sidebar.lineno - 1 : sidebar.end_lineno]
         )
-        checkbox_keywords = {keyword.arg: keyword.value for keyword in opt_in_checkbox.keywords}
-        self.assertIsInstance(checkbox_keywords["value"], ast.Constant)
-        self.assertIs(False, checkbox_keywords["value"].value)
+        self.assertIn('"AI 검수 사용"', sidebar_source)
+        self.assertIn('"API 키"', sidebar_source)
+        self.assertIn("저장하고 AI 검수 켜기", sidebar_source)
+        self.assertIn("_ai_connection_overrides", sidebar_source)
+        self.assertIn("_apply_ai_connection_settings", sidebar_source)
+        # 켰다고 표시해 놓고 실행은 못 하는 상태를 만들지 않는다.
+        self.assertIn("_ai_review_setup_blocker", sidebar_source)
 
         options_call = next(
             call
@@ -2628,11 +2861,11 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         page_source = "\n".join(
             source.splitlines()[approval_page.lineno - 1 : approval_page.end_lineno]
         )
-        self.assertIn("이 청크 반려", page_source)
+        self.assertIn("선택한 조항 반려", page_source)
         self.assertIn("반려 사유 (필수)", page_source)
-        self.assertIn("현재 화면에서 선택한 청크 1개만 반려", page_source)
+        self.assertIn("선택한 조항만 반려하여 MCP에서 제외", page_source)
         self.assertIn("disabled=not rejection_ready", page_source)
-        self.assertIn("chunk_ids=[str(compare_chunk.chunk_id)]", page_source)
+        self.assertIn("chunk_ids=list(reject_targets)", page_source)
         self.assertIn("reason=str(rejection_reason).strip()", page_source)
         self.assertIn("reject_review_chunks(", page_source)
         self.assertIn("승인·색인하지 않았으며 MCP 검색에서 제외됩니다", page_source)

@@ -13,6 +13,8 @@ from app.parsers.hwp_parser import (
     HWP_LEGACY_EXTRACTION_MODE,
     HWP_TAG_PARA_TEXT,
     HWPML_EXTRACTION_MODE,
+    HWP_DROPPED_EQUATION_DIAGNOSTIC,
+    HWP_INLINE_OBJECT_DIAGNOSTIC,
     HWP_TRUNCATED_RECORD_DIAGNOSTIC,
     HWP_UTF16_DECODE_DIAGNOSTIC,
     HwpParser,
@@ -246,6 +248,72 @@ class HwpParserTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ParserError, "HWPML XML exceeds"):
                 HwpParser(max_decompressed_document_bytes=16).parse(path, "doc_oversized_hwpml")
+
+
+class HwpInlineControlRecordTests(unittest.TestCase):
+    """문단 중간의 개체 레코드를 글자로 읽지 않는다.
+
+    HWP5에서 문단 안의 개체는 8글자 레코드다: 시작 표시 + 컨트롤 ID 2글자 +
+    정보 4글자 + 끝 표시. 이걸 글자로 읽으면 ID가 본문에 새어 나온다. 실제
+    성과급 세칙에서 "기본연봉 × 지급률"의 곱셈 기호 자리에 있던 수식 개체가
+    ``敤敱``(=eqed)로 찍혔고, 그 상태로 색인됐다.
+    """
+
+    @staticmethod
+    def _record(control_id: str) -> str:
+        """8글자짜리 확장 컨트롤 레코드를 만든다(ID는 뒤집혀 저장된다)."""
+        marker = control_id.encode("ascii")[::-1].decode("utf-16-le")
+        return "" + marker + "\x00\x00\x00\x00" + ""
+
+    def test_equation_object_id_does_not_leak_into_the_text(self) -> None:
+        text = "1. 원장: 기본연봉 " + self._record("eqed") + " 경영평가 지급률"
+
+        cleaned, objects, equations = HwpParser._strip_control_records(text)
+
+        self.assertNotIn("敤", cleaned)
+        self.assertNotIn("敱", cleaned)
+        self.assertEqual("1. 원장: 기본연봉   경영평가 지급률", cleaned)
+        self.assertEqual(1, objects)
+        self.assertEqual(1, equations)
+
+    def test_layout_objects_are_removed_without_being_called_content_loss(self) -> None:
+        """표·단·머리말 개체는 실측 26건 전부에 있었다. 세면 신호가 되지 않는다."""
+        for control_id in ("tbl ", "cold", "gso ", "head", "secd", "pgnp"):
+            with self.subTest(control_id=control_id):
+                cleaned, objects, equations = HwpParser._strip_control_records(
+                    "제1조(목적) " + self._record(control_id) + " 정한다."
+                )
+
+                self.assertEqual("제1조(목적)   정한다.", cleaned)
+                self.assertEqual(1, objects)
+                self.assertEqual(0, equations)
+
+    def test_plain_text_is_untouched(self) -> None:
+        text = "제1조(목적) 이 규정은 인사에 관한 사항을 정한다."
+
+        self.assertEqual((text, 0, 0), HwpParser._strip_control_records(text))
+
+    def test_line_break_controls_stay_line_breaks(self) -> None:
+        cleaned, _objects, _equations = HwpParser._strip_control_records("제1조\r\n제2조")
+
+        self.assertEqual("제1조\n\n제2조", cleaned)
+
+    def test_a_truncated_record_at_the_end_does_not_crash(self) -> None:
+        cleaned, objects, equations = HwpParser._strip_control_records("본문 敤")
+
+        self.assertEqual("본문  ", cleaned)
+        self.assertEqual(1, objects)
+        self.assertEqual(0, equations)
+
+    def test_dropped_equations_raise_the_parser_risk_level(self) -> None:
+        parser = HwpParser()
+        clean = parser._diagnostic_flags({})
+        with_equation = parser._diagnostic_flags({HWP_DROPPED_EQUATION_DIAGNOSTIC: 2})
+        with_layout_only = parser._diagnostic_flags({HWP_INLINE_OBJECT_DIAGNOSTIC: 30})
+
+        self.assertEqual([], clean)
+        self.assertIn("hwp_equation_dropped", with_equation)
+        self.assertEqual([], with_layout_only)
 
 
 if __name__ == "__main__":

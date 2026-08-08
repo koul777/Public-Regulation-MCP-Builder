@@ -306,6 +306,74 @@ class JsonRepository:
                     removed = True
         return removed
 
+    def purge_document_records(self, document_ids: Iterable[str]) -> dict[str, int]:
+        """Erase every journal and manifest row belonging to the given documents.
+
+        ``delete_document`` only removes the document row, its jobs, and its result
+        files. 실행 기록·승인 기록·색인 작업 기록은 저널에 그대로 남는다. 기관을
+        통째로 지울 때 그것들을 남겨 두면, 지운 규정이 감사 기록과 재처리 캐시에서
+        되살아난다. 되돌릴 수 없는 삭제이므로 호출하는 쪽에서 확인을 받는다.
+        """
+
+        targets = {str(document_id or "").strip() for document_id in document_ids}
+        targets.discard("")
+        removed: dict[str, int] = {}
+        if not targets:
+            return removed
+        with _REPOSITORY_LOCK, self._repository_write_lock():
+            for journal_name in _JOURNAL_ID_FIELDS:
+                path = self._journal_path(journal_name)
+                if not path.is_file() and not Path(f"{path}.gz").is_file():
+                    continue
+                records = self._read_journal_records(journal_name)
+                kept = [
+                    record
+                    for record in records
+                    if str(record.get("document_id") or "").strip() not in targets
+                ]
+                if len(kept) == len(records):
+                    continue
+                removed[journal_name] = len(records) - len(kept)
+                self._rewrite_journal_unlocked(journal_name, kept)
+            data = self._read_manifest_for_update()
+            for manifest_key in _MANIFEST_JOURNAL_MIRRORS:
+                mirrored = data.get(manifest_key)
+                if not isinstance(mirrored, dict):
+                    continue
+                for record_key, record in list(mirrored.items()):
+                    if (
+                        isinstance(record, dict)
+                        and str(record.get("document_id") or "").strip() in targets
+                    ):
+                        del mirrored[record_key]
+                        removed[manifest_key] = removed.get(manifest_key, 0) + 1
+            self._write_json(self.manifest_path, data)
+        return removed
+
+    def _rewrite_journal_unlocked(self, journal_name: str, records: list[dict]) -> None:
+        """Replace a journal with the kept rows and drop its cached views.
+
+        저널은 평소 덧붙이기만 한다. 여기서만 다시 쓰므로, 압축된 과거 구간까지
+        합쳐 한 파일로 만들고 캐시를 비워 다음 읽기가 새 내용을 보게 한다.
+        """
+
+        path = self._journal_path(journal_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                    handle.write("\n")
+            _replace_with_retry(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        # 압축 구간을 남겨 두면 방금 지운 기록이 다음 읽기에서 되살아난다.
+        Path(f"{path}.gz").unlink(missing_ok=True)
+        cache_key = str(path.resolve())
+        _JOURNAL_RECORD_CACHE.pop(cache_key, None)
+        _JOURNAL_IDENTITY_CACHE.pop(cache_key, None)
+
     def list_documents(self) -> list[Document]:
         self.recover_stale_processing_progress()
         docs = dict(self._read_legacy().get("documents", {}))
@@ -978,6 +1046,14 @@ class JsonRepository:
 
     def get_chunks(self, document_id: str) -> list[Chunk]:
         return [Chunk.model_validate(raw) for raw in self._read_result(document_id, "chunks")]
+
+    def get_chunk_records(self, document_id: str) -> list[dict]:
+        """Chunks as stored, without schema validation.
+
+        조항 수나 승인 상태만 세면 되는 화면이 있다. 규정 100여 개를 한꺼번에 세는데
+        전부 검증까지 하면 첫 화면이 10초 넘게 멈춘다. 세기만 할 때는 이쪽을 쓴다.
+        """
+        return [raw for raw in self._read_result(document_id, "chunks") if isinstance(raw, dict)]
 
     def get_issues(self, document_id: str) -> list[ValidationIssue]:
         return [ValidationIssue.model_validate(raw) for raw in self._read_result(document_id, "issues")]

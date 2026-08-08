@@ -59,8 +59,10 @@ class AgentReviewPolicyTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "main_pipeline_review_draft")
         self.assertEqual(plan["api_call_count"], 0)
 
-    def test_skips_clean_quality_even_when_enabled(self) -> None:
-        policy = AgentReviewPolicy(Settings(data_dir=Path("data"), enable_agent_review=True))
+    def test_skips_clean_quality_when_only_risk_flagged_chunks_are_reviewed(self) -> None:
+        policy = AgentReviewPolicy(
+            Settings(data_dir=Path("data"), enable_agent_review=True, agent_review_all_chunks=False)
+        )
 
         plan = policy.plan(
             [review_chunk(table_like=True, table_cell_rows=[{"cells": ["a"]}])],
@@ -71,6 +73,69 @@ class AgentReviewPolicyTests(unittest.TestCase):
         self.assertTrue(plan["enabled"])
         self.assertEqual(plan["status"], "skipped")
         self.assertEqual(plan["skip_reason"], "quality_gate_clean")
+
+    def test_clean_quality_is_still_reviewed_when_the_whole_document_is_in_scope(self) -> None:
+        """'문서 전체 검수'는 품질 검사가 깨끗해도 건너뛰지 않는다."""
+        policy = AgentReviewPolicy(
+            Settings(
+                data_dir=Path("data"),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_all_chunks=True,
+            )
+        )
+
+        plan = policy.plan(
+            [review_chunk(table_like=True, table_cell_rows=[{"cells": ["a"]}])],
+            quality_report(),
+            ChunkOptions(enable_agent_review=True),
+        )
+
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual(plan["selected_count"], 1)
+        self.assertEqual(["full_document_review"], plan["selected_candidates"][0]["reasons"])
+
+    def test_no_per_document_cap_reviews_every_chunk(self) -> None:
+        """한도 0은 '제한 없음'이다. 0을 상한으로 읽어 한 건도 안 고르면 안 된다."""
+        policy = AgentReviewPolicy(
+            Settings(
+                data_dir=Path("data"),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_all_chunks=True,
+                agent_review_max_chunks_per_document=0,
+                agent_review_max_input_tokens_per_document=0,
+            )
+        )
+        chunks = [
+            review_chunk().model_copy(update={"chunk_id": f"chunk_{index}"}) for index in range(50)
+        ]
+
+        plan = policy.plan(chunks, quality_report(warnings=1), ChunkOptions(enable_agent_review=True))
+
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual(plan["selected_count"], 50)
+        self.assertFalse(plan["budget_exhausted"])
+
+    def test_an_explicit_cap_is_still_honoured(self) -> None:
+        policy = AgentReviewPolicy(
+            Settings(
+                data_dir=Path("data"),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_all_chunks=True,
+                agent_review_max_chunks_per_document=5,
+                agent_review_max_input_tokens_per_document=0,
+            )
+        )
+        chunks = [
+            review_chunk().model_copy(update={"chunk_id": f"chunk_{index}"}) for index in range(50)
+        ]
+
+        plan = policy.plan(chunks, quality_report(warnings=1), ChunkOptions(enable_agent_review=True))
+
+        self.assertEqual(plan["selected_count"], 5)
+        self.assertTrue(plan["budget_exhausted"])
 
     def test_request_option_disables_provider_execution_even_when_api_is_ready(self) -> None:
         calls: list[tuple] = []
@@ -188,6 +253,8 @@ class AgentReviewPolicyTests(unittest.TestCase):
                 agent_review_max_input_tokens_per_document=100,
                 agent_review_max_output_tokens_per_chunk=25,
                 agent_review_token_safety_margin=1.25,
+                # 이 테스트는 '위험 신호가 붙은 조항만 고르는' 규칙 자체를 고정한다.
+                agent_review_all_chunks=False,
             )
         )
         candidate = review_chunk(table_like=True, table_cell_rows=[])
@@ -389,6 +456,8 @@ class AgentReviewPolicyTests(unittest.TestCase):
                 openai_api_key="configured",
                 agent_review_max_chunks_per_document=3,
                 agent_review_max_input_tokens_per_document=100,
+                # 이 테스트는 hwpx 중간 위험이 '검수 사유'로 잡히지 않는다는 규칙만 본다.
+                agent_review_all_chunks=False,
             )
         )
         candidate = review_chunk(parser_uncertainty_source="hwpx", parser_uncertainty_risk_level="medium")

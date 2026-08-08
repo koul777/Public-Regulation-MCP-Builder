@@ -14,6 +14,8 @@ class Document(BaseModel):
     document_id: str
     filename: str
     document_name: str | None = None
+    # "user"면 올린 사람이 정한 이름이므로 본문에서 찾은 제목으로 덮어쓰지 않는다.
+    document_name_source: Literal["auto", "user"] = "auto"
     file_type: str
     file_hash: str
     institution_name: str | None = None

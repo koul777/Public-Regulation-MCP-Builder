@@ -130,12 +130,15 @@ class AgentReviewPolicy:
         selected: list[dict] = []
         token_total = 0
         output_token_total = 0
+        # 0은 '제한 없음'이다. 0을 그대로 상한으로 쓰면 한 건도 못 고르므로 반드시 갈라 준다.
+        max_chunks = int(limits["max_chunks_per_document"])
+        max_input_tokens = int(limits["max_input_tokens_per_document"])
         for candidate in new_candidates:
             estimated = int(candidate["estimated_input_tokens"])
-            if len(selected) >= limits["max_chunks_per_document"]:
+            if max_chunks and len(selected) >= max_chunks:
                 base["budget_exhausted"] = True
                 break
-            if token_total + estimated > limits["max_input_tokens_per_document"]:
+            if max_input_tokens and token_total + estimated > max_input_tokens:
                 base["budget_exhausted"] = True
                 break
             selected.append(candidate)
@@ -300,6 +303,10 @@ class AgentReviewPolicy:
                 )
             ):
                 reasons.append("document_inventory_boundary_review")
+        # 위험 신호가 하나도 없어도 검수 대상에 남긴다. 신호가 붙은 조항만 보내면
+        # 문서의 일부만 검수되고, 화면에는 나머지가 'AI 검수 대상 아님'으로 남는다.
+        if not reasons and self.settings.agent_review_all_chunks:
+            reasons.append("full_document_review")
         return reasons
 
     def _positive_metadata_int(self, metadata: dict, key: str) -> bool:
