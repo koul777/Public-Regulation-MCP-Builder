@@ -966,6 +966,38 @@ class QualitySourceLineCoverageTests(unittest.TestCase):
 
         self.assertTrue(self._check(report).passed)
 
+    def test_a_table_row_promoted_to_markdown_is_not_reported_missing(self) -> None:
+        """원문의 표 한 줄은 맨 글자, 색인 본문은 "| 값 | 값 |" 형태로 저장된다.
+
+        구분선을 남겨 둔 채 대조하면 멀쩡히 색인된 표 줄이 전부 누락으로 잡혀, 별표·서식이
+        있는 문서마다 없는 손실을 경고하고 점수까지 깎는다. 비율 검사와 같은 기준으로
+        표 서식을 걷어내고 비교해야 한다.
+        """
+        source = (
+            "수상종류 표창대상 포상금액 비고란\n"
+            "장기근속상 20년 이상 근무한 직원 금 300만원 해당 없음"
+        )
+        markdown = (
+            "| 수상종류 | 표창대상 | 포상금액 | 비고란 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 장기근속상 | 20년 이상 근무한 직원 | 금 300만원 | 해당 없음 |"
+        )
+        report = self._report([markdown], source)
+
+        self.assertTrue(self._check(report).passed)
+        self.assertEqual(0, report.coverage_metrics["source_lines_missing_count"])
+
+    def test_prose_lost_beside_a_markdown_table_is_still_reported(self) -> None:
+        """표 서식을 걷어내느라 표 바깥의 진짜 누락까지 놓치면 안 된다."""
+        source = (
+            "수상종류 표창대상 포상금액 비고란\n"
+            "※ 심사위원 전원의 평균 90점 이상인 자를 대상자로 선정함."
+        )
+        report = self._report(["| 수상종류 | 표창대상 | 포상금액 | 비고란 |"], source)
+
+        self.assertFalse(self._check(report).passed)
+        self.assertEqual(1, report.coverage_metrics["source_lines_missing_count"])
+
     def test_real_loss_is_still_caught_after_the_false_alarm_fix(self) -> None:
         """오탐을 줄이느라 진짜 누락까지 놓치면 검사가 무의미해진다."""
         source = (

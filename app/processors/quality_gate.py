@@ -859,21 +859,26 @@ class QualityGate:
         # "[위치] … [본문]" 머리말이 끼어들어, 멀쩡히 색인된 줄이 누락으로 잡혔다.
         # 머리말을 걷어낸 본문끼리 이어 붙인 것과, 머리말까지 포함한 원래 색인 본문을
         # 둘 다 본다. 어느 쪽에 있어도 색인된 것이므로 누락이 아니다.
+        # 표 서식 문자는 양쪽에서 똑같이 걷어낸다. 원문에서 표 한 줄은 "수상종류 표창대상
+        # 포상금액"처럼 맨 글자로 오는데 색인 본문은 "| 수상종류 | 표창대상 |" 형태라,
+        # 구분선을 남겨 두고 대조하면 멀쩡히 색인된 줄이 전부 누락으로 잡힌다. 별표·서식이
+        # 있는 문서마다 없는 손실을 경고하고 점수를 깎아 AI 검수까지 끌고 갔다.
         haystack = "\n".join(
             (
-                self._compact_text("\n".join(self._chunk_body_without_context_header(chunk) for chunk in chunks)),
-                self._compact_text(
+                self._coverage_text("\n".join(self._chunk_body_without_context_header(chunk) for chunk in chunks)),
+                self._coverage_text(
                     "\n".join(chunk.retrieval_text or chunk.normalized_text or chunk.text for chunk in chunks)
                 ),
             )
         )
         missing: list[str] = []
         for line in source.splitlines():
-            compact_line = self._compact_text(line)
+            # 길이 판단은 서식을 뺀 내용 기준이어야 대조 대상과 어긋나지 않는다.
+            content_line = self._coverage_text(line)
             # 짧은 줄은 다른 조문에 우연히 들어 있기 쉬워 신호가 되지 않는다.
-            if len(compact_line) < SOURCE_LINE_MIN_CHARS:
+            if len(content_line) < SOURCE_LINE_MIN_CHARS:
                 continue
-            if compact_line not in haystack:
+            if content_line not in haystack:
                 missing.append(line.strip())
         return missing
 
