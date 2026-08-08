@@ -50,6 +50,7 @@ from app.agents.provider_config import (
     normalize_agent_review_provider,
 )
 from app.core.security import AuthContext
+from app.core.tenant_access import INSTITUTION_STORAGE_MARKER, institution_storage_dir
 from app.core.institution_profiles import (
     ALLOWED_REQUIRED_ROW_FIELDS,
     InstitutionProfileRegistry,
@@ -2195,24 +2196,33 @@ def _document_belongs_to_institution_profile(document: object, profile_id: str) 
     return str(getattr(document, "institution_name", "") or "").strip() in institution_names
 
 
-def _operator_projects_dir(profile_id: str | None = None) -> Path:
+def _operator_projects_dir(profile_id: str | None = None, *, create: bool = False) -> Path:
     selected_profile_id = str(profile_id or _selected_institution_profile_id()).strip().lower()
     if not selected_profile_id:
         raise ValueError("기관을 먼저 선택하세요.")
-    profile_digest = hashlib.sha256(selected_profile_id.encode("utf-8")).hexdigest()[:16]
-    return Path(settings.data_dir) / "operator_projects" / f"institution-{profile_digest}"
+    # 폴더 이름은 지우는 쪽과 같은 함수로만 만든다. 여기서 따로 계산하면 기관을 지워도
+    # 저장한 작업이 남아, 같은 이름으로 다시 등록할 때 그대로 되살아난다.
+    return institution_storage_dir(
+        Path(settings.data_dir) / "operator_projects", selected_profile_id, create=create
+    )
 
 
 def _operator_project_path(
     project_name: str,
     profile_id: str | None = None,
     projects_dir: Path | None = None,
+    *,
+    create: bool = False,
 ) -> Path:
     cleaned_project_name = str(project_name or "").strip()
     if not cleaned_project_name:
         raise ValueError("프로젝트 이름을 입력하세요. 규정명이 아니라 작업을 구분할 이름입니다.")
     project_digest = hashlib.sha256(cleaned_project_name.casefold().encode("utf-8")).hexdigest()[:20]
-    target_dir = Path(projects_dir).expanduser().resolve() if projects_dir is not None else _operator_projects_dir(profile_id)
+    target_dir = (
+        Path(projects_dir).expanduser().resolve()
+        if projects_dir is not None
+        else _operator_projects_dir(profile_id, create=create)
+    )
     return target_dir / f"project-{project_digest}.json"
 
 
@@ -2247,7 +2257,9 @@ def _operator_project_session_values(document_id: str) -> dict[str, object]:
 
 def _save_operator_project(project_name: str, page: str, projects_dir: Path | None = None) -> Path:
     cleaned_project_name = str(project_name or "").strip()
-    project_path = _operator_project_path(cleaned_project_name, projects_dir=projects_dir)
+    project_path = _operator_project_path(
+        cleaned_project_name, projects_dir=projects_dir, create=True
+    )
     project_path.parent.mkdir(parents=True, exist_ok=True)
     document_id = str(st.session_state.get("document_id") or "").strip()
     payload = {
@@ -3008,17 +3020,26 @@ def _uploaded_file_size(uploaded_file: object) -> int:
 
 
 def _pending_upload_dir(profile_id: str) -> Path:
-    digest = hashlib.sha256(str(profile_id).strip().lower().encode("utf-8")).hexdigest()[:16]
-    path = Path(settings.data_dir) / "pending_uploads" / f"institution-{digest}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    # 폴더 이름은 지우는 쪽과 같은 함수로만 만든다. 여기서 따로 계산하면 기관을 지워도
+    # 대기 파일이 남아, 같은 이름으로 다시 등록할 때 그대로 되살아난다.
+    return institution_storage_dir(
+        Path(settings.data_dir) / "pending_uploads", profile_id, create=True
+    )
 
 
 def _pending_upload_paths(profile_id: str) -> list[Path]:
     if not str(profile_id or "").strip():
         return []
     return sorted(
-        (path for path in _pending_upload_dir(profile_id).iterdir() if path.is_file() and not path.name.endswith(".tmp")),
+        (
+            path
+            for path in _pending_upload_dir(profile_id).iterdir()
+            # 표식 파일은 이 폴더가 어느 기관 것인지 적어 둔 것이지 운영자가 올린
+            # 규정이 아니다. 목록에 넣으면 지울 수 없는 파일이 하나 붙어 보인다.
+            if path.is_file()
+            and not path.name.endswith(".tmp")
+            and path.name != INSTITUTION_STORAGE_MARKER
+        ),
         key=lambda path: path.name.casefold(),
     )
 
@@ -7777,9 +7798,16 @@ def _page_preprocess() -> None:
     ai_review_max_chunks = int(settings.agent_review_max_chunks_per_document)
     ai_review_max_input_tokens = int(settings.agent_review_max_input_tokens_per_document)
     if ai_review_requested:
+        # 한도 0은 '보내지 않는다'가 아니라 '제한 없음'이다. 숫자를 그대로 적으면
+        # 문서 전체가 나가는데도 아무것도 안 보낸다고 읽힌다.
+        chunk_limit_text = (
+            f"최대 {ai_review_max_chunks:,}개까지"
+            if ai_review_max_chunks > 0
+            else "개수 제한 없이"
+        )
         st.caption(
             f"🤖 AI 검수 켜짐 — 이번 전처리에 함께 실행됩니다. 규정 전체가 아니라 품질 검사·파서 경고에 걸린 "
-            f"의심 구간만 문서당 최대 {ai_review_max_chunks:,}개까지 외부 AI로 보내며, 처리 시간과 API 비용이 늘 수 있습니다. "
+            f"의심 구간만 문서당 {chunk_limit_text} 외부 AI로 보내며, 처리 시간과 API 비용이 늘 수 있습니다. "
             "끄거나 한도를 바꾸려면 왼쪽 사이드바 'AI 검수'를 여세요."
         )
     else:
@@ -9283,6 +9311,13 @@ def _page_approval(ctx: dict | None) -> None:
     batch_loaded = not multi_selected or (
         bulk_section_open and bool(st.session_state.get(batch_loaded_key))
     )
+    bulk_sheet_key = f"approval-bulk-sheet-{document_id}"
+    # 아래 '전체 목록'이 이 규정 조항을 실제로 그릴 때만 위 비교 시트를 감춘다. 켜졌다는
+    # 이유만으로 감추면, 아래 목록은 '상태 불러오기'와 체크박스를 더 눌러야 나오므로 그
+    # 사이에 원본·전처리본·AI 검수본이 화면에서 통째로 사라진다.
+    bulk_sheet_rendered = (
+        bulk_section_open and batch_loaded and bool(st.session_state.get(bulk_sheet_key))
+    )
     if batch_loaded:
         selected_approval_contexts = _selected_approval_contexts(selected_document_ids, ctx)
     else:
@@ -9496,9 +9531,9 @@ def _page_approval(ctx: dict | None) -> None:
         agent_review_summary=agent_review_summary,
     )
 
-    if bulk_section_open:
-        # 같은 조항을 두 시트에 두 번 그리면 편집 칸이 중복된다. 전체 규정 확인을 켠 동안에는
-        # 이 규정 조항도 아래 '전체 규정 확인' 목록에서 규정 순서대로 이어서 보여 준다.
+    if bulk_sheet_rendered:
+        # 같은 조항을 두 시트에 두 번 그리면 편집 칸이 중복된다. 아래 목록이 이 규정 조항을
+        # 실제로 그리고 있을 때만 여기서 비운다.
         st.info(
             "'전체 규정 확인'을 켜 두었습니다. 이 규정의 조항은 아래 전체 목록에서 "
             "다른 규정과 이어서 비교·수정할 수 있습니다."
@@ -10032,7 +10067,7 @@ def _page_approval(ctx: dict | None) -> None:
         # 규정 경계는 유지한 채(규정명 표시) 규정 순서대로 이어 붙인다.
         if st.checkbox(
             "선택한 모든 규정의 미승인 조항을 이어서 비교하기 (원본 · 전처리본 · AI 검수본)",
-            key=f"approval-bulk-sheet-{document_id}",
+            key=bulk_sheet_key,
             help="규정별 조항을 한 화면에서 순서대로 확인하고 고칠 수 있습니다. 고친 내용은 아래 최종 확정에서 함께 저장됩니다.",
         ):
             workflow_sheet_rows = [

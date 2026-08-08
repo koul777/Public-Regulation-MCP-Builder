@@ -1209,5 +1209,28 @@ def _seed_streamlit_multi_approval_documents(settings: Settings) -> None:
     )
 
 
+class ApprovalCompareSheetVisibilityTests(unittest.TestCase):
+    """'전체 규정 확인'을 켜도 비교 시트가 사라지지 않아야 한다.
+
+    아래 전체 목록은 '상태 불러오기' 버튼과 별도 체크박스를 더 눌러야 나온다. 체크박스를
+    켰다는 이유만으로 위 시트를 감추면, 그 사이 ③ 화면에는 원본·전처리본·AI 검수본이
+    하나도 남지 않는다.
+    """
+
+    def test_sheet_is_hidden_only_when_the_bulk_list_actually_draws_it(self) -> None:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+
+        # 감추는 조건은 아래 목록이 실제로 그려지는 것과 같아야 한다.
+        self.assertIn(
+            "bulk_section_open and batch_loaded and bool(st.session_state.get(bulk_sheet_key))",
+            source,
+        )
+        self.assertIn("if bulk_sheet_rendered:", source)
+        # 켜졌다는 사실만 보고 감추면 안 된다.
+        self.assertNotIn("    if bulk_section_open:\n", source)
+        # 아래 체크박스와 같은 키를 봐야 두 조건이 어긋나지 않는다.
+        self.assertIn("key=bulk_sheet_key,", source)
+
+
 if __name__ == "__main__":
     unittest.main()

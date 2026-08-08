@@ -2842,6 +2842,26 @@ class ChunkerTablePromotionKeepsProseTests(unittest.TestCase):
 
         self.assertEqual("| 항 목 |", result)
 
+    def test_a_row_written_on_one_line_is_not_kept_twice(self) -> None:
+        """파서가 표 한 줄을 셀 여러 개로 붙여 내놓는 경우.
+
+        셀 하나와 같은지만 보면 "공적 사항 80점" 같은 줄이 산문으로 남아, 뒤에 붙는
+        마크다운과 함께 본문에 두 번 저장된다. 색인 본문이 부풀고 MCP가 인용하는 표
+        글도 겹친다.
+        """
+        body = "[별표 1]\n항 목 배 점\n공적 사항 80점\n※ 심사위원 전원의 평균으로 정한다."
+        markdown = "| 항  목 | 배  점 |\n| --- | --- |\n| 공적 사항 | 80점 |"
+        rows = self._rows([["항 목", "배 점"], ["공적 사항", "80점"]])
+
+        result = Chunker._body_with_table_prose(body, markdown, rows)
+
+        self.assertEqual(1, result.count("공적 사항"))
+        self.assertEqual(1, result.count("80점"))
+        # 표 바깥의 산문은 그대로 남아야 한다.
+        self.assertIn("[별표 1]", result)
+        self.assertIn("※ 심사위원 전원의 평균으로 정한다.", result)
+        self.assertIn(markdown, result)
+
 
 if __name__ == "__main__":
     unittest.main()

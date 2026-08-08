@@ -85,6 +85,22 @@ class AgentReviewExecutor:
         payload_digest = payload_hash(
             {"provider": self.settings.llm_provider, "request": [p["request"] for p in payloads]}
         )
+        if not payloads:
+            # 고른 조항이 실제 본문으로 하나도 이어지지 않았다. 제공자를 한 번도 부르지
+            # 않았으므로 실패로 적으면 안 된다. 실패로 남기면 화면이 없던 장애를 알리고,
+            # 다음 실행에서 이전 결과를 재사용할지 판단하는 근거도 어긋난다.
+            result.update(
+                {
+                    "status": "skipped",
+                    "skip_reason": "no_review_candidates",
+                    "api_call_count": 0,
+                    "batch_count": 0,
+                    "failed_batch_count": 0,
+                    "failed_batches": [],
+                    "payload_hash": payload_digest,
+                }
+            )
+            return result
         for payload in payloads:
             payload_leak_reason = _payload_local_path_leak_reason(payload["request"])
             if payload_leak_reason:

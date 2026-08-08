@@ -663,10 +663,23 @@ class Chunker:
             for cell in (row.get("cells") or [])
             if re.sub(r"\s+", "", str(cell))
         }
+        # 파서가 뽑아낸 표 한 줄에는 셀이 여러 개 붙어 나온다("학사 90 우수"). 셀 하나와
+        # 같은지만 보면 이런 줄은 산문으로 남아, 뒤에 붙는 표 마크다운과 함께 본문에 두 번
+        # 저장된다. 색인 본문이 부풀고 MCP가 인용하는 표 글도 겹친다. 행 전체를 이어 붙인
+        # 모양도 함께 비교한다.
+        row_values = {
+            signature
+            for row in cell_rows
+            if isinstance(row, dict)
+            for signature in (
+                re.sub(r"\s+", "", "".join(str(cell) for cell in (row.get("cells") or []))),
+            )
+            if signature
+        }
         prose: list[str] = []
         for line in body.splitlines():
             compact = re.sub(r"\s+", "", line)
-            if not compact or compact in cell_values:
+            if not compact or compact in cell_values or compact in row_values:
                 continue
             prose.append(line.strip())
         if not prose:
