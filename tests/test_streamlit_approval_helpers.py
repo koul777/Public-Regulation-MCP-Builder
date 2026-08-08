@@ -11,6 +11,7 @@ from dataclasses import replace
 from app.core.config import Settings
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
+from app.services.institution_purge_service import InstitutionPurgeService
 from app.storage.repository import JsonRepository
 from frontend import streamlit_app
 
@@ -798,6 +799,46 @@ class PreprocessProgressGaugeTests(unittest.TestCase):
         self.assertIn("last_fraction = max(last_fraction, reported_fraction)", loop_source)
         # 낱개를 셀 수 없는 단계로 넘어가면 이전 단계 숫자를 남기지 않는다.
         self.assertIn("regulation_progress_box.empty()", loop_source)
+
+
+class InstitutionStorageDirAgreementTests(unittest.TestCase):
+    """폴더를 만드는 쪽과 지우는 쪽이 같은 이름을 쓰는지 고정한다.
+
+    두 쪽이 이름을 따로 계산하던 동안, 기관을 지워도 대기 파일과 저장한 작업은 그대로
+    남았다. 기관 ID는 기관명 해시라 같은 이름으로 다시 등록하면 전부 되살아났다.
+    """
+
+    def test_frontend_folders_are_the_ones_the_purge_service_removes(self) -> None:
+        profile_id = "institution-2974949d31f0307e"
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            settings = Settings(data_dir=data_dir)
+            repository = JsonRepository(settings)
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+            with patch.object(streamlit_app, "settings", settings):
+                pending_dir = streamlit_app._pending_upload_dir(profile_id)
+                projects_dir = streamlit_app._operator_projects_dir(profile_id, create=True)
+            (pending_dir / "인사규정.hwp").write_bytes(b"hwp")
+            (projects_dir / "project-abc.json").write_text("{}", encoding="utf-8")
+
+            plan = service.plan(profile_id)
+            self.assertEqual(1, plan.pending_file_count)
+            self.assertEqual(1, plan.saved_project_count)
+            self.assertEqual({profile_id}, service.profile_ids_with_stored_data())
+
+            service.purge(profile_id)
+
+            self.assertFalse(pending_dir.exists())
+            self.assertFalse(projects_dir.exists())
+
+    def test_marker_file_is_not_offered_as_an_uploaded_regulation(self) -> None:
+        profile_id = "institution-2974949d31f0307e"
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            with patch.object(streamlit_app, "settings", settings):
+                streamlit_app._pending_upload_dir(profile_id)
+
+                self.assertEqual([], streamlit_app._pending_upload_paths(profile_id))
 
 
 if __name__ == "__main__":

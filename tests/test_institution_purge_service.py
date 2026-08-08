@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.config import Settings
+from app.core.tenant_access import institution_storage_dir
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.schemas.run import ProcessingRun
@@ -199,8 +200,11 @@ class InstitutionPurgeServiceTests(unittest.TestCase):
             root = Path(tmp)
             settings = Settings(data_dir=root / "data")
             repository = JsonRepository(settings)
-            pending_dir = settings.data_dir / "pending_uploads" / "institution-abc"
-            pending_dir.mkdir(parents=True, exist_ok=True)
+            # 화면이 폴더를 만들 때 쓰는 함수를 그대로 쓴다. 여기서 폴더 이름을 손으로
+            # 적으면, 지우는 쪽이 이름을 잘못 알고 있어도 시험은 통과한다.
+            pending_dir = institution_storage_dir(
+                settings.data_dir / "pending_uploads", "institution-abc", create=True
+            )
             (pending_dir / "인사규정.hwp").write_bytes(b"hwp")
             service = InstitutionPurgeService(settings=settings, repository=repository)
 
@@ -214,6 +218,45 @@ class InstitutionPurgeServiceTests(unittest.TestCase):
 
             self.assertFalse(pending_dir.exists())
             self.assertEqual(set(), service.profile_ids_with_stored_data())
+
+    def test_stored_data_is_reported_by_profile_id_not_folder_name(self) -> None:
+        """폴더 이름을 기관 ID로 착각하면 살아 있는 기관 파일을 지운다.
+
+        폴더 이름은 기관 ID의 해시다. 그것을 기관 ID로 돌려주면 등록된 기관과 한 번도
+        일치하지 않아, 멀쩡한 기관이 '주인 없는 데이터'로 표시된다. 그 화면에서 지우면
+        지금 쓰고 있는 기관의 대기 파일이 날아간다.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data")
+            repository = JsonRepository(settings)
+            pending_dir = institution_storage_dir(
+                settings.data_dir / "pending_uploads", "institution-abc", create=True
+            )
+            (pending_dir / "인사규정.hwp").write_bytes(b"hwp")
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+
+            reported = service.profile_ids_with_stored_data()
+
+            self.assertEqual({"institution-abc"}, reported)
+            self.assertNotIn(pending_dir.name, reported)
+            # 등록된 기관을 빼고 나면 주인 없는 데이터는 없어야 한다.
+            self.assertEqual(set(), reported - {"institution-abc"})
+
+    def test_marker_only_folder_is_not_reported_as_leftover_data(self) -> None:
+        """표식만 있는 빈 폴더는 지울 것이 남은 것으로 세지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data")
+            repository = JsonRepository(settings)
+            institution_storage_dir(
+                settings.data_dir / "pending_uploads", "institution-abc", create=True
+            )
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+
+            self.assertEqual(set(), service.profile_ids_with_stored_data())
+            self.assertEqual(0, service.plan("institution-abc").pending_file_count)
+            self.assertTrue(service.plan("institution-abc").is_empty)
 
     def test_purged_records_do_not_return_after_reload(self) -> None:
         """저널을 다시 읽어도 지운 기록이 되살아나지 않아야 한다.

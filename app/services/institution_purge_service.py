@@ -17,7 +17,12 @@ import re
 import shutil
 
 from app.core.config import Settings, get_settings
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import (
+    INSTITUTION_STORAGE_MARKER,
+    institution_profile_id_from_storage_dir,
+    institution_storage_dirname,
+    tenant_storage_key,
+)
 from app.retrieval.bm25_index import default_bm25_index_path, write_bm25_index
 from app.services.document_service import DocumentService
 from app.storage.file_store import FileStore
@@ -329,12 +334,21 @@ class InstitutionPurgeService:
             result.failures.append(f"{document_id}: 색인 산출물 삭제 실패 ({exc})")
 
     def _profile_directory(self, name: str, profile_id: str) -> Path:
-        return Path(self.settings.data_dir) / name / tenant_storage_key(profile_id)
+        # 화면이 폴더를 만들 때 쓰는 이름과 같은 함수를 써야 한다. 여기서 이름을 따로
+        # 계산하면 셀 때도 지울 때도 폴더를 못 찾아, '지울 것이 없다'고 말한 뒤 아무것도
+        # 지우지 않는다.
+        return Path(self.settings.data_dir) / name / institution_storage_dirname(profile_id)
 
     def _directory_file_count(self, directory: Path) -> int:
         if not directory.is_dir():
             return 0
-        return sum(1 for path in directory.rglob("*") if path.is_file())
+        # 표식 파일은 운영자가 넣은 자료가 아니다. 세면 빈 폴더가 '파일 1개'로 보여
+        # 지울 것이 남은 것처럼 읽힌다.
+        return sum(
+            1
+            for path in directory.rglob("*")
+            if path.is_file() and path.name != INSTITUTION_STORAGE_MARKER
+        )
 
     def profile_ids_with_stored_data(self) -> set[str]:
         """규정 데이터가 남아 있는 기관 ID.
@@ -342,6 +356,11 @@ class InstitutionPurgeService:
         문서가 하나도 없어도 대기 중인 규정 파일이나 저장한 작업만 남아 있을 수 있다.
         문서만 보고 판단하면 그 기관은 화면 어디에도 나타나지 않아, 같은 이름으로 다시
         등록할 때 되살아난다.
+
+        폴더 이름은 기관 ID의 해시라 이름을 그대로 기관 ID로 쓰면 안 된다. 그렇게 하면
+        멀쩡히 등록된 기관이 '주인 없는 데이터'로 표시되고, 그 화면에서 지우면 살아 있는
+        기관의 대기 파일이 날아간다. 폴더 안에 적어 둔 표식만 믿는다. 표식이 없는 예전
+        폴더는 어느 기관 것인지 알 수 없으므로 보고하지 않는다.
         """
         found = {
             str(getattr(document, "profile_id", "") or "").strip().lower()
@@ -352,10 +371,11 @@ class InstitutionPurgeService:
             if not root.is_dir():
                 continue
             for directory in root.iterdir():
-                if directory.is_dir() and any(
-                    path.is_file() for path in directory.rglob("*")
-                ):
-                    found.add(directory.name.strip().lower())
+                if not directory.is_dir():
+                    continue
+                if not self._directory_file_count(directory):
+                    continue
+                found.add(institution_profile_id_from_storage_dir(directory))
         found.discard("")
         return found
 
