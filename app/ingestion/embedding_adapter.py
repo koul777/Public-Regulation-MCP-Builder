@@ -5,9 +5,13 @@ import json
 import math
 import re
 from collections import Counter
+from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Iterable
 
+from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import VECTOR_RECORD_SCHEMA_VERSION, stable_content_hash, vector_record_path_leaks
+from app.retrieval.semantic_models import Qwen3EmbeddingAdapter
 
 
 EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION = "reg-rag-embedded-vector-record-v1"
@@ -23,12 +27,20 @@ def embed_vector_record(
 ) -> dict[str, Any]:
     if record.get("schema_version") not in {VECTOR_RECORD_SCHEMA_VERSION, EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION}:
         raise ValueError(f"Unsupported vector record schema_version: {record.get('schema_version')}")
-    if model != LOCAL_HASH_EMBEDDING_MODEL:
+    if model not in {LOCAL_HASH_EMBEDDING_MODEL, QWEN3_EMBEDDING_MODEL}:
         raise ValueError(f"Unsupported embedding model: {model}")
     text = str(record.get("text") or "").strip()
     if not text:
         raise ValueError(f"Vector record {record.get('id') or ''} is missing text.")
-    embedding = local_hash_embedding(text, dimensions=dimensions)
+    if model == LOCAL_HASH_EMBEDDING_MODEL:
+        embedding = local_hash_embedding(text, dimensions=dimensions)
+        runtime = "deterministic_hash"
+        semantic = False
+    else:
+        embedding = _qwen_embedding_adapter(dimensions).encode_documents([text])[0]
+        dimensions = len(embedding)
+        runtime = "sentence_transformers"
+        semantic = True
     embedded = dict(record)
     embedded["schema_version"] = EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION
     embedded["source_schema_version"] = record.get("schema_version")
@@ -36,6 +48,10 @@ def embed_vector_record(
     embedded["embedding_dimensions"] = dimensions
     embedded["embedding"] = embedding
     embedded["embedding_hash"] = stable_embedding_hash(embedding)
+    embedded["embedding_runtime"] = runtime
+    embedded["embedding_semantic"] = semantic
+    embedded["embedding_normalized"] = True
+    embedded["embedding_generated_at"] = datetime.now(timezone.utc).isoformat()
     embedded["content_hash"] = stable_content_hash(text, embedded.get("metadata") or {})
     return embedded
 
@@ -72,6 +88,21 @@ def local_hash_embedding(text: str, *, dimensions: int = 384) -> list[float]:
     if norm:
         vector = [round(value / norm, 8) for value in vector]
     return vector
+
+
+@lru_cache(maxsize=4)
+def _qwen_embedding_adapter(dimensions: int) -> Qwen3EmbeddingAdapter:
+    if (
+        not isinstance(dimensions, int)
+        or isinstance(dimensions, bool)
+        or not 64 <= dimensions <= MAX_EMBEDDING_DIMENSIONS
+    ):
+        raise ValueError("Qwen3 embedding dimensions must be between 64 and 4096")
+    return Qwen3EmbeddingAdapter(
+        device="cpu",
+        truncate_dim=dimensions,
+        local_files_only=True,
+    )
 
 
 def summarize_embedded_records(

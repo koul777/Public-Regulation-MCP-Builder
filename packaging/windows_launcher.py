@@ -99,6 +99,18 @@ def portable_self_check() -> int:
     return 0
 
 
+def _positive_port_argument(arguments: list[str], name: str) -> int | None:
+    if name not in arguments:
+        return None
+    index = arguments.index(name)
+    if index + 1 >= len(arguments):
+        raise ValueError(f"{name} requires a port number")
+    port = int(arguments[index + 1])
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return port
+
+
 def main() -> int:
     if "--portable-self-check" in sys.argv[1:]:
         return portable_self_check()
@@ -116,16 +128,40 @@ def main() -> int:
         print(__version__)
         return 0
 
+    if "--qwen-chat" in sys.argv[1:] and "--help" in sys.argv[1:]:
+        from scripts.run_qwen_chat import main as run_qwen_chat
+
+        qwen_args = [argument for argument in sys.argv[1:] if argument != "--qwen-chat"]
+        return int(run_qwen_chat(qwen_args) or 0)
+
     bundle_root, runtime_root = _configure_runtime()
-    preferred_ui_port = int(os.getenv("REG_RAG_UI_PORT", "8501"))
-    ui_port = select_available_port(preferred_ui_port)
-    app_script = bundle_root / "frontend" / "streamlit_app.py"
+    arguments = list(sys.argv[1:])
+    qwen_chat_requested = "--qwen-chat" in arguments
+    if qwen_chat_requested:
+        from scripts.run_qwen_chat import launch_environment, validate_launch_environment
+
+        safe_environment = launch_environment()
+        try:
+            validate_launch_environment(safe_environment)
+        except ValueError as exc:
+            print(f"[실행 중단] {exc}")
+            return 2
+        os.environ.clear()
+        os.environ.update(safe_environment)
+        requested_port = _positive_port_argument(arguments, "--port")
+        preferred_ui_port = requested_port or int(os.getenv("REG_RAG_QWEN_CHAT_PORT", "8502"))
+        ui_port = preferred_ui_port if requested_port else select_available_port(preferred_ui_port)
+        app_script = bundle_root / "frontend" / "qwen_chat_app.py"
+    else:
+        preferred_ui_port = int(os.getenv("REG_RAG_UI_PORT", "8501"))
+        ui_port = select_available_port(preferred_ui_port)
+        app_script = bundle_root / "frontend" / "streamlit_app.py"
     if not app_script.exists():
         print(f"[실행 오류] 프로그램 화면 파일을 찾을 수 없습니다: {app_script}")
         input("Enter 키를 누르면 닫힙니다.")
         return 2
 
-    print("공공기관 규정 MCP 빌더를 시작합니다.")
+    print("독립 Qwen 규정 챗봇을 시작합니다." if qwen_chat_requested else "공공기관 규정 MCP 빌더를 시작합니다.")
     if ui_port != preferred_ui_port:
         print(f"기본 포트 {preferred_ui_port}이 사용 중이어서 {ui_port} 포트를 자동 선택했습니다.")
     print(f"브라우저 주소: http://127.0.0.1:{ui_port}")
@@ -140,7 +176,7 @@ def main() -> int:
         str(app_script),
         "--server.address=127.0.0.1",
         f"--server.port={ui_port}",
-        "--server.headless=false",
+        f"--server.headless={'true' if '--headless' in arguments else 'false'}",
         "--server.maxUploadSize=1000",
         "--global.developmentMode=false",
         "--browser.gatherUsageStats=false",

@@ -443,9 +443,9 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            next(button for button in app.button if button.label == "④ MCP 생성·AI 연결로 이동").click().run()
+            next(button for button in app.button if button.label == "④ Qwen 규정 챗봇·AI 연결로 이동").click().run()
 
-        self.assertEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
+        self.assertEqual("④ Qwen 규정 챗봇·AI 연결", app.session_state["nav_page"])
         self.assertNotIn("workflow_transition_state", app.session_state.filtered_state)
         self.assertFalse(app.exception)
 
@@ -480,13 +480,13 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             )
             next(
                 radio for radio in app.radio if radio.label == "기본 작업 순서"
-            ).set_value("④ MCP 생성·AI 연결").run()
+            ).set_value("④ Qwen 규정 챗봇·AI 연결").run()
 
         self.assertFalse(results_button.disabled)
         self.assertFalse(
-            any(button.label == "④ MCP 생성·AI 연결로 이동" for button in app.button)
+            any(button.label == "④ Qwen 규정 챗봇·AI 연결로 이동" for button in app.button)
         )
-        self.assertNotEqual("④ MCP 생성·AI 연결", app.session_state["nav_page"])
+        self.assertNotEqual("④ Qwen 규정 챗봇·AI 연결", app.session_state["nav_page"])
         self.assertFalse(app.exception)
 
     def test_approval_tabs_approve_only_reviewed_compare_chunk(self) -> None:

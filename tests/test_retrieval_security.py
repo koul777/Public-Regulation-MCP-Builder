@@ -17,7 +17,7 @@ class RetrievalSecurityTests(unittest.TestCase):
 
         scored, metadata = search("병가 규정", visible_records, index, top_k=10, index_records=all_records)
 
-        self.assertEqual("kiwi-bm25-v1", metadata["retrieval_model"])
+        self.assertEqual("hybrid-bm25-hash-v1", metadata["retrieval_model"])
         self.assertEqual(["doc:approved"], [record["id"] for _score, record in scored])
 
 

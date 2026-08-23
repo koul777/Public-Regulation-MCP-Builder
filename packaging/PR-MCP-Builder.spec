@@ -21,12 +21,14 @@ hiddenimports += [
     "scripts.mcp_connection_diagnostic",
     "scripts.refresh_mcp_client_connection",
     "scripts.find_available_ui_port",
+    "scripts.run_qwen_chat",
     "scripts.run_regulation_mcp",
 ]
 
 datas = list(streamlit_datas)
 datas += [
     (str(project_root / "frontend" / "streamlit_app.py"), "frontend"),
+    (str(project_root / "frontend" / "qwen_chat_app.py"), "frontend"),
 ]
 
 a = Analysis(

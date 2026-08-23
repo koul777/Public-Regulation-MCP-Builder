@@ -34,14 +34,19 @@ class Settings:
     enable_agent_review: bool = _env_bool("ENABLE_AGENT_REVIEW", False)
     llm_provider: str = os.getenv("LLM_PROVIDER", "openai")
     rag_llm_backend: str = os.getenv("RAG_LLM_BACKEND", "extractive")
-    rag_llm_endpoint: str = os.getenv("RAG_LLM_ENDPOINT", "")
-    rag_llm_model: str = os.getenv("RAG_LLM_MODEL", "")
+    rag_llm_endpoint: str = os.getenv("RAG_LLM_ENDPOINT", "http://127.0.0.1:11434")
+    # Recommended local QA model. The backend remains extractive by default so
+    # installations without a local model continue to work safely. Set
+    # RAG_LLM_BACKEND=ollama to use the default Ollama model.
+    rag_llm_model: str = os.getenv("RAG_LLM_MODEL", "qwen3:8b")
     rag_llm_timeout_seconds: int = int(os.getenv("RAG_LLM_TIMEOUT_SECONDS", "30"))
     rag_llm_max_output_chars: int = int(os.getenv("RAG_LLM_MAX_OUTPUT_CHARS", "2000"))
     rag_rate_limit_requests_per_window: int = int(os.getenv("RAG_RATE_LIMIT_REQUESTS_PER_WINDOW", "120"))
     rag_rate_limit_window_seconds: int = int(os.getenv("RAG_RATE_LIMIT_WINDOW_SECONDS", "60"))
     rag_trace_enabled: bool = _env_bool("RAG_TRACE_ENABLED", True)
     agent_review_model: str = os.getenv("AGENT_REVIEW_MODEL", "gpt-4.1-mini")
+    local_structure_review_enabled: bool = _env_bool("LOCAL_STRUCTURE_REVIEW_ENABLED", False)
+    local_structure_review_max_nodes: int = int(os.getenv("LOCAL_STRUCTURE_REVIEW_MAX_NODES", "12"))
     agent_review_api_base_url: str = os.getenv("AGENT_REVIEW_API_BASE_URL", "https://api.openai.com")
     # 한 번에 20개를 보내면 교정본 출력이 1만 토큰을 넘겨 응답이 늦고, 늦으면 그 20개가
     # 통째로 사라졌다. 작게 나눠 여러 번 부르고 실패한 묶음만 다시 부른다.

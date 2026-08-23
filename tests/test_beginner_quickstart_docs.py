@@ -9,25 +9,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class BeginnerQuickstartDocsTests(unittest.TestCase):
-    def test_readme_keeps_today_and_prior_update_summaries_above_product(self) -> None:
+    def test_readme_puts_product_first_and_keeps_update_history_ordered(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        today_heading = "# 최근 업데이트: 2026년 8월 8일"
-        # 새 절을 맨 위에 얹을 때마다 이전 절은 순서대로 아래로 내려가야 한다. 위에서
-        # 아래로 최신순이 아니면 무엇이 지금 버전인지 읽는 사람이 알 수 없다.
+        today_heading = "# 최근 업데이트: 2026년 8월 23일"
+        # 첫 화면에는 제품 설명과 데모를 두고, 긴 변경 이력은 문서 뒤에서 최신순으로
+        # 펼쳐 보게 한다. 새 절을 추가해도 과거 이력의 순서는 유지해야 한다.
         prior_headings = (
             "# 이전 업데이트: 2026년 8월 3일",
             "# 이전 업데이트: 2026년 7월 29일~8월 1일",
         )
         prior_heading = prior_headings[-1]
-        product_heading = "# PR MCP Builder"
+        product_heading = "# PR MCP Builder v1.2.21"
+        history_anchor = '<a id="update-history"></a>'
 
-        self.assertTrue(readme.startswith(today_heading))
+        self.assertTrue(readme.startswith(product_heading))
+        self.assertLess(readme.index(product_heading), readme.index(today_heading))
+        self.assertIn('[업데이트 내역 보기](#update-history)', readme)
+        self.assertGreater(readme.index(history_anchor), readme.index("## Kordoc 사용 고지"))
+        self.assertLess(readme.index(history_anchor), readme.index(today_heading))
+        history = readme[readme.index(history_anchor) :]
+        self.assertIn("<details>", history)
+        self.assertIn("기존 사용자 변경 이력 펼치기", history)
+        self.assertEqual(history.count("<details>"), history.count("</details>"))
+        self.assertTrue(history.rstrip().endswith("</details>"))
         previous_index = readme.index(today_heading)
         for heading in prior_headings:
             self.assertLess(previous_index, readme.index(heading))
             previous_index = readme.index(heading)
-        self.assertLess(previous_index, readme.index(product_heading))
-        # 이번 절이 실제로 무엇을 고쳤는지 남긴다. 날짜만 바꾸고 내용을 비워 두면
+        # 최신 절이 실제로 무엇을 고쳤는지 남긴다. 날짜만 바꾸고 내용을 비워 두면
         # 업데이트 내역이 있으나 마나 해진다.
         for phrase in (
             "Request timeout",
@@ -37,7 +46,10 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "기관을 지우면 정말 지워지도록",
         ):
             with self.subTest(phrase=phrase):
-                self.assertIn(phrase, readme[: readme.index(prior_headings[0])])
+                self.assertIn(
+                    phrase,
+                    readme[readme.index(today_heading) : readme.index(prior_headings[0])],
+                )
         for phrase in (
             "초보자 안내 모드 추가",
             "개별 규정 파일과 합본 규정집의 결과 통일",
@@ -45,11 +57,14 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "list_regulations",
         ):
             with self.subTest(phrase=phrase):
-                self.assertIn(phrase, readme[: readme.index(prior_heading)])
-        self.assertLess(readme.index("## 7월 29일"), readme.index(product_heading))
-        self.assertLess(readme.index("## 7월 31일"), readme.index(product_heading))
-        self.assertLess(readme.index("## 8월 1일"), readme.index(product_heading))
-        self.assertIn("비전공자도 이해하기 쉽도록", readme[: readme.index(product_heading)])
+                self.assertIn(
+                    phrase,
+                    readme[readme.index(today_heading) : readme.index(prior_heading)],
+                )
+        self.assertLess(readme.index(product_heading), readme.index("## 7월 29일"))
+        self.assertLess(readme.index("## 7월 29일"), readme.index("## 7월 31일"))
+        self.assertLess(readme.index("## 7월 31일"), readme.index("## 8월 1일"))
+        self.assertIn("비전공자도 이해하기 쉽도록", readme[readme.index(today_heading) :])
 
     def test_readme_puts_beginner_flow_before_connection_details(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -66,7 +81,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
                 "① 문서 올려서 전처리",
                 "② 결과 확인",
                 "③ 검수하고 승인",
-                "④ MCP 생성·AI 연결",
+                "④ Qwen 규정 챗봇·AI 연결",
             )
         ]
         self.assertEqual(sorted(positions), positions)
@@ -118,7 +133,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
                 "① 문서 올려서 전처리",
                 "② 결과 확인",
                 "③ 검수하고 승인",
-                "④ MCP 생성·AI 연결",
+                "④ Qwen 규정 챗봇·AI 연결",
             )
         ]
         self.assertEqual(sorted(positions), positions)

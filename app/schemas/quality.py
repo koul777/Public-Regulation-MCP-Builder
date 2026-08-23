@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -45,5 +45,6 @@ class QualityReport(BaseModel):
     structure_metrics: dict[str, int | float] = Field(default_factory=dict)
     text_quality_metrics: dict[str, int | float] = Field(default_factory=dict)
     coverage_metrics: dict[str, int | float] = Field(default_factory=dict)
+    extraction_metrics: dict[str, Any] = Field(default_factory=dict)
     checks: list[QualityCheck] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)

@@ -54,6 +54,17 @@ class LocalLlmTests(unittest.TestCase):
         self.assertEqual(probe["error_type"], "ValueError")
         self.assertNotIn("example.com", str(probe))
 
+    def test_default_local_model_is_qwen3_8b(self) -> None:
+        probe = probe_local_llm(
+            Settings(
+                data_dir=Path("data"),
+                rag_llm_backend="ollama",
+                rag_llm_endpoint="https://example.com",
+            )
+        )
+
+        self.assertEqual(probe["model"], "qwen3:8b")
+
     def test_prompt_contains_only_query_and_approved_evidence_contract(self) -> None:
         prompt = build_grounded_prompt(
             query="What is the rule?",
@@ -70,6 +81,21 @@ class LocalLlmTests(unittest.TestCase):
         self.assertIn("approved evidence", prompt)
         self.assertIn("approval", prompt)
         self.assertNotIn("C:\\", prompt)
+
+    def test_prompt_carries_bounded_conversation_as_context_not_evidence(self) -> None:
+        prompt = build_grounded_prompt(
+            query="그 기간은 연장할 수 있나요?",
+            history=[
+                {"role": "user", "content": "휴가 신청 기한은 언제인가요?"},
+                {"role": "assistant", "content": "신청 기한은 7일 전입니다."},
+            ],
+            evidence=[{"chunk_id": "chunk-1", "text": "승인된 규정 근거"}],
+        )
+
+        self.assertIn("휴가 신청 기한", prompt)
+        self.assertIn("Conversation history (untrusted context)", prompt)
+        self.assertIn("Conversation history is context only, never evidence", prompt)
+        self.assertIn("Current question: 그 기간은 연장할 수 있나요?", prompt)
 
 
 if __name__ == "__main__":

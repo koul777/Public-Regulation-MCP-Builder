@@ -16,10 +16,16 @@ from app.parsers.base import (
     document_name_from_path,
     parser_uncertainty_metadata,
 )
+from app.parsers.paddle_ocr import (
+    KOREAN_PPOCRV5_MODEL,
+    OcrPageResult,
+    PaddleKoreanOcrAdapter,
+)
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 
 ROMAN_FOOTNOTE_MARKERS = {chr(code) for code in range(0x2170, 0x2178)}
+PADDLE_OCR_BACKENDS = {"paddle", "paddleocr", "ppocrv5", "korean-ppocrv5"}
 
 
 class PDFParser(BaseParser):
@@ -61,6 +67,8 @@ class PDFParser(BaseParser):
         footnote_links: list[dict] = []
         footnote_marker_references: list[dict] = []
         ambiguous_two_column_pages: list[int] = []
+        paddle_ocr_results: list[OcrPageResult] = []
+        paddle_ocr_error_type = ""
         try:
             with fitz.open(path) as doc:
                 for page_index, page in enumerate(doc, start=1):
@@ -92,6 +100,32 @@ class PDFParser(BaseParser):
         except Exception as exc:
             raise ParserError(f"Failed to parse PDF file: {exc}") from exc
 
+        if self.ocr_backend in PADDLE_OCR_BACKENDS and pages:
+            candidate_pages = list(missing_content_pages)
+            if not raw_parts:
+                candidate_pages = [page.page_no for page in pages]
+            if self.ocr_max_pages is not None:
+                candidate_pages = candidate_pages[: self.ocr_max_pages]
+            if candidate_pages:
+                try:
+                    paddle_ocr_results = self._extract_paddle_ocr_pages(path, candidate_pages)
+                    pages = self._merge_ocr_results(pages, paddle_ocr_results)
+                    successful_pages = {
+                        result.page_no for result in paddle_ocr_results if result.text.strip()
+                    }
+                    blank_pages = [page_no for page_no in blank_pages if page_no not in successful_pages]
+                    missing_content_pages = [
+                        page_no for page_no in missing_content_pages if page_no not in successful_pages
+                    ]
+                    raw_parts = [
+                        str(block.metadata.get("raw_text") or block.text).strip()
+                        for page in pages
+                        for block in page.blocks
+                        if str(block.metadata.get("raw_text") or block.text).strip()
+                    ]
+                except Exception as exc:
+                    paddle_ocr_error_type = type(exc).__name__
+
         if not raw_parts:
             if self.ocr_backend == "windows":
                 try:
@@ -113,6 +147,21 @@ class PDFParser(BaseParser):
                             remediation_hint="Run OCR outside the parser or provide a text-embedded PDF before approval.",
                         )["parser_uncertainty"],
                     ) from exc
+            if self.ocr_backend in PADDLE_OCR_BACKENDS:
+                raise OCRRequiredError(
+                    "No text blocks were extracted from the PDF file. "
+                    "Korean PP-OCRv5 fallback did not produce reviewable text.",
+                    page_count=len(pages),
+                    file_type="pdf",
+                    uncertainty_report=parser_uncertainty_metadata(
+                        source="pdf",
+                        risk_level="high",
+                        flags=["no_text_extracted", "ocr_required", "paddle_ocr_failed"],
+                        confidence=0.0,
+                        recommendation="run_ocr",
+                        remediation_hint="Install and run Korean PP-OCRv5, then review OCR text before approval.",
+                    )["parser_uncertainty"],
+                )
             raise OCRRequiredError(
                 "No text blocks were extracted from the PDF file. OCR may be required.",
                 page_count=len(pages),
@@ -132,6 +181,27 @@ class PDFParser(BaseParser):
         recommendation = "none"
         risk_level = "low"
         confidence = 0.95
+        if paddle_ocr_results:
+            successful_results = [result for result in paddle_ocr_results if result.text.strip()]
+            if successful_results:
+                uncertainty_flags.append("paddle_ocr_text_extracted")
+                remediation_hints.append(
+                    "Review Korean PP-OCRv5 text before approval on PDF page(s): "
+                    + ", ".join(str(result.page_no) for result in successful_results)
+                    + "."
+                )
+                recommendation = "review_ocr_text"
+                risk_level = "medium"
+                confidence = min(
+                    confidence,
+                    min(result.mean_confidence for result in successful_results),
+                )
+        if paddle_ocr_error_type:
+            uncertainty_flags.append("paddle_ocr_failed")
+            remediation_hints.append("Korean PP-OCRv5 failed for one or more image-only pages.")
+            recommendation = "review_ocr_text"
+            risk_level = "medium"
+            confidence = min(confidence, 0.65)
         if ambiguous_two_column_pages:
             uncertainty_flags.append("pdf_two_column_reading_order_ambiguous")
             remediation_hints.append(
@@ -202,8 +272,112 @@ class PDFParser(BaseParser):
                 "pdf_table_regions": table_regions,
                 "pdf_footnote_links": footnote_links,
                 "pdf_footnote_marker_references": footnote_marker_references,
+                "ocr_backend": "paddleocr" if paddle_ocr_results else None,
+                "ocr_model_id": KOREAN_PPOCRV5_MODEL if paddle_ocr_results else None,
+                "ocr_page_numbers": [
+                    result.page_no for result in paddle_ocr_results if result.text.strip()
+                ],
+                "ocr_mean_confidence": (
+                    round(
+                        sum(result.mean_confidence for result in paddle_ocr_results if result.text.strip())
+                        / max(1, sum(1 for result in paddle_ocr_results if result.text.strip())),
+                        6,
+                    )
+                    if any(result.text.strip() for result in paddle_ocr_results)
+                    else None
+                ),
+                "ocr_dropped_low_confidence_lines": sum(
+                    result.dropped_low_confidence_lines for result in paddle_ocr_results
+                ),
+                "ocr_error_type": paddle_ocr_error_type or None,
             },
         )
+
+    def _extract_paddle_ocr_pages(
+        self,
+        path: Path,
+        page_numbers: list[int],
+    ) -> list[OcrPageResult]:
+        try:
+            from app.utils.fitz_compat import fitz
+        except ImportError as exc:
+            raise ParserError("PDF OCR rendering requires PyMuPDF. Install package 'pymupdf'.") from exc
+
+        with tempfile.TemporaryDirectory(prefix="reg_rag_ppocrv5_") as tmp:
+            tmp_path = Path(tmp)
+            image_paths: list[Path] = []
+            try:
+                with fitz.open(path) as doc:
+                    for page_no in page_numbers:
+                        if page_no < 1 or page_no > len(doc):
+                            raise ParserError("OCR page number is outside the PDF page range.")
+                        image_path = tmp_path / f"page_{page_no:04d}.png"
+                        page = doc[page_no - 1]
+                        pixmap = page.get_pixmap(
+                            matrix=fitz.Matrix(self.ocr_render_scale, self.ocr_render_scale),
+                            alpha=False,
+                        )
+                        pixmap.save(image_path)
+                        image_paths.append(image_path)
+            except ParserError:
+                raise
+            except Exception as exc:
+                raise ParserError(f"Failed to render selected PDF pages for PaddleOCR: {exc}") from exc
+            try:
+                return PaddleKoreanOcrAdapter().recognize_pages(
+                    image_paths,
+                    page_numbers=page_numbers,
+                )
+            except Exception as exc:
+                raise ParserError(f"Korean PP-OCRv5 execution failed: {type(exc).__name__}") from exc
+
+    @staticmethod
+    def _merge_ocr_results(
+        pages: list[ParsedPage],
+        results: list[OcrPageResult],
+    ) -> list[ParsedPage]:
+        by_page = {result.page_no: result for result in results if result.text.strip()}
+        merged: list[ParsedPage] = []
+        for page in pages:
+            result = by_page.get(page.page_no)
+            has_text = any(block.text.strip() for block in page.blocks)
+            if result is None or has_text:
+                merged.append(page)
+                continue
+            blocks = [
+                ParsedBlock(
+                    type="text",
+                    text=line.text,
+                    bbox=line.bbox,
+                    metadata={
+                        "raw_text": line.text,
+                        "source_page": page.page_no,
+                        "source_bbox": list(line.bbox) if line.bbox else None,
+                        "ocr_backend": result.backend,
+                        "ocr_model_id": result.model_id,
+                        "ocr_confidence": line.confidence,
+                        "ocr_review_required": True,
+                    },
+                )
+                for line in result.lines
+            ]
+            if not blocks:
+                blocks = [
+                    ParsedBlock(
+                        type="text",
+                        text=result.text,
+                        metadata={
+                            "raw_text": result.text,
+                            "source_page": page.page_no,
+                            "ocr_backend": result.backend,
+                            "ocr_model_id": result.model_id,
+                            "ocr_confidence": result.mean_confidence,
+                            "ocr_review_required": True,
+                        },
+                    )
+                ]
+            merged.append(page.model_copy(update={"blocks": blocks}))
+        return merged
 
     def _layout_line_blocks(self, page, page_no: int) -> list[ParsedBlock]:
         groups = self._visual_char_groups(page)

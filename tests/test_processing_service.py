@@ -242,6 +242,23 @@ class ProcessingServiceTests(unittest.TestCase):
         self.assertEqual("skipped", agent_review["status"])
         self.assertEqual("agent_review_not_requested", agent_review["skip_reason"])
         self.assertEqual(0, agent_review["api_call_count"])
+        pipeline_trace = completed_run.stats["pipeline_trace"]
+        quality_stage = next(
+            stage for stage in pipeline_trace["stages"] if stage["stage_id"] == "quality_gate"
+        )
+        quality_roles = {
+            item["role_id"]: item for item in quality_stage["agent_role_statuses"]
+        }
+        quality_status = quality_roles["quality_gate"]["status"]
+        self.assertIn(quality_status, {"completed", "review_required"})
+        self.assertEqual(
+            "pending" if quality_status == "completed" else "review_required",
+            quality_roles["human_approval_gate"]["status"],
+        )
+        export_stage = next(
+            stage for stage in pipeline_trace["stages"] if stage["stage_id"] == "export"
+        )
+        self.assertEqual("completed", export_stage["agent_role_statuses"][0]["status"])
         self.assertIn((85, "전처리 결과 검증을 마무리하는 중"), progress_events)
         self.assertFalse(any("AI 검수" in message for _, message in progress_events))
 
