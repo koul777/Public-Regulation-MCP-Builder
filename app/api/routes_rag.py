@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -52,7 +53,12 @@ from app.agents.model_router import (
     model_profile_manifest,
 )
 from app.agents.ollama_runtime import OllamaRuntime
-from app.agents.query_agents import QueryAnalysisAgent, QueryRewriteAgent
+from app.agents.query_agents import (
+    QueryAnalysis,
+    QueryAnalysisAgent,
+    QueryRewriteAgent,
+    deterministic_query_analysis,
+)
 from app.agents.role_registry import workflow_roles
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import APPROVED_CHUNK_STATUS, stable_content_hash, vector_record_from_chunk
@@ -136,6 +142,7 @@ _RAG_VECTOR_RECORD_CACHE: dict[Path, tuple[_FileIdentitySignature, list[dict[str
 _RAG_BM25_INDEX_CACHE: dict[Path, tuple[_FileIdentitySignature, Any]] = {}
 _RAG_REBUILT_BM25_INDEX_CACHE: dict[Path, tuple[_FileIdentitySignature, str, Any]] = {}
 _RAG_VISIBLE_RECORDS_CACHE_LOCK = threading.Lock()
+_RAG_RERANKER_LOCK = threading.Lock()
 _RAG_VISIBLE_RECORDS_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
 _RAG_VISIBLE_RECORDS_MAX_ENTRIES = 512
 _RAG_VECTOR_SOURCE_HASH_CACHE: dict[Path, tuple[_FileIdentitySignature, str]] = {}
@@ -260,6 +267,15 @@ def search_rag_records(
     lifecycle_complete = sum(1 for record in visible_records if _has_complete_lifecycle_metadata(record))
     timing_ms["visibility_filter_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     multi_model = _use_multi_model_orchestration(request, settings)
+    deterministic_analysis = deterministic_query_analysis(request.query)
+    exact_locator_fast_path = bool(
+        request.document_id and _is_exact_article_locator_query(deterministic_analysis)
+    )
+    exact_locator_scored = (
+        _exact_article_locator_matches(deterministic_analysis, visible_records)
+        if exact_locator_fast_path
+        else []
+    )
     query_execution: dict[str, Any] = {
         "enabled": False,
         "analysis_mode": "deterministic_existing_query",
@@ -269,8 +285,32 @@ def search_rag_records(
         "search_query_count": 1,
         "search_queries": [request.query],
     }
-    if multi_model:
+    if exact_locator_fast_path:
+        query_execution = {
+            "enabled": False,
+            "analysis_mode": "deterministic_exact_locator",
+            "rewrite_mode": "deterministic_exact_locator",
+            "intent": deterministic_analysis.intent,
+            "locator_count": len(deterministic_analysis.locators),
+            "search_query_count": 1,
+            "search_queries": [request.query],
+            "query_model": "deterministic",
+            "query_fallback_reason": "",
+            "rewrite_fallback_reason": "",
+            "exact_locator_fast_path": True,
+        }
+        _emit_rag_chat_progress(
+            "retrieval",
+            34,
+            "선택한 규정에서 조문 번호가 정확히 일치하는 승인 조항을 확인하는 중",
+        )
+    elif multi_model:
         step_started_at = time.perf_counter()
+        _emit_rag_chat_progress(
+            "query_analysis",
+            12,
+            "Qwen3 1.7B가 질문의 검색 조건을 분석하는 중",
+        )
         runtime = OllamaRuntime(settings.rag_llm_endpoint)
         analysis = QueryAnalysisAgent(runtime).analyze(request.query)
         rewrite = QueryRewriteAgent(runtime).rewrite(analysis)
@@ -288,29 +328,53 @@ def search_rag_records(
         }
         timing_ms["query_agents_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
-    scored, retrieval = _score_records_for_queries(
-        query_execution["search_queries"],
-        visible_records,
-        settings=settings,
-        auth=auth,
-        all_records=records,
-    )
+    if exact_locator_fast_path:
+        scored = exact_locator_scored
+        retrieval = {
+            "retrieval_model": "deterministic-exact-article-v1",
+            "semantic_embedding_model": "not_used",
+            "retrieval_fallback": False,
+            "bm25_index_status": "bypassed_exact_locator",
+            "query_expanded": False,
+            "exact_locator_fast_path": True,
+            "exact_locator_match_count": len(scored),
+        }
+    else:
+        _emit_rag_chat_progress(
+            "retrieval",
+            24,
+            "승인된 조항을 키워드와 의미 검색으로 찾는 중",
+        )
+        scored, retrieval = _score_records_for_queries(
+            query_execution["search_queries"],
+            visible_records,
+            settings=settings,
+            auth=auth,
+            all_records=records,
+        )
     timing_ms["scoring_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     reranker_status = "not_requested"
     reranker_reason = ""
-    if multi_model and scored:
+    if multi_model and scored and not exact_locator_fast_path:
         step_started_at = time.perf_counter()
         try:
             local_reranker_path = Path("data/semantic_runtime_models/qwen3-reranker-0.6b")
-            scored = Qwen3RerankerAdapter(
-                device="cpu",
-                local_files_only=True,
-                model_path=local_reranker_path if local_reranker_path.exists() else None,
-            ).rerank(
-                request.query,
-                scored,
-                top_k=min(max(request.top_k, 10), len(scored)),
+            reranker_candidates = scored[
+                : min(len(scored), max(10, min(request.top_k * 2, 20)))
+            ]
+            _emit_rag_chat_progress(
+                "rerank",
+                36,
+                f"관련도가 높은 후보 {len(reranker_candidates)}개를 재정렬하는 중",
             )
+            with _RAG_RERANKER_LOCK:
+                scored = _cached_qwen3_reranker(
+                    str(local_reranker_path.resolve()) if local_reranker_path.exists() else ""
+                ).rerank(
+                    request.query,
+                    reranker_candidates,
+                    top_k=min(max(request.top_k, 10), len(reranker_candidates)),
+                )
             reranker_status = "completed"
         except Exception as exc:
             reranker_status = "degraded"
@@ -319,7 +383,13 @@ def search_rag_records(
     retrieval.update(
         {
             **{key: value for key, value in query_execution.items() if key != "search_queries"},
-            "reranker_model": QWEN3_RERANKER_MODEL if multi_model else "deterministic_structured_boosts",
+            "reranker_model": (
+                "deterministic_exact_locator"
+                if exact_locator_fast_path
+                else QWEN3_RERANKER_MODEL
+                if multi_model
+                else "deterministic_structured_boosts"
+            ),
             "reranker_status": reranker_status,
             "reranker_reason": reranker_reason,
         }
@@ -436,11 +506,6 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
         chat_history = _chat_history_payload(request.history)
         contextualized_query = _contextualized_chat_query(request.query, chat_history)
         search_request = request.model_copy(update={"query": contextualized_query})
-        _emit_rag_chat_progress(
-            "retrieval",
-            18,
-            "승인·색인된 규정에서 근거 조문을 검색하는 중",
-        )
         results, search_trace = search_rag_records(search_request, auth, execution_settings)
         _emit_rag_chat_progress(
             "context_build",
@@ -1962,6 +2027,72 @@ def _department_acl_set(value: Any) -> set[str]:
     if value is None:
         return set()
     return set(normalize_department_ids(value))
+
+
+def _exact_article_locator_matches(
+    analysis: QueryAnalysis,
+    records: list[dict[str, Any]],
+) -> list[tuple[float, dict[str, Any]]]:
+    """Return already-visible exact article matches without loading search models.
+
+    This intentionally handles only one unambiguous article locator in the
+    currently selected document. Comparisons, paragraph-only questions and
+    temporal questions continue through the normal hybrid retrieval path.
+    """
+
+    if not _is_exact_article_locator_query(analysis):
+        return []
+    locator = analysis.locators[0]
+    expected = _normalize_reference_label(locator.canonical)
+    if not expected:
+        return []
+
+    matches: list[tuple[float, dict[str, Any]]] = []
+    for position, record in enumerate(records):
+        metadata = record.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        article_no = _normalize_reference_label(str(metadata.get("article_no") or ""))
+        if article_no != expected:
+            continue
+        matches.append((round(max(0.5, 1.0 - position * 0.000001), 8), record))
+    return matches
+
+
+def _is_exact_article_locator_query(analysis: QueryAnalysis) -> bool:
+    if (
+        analysis.requires_temporal_filter
+        or len(analysis.locators) != 1
+        or analysis.locators[0].kind != "article"
+    ):
+        return False
+
+    # Only plain requests for the named article may skip semantic retrieval.
+    # Relationship, sanction, attachment and cross-article questions must keep
+    # the normal analysis/search path even when they mention one article.
+    remainder = analysis.normalized_query.replace(analysis.locators[0].raw, "", 1)
+    compact = re.sub(r"[\s?？!.。]+", "", remainder)
+    return bool(
+        re.fullmatch(
+            r"(?:(?:은|는|이|가|을|를|의)?"
+            r"(?:내용|원문|전문|조문|목적|취지)?"
+            r"(?:은|는|이|가|을|를)?"
+            r"(?:에대해(?:서)?|에관해(?:서)?)?"
+            r"(?:알려줘|알려주세요|설명해줘|설명해주세요|보여줘|보여주세요|"
+            r"뭐야|무엇이야|무엇인가요|인가요)?)?",
+            compact,
+        )
+    )
+
+
+@lru_cache(maxsize=2)
+def _cached_qwen3_reranker(local_model_path: str) -> Qwen3RerankerAdapter:
+    """Reuse the CPU reranker instead of loading its weights for every question."""
+
+    return Qwen3RerankerAdapter(
+        device="cpu",
+        local_files_only=True,
+        model_path=Path(local_model_path) if local_model_path else None,
+    )
 
 
 def _use_multi_model_orchestration(request: RagSearchRequest, settings: Settings) -> bool:

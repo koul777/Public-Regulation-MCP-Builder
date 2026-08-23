@@ -39,6 +39,7 @@ MAX_HISTORY_MESSAGES = 12
 _STAGE_LABELS = {
     "query_analysis": "1/5 질문과 검색 범위를 확인하고 있습니다.",
     "retrieval": "2/5 승인된 규정 조항을 찾고 있습니다.",
+    "rerank": "2/5 찾은 조항의 관련도 순서를 정리하고 있습니다.",
     "context_build": "3/5 답변에 사용할 근거를 정리하고 있습니다.",
     "answer_generation": "4/5 Qwen3 8B가 근거 안에서 답변을 만들고 있습니다.",
     "claim_audit": "4/5 답변의 근거 연결을 확인하고 있습니다.",

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.agents.claim_auditor import ClaimAuditResult, ClaimFinding, ExactCitation
 from app.agents.grounded_qa import AnswerClaim, GroundedAnswerDraft
+from app.agents.query_agents import deterministic_query_rewrite
 from app.api import routes_rag
 from app.core.config import Settings
 from app.core.security import AuthContext
@@ -128,6 +129,272 @@ class OrchestratedRagTests(unittest.TestCase):
                 Settings(data_dir=Path("data"), rag_llm_backend="extractive"),
             )
         )
+
+    def test_exact_article_locator_matches_only_the_exact_visible_article(self) -> None:
+        analysis = routes_rag.deterministic_query_analysis("제1조에 대해서 알려줘")
+        records = [
+            {"id": "article-1", "metadata": {"article_no": "제1조"}},
+            {"id": "article-11", "metadata": {"article_no": "제11조"}},
+            {
+                "id": "tampered-top-level",
+                "article_no": "제1조",
+                "metadata": {"article_no": "제11조"},
+            },
+        ]
+
+        matches = routes_rag._exact_article_locator_matches(analysis, records)
+
+        self.assertEqual(["article-1"], [record["id"] for _, record in matches])
+
+    def test_exact_article_fast_path_rejects_ambiguous_or_temporal_locators(self) -> None:
+        self.assertTrue(
+            routes_rag._is_exact_article_locator_query(
+                routes_rag.deterministic_query_analysis("제1조에 대해서 알려줘")
+            )
+        )
+        for query in (
+            "제1조와 제2조를 비교해줘",
+            "제1항에 대해서 알려줘",
+            "2025년 1월 1일 기준 제1조를 알려줘",
+            "적용 대상을 알려줘",
+            "제1조와 관련된 별표를 알려줘",
+            "제1조 위반 시 제재는 어느 조문이야",
+            "제1조의 마지막 내용을 알려줘",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(
+                    routes_rag._is_exact_article_locator_query(
+                        routes_rag.deterministic_query_analysis(query)
+                    )
+                )
+
+    def test_document_scoped_exact_article_search_skips_all_retrieval_models(self) -> None:
+        records = [
+            {
+                "id": "doc-1:chunk-1",
+                "document_id": "doc-1",
+                "chunk_id": "chunk-1",
+                "text": "제1조(목적) 이 규정은 승인된 근거만 사용한다.",
+                "metadata": {
+                    "document_id": "doc-1",
+                    "chunk_id": "chunk-1",
+                    "article_no": "제1조",
+                    "article_title": "목적",
+                    "regulation_title": "샘플규정",
+                    "approval_status": "approved",
+                    "approval_id": "approval-1",
+                },
+            },
+            {
+                "id": "doc-1:chunk-11",
+                "document_id": "doc-1",
+                "chunk_id": "chunk-11",
+                "text": "제11조 다른 내용",
+                "metadata": {
+                    "document_id": "doc-1",
+                    "chunk_id": "chunk-11",
+                    "article_no": "제11조",
+                    "regulation_title": "샘플규정",
+                    "approval_status": "approved",
+                    "approval_id": "approval-11",
+                },
+            },
+        ]
+        request = routes_rag.RagSearchRequest(
+            query="제1조에 대해서 알려줘",
+            document_id="doc-1",
+            top_k=5,
+            orchestration_mode="multi_model",
+        )
+        auth = AuthContext(
+            actor="tester",
+            tenant_id="tenant-a",
+            auth_mode="api_token",
+            role="admin",
+        )
+        settings = Settings(data_dir=Path("data"), rag_trace_enabled=False)
+
+        with patch.object(routes_rag, "_load_local_vector_records", return_value=records), patch.object(
+            routes_rag,
+            "_load_cached_approval_snapshot",
+            return_value={},
+        ), patch.object(routes_rag, "load_visible_records", return_value=records), patch.object(
+            routes_rag.QueryAnalysisAgent,
+            "analyze",
+        ) as analyze, patch.object(
+            routes_rag.QueryRewriteAgent,
+            "rewrite",
+        ) as rewrite, patch.object(
+            routes_rag,
+            "_score_records_for_queries",
+        ) as score, patch.object(
+            routes_rag,
+            "_cached_qwen3_reranker",
+        ) as reranker:
+            results, trace = routes_rag.search_rag_records(request, auth, settings)
+            missing_results, missing_trace = routes_rag.search_rag_records(
+                request.model_copy(update={"query": "제999조에 대해서 알려줘"}),
+                auth,
+                settings,
+            )
+
+        self.assertEqual(["chunk-1"], [result["chunk_id"] for result in results])
+        self.assertTrue(trace["exact_locator_fast_path"])
+        self.assertEqual("deterministic-exact-article-v1", trace["retrieval_model"])
+        self.assertEqual("not_requested", trace["reranker_status"])
+        self.assertEqual([], missing_results)
+        self.assertTrue(missing_trace["exact_locator_fast_path"])
+        self.assertEqual(0, missing_trace["exact_locator_match_count"])
+        analyze.assert_not_called()
+        rewrite.assert_not_called()
+        score.assert_not_called()
+        reranker.assert_not_called()
+
+    def test_cached_reranker_reuses_one_loaded_adapter(self) -> None:
+        routes_rag._cached_qwen3_reranker.cache_clear()
+        adapter = object()
+        try:
+            with patch.object(routes_rag, "Qwen3RerankerAdapter", return_value=adapter) as factory:
+                first = routes_rag._cached_qwen3_reranker("")
+                second = routes_rag._cached_qwen3_reranker("")
+        finally:
+            routes_rag._cached_qwen3_reranker.cache_clear()
+
+        self.assertIs(first, second)
+        factory.assert_called_once()
+
+    def test_general_query_reranks_only_a_bounded_candidate_set(self) -> None:
+        records = [
+            {
+                "id": f"doc-1:chunk-{index}",
+                "document_id": "doc-1",
+                "chunk_id": f"chunk-{index}",
+                "text": f"승인된 일반 규정 내용 {index}",
+                "metadata": {
+                    "document_id": "doc-1",
+                    "chunk_id": f"chunk-{index}",
+                    "article_no": f"제{index + 1}조",
+                    "regulation_title": "샘플규정",
+                    "approval_status": "approved",
+                    "approval_id": f"approval-{index}",
+                },
+            }
+            for index in range(30)
+        ]
+        scored = [(1.0 - index * 0.01, record) for index, record in enumerate(records)]
+        analysis = routes_rag.deterministic_query_analysis("휴가 신청 방법을 알려줘")
+        rewrite = deterministic_query_rewrite(analysis)
+        adapter = Mock()
+        adapter.rerank.side_effect = (
+            lambda query, candidates, *, top_k: list(candidates)[:top_k]
+        )
+        request = routes_rag.RagSearchRequest(
+            query="휴가 신청 방법을 알려줘",
+            document_id="doc-1",
+            top_k=5,
+            orchestration_mode="multi_model",
+        )
+        auth = AuthContext(
+            actor="tester",
+            tenant_id="tenant-a",
+            auth_mode="api_token",
+            role="admin",
+        )
+        settings = Settings(data_dir=Path("data"), rag_trace_enabled=False)
+
+        with patch.object(routes_rag, "_load_local_vector_records", return_value=records), patch.object(
+            routes_rag,
+            "_load_cached_approval_snapshot",
+            return_value={},
+        ), patch.object(routes_rag, "load_visible_records", return_value=records), patch.object(
+            routes_rag.QueryAnalysisAgent,
+            "analyze",
+            return_value=analysis,
+        ), patch.object(
+            routes_rag.QueryRewriteAgent,
+            "rewrite",
+            return_value=rewrite,
+        ), patch.object(
+            routes_rag,
+            "_score_records_for_queries",
+            return_value=(scored, {"retrieval_model": "test-hybrid"}),
+        ), patch.object(
+            routes_rag,
+            "_cached_qwen3_reranker",
+            return_value=adapter,
+        ):
+            results, trace = routes_rag.search_rag_records(request, auth, settings)
+
+        rerank_candidates = adapter.rerank.call_args.args[1]
+        self.assertEqual(10, len(rerank_candidates))
+        self.assertEqual(5, len(results))
+        self.assertEqual("completed", trace["reranker_status"])
+
+    def test_general_query_never_sends_more_than_twenty_candidates_to_reranker(self) -> None:
+        records = [
+            {
+                "id": f"doc-1:chunk-{index}",
+                "document_id": "doc-1",
+                "chunk_id": f"chunk-{index}",
+                "text": f"승인된 일반 규정 내용 {index}",
+                "metadata": {
+                    "document_id": "doc-1",
+                    "chunk_id": f"chunk-{index}",
+                    "article_no": f"제{index + 1}조",
+                    "regulation_title": "샘플규정",
+                    "approval_status": "approved",
+                    "approval_id": f"approval-{index}",
+                },
+            }
+            for index in range(50)
+        ]
+        scored = [(1.0 - index * 0.01, record) for index, record in enumerate(records)]
+        analysis = routes_rag.deterministic_query_analysis("휴가 신청 방법을 알려줘")
+        rewrite = deterministic_query_rewrite(analysis)
+        adapter = Mock()
+        adapter.rerank.side_effect = (
+            lambda query, candidates, *, top_k: list(candidates)[:top_k]
+        )
+        request = routes_rag.RagSearchRequest(
+            query="휴가 신청 방법을 알려줘",
+            document_id="doc-1",
+            top_k=20,
+            orchestration_mode="multi_model",
+        )
+        auth = AuthContext(
+            actor="tester",
+            tenant_id="tenant-a",
+            auth_mode="api_token",
+            role="admin",
+        )
+        settings = Settings(data_dir=Path("data"), rag_trace_enabled=False)
+
+        with patch.object(routes_rag, "_load_local_vector_records", return_value=records), patch.object(
+            routes_rag,
+            "_load_cached_approval_snapshot",
+            return_value={},
+        ), patch.object(routes_rag, "load_visible_records", return_value=records), patch.object(
+            routes_rag.QueryAnalysisAgent,
+            "analyze",
+            return_value=analysis,
+        ), patch.object(
+            routes_rag.QueryRewriteAgent,
+            "rewrite",
+            return_value=rewrite,
+        ), patch.object(
+            routes_rag,
+            "_score_records_for_queries",
+            return_value=(scored, {"retrieval_model": "test-hybrid"}),
+        ), patch.object(
+            routes_rag,
+            "_cached_qwen3_reranker",
+            return_value=adapter,
+        ):
+            results, trace = routes_rag.search_rag_records(request, auth, settings)
+
+        self.assertEqual(20, len(adapter.rerank.call_args.args[1]))
+        self.assertEqual(20, len(results))
+        self.assertEqual("completed", trace["reranker_status"])
 
     @patch("app.api.routes_rag._score_records")
     def test_multi_query_scoring_uses_weighted_rrf_without_expanding_records(self, score_records) -> None:
