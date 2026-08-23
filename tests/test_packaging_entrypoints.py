@@ -145,6 +145,27 @@ class PackagingEntrypointTests(unittest.TestCase):
         self.assertIn("--server.port %APP_PORT%", batch_launcher)
         self.assertIn("select_available_port(preferred_ui_port)", packaged_launcher)
 
+    def test_portable_launcher_includes_the_separate_qwen_chat_app(self) -> None:
+        packaged_launcher = (ROOT / "packaging" / "windows_launcher.py").read_text(
+            encoding="utf-8"
+        )
+        portable_spec = (ROOT / "packaging" / "PR-MCP-Builder.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"--qwen-chat"', packaged_launcher)
+        self.assertIn('"--port"', packaged_launcher)
+        self.assertIn('"qwen_chat_app.py"', packaged_launcher)
+        self.assertIn("run_qwen_chat(qwen_args)", packaged_launcher)
+        self.assertIn("safe_environment = launch_environment()", packaged_launcher)
+        self.assertIn("validate_launch_environment(safe_environment)", packaged_launcher)
+        self.assertIn('"scripts.run_qwen_chat"', portable_spec)
+        self.assertIn('"qwen_chat_app.py"', portable_spec)
+        build_script = (ROOT / "scripts" / "build_windows_portable.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('@("--qwen-chat", "--help")', build_script)
+
     def test_portable_self_check_exercises_pymupdf_and_pdf_parser_without_runtime_setup(
         self,
     ) -> None:

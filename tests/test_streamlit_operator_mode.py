@@ -349,7 +349,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             and node.func.value.id == "st"
             and node.func.attr == "status"
         ]
-        self.assertEqual(3, len(direct_status_calls))
+        self.assertEqual(4, len(direct_status_calls))
         self.assertGreaterEqual(source.count("_long_operation_status("), 7)
         batch_start = source.index('batch_status = st.status("선택한 규정별 승인·색인 중…')
         batch_end = source.index("if workflow_ready_count < workflow_pending_count:", batch_start)
@@ -359,6 +359,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "bundle_candidates = _matching_mcp_bundle_state_candidates", bundle_start
         )
         self.assertIn('state="error"', source[bundle_start:bundle_end])
+        qwen_source = (REPO_ROOT / "frontend" / "qwen_chat_app.py").read_text(encoding="utf-8")
+        qwen_start = qwen_source.index(
+            'with st.status("Qwen 답변을 준비하고 있습니다.", expanded=True)'
+        )
+        self.assertIn('state="error"', qwen_source[qwen_start:])
+        self.assertIn('state="complete"', qwen_source[qwen_start:])
 
     def test_mcp_connection_diagnostic_reader_reloads_bundle_status_each_call(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
@@ -1119,19 +1125,17 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("review_batch_id=review_batch_id", source)
         self.assertIn("review_batch_chunk_fingerprint=review_batch_chunk_fingerprint", source)
         self.assertIn("review_strategy=review_strategy", source)
-        self.assertIn("로컬 Qwen 규정 챗봇", source)
-        self.assertIn("RagChatRequest", source)
-        self.assertIn("history=request_history", source)
-        self.assertIn('llm_backend="ollama"', source)
+        self.assertIn("독립 로컬 Qwen 규정 챗봇", source)
+        self.assertIn("_render_standalone_qwen_chat_launcher", source)
+        self.assertIn('"scripts.run_qwen_chat"', source)
+        self.assertIn('"RAG_LLM_MODEL": DEFAULT_LOCAL_LLM_MODEL', source)
         self.assertIn("Local RAG uses approved and indexed chunks only.", source)
-        self.assertIn("st.chat_input(", source)
-        self.assertIn('key=f"rag-chat-input-{document_id}"', source)
-        self.assertIn("_regulation_chat_api_history(messages)", source)
-        self.assertIn("Qwen3 8B 챗봇 켜기", source)
+        self.assertNotIn("st.chat_input(", source)
+        self.assertIn("독립 Qwen 챗봇 실행", source)
         self.assertIn("Qwen3 8B 연결 점검", source)
         self.assertIn("로컬 다중 모델 오케스트레이션", source)
         self.assertIn("불확실한 규정 구조·표를 Qwen3 4B로 로컬 보조 검수", source)
-        self.assertIn("질의 분석 Qwen3 1.7B", source)
+        self.assertIn('"모델": "Qwen3 1.7B", "담당": "질의 분석·검색어 보정"', source)
         self.assertIn("Qwen3 Reranker 0.6B", source)
         self.assertGreaterEqual(source.count('embedding_model="Qwen/Qwen3-Embedding-0.6B"'), 9)
 
@@ -2176,13 +2180,13 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('action = "① 문서 올려서 전처리로 이동"', source)
         self.assertIn("        ctx=ctx,\n        purpose=\"여기서는 프로그램이 글자를 제대로 읽었는지", source)
         self.assertIn("        ctx=ctx,\n        purpose=\"왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고", source)
-        self.assertIn("승인된 규정을 로컬 Qwen 챗봇에 질문하고", source)
+        self.assertIn("승인된 규정을 독립 로컬 Qwen 챗봇에서 선택해 질문합니다", source)
         self.assertIn('class="rr-beginner-compass"', source)
         for purpose in (
             "원본 파일을 한 개 이상 선택하고",
             "프로그램이 글자를 제대로 읽었는지",
             "왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고",
-            "승인된 규정을 로컬 Qwen 챗봇에 질문하고",
+            "승인된 규정을 독립 로컬 Qwen 챗봇에서 선택해 질문합니다",
         ):
             with self.subTest(purpose=purpose):
                 self.assertIn(purpose, source)

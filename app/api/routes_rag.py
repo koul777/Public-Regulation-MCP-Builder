@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
@@ -79,6 +82,44 @@ from app.storage.repository import JsonRepository
 
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
+
+RagChatProgressEvent = dict[str, Any]
+RagChatProgressCallback = Callable[[RagChatProgressEvent], None]
+_RAG_CHAT_PROGRESS_CALLBACK: ContextVar[RagChatProgressCallback | None] = ContextVar(
+    "rag_chat_progress_callback",
+    default=None,
+)
+
+
+@contextmanager
+def rag_chat_progress(callback: RagChatProgressCallback) -> Iterator[None]:
+    """Expose real chat pipeline stages to a local UI without changing the API contract."""
+
+    token = _RAG_CHAT_PROGRESS_CALLBACK.set(callback)
+    try:
+        yield
+    finally:
+        _RAG_CHAT_PROGRESS_CALLBACK.reset(token)
+
+
+def _emit_rag_chat_progress(stage: str, progress: int, label: str) -> None:
+    """Report best-effort UI progress; a display callback can never alter RAG security."""
+
+    callback = _RAG_CHAT_PROGRESS_CALLBACK.get()
+    if callback is None:
+        return
+    try:
+        callback(
+            {
+                "stage": str(stage),
+                "progress": max(0, min(100, int(progress))),
+                "label": str(label),
+            }
+        )
+    except Exception:
+        # Progress is operator feedback only. Approval, tenant and citation gates
+        # must continue to run even if a UI consumer disappears mid-request.
+        return
 
 BLOCKED_QUERY_PATTERNS = (
     re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions", re.IGNORECASE),
@@ -384,13 +425,28 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
         _enforce_rag_rate_limit(request_settings, auth)
         _validate_query_policy(request.query)
         _validate_security_scope(request, auth)
+        _emit_rag_chat_progress(
+            "query_analysis",
+            8,
+            "질문과 기관·문서 검색 범위를 확인하는 중",
+        )
         metadata_profile = _validate_response_metadata_profile(request.metadata_profile)
         backend = _chat_backend(request, request_settings)
         execution_settings = replace(request_settings, rag_llm_backend=backend)
         chat_history = _chat_history_payload(request.history)
         contextualized_query = _contextualized_chat_query(request.query, chat_history)
         search_request = request.model_copy(update={"query": contextualized_query})
+        _emit_rag_chat_progress(
+            "retrieval",
+            18,
+            "승인·색인된 규정에서 근거 조문을 검색하는 중",
+        )
         results, search_trace = search_rag_records(search_request, auth, execution_settings)
+        _emit_rag_chat_progress(
+            "context_build",
+            42,
+            "검색 근거를 중복 제거하고 안전한 문맥으로 구성하는 중",
+        )
         multi_model = _use_multi_model_orchestration(request, execution_settings)
         qa_tracker = _qa_tracker_after_search(search_trace)
         qa_tracker.start(
@@ -413,6 +469,11 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
             answer = str(orchestrated["answer"])
             citations = list(orchestrated["citations"])
         else:
+            _emit_rag_chat_progress(
+                "answer_generation",
+                55,
+                "로컬 답변 엔진이 승인된 근거만 읽어 답변을 작성하는 중",
+            )
             answer = _chat_answer(
                 backend,
                 execution_settings,
@@ -424,6 +485,11 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                 _rag_chat_citation_for_metadata_profile(result, metadata_profile)
                 for result in results
             ]
+            _emit_rag_chat_progress(
+                "citation_verify",
+                88,
+                "답변에 붙일 승인 근거와 인용 정보를 최종 확인하는 중",
+            )
         qa_tracker.set_agent_role_status(
             "local_llm_answer",
             "grounded_answerer",
@@ -512,6 +578,11 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
             status_code=200,
             resource_type="rag",
             detail=f"trace_id={trace['trace_id']} result_count={len(results)}",
+        )
+        _emit_rag_chat_progress(
+            "completed",
+            100,
+            "답변 생성과 근거 인용 검증 완료",
         )
         return {
             "trace_id": trace["trace_id"],
@@ -2546,13 +2617,28 @@ def _orchestrated_chat_answer(
     history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     try:
+        _emit_rag_chat_progress(
+            "context_build",
+            44,
+            "Qwen3 8B가 읽을 승인 근거 문맥을 구성하는 중",
+        )
         context = ContextBuilder().build(results) if results else ContextBuilder().build([])
         runtime = OllamaRuntime(settings.rag_llm_endpoint)
+        _emit_rag_chat_progress(
+            "answer_generation",
+            55,
+            "Qwen3 8B가 승인된 근거만 읽어 답변을 작성하는 중",
+        )
         draft = GroundedQwenAnswerAgent(runtime).answer(
             query=query,
             context=context,
             history=history,
             strict_model=True,
+        )
+        _emit_rag_chat_progress(
+            "claim_audit",
+            76,
+            "Qwen3 4B가 답변의 핵심 주장을 근거와 대조하는 중",
         )
         audit = ClaimAuditAgent(runtime).audit(
             draft=draft,
@@ -2565,6 +2651,11 @@ def _orchestrated_chat_answer(
             detail=f"Multi-model local QA execution failed: {type(exc).__name__}",
         ) from exc
     if audit.status == "abstained":
+        _emit_rag_chat_progress(
+            "citation_verify",
+            90,
+            "근거 부족 응답과 공개 인용 범위를 최종 확인하는 중",
+        )
         return {
             "answer": _sanitize_rag_answer(draft.answer),
             "citations": [],
@@ -2576,6 +2667,11 @@ def _orchestrated_chat_answer(
             "citation_verification_status": "abstained",
         }
     if audit.status != "verified":
+        _emit_rag_chat_progress(
+            "fallback_answer",
+            84,
+            "감사 결과에 따라 승인 근거 발췌 답변으로 안전하게 전환하는 중",
+        )
         fallback = GroundedQwenAnswerAgent(runtime).answer(
             query=query,
             context=context,
@@ -2601,6 +2697,11 @@ def _orchestrated_chat_answer(
             if str(result.get("chunk_id") or result.get("document_id") or "")
             in supporting_evidence_ids
         ]
+        _emit_rag_chat_progress(
+            "citation_verify",
+            90,
+            "발췌 답변의 근거 ID와 승인 기록을 최종 검증하는 중",
+        )
         fallback_verification = CitationVerifierAgent().run(
             {
                 "answer": fallback.answer,
@@ -2633,6 +2734,11 @@ def _orchestrated_chat_answer(
             for citation in audit.citations
             for evidence_id in citation.evidence_ids
         )
+    )
+    _emit_rag_chat_progress(
+        "citation_verify",
+        90,
+        "답변의 근거 ID·승인 기록·인용 조문을 최종 검증하는 중",
     )
     identity_verification = CitationVerifierAgent().run(
         {

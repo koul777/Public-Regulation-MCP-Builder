@@ -200,9 +200,10 @@ class OrchestratedRagTests(unittest.TestCase):
             model="qwen3:4b",
             audit_mode="local_model",
         )
+        progress_events: list[dict[str, object]] = []
         with patch("app.api.routes_rag.GroundedQwenAnswerAgent.answer", return_value=draft), patch(
             "app.api.routes_rag.ClaimAuditAgent.audit", return_value=audit
-        ):
+        ), routes_rag.rag_chat_progress(progress_events.append):
             result = routes_rag._orchestrated_chat_answer(
                 Settings(data_dir=Path("data"), rag_llm_endpoint="http://127.0.0.1:11434"),
                 "검토 주기는?",
@@ -214,6 +215,23 @@ class OrchestratedRagTests(unittest.TestCase):
         self.assertEqual("제2조", result["citations"][0]["article_no"])
         self.assertEqual("제1항", result["citations"][0]["paragraph_no"])
         self.assertTrue(result["citations"][0]["support_quote"])
+        self.assertEqual(
+            ["context_build", "answer_generation", "claim_audit", "citation_verify"],
+            [event["stage"] for event in progress_events],
+        )
+        self.assertEqual([44, 55, 76, 90], [event["progress"] for event in progress_events])
+
+    def test_progress_callback_failure_never_breaks_the_rag_security_path(self) -> None:
+        def broken_callback(_event: dict[str, object]) -> None:
+            raise RuntimeError("UI disappeared")
+
+        with routes_rag.rag_chat_progress(broken_callback):
+            routes_rag._emit_rag_chat_progress("retrieval", 150, "검색 중")
+
+        captured: list[dict[str, object]] = []
+        with routes_rag.rag_chat_progress(captured.append):
+            routes_rag._emit_rag_chat_progress("retrieval", 150, "검색 중")
+        self.assertEqual(100, captured[0]["progress"])
 
     def test_rejected_qwen_draft_falls_back_to_verified_extractive_answer(self) -> None:
         results = [

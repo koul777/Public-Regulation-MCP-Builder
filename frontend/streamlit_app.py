@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import unicodedata
+import webbrowser
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -20,6 +21,7 @@ from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 import pandas as pd
 import streamlit as st
@@ -40,7 +42,6 @@ from app.api.routes_documents import (
     reindex_document,
     transition_regulation_status,
 )
-from app.api.routes_rag import RagChatRequest, rag_chat
 from app.core.api_audit import redact_sensitive_paths
 from app.core.config import Settings, get_settings, set_runtime_settings_overrides
 from app.core.pipeline import kordoc_table_command_status
@@ -116,6 +117,7 @@ from scripts.analyze_regulation_corpus import (
     GOLDSET_SCORE_SPECS,
     optional_int,
 )
+from scripts.find_available_ui_port import select_available_port
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -257,7 +259,7 @@ AI_USAGE_PATH_SIDEBAR_WIDGET_KEY = "ai_usage_path_sidebar"
 AI_USAGE_PATH_QWEN = "qwen"
 AI_USAGE_PATH_MCP = "mcp"
 AI_USAGE_PATH_OPTIONS = (AI_USAGE_PATH_QWEN, AI_USAGE_PATH_MCP)
-QWEN_CHAT_PROBE_PREFIX = "qwen_chat_probe"
+QWEN_CHAT_APP_LAUNCH_STATE_KEY = "qwen_chat_app_launch_state"
 BEGINNER_GUIDE_STEP_KEY = "beginner_guide_step"
 BEGINNER_GUIDE_SUBSTEP_KEY = "beginner_guide_substep"
 BEGINNER_GUIDE_PREPROCESS_SELECTION_KEY = "beginner_guide_preprocess_selection"
@@ -339,9 +341,9 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
 )
 BEGINNER_QWEN_PROCEDURES: tuple[str, ...] = (
     "승인·색인된 규정 준비 상태 확인",
-    "Qwen3 8B 챗봇 켜기",
-    "로컬 Qwen 연결 확인",
-    "예시 질문 또는 직접 질문 입력",
+    "독립 Qwen 챗봇 실행",
+    "대화할 규정 선택",
+    "Qwen 연결 확인 후 질문 입력",
     "답변과 근거 조문 함께 확인",
 )
 # The six external connection confirmations start at procedure 4-6 in the list above.
@@ -387,7 +389,7 @@ def _beginner_guide_step_details(step: int) -> tuple[str, str, str]:
         return (
             page,
             "로컬 Qwen 챗봇으로 질문하기",
-            "Qwen3 8B를 켜고 예시 질문을 실행한 뒤 답변과 근거 조문을 함께 확인합니다.",
+            "독립 Qwen 앱을 열고 규정을 선택한 뒤 답변과 근거 조문을 함께 확인합니다.",
         )
     return page, title, description
 
@@ -1752,20 +1754,7 @@ def _render_beginner_connection_confirmation(
     st.session_state[confirmation_key] = previous_complete
 
 
-def _qwen_chat_probe_key(document_id: str) -> str:
-    return f"{QWEN_CHAT_PROBE_PREFIX}:{document_id}"
-
-
-def _qwen_chat_runtime_enabled(runtime_settings: Settings) -> bool:
-    return bool(
-        str(runtime_settings.rag_llm_backend or "").strip().lower() == "ollama"
-        and str(runtime_settings.rag_llm_model or "").strip().lower()
-        == DEFAULT_LOCAL_LLM_MODEL.lower()
-    )
-
-
 def _qwen_beginner_procedure_states(ctx: dict | None) -> tuple[bool, ...]:
-    document_id = str(ctx.get("document_id") or "") if ctx else ""
     selected_profile_id = _selected_institution_profile_id()
     document_profile_id = str(
         getattr((ctx or {}).get("document"), "profile_id", "") or ""
@@ -1781,32 +1770,18 @@ def _qwen_beginner_procedure_states(ctx: dict | None) -> tuple[bool, ...]:
         and dict(ctx.get("mcp_connection_gate") or {}).get("ready")
         and profile_scope_matches
     )
-    runtime_settings = get_settings()
-    qwen_enabled = _qwen_chat_runtime_enabled(runtime_settings)
-    messages: list[dict[str, object]] = []
-    if document_id:
-        value = st.session_state.get(
-            _regulation_chat_history_key(document_id, selected_profile_id)
-        )
-        if isinstance(value, list):
-            messages = [message for message in value if isinstance(message, dict)]
-    question_asked = any(
-        str(message.get("role") or "").strip().lower() == "user"
-        and str(message.get("content") or "").strip()
-        for message in messages
+    launch_state = st.session_state.get(QWEN_CHAT_APP_LAUNCH_STATE_KEY)
+    app_url = str(launch_state.get("url") or "") if isinstance(launch_state, dict) else ""
+    process = launch_state.get("_process") if isinstance(launch_state, dict) else None
+    standalone_running = bool(
+        process is not None
+        and callable(getattr(process, "poll", None))
+        and process.poll() is None
+        and _standalone_qwen_chat_is_healthy(app_url)
     )
-    grounded_answer = any(
-        str(message.get("role") or "").strip().lower() == "assistant"
-        and str(message.get("content") or "").strip()
-        and isinstance(message.get("citations"), list)
-        and bool(message.get("citations"))
-        and not message.get("error")
-        for message in messages
-    )
-    qwen_connected = bool(
-        document_id and st.session_state.get(_qwen_chat_probe_key(document_id))
-    ) or grounded_answer
-    return approval_ready, qwen_enabled, qwen_connected, question_asked, grounded_answer
+    # 기관·규정 선택, 질문, 근거 확인은 별도 Streamlit 세션에서 이루어진다. 빌더가
+    # 그 세션을 추측해 완료 처리하지 않고, 독립 앱 자체의 번호 안내가 이어서 담당한다.
+    return approval_ready, standalone_running, False, False, False
 
 
 def _beginner_guide_completed_steps(
@@ -2058,7 +2033,8 @@ def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
     st.markdown("## 1. 규정을 어디에서 질문할지 선택하세요")
     st.info(
         "두 방법 모두 같은 승인된 로컬 RAG 색인을 사용합니다. "
-        "Qwen은 이 프로그램 안에서 바로 대화하고, MCP는 승인 규정을 다른 AI 앱에 연결합니다. "
+        "Qwen은 빌더와 별도로 실행되는 로컬 챗봇에서 대화하고, "
+        "MCP는 승인 규정을 다른 AI 앱에 연결합니다. "
         "선택은 나중에 왼쪽 메뉴에서 언제든 바꿀 수 있습니다."
     )
     st.session_state.setdefault(AI_USAGE_PATH_KEY, AI_USAGE_PATH_QWEN)
@@ -2073,7 +2049,8 @@ def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
     )
     if selected_usage_path == AI_USAGE_PATH_QWEN:
         st.success(
-            "권장 · 승인 후 ④ 화면에서 Qwen3 8B를 켜고 바로 질문합니다. "
+            "권장 · 승인 후 ④ 화면에서 독립 Qwen 챗봇을 한 번 클릭해 새 창으로 열고, "
+            "대화할 규정을 선택해 질문합니다. "
             "Ollama가 이 PC에서 실행되며 규정과 대화가 외부 API로 전송되지 않습니다."
         )
     else:
@@ -2371,7 +2348,7 @@ def _render_beginner_orchestration_explanation(*, nav_page: str | None = None) -
     if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
         return
     manifest = pipeline_manifest()
-    with st.expander("전체 과정과 담당 모델을 한눈에 보기", expanded=True):
+    with st.expander("전체 과정과 담당 모델을 한눈에 보기", expanded=False):
         st.markdown(
             "**화면에서 버튼을 누르면 아래 순서대로 작업이 이어집니다.** "
             "작은 모델은 질문·검수처럼 범위가 좁은 일에 쓰고, 답변 모델은 승인된 근거를 읽는 일에만 씁니다. "
@@ -2516,11 +2493,13 @@ def _render_actual_pipeline_role_trace(ctx: dict | None) -> None:
                     str(role.get("status") or "대기"),
                 )
                 model = str(role.get("primary_model") or "결정적 검증·저장")
+                role_purpose = str(role.get("purpose") or "").strip()
+                purpose_suffix = f" · 담당: {role_purpose}" if role_purpose else ""
                 reason = str(role.get("reason_code") or "").strip()
                 suffix = f" · 사유: `{reason}`" if reason else ""
                 st.write(
                     f"- {role.get('display_name') or role.get('role_id')}: "
-                    f"**{status}** · 모델/방식: `{model}`{suffix} · "
+                    f"**{status}** · 모델/방식: `{model}`{purpose_suffix}{suffix} · "
                     f"다음: {_agent_trace_next_action(role)}"
                 )
 
@@ -3425,26 +3404,20 @@ def _page_institution_select(registry) -> None:
 def _apply_operator_deep_link() -> None:
     """Allow local operators and smoke tests to reopen an existing document view."""
     try:
-        query_params = st.query_params
+        st.query_params
     except Exception:
         return
 
-    def _query_value(name: str) -> str:
-        value = query_params.get(name, "")
-        if isinstance(value, list):
-            value = value[0] if value else ""
-        return str(value or "").strip()
-
-    query_document_id = _query_value("document_id")
+    query_document_id = _operator_query_value("document_id")
     if query_document_id and repository.get_document(query_document_id) is not None:
         st.session_state["document_id"] = query_document_id
-        query_chunk_id = _query_value("chunk_id")
+        query_chunk_id = _operator_query_value("chunk_id")
         if query_chunk_id:
             chunk_ids = {str(chunk.chunk_id) for chunk in repository.get_chunks(query_document_id)}
             if query_chunk_id in chunk_ids:
                 st.session_state[f"approval-compare-chunk-{query_document_id}"] = query_chunk_id
 
-    query_nav = _query_value("nav").lower()
+    query_nav = _operator_query_value("nav").lower()
     nav_map = {
         "home": NAV_HOME,
         "preprocess": NAV_PREPROCESS,
@@ -3457,6 +3430,249 @@ def _apply_operator_deep_link() -> None:
     }
     if query_nav in nav_map:
         st.session_state["nav_page"] = nav_map[query_nav]
+
+
+def _operator_query_value(name: str) -> str:
+    """Read one Streamlit query value without accepting an ambiguous list."""
+
+    try:
+        value = st.query_params.get(name, "")
+    except Exception:
+        return ""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def _standalone_qwen_chat_environment(current_settings: Settings) -> dict[str, str]:
+    """Build the minimal local runtime environment for the separate chat app."""
+
+    launch_environment = dict(os.environ)
+    for secret_name in (
+        "OPENAI_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_COMPATIBLE_API_KEY",
+        "API_AUTH_TOKEN",
+        "API_AUTH_TOKENS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "PYTHONHOME",
+        "PYTHONPATH",
+    ):
+        launch_environment.pop(secret_name, None)
+    registry_path = _institution_profiles_storage_path(current_settings)
+    launch_environment.update(
+        {
+            "APP_ENV": str(current_settings.app_env or "local"),
+            "DATA_DIR": str(Path(current_settings.data_dir).resolve()),
+            "ARTIFACT_ROOT": str(Path(current_settings.artifact_root).resolve()),
+            "API_DEFAULT_TENANT_ID": _local_operator_tenant_id(),
+            "API_AUTH_REQUIRED": "true" if current_settings.api_auth_required else "false",
+            "TENANT_STORAGE_ISOLATION": (
+                "true" if current_settings.tenant_storage_isolation else "false"
+            ),
+            "INSTITUTION_PROFILES_PATH": str(Path(registry_path).resolve()),
+            "RAG_LLM_BACKEND": "ollama",
+            "RAG_LLM_ENDPOINT": str(
+                current_settings.rag_llm_endpoint or "http://127.0.0.1:11434"
+            ),
+            "RAG_LLM_MODEL": DEFAULT_LOCAL_LLM_MODEL,
+            "RAG_LLM_TIMEOUT_SECONDS": str(
+                max(1, int(current_settings.rag_llm_timeout_seconds))
+            ),
+            "RAG_LLM_MAX_OUTPUT_CHARS": str(
+                max(100, int(current_settings.rag_llm_max_output_chars))
+            ),
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+        }
+    )
+    return launch_environment
+
+
+def _standalone_qwen_chat_health_url(app_url: str) -> str:
+    return app_url.rstrip("/") + "/_stcore/health"
+
+
+def _standalone_qwen_chat_is_healthy(app_url: str) -> bool:
+    if not str(app_url or "").startswith("http://127.0.0.1:"):
+        return False
+    try:
+        with urlopen(_standalone_qwen_chat_health_url(app_url), timeout=0.4) as response:
+            return int(getattr(response, "status", 0) or 0) == 200
+    except (OSError, ValueError):
+        return False
+
+
+def _open_standalone_qwen_chat_when_ready(app_url: str) -> None:
+    """Open the local browser only after the separate Streamlit process is ready."""
+
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if _standalone_qwen_chat_is_healthy(app_url):
+            webbrowser.open(app_url, new=2)
+            return
+        time.sleep(0.25)
+
+
+def _launch_standalone_qwen_chat(current_settings: Settings) -> dict[str, object]:
+    """Start or reuse the localhost-only Qwen chat application."""
+
+    previous = st.session_state.get(QWEN_CHAT_APP_LAUNCH_STATE_KEY)
+    if isinstance(previous, dict):
+        previous_url = str(previous.get("url") or "")
+        previous_process = previous.get("_process")
+        previous_running = bool(
+            previous_process is not None
+            and callable(getattr(previous_process, "poll", None))
+            and previous_process.poll() is None
+        )
+        if previous_running and _standalone_qwen_chat_is_healthy(previous_url):
+            webbrowser.open(previous_url, new=2)
+            return previous
+        if previous_running:
+            threading.Thread(
+                target=_open_standalone_qwen_chat_when_ready,
+                args=(previous_url,),
+                name="open-starting-standalone-qwen-chat",
+                daemon=True,
+            ).start()
+            return previous
+
+    port = select_available_port(8502, host="127.0.0.1", search_count=100)
+    app_url = f"http://127.0.0.1:{port}"
+    packaged_executable = str(os.getenv("REG_RAG_PACKAGED_EXE") or "").strip()
+    if packaged_executable:
+        command = [
+            packaged_executable,
+            "--qwen-chat",
+            "--port",
+            str(port),
+            "--headless",
+        ]
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "scripts.run_qwen_chat",
+            "--port",
+            str(port),
+            "--headless",
+        ]
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(PROJECT_ROOT),
+        "env": _standalone_qwen_chat_environment(current_settings),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    process = subprocess.Popen(command, **popen_kwargs)
+    launch_state: dict[str, object] = {
+        "url": app_url,
+        "pid": int(process.pid),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "_process": process,
+    }
+    st.session_state[QWEN_CHAT_APP_LAUNCH_STATE_KEY] = launch_state
+    threading.Thread(
+        target=_open_standalone_qwen_chat_when_ready,
+        args=(app_url,),
+        name="open-standalone-qwen-chat",
+        daemon=True,
+    ).start()
+    return launch_state
+
+
+def _render_standalone_qwen_chat_launcher(
+    *,
+    key: str,
+    primary: bool = True,
+    width: str = "stretch",
+) -> None:
+    """Render the one-click launcher and a reusable link to the separate app."""
+
+    if st.button(
+        "💬 독립 Qwen 챗봇 실행",
+        key=key,
+        type="primary" if primary else "secondary",
+        width=width,
+    ):
+        try:
+            state = _launch_standalone_qwen_chat(get_settings())
+            app_url = str(state.get("url") or "")
+            process = state.get("_process")
+            with st.status("별도 Qwen 챗봇 프로세스를 시작하고 있습니다.", expanded=True) as status:
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline:
+                    if _standalone_qwen_chat_is_healthy(app_url):
+                        status.update(
+                            label="독립 Qwen 챗봇 실행 완료",
+                            state="complete",
+                            expanded=False,
+                        )
+                        st.success("새 브라우저 창에서 Qwen 챗봇을 사용할 수 있습니다.")
+                        st.caption(f"로컬 주소: {app_url}")
+                        break
+                    if (
+                        process is not None
+                        and callable(getattr(process, "poll", None))
+                        and process.poll() is not None
+                    ):
+                        status.update(
+                            label="독립 Qwen 챗봇을 시작하지 못했습니다.",
+                            state="error",
+                            expanded=True,
+                        )
+                        st.error(
+                            f"별도 프로세스가 시작 중 종료되었습니다(종료 코드: {process.poll()})."
+                        )
+                        break
+                    st.caption("localhost 앱 준비 상태를 확인하는 중입니다.")
+                    time.sleep(0.25)
+                else:
+                    status.update(
+                        label="독립 Qwen 챗봇이 아직 시작 중입니다.",
+                        state="running",
+                        expanded=True,
+                    )
+                    st.warning(
+                        "20초 안에 준비 확인이 끝나지 않았습니다. 잠시 뒤 아래 이동 버튼을 확인해 주세요."
+                    )
+        except (OSError, RuntimeError, ValueError) as exc:
+            st.error(f"독립 Qwen 챗봇을 시작하지 못했습니다: {exc}")
+
+    state = st.session_state.get(QWEN_CHAT_APP_LAUNCH_STATE_KEY)
+    if isinstance(state, dict):
+        app_url = str(state.get("url") or "")
+        process = state.get("_process")
+        process_running = bool(
+            process is not None
+            and callable(getattr(process, "poll", None))
+            and process.poll() is None
+        )
+        if process_running and _standalone_qwen_chat_is_healthy(app_url):
+            st.link_button(
+                "열려 있는 Qwen 챗봇으로 이동",
+                app_url,
+                width=width,
+            )
+        elif process is not None and not process_running:
+            return_code = process.poll() if callable(getattr(process, "poll", None)) else "unknown"
+            st.error(
+                f"독립 Qwen 챗봇 프로세스가 시작 중 종료되었습니다(종료 코드: {return_code})."
+            )
+        elif app_url:
+            st.caption("독립 Qwen 챗봇을 시작하는 중입니다. 잠시 뒤 새 창이 열립니다.")
 
 
 def _apply_ai_connection_overrides() -> None:
@@ -9962,6 +10178,11 @@ def _page_approval(ctx: dict | None) -> None:
         return
 
     current_document = ctx["document"]
+    selected_profile_id = _selected_institution_profile_id()
+    mcp_profile_scope_mismatch = not _document_belongs_to_institution_profile(
+        current_document,
+        selected_profile_id,
+    )
     total_chunks = len(chunks)
     current_scope_state = _mcp_scope_document_state(chunks, mcp_connection_gate)
 
@@ -11050,6 +11271,18 @@ def _page_approval(ctx: dict | None) -> None:
                 control_key_prefix="approval-goto-connect-simple",
                 substep=6,
             )
+        if (
+            _ai_usage_path() == AI_USAGE_PATH_QWEN
+            and bool(mcp_connection_gate.get("ready"))
+            and not mcp_profile_scope_mismatch
+        ):
+            _render_standalone_qwen_chat_launcher(
+                key=f"approval-launch-standalone-qwen-simple-{document_id}",
+                primary=True,
+            )
+            st.caption(
+                "빌더와 별도인 로컬 챗봇이 열립니다. 챗봇에서 승인·색인 완료 규정을 선택하세요."
+            )
         _render_workflow_next_button(
             "④ Qwen 규정 챗봇·AI 연결로 이동",
             NAV_MCP,
@@ -11351,6 +11584,15 @@ def _page_approval(ctx: dict | None) -> None:
         key="approval-goto-connect",
         disabled=not selected_document_ids,
     )
+    if (
+        _ai_usage_path() == AI_USAGE_PATH_QWEN
+        and bool(mcp_connection_gate.get("ready"))
+        and not mcp_profile_scope_mismatch
+    ):
+        _render_standalone_qwen_chat_launcher(
+            key=f"approval-launch-standalone-qwen-{document_id}",
+            primary=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -11751,82 +11993,11 @@ def _render_api_key_setup_dialog() -> None:
     _render_ai_connection_settings(settings)
 
 
-def _regulation_chat_history_key(document_id: str, profile_id: str) -> str:
-    return f"regulation-chat-history:{profile_id or 'default'}:{document_id}"
-
-
-def _regulation_chat_messages(document_id: str, profile_id: str) -> list[dict[str, object]]:
-    key = _regulation_chat_history_key(document_id, profile_id)
-    value = st.session_state.get(key)
-    if not isinstance(value, list):
-        value = []
-        st.session_state[key] = value
-    return value
-
-
-def _regulation_chat_api_history(messages: list[dict[str, object]]) -> list[dict[str, str]]:
-    history: list[dict[str, str]] = []
-    for message in messages[-12:]:
-        role = str(message.get("role") or "").strip().lower()
-        content = str(message.get("content") or "").strip()
-        if role in {"user", "assistant"} and content and not message.get("error"):
-            history.append({"role": role, "content": content[:6000]})
-    return history
-
-
-def _render_regulation_chat_assistant(
-    message: dict[str, object],
+def _page_connect(
+    ctx: dict | None,
     *,
-    beginner_mode: bool,
-    turn_index: int,
+    mcp_first: bool = False,
 ) -> None:
-    st.markdown(str(message.get("content") or ""))
-    citations = message.get("citations") or []
-    if isinstance(citations, list) and citations:
-        with st.expander(f"근거 조문 {len(citations)}건", expanded=beginner_mode):
-            st.dataframe(pd.DataFrame(citations), hide_index=True, width="stretch")
-    orchestration = message.get("orchestration") or {}
-    if not isinstance(orchestration, dict):
-        return
-    if orchestration.get("mode") == "multi_model":
-        st.caption(
-            "로컬 검증 완료 · "
-            f"답변 {orchestration.get('answer_model') or '검증 가능한 근거 발췌'} · "
-            f"주장 감사 {orchestration.get('claim_audit_model') or 'qwen3:4b'} · "
-            f"상태 {orchestration.get('claim_audit_status') or '-'}"
-        )
-        st.caption(
-            "질의 분석 Qwen3 1.7B → Qwen3 Embedding 0.6B Hybrid Search → "
-            "Qwen3 Reranker 0.6B → Qwen3 8B 답변 → Qwen3 4B 감사 → 결정적 인용 검증"
-        )
-        if orchestration.get("answer_mode") == "grounded_extractive":
-            st.info(
-                "Qwen 초안이 주장 감사를 통과하지 않아, 이번 답변은 승인 근거에서 검증 가능한 문장만 발췌했습니다."
-            )
-        role_trace = orchestration.get("roles") or []
-        if isinstance(role_trace, list) and role_trace:
-            with st.expander(f"{turn_index}번째 답변의 실행 단계", expanded=False):
-                st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {
-                                "역할": item.get("display_name") or item.get("role_id"),
-                                "단계": item.get("phase") or item.get("stage_id") or "",
-                                "담당 내용": item.get("purpose") or "",
-                                "상태": item.get("status"),
-                                "사용 모델": item.get("primary_model") or "결정적 검증",
-                                "다음 행동": _agent_trace_next_action(item),
-                            }
-                            for item in role_trace
-                            if isinstance(item, dict)
-                        ]
-                    ),
-                    hide_index=True,
-                    width="stretch",
-                )
-
-
-def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
     qwen_path = _ai_usage_path() == AI_USAGE_PATH_QWEN
     heading = _connect_nav_display_label()
     st.markdown(f"## {heading}")
@@ -11835,12 +12006,12 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         4,
         ctx=ctx,
         purpose=(
-            "승인된 규정을 로컬 Qwen 챗봇에 질문하고 답변과 근거 조문을 함께 확인합니다."
+            "승인된 규정을 독립 로컬 Qwen 챗봇에서 선택해 질문합니다."
             if qwen_path
             else "승인된 규정을 ChatGPT·Claude·Codex에서 사용하도록 MCP 연결 묶음을 만들고 확인합니다."
         ),
         finish=(
-            "Qwen 답변과 근거 조문이 함께 보이면 로컬 챗봇 사용 준비가 끝납니다."
+            "독립 Qwen 앱에서 답변과 근거 조문을 확인하면 준비가 끝납니다."
             if qwen_path
             else "외부 AI에서 list_regulations·search·fetch가 확인되면 MCP 연결이 끝납니다."
         ),
@@ -11848,16 +12019,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
     st.markdown(
         '<div class="rr-help">AI 연결 정보(API 키·모델·주소)는 <b>⚙️ 관리자 설정 → AI 연결</b>에서 한 번만 입력하면 됩니다. '
         + (
-            "이 화면은 승인된 규정으로 <b>Qwen 로컬 챗봇을 실제 사용</b>하는 곳입니다. MCP 연결은 옆 탭에서 선택해서 이어갈 수 있습니다.</div>"
+            "빌더는 데이터 구축만 담당합니다. <b>독립 Qwen 앱</b>을 새 창으로 열어 대화하세요.</div>"
             if qwen_path
-            else "이 화면은 승인된 규정을 <b>외부 AI에 MCP로 연결</b>하는 곳입니다. 로컬 Qwen 챗봇은 옆 탭에서 언제든 사용할 수 있습니다.</div>"
+            else "이 화면은 승인된 규정을 <b>외부 AI에 MCP로 연결</b>하는 곳입니다. 독립 로컬 Qwen 앱은 별도로 실행할 수 있습니다.</div>"
         ),
         unsafe_allow_html=True,
     )
-
     # 입력은 관리자 설정에서 하고, 여기서는 연결 상태만 확인한다.
     _render_ai_connection_status_banner(settings, context="connect")
-
     st.divider()
     if not _require_document_context(ctx):
         st.info("Qwen 규정 챗봇과 MCP 연결은 '① 문서 올려서 전처리'를 마친 뒤 이 화면에서 이어집니다.")
@@ -11896,236 +12065,50 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         if mcp_beginner_mode
         else "AI 프로그램 연결 — MCP 연결 (전산 담당자용)"
     )
-    first_tab, second_tab = st.tabs([mcp_label, chat_label] if mcp_first else [chat_label, mcp_label])
-    if mcp_first:
-        mcp_tab, chat_tab = first_tab, second_tab
+    if qwen_path:
+        chat_tab = nullcontext()
+        mcp_tab = None
     else:
-        chat_tab, mcp_tab = first_tab, second_tab
+        first_tab, second_tab = st.tabs([mcp_label, chat_label] if mcp_first else [chat_label, mcp_label])
+        if mcp_first:
+            mcp_tab, chat_tab = first_tab, second_tab
+        else:
+            chat_tab, mcp_tab = first_tab, second_tab
 
     with chat_tab:
-        st.markdown("### 로컬 Qwen 규정 챗봇")
+        st.markdown("### 독립 로컬 Qwen 규정 챗봇")
         st.caption(
-            "질문을 이어서 입력하면 이전 대화 문맥을 유지하면서 승인·색인된 규정만 검색하고, "
-            "Qwen3 8B가 답변과 근거 조문을 함께 제시합니다. 대화 내용과 규정은 외부 API로 보내지 않습니다."
+            "빌더와 별도인 localhost 앱에서 승인·색인 완료 규정을 골라 대화합니다. "
+            "Qwen3 8B가 답변과 근거 조문을 함께 제시하며 대화 내용과 규정은 외부 API로 보내지 않습니다."
         )
+        if mcp_connection_ready and not mcp_profile_scope_mismatch:
+            _render_standalone_qwen_chat_launcher(
+                key=f"connect-launch-standalone-qwen-{document_id}",
+                primary=True,
+            )
+            st.caption(
+                "실제 대화는 빌더와 별도인 로컬 앱에서 진행합니다. 승인·색인 완료 규정만 선택할 수 있습니다."
+            )
         if not mcp_connection_ready:
             st.warning(
                 "챗봇은 승인·색인이 끝난 내용만 사용합니다. 먼저 '③ 검수하고 승인'을 완료해 주세요.\n\n"
                 "Local RAG uses approved and indexed chunks only. "
                 "Complete human review, approval, and index/reindex before asking a question."
             )
-        local_rag_settings = get_settings()
-        local_rag_backend = str(local_rag_settings.rag_llm_backend or "extractive").strip().lower()
-        if local_rag_backend not in {"extractive", "ollama"}:
-            local_rag_backend = "extractive"
-        local_rag_model = str(local_rag_settings.rag_llm_model or DEFAULT_LOCAL_LLM_MODEL).strip()
-        qwen_runtime_enabled = _qwen_chat_runtime_enabled(local_rag_settings)
-        chat_scope_ready = bool(mcp_connection_ready and not mcp_profile_scope_mismatch)
-        engine_col, clear_col = st.columns([4, 1])
-        with engine_col:
-            st.caption(
-                f"현재 답변 엔진: {'Ollama · Qwen3 8B' if qwen_runtime_enabled else ('Ollama · 다른 로컬 모델' if local_rag_backend == 'ollama' else '모델 없는 근거 답변')} "
-                f"· 모델: {local_rag_model}"
-            )
-        history_key = _regulation_chat_history_key(document_id, selected_profile_id)
-        messages = _regulation_chat_messages(document_id, selected_profile_id)
-        if beginner_mode and qwen_path:
-            qwen_states = _qwen_beginner_procedure_states(ctx)
-            current_qwen_substep = next(
-                (index for index, complete in enumerate(qwen_states, start=1) if not complete),
-                len(BEGINNER_QWEN_PROCEDURES),
-            )
-            marker_control_keys: tuple[str, ...] = ()
-            marker_control_prefix = ""
-            if current_qwen_substep == 2:
-                marker_control_prefix = f"enable-qwen-chat-{document_id}"
-            elif current_qwen_substep == 3:
-                marker_control_prefix = f"probe-qwen-chat-{document_id}"
-            elif current_qwen_substep == 4:
-                marker_control_keys = tuple(
-                    f"qwen-example-{document_id}-{index}" for index in range(1, 4)
-                )
-            _render_beginner_action_marker(
-                4,
-                BEGINNER_QWEN_PROCEDURES[current_qwen_substep - 1],
-                (
-                    "아래 번호 순서대로 진행하세요. 질문 뒤에는 답변만 읽지 말고 펼쳐진 근거 조문도 함께 확인합니다."
-                ),
-                control_key_prefix=marker_control_prefix,
-                control_keys=marker_control_keys,
-                substep=current_qwen_substep,
-            )
-            st.markdown("#### 처음 사용하는 분은 이 순서만 따라 하세요")
+        if qwen_path:
+            st.markdown("#### 처음 사용하는 분은 새 창에서 이 순서만 따라 하세요")
             st.markdown(
-                "1. 현재 답변 엔진이 `Ollama · Qwen3 8B`인지 확인합니다.  "
-                "\n2. `Qwen 연결 확인`을 눌러 이 PC의 모델이 응답하는지 확인합니다.  "
-                "\n3. 아래 예시 질문을 하나 누르거나 질문 입력창에 직접 적습니다.  "
-                "\n4. 답변 아래에 열린 `근거 조문`의 규정명·조문·인용문을 함께 확인합니다."
+                "1. 질문할 기관을 선택합니다.  "
+                "\n2. 규정별 승인·색인 준비 상태에서 `질문 가능`을 확인합니다.  "
+                "\n3. 대화할 규정 하나를 선택합니다.  "
+                "\n4. `Ollama · qwen3:8b 연결 확인`을 누른 뒤 질문합니다.  "
+                "\n5. 진행 게이지가 끝나면 답변과 펼쳐진 근거 인용을 함께 확인합니다."
             )
             st.info(
-                "첫 답변 뒤에는 ‘그 절차에서 담당자는 누구야?’처럼 이어서 물어보세요. "
-                "이전 사용자 질문은 검색 문맥으로만 사용하며, 규정 근거를 대신하지 않습니다."
+                "빌더를 닫은 뒤 챗봇만 다시 쓰려면 프로젝트 폴더의 `RUN_QWEN_CHAT.bat`를 실행하세요. "
+                "MCP는 삭제되지 않으며, 왼쪽의 ‘Qwen 또는 MCP 선택’에서 MCP 경로로 바꾸면 별도로 만들 수 있습니다."
             )
-        with clear_col:
-            if st.button("새 대화", key=f"clear-rag-chat-{document_id}", disabled=not messages):
-                st.session_state[history_key] = []
-                st.rerun()
-
-        if not qwen_runtime_enabled:
-            st.warning(
-                "현재 설정은 감사형 Qwen3 8B 챗봇이 아닙니다. 아래 버튼을 누르면 "
-                "Ollama와 qwen3:8b를 정확히 선택합니다."
-            )
-            if st.button("Qwen3 8B 챗봇 켜기", key=f"enable-qwen-chat-{document_id}", type="primary"):
-                saved_overrides = dict(st.session_state.get(AI_CONNECTION_STATE_KEY) or {})
-                saved_overrides.update(
-                    {
-                        "rag_llm_backend": "ollama",
-                        "rag_llm_endpoint": str(local_rag_settings.rag_llm_endpoint or "http://127.0.0.1:11434"),
-                        "rag_llm_model": DEFAULT_LOCAL_LLM_MODEL,
-                    }
-                )
-                _apply_ai_connection_settings(saved_overrides)
-                st.rerun()
-
-        if qwen_runtime_enabled:
-            probe_col, probe_status_col = st.columns([1, 3])
-            with probe_col:
-                probe_requested = st.button(
-                    "Qwen 연결 확인",
-                    key=f"probe-qwen-chat-{document_id}",
-                    disabled=mcp_profile_scope_mismatch,
-                    width="stretch",
-                )
-            if probe_requested:
-                probe_result = probe_local_llm(local_rag_settings)
-                st.session_state[_qwen_chat_probe_key(document_id)] = bool(
-                    probe_result.get("available")
-                )
-                if probe_result.get("available"):
-                    st.success(
-                        f"Qwen 연결 확인 완료 · {probe_result.get('model') or local_rag_settings.rag_llm_model}"
-                    )
-                else:
-                    st.error(
-                        "Qwen에 연결하지 못했습니다. Ollama가 실행 중인지와 qwen3:8b 설치 여부를 확인하세요."
-                    )
-            with probe_status_col:
-                if st.session_state.get(_qwen_chat_probe_key(document_id)):
-                    st.success("이 PC의 Qwen이 응답할 준비가 됐습니다.")
-                elif beginner_mode and qwen_path:
-                    st.caption("먼저 왼쪽의 ‘Qwen 연결 확인’을 눌러 주세요.")
-
-        with st.expander("검색 범위·기준일 설정", expanded=False):
-            chat_col1, chat_col2 = st.columns(2)
-            with chat_col1:
-                chat_security_levels = st.multiselect(
-                    "검색 허용 보안 등급",
-                    ["public", "internal", "sensitive", "confidential"],
-                    default=["internal"],
-                    key=f"rag-chat-security-{document_id}",
-                    format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
-                )
-            with chat_col2:
-                chat_top_k = st.slider("근거로 보여줄 조각 수", 1, 10, 5, key=f"rag-chat-top-k-{document_id}")
-                chat_historical_mode = st.checkbox(
-                    "과거 효력일 기준으로 조회",
-                    key=f"rag-chat-historical-{document_id}",
-                )
-                chat_as_of_date = st.date_input(
-                    "기준일",
-                    value=date.today(),
-                    disabled=not chat_historical_mode,
-                    key=f"rag-chat-as-of-date-{document_id}",
-                )
-
-        suggested_chat_query = ""
-        if beginner_mode and qwen_path:
-            st.markdown("#### 예시 질문 — 하나를 누르면 바로 질문합니다")
-            example_questions = (
-                "이 규정의 목적과 적용 대상을 알려줘.",
-                "담당자의 주요 절차를 순서대로 설명해줘.",
-                "신청이나 승인에 필요한 조건을 근거 조문과 함께 알려줘.",
-            )
-            example_columns = st.columns(3)
-            for example_index, (example_column, example_question) in enumerate(
-                zip(example_columns, example_questions),
-                start=1,
-            ):
-                with example_column:
-                    if st.button(
-                        example_question,
-                        key=f"qwen-example-{document_id}-{example_index}",
-                        disabled=not chat_scope_ready or not qwen_runtime_enabled,
-                        width="stretch",
-                    ):
-                        suggested_chat_query = example_question
-
-        if not messages:
-            st.info("예: ‘접근권한은 누가 관리해야 하나요?’처럼 규정에서 확인할 내용을 질문해 보세요.")
-        for turn_index, message in enumerate(messages, start=1):
-            role = str(message.get("role") or "assistant")
-            with st.chat_message(role):
-                if role == "assistant":
-                    _render_regulation_chat_assistant(
-                        message,
-                        beginner_mode=beginner_mode,
-                        turn_index=turn_index,
-                    )
-                else:
-                    st.markdown(str(message.get("content") or ""))
-
-        typed_chat_query = st.chat_input(
-            "승인된 규정에 관해 질문하세요",
-            key=f"rag-chat-input-{document_id}",
-            disabled=not chat_scope_ready or not qwen_runtime_enabled,
-        )
-        chat_query = suggested_chat_query or typed_chat_query
-        if chat_query and chat_scope_ready and qwen_runtime_enabled:
-            request_history = _regulation_chat_api_history(messages)
-            user_message: dict[str, object] = {"role": "user", "content": chat_query}
-            messages.append(user_message)
-            st.session_state[history_key] = messages
-            with st.chat_message("user"):
-                st.markdown(chat_query)
-            with st.chat_message("assistant"):
-                try:
-                    with st.spinner("승인 규정을 검색하고 Qwen이 근거 답변을 만드는 중입니다..."):
-                        response = rag_chat(
-                            RagChatRequest(
-                                query=chat_query,
-                                history=request_history,
-                                top_k=chat_top_k,
-                                security_levels=chat_security_levels or None,
-                                document_id=document_id,
-                                profile_id=selected_profile_id,
-                                as_of_date=chat_as_of_date.isoformat() if chat_historical_mode else None,
-                                llm_backend="ollama",
-                            ),
-                            local_auth,
-                        )
-                    assistant_message: dict[str, object] = {
-                        "role": "assistant",
-                        "content": str(response.get("answer") or ""),
-                        "citations": list(response.get("citations") or []),
-                        "orchestration": dict(response.get("orchestration") or {}),
-                        "trace_id": str(response.get("trace_id") or ""),
-                    }
-                    messages.append(assistant_message)
-                    st.session_state[history_key] = messages
-                    _render_regulation_chat_assistant(
-                        assistant_message,
-                        beginner_mode=beginner_mode,
-                        turn_index=len(messages),
-                    )
-                except Exception as exc:
-                    failure_message = f"답변을 생성하지 못했습니다. {exc}"
-                    messages.append(
-                        {"role": "assistant", "content": failure_message, "error": True}
-                    )
-                    st.session_state[history_key] = messages
-                    st.error(failure_message)
-
+            return
     with mcp_tab:
         st.markdown("### AI 앱에 연결하기" if mcp_beginner_mode else "### MCP client connection")
         st.caption(
@@ -14409,6 +14392,14 @@ with st.sidebar:
     st.caption(
         "Qwen과 MCP는 같은 승인 RAG를 공유합니다. 선택하면 ④ 메뉴와 첫 화면만 목적에 맞게 바뀝니다."
     )
+    if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+        _render_standalone_qwen_chat_launcher(
+            key="sidebar-launch-standalone-qwen-chat",
+            primary=True,
+        )
+        st.caption(
+            "빌더와 별도 프로세스로 실행됩니다. 새 챗봇에서 승인·색인 완료 규정을 골라 대화하세요."
+        )
     _render_beginner_guide_sidebar(ctx, current_nav_page)
     _render_beginner_orchestration_explanation(nav_page=current_nav_page)
     _render_ai_review_sidebar(ctx)

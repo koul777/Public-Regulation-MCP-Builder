@@ -167,6 +167,18 @@ function Assert-PortableExecutable {
     ) {
         throw "Executable MCP help probe returned unexpected output."
     }
+    $QwenHelpProbeText = Invoke-PortableExecutableProbe `
+        -ExecutablePath $ExecutablePath `
+        -ProbeRoot $ProbeRoot `
+        -Arguments @("--qwen-chat", "--help") `
+        -ProbeName "standalone Qwen chat help"
+    if (
+        $QwenHelpProbeText -notmatch "qwen3:8b" -or
+        $QwenHelpProbeText -notmatch "--port" -or
+        $QwenHelpProbeText -notmatch "--headless"
+    ) {
+        throw "Executable standalone Qwen chat help probe returned unexpected output."
+    }
 
     $SelfCheckText = Invoke-PortableExecutableProbe `
         -ExecutablePath $ExecutablePath `
@@ -553,7 +565,7 @@ VSVersionInfo(
         -ExecutablePath $BuiltExe `
         -ExpectedVersion $Version `
         -ProbeRoot $ProbeRoot
-    Write-Host "[OK] Windows executable verified: ProductVersion $Version; --mcp-server --help"
+    Write-Host "[OK] Windows executable verified: ProductVersion $Version; MCP and standalone Qwen help"
     if (-not $SkipExeBuild) {
         Write-PortableArtifactBinding `
             -ManifestPath $ArtifactManifestPath `

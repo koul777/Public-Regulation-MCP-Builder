@@ -7,11 +7,11 @@
 - 전처리 8단계: 업로드 검증 → 파싱/OCR → 정규화 → 구조 탐지 → 조문 Chunk → 품질 게이트 → 구조화 Export → 사람 승인 기반 Vector 색인
 - 질의응답 7단계: 질의 분석 → 질의 보정 → Hybrid Search → 재랭킹/ACL 필터 → Context 구성 → Qwen3 8B 답변 → Qwen3 4B 주장 감사와 결정적 인용 검증
 
-`MCP`는 이 파이프라인의 지식 처리 엔진이 아니다. 승인된 로컬 RAG를 Codex·ChatGPT·Claude Desktop 같은 클라이언트에 노출하는 선택적 인터페이스다. 전처리와 로컬 QA는 MCP 없이도 API와 Streamlit에서 독립 실행된다. 첫 시작 화면에서는 **로컬 Qwen 챗봇** 또는 **MCP 연결** 중 최종 사용 방법을 고른다. 이는 ④의 첫 탭과 초보자 마지막 절차를 정하는 되돌릴 수 있는 화면 선택일 뿐, MCP·Qwen·승인 색인 가운데 무엇도 삭제하거나 복제하지 않는다.
+`MCP`는 이 파이프라인의 지식 처리 엔진이 아니다. 승인된 로컬 RAG를 Codex·ChatGPT·Claude Desktop 같은 클라이언트에 노출하는 선택적 인터페이스다. 전처리 빌더, 로컬 Qwen 챗봇, MCP 서버는 서로 별도 프로세스로 실행된다. 첫 시작 화면에서는 **로컬 Qwen 챗봇** 또는 **MCP 연결** 중 최종 사용 방법을 고른다. 이는 ④의 첫 안내와 초보자 마지막 절차를 정하는 되돌릴 수 있는 화면 선택일 뿐, MCP·Qwen·승인 색인 가운데 무엇도 삭제하거나 복제하지 않는다.
 
-별도 로컬 RAG를 다시 구축하지 않는다. 전처리 파이프라인이 만든 승인 Vector/BM25 색인을 로컬 Qwen 챗봇과 MCP가 함께 읽는다. Streamlit의 `④ Qwen 규정 챗봇·AI 연결` 첫 탭은 대화 이력을 세션에 유지하며, 후속 질문 검색에는 최근 사용자 질문을 문맥으로 함께 사용한다. 이전 답변은 대화 이해에만 쓰고 규정 근거로 취급하지 않는다.
+별도 로컬 RAG를 다시 구축하지 않는다. 전처리 파이프라인이 만든 승인 Vector/BM25 색인을 독립 로컬 Qwen 챗봇과 MCP가 함께 읽는다. 빌더의 `④ Qwen 규정 챗봇·AI 연결`에서 **독립 Qwen 챗봇 실행**을 누르면 localhost 전용 앱이 새 프로세스와 브라우저 창으로 열린다. 이 앱은 기관과 규정을 선택하게 하고, 선택한 규정 ID 하나와 기관 프로필을 검색 범위로 고정한다. 대화 이력은 기관·규정별 세션에 유지하며 후속 질문 검색에는 최근 사용자 질문을 문맥으로 함께 사용한다. 이전 답변은 대화 이해에만 쓰고 규정 근거로 취급하지 않는다.
 
-로컬 Qwen 경로의 초보자 절차는 다섯 단계다: (1) 승인·색인 준비 상태 확인, (2) `Qwen3 8B 챗봇 켜기`, (3) `Qwen 연결 확인`, (4) 예시 또는 직접 질문 입력, (5) 답변과 근거 조문·인용 확인. MCP 경로를 고르면 ④가 `MCP 생성·외부 AI 연결`로 표시되어 기존 MCP 묶음 생성과 `list_regulations`·`search`·`fetch` 연결 확인 절차를 따른다. 어느 경로에서도 다른 탭을 필요할 때 사용할 수 있다.
+로컬 Qwen 경로의 초보자 절차는 다섯 단계다: (1) 기관 선택, (2) 규정별 승인·색인 준비 상태 확인, (3) `질문 가능` 규정 선택, (4) `Ollama · qwen3:8b 연결 확인` 후 질문 입력, (5) 답변과 근거 조문·인용 확인. 질문을 보내면 검색 준비부터 인용 검증까지 현재 단계, 진행률, 경과 시간이 계속 표시된다. MCP 경로를 고르면 ④가 `MCP 생성·외부 AI 연결`로 표시되어 기존 MCP 묶음 생성과 `list_regulations`·`search`·`fetch` 연결 확인 절차를 따른다. 어느 경로에서도 독립 Qwen 앱과 MCP 서버를 별도로 실행할 수 있다.
 
 ## 2. 모델 배치
 
@@ -128,6 +128,15 @@ API와 UI를 각각 다른 PowerShell에서 실행한다.
 .\.venv\Scripts\python.exe -m streamlit run frontend\streamlit_app.py --server.address 127.0.0.1
 ```
 
+Qwen 챗봇은 빌더와 별도 프로세스로 실행한다. 빌더의 **독립 Qwen 챗봇 실행** 버튼을 한 번
+누르거나, 빌더 없이 다음 명령을 실행한다. 두 방법 모두 `127.0.0.1`에만 바인딩한다.
+
+```powershell
+.\RUN_QWEN_CHAT.bat
+# 또는 설치된 콘솔 명령
+reg-rag-qwen-chat
+```
+
 운영자는 다음 순서를 지킨다.
 
 1. 문서를 업로드하고 signature·크기·tenant admission 결과를 확인한다.
@@ -136,7 +145,7 @@ API와 UI를 각각 다른 PowerShell에서 실행한다.
 4. 품질 blocker를 해소한 Chunk만 사람 이름과 승인 근거를 남겨 승인한다.
 5. 승인 journal과 content hash가 일치하는 Chunk만 `Qwen/Qwen3-Embedding-0.6B`로 색인한다.
 6. QA trace에서 query 1.7B, hybrid retrieval, reranker, context, answer 8B, audit 4B, citation 검증 상태를 확인한다.
-7. 운영 UI에서 `Qwen3 8B 챗봇 켜기`를 누른 뒤 첫 질문과 후속 질문을 각각 실행하고, 두 번째 응답의 `contextualized_search`가 활성화되는지 확인한다.
+7. 운영 UI에서 **독립 Qwen 챗봇 실행**을 누른 뒤 새 창에서 기관과 `질문 가능` 규정을 선택한다. 연결 확인 후 첫 질문과 후속 질문을 각각 실행하고, 두 번째 응답의 `contextualized_search`가 활성화되는지 확인한다.
 
 `GET /api/pipelines/manifest`는 원문이나 로컬 경로 없이 15단계 정의, 역할, 구현 상태, 모델 profile과 실패 정책을 반환한다.
 

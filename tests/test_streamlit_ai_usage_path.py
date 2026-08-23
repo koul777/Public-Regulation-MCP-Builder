@@ -231,27 +231,21 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
         )
         self.assertIn("if mcp_first:", page_source)
 
-    def test_qwen_beginner_course_covers_connection_question_and_citation_checks(self) -> None:
+    def test_qwen_beginner_course_hands_off_to_the_standalone_chat_app(self) -> None:
         procedures = _literal_assignment(self.module, "BEGINNER_QWEN_PROCEDURES")
         self.assertEqual(
             (
                 "승인·색인된 규정 준비 상태 확인",
-                "Qwen3 8B 챗봇 켜기",
-                "로컬 Qwen 연결 확인",
-                "예시 질문 또는 직접 질문 입력",
+                "독립 Qwen 챗봇 실행",
+                "대화할 규정 선택",
+                "Qwen 연결 확인 후 질문 입력",
                 "답변과 근거 조문 함께 확인",
             ),
             procedures,
         )
 
         page_source = _function_source(self.source, self.module, "_page_connect")
-        for contract_text in (
-            '"Qwen 연결 확인"',
-            "#### 예시 질문 — 하나를 누르면 바로 질문합니다",
-            "이 규정의 목적과 적용 대상을 알려줘.",
-            "답변 아래에 열린 `근거 조문`의 규정명·조문·인용문을 함께 확인합니다.",
-        ):
-            self.assertIn(contract_text, page_source)
+        self.assertIn("_render_standalone_qwen_chat_launcher", page_source)
 
         states = _function(self.module, "_qwen_beginner_procedure_states")
         returns = [node for node in ast.walk(states) if isinstance(node, ast.Return)]
@@ -259,62 +253,65 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
         self.assertEqual(
             (
                 "approval_ready",
-                "qwen_enabled",
-                "qwen_connected",
-                "question_asked",
-                "grounded_answer",
+                "standalone_running",
+                "False",
+                "False",
+                "False",
             ),
             tuple(ast.unparse(item) for item in returns[0].value.elts),
         )
         states_source = ast.get_source_segment(self.source, states) or ""
-        self.assertIn("_qwen_chat_probe_key(document_id)", states_source)
-        self.assertIn('isinstance(message.get("citations"), list)', states_source)
-        self.assertIn('bool(message.get("citations"))', states_source)
+        self.assertIn("QWEN_CHAT_APP_LAUNCH_STATE_KEY", states_source)
+        self.assertIn("_standalone_qwen_chat_is_healthy(app_url)", states_source)
 
-    def test_qwen_runtime_requires_the_exact_audited_qwen3_8b_model(self) -> None:
-        namespace = {
-            "Settings": object,
-            "DEFAULT_LOCAL_LLM_MODEL": "qwen3:8b",
-        }
-        exec(
-            compile(
-                ast.Module(
-                    body=[_function(self.module, "_qwen_chat_runtime_enabled")],
-                    type_ignores=[],
-                ),
-                str(APP_PATH),
-                "exec",
-            ),
-            namespace,
+    def test_long_orchestration_guide_is_closed_by_default(self) -> None:
+        guide_source = _function_source(
+            self.source,
+            self.module,
+            "_render_beginner_orchestration_explanation",
         )
-        enabled = namespace["_qwen_chat_runtime_enabled"]
-
-        self.assertTrue(
-            enabled(SimpleNamespace(rag_llm_backend="ollama", rag_llm_model="qwen3:8b"))
-        )
-        self.assertFalse(
-            enabled(SimpleNamespace(rag_llm_backend="ollama", rag_llm_model="llama3:8b"))
-        )
-        self.assertFalse(
-            enabled(SimpleNamespace(rag_llm_backend="extractive", rag_llm_model="qwen3:8b"))
+        self.assertIn(
+            'st.expander("전체 과정과 담당 모델을 한눈에 보기", expanded=False)',
+            guide_source,
         )
 
-    def test_profile_mismatch_disables_qwen_probe_examples_and_chat(self) -> None:
+    def test_builder_launches_qwen_as_a_separate_local_process(self) -> None:
+        environment_source = _function_source(
+            self.source,
+            self.module,
+            "_standalone_qwen_chat_environment",
+        )
+        launcher_source = _function_source(
+            self.source,
+            self.module,
+            "_launch_standalone_qwen_chat",
+        )
+        renderer_source = _function_source(
+            self.source,
+            self.module,
+            "_render_standalone_qwen_chat_launcher",
+        )
+
+        self.assertIn('"RAG_LLM_BACKEND": "ollama"', environment_source)
+        self.assertIn('"RAG_LLM_MODEL": DEFAULT_LOCAL_LLM_MODEL', environment_source)
+        for secret_name in (
+            "OPENAI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_COMPATIBLE_API_KEY",
+        ):
+            self.assertIn(secret_name, environment_source)
+        self.assertIn('"--qwen-chat"', launcher_source)
+        self.assertIn('"scripts.run_qwen_chat"', launcher_source)
+        self.assertIn('select_available_port(8502, host="127.0.0.1"', launcher_source)
+        self.assertIn("subprocess.Popen", launcher_source)
+        self.assertIn("독립 Qwen 챗봇 실행", renderer_source)
+        self.assertIn("_render_standalone_qwen_chat_launcher", self.source)
         page_source = _function_source(self.source, self.module, "_page_connect")
-
-        self.assertIn(
-            "chat_scope_ready = bool(mcp_connection_ready and not mcp_profile_scope_mismatch)",
-            page_source,
-        )
-        self.assertIn("disabled=mcp_profile_scope_mismatch", page_source)
-        self.assertIn(
-            "disabled=not chat_scope_ready or not qwen_runtime_enabled",
-            page_source,
-        )
-        self.assertIn(
-            "if chat_query and chat_scope_ready and qwen_runtime_enabled:",
-            page_source,
-        )
+        self.assertIn("if qwen_path:", page_source)
+        self.assertIn("return", page_source)
+        self.assertNotIn("st.chat_input", page_source)
+        self.assertNotIn("RagChatRequest", page_source)
 
     def test_qwen_path_is_isolated_from_mcp_beginner_gates(self) -> None:
         page = _function(self.module, "_page_connect")

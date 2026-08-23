@@ -127,6 +127,7 @@ reg-rag-mcp-concurrent-benchmark = "scripts.benchmark_mcp_concurrent_queries:mai
 reg-rag-mcp-index-visibility = "scripts.audit_mcp_index_visibility:main"
 reg-rag-mcp-query-benchmark = "scripts.benchmark_mcp_queries:main"
 reg-rag-mcp-retrieval-quality = "scripts.evaluate_mcp_retrieval_quality:main"
+reg-rag-qwen-chat = "scripts.run_qwen_chat:main"
 reg-rag-local-llm-doctor = "scripts.local_llm_doctor:main"
 reg-rag-revision-impact = "scripts.build_revision_impact_report:main"
 reg-rag-real-parser-fixtures = "scripts.verify_real_parser_regression_fixtures:main"
