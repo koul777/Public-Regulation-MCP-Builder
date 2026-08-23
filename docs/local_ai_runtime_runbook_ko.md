@@ -5,19 +5,25 @@
 이 런북은 공공기관 규정 파일을 외부 AI API로 보내지 않고 다음 두 파이프라인을 한 PC 또는 폐쇄망 서버에서 운용하는 절차다.
 
 - 전처리 8단계: 업로드 검증 → 파싱/OCR → 정규화 → 구조 탐지 → 조문 Chunk → 품질 게이트 → 구조화 Export → 사람 승인 기반 Vector 색인
-- 질의응답 7단계: 질의 분석 → 질의 보정 → Hybrid Search → 재랭킹/ACL 필터 → Context 구성 → Qwen3 8B 답변 → Qwen3 4B 주장 감사와 결정적 인용 검증
+- 정밀 질의응답 7단계(API 기본 모드·전체 수용시험): 질의 분석 → 질의 보정 → Hybrid Search → 재랭킹/ACL 필터 → Context 구성 → Qwen3 8B 답변 → Qwen3 4B 주장 감사와 결정적 인용 검증
 
 `MCP`는 이 파이프라인의 지식 처리 엔진이 아니다. 승인된 로컬 RAG를 Codex·ChatGPT·Claude Desktop 같은 클라이언트에 노출하는 선택적 인터페이스다. 전처리 빌더, 로컬 Qwen 챗봇, MCP 서버는 서로 별도 프로세스로 실행된다. 첫 시작 화면에서는 **로컬 Qwen 챗봇** 또는 **MCP 연결** 중 최종 사용 방법을 고른다. 이는 ④의 첫 안내와 초보자 마지막 절차를 정하는 되돌릴 수 있는 화면 선택일 뿐, MCP·Qwen·승인 색인 가운데 무엇도 삭제하거나 복제하지 않는다.
 
 별도 로컬 RAG를 다시 구축하지 않는다. 전처리 파이프라인이 만든 승인 Vector/BM25 색인을 독립 로컬 Qwen 챗봇과 MCP가 함께 읽는다. 빌더의 `④ Qwen 규정 챗봇·AI 연결`에서 **독립 Qwen 챗봇 실행**을 누르면 localhost 전용 앱이 새 프로세스와 브라우저 창으로 열린다. 이 앱은 기관과 규정을 선택하게 하고, 선택한 규정 ID 하나와 기관 프로필을 검색 범위로 고정한다. 대화 이력은 기관·규정별 세션에 유지하며 후속 질문 검색에는 최근 사용자 질문을 문맥으로 함께 사용한다. 이전 답변은 대화 이해에만 쓰고 규정 근거로 취급하지 않는다.
 
-로컬 Qwen 경로의 초보자 절차는 다섯 단계다: (1) 기관 선택, (2) 규정별 승인·색인 준비 상태 확인, (3) `질문 가능` 규정 선택, (4) `Ollama · qwen3:8b 연결 확인` 후 질문 입력, (5) 답변과 근거 조문·인용 확인. 질문을 보내면 검색 준비부터 인용 검증까지 현재 단계, 진행률, 경과 시간이 계속 표시된다. MCP 경로를 고르면 ④가 `MCP 생성·외부 AI 연결`로 표시되어 기존 MCP 묶음 생성과 `list_regulations`·`search`·`fetch` 연결 확인 절차를 따른다. 어느 경로에서도 독립 Qwen 앱과 MCP 서버를 별도로 실행할 수 있다.
+로컬 Qwen 경로의 초보자 절차는 여섯 단계다: (1) 독립 localhost 챗봇 열기, (2) 기관과 규정별 승인·색인 준비 상태 확인, (3) `질문 가능` 규정 선택, (4) `Ollama · qwen3:8b 연결 확인`과 답변 모드 선택, (5) 질문 입력 후 진행률·경과 시간 확인, (6) 답변과 근거 조문·인용 확인. 질문을 보내면 검색 준비부터 인용 검증까지 현재 단계가 계속 표시된다. MCP 경로를 고르면 ④가 `MCP 생성·외부 AI 연결`로 표시되어 기존 MCP 묶음 생성과 `list_regulations`·`search`·`fetch` 연결 확인 절차를 따른다. 어느 경로에서도 독립 Qwen 앱과 MCP 서버를 별도로 실행할 수 있다.
 
 독립 Qwen 챗봇은 기본적으로 MCP와 같은 저지연 승인 BM25 검색을 사용한다. 이 모드에서는
 질문마다 1.7B 분석·질의 임베딩·CPU 재랭커를 실행하지 않고 Qwen3 8B가 짧은 답변과 근거
 ID를 만든 뒤 결정론적 인용 검증을 수행한다. 화면의 `Qwen3 4B 정밀 근거 감사`는 의미 감사가
 추가로 필요한 경우에만 켠다. 기본값은 꺼짐이며, 켜면 GPU에서 8B·4B 모델을 교체하느라
 응답 시간이 크게 늘 수 있다.
+
+따라서 위 7단계는 **독립 Qwen 챗봇의 기본 실행 순서가 아니다.** 모든 모델 역할을 확인하는
+정밀 수용시험 또는 `retrieval_mode=auto`, `claim_audit_mode=model`인 API 경로의 순서다.
+독립 챗봇 기본값은 `retrieval_mode=fast`, `claim_audit_mode=deterministic`이며
+`승인 범위 확인 → BM25/lexical 검색 → Context 구성 → Qwen3 8B 답변 → 결정론적 인용 검증`
+순서로 실행한다. 어느 경로도 tenant·기관 프로필·문서·승인·ACL·최신본 필터를 생략하지 않는다.
 
 ## 2. 모델 배치
 
@@ -28,7 +34,7 @@ ID를 만든 뒤 결정론적 인용 검증을 수행한다. 화면의 `Qwen3 4B
 | S2-E | `Qwen/Qwen3-Embedding-0.6B` | 승인 Chunk와 질의의 의미 벡터 | BM25 degraded, semantic 필수 gate 실패 |
 | S2-R | `Qwen/Qwen3-Reranker-0.6B` | ACL 통과 후보 재순위 | deterministic rank degraded |
 | L1 | `qwen3:1.7b` | 질의 의도·locator 분석과 보수적 검색어 재작성 | 원 질문 + 규칙 기반 확장 |
-| L2 | `qwen3:4b` | 불확실 구조 검수와 답변 주장-근거 감사 | 사람 검수 또는 답변 제한 |
+| L2 | `qwen3:4b` | 불확실 구조 검수와 선택형 정밀 답변 주장-근거 감사 | 사람 검수 또는 답변 제한; 독립 챗봇 기본 대화에서는 OFF |
 | L3 | `qwen3:8b` | 승인된 bounded Context 기반 최종 한국어 답변 | 근거 발췌형 답변 또는 unavailable |
 
 생성 모델은 승인, ACL 변경, 색인 공개, source text 변경 권한이 없다. 최종 Qwen3 8B가 만든 인용도 신뢰하지 않고 시스템이 승인 journal과 content hash를 다시 대조해 공개 citation을 만든다.
@@ -57,14 +63,24 @@ py -3.11 -m venv .venv
 
 ## 5. Ollama 모델 준비
 
-Ollama를 설치·실행한 뒤 다음 모델을 로컬에 받는다.
+독립 Qwen 챗봇의 기본 빠른 대화만 사용할 때는 `qwen3:8b`가 필수다.
+
+```powershell
+ollama pull qwen3:8b
+ollama list
+```
+
+API 정밀 경로, 4B 정밀 감사와 전체 수용시험까지 실행할 때만 나머지 역할 모델도 받는다.
 
 ```powershell
 ollama pull qwen3:1.7b
 ollama pull qwen3:4b
-ollama pull qwen3:8b
 ollama list
 ```
+
+`ollama list`에 `qwen3:8b`가 보이고 Ollama가 실행 중이어야 독립 앱의 **Ollama · qwen3:8b
+연결 확인**이 성공한다. 첫 확인은 8B 모델을 RAM/GPU에 적재하므로 수십 초 걸릴 수 있다.
+진행 중에는 연결 버튼을 반복해서 누르지 않는다.
 
 Ollama endpoint는 `http://127.0.0.1:11434` 또는 `localhost`만 허용된다. 사설 LAN 주소나 외부 URL을 넣으면 model router가 거부한다.
 
@@ -205,6 +221,11 @@ Ollama와 모든 semantic/OCR cache가 준비된 후 실행한다.
 
 | 증상 | 우선 확인 | 안전한 처리 |
 |---|---|---|
+| 독립 챗봇에 선택 가능한 규정 없음 | 활성 청크 검수 결정, 승인 journal, 색인 수, stale 레코드 | 빌더 ③에서 승인·색인을 완료하고 필요하면 문서 색인 복구; 미승인 규정으로 우회 금지 |
+| `qwen3:8b` 연결 확인 실패 | `ollama list`, Ollama 프로세스, `127.0.0.1:11434` | `ollama pull qwen3:8b` 후 Ollama 재시작; 외부 endpoint로 우회 금지 |
+| 첫 8B 연결 확인이 오래 걸림 | RAM/VRAM 사용량, Ollama model load | 경과 시간을 보며 한 번만 기다리고 중복 실행 금지; 연결 후 동일 세션 재질문으로 warm 상태 확인 |
+| 기본 대화가 4B 단계에서 오래 걸림 | `Qwen3 4B 정밀 근거 감사` 토글 | 일반 대화는 기본 OFF로 복귀; 정밀 의미 감사가 필요한 경우에만 ON |
+| 근거 부족 고정 답변 | 선택 문서, 조문 존재 여부, 승인·색인 상태 | 다른 조문을 임의 대체하지 말고 원문·승인 범위를 확인한 뒤 필요한 규정을 승인·재색인 |
 | OCR 결과 없음 | Paddle model cache, 렌더링 페이지, 추출 coverage | normalize 진행 금지, review/blocked |
 | `qwen3:1.7b` JSON 오류 | Ollama 상태, timeout, schema error trace | 원 질문과 deterministic rewrite 사용 |
 | Embedding load 실패 | local cache, 모델명, RAM | 기존 승인 색인을 유지하고 BM25 degraded로 답변 계속; semantic 릴리스 차단 |

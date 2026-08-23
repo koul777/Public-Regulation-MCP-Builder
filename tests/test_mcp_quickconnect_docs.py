@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 import unittest
 from pathlib import Path
@@ -8,6 +9,26 @@ from xml.etree import ElementTree
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+QWEN_README_CAPTURE_FILENAMES = (
+    "readme-qwen-01-mode-choice.png",
+    "readme-qwen-02-launch.png",
+    "readme-qwen-03-ready.png",
+    "readme-qwen-04-progress.png",
+    "readme-qwen-05-answer-citations.png",
+    "readme-qwen-06-mcp-path.png",
+)
+QWEN_README_DEMO_FILENAMES = (
+    "public-regulation-qwen-rag-demo.gif",
+    "public-regulation-qwen-rag-demo.mp4",
+)
+PUBLIC_ASSET_FORBIDDEN_PATH_MARKERS = (
+    "c:\\users\\",
+    "c:/users/",
+    "/users/",
+    "c:\\workspace\\",
+    "c:/workspace/",
+)
 
 
 class McpQuickConnectDocsTests(unittest.TestCase):
@@ -338,6 +359,105 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "readme-guide-09-generated-bat-files.png",
         ):
             self.assertNotIn(retired_image, text)
+
+    def test_readme_embeds_qwen_demo_and_step_captures(self) -> None:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        image_filenames = (
+            QWEN_README_DEMO_FILENAMES[0],
+            *QWEN_README_CAPTURE_FILENAMES,
+        )
+
+        for filename in image_filenames:
+            asset_path = f"docs/assets/{filename}"
+            with self.subTest(filename=filename):
+                self.assertRegex(
+                    text,
+                    rf"!\[[^\]]+\]\({re.escape(asset_path)}(?:\s+\"[^\"]*\")?\)",
+                )
+                self.assertTrue((REPO_ROOT / asset_path).is_file(), asset_path)
+
+        mp4_path = f"docs/assets/{QWEN_README_DEMO_FILENAMES[1]}"
+        self.assertRegex(
+            text,
+            rf"(?:\[[^\]]+\]\({re.escape(mp4_path)}(?:\s+\"[^\"]*\")?\)"
+            rf"|(?:src|href)=[\"']{re.escape(mp4_path)}[\"'])",
+        )
+        self.assertTrue((REPO_ROOT / mp4_path).is_file(), mp4_path)
+        for public_safety_notice in (
+            "합성 샘플",
+            "실제 기관명",
+            "사용자 로컬 경로",
+        ):
+            self.assertIn(public_safety_notice, text)
+
+    def test_qwen_readme_png_captures_are_valid_and_public_safe(self) -> None:
+        for filename in QWEN_README_CAPTURE_FILENAMES:
+            path = REPO_ROOT / "docs" / "assets" / filename
+            with self.subTest(filename=filename):
+                self.assertTrue(path.is_file(), path)
+                png = path.read_bytes()
+                self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertGreaterEqual(len(png), 24)
+                width, height = struct.unpack(">II", png[16:24])
+                self.assertGreaterEqual(width, 1_400)
+                self.assertGreaterEqual(height, 780)
+                self.assertGreater(path.stat().st_size, 10_000)
+
+                chunk_types: list[bytes] = []
+                offset = 8
+                while offset + 12 <= len(png):
+                    chunk_length = struct.unpack(">I", png[offset : offset + 4])[0]
+                    chunk_end = offset + 12 + chunk_length
+                    self.assertLessEqual(chunk_end, len(png))
+                    chunk_type = png[offset + 4 : offset + 8]
+                    chunk_types.append(chunk_type)
+                    offset = chunk_end
+                    if chunk_type == b"IEND":
+                        break
+                self.assertIn(b"IHDR", chunk_types)
+                self.assertIn(b"IEND", chunk_types)
+                for private_chunk in (b"tEXt", b"zTXt", b"iTXt", b"eXIf"):
+                    self.assertNotIn(private_chunk, chunk_types)
+                self._assert_public_asset_has_no_local_path(path, png)
+
+    def test_qwen_readme_demo_media_have_valid_public_safe_signatures(self) -> None:
+        gif_path = (
+            REPO_ROOT
+            / "docs"
+            / "assets"
+            / QWEN_README_DEMO_FILENAMES[0]
+        )
+        self.assertTrue(gif_path.is_file(), gif_path)
+        gif = gif_path.read_bytes()
+        self.assertIn(gif[:6], (b"GIF87a", b"GIF89a"))
+        self.assertGreaterEqual(len(gif), 13)
+        self._assert_public_asset_has_no_local_path(gif_path, gif)
+
+        mp4_path = (
+            REPO_ROOT
+            / "docs"
+            / "assets"
+            / QWEN_README_DEMO_FILENAMES[1]
+        )
+        self.assertTrue(mp4_path.is_file(), mp4_path)
+        mp4 = mp4_path.read_bytes()
+        self.assertGreaterEqual(len(mp4), 12)
+        self.assertEqual(mp4[4:8], b"ftyp")
+        first_atom_size = struct.unpack(">I", mp4[:4])[0]
+        self.assertGreaterEqual(first_atom_size, 8)
+        self.assertLessEqual(first_atom_size, len(mp4))
+        self._assert_public_asset_has_no_local_path(mp4_path, mp4)
+
+    def _assert_public_asset_has_no_local_path(
+        self,
+        path: Path,
+        payload: bytes,
+    ) -> None:
+        lowered_payload = payload.lower()
+        for marker in PUBLIC_ASSET_FORBIDDEN_PATH_MARKERS:
+            with self.subTest(path=path.name, marker=marker):
+                self.assertNotIn(marker.encode("utf-8"), lowered_payload)
+                self.assertNotIn(marker.encode("utf-16-le"), lowered_payload)
 
     def test_readme_course_captures_are_valid_pngs(self) -> None:
         for filename in (
