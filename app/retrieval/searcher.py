@@ -2,12 +2,15 @@
 
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 import re
 from typing import Any
 import unicodedata
 
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, local_hash_embedding
+from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.retrieval.bm25_index import BM25_RETRIEVAL_MODEL, Bm25Index
+from app.retrieval.semantic_models import Qwen3EmbeddingAdapter, cosine_similarity, semantic_runtime_available
 from app.retrieval.tokenizer import tokenize
 
 
@@ -117,12 +120,37 @@ def search(
         )
     )
     if index is not None and not stale_index:
+        semantic_failure_reason = ""
+        if _has_usable_embeddings(records):
+            try:
+                scored = _hybrid_bm25_hash_search(
+                    expanded_query,
+                    records,
+                    index,
+                    structured_context=candidate_context,
+                )
+            except Exception as exc:
+                scored = []
+                semantic_failure_reason = _semantic_failure_reason(exc)
+            if scored:
+                scored, definition_metadata = _promote_enumeration_definitions(query, scored, records)
+                semantic_model = _record_embedding_model(records)
+                return scored[:top_k], {
+                    "retrieval_model": (
+                        "hybrid-bm25-qwen3-v1"
+                        if semantic_model == QWEN3_EMBEDDING_MODEL
+                        else "hybrid-bm25-hash-v1"
+                    ),
+                    "semantic_embedding_model": semantic_model,
+                    "retrieval_fallback": False,
+                    "bm25_index_status": "ready",
+                    "query_expanded": expanded_query != query,
+                    "hybrid_keyword_weight": 0.65,
+                    "hybrid_vector_weight": 0.35,
+                    **definition_metadata,
+                }
         scored = _bm25_search(expanded_query, records, index)
-        scored = _apply_query_boosts(
-            query,
-            scored,
-            structured_context=candidate_context,
-        )
+        scored = _apply_query_boosts(query, scored, structured_context=candidate_context)
         if not scored:
             literal_scored = _literal_substring_search(expanded_query, records)
             if literal_scored:
@@ -135,22 +163,39 @@ def search(
         scored, definition_metadata = _promote_enumeration_definitions(query, scored, records)
         return scored[:top_k], {
             "retrieval_model": BM25_RETRIEVAL_MODEL,
-            "retrieval_fallback": False,
-            "bm25_index_status": "ready",
+            "retrieval_fallback": bool(semantic_failure_reason),
+            "bm25_index_status": (
+                "ready_semantic_query_fallback" if semantic_failure_reason else "ready"
+            ),
             "query_expanded": expanded_query != query,
+            **(
+                {
+                    "semantic_embedding_model": _record_embedding_model(records),
+                    "semantic_query_status": "degraded",
+                    "semantic_fallback_reason": semantic_failure_reason,
+                }
+                if semantic_failure_reason
+                else {}
+            ),
             **definition_metadata,
         }
     fallback_reason = "missing_bm25_index" if index is None else "stale_bm25_index"
-    hash_scored = _hash_embedding_search(expanded_query, records)
-    if hash_scored:
-        hash_scored = _apply_query_boosts(
+    semantic_failure_reason = ""
+    try:
+        vector_scored = _hash_embedding_search(expanded_query, records)
+    except Exception as exc:
+        vector_scored = []
+        semantic_failure_reason = _semantic_failure_reason(exc)
+    if vector_scored:
+        vector_scored = _apply_query_boosts(
             query,
-            hash_scored,
+            vector_scored,
             structured_context=candidate_context,
         )
-        hash_scored, definition_metadata = _promote_enumeration_definitions(query, hash_scored, records)
-        return hash_scored[:top_k], {
-            "retrieval_model": LOCAL_HASH_EMBEDDING_MODEL,
+        vector_scored, definition_metadata = _promote_enumeration_definitions(query, vector_scored, records)
+        semantic_model = _record_embedding_model(records)
+        return vector_scored[:top_k], {
+            "retrieval_model": semantic_model or LOCAL_HASH_EMBEDDING_MODEL,
             "retrieval_fallback": True,
             "bm25_index_status": fallback_reason,
             "query_expanded": expanded_query != query,
@@ -165,10 +210,82 @@ def search(
     return lexical_scored[:top_k], {
         "retrieval_model": LEXICAL_FALLBACK_MODEL,
         "retrieval_fallback": True,
-        "bm25_index_status": fallback_reason,
+        "bm25_index_status": (
+            f"{fallback_reason}_semantic_query_fallback"
+            if semantic_failure_reason
+            else fallback_reason
+        ),
         "query_expanded": expanded_query != query,
+        **(
+            {
+                "semantic_embedding_model": _record_embedding_model(records),
+                "semantic_query_status": "degraded",
+                "semantic_fallback_reason": semantic_failure_reason,
+            }
+            if semantic_failure_reason
+            else {}
+        ),
         **definition_metadata,
     }
+
+
+def _has_usable_embeddings(records: list[dict[str, Any]]) -> bool:
+    dimensions: int | None = None
+    for record in records:
+        embedding = record.get("embedding")
+        if not isinstance(embedding, list) or not embedding:
+            continue
+        if not all(isinstance(value, (int, float)) for value in embedding):
+            continue
+        current_dimensions = len(embedding)
+        if dimensions is None:
+            dimensions = current_dimensions
+        if current_dimensions == dimensions:
+            return True
+    return False
+
+
+def _hybrid_bm25_hash_search(
+    query: str,
+    records: list[dict[str, Any]],
+    index: Bm25Index,
+    *,
+    structured_context: _StructuredQueryContext,
+) -> list[tuple[float, dict[str, Any]]]:
+    """Fuse lexical and local-vector candidates without expanding visibility.
+
+    Candidate visibility is already established by the caller. Reciprocal rank
+    fusion is used instead of raw-score addition because BM25 and cosine-like
+    hash scores are on different scales. The final structured boosts still run
+    after fusion so exact article/table locators remain authoritative.
+    """
+
+    keyword_scored = _apply_query_boosts(
+        query,
+        _bm25_search(query, records, index),
+        structured_context=structured_context,
+    )
+    vector_scored = _apply_query_boosts(
+        query,
+        _hash_embedding_search(query, records),
+        structured_context=structured_context,
+    )
+    by_id = {str(record.get("id") or ""): record for record in records}
+    fused: dict[str, float] = {}
+    rank_constant = 60.0
+    for rank, (_score, record) in enumerate(keyword_scored, start=1):
+        record_id = str(record.get("id") or "")
+        if record_id in by_id:
+            fused[record_id] = fused.get(record_id, 0.0) + 0.65 / (rank_constant + rank)
+    for rank, (_score, record) in enumerate(vector_scored, start=1):
+        record_id = str(record.get("id") or "")
+        if record_id in by_id:
+            fused[record_id] = fused.get(record_id, 0.0) + 0.35 / (rank_constant + rank)
+    return sorted(
+        [(round(score, 8), by_id[record_id]) for record_id, score in fused.items()],
+        key=lambda item: item[0],
+        reverse=True,
+    )
 
 
 def _bm25_search(query: str, records: list[dict[str, Any]], index: Bm25Index) -> list[tuple[float, dict[str, Any]]]:
@@ -186,19 +303,52 @@ def _bm25_search(query: str, records: list[dict[str, Any]], index: Bm25Index) ->
 
 def _hash_embedding_search(query: str, records: list[dict[str, Any]]) -> list[tuple[float, dict[str, Any]]]:
     scored: list[tuple[float, dict[str, Any]]] = []
-    query_embedding_cache: dict[int, list[float]] = {}
+    query_embedding_cache: dict[tuple[str, int], list[float]] = {}
     for record in records:
         embedding = record.get("embedding")
         if not isinstance(embedding, list) or not embedding:
             continue
         dimensions = len(embedding)
-        query_embedding = query_embedding_cache.get(dimensions)
+        model = str(record.get("embedding_model") or LOCAL_HASH_EMBEDDING_MODEL)
+        cache_key = (model, dimensions)
+        query_embedding = query_embedding_cache.get(cache_key)
         if query_embedding is None:
-            query_embedding = local_hash_embedding(query, dimensions=dimensions)
-            query_embedding_cache[dimensions] = query_embedding
-        score = round(sum(float(a) * float(b) for a, b in zip(query_embedding, embedding)), 8)
+            if model == QWEN3_EMBEDDING_MODEL:
+                if not semantic_runtime_available():
+                    raise RuntimeError("semantic_runtime_unavailable")
+                query_embedding = _semantic_query_adapter(dimensions).encode_queries([query])[0]
+            else:
+                query_embedding = local_hash_embedding(query, dimensions=dimensions)
+            query_embedding_cache[cache_key] = query_embedding
+        score = cosine_similarity(query_embedding, [float(value) for value in embedding])
         scored.append((score, record))
     return sorted(scored, key=lambda item: item[0], reverse=True)
+
+
+def _semantic_failure_reason(exc: Exception) -> str:
+    if str(exc) == "semantic_runtime_unavailable":
+        return "semantic_runtime_unavailable"
+    return f"semantic_query_{type(exc).__name__}"[:120]
+
+
+def _record_embedding_model(records: list[dict[str, Any]]) -> str:
+    models = {
+        str(record.get("embedding_model") or "").strip()
+        for record in records
+        if isinstance(record.get("embedding"), list) and record.get("embedding")
+    } - {""}
+    if len(models) == 1:
+        return next(iter(models))
+    return LOCAL_HASH_EMBEDDING_MODEL if not models else "mixed-local-embeddings"
+
+
+@lru_cache(maxsize=4)
+def _semantic_query_adapter(dimensions: int) -> Qwen3EmbeddingAdapter:
+    return Qwen3EmbeddingAdapter(
+        device="cpu",
+        truncate_dim=dimensions,
+        local_files_only=True,
+    )
 
 
 def _lexical_search(query: str, records: list[dict[str, Any]]) -> list[tuple[float, dict[str, Any]]]:

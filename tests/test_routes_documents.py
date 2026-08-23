@@ -3565,6 +3565,10 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(stored_rows[0]["chunk_id"], "approved-1")
         self.assertEqual(stored_rows[0]["embedding_dimensions"], 8)
         self.assertEqual(jobs[0]["indexing_job_id"], response["indexing_job_id"])
+        pipeline_trace = response.get("pipeline_trace") or {}
+        self.assertEqual("regulation_preprocessing_v1", pipeline_trace.get("pipeline_id"))
+        self.assertEqual("vector_index", pipeline_trace.get("stages", [{}])[-1].get("stage_id"))
+        self.assertEqual("completed", pipeline_trace.get("stages", [{}])[-1].get("status"))
 
     def test_index_document_rejects_approved_chunk_without_content_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

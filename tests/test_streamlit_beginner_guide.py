@@ -353,6 +353,49 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
 
         self.assertFalse(app.exception)
 
+    def test_beginner_mode_renders_complete_orchestration_explanation(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            registry = InstitutionProfileRegistry(
+                profiles={
+                    "test-profile": InstitutionProfile(
+                        profile_id="test-profile",
+                        display_name="테스트 기관",
+                        institution_name="테스트 기관",
+                        tenant_id="default",
+                    )
+                },
+                default_profile_id="test-profile",
+            )
+            app = AppTest.from_file(str(APP_PATH), default_timeout=20)
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.session_state["institution_profile_registry_bytes"] = (
+                institution_profile_registry_to_bytes(registry)
+            )
+            app.session_state["selected_institution_profile_id"] = "test-profile"
+            app.run()
+
+            next(button for button in app.button if button.label == "초보자 안내 시작").click().run()
+            page_text = "\n".join(
+                [str(markdown.value) for markdown in app.markdown]
+                + [str(caption.value) for caption in app.caption]
+            )
+
+            self.assertIn("① 문서 전처리·승인·색인", page_text)
+            self.assertIn("② 질문 분석·근거 답변", page_text)
+            self.assertIn("③ 검증 결과를 릴리스하고 MCP 연결 준비", page_text)
+            self.assertIn("받는 것:", page_text)
+            self.assertIn("만드는 것:", page_text)
+
+        self.assertFalse(app.exception)
+
     def test_sidebar_toggle_counts_as_an_explicit_guide_choice(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
@@ -434,7 +477,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('index=None if beginner_target_choice_required else 0', source)
         self.assertIn('[data-testid="stRadio"]', source)
         self.assertIn('[data-testid="stLinkButton"]', source)
-        self.assertIn("승인·색인을 마쳤다면 MCP 생성으로 이동하세요", source)
+        self.assertIn("승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요", source)
         self.assertEqual(2, source.count("_render_beginner_connection_confirmation("))
         registration_course = source.index("_render_mcp_completion_connection_course(", 8000)
         final_confirmation = source.index(
@@ -789,7 +832,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 "① 문서 올려서 전처리",
                 "② 결과 확인",
                 "③ 검수하고 승인",
-                "④ MCP 생성·AI 연결",
+                "④ Qwen 규정 챗봇·AI 연결",
             ],
             guide_pages,
         )
@@ -1047,6 +1090,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
     def test_completion_state_requires_real_approval_and_index_gate(self) -> None:
         _source, module = _source_and_module()
         helper = _function(module, "_beginner_guide_completed_steps")
+        usage_path = {"value": "mcp"}
         namespace: dict[str, object] = {
             "APPROVABLE_CHUNK_STATUSES": frozenset(
                 {
@@ -1061,6 +1105,11 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "_beginner_scope_approval_ready": lambda _ctx: True,
             "_results_step_is_used": lambda ctx: bool(
                 (ctx or {}).get("results_step_used", True)
+            ),
+            "AI_USAGE_PATH_QWEN": "qwen",
+            "_ai_usage_path": lambda: usage_path["value"],
+            "_qwen_beginner_procedure_states": lambda ctx: tuple(
+                (ctx or {}).get("qwen_states", (False,) * 5)
             ),
         }
         exec(compile(ast.Module(body=[helper], type_ignores=[]), "<guide-completion>", "exec"), namespace)
@@ -1128,6 +1177,20 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 mcp_connection_confirmed=False,
             ),
         )
+
+        usage_path["value"] = "qwen"
+        self.assertEqual(
+            (True, True, True, False),
+            completed_steps(approved_context, results_confirmed=False),
+        )
+        self.assertEqual(
+            (True, True, True, True),
+            completed_steps(
+                {**approved_context, "qwen_states": (True,) * 5},
+                results_confirmed=False,
+            ),
+        )
+        usage_path["value"] = "mcp"
 
         partial_context = {
             "document_id": "doc-1",
@@ -1544,6 +1607,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
     def test_home_workflow_cards_complete_only_in_fail_closed_order(self) -> None:
         _source, module = _source_and_module()
         helper = _function(module, "_workflow_states")
+        usage_path = {"value": "mcp"}
         namespace: dict[str, object] = {
             "APPROVABLE_CHUNK_STATUSES": frozenset(
                 {
@@ -1561,6 +1625,11 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             ),
             "_results_step_is_used": lambda ctx: bool(
                 (ctx or {}).get("results_step_used", True)
+            ),
+            "AI_USAGE_PATH_QWEN": "qwen",
+            "_ai_usage_path": lambda: usage_path["value"],
+            "_qwen_beginner_procedure_states": lambda ctx: tuple(
+                ctx.get("qwen_states", (False,) * 5)
             ),
             "st": SimpleNamespace(session_state={}),
         }
@@ -1648,6 +1717,15 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertEqual(
             [True, True, True, True],
             workflow_states(actual_bundle_ready),
+        )
+        usage_path["value"] = "qwen"
+        self.assertEqual(
+            [True, True, True, False],
+            workflow_states(actual_bundle_ready),
+        )
+        self.assertEqual(
+            [True, True, True, True],
+            workflow_states({**actual_bundle_ready, "qwen_states": (True,) * 5}),
         )
 
         # AI 추가 검수를 쓰지 않아 ②를 건너뛰는 규정은, 누를 화면이 없으므로

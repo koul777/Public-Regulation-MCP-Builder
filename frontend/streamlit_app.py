@@ -14,7 +14,7 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from functools import lru_cache
@@ -44,6 +44,7 @@ from app.api.routes_rag import RagChatRequest, rag_chat
 from app.core.api_audit import redact_sensitive_paths
 from app.core.config import Settings, get_settings, set_runtime_settings_overrides
 from app.core.pipeline import kordoc_table_command_status
+from app.agents.role_registry import workflow_roles
 from app.agents.provider_config import (
     SUPPORTED_AGENT_REVIEW_PROVIDERS,
     agent_review_configuration_reason,
@@ -51,6 +52,7 @@ from app.agents.provider_config import (
 )
 from app.core.security import AuthContext
 from app.core.tenant_access import INSTITUTION_STORAGE_MARKER, institution_storage_dir
+from app.rag.local_llm import DEFAULT_LOCAL_LLM_MODEL, probe_local_llm
 from app.core.institution_profiles import (
     ALLOWED_REQUIRED_ROW_FIELDS,
     InstitutionProfileRegistry,
@@ -87,6 +89,7 @@ from app.services.processing_service import ProcessingService
 from app.services.regulation_catalog_service import group_documents_by_regulation, latest_active_version, read_regulation_metadata
 from app.services.regulation_metadata_service import infer_regulation_metadata, regulation_upload_sort_key
 from app.services.review_workflow_service import review_batch_chunk_fingerprint, review_content_hash
+from app.pipelines.definitions import pipeline_manifest
 from app.services.approval_governance import (
     apply_ai_review_decisions_to_preview_text,
     approval_review_completion_state,
@@ -238,7 +241,7 @@ NAV_PREPROCESS = "① 문서 올려서 전처리"
 NAV_RESULTS = "② 결과 확인"
 NAV_APPROVAL = "③ 검수하고 승인"
 LEGACY_NAV_CONNECT = "시범 질의응답"
-NAV_MCP = "④ MCP 생성·AI 연결"
+NAV_MCP = "④ Qwen 규정 챗봇·AI 연결"
 NAV_GOLDSET = "🔍 정확도 검수(골드셋)"
 NAV_ADMIN = "⚙️ 관리자 설정"
 NAV_PAGES = [NAV_HOME, NAV_PREPROCESS, NAV_RESULTS, NAV_APPROVAL, NAV_MCP, NAV_GOLDSET, NAV_ADMIN]
@@ -247,6 +250,14 @@ ADVANCED_NAV_PAGES = [NAV_GOLDSET, NAV_ADMIN]
 
 BEGINNER_GUIDE_CHOICE_KEY = "beginner_guide_choice_made"
 BEGINNER_GUIDE_ENABLED_KEY = "beginner_guide_enabled"
+BEGINNER_GUIDE_TOGGLE_WIDGET_KEY = "beginner_guide_toggle_widget"
+AI_USAGE_PATH_KEY = "ai_usage_path"
+AI_USAGE_PATH_FIRST_WIDGET_KEY = "ai_usage_path_first"
+AI_USAGE_PATH_SIDEBAR_WIDGET_KEY = "ai_usage_path_sidebar"
+AI_USAGE_PATH_QWEN = "qwen"
+AI_USAGE_PATH_MCP = "mcp"
+AI_USAGE_PATH_OPTIONS = (AI_USAGE_PATH_QWEN, AI_USAGE_PATH_MCP)
+QWEN_CHAT_PROBE_PREFIX = "qwen_chat_probe"
 BEGINNER_GUIDE_STEP_KEY = "beginner_guide_step"
 BEGINNER_GUIDE_SUBSTEP_KEY = "beginner_guide_substep"
 BEGINNER_GUIDE_PREPROCESS_SELECTION_KEY = "beginner_guide_preprocess_selection"
@@ -286,8 +297,8 @@ BEGINNER_GUIDE_STEPS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         NAV_MCP,
-        "MCP 만들고 연결 확인하기",
-        "승인된 규정으로 MCP 파일 묶음을 만들고 사용할 AI의 연결을 확인합니다.",
+        "Qwen 챗봇 사용하고 MCP 연결하기",
+        "승인된 규정을 로컬 Qwen에 질문하고, 필요하면 다른 AI용 MCP 연결 묶음도 만듭니다.",
     ),
 )
 BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
@@ -326,8 +337,65 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
         "fetch 원문·출처 조회 확인",
     ),
 )
+BEGINNER_QWEN_PROCEDURES: tuple[str, ...] = (
+    "승인·색인된 규정 준비 상태 확인",
+    "Qwen3 8B 챗봇 켜기",
+    "로컬 Qwen 연결 확인",
+    "예시 질문 또는 직접 질문 입력",
+    "답변과 근거 조문 함께 확인",
+)
 # The six external connection confirmations start at procedure 4-6 in the list above.
 BEGINNER_CONNECTION_FIRST_SUBSTEP = 6
+
+
+def _ai_usage_path() -> str:
+    value = str(st.session_state.get(AI_USAGE_PATH_KEY) or AI_USAGE_PATH_QWEN).strip().lower()
+    return value if value in AI_USAGE_PATH_OPTIONS else AI_USAGE_PATH_QWEN
+
+
+def _ai_usage_path_label(value: str) -> str:
+    return {
+        AI_USAGE_PATH_QWEN: "이 PC의 로컬 Qwen 챗봇으로 바로 질문",
+        AI_USAGE_PATH_MCP: "ChatGPT·Claude·Codex에 MCP로 연결",
+    }.get(str(value or ""), "로컬 Qwen 챗봇")
+
+
+def _ai_usage_path_changed(widget_key: str) -> None:
+    value = str(st.session_state.get(widget_key) or AI_USAGE_PATH_QWEN).strip().lower()
+    st.session_state[AI_USAGE_PATH_KEY] = value if value in AI_USAGE_PATH_OPTIONS else AI_USAGE_PATH_QWEN
+
+
+def _connect_nav_display_label() -> str:
+    if _ai_usage_path() == AI_USAGE_PATH_MCP:
+        return "④ MCP 생성·외부 AI 연결"
+    return NAV_MCP
+
+
+def _primary_nav_display_label(page: str) -> str:
+    return _connect_nav_display_label() if page == NAV_MCP else page
+
+
+def _beginner_guide_step_details(step: int) -> tuple[str, str, str]:
+    page, title, description = BEGINNER_GUIDE_STEPS[int(step) - 1]
+    if int(step) == 4 and _ai_usage_path() == AI_USAGE_PATH_MCP:
+        return (
+            page,
+            "MCP 연결 만들고 외부 AI에서 확인하기",
+            "승인된 규정을 사용할 AI 앱을 골라 MCP를 등록하고 search·fetch까지 확인합니다.",
+        )
+    if int(step) == 4:
+        return (
+            page,
+            "로컬 Qwen 챗봇으로 질문하기",
+            "Qwen3 8B를 켜고 예시 질문을 실행한 뒤 답변과 근거 조문을 함께 확인합니다.",
+        )
+    return page, title, description
+
+
+def _beginner_guide_procedures(step: int) -> tuple[str, ...]:
+    if int(step) == 4 and _ai_usage_path() == AI_USAGE_PATH_QWEN:
+        return BEGINNER_QWEN_PROCEDURES
+    return BEGINNER_GUIDE_PROCEDURES[int(step) - 1]
 
 # 전처리 기본 로직: 파서 초안 → (선택) AI 추가 검수 → 사람 승인.
 PIPELINE_STAGES: list[tuple[str, str]] = [
@@ -1213,7 +1281,12 @@ def _queue_workflow_navigation(page: str, *, label: str | None = None) -> None:
             page = BEGINNER_GUIDE_STEPS[recommended_step - 1][0]
             label = f"초보자 안내 {recommended_step}단계로 이동"
             st.session_state[BEGINNER_GUIDE_NAV_NOTICE_KEY] = (
-                "초보자 안내 모드에서는 검수·승인·색인을 마친 뒤 ④ MCP 생성 단계로 이동할 수 있습니다."
+                "초보자 안내 모드에서는 검수·승인·색인을 마친 뒤 "
+                + (
+                    "④ Qwen 규정 챗봇 단계로 이동할 수 있습니다."
+                    if _ai_usage_path() == AI_USAGE_PATH_QWEN
+                    else "④ MCP 생성·외부 AI 연결 단계로 이동할 수 있습니다."
+                )
             )
     if document_id and page in DOCUMENT_CONTEXT_NAV_PAGES:
         st.session_state[WORKFLOW_TRANSITION_STATE_KEY] = {
@@ -1679,6 +1752,63 @@ def _render_beginner_connection_confirmation(
     st.session_state[confirmation_key] = previous_complete
 
 
+def _qwen_chat_probe_key(document_id: str) -> str:
+    return f"{QWEN_CHAT_PROBE_PREFIX}:{document_id}"
+
+
+def _qwen_chat_runtime_enabled(runtime_settings: Settings) -> bool:
+    return bool(
+        str(runtime_settings.rag_llm_backend or "").strip().lower() == "ollama"
+        and str(runtime_settings.rag_llm_model or "").strip().lower()
+        == DEFAULT_LOCAL_LLM_MODEL.lower()
+    )
+
+
+def _qwen_beginner_procedure_states(ctx: dict | None) -> tuple[bool, ...]:
+    document_id = str(ctx.get("document_id") or "") if ctx else ""
+    selected_profile_id = _selected_institution_profile_id()
+    document_profile_id = str(
+        getattr((ctx or {}).get("document"), "profile_id", "") or ""
+    ).strip().lower()
+    profile_scope_matches = not (
+        selected_profile_id
+        and document_profile_id
+        and selected_profile_id != document_profile_id
+    )
+    approval_ready = bool(
+        ctx
+        and int(ctx.get("approved_count") or 0) > 0
+        and dict(ctx.get("mcp_connection_gate") or {}).get("ready")
+        and profile_scope_matches
+    )
+    runtime_settings = get_settings()
+    qwen_enabled = _qwen_chat_runtime_enabled(runtime_settings)
+    messages: list[dict[str, object]] = []
+    if document_id:
+        value = st.session_state.get(
+            _regulation_chat_history_key(document_id, selected_profile_id)
+        )
+        if isinstance(value, list):
+            messages = [message for message in value if isinstance(message, dict)]
+    question_asked = any(
+        str(message.get("role") or "").strip().lower() == "user"
+        and str(message.get("content") or "").strip()
+        for message in messages
+    )
+    grounded_answer = any(
+        str(message.get("role") or "").strip().lower() == "assistant"
+        and str(message.get("content") or "").strip()
+        and isinstance(message.get("citations"), list)
+        and bool(message.get("citations"))
+        and not message.get("error")
+        for message in messages
+    )
+    qwen_connected = bool(
+        document_id and st.session_state.get(_qwen_chat_probe_key(document_id))
+    ) or grounded_answer
+    return approval_ready, qwen_enabled, qwen_connected, question_asked, grounded_answer
+
+
 def _beginner_guide_completed_steps(
     ctx: dict | None,
     *,
@@ -1721,6 +1851,9 @@ def _beginner_guide_completed_steps(
     if not _results_step_is_used(ctx):
         results_confirmed = True
     results_complete = bool(preprocessing_complete and (results_confirmed or approval_complete))
+    if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+        qwen_complete = bool(approval_complete and all(_qwen_beginner_procedure_states(ctx)))
+        return preprocessing_complete, results_complete, approval_complete, qwen_complete
     if mcp_bundle_created is None:
         mcp_bundle_created = _mcp_bundle_created(ctx)
     if mcp_connection_confirmed is None:
@@ -1757,10 +1890,13 @@ def _beginner_guide_procedure_states(
         source_selected = bool(
             _uploaded_file_list(st.session_state.get("regulation_document_upload"))
             or document_id
+            or _beginner_pending_upload_selected()
         )
         return (
             bool(_selected_institution_profile_id()),
-            bool(st.session_state.get(BEGINNER_GUIDE_KORDOC_CHECKED_KEY)) or preprocessing_complete,
+            bool(st.session_state.get(BEGINNER_GUIDE_KORDOC_CHECKED_KEY))
+            or _beginner_guide_kordoc_ready()
+            or preprocessing_complete,
             source_selected,
             bool(st.session_state.get(BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY))
             or preprocessing_complete,
@@ -1817,6 +1953,8 @@ def _beginner_guide_procedure_states(
             selected_regulations_complete,
         )
     if step == 4:
+        if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+            return _qwen_beginner_procedure_states(ctx)
         bundle_created = _mcp_bundle_created(ctx) if mcp_bundle_created is None else mcp_bundle_created
         principle_confirmed = bool(
             document_id
@@ -1881,6 +2019,7 @@ def _beginner_guide_recommended_step(completed_steps: tuple[bool, ...]) -> int:
 def _beginner_guide_start() -> None:
     st.session_state[BEGINNER_GUIDE_CHOICE_KEY] = True
     st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = True
+    st.session_state[BEGINNER_GUIDE_TOGGLE_WIDGET_KEY] = True
     st.session_state[BEGINNER_GUIDE_STEP_KEY] = 1
     st.session_state["_nav_target"] = NAV_PREPROCESS
 
@@ -1888,15 +2027,19 @@ def _beginner_guide_start() -> None:
 def _beginner_guide_use_general_mode() -> None:
     st.session_state[BEGINNER_GUIDE_CHOICE_KEY] = True
     st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = False
+    st.session_state[BEGINNER_GUIDE_TOGGLE_WIDGET_KEY] = False
 
 
 def _beginner_guide_skip() -> None:
     st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = False
+    st.session_state[BEGINNER_GUIDE_TOGGLE_WIDGET_KEY] = False
 
 
 def _beginner_guide_toggle_changed() -> None:
     st.session_state[BEGINNER_GUIDE_CHOICE_KEY] = True
-    if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+    enabled = bool(st.session_state.get(BEGINNER_GUIDE_TOGGLE_WIDGET_KEY))
+    st.session_state[BEGINNER_GUIDE_ENABLED_KEY] = enabled
+    if enabled:
         st.session_state.setdefault(BEGINNER_GUIDE_STEP_KEY, 1)
 
 
@@ -1912,7 +2055,33 @@ def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
 
     if show_hero:
         _render_hero("처음 사용한다면 화면이 가리키는 버튼만 순서대로 따라가세요.")
-    st.markdown("## 화면 안내 방식을 선택하세요")
+    st.markdown("## 1. 규정을 어디에서 질문할지 선택하세요")
+    st.info(
+        "두 방법 모두 같은 승인된 로컬 RAG 색인을 사용합니다. "
+        "Qwen은 이 프로그램 안에서 바로 대화하고, MCP는 승인 규정을 다른 AI 앱에 연결합니다. "
+        "선택은 나중에 왼쪽 메뉴에서 언제든 바꿀 수 있습니다."
+    )
+    st.session_state.setdefault(AI_USAGE_PATH_KEY, AI_USAGE_PATH_QWEN)
+    st.session_state[AI_USAGE_PATH_FIRST_WIDGET_KEY] = _ai_usage_path()
+    selected_usage_path = st.radio(
+        "최종 사용 방법",
+        AI_USAGE_PATH_OPTIONS,
+        key=AI_USAGE_PATH_FIRST_WIDGET_KEY,
+        format_func=_ai_usage_path_label,
+        on_change=_ai_usage_path_changed,
+        args=(AI_USAGE_PATH_FIRST_WIDGET_KEY,),
+    )
+    if selected_usage_path == AI_USAGE_PATH_QWEN:
+        st.success(
+            "권장 · 승인 후 ④ 화면에서 Qwen3 8B를 켜고 바로 질문합니다. "
+            "Ollama가 이 PC에서 실행되며 규정과 대화가 외부 API로 전송되지 않습니다."
+        )
+    else:
+        st.success(
+            "승인 후 ④ 화면에서 MCP 묶음을 만들고 ChatGPT·Claude·Codex 중 사용할 앱에 등록합니다. "
+            "로컬 Qwen 챗봇은 선택 사항으로 남아 있습니다."
+        )
+    st.markdown("## 2. 화면 안내 방식을 선택하세요")
     st.info(
         "초보자 안내 모드는 현재 눌러야 할 항목을 번호·문장·빨간 외곽선으로 표시합니다. "
         "안내가 승인이나 색인을 대신 실행하지 않으며, 언제든 왼쪽 메뉴에서 끄거나 다시 볼 수 있습니다."
@@ -1926,7 +2095,7 @@ def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
             on_click=_beginner_guide_start,
             width="stretch",
         )
-        st.caption("처음 규정을 처리하거나 MCP를 처음 만드는 사용자에게 권장합니다.")
+        st.caption("처음 규정을 처리하거나 Qwen·MCP를 처음 사용하는 분에게 권장합니다.")
     with general_col:
         st.button(
             "일반 모드로 계속",
@@ -1950,11 +2119,107 @@ def _beginner_guide_active_step(nav_page: str, completed_steps: tuple[bool, ...]
     return _beginner_guide_recommended_step(completed_steps)
 
 
+def _beginner_guide_kordoc_ready() -> bool:
+    """Read the same Kordoc readiness signal used by the preprocess page.
+
+    The sidebar is rendered before the page body. Looking at the persisted
+    checkbox alone therefore made the sidebar point at Kordoc even when the
+    page body had already confirmed that Kordoc was available. Use the real
+    readiness probe here so the highlighted action and the body stay in sync.
+    """
+
+    try:
+        return bool(
+            kordoc_table_command_status(
+                str(getattr(settings, "kordoc_table_command", "") or "")
+            ).get("available")
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _beginner_pending_upload_selected() -> bool:
+    """Return whether a persisted pending upload checkbox is selected."""
+
+    return any(
+        len(str(key).removeprefix("pending-upload-")) == 16
+        and all(
+            character in "0123456789abcdef"
+            for character in str(key).removeprefix("pending-upload-").lower()
+        )
+        and bool(value)
+        for key, value in st.session_state.items()
+        if str(key).startswith("pending-upload-")
+    )
+
+
+def _render_beginner_page_compass(
+    step: int,
+    *,
+    ctx: dict | None = None,
+    purpose: str,
+    finish: str,
+) -> None:
+    """Put one plain-language action card above each beginner page.
+
+    Red markers stay close to their controls, while this card answers the
+    first-time operator's three questions before scrolling: why am I here,
+    what is the one thing I should do now, and what happens next? It creates no
+    workflow action and is safe to render on every rerun.
+    """
+
+    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        return
+    safe_step = max(1, min(len(BEGINNER_GUIDE_STEPS), int(step)))
+    procedure_states = _beginner_guide_procedure_states(ctx, safe_step)
+    if safe_step > 1 and ctx is None:
+        action = "① 문서 올려서 전처리로 이동"
+        purpose = "아직 전처리한 문서가 없습니다. 아래 이동 버튼을 눌러 먼저 파일을 올리고 전처리하세요."
+        finish = "전처리가 끝나면 이 단계로 돌아와 결과를 확인합니다."
+    else:
+        action = ""
+    current_substep = int(st.session_state.get(BEGINNER_GUIDE_SUBSTEP_KEY) or 0)
+    procedure_names = _beginner_guide_procedures(safe_step)
+    if not action:
+        if 0 < current_substep <= len(procedure_names) and not procedure_states[current_substep - 1]:
+            action = procedure_names[current_substep - 1]
+        elif all(procedure_states):
+            action = "이 단계의 확인이 끝났습니다. 아래 완료 상태를 확인하세요."
+        else:
+            action = next(
+                (
+                    procedure
+                    for procedure, completed in zip(procedure_names, procedure_states)
+                    if not completed
+                ),
+                "화면의 빨간 안내를 따라 진행하세요.",
+            )
+    st.markdown(
+        f"""
+        <div class="rr-beginner-compass" role="status">
+          <div class="rr-beginner-compass-kicker">초보자 모드 · {safe_step}단계</div>
+          <h3>지금은 이것만 하세요</h3>
+          <p class="rr-beginner-compass-action"><strong>{html.escape(action)}</strong></p>
+          <p>{html.escape(purpose)}</p>
+          <div class="rr-beginner-compass-finish">끝나면 → {html.escape(finish)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
     st.session_state.setdefault(BEGINNER_GUIDE_ENABLED_KEY, False)
+    # The guide can be enabled by the landing-page button before this widget
+    # exists. Always mirror the durable mode state before rendering the
+    # widget, otherwise a stale `False` widget value can turn the guide off
+    # on the next sidebar interaction.
+    st.session_state[BEGINNER_GUIDE_TOGGLE_WIDGET_KEY] = bool(
+        st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+    )
     st.toggle(
         "초보자 안내 모드",
-        key=BEGINNER_GUIDE_ENABLED_KEY,
+        key=BEGINNER_GUIDE_TOGGLE_WIDGET_KEY,
         on_change=_beginner_guide_toggle_changed,
         help="켜면 현재 단계의 눌러야 할 항목을 번호와 빨간 외곽선으로 표시합니다.",
     )
@@ -1975,7 +2240,7 @@ def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
     )
     active_step = _beginner_guide_active_step(nav_page, completed_steps)
     st.session_state[BEGINNER_GUIDE_STEP_KEY] = active_step
-    _page, title, description = BEGINNER_GUIDE_STEPS[active_step - 1]
+    _page, title, description = _beginner_guide_step_details(active_step)
     st.progress(active_step / len(BEGINNER_GUIDE_STEPS), text=f"{active_step}/{len(BEGINNER_GUIDE_STEPS)} 단계")
     st.markdown(f"**{active_step}. {title}**")
     st.caption(description)
@@ -1996,7 +2261,7 @@ def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
     # The sidebar runs before the page body, so markers can show only this one.
     st.session_state[BEGINNER_GUIDE_SUBSTEP_KEY] = current_substep
     for index, (procedure, completed) in enumerate(
-        zip(BEGINNER_GUIDE_PROCEDURES[active_step - 1], procedure_states),
+        zip(_beginner_guide_procedures(active_step), procedure_states),
         start=1,
     ):
         if completed:
@@ -2036,6 +2301,228 @@ def _render_beginner_guide_sidebar(ctx: dict | None, nav_page: str) -> None:
         on_click=_beginner_guide_start,
         width="stretch",
     )
+
+
+_BEGINNER_PIPELINE_LABELS = {
+    "regulation_preprocessing_v1": "① 문서 전처리·승인·색인",
+    "local_regulation_qa_v1": "② 질문 분석·근거 답변",
+}
+
+_BEGINNER_PIPELINE_FIELD_LABELS = {
+    "uploaded_document": "업로드한 문서",
+    "parsed_document": "문서에서 추출한 글·표·페이지 정보",
+    "normalized_document": "정리된 문서와 원문 위치 정보",
+    "structure_nodes": "규정·장·절·조·항·호 구조",
+    "chunks": "검색할 조문 단위 묶음",
+    "quality_report": "품질 검사 결과",
+    "approval_worklist": "사람이 확인할 목록",
+    "artifacts": "내보낸 JSONL·CSV·Markdown 파일",
+    "approved_chunks": "사람이 승인한 조문 묶음",
+    "vector_index": "승인된 조문 검색 인덱스",
+    "query_plan": "질문의 기관·조문·날짜 조건",
+    "search_queries": "보정된 검색어 묶음",
+    "candidates": "검색 후보 조문",
+    "evidence": "최종 답변에 사용할 근거 조문",
+    "grounding_context": "근거 본문과 인용 정보",
+    "draft_answer": "근거를 바탕으로 만든 답변 초안",
+    "answer": "검증이 끝난 최종 답변",
+    "citations": "답변에 붙은 근거 인용",
+    "evaluation_seedpack": "검증용 테스트 자료",
+    "runtime_profile": "현재 실행 환경 정보",
+    "test_scope": "이번 검증 범위",
+    "evaluation_report": "검증 결과 보고서",
+    "quality_metrics": "품질 측정 결과",
+    "blockers": "출시를 막는 문제 목록",
+    "project_root": "프로젝트 소스",
+    "release_scope": "이번 릴리스 범위",
+    "tenant_scope": "기관 범위",
+    "release_options": "릴리스 선택 사항",
+    "release_report": "릴리스 결과 보고서",
+    "evidence_artifacts": "검증 증거 파일",
+    "next_actions": "다음 조치 목록",
+}
+
+
+def _beginner_pipeline_fields(values: object) -> str:
+    """Turn manifest field keys into a short, beginner-readable sentence."""
+
+    # Stage manifests use JSON lists, while the release-role registry exposes
+    # immutable tuples. Accept both so every explanation row shows its real
+    # inputs and outputs instead of silently falling back to “없음”.
+    if not isinstance(values, (list, tuple)) or not values:
+        return "없음"
+    labels = [
+        _BEGINNER_PIPELINE_FIELD_LABELS.get(str(value), str(value))
+        for value in values
+        if str(value or "").strip()
+    ]
+    return "· ".join(labels) or "없음"
+
+
+def _render_beginner_orchestration_explanation(*, nav_page: str | None = None) -> None:
+    """Explain the complete role/model handoff in plain language.
+
+    The guide previously explained the next click but not who handled the
+    work behind that click.  This panel uses the same manifest as the API so
+    the beginner UI, pipeline trace, and machine-readable contract cannot
+    drift apart.
+    """
+
+    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        return
+    manifest = pipeline_manifest()
+    with st.expander("전체 과정과 담당 모델을 한눈에 보기", expanded=True):
+        st.markdown(
+            "**화면에서 버튼을 누르면 아래 순서대로 작업이 이어집니다.** "
+            "작은 모델은 질문·검수처럼 범위가 좁은 일에 쓰고, 답변 모델은 승인된 근거를 읽는 일에만 씁니다. "
+            "보안·승인·인용 검증은 AI에게 맡기지 않고 규칙과 사람 확인으로 막습니다."
+        )
+        for pipeline_id, pipeline_title in _BEGINNER_PIPELINE_LABELS.items():
+            stages = manifest.get(pipeline_id) or []
+            st.markdown(f"#### {pipeline_title}")
+            for stage in stages:
+                stage_number = stage.get("stage_number", "-")
+                title = str(stage.get("title_ko") or stage.get("stage_id") or "단계")
+                purpose = str(stage.get("purpose") or "")
+                role_lines: list[str] = []
+                for role in stage.get("agent_roles") or []:
+                    role_name = str(role.get("display_name") or role.get("role_id") or "담당 역할")
+                    model = str(role.get("primary_model") or "결정론적 규칙/사람 확인")
+                    if role.get("human_decision_required"):
+                        model = "사람이 최종 결정"
+                    role_purpose = str(role.get("purpose") or "").strip()
+                    role_line = f"{role_name} ({model})"
+                    if role_purpose:
+                        role_line += f" — {role_purpose}"
+                    role_lines.append(role_line)
+                role_text = " → ".join(role_lines) or "담당 역할 정보 없음"
+                failure_policy = str(
+                    (stage.get("agent_roles") or [{}])[0].get("failure_policy")
+                    or "문제가 있으면 다음 단계로 넘기지 않음"
+                )
+                active_marker = "현재 화면" if nav_page and _BEGINNER_PIPELINE_LABELS.get(pipeline_id) and (
+                    (pipeline_id == "regulation_preprocessing_v1" and nav_page in {NAV_PREPROCESS, NAV_RESULTS, NAV_APPROVAL})
+                    or (pipeline_id == "local_regulation_qa_v1" and nav_page == NAV_MCP)
+                ) else ""
+                marker = f" · **{active_marker}**" if active_marker else ""
+                st.markdown(f"**{stage_number}. {title}**{marker} — {purpose}")
+                st.caption(
+                    f"받는 것: {_beginner_pipeline_fields(stage.get('input_keys'))} → "
+                    f"만드는 것: {_beginner_pipeline_fields(stage.get('output_keys'))}"
+                )
+                st.caption(f"담당: {role_text} · 문제가 생기면: {failure_policy}")
+        release_roles = workflow_roles("release_and_mcp_handoff")[1:]
+        st.markdown("#### ③ 검증 결과를 릴리스하고 MCP 연결 준비")
+        st.caption(
+            "문서 전처리와 질문 답변이 끝난 뒤, 공개·연결 전에 별도로 거치는 안전한 릴리스 흐름입니다."
+        )
+        for stage_number, role in enumerate(release_roles, start=1):
+            model = role.primary_model or "결정론적 검증·저장"
+            st.markdown(f"**3-{stage_number}. {role.display_name}** · {role.purpose}")
+            st.caption(
+                f"받는 것: {_beginner_pipeline_fields(role.required_inputs)} → "
+                f"만드는 것: {_beginner_pipeline_fields(role.outputs)}"
+            )
+            st.caption(f"담당 모델/방식: {model} · 문제가 생기면: {role.failure_policy}")
+        st.info(
+            "핵심 원칙: AI는 초안·검색어·검수 의견만 만들 수 있습니다. "
+            "승인되지 않은 조항은 색인하지 않고, 원문과 처리 결과가 맞지 않으면 사람이 확인할 때까지 멈춥니다."
+        )
+
+
+_AGENT_TRACE_STATUS_LABELS = {
+    "pending": "대기",
+    "running": "실행 중",
+    "completed": "완료",
+    "skipped": "건너뜀",
+    "degraded": "제한 실행",
+    "review_required": "사람 검토 필요",
+    "blocked": "차단",
+    "failed": "실패",
+    "verified": "검증 완료",
+    "abstained": "검증 보류",
+    "rejected": "검증 거부",
+    "fallback": "대체 경로 사용",
+    "unavailable": "사용 불가",
+    "not_requested": "사용하지 않음",
+    "human_approved": "사람 승인 완료",
+    "human_rejected": "사람이 거부",
+}
+
+_AGENT_TRACE_NEXT_ACTIONS = {
+    "pending": "앞 단계가 끝나면 시작합니다.",
+    "running": "지금 처리 중입니다. 화면을 닫지 말고 잠시 기다리세요.",
+    "completed": "이 역할의 결과를 다음 단계가 이어서 사용합니다.",
+    "skipped": "현재 설정에서는 사용하지 않아 건너뛰었습니다.",
+    "degraded": "모델 대신 안전한 대체 경로로 이어서 처리했습니다.",
+    "review_required": "사람이 결과를 확인해야 다음 단계로 갈 수 있습니다.",
+    "blocked": "안전 조건을 만족하지 못해 멈췄습니다. 입력과 안내 사유를 확인하세요.",
+    "failed": "처리에 실패했습니다. 사유를 확인한 뒤 다시 실행하세요.",
+    "verified": "검증이 끝났습니다. 검증된 결과를 다음 화면에서 사용할 수 있습니다.",
+    "abstained": "검증을 확정하지 못했습니다. 근거를 확인하고 사람 검토를 진행하세요.",
+    "rejected": "검증을 통과하지 못했습니다. 답변을 사용하지 말고 근거를 다시 확인하세요.",
+    "fallback": "기본 모델 대신 안전한 대체 경로를 사용했습니다.",
+    "unavailable": "필요한 모델을 사용할 수 없습니다. 설치 상태를 확인하세요.",
+    "not_requested": "이번 실행에서는 이 역할을 요청하지 않았습니다.",
+    "human_approved": "사람 승인이 완료되어 다음 단계로 진행할 수 있습니다.",
+    "human_rejected": "사람이 승인하지 않아 안전하게 멈췄습니다.",
+}
+
+
+def _agent_trace_next_action(role: dict) -> str:
+    """Give the human gate a useful action even before it starts running."""
+
+    status = str(role.get("status") or "pending")
+    reason_code = str(role.get("reason_code") or "").strip()
+    if status == "pending" and reason_code == "awaiting_human_approval":
+        return "원문과 품질 결과를 확인한 뒤 사람이 승인·거부·재검토를 선택합니다."
+    return _AGENT_TRACE_NEXT_ACTIONS.get(status, "상태를 확인하세요")
+
+
+def _render_actual_pipeline_role_trace(ctx: dict | None) -> None:
+    """Show the roles that actually ran for the current document.
+
+    The static sidebar explains the complete contract. This trace is the
+    durable run result, so it deliberately renders only role names, statuses,
+    model labels, and bounded reason codes—not source text or local paths.
+    """
+
+    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) or not isinstance(ctx, dict):
+        return
+    trace = ctx.get("pipeline_trace")
+    stages = trace.get("stages") if isinstance(trace, dict) else None
+    if not isinstance(stages, list) or not stages:
+        return
+    with st.expander("이번 문서에서 실제로 수행된 역할 보기", expanded=True):
+        st.caption(
+            "위의 전체 과정 설명은 설계도이고, 아래 기록은 현재 문서 처리에서 실제로 남은 실행 결과입니다."
+        )
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            title = str(stage.get("title_ko") or stage.get("stage_id") or "단계")
+            statuses = stage.get("agent_role_statuses") or []
+            if not isinstance(statuses, list):
+                continue
+            st.markdown(f"**{stage.get('stage_number', '-')}단계 · {title}**")
+            purpose = str(stage.get("purpose") or "").strip()
+            if purpose:
+                st.caption(f"이 단계의 일: {purpose}")
+            for role in statuses:
+                if not isinstance(role, dict):
+                    continue
+                status = _AGENT_TRACE_STATUS_LABELS.get(
+                    str(role.get("status") or "pending"),
+                    str(role.get("status") or "대기"),
+                )
+                model = str(role.get("primary_model") or "결정적 검증·저장")
+                reason = str(role.get("reason_code") or "").strip()
+                suffix = f" · 사유: `{reason}`" if reason else ""
+                st.write(
+                    f"- {role.get('display_name') or role.get('role_id')}: "
+                    f"**{status}** · 모델/방식: `{model}`{suffix} · "
+                    f"다음: {_agent_trace_next_action(role)}"
+                )
 
 
 def _streamlit_key_css_fragment(value: object) -> str:
@@ -2124,7 +2611,8 @@ def _render_beginner_action_marker(
             """,
             unsafe_allow_html=True,
         )
-    procedure_total = len(BEGINNER_GUIDE_PROCEDURES[int(step) - 1])
+    step_procedures = _beginner_guide_procedures(int(step))
+    procedure_total = len(step_procedures)
     if prerequisite:
         # A blocker that must be cleared on an earlier screen: it is not one of this
         # step's numbered procedures, so it must not borrow a procedure number.
@@ -2134,7 +2622,7 @@ def _render_beginner_action_marker(
         marker_label = _beginner_marker_label(step, substep)
         procedure_name = ""
         if 0 < substep <= procedure_total:
-            procedure_name = BEGINNER_GUIDE_PROCEDURES[int(step) - 1][int(substep) - 1]
+            procedure_name = step_procedures[int(substep) - 1]
         progress_note = f"{int(step)}단계 세부 절차 {int(substep)}/{procedure_total}"
         if procedure_name:
             progress_note = f"{progress_note} · {procedure_name}"
@@ -5278,6 +5766,9 @@ def _selected_approval_contexts(selected_document_ids: list[str], current_ctx: d
         agent_review_summary = (latest_run.stats or {}).get("agent_review") if latest_run else {}
         if not isinstance(agent_review_summary, dict):
             agent_review_summary = {}
+        pipeline_trace = (latest_run.stats or {}).get("pipeline_trace") if latest_run else {}
+        if not isinstance(pipeline_trace, dict):
+            pipeline_trace = {}
         loaded_context = {
             "document_id": normalized_document_id,
             "document": document,
@@ -5292,6 +5783,7 @@ def _selected_approval_contexts(selected_document_ids: list[str], current_ctx: d
                 if chunk_review_attention_reasons(chunk)
             },
             "agent_review_summary": agent_review_summary,
+            "pipeline_trace": pipeline_trace,
         }
         contexts.append(loaded_context)
         if len(retained_contexts) < SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES:
@@ -5540,7 +6032,11 @@ def _execute_reviewed_document_approval_plan(
             progress_callback(50, "검색 인덱스 생성", 0, 1)
         index_result = index_document(
             document_id,
-            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+            IndexRequest(
+                target_type="local-jsonl",
+                embedding_dimensions=384,
+                embedding_model="Qwen/Qwen3-Embedding-0.6B",
+            ),
             local_auth,
         )
     elif approval_index_result is not None:
@@ -5666,6 +6162,43 @@ def _render_operator_theme() -> None:
             background: #f2faf6;
             margin: 1rem 0;
             font-size: 1.02rem;
+        }
+        .rr-beginner-compass {
+            border: 2px solid #c62828;
+            border-radius: 1rem;
+            padding: 1rem 1.15rem;
+            background: linear-gradient(135deg, #fff8f7 0%, #fffdf7 100%);
+            box-shadow: 0 8px 22px rgba(198, 40, 40, .1);
+            margin: .45rem 0 1rem 0;
+        }
+        .rr-beginner-compass-kicker {
+            color: #8e1b1b;
+            font-size: .78rem;
+            font-weight: 800;
+            letter-spacing: .03em;
+        }
+        .rr-beginner-compass h3 {
+            color: #6f1717;
+            font-size: 1.18rem;
+            margin: .18rem 0 .3rem 0;
+        }
+        .rr-beginner-compass p {
+            color: #543737;
+            font-size: .92rem;
+            line-height: 1.55;
+            margin: .18rem 0;
+        }
+        .rr-beginner-compass .rr-beginner-compass-action {
+            color: #8e1b1b;
+            font-size: 1.02rem;
+        }
+        .rr-beginner-compass-finish {
+            border-top: 1px solid #f0c9c5;
+            color: #6d4b49;
+            font-size: .84rem;
+            font-weight: 700;
+            margin-top: .55rem;
+            padding-top: .55rem;
         }
         .rr-help {
             padding: .7rem .9rem;
@@ -5915,6 +6448,9 @@ def _load_document_context_for_profile(document_id: str, *, selected_profile_id:
         agent_review_summary = (latest_run.stats or {}).get("agent_review") if latest_run else {}
         if not isinstance(agent_review_summary, dict):
             agent_review_summary = {}
+        pipeline_trace = (latest_run.stats or {}).get("pipeline_trace") if latest_run else {}
+        if not isinstance(pipeline_trace, dict):
+            pipeline_trace = {}
         return {
             "document_id": document_id,
             "document": document,
@@ -5931,6 +6467,7 @@ def _load_document_context_for_profile(document_id: str, *, selected_profile_id:
             "index_status_error": None,
             "mcp_connection_gate": _mcp_connection_gate(None, 0),
             "agent_review_summary": agent_review_summary,
+            "pipeline_trace": pipeline_trace,
             "large_result_warning": oversized_result_warning,
         }
     chunks = repository.get_chunks(document_id)
@@ -5970,6 +6507,9 @@ def _load_document_context_for_profile(document_id: str, *, selected_profile_id:
     agent_review_summary = (latest_run.stats or {}).get("agent_review") if latest_run else {}
     if not isinstance(agent_review_summary, dict):
         agent_review_summary = {}
+    pipeline_trace = (latest_run.stats or {}).get("pipeline_trace") if latest_run else {}
+    if not isinstance(pipeline_trace, dict):
+        pipeline_trace = {}
     return {
         "document_id": document_id,
         "document": document,
@@ -5986,6 +6526,7 @@ def _load_document_context_for_profile(document_id: str, *, selected_profile_id:
         "index_status_error": index_status_error,
         "mcp_connection_gate": _mcp_connection_gate(index_status, approved_count),
         "agent_review_summary": agent_review_summary,
+        "pipeline_trace": pipeline_trace,
     }
 
 
@@ -6897,14 +7438,19 @@ def _workflow_states(ctx: dict | None) -> list[bool]:
     approval_and_index_complete = bool(
         results_complete and approval_evidence_complete
     )
-    bundle_complete = bool(
-        approval_and_index_complete and _mcp_bundle_created(ctx)
-    )
+    if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+        final_use_complete = bool(
+            approval_and_index_complete and all(_qwen_beginner_procedure_states(ctx))
+        )
+    else:
+        final_use_complete = bool(
+            approval_and_index_complete and _mcp_bundle_created(ctx)
+        )
     return [
         preprocessing_complete,
         results_complete,
         approval_and_index_complete,
-        bundle_complete,
+        final_use_complete,
     ]
 
 
@@ -6921,7 +7467,11 @@ def _next_action(ctx: dict | None) -> tuple[str, str]:
             NAV_APPROVAL,
         )
     if not workflow_states[3]:
-        return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. Claude, ChatGPT, 내부 AI 연결용 ④ 단계입니다.", NAV_MCP)
+        if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+            return ("로컬 Qwen 챗봇을 켜고 질문한 뒤 답변과 근거 조문을 함께 확인하세요.", NAV_MCP)
+        return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. Claude, ChatGPT, Codex 연결용 ④ 단계입니다.", NAV_MCP)
+    if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+        return ("Qwen 답변과 근거 조문을 확인했습니다. ④ 화면에서 다음 질문을 이어가세요.", NAV_MCP)
     return ("MCP 설정 묶음까지 생성됐습니다. ④ 화면에서 검색 점검과 연결 상태를 확인해 보세요.", NAV_MCP)
 
 
@@ -7345,7 +7895,15 @@ def _page_home(ctx: dict | None) -> None:
         ("문서 올려서 전처리", "규정 파일을 올리면 파서가 조문 단위로 1차 정리합니다. AI 추가 검수는 직접 선택한 경우에만 실행됩니다.", NAV_PREPROCESS),
         ("결과 확인", "AI 추가 검수가 짚은 부분과 품질 검사를 확인합니다.", NAV_RESULTS),
         ("검수하고 승인", "원본과 전처리본을 나란히 놓고 확인한 뒤, 승인한 내용만 AI에 등록(색인)합니다.", NAV_APPROVAL),
-        ("MCP 생성·AI 연결", "Claude, ChatGPT, 내부 AI에 붙일 MCP 설정 JSON과 setup bundle을 생성합니다.", NAV_MCP),
+        (
+            "Qwen 규정 챗봇"
+            if _ai_usage_path() == AI_USAGE_PATH_QWEN
+            else "MCP 생성·외부 AI 연결",
+            "승인 규정을 로컬 Qwen에 질문하고 답변과 근거 조문을 함께 확인합니다."
+            if _ai_usage_path() == AI_USAGE_PATH_QWEN
+            else "승인 규정의 MCP 묶음을 만들어 ChatGPT·Claude·Codex에 연결합니다.",
+            NAV_MCP,
+        ),
     ]
     # AI 추가 검수를 쓰지 않았으면 '결과 확인'을 빼고 번호를 다시 매긴다.
     # 볼 것이 없는 단계를 세워 두면 초보자는 자기가 뭘 놓쳤나 싶어 멈춘다.
@@ -7425,9 +7983,15 @@ def _preprocess_next_action_text(
 
 
 def _page_preprocess() -> None:
+    beginner_mode = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
     st.markdown("## ① 문서 올려서 전처리")
     _render_operator_project_controls(NAV_PREPROCESS)
     _render_pipeline_stages(PIPELINE_STAGE_PARSER)
+    _render_beginner_page_compass(
+        1,
+        purpose="여기서는 원본 파일을 한 개 이상 선택하고, 프로그램이 읽은 규정 정보가 맞는지만 확인합니다.",
+        finish="전처리 시작을 누르면 프로그램이 문서를 정리한 뒤 ② 결과 확인으로 이어집니다.",
+    )
     st.markdown(
         '<div class="rr-help">규정 파일을 올리고 문서 정보를 확인한 뒤 <b>전처리 시작</b> 버튼만 누르면 됩니다. '
         "기본은 <b>빠른 구조 전처리</b>로 조문·항·호를 먼저 정리합니다. "
@@ -7437,13 +8001,14 @@ def _page_preprocess() -> None:
 
     _render_api_key_setup_cta("preprocess")
     kordoc_ready = _render_kordoc_preprocess_preflight()
-    if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
-        st.session_state[BEGINNER_GUIDE_KORDOC_CHECKED_KEY] = True
+    if beginner_mode:
+        st.session_state[BEGINNER_GUIDE_KORDOC_CHECKED_KEY] = bool(kordoc_ready)
 
     st.markdown("### 1. 파일 올리기")
     if (
         not _uploaded_file_list(st.session_state.get("regulation_document_upload"))
         and not st.session_state.get("document_id")
+        and not _beginner_pending_upload_selected()
     ):
         _render_beginner_action_marker(
             1,
@@ -7497,7 +8062,12 @@ def _page_preprocess() -> None:
         )
         required_fields = institution_registry.required_row_fields_for(profile_id, strict=False)
         if required_fields:
-            st.caption("필수 입력 항목: " + ", ".join(required_fields))
+            if beginner_mode:
+                st.caption(
+                    "기관 정보는 선택한 기관에서 자동으로 연결됩니다. 지금 별도로 입력할 필요는 없습니다."
+                )
+            else:
+                st.caption("필수 입력 항목: " + ", ".join(required_fields))
     else:
         profile_id = st.text_input("기관 프로필 ID", value="")
 
@@ -7526,58 +8096,72 @@ def _page_preprocess() -> None:
                 if path not in current_pending_paths
             ]
             if pending_only:
-                st.markdown("#### 저장된 대기 파일")
-                pending_checkbox_keys = [
-                    f"pending-upload-{hashlib.sha256(str(path).encode('utf-8')).hexdigest()[:16]}"
-                    for path in pending_only
-                ]
-                # 대기 파일을 하나씩 체크하게 두면 규정 수십 개를 한 번에 전처리할 방법이 없다.
-                select_all_cols = st.columns(2)
-                if select_all_cols[0].button(
-                    f"전체 규정 선택 ({len(pending_only):,}개)",
-                    key="pending-upload-select-all",
-                    help="저장된 대기 파일을 모두 골라 한 번에 전처리합니다.",
-                ):
-                    for checkbox_key in pending_checkbox_keys:
-                        st.session_state[checkbox_key] = True
-                    st.rerun()
-                if select_all_cols[1].button(
-                    "전체 선택 해제",
-                    key="pending-upload-clear-all",
-                ):
-                    for checkbox_key in pending_checkbox_keys:
-                        st.session_state[checkbox_key] = False
-                    st.rerun()
-                for path, checkbox_key in zip(pending_only, pending_checkbox_keys):
-                    if st.checkbox(
-                        f"{_pending_upload_display_name(path)} · {_format_upload_mb(path.stat().st_size)}",
-                        key=checkbox_key,
-                    ):
-                        selected_pending_paths.append(path)
-                delete_options = {
-                    f"{_pending_upload_display_name(path)} · {_format_upload_mb(path.stat().st_size)}": path
-                    for path in pending_only
-                }
-                delete_labels = st.multiselect(
-                    "삭제할 대기 작업",
-                    options=list(delete_options),
-                    key="pending-upload-delete-selection",
-                    help="아직 전처리하지 않은 대기 파일만 삭제합니다. 이미 전처리된 규정 결과는 삭제하지 않습니다.",
+                pending_expander = (
+                    st.expander(
+                        f"이전에 저장된 대기 규정 {len(pending_only):,}개 처리하기 (선택 사항)",
+                        expanded=False,
+                    )
+                    if beginner_mode
+                    else nullcontext()
                 )
-                if st.button(
-                    "선택한 대기 작업 삭제",
-                    key="pending-upload-delete-button",
-                    disabled=not delete_labels,
-                ):
-                    deleted_count = 0
-                    for label in delete_labels:
-                        path = delete_options.get(label)
-                        if path is not None and path.exists():
-                            path.unlink()
-                            deleted_count += 1
-                    st.session_state.pop("pending-upload-delete-selection", None)
-                    st.success(f"대기 작업 {deleted_count}개를 삭제했습니다.")
-                    st.rerun()
+                with pending_expander:
+                    st.markdown("#### 저장된 대기 파일")
+                    if beginner_mode:
+                        st.caption(
+                            "지금 새 파일을 올릴 예정이면 이 목록은 열지 않아도 됩니다. "
+                            "예전에 올려 둔 규정부터 처리할 때만 아래에서 고르세요."
+                        )
+                    pending_checkbox_keys = [
+                        f"pending-upload-{hashlib.sha256(str(path).encode('utf-8')).hexdigest()[:16]}"
+                        for path in pending_only
+                    ]
+                    # 대기 파일을 하나씩 체크하게 두면 규정 수십 개를 한 번에 처리할 방법이 없다.
+                    select_all_cols = st.columns(2)
+                    if select_all_cols[0].button(
+                        f"전체 규정 선택 ({len(pending_only):,}개)",
+                        key="pending-upload-select-all",
+                        help="저장된 대기 파일을 모두 골라 한 번에 전처리합니다.",
+                    ):
+                        for checkbox_key in pending_checkbox_keys:
+                            st.session_state[checkbox_key] = True
+                        st.rerun()
+                    if select_all_cols[1].button(
+                        "전체 선택 해제",
+                        key="pending-upload-clear-all",
+                    ):
+                        for checkbox_key in pending_checkbox_keys:
+                            st.session_state[checkbox_key] = False
+                        st.rerun()
+                    for path, checkbox_key in zip(pending_only, pending_checkbox_keys):
+                        if st.checkbox(
+                            f"{_pending_upload_display_name(path)} · {_format_upload_mb(path.stat().st_size)}",
+                            key=checkbox_key,
+                        ):
+                            selected_pending_paths.append(path)
+                    delete_options = {
+                        f"{_pending_upload_display_name(path)} · {_format_upload_mb(path.stat().st_size)}": path
+                        for path in pending_only
+                    }
+                    delete_labels = st.multiselect(
+                        "삭제할 대기 작업",
+                        options=list(delete_options),
+                        key="pending-upload-delete-selection",
+                        help="아직 전처리하지 않은 대기 파일만 삭제합니다. 이미 전처리된 규정 결과는 삭제하지 않습니다.",
+                    )
+                    if st.button(
+                        "선택한 대기 작업 삭제",
+                        key="pending-upload-delete-button",
+                        disabled=not delete_labels,
+                    ):
+                        deleted_count = 0
+                        for label in delete_labels:
+                            path = delete_options.get(label)
+                            if path is not None and path.exists():
+                                path.unlink()
+                                deleted_count += 1
+                        st.session_state.pop("pending-upload-delete-selection", None)
+                        st.success(f"대기 작업 {deleted_count}개를 삭제했습니다.")
+                        st.rerun()
             upload_sources.extend(
                 {
                     "kind": "current",
@@ -7616,7 +8200,12 @@ def _page_preprocess() -> None:
         source_posted_date = st.text_input("게시일", value="")
 
     existing_institution_documents = _documents_for_selected_institution()
-    if existing_institution_documents:
+    if existing_institution_documents and beginner_mode:
+        st.caption(
+            f"이 기관에는 이전 전처리 작업 {len(existing_institution_documents):,}개가 있습니다. "
+            "삭제·정리는 안내를 끈 뒤 일반 모드에서 진행하세요."
+        )
+    if existing_institution_documents and not beginner_mode:
         st.markdown("#### 이전 전처리 작업 관리")
         document_options = {
             f"{getattr(document, 'document_name', '') or getattr(document, 'filename', '')} · {str(getattr(document, 'document_id', ''))[:12]}": document
@@ -7906,7 +8495,7 @@ def _page_preprocess() -> None:
     if not upload_sources:
         st.info("먼저 위에서 문서 파일을 올려 주세요.")
     if upload_sources and not beginner_preprocess_confirmations_complete:
-        st.warning("초보자 안내의 문서 정보와 AI 검수 선택 확인을 차례로 완료해야 전처리 시작 버튼이 열립니다.")
+        st.warning("초보자 안내의 문서 정보 확인을 끝내야 전처리 시작 버튼이 열립니다.")
 
     if upload_sources and beginner_preprocess_confirmations_complete:
         _render_beginner_action_marker(
@@ -8504,6 +9093,12 @@ def _page_results(ctx: dict | None) -> None:
     st.markdown("## ② 결과 확인")
     _render_operator_project_controls(NAV_RESULTS)
     _render_pipeline_stages(PIPELINE_STAGE_AI_REVIEW)
+    _render_beginner_page_compass(
+        2,
+        ctx=ctx,
+        purpose="여기서는 프로그램이 글자를 제대로 읽었는지와 자동 검사에서 확인이 필요하다고 표시한 부분만 봅니다.",
+        finish="두 확인란을 차례로 선택하면 ③ 검수하고 승인에서 원문과 조항을 비교할 수 있습니다.",
+    )
     if not _require_document_context(ctx):
         return
     selected_document_ids = _render_workflow_document_directory(page_key="results")
@@ -8557,6 +9152,7 @@ def _page_results(ctx: dict | None) -> None:
         summary_cols[3].metric("청크", f"{len(chunks):,}", help="청크 = AI가 검색하기 좋게 나눈 문서 조각입니다.")
         summary_cols[4].metric("이슈", f"{len(issues):,}", help="자동 검사에서 발견된 확인 필요 항목 수입니다.")
     _render_quality_banner(quality_report)
+    _render_actual_pipeline_role_trace(ctx)
     _render_beginner_action_marker(
         2,
         "전처리가 끝났는지 위 숫자로 확인하세요",
@@ -9278,6 +9874,12 @@ def _page_approval(ctx: dict | None) -> None:
     st.markdown("## ③ 검수하고 승인")
     _render_operator_project_controls(NAV_APPROVAL)
     _render_pipeline_stages(PIPELINE_STAGE_HUMAN_APPROVAL)
+    _render_beginner_page_compass(
+        3,
+        ctx=ctx,
+        purpose="왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고, 맞는 내용만 최종 승인합니다.",
+        finish="선택한 규정의 승인·색인이 끝나면 ④ Qwen 규정 챗봇·AI 연결로 넘어갑니다.",
+    )
     if not _require_document_context(ctx):
         return
     _render_approval_screen_guide()
@@ -9843,7 +10445,11 @@ def _page_approval(ctx: dict | None) -> None:
             result = _run_background_operation_with_progress(
                 lambda _report: index_document(
                     document_id,
-                    IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                    IndexRequest(
+                        target_type="local-jsonl",
+                        embedding_dimensions=384,
+                        embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                    ),
                     local_auth,
                 ),
                 progress_bar=approval_progress,
@@ -9932,7 +10538,11 @@ def _page_approval(ctx: dict | None) -> None:
                 result = _run_background_operation_with_progress(
                     lambda _report: index_document(
                         document_id,
-                        IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                        IndexRequest(
+                            target_type="local-jsonl",
+                            embedding_dimensions=384,
+                            embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                        ),
                         local_auth,
                     ),
                     progress_bar=quick_index_progress,
@@ -10248,7 +10858,11 @@ def _page_approval(ctx: dict | None) -> None:
                     batch_index_result = _run_background_operation_with_progress(
                         lambda report: index_documents_batch(
                             deferred_document_ids,
-                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            IndexRequest(
+                                target_type="local-jsonl",
+                                embedding_dimensions=384,
+                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                            ),
                             local_auth,
                             progress_callback=report,
                             vector_sync_batch_ids=deferred_batch_ids,
@@ -10310,7 +10924,11 @@ def _page_approval(ctx: dict | None) -> None:
                     try:
                         recovery = index_documents_batch(
                             recovery_document_ids,
-                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            IndexRequest(
+                                target_type="local-jsonl",
+                                embedding_dimensions=384,
+                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                            ),
                             local_auth,
                             vector_sync_batch_ids=recovery_batch_ids,
                         )
@@ -10373,7 +10991,7 @@ def _page_approval(ctx: dict | None) -> None:
         )
         if beginner_current_document_incomplete:
             st.info(
-                "현재 규정의 모든 검수 결정을 마치고 승인·색인을 완료해야 다음 규정이나 MCP 단계로 이동할 수 있습니다."
+                "현재 규정의 모든 검수 결정을 마치고 승인·색인을 완료해야 다음 규정이나 Qwen 챗봇·MCP 단계로 이동할 수 있습니다."
             )
         elif beginner_selected_documents_incomplete:
             pending_labels = [
@@ -10388,7 +11006,7 @@ def _page_approval(ctx: dict | None) -> None:
             )
             st.info(
                 f"초보자 안내 모드에서는 선택한 {len(selected_document_ids):,}개 규정이 "
-                "승인·색인되거나 명시적으로 반려되어 처리 방향이 모두 결정되어야 MCP 단계로 넘어갈 수 있습니다. "
+                "승인·색인되거나 명시적으로 반려되어 처리 방향이 모두 결정되어야 Qwen 챗봇·MCP 단계로 넘어갈 수 있습니다. "
                 f"아직 {len(selected_pending_document_ids):,}개 규정이 남았습니다.{pending_note}"
             )
             next_document_id = str(selected_pending_document_ids[0])
@@ -10427,13 +11045,13 @@ def _page_approval(ctx: dict | None) -> None:
         else:
             _render_beginner_action_marker(
                 3,
-                "승인·색인을 마쳤다면 MCP 생성으로 이동하세요",
+                "승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요",
                 "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
                 control_key_prefix="approval-goto-connect-simple",
                 substep=6,
             )
         _render_workflow_next_button(
-            "④ MCP 생성·AI 연결로 이동",
+            "④ Qwen 규정 챗봇·AI 연결로 이동",
             NAV_MCP,
             key="approval-goto-connect-simple",
             disabled=beginner_approval_incomplete,
@@ -10660,7 +11278,11 @@ def _page_approval(ctx: dict | None) -> None:
                     result = _run_background_operation_with_progress(
                         lambda _report: index_document(
                             document_id,
-                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            IndexRequest(
+                                target_type="local-jsonl",
+                                embedding_dimensions=384,
+                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                            ),
                             local_auth,
                         ),
                         progress_bar=index_progress,
@@ -10694,7 +11316,11 @@ def _page_approval(ctx: dict | None) -> None:
                     result = _run_background_operation_with_progress(
                         lambda _report: reindex_document(
                             document_id,
-                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            IndexRequest(
+                                target_type="local-jsonl",
+                                embedding_dimensions=384,
+                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                            ),
                             local_auth,
                         ),
                         progress_bar=index_progress,
@@ -10714,13 +11340,13 @@ def _page_approval(ctx: dict | None) -> None:
     st.divider()
     _render_beginner_action_marker(
         3,
-        "승인·색인을 마쳤다면 MCP 생성으로 이동하세요",
+        "승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요",
         "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
         control_key_prefix="approval-goto-connect",
         substep=6,
     )
     _render_workflow_next_button(
-        f"선택한 {len(selected_document_ids):,}개 규정을 ④ MCP 생성·AI 연결로 이동",
+        f"선택한 {len(selected_document_ids):,}개 규정을 ④ Qwen 규정 챗봇·AI 연결로 이동",
         NAV_MCP,
         key="approval-goto-connect",
         disabled=not selected_document_ids,
@@ -10728,7 +11354,7 @@ def _page_approval(ctx: dict | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 페이지: 시범 질의응답 / ④ MCP 생성·AI 연결
+# 페이지: 로컬 Qwen 규정 챗봇 / ④ Qwen 규정 챗봇·AI 연결
 # ---------------------------------------------------------------------------
 
 AI_REVIEW_PROVIDER_LABELS = {
@@ -10791,6 +11417,10 @@ def _ai_connection_overrides(
         "agent_review_api_base_url": str(
             settings_snapshot.agent_review_api_base_url or "https://api.openai.com"
         ),
+        "rag_llm_backend": str(settings_snapshot.rag_llm_backend or "extractive"),
+        "rag_llm_endpoint": str(settings_snapshot.rag_llm_endpoint or "http://127.0.0.1:11434"),
+        "rag_llm_model": str(settings_snapshot.rag_llm_model or DEFAULT_LOCAL_LLM_MODEL),
+        "local_structure_review_enabled": bool(settings_snapshot.local_structure_review_enabled),
     }
     if provider == "openai":
         overrides["openai_api_key"] = str(api_key or "")
@@ -10858,7 +11488,7 @@ def _render_ai_connection_status_banner(settings_snapshot, *, context: str) -> N
     if context == "preprocess":
         st.caption("AI 추가 검수를 직접 선택하면 이 설정으로 검수 초안을 만듭니다. (실제 사용량만큼 과금)")
     else:
-        st.caption("이 API 연결은 전처리(검수) 전용입니다. 실제 질의응답은 '④ MCP 생성·AI 연결'로 외부 AI를 붙여서 합니다.")
+        st.caption("전처리 검수와 별도로, 승인된 규정은 이 PC의 Qwen3 8B 로컬 LLM으로 질의할 수 있습니다.")
     _render_status_line(review_level, review_message)
     st.button(
         "⚙️ 관리자 설정에서 AI 연결 입력·수정하기",
@@ -10893,10 +11523,95 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
         "PC를 재시작해도 유지하려면 전산 담당자가 .env 파일에 넣어 두면 됩니다."
     )
     st.info(
-        "이 API 연결은 **전처리(AI 검수)** 에만 씁니다. 승인된 규정으로 실제 질의응답은 "
-        "이 앱이 직접 답을 만드는 게 아니라, '④ MCP 생성·AI 연결'에서 만든 설정으로 "
-        "외부 범용 AI(Claude·ChatGPT·Codex)를 붙여서 합니다."
+        "전처리 AI 검수는 선택한 공급자로 의심 구간을 검토하는 기능입니다. "
+        "승인된 규정의 실제 질의응답은 이 PC의 Qwen3 8B 로컬 LLM을 사용하며, "
+        "필요한 경우 같은 승인 RAG를 MCP로 외부 AI에도 연결할 수 있습니다."
     )
+
+    st.markdown("### 로컬 다중 모델 오케스트레이션")
+    st.caption(
+        "작업 난이도와 목적에 맞춰 서로 다른 로컬 모델을 사용합니다. "
+        "승인·권한·색인 공개·인용 확정은 모델이 아니라 결정적 보안 게이트가 담당합니다."
+    )
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"수준": "S1", "모델": "Korean PP-OCRv5", "담당": "스캔 페이지 문자 인식"},
+                {"수준": "S2-E", "모델": "Qwen3 Embedding 0.6B", "담당": "승인 조문·질의 의미 벡터"},
+                {"수준": "S2-R", "모델": "Qwen3 Reranker 0.6B", "담당": "ACL 통과 후보 재순위"},
+                {"수준": "L1", "모델": "Qwen3 1.7B", "담당": "질의 분석·검색어 보정"},
+                {"수준": "L2", "모델": "Qwen3 4B", "담당": "불확실 구조·답변 주장 검수"},
+                {"수준": "L3", "모델": "Qwen3 8B", "담당": "승인 근거 기반 최종 답변"},
+                {"수준": "D0", "모델": "결정적 Python", "담당": "보안·승인·품질·인용 검증"},
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    local_structure_review = st.checkbox(
+        "불확실한 규정 구조·표를 Qwen3 4B로 로컬 보조 검수",
+        value=bool(settings_snapshot.local_structure_review_enabled),
+        help=(
+            "규칙 기반 parser가 표시한 제한된 구조와 추출 표 후보만 4B에 전달합니다. "
+            "모델은 원문을 수정하거나 승인할 수 없고 finding만 남깁니다."
+        ),
+        key="local-structure-review-enabled",
+    )
+
+    st.markdown("### 로컬 규정 QA — Qwen3 8B")
+    st.caption(
+        "기관 문서는 외부 API로 보내지 않습니다. Ollama는 localhost에서 실행하고, "
+        "기본 모델은 qwen3:8b입니다. 모델이 없으면 질문 화면에서 모델 없는 extractive 모드도 선택할 수 있습니다."
+    )
+    configured_rag_backend = str(settings_snapshot.rag_llm_backend or "extractive").strip().lower()
+    if configured_rag_backend not in {"extractive", "ollama"}:
+        configured_rag_backend = "extractive"
+    rag_backend = st.selectbox(
+        "로컬 QA 답변 엔진",
+        options=["ollama", "extractive"],
+        index=0 if configured_rag_backend == "ollama" else 1,
+        format_func=lambda value: "Ollama · Qwen3 8B" if value == "ollama" else "모델 없는 근거 답변",
+        key="local-rag-backend-choice",
+    )
+    rag_endpoint = st.text_input(
+        "로컬 LLM endpoint",
+        value=str(settings_snapshot.rag_llm_endpoint or "http://127.0.0.1:11434"),
+        help="외부 주소는 허용하지 않습니다. Ollama 기본 주소는 http://127.0.0.1:11434 입니다.",
+        key="local-rag-endpoint",
+    )
+    rag_model = st.text_input(
+        "로컬 LLM 모델",
+        value=str(settings_snapshot.rag_llm_model or DEFAULT_LOCAL_LLM_MODEL),
+        help="Qwen3 8B Ollama 모델명은 qwen3:8b입니다.",
+        key="local-rag-model",
+    )
+    rag_setting_col, rag_probe_col = st.columns(2)
+    with rag_setting_col:
+        if st.button("로컬 QA 설정 적용", key="apply-local-rag-settings"):
+            saved_overrides = dict(st.session_state.get(AI_CONNECTION_STATE_KEY) or {})
+            saved_overrides.update(
+                {
+                    "rag_llm_backend": rag_backend,
+                    "rag_llm_endpoint": rag_endpoint,
+                    "rag_llm_model": rag_model or DEFAULT_LOCAL_LLM_MODEL,
+                    "local_structure_review_enabled": local_structure_review,
+                }
+            )
+            _apply_ai_connection_settings(saved_overrides)
+            st.success("로컬 다중 모델 QA·구조 검수 설정을 현재 실행에 적용했습니다.")
+    with rag_probe_col:
+        if st.button("Qwen3 8B 연결 점검", key="probe-local-qwen3"):
+            probe_settings = replace(
+                settings_snapshot,
+                rag_llm_backend=rag_backend,
+                rag_llm_endpoint=rag_endpoint,
+                rag_llm_model=rag_model or DEFAULT_LOCAL_LLM_MODEL,
+            )
+            result = probe_local_llm(probe_settings)
+            if result.get("available"):
+                st.success(f"로컬 LLM 연결 가능 · {result.get('model') or rag_model}")
+            else:
+                st.warning("Qwen3 8B 연결을 확인하지 못했습니다. Ollama 실행·모델 설치·endpoint를 확인하세요.")
 
     review_level, review_message = _review_api_connection_status(settings_snapshot)
     st.markdown("**검수용 외부 AI (문서 검수 초안 생성)**")
@@ -11017,7 +11732,7 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
               `ENABLE_AGENT_REVIEW`, `LLM_PROVIDER`, `AGENT_REVIEW_MODEL`, `AGENT_REVIEW_API_BASE_URL`,
               `OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
               `ANTHROPIC_API_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`.
-            - 승인된 규정으로 실제 질의응답을 하려면 '④ MCP 생성·AI 연결'에서 만든 설정으로 외부 범용 AI를 붙입니다(이 앱이 답을 생성하지 않음).
+            - 승인된 규정은 '④ Qwen 규정 챗봇·AI 연결'에서 로컬 Qwen에 바로 질문할 수 있습니다. 외부 범용 AI가 필요할 때만 같은 화면의 MCP 탭을 사용합니다.
             """
         )
 
@@ -11036,13 +11751,107 @@ def _render_api_key_setup_dialog() -> None:
     _render_ai_connection_settings(settings)
 
 
+def _regulation_chat_history_key(document_id: str, profile_id: str) -> str:
+    return f"regulation-chat-history:{profile_id or 'default'}:{document_id}"
+
+
+def _regulation_chat_messages(document_id: str, profile_id: str) -> list[dict[str, object]]:
+    key = _regulation_chat_history_key(document_id, profile_id)
+    value = st.session_state.get(key)
+    if not isinstance(value, list):
+        value = []
+        st.session_state[key] = value
+    return value
+
+
+def _regulation_chat_api_history(messages: list[dict[str, object]]) -> list[dict[str, str]]:
+    history: list[dict[str, str]] = []
+    for message in messages[-12:]:
+        role = str(message.get("role") or "").strip().lower()
+        content = str(message.get("content") or "").strip()
+        if role in {"user", "assistant"} and content and not message.get("error"):
+            history.append({"role": role, "content": content[:6000]})
+    return history
+
+
+def _render_regulation_chat_assistant(
+    message: dict[str, object],
+    *,
+    beginner_mode: bool,
+    turn_index: int,
+) -> None:
+    st.markdown(str(message.get("content") or ""))
+    citations = message.get("citations") or []
+    if isinstance(citations, list) and citations:
+        with st.expander(f"근거 조문 {len(citations)}건", expanded=beginner_mode):
+            st.dataframe(pd.DataFrame(citations), hide_index=True, width="stretch")
+    orchestration = message.get("orchestration") or {}
+    if not isinstance(orchestration, dict):
+        return
+    if orchestration.get("mode") == "multi_model":
+        st.caption(
+            "로컬 검증 완료 · "
+            f"답변 {orchestration.get('answer_model') or '검증 가능한 근거 발췌'} · "
+            f"주장 감사 {orchestration.get('claim_audit_model') or 'qwen3:4b'} · "
+            f"상태 {orchestration.get('claim_audit_status') or '-'}"
+        )
+        st.caption(
+            "질의 분석 Qwen3 1.7B → Qwen3 Embedding 0.6B Hybrid Search → "
+            "Qwen3 Reranker 0.6B → Qwen3 8B 답변 → Qwen3 4B 감사 → 결정적 인용 검증"
+        )
+        if orchestration.get("answer_mode") == "grounded_extractive":
+            st.info(
+                "Qwen 초안이 주장 감사를 통과하지 않아, 이번 답변은 승인 근거에서 검증 가능한 문장만 발췌했습니다."
+            )
+        role_trace = orchestration.get("roles") or []
+        if isinstance(role_trace, list) and role_trace:
+            with st.expander(f"{turn_index}번째 답변의 실행 단계", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "역할": item.get("display_name") or item.get("role_id"),
+                                "단계": item.get("phase") or item.get("stage_id") or "",
+                                "담당 내용": item.get("purpose") or "",
+                                "상태": item.get("status"),
+                                "사용 모델": item.get("primary_model") or "결정적 검증",
+                                "다음 행동": _agent_trace_next_action(item),
+                            }
+                            for item in role_trace
+                            if isinstance(item, dict)
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+
+
 def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
-    heading = "④ MCP 생성·AI 연결" if mcp_first else "승인 데이터 검색 점검"
+    qwen_path = _ai_usage_path() == AI_USAGE_PATH_QWEN
+    heading = _connect_nav_display_label()
     st.markdown(f"## {heading}")
     _render_operator_project_controls(NAV_MCP)
+    _render_beginner_page_compass(
+        4,
+        ctx=ctx,
+        purpose=(
+            "승인된 규정을 로컬 Qwen 챗봇에 질문하고 답변과 근거 조문을 함께 확인합니다."
+            if qwen_path
+            else "승인된 규정을 ChatGPT·Claude·Codex에서 사용하도록 MCP 연결 묶음을 만들고 확인합니다."
+        ),
+        finish=(
+            "Qwen 답변과 근거 조문이 함께 보이면 로컬 챗봇 사용 준비가 끝납니다."
+            if qwen_path
+            else "외부 AI에서 list_regulations·search·fetch가 확인되면 MCP 연결이 끝납니다."
+        ),
+    )
     st.markdown(
         '<div class="rr-help">AI 연결 정보(API 키·모델·주소)는 <b>⚙️ 관리자 설정 → AI 연결</b>에서 한 번만 입력하면 됩니다. '
-        "이 화면은 승인된 규정의 <b>검색 결과를 점검</b>하고 <b>④ MCP 생성·AI 연결</b> 설정 묶음을 만드는 곳입니다.</div>",
+        + (
+            "이 화면은 승인된 규정으로 <b>Qwen 로컬 챗봇을 실제 사용</b>하는 곳입니다. MCP 연결은 옆 탭에서 선택해서 이어갈 수 있습니다.</div>"
+            if qwen_path
+            else "이 화면은 승인된 규정을 <b>외부 AI에 MCP로 연결</b>하는 곳입니다. 로컬 Qwen 챗봇은 옆 탭에서 언제든 사용할 수 있습니다.</div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -11051,7 +11860,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
 
     st.divider()
     if not _require_document_context(ctx):
-        st.info("승인 데이터 검색 점검과 MCP 생성·AI 연결은 '① 문서 올려서 전처리'를 마친 뒤 이 화면에서 이어집니다.")
+        st.info("Qwen 규정 챗봇과 MCP 연결은 '① 문서 올려서 전처리'를 마친 뒤 이 화면에서 이어집니다.")
         return
     selected_document_ids = _render_workflow_document_directory(page_key="mcp")
     document_id = ctx["document_id"]
@@ -11073,14 +11882,20 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
     if mcp_profile_scope_mismatch:
         st.error(
             "현재 선택한 기관과 문서의 기관 프로필이 다릅니다. "
-            "기관을 전환하거나 해당 기관의 문서를 선택한 뒤 MCP를 생성하세요."
+            "기관을 전환하거나 해당 기관의 문서를 선택한 뒤 Qwen 질문 또는 MCP 생성을 진행하세요."
         )
 
     if _unreviewed_preview_requested():
         st.warning(UNREVIEWED_PREVIEW_WARNING_KO + "\n\n" + UNREVIEWED_PREVIEW_WARNING)
 
-    chat_label = "승인 데이터 검색 점검 (발췌·과금 없음)"
-    mcp_label = "AI 프로그램 연결 — MCP 연결 (전산 담당자용)"
+    beginner_mode = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+    mcp_beginner_mode = beginner_mode and not qwen_path
+    chat_label = "Qwen 규정 챗봇"
+    mcp_label = (
+        "AI 앱 연결 설정"
+        if mcp_beginner_mode
+        else "AI 프로그램 연결 — MCP 연결 (전산 담당자용)"
+    )
     first_tab, second_tab = st.tabs([mcp_label, chat_label] if mcp_first else [chat_label, mcp_label])
     if mcp_first:
         mcp_tab, chat_tab = first_tab, second_tab
@@ -11088,70 +11903,239 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         chat_tab, mcp_tab = first_tab, second_tab
 
     with chat_tab:
-        st.markdown("### 승인 데이터 검색 점검 (발췌 답변)")
+        st.markdown("### 로컬 Qwen 규정 챗봇")
         st.caption(
-            "승인된 규정에서 근거를 찾아 그대로 발췌해 보여 주는 시범입니다. 검색이 제대로 되는지 확인하는 용도이며, "
-            "외부 AI 호출 없이 동작합니다(과금 없음). 실제 활용은 '④ MCP 생성·AI 연결'로 범용 AI를 붙여서 하세요."
+            "질문을 이어서 입력하면 이전 대화 문맥을 유지하면서 승인·색인된 규정만 검색하고, "
+            "Qwen3 8B가 답변과 근거 조문을 함께 제시합니다. 대화 내용과 규정은 외부 API로 보내지 않습니다."
         )
         if not mcp_connection_ready:
             st.warning(
-                "검색 점검은 승인·색인이 끝난 내용만 사용합니다. 먼저 '③ 검수하고 승인'을 완료해 주세요.\n\n"
-                "Local RAG demo uses approved and indexed chunks only. "
-                "Complete human review, approval, index/reindex, and the MCP visibility gate before running official RAG."
+                "챗봇은 승인·색인이 끝난 내용만 사용합니다. 먼저 '③ 검수하고 승인'을 완료해 주세요.\n\n"
+                "Local RAG uses approved and indexed chunks only. "
+                "Complete human review, approval, and index/reindex before asking a question."
             )
-        chat_col1, chat_col2 = st.columns(2)
-        with chat_col1:
-            chat_security_levels = st.multiselect(
-                "검색 허용 보안 등급",
-                ["public", "internal", "sensitive", "confidential"],
-                default=["internal"],
-                key=f"rag-chat-security-{document_id}",
-                format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
+        local_rag_settings = get_settings()
+        local_rag_backend = str(local_rag_settings.rag_llm_backend or "extractive").strip().lower()
+        if local_rag_backend not in {"extractive", "ollama"}:
+            local_rag_backend = "extractive"
+        local_rag_model = str(local_rag_settings.rag_llm_model or DEFAULT_LOCAL_LLM_MODEL).strip()
+        qwen_runtime_enabled = _qwen_chat_runtime_enabled(local_rag_settings)
+        chat_scope_ready = bool(mcp_connection_ready and not mcp_profile_scope_mismatch)
+        engine_col, clear_col = st.columns([4, 1])
+        with engine_col:
+            st.caption(
+                f"현재 답변 엔진: {'Ollama · Qwen3 8B' if qwen_runtime_enabled else ('Ollama · 다른 로컬 모델' if local_rag_backend == 'ollama' else '모델 없는 근거 답변')} "
+                f"· 모델: {local_rag_model}"
             )
-        with chat_col2:
-            chat_top_k = st.slider("근거로 보여줄 조각 수", 1, 10, 5, key=f"rag-chat-top-k-{document_id}")
-            chat_historical_mode = st.checkbox(
-                "과거 효력일 기준으로 조회",
-                key=f"rag-chat-historical-{document_id}",
+        history_key = _regulation_chat_history_key(document_id, selected_profile_id)
+        messages = _regulation_chat_messages(document_id, selected_profile_id)
+        if beginner_mode and qwen_path:
+            qwen_states = _qwen_beginner_procedure_states(ctx)
+            current_qwen_substep = next(
+                (index for index, complete in enumerate(qwen_states, start=1) if not complete),
+                len(BEGINNER_QWEN_PROCEDURES),
             )
-            chat_as_of_date = st.date_input(
-                "기준일",
-                value=date.today(),
-                disabled=not chat_historical_mode,
-                key=f"rag-chat-as-of-date-{document_id}",
+            marker_control_keys: tuple[str, ...] = ()
+            marker_control_prefix = ""
+            if current_qwen_substep == 2:
+                marker_control_prefix = f"enable-qwen-chat-{document_id}"
+            elif current_qwen_substep == 3:
+                marker_control_prefix = f"probe-qwen-chat-{document_id}"
+            elif current_qwen_substep == 4:
+                marker_control_keys = tuple(
+                    f"qwen-example-{document_id}-{index}" for index in range(1, 4)
+                )
+            _render_beginner_action_marker(
+                4,
+                BEGINNER_QWEN_PROCEDURES[current_qwen_substep - 1],
+                (
+                    "아래 번호 순서대로 진행하세요. 질문 뒤에는 답변만 읽지 말고 펼쳐진 근거 조문도 함께 확인합니다."
+                ),
+                control_key_prefix=marker_control_prefix,
+                control_keys=marker_control_keys,
+                substep=current_qwen_substep,
             )
-        chat_query = st.text_area("질문", key=f"rag-chat-query-{document_id}", height=96, placeholder="예: 출장비 정산 기한은 언제까지인가요?")
-        if st.button("시범 실행 (Run demo)", key=f"run-rag-chat-{document_id}", disabled=not mcp_connection_ready):
-            if not chat_query.strip():
-                st.warning("먼저 질문을 입력해 주세요.")
-            else:
-                try:
-                    response = rag_chat(
-                        RagChatRequest(
-                            query=chat_query,
-                            top_k=chat_top_k,
-                            security_levels=chat_security_levels or None,
-                            document_id=document_id,
-                            profile_id=selected_profile_id,
-                            as_of_date=chat_as_of_date.isoformat() if chat_historical_mode else None,
-                            llm_backend="extractive",
-                        ),
-                        local_auth,
+            st.markdown("#### 처음 사용하는 분은 이 순서만 따라 하세요")
+            st.markdown(
+                "1. 현재 답변 엔진이 `Ollama · Qwen3 8B`인지 확인합니다.  "
+                "\n2. `Qwen 연결 확인`을 눌러 이 PC의 모델이 응답하는지 확인합니다.  "
+                "\n3. 아래 예시 질문을 하나 누르거나 질문 입력창에 직접 적습니다.  "
+                "\n4. 답변 아래에 열린 `근거 조문`의 규정명·조문·인용문을 함께 확인합니다."
+            )
+            st.info(
+                "첫 답변 뒤에는 ‘그 절차에서 담당자는 누구야?’처럼 이어서 물어보세요. "
+                "이전 사용자 질문은 검색 문맥으로만 사용하며, 규정 근거를 대신하지 않습니다."
+            )
+        with clear_col:
+            if st.button("새 대화", key=f"clear-rag-chat-{document_id}", disabled=not messages):
+                st.session_state[history_key] = []
+                st.rerun()
+
+        if not qwen_runtime_enabled:
+            st.warning(
+                "현재 설정은 감사형 Qwen3 8B 챗봇이 아닙니다. 아래 버튼을 누르면 "
+                "Ollama와 qwen3:8b를 정확히 선택합니다."
+            )
+            if st.button("Qwen3 8B 챗봇 켜기", key=f"enable-qwen-chat-{document_id}", type="primary"):
+                saved_overrides = dict(st.session_state.get(AI_CONNECTION_STATE_KEY) or {})
+                saved_overrides.update(
+                    {
+                        "rag_llm_backend": "ollama",
+                        "rag_llm_endpoint": str(local_rag_settings.rag_llm_endpoint or "http://127.0.0.1:11434"),
+                        "rag_llm_model": DEFAULT_LOCAL_LLM_MODEL,
+                    }
+                )
+                _apply_ai_connection_settings(saved_overrides)
+                st.rerun()
+
+        if qwen_runtime_enabled:
+            probe_col, probe_status_col = st.columns([1, 3])
+            with probe_col:
+                probe_requested = st.button(
+                    "Qwen 연결 확인",
+                    key=f"probe-qwen-chat-{document_id}",
+                    disabled=mcp_profile_scope_mismatch,
+                    width="stretch",
+                )
+            if probe_requested:
+                probe_result = probe_local_llm(local_rag_settings)
+                st.session_state[_qwen_chat_probe_key(document_id)] = bool(
+                    probe_result.get("available")
+                )
+                if probe_result.get("available"):
+                    st.success(
+                        f"Qwen 연결 확인 완료 · {probe_result.get('model') or local_rag_settings.rag_llm_model}"
                     )
-                    st.markdown("#### 발췌 답변")
-                    st.write(response.get("answer", ""))
-                    citations = response.get("citations") or []
-                    if citations:
-                        st.markdown("#### 근거 (Citations)")
-                        st.dataframe(pd.DataFrame(citations), width="stretch")
+                else:
+                    st.error(
+                        "Qwen에 연결하지 못했습니다. Ollama가 실행 중인지와 qwen3:8b 설치 여부를 확인하세요."
+                    )
+            with probe_status_col:
+                if st.session_state.get(_qwen_chat_probe_key(document_id)):
+                    st.success("이 PC의 Qwen이 응답할 준비가 됐습니다.")
+                elif beginner_mode and qwen_path:
+                    st.caption("먼저 왼쪽의 ‘Qwen 연결 확인’을 눌러 주세요.")
+
+        with st.expander("검색 범위·기준일 설정", expanded=False):
+            chat_col1, chat_col2 = st.columns(2)
+            with chat_col1:
+                chat_security_levels = st.multiselect(
+                    "검색 허용 보안 등급",
+                    ["public", "internal", "sensitive", "confidential"],
+                    default=["internal"],
+                    key=f"rag-chat-security-{document_id}",
+                    format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
+                )
+            with chat_col2:
+                chat_top_k = st.slider("근거로 보여줄 조각 수", 1, 10, 5, key=f"rag-chat-top-k-{document_id}")
+                chat_historical_mode = st.checkbox(
+                    "과거 효력일 기준으로 조회",
+                    key=f"rag-chat-historical-{document_id}",
+                )
+                chat_as_of_date = st.date_input(
+                    "기준일",
+                    value=date.today(),
+                    disabled=not chat_historical_mode,
+                    key=f"rag-chat-as-of-date-{document_id}",
+                )
+
+        suggested_chat_query = ""
+        if beginner_mode and qwen_path:
+            st.markdown("#### 예시 질문 — 하나를 누르면 바로 질문합니다")
+            example_questions = (
+                "이 규정의 목적과 적용 대상을 알려줘.",
+                "담당자의 주요 절차를 순서대로 설명해줘.",
+                "신청이나 승인에 필요한 조건을 근거 조문과 함께 알려줘.",
+            )
+            example_columns = st.columns(3)
+            for example_index, (example_column, example_question) in enumerate(
+                zip(example_columns, example_questions),
+                start=1,
+            ):
+                with example_column:
+                    if st.button(
+                        example_question,
+                        key=f"qwen-example-{document_id}-{example_index}",
+                        disabled=not chat_scope_ready or not qwen_runtime_enabled,
+                        width="stretch",
+                    ):
+                        suggested_chat_query = example_question
+
+        if not messages:
+            st.info("예: ‘접근권한은 누가 관리해야 하나요?’처럼 규정에서 확인할 내용을 질문해 보세요.")
+        for turn_index, message in enumerate(messages, start=1):
+            role = str(message.get("role") or "assistant")
+            with st.chat_message(role):
+                if role == "assistant":
+                    _render_regulation_chat_assistant(
+                        message,
+                        beginner_mode=beginner_mode,
+                        turn_index=turn_index,
+                    )
+                else:
+                    st.markdown(str(message.get("content") or ""))
+
+        typed_chat_query = st.chat_input(
+            "승인된 규정에 관해 질문하세요",
+            key=f"rag-chat-input-{document_id}",
+            disabled=not chat_scope_ready or not qwen_runtime_enabled,
+        )
+        chat_query = suggested_chat_query or typed_chat_query
+        if chat_query and chat_scope_ready and qwen_runtime_enabled:
+            request_history = _regulation_chat_api_history(messages)
+            user_message: dict[str, object] = {"role": "user", "content": chat_query}
+            messages.append(user_message)
+            st.session_state[history_key] = messages
+            with st.chat_message("user"):
+                st.markdown(chat_query)
+            with st.chat_message("assistant"):
+                try:
+                    with st.spinner("승인 규정을 검색하고 Qwen이 근거 답변을 만드는 중입니다..."):
+                        response = rag_chat(
+                            RagChatRequest(
+                                query=chat_query,
+                                history=request_history,
+                                top_k=chat_top_k,
+                                security_levels=chat_security_levels or None,
+                                document_id=document_id,
+                                profile_id=selected_profile_id,
+                                as_of_date=chat_as_of_date.isoformat() if chat_historical_mode else None,
+                                llm_backend="ollama",
+                            ),
+                            local_auth,
+                        )
+                    assistant_message: dict[str, object] = {
+                        "role": "assistant",
+                        "content": str(response.get("answer") or ""),
+                        "citations": list(response.get("citations") or []),
+                        "orchestration": dict(response.get("orchestration") or {}),
+                        "trace_id": str(response.get("trace_id") or ""),
+                    }
+                    messages.append(assistant_message)
+                    st.session_state[history_key] = messages
+                    _render_regulation_chat_assistant(
+                        assistant_message,
+                        beginner_mode=beginner_mode,
+                        turn_index=len(messages),
+                    )
                 except Exception as exc:
-                    st.error(str(exc))
+                    failure_message = f"답변을 생성하지 못했습니다. {exc}"
+                    messages.append(
+                        {"role": "assistant", "content": failure_message, "error": True}
+                    )
+                    st.session_state[history_key] = messages
+                    st.error(failure_message)
 
     with mcp_tab:
-        st.markdown("### MCP client connection")
+        st.markdown("### AI 앱에 연결하기" if mcp_beginner_mode else "### MCP client connection")
         st.caption(
-            "승인·인덱싱 후 Claude Code, Codex CLI·IDE, Claude Desktop, "
-            "ChatGPT 웹 원격 MCP 또는 Claude HTTPS에 붙일 설정을 생성합니다."
+            (
+                "승인된 규정을 AI 앱에서 읽을 수 있도록 연결 파일을 만들고, "
+                "앱 등록부터 실제 검색 확인까지 순서대로 안내합니다."
+                if mcp_beginner_mode
+                else "승인·인덱싱 후 Claude Code, Codex CLI·IDE, Claude Desktop, "
+                "ChatGPT 웹 원격 MCP 또는 Claude HTTPS에 붙일 설정을 생성합니다."
+            )
         )
         with st.expander("MCP/AI connection guide", expanded=False):
             st.markdown(
@@ -11164,7 +12148,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 - Codex can connect as an MCP client, but it is not a replacement API key for this product runtime.
                 """
             )
-        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        if mcp_beginner_mode:
             principle_confirmation_key = (
                 _beginner_guide_mcp_principle_confirmed_key(document_id)
             )
@@ -11251,7 +12235,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     elif int(mcp_connection_gate.get("approved_count") or 0) > 0:
                         result = index_document(
                             document_id,
-                            IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                            IndexRequest(
+                                target_type="local-jsonl",
+                                embedding_dimensions=384,
+                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                            ),
                             local_auth,
                         )
                         st.success(
@@ -11281,9 +12269,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             "ChatGPT 웹 원격 MCP 또는 Claude HTTPS 연결 파일 묶음이 생성됩니다."
         )
         scope_key = f"mcp-data-scope-{document_id}"
-        if scope_key not in st.session_state and st.session_state.get(
-            BEGINNER_GUIDE_ENABLED_KEY
-        ):
+        if scope_key not in st.session_state and mcp_beginner_mode:
             st.session_state[scope_key] = "current_document"
         mcp_scope = st.radio(
             "MCP 데이터 범위",
@@ -11315,7 +12301,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             for scope_document in scope_documents
         ]
         beginner_scope_confirmed = True
-        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        if mcp_beginner_mode:
             scope_confirmation_key = _beginner_mcp_confirmation_key(
                 BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX,
                 document_id,
@@ -11616,10 +12602,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         )
         if mcp_bundle_ready:
             st.success("선택한 MCP 범위의 검토·승인·색인과 표 파싱 품질 확인이 모두 끝났습니다.")
-        if (
-            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
-            and not beginner_scope_confirmed
-        ):
+        if mcp_beginner_mode and not beginner_scope_confirmed:
             st.info("위에서 MCP에 넣을 규정 범위를 확인하면 연결 방식 선택 절차가 열립니다.")
             return
         mcp_connection_target_labels = {
@@ -11639,9 +12622,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         mcp_connection_target_key = f"mcp-connection-target-{document_id}"
         if st.session_state.get(mcp_connection_target_key) not in {None, *mcp_connection_target_options}:
             del st.session_state[mcp_connection_target_key]
-        beginner_target_choice_required = bool(
-            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
-        ) and st.session_state.get(mcp_connection_target_key) not in mcp_connection_target_options
+        beginner_target_choice_required = (
+            mcp_beginner_mode
+            and st.session_state.get(mcp_connection_target_key)
+            not in mcp_connection_target_options
+        )
         if beginner_target_choice_required:
             _render_beginner_action_marker(
                 4,
@@ -11666,7 +12651,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         if mcp_connection_target is None:
             st.info("위에서 실제 사용할 AI 앱을 하나 선택하면 MCP 이름과 저장 위치 설정이 나타납니다.")
             return
-        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        if mcp_beginner_mode:
             beginner_target_paths = {
                 "claude-code": (
                     "Claude Code 로컬 연결",
@@ -11871,7 +12856,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         current_normalized_mcp_server_name = _normalize_mcp_server_name(
             current_mcp_server_name
         )
-        if (
+        if mcp_beginner_mode and (
             not current_mcp_server_name
             or current_normalized_mcp_server_name != current_mcp_server_name
         ):
@@ -11905,7 +12890,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
         )
         beginner_output_confirmed = True
         if (
-            st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
+            mcp_beginner_mode
             and beginner_scope_confirmed
             and mcp_connection_target
             and mcp_server_name
@@ -11938,9 +12923,9 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                 key=output_confirmation_key,
                 help="이 값 중 하나를 바꾸면 변경된 설정을 다시 확인해야 합니다.",
             )
-        elif st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+        elif mcp_beginner_mode:
             beginner_output_confirmed = False
-        if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) and not beginner_output_confirmed:
+        if mcp_beginner_mode and not beginner_output_confirmed:
             mcp_target_ready = False
         mcp_config = _direct_python_mcp_config(
             build_mcp_client_config(
@@ -12022,7 +13007,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
             )
         else:
             st.caption("일반 사용자는 아래 버튼만 누르면 됩니다. JSON과 명령어는 아래 전산 담당자용 영역에 숨겨져 있습니다.")
-        if not _mcp_bundle_created(ctx):
+        if mcp_beginner_mode and not _mcp_bundle_created(ctx):
             if mcp_bundle_ready and not mcp_profile_scope_mismatch and mcp_target_ready:
                 _render_beginner_action_marker(
                     4,
@@ -12133,7 +13118,11 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         _run_background_operation_with_progress(
                             lambda report: index_documents_batch(
                                 patched_document_ids,
-                                IndexRequest(target_type="local-jsonl", embedding_dimensions=384),
+                                IndexRequest(
+                                    target_type="local-jsonl",
+                                    embedding_dimensions=384,
+                                    embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                                ),
                                 local_auth,
                                 progress_callback=report,
                             ),
@@ -12375,7 +13364,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                         f"누락된 로컬 출처 정보를 규정 {len(source_metadata_patch):,}개에 보완한 뒤 다시 색인했습니다."
                     )
                 st.success("MCP 실행 데이터와 연결 파일 묶음을 만들었습니다.")
-                if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+                if mcp_beginner_mode:
                     st.info(
                         "아래 앱별 등록·진단 안내를 끝까지 진행한 뒤, 맨 아래에서 "
                         "search와 fetch의 실제 성공 여부를 확인하세요."
@@ -12536,13 +13525,14 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     "이 프로그램은 다른 앱의 현재 대화 결과를 자동으로 읽을 수 없으므로, "
                     "아래 최종 도구 호출 성공은 해당 대화에서 직접 확인해야 합니다."
                 )
-                _render_beginner_action_marker(
-                    4,
-                    "연결 상태를 확인하세요",
-                    "AI 프로그램에서 MCP를 켠 뒤 바로 아래 새로고침 버튼으로 설정·서버 상태를 다시 확인하세요.",
-                    control_key_prefix="refresh-mcp-connection-diagnostic-",
-                    substep=8,
-                )
+                if mcp_beginner_mode:
+                    _render_beginner_action_marker(
+                        4,
+                        "연결 상태를 확인하세요",
+                        "AI 프로그램에서 MCP를 켠 뒤 바로 아래 새로고침 버튼으로 설정·서버 상태를 다시 확인하세요.",
+                        control_key_prefix="refresh-mcp-connection-diagnostic-",
+                        substep=8,
+                    )
                 diagnostic_refreshed = st.button(
                     "MCP 연결 상태 새로고침",
                     key=f"refresh-mcp-connection-diagnostic-{document_id}-{mcp_scope}",
@@ -12626,7 +13616,7 @@ def _page_connect(ctx: dict | None, *, mcp_first: bool = False) -> None:
                     bundle_state.get("connection_display_value") or ""
                 ),
             )
-            if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
+            if mcp_beginner_mode:
                 st.markdown("### 마지막 확인: 실제 AI 대화에서 검색하기")
                 st.caption(
                     "위의 앱 등록·활성화·연결 진단을 마친 뒤 새 AI 대화를 열어 "
@@ -13405,7 +14395,22 @@ with st.sidebar:
         st.divider()
     st.markdown("### 공공기관 규정 MCP 빌더")
     st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
+    st.markdown("**최종 사용 방법**")
+    st.session_state[AI_USAGE_PATH_SIDEBAR_WIDGET_KEY] = _ai_usage_path()
+    st.radio(
+        "Qwen 또는 MCP 선택",
+        AI_USAGE_PATH_OPTIONS,
+        key=AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,
+        format_func=_ai_usage_path_label,
+        on_change=_ai_usage_path_changed,
+        args=(AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,),
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "Qwen과 MCP는 같은 승인 RAG를 공유합니다. 선택하면 ④ 메뉴와 첫 화면만 목적에 맞게 바뀝니다."
+    )
     _render_beginner_guide_sidebar(ctx, current_nav_page)
+    _render_beginner_orchestration_explanation(nav_page=current_nav_page)
     _render_ai_review_sidebar(ctx)
     st.divider()
     # AI 추가 검수를 쓰지 않은 문서에서는 ②를 빼고 ①→③ 2단계로 보여 준다.
@@ -13423,6 +14428,7 @@ with st.sidebar:
         primary_nav_pages,
         key="primary_nav_page",
         on_change=_go_primary_nav,
+        format_func=_primary_nav_display_label,
     )
     if NAV_RESULTS not in primary_nav_pages:
         st.caption(
@@ -13445,7 +14451,13 @@ with st.sidebar:
         st.caption(f"품질: {'통과' if quality_report and quality_report.passed else '검토 필요'}")
         st.caption(f"승인된 청크: {ctx['approved_count']:,} / {len(ctx['chunks']):,}")
         st.caption(f"AI 사용 준비: {'완료' if ctx['mcp_connection_gate'].get('ready') else '아직'}")
-        st.caption(f"MCP 생성: {'완료' if _mcp_bundle_created(ctx) else '아직'}")
+        if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+            st.caption(
+                "Qwen 질문·근거 확인: "
+                + ("완료" if all(_qwen_beginner_procedure_states(ctx)) else "아직")
+            )
+        else:
+            st.caption(f"MCP 생성: {'완료' if _mcp_bundle_created(ctx) else '아직'}")
     else:
         st.caption("아직 전처리한 문서가 없습니다.")
     st.divider()
@@ -13460,7 +14472,7 @@ elif nav_page == NAV_RESULTS:
 elif nav_page == NAV_APPROVAL:
     _page_approval(ctx)
 elif nav_page == NAV_MCP:
-    _page_connect(ctx, mcp_first=True)
+    _page_connect(ctx, mcp_first=_ai_usage_path() == AI_USAGE_PATH_MCP)
 elif nav_page == NAV_GOLDSET:
     _render_parsing_goldset_review_panel()
 elif nav_page == NAV_ADMIN:

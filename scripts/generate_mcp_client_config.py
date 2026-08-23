@@ -6934,7 +6934,7 @@ function Read-ClaudeDesktopBundleServerConfig {
   try {
     return Read-JsonFile "claude_desktop_config.json"
   } catch {
-    Write-Warning "Generated claude_desktop_config.json is invalid; recovering the MCP entry from the embedded UTF-8 configuration."
+    Write-Warning "Invalid Claude Desktop JSON; recovering the MCP entry."
     return Read-EmbeddedBundleServerConfig $EmbeddedClaudeDesktopConfigBase64 "Claude Desktop"
   }
 }
@@ -8471,6 +8471,7 @@ function Assert-ClaudeDesktopInstalledContract(
   $ActualFingerprint = "sha256:" + (Get-McpFileSha256 $TargetPath)
   if (-not [string]::IsNullOrWhiteSpace($ExpectedFingerprint) -and
       -not [string]::Equals($ActualFingerprint, $ExpectedFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+    [Console]::Out.WriteLine("Claude Desktop config changed after its installed launch contract was verified.")
     throw "Claude Desktop config changed after its installed launch contract was verified."
   }
   return $ActualFingerprint
@@ -9849,7 +9850,7 @@ def _powershell_bundle_runtime_transport_smoke_script(
         'if (Test-Path -LiteralPath $SmokeReport) { try { $SmokeResult = Get-Content -LiteralPath $SmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $SmokeResult = $null } }',
         '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_transport_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and $SmokeResult.full_profile.passed -eq $true -and [int]$SmokeResult.full_profile.search_result_count -gt 0 -and $SmokeResult.full_profile.fetch_has_text -eq $true -and $SmokeResult.chatgpt_data_profile.passed -eq $true -and [int]$SmokeResult.chatgpt_data_profile.search_result_count -gt 0 -and $SmokeResult.chatgpt_data_profile.fetch_has_text -eq $true',
         'Write-Host "Transport smoke report: $SmokeReport"',
-        'if (-not $SmokeVerified) { throw "Runtime MCP smoke did not produce a fresh passing search/fetch report." }',
+        'if (-not $SmokeVerified) { Write-Output "Runtime MCP smoke did not produce a fresh passing search/fetch report."; throw "Runtime MCP smoke did not produce a fresh passing search/fetch report." }',
     ]
     return "\n".join(lines).replace("__TENANT_ID__", tenant_id).replace("__STORAGE_FLAG__", storage_flag)
 
@@ -9920,7 +9921,7 @@ def _powershell_bundle_client_config_smoke_script(*, server_name: str) -> str:
         'if (Test-Path -LiteralPath $SmokeReport) { try { $SmokeResult = Get-Content -LiteralPath $SmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $SmokeResult = $null } }',
         '$SmokeVerified = $SmokeExitCode -eq 0 -and $SmokeResult -and [string]$SmokeResult.report_type -eq "mcp_client_config_smoke" -and $SmokeResult.passed -eq $true -and $SmokeResult.launcher_ready -eq $true -and $SmokeResult.process_started -eq $true -and $SmokeResult.mcp_initialized -eq $true -and $SmokeResult.tools_discovered -eq $true -and $SmokeResult.end_to_end_verified -eq $true -and @($SmokeResult.results).Count -eq 2',
         'Write-Host "Client config smoke report: $SmokeReport"',
-        'if (-not $SmokeVerified) { throw "Client config smoke did not produce a fresh passing Codex and Claude Desktop report." }',
+        'if (-not $SmokeVerified) { Write-Output "Client config smoke did not produce a fresh passing Codex and Claude Desktop report."; throw "Client config smoke did not produce a fresh passing Codex and Claude Desktop report." }',
     ]
     return "\n".join(lines).replace("__SERVER_NAME__", server_name)
 
@@ -10102,6 +10103,7 @@ def _powershell_claude_code_stdio_bundle_script(
         '[System.IO.File]::WriteAllText($ClaudeEvidencePath, $EvidenceJson, $Utf8NoBom)',
         '} catch {',
         '  $ClaudeInstallError = $_',
+        '  [Console]::Error.WriteLine("Claude Code transaction failed: " + [string]$ClaudeInstallError.Exception.Message)',
         '  $ClaudeRollbackComplete = $false',
         '  try {',
         '    if (-not $ClaudeMutationStarted) { $ClaudeRollbackComplete = $true }',

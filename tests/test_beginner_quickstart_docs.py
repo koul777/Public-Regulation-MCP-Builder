@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class BeginnerQuickstartDocsTests(unittest.TestCase):
     def test_readme_keeps_today_and_prior_update_summaries_above_product(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        today_heading = "# 최근 업데이트: 2026년 8월 8일"
+        today_heading = "# 최근 업데이트: 2026년 8월 23일"
         # 새 절을 맨 위에 얹을 때마다 이전 절은 순서대로 아래로 내려가야 한다. 위에서
         # 아래로 최신순이 아니면 무엇이 지금 버전인지 읽는 사람이 알 수 없다.
         prior_headings = (
@@ -66,7 +66,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
                 "① 문서 올려서 전처리",
                 "② 결과 확인",
                 "③ 검수하고 승인",
-                "④ MCP 생성·AI 연결",
+                "④ Qwen 규정 챗봇·AI 연결",
             )
         ]
         self.assertEqual(sorted(positions), positions)
@@ -118,7 +118,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
                 "① 문서 올려서 전처리",
                 "② 결과 확인",
                 "③ 검수하고 승인",
-                "④ MCP 생성·AI 연결",
+                "④ Qwen 규정 챗봇·AI 연결",
             )
         ]
         self.assertEqual(sorted(positions), positions)

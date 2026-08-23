@@ -10,12 +10,12 @@ def import_fitz() -> ModuleType:
         import fitz as backend  # type: ignore
 
         return backend
-    except ImportError:
+    except (ImportError, OSError):
         try:
             import pymupdf as backend  # type: ignore
 
             return backend
-        except ImportError as pymupdf_error:
+        except (ImportError, OSError) as pymupdf_error:
             raise ImportError(
                 "PyMuPDF is not installed. Install package 'pymupdf'."
             ) from pymupdf_error

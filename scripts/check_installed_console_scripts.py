@@ -117,6 +117,7 @@ DEFAULT_COMMANDS = (
     "reg-rag-mcp-index-visibility",
     "reg-rag-mcp-query-benchmark",
     "reg-rag-mcp-retrieval-quality",
+    "reg-rag-local-llm-doctor",
     "reg-rag-revision-impact",
     "reg-rag-real-parser-fixtures",
 )

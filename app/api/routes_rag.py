@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
+from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -8,7 +9,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -37,13 +38,28 @@ from app.core.security import (
     require_api_role,
 )
 from app.core.tenant_access import resource_visible_to_tenant, settings_for_tenant, tenant_storage_key
+from app.agents.citation_verifier import CitationVerifierAgent
+from app.agents.claim_auditor import ClaimAuditAgent
+from app.agents.grounded_qa import GroundedQwenAnswerAgent
+from app.agents.grounded_answer_agent import GroundedAnswerAgent
+from app.agents.model_router import (
+    QWEN3_ANSWER_MODEL,
+    QWEN3_EMBEDDING_MODEL,
+    QWEN3_RERANKER_MODEL,
+    model_profile_manifest,
+)
+from app.agents.ollama_runtime import OllamaRuntime
+from app.agents.query_agents import QueryAnalysisAgent, QueryRewriteAgent
+from app.agents.role_registry import workflow_roles
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import APPROVED_CHUNK_STATUS, stable_content_hash, vector_record_from_chunk
 from app.ingestion.vector_integrity import embedded_vector_integrity_reason
 from app.ingestion.vector_upsert import validate_vector_records
 from app.rag.local_llm import generate_local_llm_answer, local_llm_available, probe_local_llm
+from app.rag.context_builder import ContextBuilder
 from app.rag.output_filter import sanitize_rag_answer
 from app.rag.extractive_answer import build_structured_extractive_answer
+from app.pipelines.definitions import LOCAL_QA_PIPELINE_ID, PipelineStageTracker
 from app.retrieval.bm25_index import (
     BM25_RETRIEVAL_MODEL,
     BM25_STRUCTURED_METADATA_VERSION,
@@ -53,6 +69,9 @@ from app.retrieval.bm25_index import (
     source_content_hashes,
 )
 from app.retrieval.searcher import search as search_retrieval_records
+from app.retrieval.semantic_models import Qwen3RerankerAdapter
+from app.retrieval.semantic_models import semantic_runtime_available
+from app.parsers.paddle_ocr import paddle_ocr_available
 from app.services.review_decision_service import APPROVAL_WORKLIST_METADATA_KEYS, approval_worklist_metadata
 from app.services.regulation_catalog_service import filter_to_latest_active_versions, read_regulation_metadata
 from app.services import regulation_rag_runtime as rag_runtime
@@ -145,10 +164,17 @@ class RagSearchRequest(BaseModel):
     profile_id: McpOptionalIdentifier | None = None
     metadata_profile: str = Field(default="full", max_length=20)
     as_of_date: str | None = Field(default=None, max_length=20)
+    orchestration_mode: Literal["auto", "legacy", "multi_model"] = "auto"
+
+
+class RagChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=6000)
 
 
 class RagChatRequest(RagSearchRequest):
     llm_backend: str | None = Field(default=None, max_length=40)
+    history: list[RagChatMessage] = Field(default_factory=list, max_length=12)
 
 
 class RagFeedbackRequest(BaseModel):
@@ -192,14 +218,87 @@ def search_rag_records(
     )
     lifecycle_complete = sum(1 for record in visible_records if _has_complete_lifecycle_metadata(record))
     timing_ms["visibility_filter_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    multi_model = _use_multi_model_orchestration(request, settings)
+    query_execution: dict[str, Any] = {
+        "enabled": False,
+        "analysis_mode": "deterministic_existing_query",
+        "rewrite_mode": "deterministic_existing_query",
+        "intent": "general",
+        "locator_count": 0,
+        "search_query_count": 1,
+        "search_queries": [request.query],
+    }
+    if multi_model:
+        step_started_at = time.perf_counter()
+        runtime = OllamaRuntime(settings.rag_llm_endpoint)
+        analysis = QueryAnalysisAgent(runtime).analyze(request.query)
+        rewrite = QueryRewriteAgent(runtime).rewrite(analysis)
+        query_execution = {
+            "enabled": True,
+            "analysis_mode": analysis.analysis_mode,
+            "rewrite_mode": rewrite.rewrite_mode,
+            "intent": analysis.intent,
+            "locator_count": len(analysis.locators),
+            "search_query_count": len(rewrite.search_queries),
+            "search_queries": list(rewrite.search_queries),
+            "query_model": analysis.model or "deterministic",
+            "query_fallback_reason": analysis.fallback_reason or "",
+            "rewrite_fallback_reason": rewrite.fallback_reason or "",
+        }
+        timing_ms["query_agents_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
-    scored, retrieval = _score_records(request.query, visible_records, settings=settings, auth=auth, all_records=records)
+    scored, retrieval = _score_records_for_queries(
+        query_execution["search_queries"],
+        visible_records,
+        settings=settings,
+        auth=auth,
+        all_records=records,
+    )
     timing_ms["scoring_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    reranker_status = "not_requested"
+    reranker_reason = ""
+    if multi_model and scored:
+        step_started_at = time.perf_counter()
+        try:
+            local_reranker_path = Path("data/semantic_runtime_models/qwen3-reranker-0.6b")
+            scored = Qwen3RerankerAdapter(
+                device="cpu",
+                local_files_only=True,
+                model_path=local_reranker_path if local_reranker_path.exists() else None,
+            ).rerank(
+                request.query,
+                scored,
+                top_k=min(max(request.top_k, 10), len(scored)),
+            )
+            reranker_status = "completed"
+        except Exception as exc:
+            reranker_status = "degraded"
+            reranker_reason = f"reranker_{type(exc).__name__}"[:120]
+        timing_ms["reranker_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
+    retrieval.update(
+        {
+            **{key: value for key, value in query_execution.items() if key != "search_queries"},
+            "reranker_model": QWEN3_RERANKER_MODEL if multi_model else "deterministic_structured_boosts",
+            "reranker_status": reranker_status,
+            "reranker_reason": reranker_reason,
+        }
+    )
     step_started_at = time.perf_counter()
     results = [
         _public_search_result(record, score, related_records=visible_records)
         for score, record in scored[: request.top_k]
     ]
+    context_summary: dict[str, Any] = {"context_status": "not_requested"}
+    if multi_model:
+        context = ContextBuilder().build(results) if results else ContextBuilder().build([])
+        context_summary = {
+            "context_status": "completed",
+            "context_item_count": len(context.items),
+            "context_character_count": context.character_count,
+            "context_estimated_tokens": context.estimated_tokens,
+            "context_review_flag_count": len(context.review_flags),
+        }
+        retrieval.update(context_summary)
     timing_ms["public_results_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     timing_ms["total_before_trace_write_elapsed_ms"] = _perf_elapsed_ms(total_started_at)
     trace = _rag_trace(
@@ -220,6 +319,15 @@ def search_rag_records(
             },
             "embedding_model": retrieval["retrieval_model"],
             "timing_ms": timing_ms,
+            "pipeline_trace": _qa_search_pipeline_trace(
+                retrieval=retrieval,
+                candidate_count=len(records),
+                visible_count=len(visible_records),
+                result_count=len(results),
+                tenant_id=auth.tenant_id,
+            ),
+            "multi_model_orchestration": multi_model,
+            **context_summary,
             **retrieval,
         },
     )
@@ -277,9 +385,104 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
         _validate_query_policy(request.query)
         _validate_security_scope(request, auth)
         metadata_profile = _validate_response_metadata_profile(request.metadata_profile)
-        results, search_trace = search_rag_records(request, auth, request_settings)
         backend = _chat_backend(request, request_settings)
-        answer = _chat_answer(backend, request_settings, request.query, results)
+        execution_settings = replace(request_settings, rag_llm_backend=backend)
+        chat_history = _chat_history_payload(request.history)
+        contextualized_query = _contextualized_chat_query(request.query, chat_history)
+        search_request = request.model_copy(update={"query": contextualized_query})
+        results, search_trace = search_rag_records(search_request, auth, execution_settings)
+        multi_model = _use_multi_model_orchestration(request, execution_settings)
+        qa_tracker = _qa_tracker_after_search(search_trace)
+        qa_tracker.start(
+            "local_llm_answer",
+            detail={"backend": backend, "evidence_count": len(results), "multi_model": multi_model},
+        )
+        qa_tracker.set_agent_role_status(
+            "local_llm_answer",
+            "grounded_answerer",
+            status="running",
+        )
+        orchestrated: dict[str, Any] | None = None
+        if multi_model:
+            orchestrated = _orchestrated_chat_answer(
+                execution_settings,
+                request.query,
+                results,
+                history=chat_history,
+            )
+            answer = str(orchestrated["answer"])
+            citations = list(orchestrated["citations"])
+        else:
+            answer = _chat_answer(
+                backend,
+                execution_settings,
+                request.query,
+                results,
+                history=chat_history,
+            )
+            citations = [
+                _rag_chat_citation_for_metadata_profile(result, metadata_profile)
+                for result in results
+            ]
+        qa_tracker.set_agent_role_status(
+            "local_llm_answer",
+            "grounded_answerer",
+            status="completed"
+            if orchestrated
+            else "skipped"
+            if backend == "extractive"
+            else "degraded",
+            reason_code=(
+                None
+                if orchestrated
+                else "legacy_extractive_answer"
+                if backend == "extractive"
+                else "legacy_local_backend"
+            ),
+            detail={"answer_present": bool(answer)},
+        )
+        qa_tracker.complete(
+            "local_llm_answer",
+            detail={
+                "answer_generated": bool(answer),
+                "answer_model": (orchestrated or {}).get("answer_model"),
+                "answer_mode": (orchestrated or {}).get("answer_mode"),
+                "claim_count": (orchestrated or {}).get("claim_count", 0),
+            },
+        )
+        qa_tracker.start("citation_verify", detail={"evidence_count": len(results)})
+        qa_tracker.set_agent_role_status(
+            "citation_verify",
+            "claim_auditor",
+            status=(
+                "completed"
+                if orchestrated and orchestrated.get("claim_audit_status") == "verified"
+                else "skipped"
+                if not orchestrated
+                else "degraded"
+            ),
+            reason_code=(
+                None
+                if orchestrated and orchestrated.get("claim_audit_status") == "verified"
+                else "legacy_answer_path"
+                if not orchestrated
+                else str(orchestrated.get("claim_audit_status") or "claim_audit_not_verified")
+            ),
+        )
+        qa_tracker.set_agent_role_status(
+            "citation_verify",
+            "citation_verifier",
+            status="completed" if citations else "degraded" if orchestrated else "completed",
+            reason_code=None if citations or not orchestrated else "no_verified_citations",
+        )
+        qa_tracker.complete(
+            "citation_verify",
+            detail={
+                "citation_count": len(citations),
+                "claim_audit_model": (orchestrated or {}).get("claim_audit_model"),
+                "claim_audit_status": (orchestrated or {}).get("claim_audit_status"),
+            },
+        )
         trace = _rag_trace(
             action="chat",
             request=request,
@@ -288,7 +491,15 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
             extra={
                 "search_trace_id": search_trace["trace_id"],
                 "llm_backend": backend,
-                "answer_mode": "grounded_local" if backend != "extractive" else "grounded_extractive",
+                "answer_mode": (
+                    (orchestrated or {}).get("answer_mode")
+                    or ("grounded_local" if backend != "extractive" else "grounded_extractive")
+                ),
+                "multi_model_orchestration": multi_model,
+                "claim_audit_status": (orchestrated or {}).get("claim_audit_status"),
+                "history_message_count": len(chat_history),
+                "contextualized_search": contextualized_query != request.query,
+                "pipeline_trace": qa_tracker.snapshot(),
             },
         )
         if request_settings.rag_trace_enabled:
@@ -305,10 +516,28 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
         return {
             "trace_id": trace["trace_id"],
             "answer": answer,
-            "citations": [
-                _rag_chat_citation_for_metadata_profile(result, metadata_profile)
-                for result in results
-            ],
+            "citations": citations,
+            "conversation": {
+                "history_message_count": len(chat_history),
+                "contextualized_search": contextualized_query != request.query,
+            },
+            "orchestration": (
+                {
+                    "mode": "multi_model",
+                    "answer_model": orchestrated.get("answer_model"),
+                    "attempted_answer_model": orchestrated.get("attempted_answer_model"),
+                    "answer_mode": orchestrated.get("answer_mode"),
+                    "claim_audit_model": orchestrated.get("claim_audit_model"),
+                    "claim_audit_status": orchestrated.get("claim_audit_status"),
+                    "claim_audit_reason": orchestrated.get("claim_audit_reason"),
+                    "roles": _qa_orchestration_role_trace(
+                        search_trace=search_trace,
+                        orchestration=orchestrated,
+                    ),
+                }
+                if orchestrated
+                else {"mode": "legacy"}
+            ),
         }
     except HTTPException as exc:
         audit_api_event(
@@ -389,8 +618,18 @@ def rag_runtime_status(auth_context: AuthContext = Depends(get_auth_context)):
             "configured_backend": request_backend_status(settings),
             "local_llm_available": local_llm_available(settings),
             "embedding_model": LOCAL_HASH_EMBEDDING_MODEL,
+            "available_embedding_models": [LOCAL_HASH_EMBEDDING_MODEL, QWEN3_EMBEDDING_MODEL],
             "retrieval_model": BM25_RETRIEVAL_MODEL,
             "vector_store_configured": vector_path.is_file(),
+            "multi_model_orchestration": {
+                "enabled_when": "ollama+qwen3:8b",
+                "model_profiles": model_profile_manifest(),
+                "semantic_runtime_available": semantic_runtime_available(),
+                "reranker_weights_available": Path(
+                    "data/semantic_runtime_models/qwen3-reranker-0.6b"
+                ).is_dir(),
+                "paddle_ocr_runtime_available": paddle_ocr_available(),
+            },
         }
         audit_api_event(
             settings,
@@ -1654,6 +1893,76 @@ def _department_acl_set(value: Any) -> set[str]:
     return set(normalize_department_ids(value))
 
 
+def _use_multi_model_orchestration(request: RagSearchRequest, settings: Settings) -> bool:
+    mode = str(request.orchestration_mode or "auto").strip().lower()
+    if mode == "legacy":
+        return False
+    if mode == "multi_model":
+        return True
+    backend = str(settings.rag_llm_backend or "extractive").strip().lower()
+    model = str(settings.rag_llm_model or "").strip().lower()
+    return backend == "ollama" and model == QWEN3_ANSWER_MODEL
+
+
+def _score_records_for_queries(
+    queries: list[str] | tuple[str, ...],
+    records: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    all_records: list[dict[str, Any]] | None = None,
+) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
+    normalized = list(dict.fromkeys(" ".join(str(query or "").split()) for query in queries))
+    normalized = [query for query in normalized if query][:8]
+    if not normalized:
+        raise ValueError("at least one search query is required")
+    if len(normalized) == 1:
+        return _score_records(
+            normalized[0],
+            records,
+            settings=settings,
+            auth=auth,
+            all_records=all_records,
+        )
+    by_id = {
+        str(record.get("id") or record.get("chunk_id") or f"record-{index}"): record
+        for index, record in enumerate(records)
+    }
+    fused: dict[str, float] = {}
+    per_query_models: list[str] = []
+    primary_metadata: dict[str, Any] = {}
+    for query_index, query in enumerate(normalized):
+        scored, metadata = _score_records(
+            query,
+            records,
+            settings=settings,
+            auth=auth,
+            all_records=all_records,
+        )
+        if query_index == 0:
+            primary_metadata = dict(metadata)
+        per_query_models.append(str(metadata.get("retrieval_model") or ""))
+        query_weight = 1.0 if query_index == 0 else 0.85
+        for rank, (_score, record) in enumerate(scored, start=1):
+            record_id = str(record.get("id") or record.get("chunk_id") or "")
+            if record_id in by_id:
+                fused[record_id] = fused.get(record_id, 0.0) + query_weight / (60.0 + rank)
+    ranked = sorted(
+        [(round(score, 8), by_id[record_id]) for record_id, score in fused.items()],
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    primary_metadata.update(
+        {
+            "multi_query_fusion": "weighted_rrf-v1",
+            "search_query_count": len(normalized),
+            "per_query_retrieval_models": per_query_models,
+            "query_expanded": True,
+        }
+    )
+    return ranked, primary_metadata
+
+
 def _score_records(
     query: str,
     records: list[dict[str, Any]],
@@ -2044,31 +2353,422 @@ def _extractive_answer(query: str, results: list[dict[str, Any]]) -> str:
     return build_structured_extractive_answer(query, results)
 
 
+def _qa_search_pipeline_trace(
+    *,
+    retrieval: dict[str, Any],
+    candidate_count: int,
+    visible_count: int,
+    result_count: int,
+    tenant_id: str | None,
+) -> dict[str, Any]:
+    """Publish the search half of the image's local-QA pipeline.
+
+    Details contain only bounded counters and model/status codes, never the raw
+    query, generated prompt, regulation text, tenant id, or local path.
+    """
+
+    tracker = PipelineStageTracker(LOCAL_QA_PIPELINE_ID, tenant_id=tenant_id)
+    stages = (
+        (
+            "query_analysis",
+            {
+                "query_policy": "passed",
+                "analysis_mode": retrieval.get("analysis_mode"),
+                "query_model": retrieval.get("query_model"),
+                "query_fallback_reason": retrieval.get("query_fallback_reason"),
+                "intent": retrieval.get("intent"),
+                "locator_count": retrieval.get("locator_count", 0),
+            },
+        ),
+        (
+            "query_correction",
+            {
+                "query_expanded": bool(retrieval.get("query_expanded")),
+                "rewrite_mode": retrieval.get("rewrite_mode"),
+                "rewrite_fallback_reason": retrieval.get("rewrite_fallback_reason"),
+                "search_query_count": retrieval.get("search_query_count", 1),
+            },
+        ),
+        (
+            "hybrid_retrieval",
+            {
+                "retrieval_model": retrieval.get("retrieval_model"),
+                "retrieval_fallback": bool(retrieval.get("retrieval_fallback")),
+                "candidate_count": candidate_count,
+            },
+        ),
+        (
+            "rerank_filter",
+            {
+                "bm25_index_status": retrieval.get("bm25_index_status"),
+                "reranker_model": retrieval.get("reranker_model"),
+                "reranker_status": retrieval.get("reranker_status"),
+                "reranker_reason": retrieval.get("reranker_reason"),
+                "visible_count": visible_count,
+            },
+        ),
+        (
+            "context_build",
+            {
+                "evidence_count": result_count,
+                "context_status": retrieval.get("context_status"),
+                "context_item_count": retrieval.get("context_item_count", result_count),
+                "context_estimated_tokens": retrieval.get("context_estimated_tokens", 0),
+            },
+        ),
+    )
+    for stage_id, detail in stages:
+        tracker.start(stage_id, detail=detail)
+        _mark_qa_stage_roles(tracker, stage_id, detail)
+        tracker.complete(stage_id, detail=detail)
+    return tracker.snapshot()
+
+
+def _qa_tracker_after_search(search_trace: dict[str, Any]) -> PipelineStageTracker:
+    tracker = PipelineStageTracker(
+        LOCAL_QA_PIPELINE_ID,
+        tenant_id=str(search_trace.get("tenant_id") or "") or None,
+    )
+    trace = search_trace.get("pipeline_trace")
+    events = trace.get("stages") if isinstance(trace, dict) else []
+    details = {
+        str(event.get("stage_id")): event.get("detail") or {}
+        for event in events
+        if isinstance(event, dict)
+    }
+    for stage_id in ("query_analysis", "query_correction", "hybrid_retrieval", "rerank_filter", "context_build"):
+        detail = details.get(stage_id, {})
+        tracker.start(stage_id, detail=detail)
+        _mark_qa_stage_roles(tracker, stage_id, detail)
+        tracker.complete(stage_id, detail=detail)
+    return tracker
+
+
+def _mark_qa_stage_roles(
+    tracker: PipelineStageTracker,
+    stage_id: str,
+    detail: dict[str, Any],
+) -> None:
+    """Translate bounded QA stage details into real role statuses."""
+
+    role_by_stage = {
+        "query_analysis": ("query_analyst",),
+        "query_correction": ("query_rewriter",),
+        "hybrid_retrieval": ("retrieval_guard",),
+        "rerank_filter": ("reranker",),
+        "context_build": ("context_builder",),
+    }
+    roles = role_by_stage.get(stage_id, ())
+    for role_id in roles:
+        raw_status = "completed"
+        if role_id == "reranker":
+            reranker_status = str(detail.get("reranker_status") or "").strip().lower()
+            raw_status = {
+                "not_requested": "skipped",
+                "degraded": "degraded",
+                "failed": "failed",
+                "completed": "completed",
+            }.get(reranker_status, "completed")
+        elif role_id in {"query_analyst", "query_rewriter"}:
+            fallback_reason = str(
+                detail.get("query_fallback_reason") or detail.get("rewrite_fallback_reason") or ""
+            ).strip()
+            raw_status = "degraded" if fallback_reason else "completed"
+        tracker.set_agent_role_status(
+            stage_id,
+            role_id,
+            status=raw_status,  # type: ignore[arg-type]
+            reason_code=(
+                str(detail.get("reranker_reason") or "")[:120]
+                if role_id == "reranker" and raw_status == "degraded"
+                else None
+            ),
+            detail={
+                key: value
+                for key, value in detail.items()
+                if key in {"analysis_mode", "rewrite_mode", "retrieval_fallback", "reranker_status", "context_status"}
+            },
+        )
+
+
 def _chat_backend(request: RagChatRequest, settings: Settings) -> str:
-    backend = str(request.llm_backend or settings.rag_llm_backend or "extractive").strip().lower()
+    configured_backend = str(settings.rag_llm_backend or "extractive").strip().lower()
+    requested_backend = str(request.llm_backend or "").strip().lower()
+    if requested_backend and requested_backend != configured_backend:
+        raise HTTPException(
+            status_code=403,
+            detail="Request-level local RAG backend override is not permitted.",
+        )
+    backend = configured_backend
     if backend == "extractive":
         return backend
     if backend in {"ollama", "llama-cpp", "openai-compatible"}:
-        if not local_llm_available(settings):
+        if not local_llm_available(replace(settings, rag_llm_backend=backend)):
             raise HTTPException(status_code=503, detail="Configured local LLM backend is not available.")
         return backend
     raise HTTPException(status_code=400, detail="Unsupported local RAG chat backend.")
 
 
-def _chat_answer(backend: str, settings: Settings, query: str, results: list[dict[str, Any]]) -> str:
+def _chat_history_payload(history: list[RagChatMessage]) -> list[dict[str, str]]:
+    return [
+        {
+            "role": message.role,
+            "content": " ".join(message.content.split())[:2000],
+        }
+        for message in history[-12:]
+        if message.content.strip()
+    ]
+
+
+def _contextualized_chat_query(query: str, history: list[dict[str, str]]) -> str:
+    current = " ".join(str(query or "").split())
+    previous_questions = [
+        str(message.get("content") or "").strip()
+        for message in history
+        if message.get("role") == "user" and str(message.get("content") or "").strip()
+    ][-2:]
+    if not previous_questions:
+        return current
+    suffix = f"\n현재 질문:\n{current}"
+    header = "이전 사용자 질문:\n"
+    history_budget = MAX_MCP_QUERY_CHARS - len(header) - len(suffix)
+    if history_budget <= 0:
+        return current[:MAX_MCP_QUERY_CHARS]
+    previous_block = "\n".join(f"- {item}" for item in previous_questions)
+    return f"{header}{previous_block[:history_budget]}{suffix}"
+
+
+def _orchestrated_chat_answer(
+    settings: Settings,
+    query: str,
+    results: list[dict[str, Any]],
+    *,
+    history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    try:
+        context = ContextBuilder().build(results) if results else ContextBuilder().build([])
+        runtime = OllamaRuntime(settings.rag_llm_endpoint)
+        draft = GroundedQwenAnswerAgent(runtime).answer(
+            query=query,
+            context=context,
+            history=history,
+            strict_model=True,
+        )
+        audit = ClaimAuditAgent(runtime).audit(
+            draft=draft,
+            context=context,
+            strict_model=True,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Multi-model local QA execution failed: {type(exc).__name__}",
+        ) from exc
+    if audit.status == "abstained":
+        return {
+            "answer": _sanitize_rag_answer(draft.answer),
+            "citations": [],
+            "answer_model": draft.model,
+            "answer_mode": draft.answer_mode,
+            "claim_count": 0,
+            "claim_audit_model": audit.model,
+            "claim_audit_status": audit.status,
+            "citation_verification_status": "abstained",
+        }
+    if audit.status != "verified":
+        fallback = GroundedQwenAnswerAgent(runtime).answer(
+            query=query,
+            context=context,
+            history=history,
+            prefer_model=False,
+        )
+        supporting_context_ids = {
+            context_id
+            for claim in fallback.claims
+            for context_id in claim.evidence_context_ids
+        }
+        supporting_evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for item in context.items
+                if item.context_id in supporting_context_ids
+                for evidence_id in item.evidence_ids
+            )
+        )
+        supporting_results = [
+            result
+            for result in results
+            if str(result.get("chunk_id") or result.get("document_id") or "")
+            in supporting_evidence_ids
+        ]
+        fallback_verification = CitationVerifierAgent().run(
+            {
+                "answer": fallback.answer,
+                "evidence": supporting_results,
+                "evidence_ids": supporting_evidence_ids,
+            }
+        )
+        if fallback_verification.get("status") != "verified":
+            raise HTTPException(
+                status_code=503,
+                detail=f"Multi-model answer claim audit did not verify: {audit.status}",
+            )
+        return {
+            "answer": _sanitize_rag_answer(
+                str(fallback_verification.get("verified_answer") or fallback.answer)
+            ),
+            "citations": list(fallback_verification.get("citations") or []),
+            "answer_model": fallback.model,
+            "attempted_answer_model": draft.model,
+            "answer_mode": fallback.answer_mode,
+            "claim_count": len(fallback.claims),
+            "claim_audit_model": audit.model,
+            "claim_audit_status": f"fallback_from_{audit.status}",
+            "claim_audit_reason": audit.reason_code,
+            "citation_verification_status": "verified",
+        }
+    requested_evidence_ids = list(
+        dict.fromkeys(
+            evidence_id
+            for citation in audit.citations
+            for evidence_id in citation.evidence_ids
+        )
+    )
+    identity_verification = CitationVerifierAgent().run(
+        {
+            "answer": draft.answer,
+            "evidence": results,
+            "evidence_ids": requested_evidence_ids,
+        }
+    )
+    if identity_verification.get("status") != "verified":
+        raise HTTPException(status_code=503, detail="Final evidence identity verification failed")
+    citations = []
+    for citation in audit.citations:
+        payload = citation.model_dump(mode="json")
+        payload["support_quote"] = _sanitize_rag_answer(str(payload.get("support_quote") or ""))
+        citations.append(payload)
+    return {
+        "answer": _sanitize_rag_answer(str(identity_verification.get("verified_answer") or "")),
+        "citations": citations,
+        "answer_model": draft.model,
+        "answer_mode": draft.answer_mode,
+        "claim_count": len(draft.claims),
+        "claim_audit_model": audit.model,
+        "claim_audit_status": audit.status,
+        "citation_verification_status": "verified",
+    }
+
+
+def _qa_orchestration_role_trace(
+    *,
+    search_trace: dict[str, Any],
+    orchestration: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return a path-free explanation of the roles used for one QA answer."""
+
+    stage_statuses = {
+        str(stage.get("stage_id")): str(stage.get("status"))
+        for stage in ((search_trace.get("pipeline_trace") or {}).get("stages") or [])
+        if isinstance(stage, dict)
+    }
+    stage_to_role = {
+        "orchestrator": "completed",
+        "query_analyst": stage_statuses.get("query_analysis", "completed"),
+        "query_rewriter": stage_statuses.get("query_correction", "completed"),
+        "retrieval_guard": stage_statuses.get("hybrid_retrieval", "completed"),
+        "reranker": stage_statuses.get("rerank_filter", "completed"),
+        "context_builder": stage_statuses.get("context_build", "completed"),
+        "grounded_answerer": "completed",
+        "claim_auditor": str(orchestration.get("claim_audit_status") or "completed"),
+        "citation_verifier": str(orchestration.get("citation_verification_status") or "verified"),
+    }
+    role_stage_ids = {
+        "query_analyst": "query_analysis",
+        "query_rewriter": "query_correction",
+        "retrieval_guard": "hybrid_retrieval",
+        "reranker": "rerank_filter",
+        "context_builder": "context_build",
+        "grounded_answerer": "local_llm_answer",
+        "claim_auditor": "citation_verify",
+        "citation_verifier": "citation_verify",
+    }
+    trace: list[dict[str, Any]] = []
+    security_occurrence = 0
+    for role in workflow_roles("local_regulation_qa"):
+        phase = "pipeline"
+        stage_id = None
+        if role.role_id == "security_guard":
+            security_occurrence += 1
+            phase = "입력 범위 검사" if security_occurrence == 1 else "출력 보안 검사"
+            stage_id = "security_gate_input" if security_occurrence == 1 else "security_gate_output"
+            status = (
+                "completed"
+                if security_occurrence == 1
+                or str(orchestration.get("citation_verification_status") or "verified")
+                in {"verified", "abstained"}
+                else "blocked"
+            )
+        else:
+            status = stage_to_role.get(role.role_id, "completed")
+            stage_id = role_stage_ids.get(role.role_id)
+        trace.append(
+            {
+                "role_id": role.role_id,
+                "display_name": role.display_name,
+                "status": status,
+                "phase": phase,
+                "stage_id": stage_id,
+                "model_profile": role.model_profile,
+                "primary_model": role.primary_model,
+                "purpose": role.purpose,
+                "human_decision_required": role.kind == "human_gate",
+            }
+        )
+    return trace
+
+
+def _chat_answer(
+    backend: str,
+    settings: Settings,
+    query: str,
+    results: list[dict[str, Any]],
+    *,
+    history: list[dict[str, str]] | None = None,
+) -> str:
     if backend == "extractive":
         return _sanitize_rag_answer(_extractive_answer(query, results))
     if not results:
         return "승인된 규정 근거에서 확인할 수 없습니다."
     try:
-        answer = generate_local_llm_answer(settings=settings, query=query, evidence=results)
+        result = GroundedAnswerAgent(settings).run(
+            {
+                "query": query,
+                "evidence": results,
+                "backend": backend,
+                "history": history or [],
+                # Preserve the API's existing explicit 503 contract for a
+                # configured backend failure. The agent itself supports a
+                # safe extractive fallback for other callers.
+                "allow_fallback": False,
+            }
+        )
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Local LLM backend request failed: {type(exc).__name__}") from exc
-    if not answer:
-        return _sanitize_rag_answer(_extractive_answer(query, results))
-    return _sanitize_rag_answer(answer)
+    if result.get("status") == "unavailable":
+        raise HTTPException(status_code=503, detail="Local LLM backend request failed: backend unavailable")
+    verification = CitationVerifierAgent().run(
+        {
+            "answer": result.get("answer"),
+            "evidence": results,
+            "evidence_ids": result.get("evidence_ids") or [],
+        }
+    )
+    if verification.get("status") != "verified":
+        raise HTTPException(status_code=503, detail="Answer citation verification failed")
+    return _sanitize_rag_answer(str(verification.get("verified_answer") or ""))
 
 
 def _sanitize_rag_answer(answer: str) -> str:

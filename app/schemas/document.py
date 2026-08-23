@@ -55,6 +55,11 @@ class ProcessingJob(BaseModel):
     current_unit: int | None = None
     total_units: int | None = None
     unit_label: str | None = None
+    pipeline_id: str | None = None
+    stage_id: str | None = None
+    stage_number: int | None = None
+    stage_total: int | None = None
+    stage_status: Literal["pending", "running", "completed", "blocked", "failed"] = "pending"
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
     error: str | None = None

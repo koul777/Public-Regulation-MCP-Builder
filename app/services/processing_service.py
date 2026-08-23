@@ -14,7 +14,12 @@ from app.core.failure_classification import classify_processing_failure
 from app.core.pipeline import processing_options_payload
 from app.agents.review_executor import AgentReviewExecutor
 from app.agents.review_policy import AgentReviewPolicy
+from app.agents.local_structure_review import LocalStructureReviewAgent, apply_structure_review
+from app.agents.local_table_review import LocalTableReviewAgent, apply_table_review
 from app.parsers.factory import get_parser
+from app.parsers.base import ParserError
+from app.parsers.extraction_quality import build_extraction_quality_report
+from app.pipelines.definitions import PREPROCESSING_PIPELINE_ID, PipelineStageTracker, get_pipeline_definition
 from app.processors.chunker import Chunker
 from app.processors.exporter import Exporter
 from app.processors.kordoc_table_parser import KordocTableParser
@@ -144,6 +149,12 @@ class ProcessingService:
         )
         self.agent_review_policy = AgentReviewPolicy(self.settings)
         self.agent_review_executor = AgentReviewExecutor(self.settings)
+        self.local_structure_review = LocalStructureReviewAgent(
+            max_nodes=self.settings.local_structure_review_max_nodes
+        )
+        self.local_table_review = LocalTableReviewAgent(
+            max_tables=self.settings.local_structure_review_max_nodes
+        )
         self.exporter = Exporter()
 
     def process(
@@ -172,7 +183,64 @@ class ProcessingService:
             status="processing",
             progress=5,
             message="Processing started",
+            pipeline_id=PREPROCESSING_PIPELINE_ID,
+            stage_id="upload_admission",
+            stage_number=1,
+            stage_total=len(get_pipeline_definition(PREPROCESSING_PIPELINE_ID)),
+            stage_status="completed",
         )
+        pipeline_tracker = PipelineStageTracker(
+            PREPROCESSING_PIPELINE_ID,
+            tenant_id=document.tenant_id,
+        )
+        pipeline_tracker.start("upload_admission", detail={"source": "document.upload"})
+        pipeline_tracker.set_agent_role_status(
+            "upload_admission",
+            "security_guard",
+            status="completed",
+            detail={"decision": "accepted"},
+        )
+        pipeline_tracker.set_agent_role_status(
+            "upload_admission",
+            "intake_guard",
+            status="completed",
+            detail={"decision": "accepted"},
+        )
+        pipeline_tracker.complete("upload_admission")
+
+        def set_stage(stage_id: str, *, status: str, detail: dict | None = None) -> None:
+            if status == "running":
+                pipeline_tracker.start(stage_id, detail=detail)
+            elif status == "completed":
+                pipeline_tracker.complete(stage_id, detail=detail)
+            elif status == "blocked":
+                pipeline_tracker.block(stage_id, reason_code=str((detail or {}).get("reason_code") or "blocked"), detail=detail)
+            elif status == "failed":
+                pipeline_tracker.fail(stage_id, reason_code=str((detail or {}).get("reason_code") or "failed"), detail=detail)
+            else:
+                raise ValueError(f"Unsupported pipeline stage status: {status}")
+            spec = next(item for item in get_pipeline_definition(PREPROCESSING_PIPELINE_ID) if item.stage_id == stage_id)
+            job.pipeline_id = PREPROCESSING_PIPELINE_ID
+            job.stage_id = stage_id
+            job.stage_number = spec.order
+            job.stage_total = len(get_pipeline_definition(PREPROCESSING_PIPELINE_ID))
+            job.stage_status = status
+
+        def set_role_status(
+            stage_id: str,
+            role_id: str,
+            *,
+            status: str,
+            reason_code: str | None = None,
+            detail: dict | None = None,
+        ) -> None:
+            pipeline_tracker.set_agent_role_status(
+                stage_id,
+                role_id,
+                status=status,  # type: ignore[arg-type]
+                reason_code=reason_code,
+                detail=detail,
+            )
         processing_options = processing_options_payload(
             options,
             settings=self.settings,
@@ -220,6 +288,10 @@ class ProcessingService:
                 job.status = "completed"
                 job.progress = 100
                 job.message = "Processing skipped; reusable completed run exists"
+                job.stage_id = "export"
+                job.stage_number = 7
+                job.stage_total = 8
+                job.stage_status = "completed"
                 job.completed_at = datetime.now(timezone.utc)
                 self.repository.upsert_job(job)
                 self.repository.finish_processing_claim(
@@ -234,11 +306,57 @@ class ProcessingService:
             path = self.documents.path_for(document)
             job.progress = 15
             job.message = "원본 파일에서 텍스트를 추출하는 중"
+            set_stage("parse_extract", status="running", detail={"file_type": document.file_type})
+            set_role_status("parse_extract", "parser_extractor", status="running")
+            set_role_status("parse_extract", "ocr_extractor", status="pending")
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
             phase_started = time.perf_counter()
             parser = get_parser(path, settings=self.settings)
             parsed = parser.parse(path, document_id)
+            extraction_quality = build_extraction_quality_report(parsed)
+            set_role_status(
+                "parse_extract",
+                "parser_extractor",
+                status="completed",
+                detail={"status": extraction_quality.get("status")},
+            )
+            ocr_candidate = bool(
+                extraction_quality.get("missing_content_page_numbers")
+                or extraction_quality.get("image_block_count")
+                or extraction_quality.get("embedded_image_page_numbers")
+            )
+            set_role_status(
+                "parse_extract",
+                "ocr_extractor",
+                status="review_required" if ocr_candidate else "skipped",
+                reason_code="ocr_candidate_detected" if ocr_candidate else "no_ocr_candidate",
+                detail={
+                    "missing_content_page_count": len(
+                        extraction_quality.get("missing_content_page_numbers") or []
+                    ),
+                },
+            )
+            parsed = parsed.model_copy(
+                update={
+                    "metadata": {
+                        **parsed.metadata,
+                        "extraction_quality": extraction_quality,
+                    }
+                }
+            )
+            if not bool(extraction_quality.get("ready_for_normalization")):
+                set_stage(
+                    "parse_extract",
+                    status="blocked",
+                    detail={
+                        "reason_code": "extraction_not_ready_for_normalization",
+                        "extraction_status": extraction_quality.get("status"),
+                    },
+                )
+                raise ParserError(
+                    "Extraction produced no source text; normalization is blocked pending parser or OCR recovery."
+                )
             record_phase("native_parse", phase_started)
             # Kordoc can take a while on large integrated HWP books; expose this
             # separately so the operator does not mistake the wait for a hang.
@@ -366,9 +484,21 @@ class ProcessingService:
                     },
                 }
             )
+            set_stage(
+                "parse_extract",
+                status="completed",
+                detail={
+                    "page_count": parsed.page_count,
+                    "block_count": sum(len(page.blocks) for page in parsed.pages),
+                    "kordoc_table_count": kordoc_summary.get("table_count", 0),
+                    "extraction_status": extraction_quality.get("status"),
+                    "extraction_review_required": bool(extraction_quality.get("review_required")),
+                },
+            )
             record_phase("metadata_inference_and_staging", phase_started)
             job.progress = 35
             job.message = "텍스트 추출 완료 · 통합 규정 구조를 분석하는 중"
+            set_stage("normalize", status="running")
             self.repository.upsert_job(job)
             self._notify_progress(job, progress_callback)
 
@@ -400,13 +530,135 @@ class ProcessingService:
                 self._notify_progress(job, progress_callback)
 
             phase_started = time.perf_counter()
+            set_role_status("normalize", "normalizer", status="running")
             normalized = self.normalizer.normalize_document(
                 parsed,
                 progress_callback=lambda current, total: _structure_progress(
                     "normalize", current, total
                 ),
             )
+            set_role_status(
+                "normalize",
+                "normalizer",
+                status="completed",
+                detail={"page_count": normalized.page_count},
+            )
+            set_stage(
+                "normalize",
+                status="completed",
+                detail={"page_count": normalized.page_count, "raw_text_chars": len(normalized.raw_text or "")},
+            )
+            set_stage("structure_detect", status="running")
+            set_role_status("structure_detect", "structure_detector", status="running")
             nodes = self.detector.detect(normalized, progress_callback=_structure_progress)
+            set_role_status(
+                "structure_detect",
+                "structure_detector",
+                status="completed",
+                detail={"node_count": len(nodes)},
+            )
+            if self.settings.local_structure_review_enabled:
+                set_role_status("structure_detect", "structure_reviewer", status="running")
+                set_role_status("structure_detect", "table_reviewer", status="running")
+                structure_review_report = self.local_structure_review.review(nodes)
+                nodes = apply_structure_review(nodes, structure_review_report)
+                table_review_report = self.local_table_review.review(nodes)
+                nodes = apply_table_review(nodes, table_review_report)
+            else:
+                structure_review_report = None
+                table_review_report = None
+            for role_id, report, disabled_reason in (
+                ("structure_reviewer", structure_review_report, "local_structure_review_not_enabled"),
+                ("table_reviewer", table_review_report, "local_table_review_not_enabled"),
+            ):
+                if report is None:
+                    set_role_status(
+                        "structure_detect",
+                        role_id,
+                        status="skipped",
+                        reason_code=disabled_reason,
+                    )
+                else:
+                    set_role_status(
+                        "structure_detect",
+                        role_id,
+                        status=(
+                            "review_required"
+                            if report.status == "review_required"
+                            else "degraded"
+                            if report.status == "degraded"
+                            else "skipped"
+                            if report.status == "skipped"
+                            else "completed"
+                        ),
+                        reason_code=report.reason_code,
+                        detail={
+                            "candidate_count": report.candidate_count,
+                            "finding_count": len(report.findings),
+                            "model": report.model,
+                        },
+                    )
+            normalized = normalized.model_copy(
+                update={
+                    "metadata": {
+                        **dict(normalized.metadata or {}),
+                        "local_structure_review": (
+                            structure_review_report.model_dump(mode="json")
+                            if structure_review_report is not None
+                            else {
+                                "status": "disabled",
+                                "reason_code": "local_structure_review_not_enabled",
+                            }
+                        ),
+                        "local_table_review": (
+                            table_review_report.model_dump(mode="json")
+                            if table_review_report is not None
+                            else {
+                                "status": "disabled",
+                                "reason_code": "local_structure_review_not_enabled",
+                            }
+                        ),
+                    }
+                }
+            )
+            set_stage(
+                "structure_detect",
+                status="completed",
+                detail={
+                    "node_count": len(nodes),
+                    "regulation_count": sum(1 for node in nodes if node.node_type == "regulation"),
+                    "local_review_status": (
+                        structure_review_report.status
+                        if structure_review_report is not None
+                        else "disabled"
+                    ),
+                    "local_review_model": (
+                        structure_review_report.model
+                        if structure_review_report is not None
+                        else None
+                    ),
+                    "local_review_finding_count": (
+                        len(structure_review_report.findings)
+                        if structure_review_report is not None
+                        else 0
+                    ),
+                    "local_table_review_status": (
+                        table_review_report.status
+                        if table_review_report is not None
+                        else "disabled"
+                    ),
+                    "local_table_review_model": (
+                        table_review_report.model
+                        if table_review_report is not None
+                        else None
+                    ),
+                    "local_table_review_finding_count": (
+                        len(table_review_report.findings)
+                        if table_review_report is not None
+                        else 0
+                    ),
+                },
+            )
             record_phase("normalize_and_structure_detect", phase_started)
             regulation_nodes = [node for node in nodes if node.node_type == "regulation"]
             regulation_total = len(regulation_nodes)
@@ -431,6 +683,8 @@ class ProcessingService:
                 self._notify_progress(job, progress_callback)
 
             phase_started = time.perf_counter()
+            set_stage("chunk_generate", status="running")
+            set_role_status("chunk_generate", "chunk_builder", status="running")
             chunks = self.chunker.build_chunks(
                 nodes,
                 normalized,
@@ -439,6 +693,16 @@ class ProcessingService:
             )
             for chunk in chunks:
                 chunk.metadata = {**document_metadata, **dict(chunk.metadata or {})}
+            set_role_status(
+                "chunk_generate",
+                "chunk_builder",
+                status="completed",
+                detail={"chunk_count": len(chunks)},
+            )
+            set_stage("chunk_generate", status="completed", detail={"chunk_count": len(chunks)})
+            set_stage("quality_gate", status="running")
+            set_role_status("quality_gate", "quality_gate", status="running")
+            set_role_status("quality_gate", "human_approval_gate", status="pending")
             issues = self.validator.validate(nodes, chunks, document_id, options)
             quality_report = self.quality_gate.evaluate(
                 nodes,
@@ -449,7 +713,37 @@ class ProcessingService:
                 profile_id=document.profile_id,
                 normalizer_metadata=normalized.metadata,
             )
+            quality_report = quality_report.model_copy(
+                update={"extraction_metrics": extraction_quality}
+            )
             record_phase("chunk_validate_quality", phase_started)
+            quality_passed = bool(quality_report.passed)
+            set_role_status(
+                "quality_gate",
+                "quality_gate",
+                status="completed" if quality_passed else "review_required",
+                reason_code=None if quality_passed else "quality_review_required",
+                detail={
+                    "quality_score": quality_report.score,
+                    "issue_count": len(issues),
+                },
+            )
+            set_role_status(
+                "quality_gate",
+                "human_approval_gate",
+                status="pending" if quality_passed else "review_required",
+                reason_code="awaiting_human_approval",
+            )
+            set_stage(
+                "quality_gate",
+                status="completed",
+                detail={
+                    "quality_passed": bool(quality_report.passed),
+                    "quality_score": quality_report.score,
+                    "issue_count": len(issues),
+                    "review_required": not bool(quality_report.passed),
+                },
+            )
             job.progress = 75
             job.message = (
                 f"통합 규정집 {regulation_total}/{regulation_total} 구조화 완료 · 품질 검사 완료"
@@ -591,6 +885,8 @@ class ProcessingService:
                 self._notify_progress(job, progress_callback)
 
             phase_started = time.perf_counter()
+            set_stage("export", status="running")
+            set_role_status("export", "exporter", status="running")
             artifacts = self._write_exports(
                 document_id,
                 chunks,
@@ -599,6 +895,13 @@ class ProcessingService:
                 agent_review_plan,
                 progress_callback=_export_progress,
             )
+            set_role_status(
+                "export",
+                "exporter",
+                status="completed",
+                detail={"artifact_count": len(artifacts)},
+            )
+            set_stage("export", status="completed", detail={"artifact_count": len(artifacts)})
             record_phase("exports", phase_started)
             phase_timings_ms["total_before_terminal_commit"] = round(
                 (time.perf_counter() - started_perf) * 1000,
@@ -637,6 +940,7 @@ class ProcessingService:
                     quality_report,
                     agent_review_plan,
                     phase_timings_ms=phase_timings_ms,
+                    pipeline_trace=pipeline_tracker.snapshot(),
                 ),
                 artifacts=artifacts,
             )
@@ -657,6 +961,18 @@ class ProcessingService:
                 3,
             )
             failure = classify_processing_failure(exc, filename=document.filename)
+            current_stage = pipeline_tracker.snapshot().get("current_stage_id")
+            if current_stage:
+                try:
+                    set_stage(
+                        current_stage,
+                        status="failed",
+                        detail={"reason_code": failure.failure_category, "error_type": type(exc).__name__},
+                    )
+                except (ValueError, StopIteration):
+                    # A failure while recording the failure must not hide the
+                    # original processing error or prevent terminal journaling.
+                    pass
             if failure.ocr_page_count:
                 document.page_count = failure.ocr_page_count
             document.status = "failed"
@@ -679,6 +995,7 @@ class ProcessingService:
                 stats={
                     "failure": failure.as_row_fields(),
                     "phase_timings_ms": phase_timings_ms,
+                    "pipeline_trace": pipeline_tracker.snapshot(),
                 },
                 error=str(exc),
             )
@@ -816,6 +1133,7 @@ class ProcessingService:
         agent_review_plan: dict | None = None,
         *,
         phase_timings_ms: dict[str, float] | None = None,
+        pipeline_trace: dict | None = None,
     ) -> dict:
         agent_review_summary = dict(agent_review_plan or {})
         candidate_details = agent_review_summary.pop("candidates", None)
@@ -834,8 +1152,10 @@ class ProcessingService:
             "metadata_coverage": quality_report.metadata_coverage,
             "structure_metrics": quality_report.structure_metrics,
             "coverage_metrics": quality_report.coverage_metrics,
+            "extraction_metrics": quality_report.extraction_metrics,
             "agent_review": agent_review_summary,
             "phase_timings_ms": dict(phase_timings_ms or {}),
+            "pipeline_trace": dict(pipeline_trace or {}),
         }
 
     def _agent_review_cache_index(

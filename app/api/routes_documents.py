@@ -35,6 +35,7 @@ from app.core.input_limits import (
 from app.core.institution_profiles import apply_institution_profile_to_metadata, load_institution_profile_registry
 from app.core.tenant_access import resource_visible_to_tenant, settings_for_tenant, tenant_storage_key
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, embed_vector_records
+from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import (
     APPROVED_CHUNK_STATUS,
     approval_provenance_issue_fields,
@@ -49,6 +50,7 @@ from app.ingestion.vector_upsert import (
     vector_upsert_target,
 )
 from app.parsers.base import ParserError
+from app.pipelines.definitions import PREPROCESSING_PIPELINE_ID, PipelineStageTracker
 from app.processors.exporter import Exporter
 from app.schemas.chunk import Chunk, ChunkOptions
 from app.schemas.document import Document
@@ -233,8 +235,17 @@ class MergeChunksRequest(BaseModel):
 class IndexRequest(BaseModel):
     target_type: str = Field(default="local-jsonl", max_length=MAX_SHORT_LABEL_CHARS)
     embedding_dimensions: int = Field(default=384, ge=1, le=4096)
+    embedding_model: str = Field(default=LOCAL_HASH_EMBEDDING_MODEL, max_length=160)
     dry_run: bool = False
     collection_name: str | None = Field(default=None, max_length=MAX_SHORT_LABEL_CHARS)
+
+    @field_validator("embedding_model")
+    @classmethod
+    def validate_embedding_model(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if normalized not in {LOCAL_HASH_EMBEDDING_MODEL, QWEN3_EMBEDDING_MODEL}:
+            raise ValueError("embedding_model must be an approved local embedding model")
+        return normalized
 
 
 class SecurityScanRequest(BaseModel):
@@ -855,40 +866,71 @@ def _run_document_indexing(
     document = repository.get_document(document_id)
     if document is None:
         raise HTTPException(status_code=404, detail=f"Document not found: {document_id}")
-    chunks = chunks if chunks is not None else _load_review_chunks(repository, document_id)
     target_type = _safe_secure_rag_target_type(request.target_type)
-    prepared_chunks = _chunks_for_indexing(chunks, document, auth)
-    _require_approval_journal_records(repository, document_id=document_id, chunks=chunks, auth=auth)
-    timing_ms["load_validate"] = round((time.perf_counter() - step_started) * 1000, 3)
-    step_started = time.perf_counter()
-    records, vector_summary = build_vector_records(prepared_chunks)
-    validate_vector_record_tenant_scope(records, expected_tenant_id=auth.tenant_id)
-    if not records and action not in {"reindex", "review_vector_sync"}:
-        raise HTTPException(status_code=400, detail="No approved chunks are available for indexing.")
-    timing_ms["vector_record_build"] = round((time.perf_counter() - step_started) * 1000, 3)
-
-    step_started = time.perf_counter()
-    embedded_records, embedding_summary = embed_vector_records(
-        records,
-        dimensions=request.embedding_dimensions,
-        model=LOCAL_HASH_EMBEDDING_MODEL,
+    pipeline_tracker = PipelineStageTracker(
+        PREPROCESSING_PIPELINE_ID,
+        tenant_id=auth.tenant_id,
     )
-    timing_ms["embedding"] = round((time.perf_counter() - step_started) * 1000, 3)
-    step_started = time.perf_counter()
-    target_path = _default_vector_target_path(settings, auth, target_type)
-    validate_vector_target_tenant_scope(target_type, target_path, expected_tenant_id=auth.tenant_id)
-    target = vector_upsert_target(target_type, target_path=target_path, collection_name=request.collection_name)
-    upsert_summary = target.upsert(embedded_records, dry_run=request.dry_run, fail_on_leak=True, document_id=document_id)
-    timing_ms["shared_store_upsert"] = round((time.perf_counter() - step_started) * 1000, 3)
+    pipeline_tracker.start(
+        "vector_index",
+        detail={
+            "action": action,
+            "target_type": target_type,
+            "dry_run": request.dry_run,
+        },
+    )
+    chunks = chunks if chunks is not None else _load_review_chunks(repository, document_id)
+    try:
+        prepared_chunks = _chunks_for_indexing(chunks, document, auth)
+        _require_approval_journal_records(repository, document_id=document_id, chunks=chunks, auth=auth)
+        timing_ms["load_validate"] = round((time.perf_counter() - step_started) * 1000, 3)
+        step_started = time.perf_counter()
+        records, vector_summary = build_vector_records(prepared_chunks)
+        validate_vector_record_tenant_scope(records, expected_tenant_id=auth.tenant_id)
+        if not records and action not in {"reindex", "review_vector_sync"}:
+            raise HTTPException(status_code=400, detail="No approved chunks are available for indexing.")
+        timing_ms["vector_record_build"] = round((time.perf_counter() - step_started) * 1000, 3)
 
-    step_started = time.perf_counter()
-    artifact_dir = _vector_artifact_dir(settings, document_id)
-    records_jsonl = artifact_dir / "vector_records.jsonl"
-    embedded_jsonl = artifact_dir / "embedded_records.jsonl"
-    _write_jsonl(records_jsonl, records)
-    _write_jsonl(embedded_jsonl, embedded_records)
-    timing_ms["artifact_write"] = round((time.perf_counter() - step_started) * 1000, 3)
-    timing_ms["total_before_journal"] = round((time.perf_counter() - indexing_started) * 1000, 3)
+        step_started = time.perf_counter()
+        embedded_records, embedding_summary = embed_vector_records(
+            records,
+            dimensions=request.embedding_dimensions,
+            model=request.embedding_model,
+        )
+        timing_ms["embedding"] = round((time.perf_counter() - step_started) * 1000, 3)
+        step_started = time.perf_counter()
+        target_path = _default_vector_target_path(settings, auth, target_type)
+        validate_vector_target_tenant_scope(target_type, target_path, expected_tenant_id=auth.tenant_id)
+        target = vector_upsert_target(target_type, target_path=target_path, collection_name=request.collection_name)
+        upsert_summary = target.upsert(embedded_records, dry_run=request.dry_run, fail_on_leak=True, document_id=document_id)
+        timing_ms["shared_store_upsert"] = round((time.perf_counter() - step_started) * 1000, 3)
+
+        step_started = time.perf_counter()
+        artifact_dir = _vector_artifact_dir(settings, document_id)
+        records_jsonl = artifact_dir / "vector_records.jsonl"
+        embedded_jsonl = artifact_dir / "embedded_records.jsonl"
+        _write_jsonl(records_jsonl, records)
+        _write_jsonl(embedded_jsonl, embedded_records)
+        timing_ms["artifact_write"] = round((time.perf_counter() - step_started) * 1000, 3)
+        timing_ms["total_before_journal"] = round((time.perf_counter() - indexing_started) * 1000, 3)
+        pipeline_tracker.complete(
+            "vector_index",
+            detail={
+                "record_count": len(records),
+                "embedded_record_count": len(embedded_records),
+                "status": "dry_run" if request.dry_run else "indexed",
+            },
+        )
+    except Exception as exc:
+        try:
+            pipeline_tracker.fail(
+                "vector_index",
+                reason_code=type(exc).__name__,
+                detail={"error_type": type(exc).__name__},
+            )
+        except ValueError:
+            pass
+        raise
 
     timestamp = datetime.now(timezone.utc).isoformat()
     indexing_job = {
@@ -897,6 +939,11 @@ def _run_document_indexing(
         "tenant_id": auth.tenant_id,
         "action": action,
         "status": "not_indexed" if request.dry_run else "indexed",
+        "pipeline_id": PREPROCESSING_PIPELINE_ID,
+        "pipeline_stage_id": "vector_index",
+        "pipeline_stage_number": 8,
+        "pipeline_stage_total": 8,
+        "pipeline_stage_status": "pending" if request.dry_run else "completed",
         "created_at": timestamp,
         "completed_at": timestamp,
         "requested_by": auth.actor,
@@ -904,11 +951,12 @@ def _run_document_indexing(
         "collection_name": request.collection_name or "",
         "dry_run": request.dry_run,
         "record_count": len(records),
-        "embedding_model": LOCAL_HASH_EMBEDDING_MODEL,
+        "embedding_model": request.embedding_model,
         "embedding_dimensions": request.embedding_dimensions,
         "vector_summary": vector_summary,
         "embedding_summary": embedding_summary,
         "timing_ms": timing_ms,
+        "pipeline_trace": pipeline_tracker.snapshot(),
         "upsert_summary": _public_upsert_summary(upsert_summary),
         "artifacts": {
             "vector_records_jsonl": records_jsonl.name,
@@ -994,7 +1042,7 @@ def index_documents_batch(
             embedded_records, embedding_summary = embed_vector_records(
                 records,
                 dimensions=request.embedding_dimensions,
-                model=LOCAL_HASH_EMBEDDING_MODEL,
+                model=request.embedding_model,
             )
             prepared_items[document_id] = {
                 "records": records,
@@ -1045,6 +1093,11 @@ def index_documents_batch(
                 "tenant_id": auth.tenant_id,
                 "action": "batch_index",
                 "status": "not_indexed" if request.dry_run else "indexed",
+                "pipeline_id": PREPROCESSING_PIPELINE_ID,
+                "pipeline_stage_id": "vector_index",
+                "pipeline_stage_number": 8,
+                "pipeline_stage_total": 8,
+                "pipeline_stage_status": "pending" if request.dry_run else "completed",
                 "created_at": timestamp,
                 "completed_at": timestamp,
                 "requested_by": auth.actor,
@@ -1052,7 +1105,7 @@ def index_documents_batch(
                 "collection_name": request.collection_name or "",
                 "dry_run": request.dry_run,
                 "record_count": len(item["records"]),
-                "embedding_model": LOCAL_HASH_EMBEDDING_MODEL,
+                "embedding_model": request.embedding_model,
                 "embedding_dimensions": request.embedding_dimensions,
                 "vector_sync_batch_id": normalized_sync_batch_ids.get(document_id, ""),
                 "vector_summary": item["vector_summary"],
@@ -1527,6 +1580,7 @@ def _sync_vector_index_after_review_change(
         request = IndexRequest(
             target_type=str(latest_job.get("target_type") or "local-jsonl"),
             embedding_dimensions=_indexed_job_embedding_dimensions(latest_job),
+            embedding_model=_indexed_job_embedding_model(latest_job),
             collection_name=str(latest_job.get("collection_name") or "") or None,
         )
     return _run_document_indexing(
@@ -1604,6 +1658,13 @@ def _indexed_job_embedding_dimensions(job: dict) -> int:
     except (TypeError, ValueError):
         dimensions = 384
     return max(1, min(4096, dimensions))
+
+
+def _indexed_job_embedding_model(job: dict) -> str:
+    model = str(job.get("embedding_model") or LOCAL_HASH_EMBEDDING_MODEL).strip()
+    if model not in {LOCAL_HASH_EMBEDDING_MODEL, QWEN3_EMBEDDING_MODEL}:
+        return LOCAL_HASH_EMBEDDING_MODEL
+    return model
 
 
 @router.post("")

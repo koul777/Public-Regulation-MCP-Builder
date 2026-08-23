@@ -565,8 +565,16 @@ class RoutesRagTests(unittest.TestCase):
         self.assertEqual(external_search["results"][0]["parser_uncertainty_risk_level"], "medium")
         self.assertEqual(external_chat["citations"][0]["parser_uncertainty_flags"], ["ocr_text_extracted"])
         self.assertGreaterEqual(len(traces), 2)
-        self.assertTrue(any(trace.get("embedding_model") == "kiwi-bm25-v1" for trace in traces))
+        self.assertTrue(
+            any(
+                trace.get("retrieval_model") in {"kiwi-bm25-v1", "hybrid-bm25-hash-v1"}
+                for trace in traces
+            )
+        )
         search_trace = next(trace for trace in traces if trace.get("action") == "search")
+        search_pipeline = search_trace.get("pipeline_trace")
+        self.assertEqual("local_regulation_qa_v1", search_pipeline.get("pipeline_id"))
+        self.assertEqual(5, len(search_pipeline.get("stages") or []))
         timing = search_trace.get("timing_ms")
         self.assertIsInstance(timing, dict)
         for field in (
@@ -1004,6 +1012,9 @@ class RoutesRagTests(unittest.TestCase):
                 routes_rag,
                 "generate_local_llm_answer",
                 return_value=unsafe_answer,
+            ), patch("app.agents.grounded_answer_agent.local_llm_available", return_value=True), patch(
+                "app.agents.grounded_answer_agent.generate_local_llm_answer",
+                return_value=unsafe_answer,
             ):
                 routes_documents.approve_review_chunks(
                     "doc_output_filter",
@@ -1080,6 +1091,9 @@ class RoutesRagTests(unittest.TestCase):
             ), patch.object(routes_rag, "local_llm_available", return_value=True), patch.object(
                 routes_rag,
                 "generate_local_llm_answer",
+                side_effect=ConnectionError("backend down"),
+            ), patch("app.agents.grounded_answer_agent.local_llm_available", return_value=True), patch(
+                "app.agents.grounded_answer_agent.generate_local_llm_answer",
                 side_effect=ConnectionError("backend down"),
             ):
                 routes_documents.approve_review_chunks(

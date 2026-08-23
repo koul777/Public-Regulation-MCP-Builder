@@ -12,6 +12,7 @@ from app.api.routes_institutions import router as institutions_router
 from app.api.routes_exports import router as exports_router
 from app.api.routes_jobs import router as jobs_router
 from app.api.routes_rag import router as rag_router
+from app.api.routes_pipelines import router as pipelines_router
 from app.core.api_audit import api_audit_path
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
@@ -40,6 +41,7 @@ app.include_router(institutions_router)
 app.include_router(jobs_router)
 app.include_router(exports_router)
 app.include_router(rag_router)
+app.include_router(pipelines_router)
 
 
 @app.get("/health")
