@@ -43,6 +43,7 @@ _STAGE_LABELS = {
     "context_build": "3/5 답변에 사용할 근거를 정리하고 있습니다.",
     "answer_generation": "4/5 Qwen3 8B가 근거 안에서 답변을 만들고 있습니다.",
     "claim_audit": "4/5 답변의 근거 연결을 확인하고 있습니다.",
+    "deterministic_audit": "4/5 답변과 승인 근거의 연결을 빠르게 확인하고 있습니다.",
     "fallback_answer": "4/5 확인 가능한 근거만 남겨 답변을 다듬고 있습니다.",
     "citation_verify": "5/5 답변과 인용 조항을 마지막으로 확인하고 있습니다.",
     "completed": "답변과 인용 확인을 마쳤습니다.",
@@ -310,6 +311,7 @@ def build_chat_request(
     document_id: str,
     profile_id: str,
     top_k: int = 5,
+    precise_claim_audit: bool = False,
 ) -> RagChatRequest:
     normalized_document_id = str(document_id or "").strip()
     normalized_profile_id = normalize_profile_id(profile_id)
@@ -335,6 +337,10 @@ def build_chat_request(
         # query analysis, grounded answering, claim audit, citation verification,
         # and their existing deterministic/extractive fallback behavior.
         orchestration_mode="auto",
+        # Match the MCP-style low-latency approved-index lookup. Qwen3 8B and
+        # the 4B claim audit still run after deterministic retrieval.
+        retrieval_mode="fast",
+        claim_audit_mode="model" if precise_claim_audit else "deterministic",
     )
 
 
@@ -706,6 +712,14 @@ def main() -> None:
             st.rerun()
     with scope_column:
         top_k = st.slider("답변에 참고할 승인 조항 수", min_value=1, max_value=10, value=5)
+        precise_claim_audit = st.toggle(
+            "Qwen3 4B 정밀 근거 감사",
+            value=False,
+            help=(
+                "끄면 MCP와 비슷한 빠른 검색·결정론적 인용 검증을 사용합니다. "
+                "켜면 답변 뒤에 Qwen3 4B 의미 감사를 추가해 더 오래 걸릴 수 있습니다."
+            ),
+        )
 
     for message in messages:
         role = str(message.get("role") or "assistant")
@@ -728,6 +742,7 @@ def main() -> None:
         document_id=selected_document_id,
         profile_id=selected_profile_id,
         top_k=top_k,
+        precise_claim_audit=precise_claim_audit,
     )
     messages.append({"role": "user", "content": question})
     with st.chat_message("user"):

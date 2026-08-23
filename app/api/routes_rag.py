@@ -44,7 +44,7 @@ from app.core.security import (
 from app.core.tenant_access import resource_visible_to_tenant, settings_for_tenant, tenant_storage_key
 from app.agents.citation_verifier import CitationVerifierAgent
 from app.agents.claim_auditor import ClaimAuditAgent
-from app.agents.grounded_qa import GroundedQwenAnswerAgent
+from app.agents.grounded_qa import GroundedAnswerDraft, GroundedQwenAnswerAgent
 from app.agents.grounded_answer_agent import GroundedAnswerAgent
 from app.agents.model_router import (
     QWEN3_ANSWER_MODEL,
@@ -65,7 +65,7 @@ from app.ingestion.vector_adapter import APPROVED_CHUNK_STATUS, stable_content_h
 from app.ingestion.vector_integrity import embedded_vector_integrity_reason
 from app.ingestion.vector_upsert import validate_vector_records
 from app.rag.local_llm import generate_local_llm_answer, local_llm_available, probe_local_llm
-from app.rag.context_builder import ContextBuilder
+from app.rag.context_builder import ContextBuilder, GroundingContext
 from app.rag.output_filter import sanitize_rag_answer
 from app.rag.extractive_answer import build_structured_extractive_answer
 from app.pipelines.definitions import LOCAL_QA_PIPELINE_ID, PipelineStageTracker
@@ -213,6 +213,7 @@ class RagSearchRequest(BaseModel):
     metadata_profile: str = Field(default="full", max_length=20)
     as_of_date: str | None = Field(default=None, max_length=20)
     orchestration_mode: Literal["auto", "legacy", "multi_model"] = "auto"
+    retrieval_mode: Literal["auto", "fast"] = "auto"
 
 
 class RagChatMessage(BaseModel):
@@ -223,6 +224,7 @@ class RagChatMessage(BaseModel):
 class RagChatRequest(RagSearchRequest):
     llm_backend: str | None = Field(default=None, max_length=40)
     history: list[RagChatMessage] = Field(default_factory=list, max_length=12)
+    claim_audit_mode: Literal["model", "deterministic"] = "model"
 
 
 class RagFeedbackRequest(BaseModel):
@@ -267,6 +269,8 @@ def search_rag_records(
     lifecycle_complete = sum(1 for record in visible_records if _has_complete_lifecycle_metadata(record))
     timing_ms["visibility_filter_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     multi_model = _use_multi_model_orchestration(request, settings)
+    fast_retrieval = request.retrieval_mode == "fast"
+    multi_model_retrieval = multi_model and not fast_retrieval
     deterministic_analysis = deterministic_query_analysis(request.query)
     exact_locator_fast_path = bool(
         request.document_id and _is_exact_article_locator_query(deterministic_analysis)
@@ -304,7 +308,7 @@ def search_rag_records(
             34,
             "선택한 규정에서 조문 번호가 정확히 일치하는 승인 조항을 확인하는 중",
         )
-    elif multi_model:
+    elif multi_model_retrieval:
         step_started_at = time.perf_counter()
         _emit_rag_chat_progress(
             "query_analysis",
@@ -351,11 +355,12 @@ def search_rag_records(
             settings=settings,
             auth=auth,
             all_records=records,
+            semantic_query_enabled=not fast_retrieval,
         )
     timing_ms["scoring_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     reranker_status = "not_requested"
     reranker_reason = ""
-    if multi_model and scored and not exact_locator_fast_path:
+    if multi_model_retrieval and scored and not exact_locator_fast_path:
         step_started_at = time.perf_counter()
         try:
             local_reranker_path = Path("data/semantic_runtime_models/qwen3-reranker-0.6b")
@@ -387,7 +392,7 @@ def search_rag_records(
                 "deterministic_exact_locator"
                 if exact_locator_fast_path
                 else QWEN3_RERANKER_MODEL
-                if multi_model
+                if multi_model_retrieval
                 else "deterministic_structured_boosts"
             ),
             "reranker_status": reranker_status,
@@ -504,8 +509,13 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
         backend = _chat_backend(request, request_settings)
         execution_settings = replace(request_settings, rag_llm_backend=backend)
         chat_history = _chat_history_payload(request.history)
-        contextualized_query = _contextualized_chat_query(request.query, chat_history)
-        search_request = request.model_copy(update={"query": contextualized_query})
+        _validate_chat_history_policy(chat_history)
+        search_query = _chat_search_query(
+            request.query,
+            chat_history,
+            document_id=request.document_id,
+        )
+        search_request = request.model_copy(update={"query": search_query})
         results, search_trace = search_rag_records(search_request, auth, execution_settings)
         _emit_rag_chat_progress(
             "context_build",
@@ -530,6 +540,7 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                 request.query,
                 results,
                 history=chat_history,
+                use_model_claim_audit=request.claim_audit_mode == "model",
             )
             answer = str(orchestrated["answer"])
             citations = list(orchestrated["citations"])
@@ -589,12 +600,18 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                 "completed"
                 if orchestrated and orchestrated.get("claim_audit_status") == "verified"
                 else "skipped"
+                if orchestrated
+                and str(orchestrated.get("claim_audit_status") or "").startswith("deterministic_")
+                else "skipped"
                 if not orchestrated
                 else "degraded"
             ),
             reason_code=(
                 None
                 if orchestrated and orchestrated.get("claim_audit_status") == "verified"
+                else "deterministic_fast_chat"
+                if orchestrated
+                and str(orchestrated.get("claim_audit_status") or "").startswith("deterministic_")
                 else "legacy_answer_path"
                 if not orchestrated
                 else str(orchestrated.get("claim_audit_status") or "claim_audit_not_verified")
@@ -629,7 +646,7 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                 "multi_model_orchestration": multi_model,
                 "claim_audit_status": (orchestrated or {}).get("claim_audit_status"),
                 "history_message_count": len(chat_history),
-                "contextualized_search": contextualized_query != request.query,
+                "contextualized_search": search_query != request.query,
                 "pipeline_trace": qa_tracker.snapshot(),
             },
         )
@@ -655,7 +672,7 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
             "citations": citations,
             "conversation": {
                 "history_message_count": len(chat_history),
-                "contextualized_search": contextualized_query != request.query,
+                "contextualized_search": search_query != request.query,
             },
             "orchestration": (
                 {
@@ -2113,6 +2130,7 @@ def _score_records_for_queries(
     settings: Settings,
     auth: AuthContext,
     all_records: list[dict[str, Any]] | None = None,
+    semantic_query_enabled: bool = True,
 ) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
     normalized = list(dict.fromkeys(" ".join(str(query or "").split()) for query in queries))
     normalized = [query for query in normalized if query][:8]
@@ -2125,6 +2143,7 @@ def _score_records_for_queries(
             settings=settings,
             auth=auth,
             all_records=all_records,
+            semantic_query_enabled=semantic_query_enabled,
         )
     by_id = {
         str(record.get("id") or record.get("chunk_id") or f"record-{index}"): record
@@ -2140,6 +2159,7 @@ def _score_records_for_queries(
             settings=settings,
             auth=auth,
             all_records=all_records,
+            semantic_query_enabled=semantic_query_enabled,
         )
         if query_index == 0:
             primary_metadata = dict(metadata)
@@ -2172,6 +2192,7 @@ def _score_records(
     settings: Settings,
     auth: AuthContext,
     all_records: list[dict[str, Any]] | None = None,
+    semantic_query_enabled: bool = True,
 ) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
     vector_path = _local_vector_path(settings, auth)
     index_path = default_bm25_index_path(vector_path)
@@ -2198,6 +2219,7 @@ def _score_records(
         len(records),
         index_records=index_records,
         index_source_content_hashes=index_source_hash,
+        prefer_semantic=semantic_query_enabled,
     )
 
 
@@ -2740,12 +2762,34 @@ def _contextualized_chat_query(query: str, history: list[dict[str, str]]) -> str
     return f"{header}{previous_block[:history_budget]}{suffix}"
 
 
+def _validate_chat_history_policy(history: list[dict[str, str]]) -> None:
+    """Apply the input policy to every untrusted history item sent by the client."""
+
+    for message in history:
+        _validate_query_policy(str(message.get("content") or ""))
+
+
+def _chat_search_query(
+    query: str,
+    history: list[dict[str, str]],
+    *,
+    document_id: str | None,
+) -> str:
+    """Keep self-contained exact article requests independent from old turns."""
+
+    current = " ".join(str(query or "").split())
+    if document_id and _is_exact_article_locator_query(deterministic_query_analysis(current)):
+        return current
+    return _contextualized_chat_query(current, history)
+
+
 def _orchestrated_chat_answer(
     settings: Settings,
     query: str,
     results: list[dict[str, Any]],
     *,
     history: list[dict[str, str]] | None = None,
+    use_model_claim_audit: bool = True,
 ) -> dict[str, Any]:
     try:
         _emit_rag_chat_progress(
@@ -2760,12 +2804,29 @@ def _orchestrated_chat_answer(
             55,
             "Qwen3 8B가 승인된 근거만 읽어 답변을 작성하는 중",
         )
-        draft = GroundedQwenAnswerAgent(runtime).answer(
-            query=query,
-            context=context,
-            history=history,
-            strict_model=True,
+        answer_agent = GroundedQwenAnswerAgent(runtime)
+        draft = (
+            answer_agent.answer(
+                query=query,
+                context=context,
+                history=history,
+                strict_model=True,
+            )
+            if use_model_claim_audit
+            else answer_agent.answer_fast(
+                query=query,
+                context=context,
+                history=history,
+                strict_model=False,
+            )
         )
+        if not use_model_claim_audit:
+            _emit_rag_chat_progress(
+                "deterministic_audit",
+                76,
+                "답변의 근거 ID와 승인 인용을 빠르게 검증하는 중",
+            )
+            return _deterministic_chat_draft_verification(draft, context, results)
         _emit_rag_chat_progress(
             "claim_audit",
             76,
@@ -2897,6 +2958,72 @@ def _orchestrated_chat_answer(
     }
 
 
+def _deterministic_chat_draft_verification(
+    draft: GroundedAnswerDraft,
+    context: GroundingContext,
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Verify fast-chat evidence identity without loading a second Ollama model."""
+
+    _emit_rag_chat_progress(
+        "citation_verify",
+        90,
+        "답변에 연결된 승인 조항과 공개 인용을 최종 확인하는 중",
+    )
+    if draft.abstained:
+        return {
+            "answer": _sanitize_rag_answer(draft.answer),
+            "citations": [],
+            "answer_model": draft.model,
+            "answer_mode": draft.answer_mode,
+            "claim_count": 0,
+            "claim_audit_model": None,
+            "claim_audit_status": "deterministic_abstained",
+            "citation_verification_status": "abstained",
+        }
+
+    context_by_id = {item.context_id: item for item in context.items}
+    supporting_context_ids = {
+        context_id
+        for claim in draft.claims
+        for context_id in claim.evidence_context_ids
+    }
+    requested_evidence_ids = list(
+        dict.fromkeys(
+            evidence_id
+            for context_id in supporting_context_ids
+            for evidence_id in context_by_id[context_id].evidence_ids
+        )
+    )
+    requested_set = set(requested_evidence_ids)
+    supporting_results = [
+        result
+        for result in results
+        if str(result.get("chunk_id") or result.get("document_id") or "") in requested_set
+    ]
+    verification = CitationVerifierAgent().run(
+        {
+            "answer": draft.answer,
+            "evidence": supporting_results,
+            "evidence_ids": requested_evidence_ids,
+        }
+    )
+    if verification.get("status") != "verified":
+        raise HTTPException(status_code=503, detail="Fast chat evidence identity verification failed")
+    return {
+        "answer": _sanitize_rag_answer(
+            str(verification.get("verified_answer") or draft.answer)
+        ),
+        "citations": list(verification.get("citations") or []),
+        "answer_model": draft.model,
+        "answer_mode": draft.answer_mode,
+        "claim_count": len(draft.claims),
+        "claim_audit_model": None,
+        "claim_audit_status": "deterministic_identity_verified",
+        "citation_verification_status": "verified",
+    }
+
+
 def _qa_orchestration_role_trace(
     *,
     search_trace: dict[str, Any],
@@ -2917,7 +3044,11 @@ def _qa_orchestration_role_trace(
         "reranker": stage_statuses.get("rerank_filter", "completed"),
         "context_builder": stage_statuses.get("context_build", "completed"),
         "grounded_answerer": "completed",
-        "claim_auditor": str(orchestration.get("claim_audit_status") or "completed"),
+        "claim_auditor": (
+            "skipped"
+            if str(orchestration.get("claim_audit_status") or "").startswith("deterministic_")
+            else str(orchestration.get("claim_audit_status") or "completed")
+        ),
         "citation_verifier": str(orchestration.get("citation_verification_status") or "verified"),
     }
     role_stage_ids = {

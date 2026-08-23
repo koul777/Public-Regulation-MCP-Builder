@@ -98,6 +98,33 @@ class SemanticModelTests(unittest.TestCase):
         self.assertEqual("doc:a", scored[0][1]["id"])
         adapter.assert_called_once_with(2)
 
+    @patch("app.retrieval.searcher._semantic_query_adapter")
+    def test_fast_search_uses_bm25_without_loading_query_embedding(self, adapter) -> None:
+        records = [
+            {
+                "id": "doc:a",
+                "document_id": "doc",
+                "chunk_id": "a",
+                "text": "휴가 신청 절차",
+                "embedding": [1.0, 0.0],
+                "embedding_model": QWEN3_EMBEDDING_MODEL,
+                "metadata": {"approval_status": "approved", "article_no": "제5조"},
+            }
+        ]
+        index = Bm25Index.build(records)
+
+        scored, metadata = search(
+            "휴가 신청",
+            records,
+            index,
+            top_k=1,
+            prefer_semantic=False,
+        )
+
+        self.assertEqual("doc:a", scored[0][1]["id"])
+        self.assertEqual(BM25_RETRIEVAL_MODEL, metadata["retrieval_model"])
+        adapter.assert_not_called()
+
     @patch("app.retrieval.searcher.semantic_runtime_available", return_value=False)
     def test_qwen_semantic_records_fall_back_to_bm25_when_runtime_is_missing(self, _available) -> None:
         records = [

@@ -201,8 +201,19 @@ class QwenChatSecurityAndGateTests(unittest.TestCase):
         self.assertEqual("profile-a", request.profile_id)
         self.assertEqual("ollama", request.llm_backend)
         self.assertEqual("auto", request.orchestration_mode)
+        self.assertEqual("fast", request.retrieval_mode)
+        self.assertEqual("deterministic", request.claim_audit_mode)
         self.assertEqual(4, request.top_k)
         self.assertEqual(1, len(request.history))
+
+        precise = build_chat_request(
+            question="적용 범위는 무엇인가요?",
+            messages=[],
+            document_id="doc-1",
+            profile_id="Profile-A",
+            precise_claim_audit=True,
+        )
+        self.assertEqual("model", precise.claim_audit_mode)
 
     def test_worker_runs_without_blocking_caller_and_captures_result(self) -> None:
         request = build_chat_request(

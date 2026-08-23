@@ -12,11 +12,13 @@ class _Runtime:
     def __init__(self, payload: dict, *, available: bool = True) -> None:
         self.payload = payload
         self.available = available
+        self.last_kwargs: dict = {}
 
     def model_available(self, model: str) -> bool:
         return self.available
 
     def generate_json(self, **kwargs):
+        self.last_kwargs = dict(kwargs)
         return self.payload, SimpleNamespace(duration_ms=21.0)
 
 
@@ -92,6 +94,63 @@ class GroundedQATests(unittest.TestCase):
         )
 
         result = GroundedQwenAnswerAgent(runtime=runtime).answer(
+            query="질문",
+            context=_context(),
+        )
+
+        self.assertEqual("grounded_extractive", result.answer_mode)
+        self.assertEqual("model_ValueError", result.fallback_reason)
+
+    def test_fast_qwen_answer_uses_compact_schema_and_known_evidence(self) -> None:
+        runtime = _Runtime(
+            {
+                "answer": "접근권한은 분기마다 검토합니다. [E1]",
+                "evidence_context_ids": ["E1"],
+                "abstained": False,
+            }
+        )
+
+        result = GroundedQwenAnswerAgent(runtime=runtime).answer_fast(
+            query="접근권한은 언제 검토하나요?",
+            context=_context(),
+        )
+
+        self.assertEqual("grounded_local", result.answer_mode)
+        self.assertEqual(("E1",), result.claims[0].evidence_context_ids)
+        self.assertEqual(420, runtime.last_kwargs["max_output_tokens"])
+        schema_properties = runtime.last_kwargs["schema"]["properties"]
+        self.assertEqual(
+            {"answer", "evidence_context_ids", "abstained"},
+            set(schema_properties),
+        )
+
+    def test_fast_qwen_abstention_never_returns_model_authored_claims(self) -> None:
+        runtime = _Runtime(
+            {
+                "answer": "근거 없이 단정한 내용입니다.",
+                "evidence_context_ids": [],
+                "abstained": True,
+            }
+        )
+
+        result = GroundedQwenAnswerAgent(runtime=runtime).answer_fast(
+            query="질문",
+            context=_context(),
+        )
+
+        self.assertTrue(result.abstained)
+        self.assertEqual("승인된 규정 근거에서 확인할 수 없습니다.", result.answer)
+
+    def test_fast_qwen_answer_rejects_undeclared_evidence_markers(self) -> None:
+        runtime = _Runtime(
+            {
+                "answer": "검토 주기는 분기입니다. [E1] 추가 근거 [E9]",
+                "evidence_context_ids": ["E1"],
+                "abstained": False,
+            }
+        )
+
+        result = GroundedQwenAnswerAgent(runtime=runtime).answer_fast(
             query="질문",
             context=_context(),
         )

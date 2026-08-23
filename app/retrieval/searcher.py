@@ -101,6 +101,7 @@ def search(
     *,
     index_records: list[dict[str, Any]] | None = None,
     index_source_content_hashes: str | None = None,
+    prefer_semantic: bool = True,
 ) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
     candidate_context = _build_structured_query_context(
         query,
@@ -121,7 +122,7 @@ def search(
     )
     if index is not None and not stale_index:
         semantic_failure_reason = ""
-        if _has_usable_embeddings(records):
+        if prefer_semantic and _has_usable_embeddings(records):
             try:
                 scored = _hybrid_bm25_hash_search(
                     expanded_query,
@@ -181,11 +182,12 @@ def search(
         }
     fallback_reason = "missing_bm25_index" if index is None else "stale_bm25_index"
     semantic_failure_reason = ""
-    try:
-        vector_scored = _hash_embedding_search(expanded_query, records)
-    except Exception as exc:
-        vector_scored = []
-        semantic_failure_reason = _semantic_failure_reason(exc)
+    vector_scored: list[tuple[float, dict[str, Any]]] = []
+    if prefer_semantic:
+        try:
+            vector_scored = _hash_embedding_search(expanded_query, records)
+        except Exception as exc:
+            semantic_failure_reason = _semantic_failure_reason(exc)
     if vector_scored:
         vector_scored = _apply_query_boosts(
             query,
