@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/pr-mcp-builder-brand-trailer.gif" alt="문서 구조화, 사람 승인, 승인 RAG 색인, 로컬 Qwen과 MCP 연결로 이어지는 PR MCP Builder 브랜드 트레일러" width="960">
+</p>
+
 # PR MCP Builder v1.2.21
 
 **사람이 승인·색인한 공공기관 규정을 독립 로컬 Qwen 챗봇에서 고르고 바로 대화하거나,
