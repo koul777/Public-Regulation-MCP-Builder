@@ -189,6 +189,17 @@ class HwpParserTests(unittest.TestCase):
 
         self.assertEqual(parser._clean_text("捤獥 汤捯 湰灧 공공기관 지침"), "공공기관 지침")
 
+    def test_preserves_legal_hanja_prefix_before_korean_text(self) -> None:
+        parser = HwpParser()
+
+        self.assertEqual(parser._clean_text("施行 規則 개정"), "施行 規則 개정")
+        self.assertEqual(parser._clean_text("職務 遂行 중 발생한"), "職務 遂行 중 발생한")
+
+    def test_strips_unregistered_ascii_packed_hwp_mojibake_prefix(self) -> None:
+        parser = HwpParser()
+
+        self.assertEqual(parser._clean_text("晦潬 敭湵 공공기관 지침"), "공공기관 지침")
+
     def test_strips_standalone_hwp_mojibake_lines_when_other_text_exists(self) -> None:
         parser = HwpParser()
 

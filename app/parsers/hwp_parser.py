@@ -55,6 +55,9 @@ HWP_ARTIFACT_TOKENS = (
     "湯湷",
     "†普",
 )
+HWP_CJK_PREFIX_RE = re.compile(
+    r"^(?P<prefix>[\u3400-\u9fff]{1,4}(?:\s+[\u3400-\u9fff]{1,4}){1,5})\s+(?=[가-힣])"
+)
 HWP_PUA_TRANSLATION = str.maketrans(
     {
         "\U000F0852": '"',
@@ -817,10 +820,27 @@ class HwpParser(BaseParser):
         text = re.sub(r" *\n *", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = text.strip()
-        text = re.sub(r"^[\u3400-\u9fff]{1,4}(?:\s+[\u3400-\u9fff]{1,4}){1,5}\s+(?=[가-힣])", "", text)
+        text = self._strip_ascii_packed_hwp_prefix(text)
         text = self._strip_standalone_mojibake_lines(text)
         text = self._strip_known_hwp_artifact_tokens(text)
         return text.strip()
+
+    def _strip_ascii_packed_hwp_prefix(self, text: str) -> str:
+        """Drop CJK-looking prefixes only when their UTF-16 bytes spell ASCII."""
+
+        match = HWP_CJK_PREFIX_RE.match(text)
+        if not match or not self._looks_like_ascii_packed_hwp_artifact(match.group("prefix")):
+            return text
+        return text[match.end() :]
+
+    def _looks_like_ascii_packed_hwp_artifact(self, value: str) -> bool:
+        """Recognize HWP control bytes that were decoded as CJK code points."""
+
+        cjk_characters = [char for char in value if "\u3400" <= char <= "\u9fff"]
+        if not cjk_characters:
+            return False
+        packed_bytes = b"".join(ord(char).to_bytes(2, "little") for char in cjk_characters)
+        return all(0x20 <= byte <= 0x7E for byte in packed_bytes)
 
     def _strip_standalone_mojibake_lines(self, text: str) -> str:
         lines = text.splitlines()

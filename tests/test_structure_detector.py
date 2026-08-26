@@ -1192,6 +1192,63 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertTrue(all(node.parent_id == paragraphs[0].node_id for node in items))
         self.assertTrue(all(node.parent_id == items[0].node_id for node in subitems))
 
+    def test_parenthesized_numeric_details_preserve_hangul_subitem_siblings(self) -> None:
+        text = "\n".join(
+            [
+                "제1조(목적) 본문.",
+                "1. 첫째 호",
+                "가. 첫째 목",
+                "(1) 첫째 세목",
+                "(2) 둘째 세목",
+                "둘째 세목의 계속 문장",
+                "나. 둘째 목",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        by_number = {node.number: node for node in nodes if node.number}
+
+        self.assertEqual("subitem", by_number["(1)"].node_type)
+        self.assertEqual("subitem", by_number["(2)"].node_type)
+        self.assertEqual(by_number["가."].node_id, by_number["(1)"].parent_id)
+        self.assertEqual(by_number["가."].node_id, by_number["(2)"].parent_id)
+        self.assertIn("둘째 세목의 계속 문장", by_number["(2)"].text)
+        self.assertEqual(by_number["1."].node_id, by_number["나."].parent_id)
+
+    def test_parenthesized_numeric_marker_at_article_start_remains_paragraph(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(
+                [
+                    "제1조(목적) 본문.",
+                    "(1) 첫째 항",
+                    "(2) 둘째 항",
+                ]
+            )
+        )
+        article = next(node for node in nodes if node.node_type == "article")
+        paragraphs = [node for node in nodes if node.node_type == "paragraph"]
+
+        self.assertEqual(["(1)", "(2)"], [node.number for node in paragraphs])
+        self.assertTrue(all(node.parent_id == article.node_id for node in paragraphs))
+
+    def test_parenthesized_numeric_details_directly_under_item_are_siblings(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(
+                [
+                    "제1조(목적) 본문.",
+                    "1. 첫째 호",
+                    "(1) 첫째 세목",
+                    "(2) 둘째 세목",
+                    "2. 둘째 호",
+                ]
+            )
+        )
+        by_number = {node.number: node for node in nodes if node.number}
+
+        self.assertEqual(by_number["1."].node_id, by_number["(1)"].parent_id)
+        self.assertEqual(by_number["1."].node_id, by_number["(2)"].parent_id)
+        self.assertEqual(by_number["1."].parent_id, by_number["2."].parent_id)
+
     def test_je_hang_and_je_ho_lines_are_detected_as_paragraph_and_item(self) -> None:
         text = "\n".join(
             [
