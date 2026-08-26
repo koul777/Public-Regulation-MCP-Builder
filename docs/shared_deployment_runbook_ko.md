@@ -18,19 +18,19 @@
 
 ```powershell
 Copy-Item .env.shared.example .env.shared
-# .env.shared의 API_AUTH_TOKEN을 secret manager 주입 값으로 교체
-docker compose -f docker-compose.yml -f docker-compose.shared.yml up --build api
+# .env.shared의 API_AUTH_TOKENS를 actor와 tenant_id(s)를 가진 secret manager 주입 JSON으로 교체
+docker compose --env-file .env.shared -f docker-compose.yml -f docker-compose.shared.yml up --build api
 python scripts/check_private_release_readiness.py --require-shared-deployment --out-json reports/shared_readiness.json
 ```
 
 실제 컨테이너와 같은 환경/마운트에서 다음을 실행해야 한다.
 
 ```powershell
-docker compose -f docker-compose.yml -f docker-compose.shared.yml exec api `
+docker compose --env-file .env.shared -f docker-compose.yml -f docker-compose.shared.yml exec api `
   python scripts/check_private_release_readiness.py --require-shared-deployment
 ```
 
-`API_AUTH_TOKEN`은 소스나 `.env.shared.example`에 저장하지 않는다. 모든 요청에는 인증과 `X-Tenant-Id`가 필요하고, `API_AUDIT_ENABLED=true`, `TENANT_STORAGE_ISOLATION=true`를 유지한다. Streamlit은 공유 API와 분리된 로컬 운영자 UI다.
+보호 환경에서는 레거시 `API_AUTH_TOKEN`을 사용하지 않는다. `API_AUTH_TOKENS`의 각 비밀 토큰을 `role`, 고정 `actor`, 허용 `tenant_id` 또는 `tenant_ids`와 결합하고 소스나 `.env.shared.example`에 실제 토큰을 저장하지 않는다. 모든 요청에는 인증과 `X-Tenant-Id`가 필요하고, `API_AUDIT_ENABLED=true`, `TENANT_STORAGE_ISOLATION=true`를 유지한다. Streamlit은 공유 API와 분리된 로컬 운영자 UI다.
 
 ## 규정 생명주기와 RAG
 

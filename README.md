@@ -1,8 +1,8 @@
+# PR MCP Builder v1.2.21
+
 <p align="center">
   <img src="docs/assets/pr-mcp-builder-brand-trailer.gif" alt="문서 구조화, 사람 승인, 승인 RAG 색인, 로컬 Qwen과 MCP 연결로 이어지는 PR MCP Builder 브랜드 트레일러" width="960">
 </p>
-
-# PR MCP Builder v1.2.21
 
 **사람이 승인·색인한 공공기관 규정을 독립 로컬 Qwen 챗봇에서 고르고 바로 대화하거나,
 같은 승인 데이터를 MCP로 연결하는 Windows용 규정 전처리·RAG 빌더입니다.**
@@ -640,6 +640,18 @@ MCP 파일 묶음을 만들거나 갱신할 때 자동으로 생성되므로, �
 
 **성공 신호:** Codex가 설정 블록을 읽고 도구 목록을 표시합니다. **막히면:** TOML 블록을
 기존 설정 아래에 별도 블록으로 붙였는지, 번들 폴더를 생성 뒤 옮기지 않았는지 확인합니다.
+
+Builder가 만든 `mcp_config.bundle.json`의 `quickstart.codex_claude_team`에는
+Codex를 구현·수정 담당, Claude Code를 독립 감리 담당으로 두는 기본 handoff 순서와
+공유 검증 산출물이 함께 들어 있습니다. 두 클라이언트를 같은 승인 번들로 병행 운용할 때는
+이 계약을 기준으로 `validate_client_config_smoke.ps1` 이후 `search`와 `fetch`를 양쪽에서
+같이 확인하세요.
+
+저장소에는 Claude Code의 읽기 전용 프로젝트 에이전트
+`regulation-security-auditor`와 `regulation-release-reviewer`도 포함됩니다. Codex가
+구현과 focused test를 마치면 보안 감리, 보완, 릴리스 회귀 감리 순으로 handoff하며,
+Claude 에이전트는 구현 파일을 직접 수정하지 않습니다. 에이전트 정의를 새로 추가하거나
+바꾼 뒤에는 Claude Code 세션을 새로 열어 프로젝트 정의를 다시 읽게 하세요.
 
 ### 방법 C — Claude Desktop 로컬 STDIO
 

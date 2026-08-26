@@ -21,6 +21,7 @@ from app.core.tenant_access import (
     INSTITUTION_STORAGE_MARKER,
     institution_profile_id_from_storage_dir,
     institution_storage_dirname,
+    tenant_directory_key,
     tenant_storage_key,
 )
 from app.retrieval.bm25_index import default_bm25_index_path, write_bm25_index
@@ -239,7 +240,7 @@ class InstitutionPurgeService:
         return (
             Path(self.settings.data_dir)
             / "vector_db"
-            / tenant_storage_key(tenant_id)
+            / tenant_directory_key(tenant_id)
             / "approved_vectors.jsonl"
         )
 

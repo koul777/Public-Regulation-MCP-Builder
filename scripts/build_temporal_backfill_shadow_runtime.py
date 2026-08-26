@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import Settings
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.ingestion.vector_adapter import build_vector_records
 from scripts.backfill_temporal_metadata import (
     backfill_temporal_metadata,
@@ -93,7 +93,7 @@ def build_temporal_backfill_shadow_runtime(
         )
 
     records, vector_summary = build_vector_records(all_after, text_field=text_field)
-    vector_path = target_effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = target_effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
 
     before_summary = summarize_temporal_metadata(all_before)
     after_summary = summarize_temporal_metadata(all_after)

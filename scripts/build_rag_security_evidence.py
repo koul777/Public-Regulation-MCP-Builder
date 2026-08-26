@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.config import Settings
 from app.core.api_audit import api_audit_path
 from app.core.security import normalize_department_ids
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import APPROVED_CHUNK_STATUS, stable_content_hash
 from app.ingestion.vector_integrity import embedded_vector_integrity_reason
@@ -48,7 +48,7 @@ def build_rag_security_evidence(
     rag_llm_timeout_seconds: int | None = None,
     out_json: Path | None = None,
 ) -> dict[str, Any]:
-    tenant_key = tenant_storage_key(tenant_id)
+    tenant_key = tenant_directory_key(tenant_id)
     auto_isolated = (data_dir / "tenants" / tenant_key).is_dir()
     settings_overrides: dict[str, Any] = {}
     if rag_llm_backend is not None:

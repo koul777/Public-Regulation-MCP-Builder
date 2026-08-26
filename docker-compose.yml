@@ -12,7 +12,7 @@ services:
       APP_ENV: ${APP_ENV:-production}
       API_AUTH_REQUIRED: ${API_AUTH_REQUIRED:-true}
       API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
-      API_AUTH_TOKENS: ${API_AUTH_TOKENS:-}
+      API_AUTH_TOKENS: "${API_AUTH_TOKENS:-}"
       TENANT_STORAGE_ISOLATION: ${TENANT_STORAGE_ISOLATION:-true}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).read()"]
@@ -36,6 +36,5 @@ services:
       APP_ENV: ${STREAMLIT_APP_ENV:-local}
       API_AUTH_REQUIRED: ${STREAMLIT_API_AUTH_REQUIRED:-false}
       API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
-      API_AUTH_TOKENS: ${API_AUTH_TOKENS:-}
+      API_AUTH_TOKENS: "${API_AUTH_TOKENS:-}"
       TENANT_STORAGE_ISOLATION: ${STREAMLIT_TENANT_STORAGE_ISOLATION:-false}
-

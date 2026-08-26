@@ -41,7 +41,11 @@ from app.core.security import (
     normalize_department_ids,
     require_api_role,
 )
-from app.core.tenant_access import resource_visible_to_tenant, settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import (
+    resource_visible_to_tenant,
+    settings_for_tenant,
+    tenant_directory_key,
+)
 from app.agents.citation_verifier import CitationVerifierAgent
 from app.agents.claim_auditor import ClaimAuditAgent
 from app.agents.grounded_qa import GroundedAnswerDraft, GroundedQwenAnswerAgent
@@ -1052,7 +1056,7 @@ def _local_vector_record_matches_chunk(
 
 
 def _local_vector_path(settings: Settings, auth: AuthContext) -> Path:
-    return settings.data_dir / "vector_db" / tenant_storage_key(auth.tenant_id) / "approved_vectors.jsonl"
+    return settings.data_dir / "vector_db" / tenant_directory_key(auth.tenant_id) / "approved_vectors.jsonl"
 
 
 def _record_visible_to_request(

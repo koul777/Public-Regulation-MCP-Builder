@@ -31,7 +31,15 @@ class PrivateReleaseSmokeTests(unittest.TestCase):
                     app_env="production",
                     data_dir=data_dir,
                     api_auth_required=True,
-                    api_auth_token="smoke-token",
+                    api_auth_tokens=json.dumps(
+                        {
+                            "smoke-token": {
+                                "role": "admin",
+                                "actor": "private-release-smoke",
+                                "tenant_id": "tenant-smoke",
+                            }
+                        }
+                    ),
                     tenant_storage_isolation=True,
                     api_audit_enabled=True,
                 ),

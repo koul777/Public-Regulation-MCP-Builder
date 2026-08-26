@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 
 
 REQUIRED_FIELDS = (
@@ -33,7 +33,7 @@ def build_regulation_migration_manifest(
     out_md: Path | None = None,
 ) -> dict[str, Any]:
     effective_dir = data_dir / "tenants" / tenant_id if tenant_storage_isolation else data_dir
-    vector_path = effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     requested_profile_id = str(profile_id or "").strip()
     records: list[dict[str, Any]] = []
     parse_errors: list[dict[str, Any]] = []

@@ -144,7 +144,7 @@ python -m build --sdist --wheel
 python scripts\audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan
 python scripts\run_fresh_clone_rehearsal.py --mode public --dry-run --fail-on-issue
 python scripts\run_release_harness.py --mode public --keep-going
-python scripts\run_public_release_gate.py --include-untracked --execute-harness --fail-on-issue
+python scripts\run_public_release_gate.py --include-untracked --execute-harness --fail-on-blocked
 ```
 
 For release evidence, use the public audit, cleanup plan, release gate, approval evidence, review-batch evidence, and MCP release evidence tools. Keep generated reports outside the tracked source tree.

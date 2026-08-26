@@ -32,7 +32,7 @@ from app.core.security_primitives import (
     API_ROLE_OPERATOR,
     AuthContext,
 )
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.processors.answer_profile import clean_answer_profile_text
 from app.retrieval.bm25_index import (
     BM25_STRUCTURED_METADATA_VERSION,
@@ -581,7 +581,7 @@ def settings_for_mcp_project(
     rag_trace_enabled: bool | None = None,
 ) -> Settings:
     base_dir = Path(data_dir)
-    tenant_key = tenant_storage_key(tenant_id)
+    tenant_key = tenant_directory_key(tenant_id)
     manifest_isolation = _runtime_manifest_tenant_storage_isolation(base_dir)
     auto_isolated = manifest_isolation if manifest_isolation is not None else (base_dir / "tenants" / tenant_key).is_dir()
     base_settings = Settings(

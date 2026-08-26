@@ -13,6 +13,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from app.core.config import Settings
+from app.core.tenant_access import settings_for_tenant
 from app.ingestion.vector_adapter import vector_record_from_chunk
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
@@ -29,17 +30,26 @@ class VercelMcpEndToEndTests(unittest.IsolatedAsyncioTestCase):
             source_data_dir = root / "approved-source"
             bundle_dir = root / "runtime-bundle"
             stage_dir = root / "vercel-stage"
-            _write_approved_regulation_source(source_data_dir)
+            source_settings = Settings(
+                data_dir=source_data_dir,
+                tenant_storage_isolation=True,
+            )
+            _write_approved_regulation_source(source_settings)
 
             runtime_manifest = write_mcp_runtime_data_bundle(
-                source_data_dir=source_data_dir,
+                source_data_dir=source_settings.data_dir,
                 out_dir=bundle_dir,
                 tenant_id="tenant-e2e",
                 profile_id="public-regulation-e2e",
                 document_id="regulation-e2e-document",
+                tenant_storage_isolation=True,
                 require_kordoc_table_parser=False,
             )
             self.assertEqual(1, runtime_manifest["record_count"])
+            self.assertFalse(runtime_manifest["tenant_storage_isolation"])
+            self.assertTrue(runtime_manifest["source_tenant_storage_isolation"])
+            self.assertTrue((bundle_dir / "data" / "repository").is_dir())
+            self.assertFalse((bundle_dir / "data" / "tenants").exists())
             prepare_vercel_mcp_deployment(
                 runtime_data_dir=bundle_dir / "data",
                 out_dir=stage_dir,
@@ -125,9 +135,9 @@ def _load_staged_entrypoint(entrypoint: Path, runtime_data_dir: Path):
     return module.app
 
 
-def _write_approved_regulation_source(data_dir: Path) -> None:
-    settings = Settings(data_dir=data_dir)
-    repository = JsonRepository(settings)
+def _write_approved_regulation_source(base_settings: Settings) -> None:
+    tenant_settings = settings_for_tenant(base_settings, "tenant-e2e")
+    repository = JsonRepository(tenant_settings)
     document = Document(
         document_id="regulation-e2e-document",
         filename="e2e-regulation.txt",
@@ -220,7 +230,12 @@ def _write_approved_regulation_source(data_dir: Path) -> None:
             },
         }
     )
-    vector_path = data_dir / "vector_db" / "tenant-e2e" / "approved_vectors.jsonl"
+    vector_path = (
+        tenant_settings.data_dir
+        / "vector_db"
+        / "tenant-e2e"
+        / "approved_vectors.jsonl"
+    )
     vector_path.parent.mkdir(parents=True, exist_ok=True)
     vector_chunk = chunk.model_dump(mode="json")
     vector_chunk["tenant_id"] = document.tenant_id

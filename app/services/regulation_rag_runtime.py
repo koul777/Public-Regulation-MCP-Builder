@@ -27,7 +27,7 @@ from app.core.security_primitives import (
     SECURITY_LEVEL_ORDER,
     AuthContext,
 )
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 from app.retrieval.bm25_index import (
     Bm25Index,
     default_bm25_index_path,
@@ -334,7 +334,7 @@ def local_vector_path(settings: Any, auth: AuthContext) -> Path:
     return (
         settings.data_dir
         / "vector_db"
-        / tenant_storage_key(auth.tenant_id)
+        / tenant_directory_key(auth.tenant_id)
         / "approved_vectors.jsonl"
     )
 

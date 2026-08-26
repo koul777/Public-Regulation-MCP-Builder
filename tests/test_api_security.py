@@ -38,24 +38,48 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertEqual(missing.exception.status_code, 401)
         self.assertEqual(invalid.exception.status_code, 401)
 
-    def test_required_auth_requires_actor_header(self) -> None:
+    def test_legacy_token_uses_server_assigned_actor_without_actor_header(self) -> None:
         settings = Settings(api_auth_required=True, api_auth_token="secret")
 
-        with self.assertRaises(HTTPException) as raised:
-            authenticate_request(settings, authorization="Bearer secret")
+        context = authenticate_request(settings, authorization="Bearer secret")
 
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("X-Actor", raised.exception.detail)
+        self.assertEqual("legacy-api-token", context.actor)
+
+    def test_unbound_token_actor_header_cannot_spoof_audit_identity(self) -> None:
+        legacy = authenticate_request(
+            Settings(api_auth_required=True, api_auth_token="secret"),
+            authorization="Bearer secret",
+            actor="spoofed-admin",
+        )
+        role_string = authenticate_request(
+            Settings(
+                api_auth_required=True,
+                api_auth_tokens=json.dumps({"view-secret": "viewer"}),
+            ),
+            authorization="Bearer view-secret",
+            actor="spoofed-auditor",
+        )
+
+        self.assertEqual("legacy-api-token", legacy.actor)
+        self.assertEqual("configured-api-token", role_string.actor)
 
     def test_required_auth_requires_tenant_header_when_tenant_storage_isolated(self) -> None:
         settings = Settings(
             api_auth_required=True,
-            api_auth_token="secret",
+            api_auth_tokens=json.dumps(
+                {
+                    "secret": {
+                        "role": "operator",
+                        "actor": "tester",
+                        "tenant_id": "tenant-a",
+                    }
+                }
+            ),
             tenant_storage_isolation=True,
         )
 
         with self.assertRaises(HTTPException) as raised:
-            authenticate_request(settings, authorization="Bearer secret", actor="tester")
+            authenticate_request(settings, authorization="Bearer secret")
 
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("X-Tenant-Id", raised.exception.detail)
@@ -80,7 +104,7 @@ class ApiSecurityTests(unittest.TestCase):
 
         context = authenticate_request(settings, authorization="Bearer view-secret", actor="auditor")
 
-        self.assertEqual("auditor", context.actor)
+        self.assertEqual("configured-api-token", context.actor)
         self.assertEqual("viewer", context.role)
         self.assertEqual("api_token_rbac", context.auth_mode)
 
@@ -107,6 +131,87 @@ class ApiSecurityTests(unittest.TestCase):
 
         self.assertEqual(("hr", "finance"), context.department_ids)
 
+    def test_role_specific_token_is_limited_to_its_configured_tenant(self) -> None:
+        settings = Settings(
+            api_auth_required=True,
+            api_auth_tokens=json.dumps(
+                {
+                    "tenant-a-secret": {
+                        "role": "operator",
+                        "actor": "scheduler",
+                        "tenant_id": "tenant-a",
+                    }
+                }
+            ),
+        )
+
+        allowed = authenticate_request(
+            settings,
+            authorization="Bearer tenant-a-secret",
+            tenant_id="tenant-a",
+        )
+        with self.assertRaises(HTTPException) as denied:
+            authenticate_request(
+                settings,
+                authorization="Bearer tenant-a-secret",
+                tenant_id="tenant-b",
+            )
+
+        self.assertEqual("tenant-a", allowed.tenant_id)
+        self.assertEqual(403, denied.exception.status_code)
+
+    def test_role_specific_token_can_bind_multiple_tenants(self) -> None:
+        settings = Settings(
+            api_auth_required=True,
+            api_auth_tokens=json.dumps(
+                {
+                    "multi-secret": {
+                        "role": "operator",
+                        "actor": "scheduler",
+                        "tenant_ids": ["tenant-a", "tenant-b"],
+                    }
+                }
+            ),
+        )
+
+        tenant_a = authenticate_request(
+            settings,
+            authorization="Bearer multi-secret",
+            tenant_id="tenant-a",
+        )
+        tenant_b = authenticate_request(
+            settings,
+            authorization="Bearer multi-secret",
+            tenant_id="tenant-b",
+        )
+
+        self.assertEqual("tenant-a", tenant_a.tenant_id)
+        self.assertEqual("tenant-b", tenant_b.tenant_id)
+
+    def test_legacy_token_is_limited_to_default_tenant(self) -> None:
+        settings = Settings(
+            api_auth_required=True,
+            api_auth_token="secret",
+            api_default_tenant_id="tenant-default",
+        )
+
+        allowed = authenticate_request(
+            settings,
+            authorization="Bearer secret",
+            actor="tester",
+            tenant_id="tenant-default",
+        )
+        with self.assertRaises(HTTPException) as denied:
+            authenticate_request(
+                settings,
+                authorization="Bearer secret",
+                actor="tester",
+                tenant_id="tenant-other",
+            )
+
+        self.assertEqual("tenant-default", allowed.tenant_id)
+        self.assertEqual(403, denied.exception.status_code)
+
     def test_role_specific_token_rejects_actor_mismatch(self) -> None:
         settings = Settings(
             api_auth_required=True,
@@ -132,6 +237,15 @@ class ApiSecurityTests(unittest.TestCase):
             self.assertEqual(400, raised.exception.status_code)
             self.assertIn(field_name, str(raised.exception.detail))
 
+    def test_authentication_rejects_noncanonical_tenant_headers(self) -> None:
+        settings = Settings(api_auth_required=False)
+
+        for tenant_id in ("a/b", "a?b", "Tenant-A", " tenant-a", "tenant-a ", ".tenant-a"):
+            with self.subTest(tenant_id=tenant_id), self.assertRaises(HTTPException) as raised:
+                authenticate_request(settings, tenant_id=tenant_id)
+            self.assertEqual(400, raised.exception.status_code)
+            self.assertIn("canonical lowercase", str(raised.exception.detail))
+
     def test_authentication_rejects_invalid_configured_identity_values_as_server_error(self) -> None:
         invalid_default = Settings(api_auth_required=False, api_default_tenant_id="t" * 129)
         invalid_actor = Settings(
@@ -148,6 +262,108 @@ class ApiSecurityTests(unittest.TestCase):
 
         self.assertEqual(500, tenant_error.exception.status_code)
         self.assertEqual(500, actor_error.exception.status_code)
+
+    def test_authentication_rejects_empty_or_noncanonical_default_tenant_as_server_error(self) -> None:
+        for tenant_id in ("", "a/b", "a?b", "Tenant-A", " tenant-a"):
+            with self.subTest(tenant_id=tenant_id), self.assertRaises(HTTPException) as raised:
+                authenticate_request(
+                    Settings(api_auth_required=False, api_default_tenant_id=tenant_id),
+                )
+            self.assertEqual(500, raised.exception.status_code)
+
+    def test_authentication_rejects_invalid_token_tenant_claims_as_server_error(self) -> None:
+        invalid_specs = (
+            {"role": "operator", "actor": "scheduler", "tenant_id": ""},
+            {"role": "operator", "actor": "scheduler", "tenant_id": "a/b"},
+            {"role": "operator", "actor": "scheduler", "tenant_id": "a?b"},
+            {"role": "operator", "actor": "scheduler", "tenant_id": "Tenant-A"},
+            {"role": "operator", "actor": "scheduler", "tenant_id": "bad\ttenant"},
+            {"role": "operator", "actor": "scheduler", "tenant_id": "t" * 129},
+            {"role": "operator", "actor": "scheduler", "tenant_ids": []},
+            {
+                "role": "operator",
+                "actor": "scheduler",
+                "tenant_id": "tenant-a",
+                "tenant_ids": ["tenant-a"],
+            },
+        )
+
+        for spec in invalid_specs:
+            with self.subTest(spec=spec), self.assertRaises(HTTPException) as raised:
+                authenticate_request(
+                    Settings(
+                        api_auth_required=True,
+                        api_auth_tokens=json.dumps({"ops-secret": spec}),
+                    ),
+                    authorization="Bearer ops-secret",
+                )
+            self.assertEqual(500, raised.exception.status_code)
+
+    def test_protected_environment_rejects_legacy_or_unbound_token_configuration(self) -> None:
+        invalid_settings = (
+            Settings(app_env="production", api_auth_required=True, api_auth_token="legacy-secret"),
+            Settings(
+                app_env="production",
+                api_auth_required=True,
+                api_auth_tokens=json.dumps({"string-secret": "operator"}),
+            ),
+            Settings(
+                app_env="production",
+                api_auth_required=True,
+                api_auth_tokens=json.dumps(
+                    {"missing-actor": {"role": "operator", "tenant_id": "tenant-a"}}
+                ),
+            ),
+            Settings(
+                app_env="production",
+                api_auth_required=True,
+                api_auth_tokens=json.dumps(
+                    {"missing-tenant": {"role": "operator", "actor": "scheduler"}}
+                ),
+            ),
+        )
+
+        for settings in invalid_settings:
+            with self.subTest(settings=settings), self.assertRaises(HTTPException) as raised:
+                authenticate_request(
+                    settings,
+                    authorization="Bearer legacy-secret",
+                    actor="scheduler",
+                    tenant_id="tenant-a",
+                )
+            self.assertEqual(500, raised.exception.status_code)
+
+    def test_protected_environment_rejects_disabled_authentication(self) -> None:
+        settings = Settings(app_env="production", api_auth_required=False)
+
+        with self.assertRaises(HTTPException) as raised:
+            authenticate_request(settings)
+
+        self.assertEqual(500, raised.exception.status_code)
+
+    def test_protected_environment_accepts_actor_and_tenant_bound_token(self) -> None:
+        settings = Settings(
+            app_env="production",
+            api_auth_required=True,
+            api_auth_tokens=json.dumps(
+                {
+                    "ops-secret": {
+                        "role": "operator",
+                        "actor": "scheduler",
+                        "tenant_id": "tenant-a",
+                    }
+                }
+            ),
+        )
+
+        context = authenticate_request(
+            settings,
+            authorization="Bearer ops-secret",
+            tenant_id="tenant-a",
+        )
+
+        self.assertEqual("scheduler", context.actor)
+        self.assertEqual("tenant-a", context.tenant_id)
 
     def test_write_role_guard_rejects_viewer(self) -> None:
         auth = AuthContext(actor="auditor", tenant_id="tenant-a", auth_mode="api_token_rbac", role="viewer")
@@ -167,7 +383,12 @@ class ApiSecurityTests(unittest.TestCase):
 
     def test_fastapi_dependency_protects_document_routes_when_auth_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            settings = Settings(data_dir=Path(tmp), api_auth_required=True, api_auth_token="secret")
+            settings = Settings(
+                data_dir=Path(tmp),
+                api_auth_required=True,
+                api_auth_token="secret",
+                api_default_tenant_id="tenant-a",
+            )
             app.dependency_overrides[get_settings] = lambda: settings
             try:
                 client = TestClient(app)

@@ -127,10 +127,12 @@ HERMES_BUNDLE_QUICKSTART_KEYS = frozenset(
         "run_local_stdio_server",
         "chatgpt_desktop_local",
         "claude_desktop",
+        "codex",
         "claude_code",
         "chatgpt_remote",
         "vercel_https",
         "claude_remote",
+        "codex_claude_team",
     }
 )
 HERMES_BUNDLE_ZIP_REQUIRED_ENTRIES = frozenset(

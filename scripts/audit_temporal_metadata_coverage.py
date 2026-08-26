@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import Settings
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 from app.services.regulation_catalog_service import read_regulation_metadata
 
 
@@ -186,7 +186,7 @@ def _effective_runtime_dir(data_dir: Path, *, tenant_id: str, tenant_storage_iso
 
 
 def _load_vector_records(effective_dir: Path, *, tenant_id: str) -> list[dict[str, Any]]:
-    vector_path = effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     if not vector_path.is_file():
         return []
     rows = []

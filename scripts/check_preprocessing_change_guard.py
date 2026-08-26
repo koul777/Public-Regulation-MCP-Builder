@@ -14,30 +14,39 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REVIEW_LABEL = "preprocessing-reviewed"
 
 LOGIC_PREFIXES = (
-    "app/parsers/",
-    "app/processors/",
-    "app/ingestion/",
-    "app/retrieval/",
-    "app/mcp_server/",
+    # Runtime modules share approval, tenant, retrieval, and output-security
+    # boundaries.  Protect the complete package so moving a check between
+    # layers cannot silently move it outside the review contract.
+    "app/",
 )
 LOGIC_FILES = {
-    "app/core/pipeline.py",
-    "app/services/processing_service.py",
-    "app/schemas/chunk.py",
-    "app/schemas/parsed.py",
-    "app/schemas/quality.py",
-    "app/schemas/structure.py",
     "frontend/streamlit_app.py",
     "scripts/analyze_regulation_corpus.py",
+    "scripts/apply_reapproval_plan_shadow.py",
+    "scripts/audit_mcp_product_readiness.py",
+    "scripts/audit_public_release_readiness.py",
+    "scripts/audit_release_hygiene.py",
+    "scripts/audit_runtime_version_drift.py",
     "scripts/audit_table_preprocessing_claim_gate.py",
+    "scripts/audit_temporal_metadata_coverage.py",
     "scripts/batch_process_regulations.py",
+    "scripts/build_profile_provenance_report.py",
+    "scripts/build_rag_security_evidence.py",
+    "scripts/build_reapproval_worklist.py",
+    "scripts/build_regulation_migration_manifest.py",
+    "scripts/build_temporal_backfill_shadow_runtime.py",
     "scripts/check_parsing_goldset_table_drift.py",
     "scripts/check_mcp_connection_readiness.py",
     "scripts/check_regression_expectations.py",
+    "scripts/evaluate_rag_retrieval.py",
     "scripts/refresh_table_exports.py",
     "scripts/generate_mcp_client_config.py",
     "scripts/mcp_bundle_contract.py",
+    "scripts/mcp_publish_approval_evidence.py",
+    "scripts/create_public_orphan_snapshot.py",
     "scripts/run_mcp_client_config_smoke.py",
+    "scripts/run_mcp_smoke.py",
+    "scripts/run_public_release_gate.py",
     "scripts/run_mcp_transport_smoke.py",
     "scripts/run_regulation_mcp.py",
     "scripts/run_ci_regression_gate.py",
@@ -49,6 +58,7 @@ BASELINE_FILES = {"config/quality_profiles.example.json"}
 GOVERNANCE_FILES = {
     ".github/CODEOWNERS",
     ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/workflows/auto-release.yml",
     ".github/workflows/preprocessing-change-policy.yml",
     ".github/workflows/preprocessing-regression.yml",
     "scripts/check_preprocessing_change_guard.py",
@@ -56,6 +66,7 @@ GOVERNANCE_FILES = {
     "tests/test_preprocessing_change_guard.py",
 }
 GUARD_IMPLEMENTATION_FILES = {
+    ".github/workflows/auto-release.yml",
     ".github/workflows/preprocessing-change-policy.yml",
     ".github/workflows/preprocessing-regression.yml",
     "scripts/check_preprocessing_change_guard.py",
@@ -65,6 +76,9 @@ GUARD_TEST_FILES = {
     "tests/test_preprocessing_change_guard.py",
 }
 FOCUSED_TEST_KEYWORDS = (
+    "agent",
+    "api",
+    "approval",
     "archive_safety",
     "article_validity",
     "chunk",
@@ -81,10 +95,17 @@ FOCUSED_TEST_KEYWORDS = (
     "preprocess",
     "processing_service",
     "quality",
+    "rag",
+    "release",
+    "repository",
     "retrieval",
+    "routes",
+    "security",
+    "storage",
     "structure",
     "streamlit_operator",
     "table",
+    "tenant",
     "vector_ingestion",
 )
 BODY_FIELDS = (

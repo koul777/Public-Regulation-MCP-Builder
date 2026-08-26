@@ -21,10 +21,12 @@ from app.core.security_primitives import (
     SECURITY_LEVEL_ORDER,
     AuthContext,
 )
+from app.core.tenant_access import CANONICAL_TENANT_ID_PATTERN
 
 
 MAX_ACTOR_HEADER_CHARS = 200
 MAX_TENANT_HEADER_CHARS = 128
+LOCAL_APP_ENVS = frozenset({"local", "dev", "development", "test"})
 
 # Security-level clearance policy — the single source of truth shared by every
 # endpoint that returns approved chunk content (RAG search and the documents
@@ -35,8 +37,10 @@ MAX_TENANT_HEADER_CHARS = 128
 class _TokenIdentity:
     role: str
     actor: str = ""
+    actor_is_bound: bool = False
     auth_mode: str = "api_token"
     department_ids: tuple[str, ...] = ()
+    tenant_ids: tuple[str, ...] = ()
 
 
 def authenticate_request(
@@ -53,19 +57,25 @@ def authenticate_request(
         max_chars=MAX_ACTOR_HEADER_CHARS,
         status_code=400,
     )
-    tenant_header_value = _validated_identity_value(
-        tenant_id,
-        label="X-Tenant-Id",
-        max_chars=MAX_TENANT_HEADER_CHARS,
-        status_code=400,
-    )
-    tenant_value = tenant_header_value or _validated_identity_value(
+    tenant_header_value = ""
+    if tenant_id is not None:
+        tenant_header_value = _validated_tenant_id(
+            tenant_id,
+            label="X-Tenant-Id",
+            status_code=400,
+        )
+    default_tenant_id = _validated_tenant_id(
         settings.api_default_tenant_id,
         label="API_DEFAULT_TENANT_ID",
-        max_chars=MAX_TENANT_HEADER_CHARS,
         status_code=500,
     )
+    tenant_value = tenant_header_value or default_tenant_id
     if not settings.api_auth_required:
+        if _is_protected_env(settings):
+            raise HTTPException(
+                status_code=500,
+                detail="API authentication must be enabled in a protected environment.",
+            )
         return AuthContext(
             actor=actor_value or "local-anonymous",
             tenant_id=tenant_value,
@@ -73,18 +83,27 @@ def authenticate_request(
             role=API_ROLE_ADMIN,
         )
 
-    if not settings.api_auth_token and not _clean_header(settings.api_auth_tokens):
+    configured_tokens, legacy_token = _configured_auth_credentials(
+        settings,
+        default_tenant_id=default_tenant_id,
+    )
+    if not legacy_token and not configured_tokens:
         raise HTTPException(
             status_code=500,
             detail="API authentication is required but neither API_AUTH_TOKEN nor API_AUTH_TOKENS is set.",
         )
 
     supplied = _bearer_token(authorization) or _clean_header(api_key)
-    identity = _resolve_api_token(settings, supplied)
+    identity = _resolve_api_token(
+        supplied,
+        configured_tokens=configured_tokens,
+        legacy_token=legacy_token,
+        default_tenant_id=default_tenant_id,
+    )
     if not supplied or identity is None:
         raise HTTPException(status_code=401, detail="Missing or invalid API credentials.")
     if identity.actor:
-        if actor_value and actor_value != identity.actor:
+        if identity.actor_is_bound and actor_value and actor_value != identity.actor:
             raise HTTPException(status_code=403, detail="X-Actor header does not match the authenticated token actor.")
         actor_value = _validated_identity_value(
             identity.actor,
@@ -98,6 +117,11 @@ def authenticate_request(
         raise HTTPException(
             status_code=400,
             detail="X-Tenant-Id header is required when tenant storage isolation is enabled.",
+        )
+    if tenant_value not in identity.tenant_ids:
+        raise HTTPException(
+            status_code=403,
+            detail="X-Tenant-Id is not allowed for the authenticated token.",
         )
     return AuthContext(
         actor=actor_value,
@@ -182,13 +206,28 @@ def require_api_role(auth_context: AuthContext, allowed_roles: set[str] | frozen
 
 
 def api_auth_credentials_configured(settings: Settings) -> bool:
-    configured_tokens = _configured_api_tokens(settings.api_auth_tokens)
-    return bool(_clean_header(settings.api_auth_token) or configured_tokens)
+    default_tenant_id = _validated_tenant_id(
+        settings.api_default_tenant_id,
+        label="API_DEFAULT_TENANT_ID",
+        status_code=500,
+    )
+    configured_tokens, legacy_token = _configured_auth_credentials(
+        settings,
+        default_tenant_id=default_tenant_id,
+    )
+    return bool(legacy_token or configured_tokens)
 
 
 def representative_api_auth_credentials(settings: Settings) -> tuple[str, str]:
-    configured_tokens = _configured_api_tokens(settings.api_auth_tokens)
-    legacy_token = _clean_header(settings.api_auth_token)
+    default_tenant_id = _validated_tenant_id(
+        settings.api_default_tenant_id,
+        label="API_DEFAULT_TENANT_ID",
+        status_code=500,
+    )
+    configured_tokens, legacy_token = _configured_auth_credentials(
+        settings,
+        default_tenant_id=default_tenant_id,
+    )
     if legacy_token:
         return legacy_token, "private-release-readiness"
     for token, identity in configured_tokens.items():
@@ -217,27 +256,63 @@ def _validated_identity_value(
     max_chars: int,
     status_code: int,
 ) -> str:
-    cleaned = _clean_header(value)
+    raw = str(value or "")
+    cleaned = raw.strip()
     if len(cleaned) > max_chars:
         raise HTTPException(status_code=status_code, detail=f"{label} exceeds {max_chars} characters.")
-    if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw):
         raise HTTPException(status_code=status_code, detail=f"{label} contains control characters.")
     return cleaned
 
 
-def _resolve_api_token(settings: Settings, supplied: str) -> _TokenIdentity | None:
+def _resolve_api_token(
+    supplied: str,
+    *,
+    configured_tokens: dict[str, _TokenIdentity],
+    legacy_token: str,
+    default_tenant_id: str,
+) -> _TokenIdentity | None:
     if not supplied:
         return None
-    for token, identity in _configured_api_tokens(settings.api_auth_tokens).items():
+    for token, identity in configured_tokens.items():
         if hmac.compare_digest(supplied, token):
             return identity
-    expected = settings.api_auth_token
-    if expected and hmac.compare_digest(supplied, expected):
-        return _TokenIdentity(role=API_ROLE_ADMIN, auth_mode="api_token")
+    if legacy_token and hmac.compare_digest(supplied, legacy_token):
+        return _TokenIdentity(
+            role=API_ROLE_ADMIN,
+            actor="legacy-api-token",
+            auth_mode="api_token",
+            tenant_ids=(default_tenant_id,),
+        )
     return None
 
 
-def _configured_api_tokens(raw_value: str) -> dict[str, _TokenIdentity]:
+def _configured_auth_credentials(
+    settings: Settings,
+    *,
+    default_tenant_id: str,
+) -> tuple[dict[str, _TokenIdentity], str]:
+    protected_env = _is_protected_env(settings)
+    legacy_token = _clean_header(settings.api_auth_token)
+    if protected_env and legacy_token:
+        raise HTTPException(
+            status_code=500,
+            detail="API_AUTH_TOKEN is not allowed in a protected environment; use structured API_AUTH_TOKENS identities.",
+        )
+    configured_tokens = _configured_api_tokens(
+        settings.api_auth_tokens,
+        default_tenant_id=default_tenant_id,
+        protected_env=protected_env,
+    )
+    return configured_tokens, legacy_token
+
+
+def _configured_api_tokens(
+    raw_value: str,
+    *,
+    default_tenant_id: str,
+    protected_env: bool,
+) -> dict[str, _TokenIdentity]:
     raw = str(raw_value or "").strip()
     if not raw:
         return {}
@@ -253,28 +328,145 @@ def _configured_api_tokens(raw_value: str) -> dict[str, _TokenIdentity]:
         token_value = str(token or "").strip()
         if not token_value:
             raise HTTPException(status_code=500, detail="API_AUTH_TOKENS contains an empty token key.")
-        identity = _parse_token_identity(spec)
+        identity = _parse_token_identity(
+            spec,
+            default_tenant_id=default_tenant_id,
+            protected_env=protected_env,
+        )
         identities[token_value] = identity
     return identities
 
 
-def _parse_token_identity(spec: Any) -> _TokenIdentity:
+def _parse_token_identity(
+    spec: Any,
+    *,
+    default_tenant_id: str,
+    protected_env: bool,
+) -> _TokenIdentity:
     if isinstance(spec, str):
-        return _TokenIdentity(role=_normalize_role(spec), auth_mode="api_token_rbac")
+        if protected_env:
+            raise HTTPException(
+                status_code=500,
+                detail="Protected environments require structured API_AUTH_TOKENS identities with actor and tenant_id(s).",
+            )
+        return _TokenIdentity(
+            role=_normalize_role(spec),
+            actor="configured-api-token",
+            auth_mode="api_token_rbac",
+            tenant_ids=(default_tenant_id,),
+        )
     if isinstance(spec, dict):
         role = _normalize_role(str(spec.get("role", "")).strip())
-        actor = _clean_header(spec.get("actor"))
+        actor_value = spec.get("actor")
+        if actor_value is not None and not isinstance(actor_value, str):
+            raise HTTPException(status_code=500, detail="API_AUTH_TOKENS actor must be a string.")
+        actor = _validated_identity_value(
+            actor_value,
+            label="API_AUTH_TOKENS actor",
+            max_chars=MAX_ACTOR_HEADER_CHARS,
+            status_code=500,
+        )
+        if protected_env and not actor:
+            raise HTTPException(
+                status_code=500,
+                detail="Protected API_AUTH_TOKENS identities require a nonempty actor.",
+            )
+        actor_is_bound = bool(actor)
+        if not actor:
+            actor = "configured-api-token"
+        tenant_ids = _parse_token_tenant_ids(
+            spec,
+            default_tenant_id=default_tenant_id,
+            protected_env=protected_env,
+        )
         department_ids = _parse_department_ids(spec.get("department_ids") or spec.get("departments"))
         return _TokenIdentity(
             role=role,
             actor=actor,
+            actor_is_bound=actor_is_bound,
             auth_mode="api_token_rbac",
             department_ids=department_ids,
+            tenant_ids=tenant_ids,
         )
     raise HTTPException(
         status_code=500,
         detail="API_AUTH_TOKENS values must be role strings or objects with role/actor fields.",
     )
+
+
+def _parse_token_tenant_ids(
+    spec: dict[str, Any],
+    *,
+    default_tenant_id: str,
+    protected_env: bool,
+) -> tuple[str, ...]:
+    has_tenant_id = "tenant_id" in spec
+    has_tenant_ids = "tenant_ids" in spec
+    if has_tenant_id and has_tenant_ids:
+        raise HTTPException(
+            status_code=500,
+            detail="API_AUTH_TOKENS identity must not set both tenant_id and tenant_ids.",
+        )
+    if has_tenant_id:
+        tenant_id = spec.get("tenant_id")
+        if not isinstance(tenant_id, str):
+            raise HTTPException(status_code=500, detail="API_AUTH_TOKENS tenant_id must be a string.")
+        return (
+            _validated_tenant_id(
+                tenant_id,
+                label="API_AUTH_TOKENS tenant_id",
+                status_code=500,
+            ),
+        )
+    if has_tenant_ids:
+        tenant_ids = spec.get("tenant_ids")
+        if not isinstance(tenant_ids, list):
+            raise HTTPException(status_code=500, detail="API_AUTH_TOKENS tenant_ids must be a JSON array.")
+        if not tenant_ids:
+            raise HTTPException(status_code=500, detail="API_AUTH_TOKENS tenant_ids must not be empty.")
+        parsed = []
+        for tenant_id in tenant_ids:
+            if not isinstance(tenant_id, str):
+                raise HTTPException(
+                    status_code=500,
+                    detail="API_AUTH_TOKENS tenant_ids entries must be strings.",
+                )
+            parsed.append(
+                _validated_tenant_id(
+                    tenant_id,
+                    label="API_AUTH_TOKENS tenant_ids entry",
+                    status_code=500,
+                )
+            )
+        return tuple(dict.fromkeys(parsed))
+    if protected_env:
+        raise HTTPException(
+            status_code=500,
+            detail="Protected API_AUTH_TOKENS identities require tenant_id or tenant_ids.",
+        )
+    return (default_tenant_id,)
+
+
+def _validated_tenant_id(value: str | None, *, label: str, status_code: int) -> str:
+    raw = str(value or "")
+    cleaned = _validated_identity_value(
+        value,
+        label=label,
+        max_chars=MAX_TENANT_HEADER_CHARS,
+        status_code=status_code,
+    )
+    if not cleaned:
+        raise HTTPException(status_code=status_code, detail=f"{label} must not be empty.")
+    if raw != cleaned or not CANONICAL_TENANT_ID_PATTERN.fullmatch(cleaned):
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"{label} must be a canonical lowercase tenant ID.",
+        )
+    return cleaned
+
+
+def _is_protected_env(settings: Settings) -> bool:
+    return str(settings.app_env or "").strip().lower() not in LOCAL_APP_ENVS
 
 
 def _normalize_role(role: str) -> str:

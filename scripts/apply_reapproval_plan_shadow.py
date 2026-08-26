@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import Settings
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key, tenant_storage_key
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, embed_vector_records
 from app.ingestion.vector_adapter import build_vector_records, is_chunk_approved_for_indexing
 from app.processors.exporter import Exporter
@@ -774,7 +774,7 @@ def _apply_to_shadow(
     )
     settings = settings_for_tenant(base_settings, tenant_id)
     repository = JsonRepository(settings)
-    vector_path = settings.data_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = settings.data_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     vector_path.unlink(missing_ok=True)
 
     document_states: dict[str, list[Chunk]] = {}
@@ -1330,7 +1330,7 @@ def _copy_shadow_runtime(
         tenant_id,
     )
     selected_vector_dir = (
-        source_settings.data_dir / "vector_db" / tenant_storage_key(tenant_id)
+        source_settings.data_dir / "vector_db" / tenant_directory_key(tenant_id)
     ).resolve()
 
     def ignore_selected_tenant_vector(path: str, names: list[str]) -> set[str]:

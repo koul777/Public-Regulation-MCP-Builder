@@ -1285,7 +1285,15 @@ class RoutesRagTests(unittest.TestCase):
                 data_dir=Path(tmp) / "data",
                 artifact_root=Path(tmp),
                 api_auth_required=True,
-                api_auth_tokens=json.dumps({"op-secret": {"role": "operator", "actor": "operator"}}),
+                api_auth_tokens=json.dumps(
+                    {
+                        "op-secret": {
+                            "role": "operator",
+                            "actor": "operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
             )
             repository = JsonRepository(settings)
             repository.upsert_document(

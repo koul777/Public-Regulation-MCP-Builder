@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.audit_mcp_index_visibility import audit_mcp_index_visibility
 from scripts.mcp_bundle_contract import REQUIRED_SETUP_BUNDLE_FILES
 from scripts.report_metadata import current_repo_commit
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 
 
 PROFILE_ALIASES = {
@@ -735,7 +735,7 @@ def _unexpected_runtime_vector_store_files(runtime_dir: Path) -> list[Path]:
     tenant_id = str(payload.get("tenant_id") or "").strip() if payload else ""
     if not tenant_id:
         return []
-    expected_storage_key = tenant_storage_key(tenant_id)
+    expected_storage_key = tenant_directory_key(tenant_id)
     vector_dir = runtime_dir / "vector_db"
     if not vector_dir.is_dir():
         return []

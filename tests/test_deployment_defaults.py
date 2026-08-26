@@ -9,6 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class DeploymentDefaultsTests(unittest.TestCase):
     def test_env_example_defaults_to_secure_runtime_mode(self):
         env_values = self._read_env_example()
+        env_text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
 
         self.assertEqual("production", env_values.get("APP_ENV"))
         self.assertEqual("true", env_values.get("API_AUTH_REQUIRED"))
@@ -16,6 +17,10 @@ class DeploymentDefaultsTests(unittest.TestCase):
         self.assertEqual("local", env_values.get("STREAMLIT_APP_ENV"))
         self.assertEqual("false", env_values.get("STREAMLIT_API_AUTH_REQUIRED"))
         self.assertEqual("false", env_values.get("STREAMLIT_TENANT_STORAGE_ISOLATION"))
+        self.assertIn("Legacy API_AUTH_TOKEN is local/development compatibility only", env_text)
+        self.assertIn('"actor":"batch-operator"', env_text)
+        self.assertIn('"tenant_id":"default"', env_text)
+        self.assertNotIn('"viewer-token":"viewer"', env_text)
 
     def test_docker_compose_uses_dotenv_not_example_file(self):
         compose_text = self._read_docker_compose()
@@ -34,7 +39,7 @@ class DeploymentDefaultsTests(unittest.TestCase):
         compose_text = self._read_docker_compose()
 
         self.assertIn("API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}", compose_text)
-        self.assertIn("API_AUTH_TOKENS: ${API_AUTH_TOKENS:-}", compose_text)
+        self.assertIn('API_AUTH_TOKENS: "${API_AUTH_TOKENS:-}"', compose_text)
 
     def test_api_service_declares_ready_healthcheck(self):
         compose_text = self._read_docker_compose()
@@ -45,13 +50,16 @@ class DeploymentDefaultsTests(unittest.TestCase):
     def test_shared_deployment_overlay_requires_production_auth_and_isolation(self):
         overlay = (REPO_ROOT / "docker-compose.shared.yml").read_text(encoding="utf-8")
 
-        self.assertIn("env_file:", overlay)
+        self.assertIn("env_file: !override", overlay)
         self.assertIn("- .env.shared", overlay)
         self.assertIn('APP_ENV: production', overlay)
         self.assertIn('API_AUTH_REQUIRED: "true"', overlay)
         self.assertIn('API_AUDIT_ENABLED: "true"', overlay)
         self.assertIn('TENANT_STORAGE_ISOLATION: "true"', overlay)
-        self.assertIn("API_AUTH_TOKEN:?Set API_AUTH_TOKEN", overlay)
+        self.assertIn('API_AUTH_TOKEN: ""', overlay)
+        self.assertIn("API_AUTH_TOKENS:?Set structured API_AUTH_TOKENS", overlay)
+        self.assertIn("API_DEFAULT_TENANT_ID:?Set a canonical lowercase", overlay)
+        self.assertIn("--env-file .env.shared", overlay)
 
     def test_shared_env_example_is_secretless_and_protected(self):
         shared = (REPO_ROOT / ".env.shared.example").read_text(encoding="utf-8")
@@ -61,7 +69,10 @@ class DeploymentDefaultsTests(unittest.TestCase):
         self.assertIn("API_AUDIT_ENABLED=true", shared)
         self.assertIn("TENANT_STORAGE_ISOLATION=true", shared)
         self.assertIn("API_AUTH_TOKEN=", shared)
-        self.assertIn("Inject API_AUTH_TOKEN at deployment time", shared)
+        self.assertIn("Legacy API_AUTH_TOKEN is deliberately disabled", shared)
+        self.assertIn("API_AUTH_TOKENS=", shared)
+        self.assertIn("API_DEFAULT_TENANT_ID=tenant-a", shared)
+        self.assertIn('"actor":"release-operator"', shared)
 
     def test_github_workflows_are_limited_to_reviewed_release_and_protection_harnesses(self):
         try:

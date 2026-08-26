@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 
 from app.core.config import Settings
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import (
+    settings_for_tenant,
+    tenant_directory_key,
+    tenant_storage_key,
+)
 
 
 class TenantAccessTests(unittest.TestCase):
@@ -26,10 +30,17 @@ class TenantAccessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp), tenant_storage_isolation=True)
 
-            scoped = settings_for_tenant(settings, "../tenant-a")
+            scoped = settings_for_tenant(settings, "tenant-a")
 
         self.assertEqual(scoped.data_dir, Path(tmp) / "tenants" / "tenant-a")
         self.assertEqual(scoped.api_auth_token, settings.api_auth_token)
+
+    def test_tenant_directory_key_rejects_colliding_or_noncanonical_ids(self) -> None:
+        self.assertEqual(tenant_directory_key("tenant-a"), "tenant-a")
+        for tenant_id in ("a/b", "a?b", "Tenant-a", " tenant-a", "tenant-a "):
+            with self.subTest(tenant_id=tenant_id):
+                with self.assertRaises(ValueError):
+                    tenant_directory_key(tenant_id)
 
 
 if __name__ == "__main__":

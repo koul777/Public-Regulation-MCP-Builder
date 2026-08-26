@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.config import Settings
 from app.core.pipeline import PREPROCESSOR_PIPELINE_VERSION
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.ingestion.embedding_adapter import EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION
 from app.ingestion.vector_adapter import (
     ALLOWED_SECURITY_LEVELS,
@@ -210,7 +210,7 @@ def _chunk_belongs_to_tenant(chunk: dict[str, Any], tenant_id: str) -> bool:
 
 
 def _load_vector_records(effective_dir: Path, *, tenant_id: str) -> list[dict[str, Any]]:
-    vector_path = effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     if not vector_path.is_file():
         return []
     rows: list[dict[str, Any]] = []

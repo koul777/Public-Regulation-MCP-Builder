@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import Settings
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.services.regulation_catalog_service import read_regulation_metadata
 from scripts.report_metadata import current_repo_commit
 
@@ -620,7 +620,7 @@ def _is_tenant_isolated(
 ) -> bool:
     if tenant_storage_isolation is not None:
         return tenant_storage_isolation
-    return runtime_data_dir.joinpath("tenants", tenant_storage_key(tenant_id)).is_dir()
+    return runtime_data_dir.joinpath("tenants", tenant_directory_key(tenant_id)).is_dir()
 
 
 def _load_runtime_chunks(effective_dir: Path) -> list[dict[str, Any]]:
@@ -654,7 +654,7 @@ def _chunk_belongs_to_tenant(chunk: dict[str, Any], tenant_id: str) -> bool:
 
 
 def _load_vector_records(effective_dir: Path, *, tenant_id: str) -> list[dict[str, Any]]:
-    vector_path = effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     return _load_jsonl(vector_path) if vector_path.is_file() else []
 
 

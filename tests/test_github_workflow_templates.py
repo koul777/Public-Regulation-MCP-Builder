@@ -17,6 +17,35 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertNotIn("match.start(1)", text)
         self.assertNotIn("match.end(1)", text)
 
+    def test_auto_release_runs_public_gates_before_versioning_and_publish(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
+        text = path.read_text(encoding="utf-8")
+
+        hygiene_command = (
+            "python scripts/audit_release_hygiene.py --workflow-scope available "
+            "--include-untracked --include-source-path-scan"
+        )
+        public_gate_command = (
+            "python scripts/run_public_release_gate.py --root . "
+            "--include-untracked --fail-on-blocked"
+        )
+        release_steps = (
+            "Determine and write the release version",
+            "Build release artifacts",
+            "Build Windows portable ZIP",
+            "Commit the release version and tag it",
+            "Publish GitHub Release",
+        )
+
+        self.assertIn(hygiene_command, text)
+        self.assertIn(public_gate_command, text)
+        hygiene_index = text.index(hygiene_command)
+        public_gate_index = text.index(public_gate_command)
+        for release_step in release_steps:
+            release_step_index = text.index(release_step)
+            self.assertLess(hygiene_index, release_step_index)
+            self.assertLess(public_gate_index, release_step_index)
+
     def test_preprocessing_policy_never_executes_pull_request_code(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "preprocessing-change-policy.yml"
         text = path.read_text(encoding="utf-8")

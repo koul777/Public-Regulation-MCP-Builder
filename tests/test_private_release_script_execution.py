@@ -19,7 +19,17 @@ class PrivateReleaseScriptExecutionTests(unittest.TestCase):
                 **os.environ,
                 "APP_ENV": "production",
                 "API_AUTH_REQUIRED": "true",
-                "API_AUTH_TOKEN": "secret",
+                "API_AUTH_TOKEN": "",
+                "API_AUTH_TOKENS": json.dumps(
+                    {
+                        "secret": {
+                            "role": "admin",
+                            "actor": "private-release-readiness",
+                            "tenant_id": "default",
+                        }
+                    }
+                ),
+                "API_DEFAULT_TENANT_ID": "default",
                 "TENANT_STORAGE_ISOLATION": "true",
                 "API_AUDIT_ENABLED": "true",
                 "DATA_DIR": str(Path(tmp) / "data"),
