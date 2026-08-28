@@ -21,6 +21,16 @@ class RetrievalTokenizerTests(unittest.TestCase):
             tokenize(nfd, tokenizer_model=FALLBACK_TOKENIZER_MODEL),
         )
 
+    def test_tokenize_normalizes_fullwidth_article_numbers(self) -> None:
+        self.assertEqual(
+            tokenize("제12조 적용 범위", tokenizer_model=FALLBACK_TOKENIZER_MODEL),
+            tokenize("제１２조 적용 범위", tokenizer_model=FALLBACK_TOKENIZER_MODEL),
+        )
+        self.assertIn(
+            "제12조",
+            tokenize("제１２조", tokenizer_model=FALLBACK_TOKENIZER_MODEL),
+        )
+
     def test_korean_particle_variant_includes_base_noun(self) -> None:
         tokens = tokenize("병가를 사용한 직원")
 

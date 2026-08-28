@@ -125,6 +125,7 @@ class PackagingEntrypointTests(unittest.TestCase):
         self.assertIn("원래 PC에서 생성 폴더를 그대로 사용하는 경우", readme)
         self.assertIn(".\\.venv\\Scripts\\python.exe -m streamlit", readme)
         self.assertIn("scripts\\build_windows_portable.ps1", readme)
+        self.assertIn("--portable-python", readme)
         self.assertIn("프로젝트 폴더의 `data\\`", readme)
 
     def test_windows_installer_stops_when_python_or_venv_is_missing(self) -> None:
@@ -348,6 +349,8 @@ class PackagingEntrypointTests(unittest.TestCase):
         self.assertIn('@("--version")', build_script)
         self.assertIn("WaitForExit(60000)", build_script)
         self.assertIn("$ProbeProcess.Handle", build_script)
+        self.assertIn("return $StdoutText", build_script)
+        self.assertNotIn('return "$StdoutText`n$StderrText"', build_script)
         self.assertIn("pr-mcp-builder-windows-artifact-v1", build_script)
         self.assertIn("pr-mcp-builder-wheel-source-v1", build_script)
         self.assertIn("Get-FileHash", build_script)
@@ -419,10 +422,14 @@ class PackagingEntrypointTests(unittest.TestCase):
 
         self.assertIn("[switch]$RecreateBuildVenv", build_script)
         self.assertIn("$RecreateBuildVenv -and $SkipExeBuild", build_script)
-        self.assertIn("$ExpectedBuildVenv", build_script)
+        self.assertIn("$PreferredBuildVenv", build_script)
+        self.assertIn("function Assert-SafeBuildVenvPath", build_script)
+        self.assertIn("function Test-PathWithinRoot", build_script)
         self.assertIn("[System.StringComparison]::OrdinalIgnoreCase", build_script)
         self.assertIn("[System.IO.FileAttributes]::ReparsePoint", build_script)
-        self.assertIn("Remove-Item -LiteralPath $BuildVenv -Recurse -Force", build_script)
+        self.assertIn("Remove-Item -LiteralPath $BuildVenv -Recurse -Force -ErrorAction Stop", build_script)
+        self.assertIn('Join-Path $BuildRoot (".build-venv-" + [Guid]::NewGuid().ToString("N"))', build_script)
+        self.assertIn("Unable to remove the existing .build-venv cleanly", build_script)
 
     @unittest.skipUnless(os.name == "nt", "Windows portable script requires PowerShell")
     def test_skip_exe_build_fails_closed_without_bound_executable(self) -> None:

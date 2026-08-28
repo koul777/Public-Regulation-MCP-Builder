@@ -12,7 +12,7 @@ from app.parsers.archive_safety import (
     validate_office_archive_file_size,
 )
 from app.parsers.base import BaseParser, ParserError, document_name_from_path, parser_uncertainty_metadata
-from app.parsers.xml_safety import reject_unsafe_xml_declarations
+from app.parsers.xml_safety import elementtree_xml_input, reject_unsafe_xml_declarations
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 
@@ -68,8 +68,12 @@ class HwpxParser(BaseParser):
                     )
                     try:
                         reject_unsafe_xml_declarations(payload, format_name="HWPX")
-                        root = ElementTree.fromstring(payload)
-                    except ElementTree.ParseError:
+                        root = ElementTree.fromstring(elementtree_xml_input(payload))
+                    except (ElementTree.ParseError, LookupError, UnicodeError, ValueError) as exc:
+                        if xml_role == "body":
+                            raise ParserError(
+                                "HWPX body XML is malformed; processing stopped to prevent missing regulation content."
+                            ) from exc
                         parse_error_sections.append(info.filename)
                         continue
                     for block in self._blocks(root, info.filename, xml_role=xml_role):

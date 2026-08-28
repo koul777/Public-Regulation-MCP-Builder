@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agents.base import AgentResult, BaseAgent
+from app.ingestion.vector_adapter import APPROVED_CHUNK_STATUS
 from app.rag.extractive_answer import NO_EVIDENCE_ANSWER
 from app.rag.output_filter import sanitize_rag_answer
 
@@ -23,12 +24,25 @@ class CitationVerifierAgent(BaseAgent):
         evidence = _validated_evidence(payload.get("evidence"))
         requested_ids = _requested_ids(payload.get("evidence_ids"))
 
+        if answer == NO_EVIDENCE_ANSWER:
+            return AgentResult(
+                {
+                    "role_id": "citation_verifier",
+                    "status": "abstained",
+                    "verified_answer": NO_EVIDENCE_ANSWER,
+                    "citations": [],
+                    "verified_evidence_ids": [],
+                    "findings": ["answer_abstained"],
+                    "verification_mode": "evidence_identity_only",
+                }
+            )
+
         if not evidence:
             return AgentResult(
                 {
                     "role_id": "citation_verifier",
-                    "status": "abstained" if answer == NO_EVIDENCE_ANSWER else "rejected",
-                    "verified_answer": NO_EVIDENCE_ANSWER if answer == NO_EVIDENCE_ANSWER else "",
+                    "status": "rejected",
+                    "verified_answer": "",
                     "citations": [],
                     "verified_evidence_ids": [],
                     "findings": ["evidence_empty"],
@@ -40,7 +54,16 @@ class CitationVerifierAgent(BaseAgent):
         if requested_ids and any(identifier not in evidence_by_id for identifier in requested_ids):
             return _rejected("answer_evidence_id_not_in_retrieval")
 
-        citations = [_public_citation(item) for item in evidence]
+        citation_evidence = evidence
+        if requested_ids:
+            requested_id_set = set(requested_ids)
+            citation_evidence = [
+                item
+                for item in evidence
+                if requested_id_set.intersection(_item_ids(item))
+            ]
+
+        citations = [_public_citation(item) for item in citation_evidence]
         citations = [citation for citation in citations if citation["evidence_id"]]
         if not citations:
             return _rejected("citation_identity_missing")
@@ -63,7 +86,15 @@ def _validated_evidence(value: Any) -> list[dict[str, Any]]:
         return []
     if not isinstance(value, list):
         raise ValueError("citation_verifier evidence must be a list")
-    return [dict(item) for item in value if isinstance(item, dict)]
+    validated: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("citation_verifier evidence items must be objects")
+        approval_status = str(item.get("approval_status") or "").strip().lower()
+        if approval_status and approval_status != APPROVED_CHUNK_STATUS:
+            raise ValueError("citation_verifier received non-approved evidence")
+        validated.append(dict(item))
+    return validated
 
 
 def _requested_ids(value: Any) -> list[str]:

@@ -5,9 +5,15 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.core.config import Settings
-from app.core.tenant_access import institution_storage_dir
+from app.core.tenant_access import institution_storage_dir, tenant_storage_key
+from app.retrieval.bm25_index import (
+    default_bm25_index_path,
+    load_bm25_index,
+    write_bm25_index,
+)
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.schemas.run import ProcessingRun
@@ -151,6 +157,95 @@ class InstitutionPurgeServiceTests(unittest.TestCase):
 
             self.assertEqual(1, result.deindexed_record_count)
             self.assertEqual("", vector_path.read_text(encoding="utf-8").strip())
+
+    def test_bm25_write_failure_converges_safely_on_retry(self) -> None:
+        """A retry must repair stale BM25 before deleting the source document."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, repository = self._seed(
+                root, profile_id="institution-abc", document_id="doc_purge_me"
+            )
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+            vector_path = settings.data_dir / "vector_db" / "default" / "approved_vectors.jsonl"
+            records = [
+                json.loads(line)
+                for line in vector_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            bm25_path = default_bm25_index_path(vector_path)
+            write_bm25_index(bm25_path, records)
+            real_write = write_bm25_index
+            call_count = 0
+
+            def flaky_write(path: Path, current_records) -> object:
+                nonlocal call_count
+                call_count += 1
+                materialized = list(current_records)
+                if call_count == 1:
+                    raise OSError("simulated BM25 write failure")
+                return real_write(path, materialized)
+
+            with patch(
+                "app.services.institution_purge_service.write_bm25_index",
+                side_effect=flaky_write,
+            ):
+                first = service.purge("institution-abc")
+                self.assertFalse(first.completed)
+                self.assertIsNotNone(repository.get_document("doc_purge_me"))
+                self.assertEqual("", vector_path.read_text(encoding="utf-8").strip())
+                self.assertEqual(1, len(load_bm25_index(bm25_path).documents))
+
+                second = service.purge("institution-abc")
+
+            repaired = load_bm25_index(bm25_path)
+            self.assertTrue(second.completed)
+            self.assertIsNone(repository.get_document("doc_purge_me"))
+            self.assertIsNotNone(repaired)
+            self.assertEqual([], repaired.documents)
+
+    def test_vector_artifact_failure_keeps_document_discoverable_for_retry(self) -> None:
+        """Post-index cleanup failure must not erase the durable retry target."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, repository = self._seed(
+                root, profile_id="institution-abc", document_id="doc_purge_me"
+            )
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+            artifact_dir = (
+                settings.data_dir
+                / "vector_ingestion"
+                / tenant_storage_key("doc_purge_me")
+            )
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "receipt.json").write_text("{}", encoding="utf-8")
+            real_remove = service._remove_vector_artifacts
+            call_count = 0
+
+            def flaky_remove(document_id: str, result) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    result.failures.append("simulated vector artifact failure")
+                    return
+                real_remove(document_id, result)
+
+            with patch.object(
+                service,
+                "_remove_vector_artifacts",
+                side_effect=flaky_remove,
+            ):
+                first = service.purge("institution-abc")
+                self.assertFalse(first.completed)
+                self.assertIsNotNone(repository.get_document("doc_purge_me"))
+                self.assertTrue(artifact_dir.is_dir())
+
+                second = service.purge("institution-abc")
+
+            self.assertTrue(second.completed)
+            self.assertIsNone(repository.get_document("doc_purge_me"))
+            self.assertFalse(artifact_dir.exists())
 
     def test_purge_leaves_other_institutions_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,12 +6,33 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import check_build_environment_isolation as isolation
 
 
 class BuildEnvironmentIsolationTests(unittest.TestCase):
+    def test_environment_probe_prefers_modern_name_without_importing_backends(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            venv = Path(temp_dir) / ".build-venv"
+            site_packages = venv / "Lib" / "site-packages"
+            probed_names: list[str] = []
+
+            def fake_find_spec(name: str):
+                probed_names.append(name)
+                return SimpleNamespace(origin=str(site_packages / name / "__init__.py"))
+
+            with (
+                patch.object(isolation.importlib.metadata, "distributions", return_value=[]),
+                patch.object(isolation.importlib.util, "find_spec", side_effect=fake_find_spec),
+                patch.object(isolation.sys, "prefix", str(venv)),
+            ):
+                report = isolation.inspect_current_environment(venv)
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(["pymupdf", "fitz"], probed_names)
+
     def test_artifact_sources_pass_only_under_explicit_allowed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -2147,6 +2147,84 @@ class RoutesDocumentsTests(unittest.TestCase):
         ])
         self.assertEqual(1, approvals[0]["review_attention_chunk_count"])
 
+    def test_approve_review_chunks_requires_ack_for_damaged_text_and_missing_source_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_damaged_source",
+                    filename="damaged-source.pdf",
+                    document_name="Damaged Source",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            repository.save_processing_result(
+                "doc_damaged_source",
+                [],
+                [
+                    Chunk(
+                        chunk_id="chunk-damaged",
+                        document_id="doc_damaged_source",
+                        chunk_type="article",
+                        text="손상된 글자 � 포함",
+                        retrieval_text="손상된 글자 � 포함",
+                        metadata={
+                            "source_page_unavailable_reason": "kordoc_table_source_page_missing",
+                        },
+                    )
+                ],
+                [],
+            )
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id="doc_damaged_source",
+                chunks=repository.get_chunks("doc_damaged_source"),
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                with self.assertRaises(HTTPException) as raised:
+                    routes_documents.approve_review_chunks(
+                        "doc_damaged_source",
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-damaged"],
+                            approval_id="approval-damaged-source",
+                            security_level="internal",
+                        ),
+                        _auth_context(),
+                    )
+                response = routes_documents.approve_review_chunks(
+                    "doc_damaged_source",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-damaged"],
+                        approval_id="approval-damaged-source",
+                        security_level="internal",
+                        review_flags_acknowledged=True,
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+            approvals = JsonRepository(settings).list_approval_records("doc_damaged_source")
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertIn("Review flags must be acknowledged", raised.exception.detail)
+        self.assertEqual("approval-damaged-source", response["approval_id"])
+        self.assertEqual(1, approvals[0]["review_attention_chunk_count"])
+        self.assertIn("replacement_character", approvals[0]["review_attention_flags"])
+        self.assertIn("source_page_unavailable_reason", approvals[0]["review_attention_flags"])
+        self.assertEqual(
+            [
+                "replacement_character",
+                "source_page_unavailable_reason",
+            ],
+            approvals[0]["approved_chunks"][0]["review_attention_reasons"],
+        )
+
     def test_approve_review_chunks_requires_ack_for_parser_uncertainty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4445,7 +4523,12 @@ def _sha256_file(path: Path) -> str:
 
 
 def _auth_context() -> AuthContext:
-    return AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+    return AuthContext(
+        actor="tester",
+        tenant_id="tenant-a",
+        auth_mode="api_token",
+        role="admin",
+    )
 
 
 if __name__ == "__main__":

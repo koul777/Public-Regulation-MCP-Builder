@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from streamlit.testing.v1 import AppTest
@@ -17,10 +18,13 @@ from app.core.institution_profiles import (
     InstitutionProfileRegistry,
     institution_profile_registry_to_bytes,
     load_institution_profile_registry,
+    save_institution_profile_registry,
 )
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.schemas.run import ProcessingRun
+from app.services.document_service import DocumentService
+from app.services.institution_purge_service import InstitutionPurgeService
 from app.storage.repository import JsonRepository
 
 
@@ -44,7 +48,173 @@ def _seed_app_institution_context(app) -> None:
     app.session_state["selected_institution_profile_id"] = "test-profile"
 
 
+def _confirm_rendered_approval_rows(app) -> None:
+    """Exercise every explicit approval control currently visible in the sheet."""
+
+    reflect_keys = [
+        button.key
+        for button in app.button
+        if button.label == "수정 필요로 판단"
+    ]
+    for key in reflect_keys:
+        next(button for button in app.button if button.key == key).click().run()
+
+    resolution_note_keys = [
+        area.key
+        for area in app.text_area
+        if area.label == "수정 필요 항목 처리 메모"
+    ]
+    for key in resolution_note_keys:
+        next(area for area in app.text_area if area.key == key).set_value(
+            "AI 지적을 원문과 대조해 처리했습니다."
+        ).run()
+
+    ai_confirmation_keys = [
+        checkbox.key
+        for checkbox in app.checkbox
+        if checkbox.label in {
+            "AI 검수 항목에 대한 판단을 모두 확인했습니다.",
+            "AI 검수 항목이 없음을 확인했습니다.",
+        }
+    ]
+    for key in ai_confirmation_keys:
+        next(checkbox for checkbox in app.checkbox if checkbox.key == key).set_value(True).run()
+
+    human_confirmation_keys = [
+        checkbox.key
+        for checkbox in app.checkbox
+        if checkbox.label
+        == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+    ]
+    for key in human_confirmation_keys:
+        next(checkbox for checkbox in app.checkbox if checkbox.key == key).set_value(True).run()
+
+
 class StreamlitApprovalAppTests(unittest.TestCase):
+    def test_home_document_delete_requires_explicit_confirmation(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            repository = JsonRepository(settings)
+            document = repository.get_document("doc_streamlit_approval")
+            self.assertIsNotNone(document)
+            source_path = DocumentService(
+                settings=settings,
+                repository=repository,
+            ).path_for(document)
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(b"synthetic source")
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["nav_page"] = "🏠 시작하기"
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+            next(button for button in app.button if button.label == "삭제").click().run()
+
+            self.assertIsNotNone(repository.get_document("doc_streamlit_approval"))
+            self.assertTrue(source_path.is_file())
+            permanent_delete = next(
+                button for button in app.button if button.label == "영구 삭제"
+            )
+            self.assertTrue(permanent_delete.disabled)
+            next(button for button in app.button if button.label == "취소").click().run()
+            self.assertIsNotNone(repository.get_document("doc_streamlit_approval"))
+            self.assertTrue(source_path.is_file())
+
+            next(button for button in app.button if button.label == "삭제").click().run()
+            next(
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label == "이 문서와 원본 파일의 영구 삭제를 확인했습니다."
+            ).set_value(True).run()
+            next(button for button in app.button if button.label == "영구 삭제").click().run()
+
+            deleted_document = repository.get_document("doc_streamlit_approval")
+            source_exists_after_delete = source_path.exists()
+
+        self.assertFalse(app.exception)
+        self.assertIsNone(deleted_document)
+        self.assertFalse(source_exists_after_delete)
+
+    def test_preprocess_document_delete_requires_second_confirmation(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            repository = JsonRepository(settings)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["nav_page"] = "① 문서 올려서 전처리"
+            app.session_state["beginner_guide_enabled"] = False
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+            next(
+                item
+                for item in app.multiselect
+                if item.label == "삭제할 이전 전처리 작업"
+            ).select(app.multiselect[-1].options[0]).run()
+            next(
+                button
+                for button in app.button
+                if button.label == "선택한 전처리 작업 삭제"
+            ).click().run()
+
+            self.assertIsNotNone(repository.get_document("doc_streamlit_approval"))
+            permanent_delete = next(
+                button
+                for button in app.button
+                if button.label == "선택 작업 영구 삭제"
+            )
+            self.assertTrue(permanent_delete.disabled)
+
+            next(
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "선택한 문서와 관련 검색·승인 기록의 영구 삭제를 확인했습니다."
+            ).set_value(True).run()
+            next(
+                button
+                for button in app.button
+                if button.label == "선택 작업 영구 삭제"
+            ).click().run()
+
+            deleted_document = repository.get_document("doc_streamlit_approval")
+
+        self.assertFalse(app.exception)
+        self.assertIsNone(deleted_document)
+
     def test_empty_institution_registry_stops_cleanly(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
@@ -271,6 +441,103 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertEqual({}, saved_registry.profiles)
         self.assertEqual([], remaining_documents)
 
+    def test_institution_delete_keeps_profile_when_deindex_fails(self) -> None:
+        """A failed deindex must leave the profile, document, and index discoverable."""
+
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            repository.upsert_document(
+                Document(
+                    document_id="doc_failed_institution_purge",
+                    filename="인사규정.hwp",
+                    document_name="인사규정",
+                    file_type="hwp",
+                    file_hash="failed-purge-hash",
+                    tenant_id="default",
+                    profile_id="existing-profile",
+                    status="completed",
+                )
+            )
+            registry = InstitutionProfileRegistry(
+                profiles={
+                    "existing-profile": InstitutionProfile(
+                        profile_id="existing-profile",
+                        display_name="삭제 실패 기관",
+                        institution_name="삭제 실패 기관",
+                        tenant_id="default",
+                    )
+                },
+                default_profile_id="existing-profile",
+            )
+            registry_path = settings.data_dir / "institution_profiles.json"
+            save_institution_profile_registry(registry_path, registry)
+            vector_path = settings.data_dir / "vector_db" / "default" / "approved_vectors.jsonl"
+            vector_path.parent.mkdir(parents=True, exist_ok=True)
+            vector_bytes = (
+                json.dumps(
+                    {
+                        "id": "failed-purge-chunk",
+                        "document_id": "doc_failed_institution_purge",
+                        "text": "제1조 본문",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            vector_path.write_bytes(vector_bytes)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.session_state["institution_profile_registry_bytes"] = (
+                institution_profile_registry_to_bytes(registry)
+            )
+            app.run()
+            next(button for button in app.button if button.label == "기관 삭제").click().run()
+            app.text_input[-1].set_value("삭제 실패 기관").run()
+
+            def fail_deindex(_service, _documents, result) -> int:
+                result.failures.append("simulated deindex failure")
+                return 0
+
+            with patch.object(
+                InstitutionPurgeService,
+                "_deindex_documents",
+                fail_deindex,
+            ):
+                next(
+                    button for button in app.button if button.label == "삭제 확인"
+                ).click().run()
+
+            saved_registry = load_institution_profile_registry(registry_path)
+            remaining_document = JsonRepository(settings).get_document(
+                "doc_failed_institution_purge"
+            )
+            remaining_vector_bytes = vector_path.read_bytes()
+
+        self.assertFalse(app.exception)
+        self.assertIn("existing-profile", saved_registry.profiles)
+        self.assertIsNotNone(remaining_document)
+        self.assertEqual(vector_bytes, remaining_vector_bytes)
+        self.assertTrue(
+            any("기관 프로필을 유지했습니다" in str(item.value) for item in app.error)
+        )
+
     def test_local_quality_profile_save_persists_without_env_path(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
@@ -376,8 +643,13 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             body = "\n".join(str(markdown.value) for markdown in app.markdown)
             self.assertIn("\u2462 \uac80\uc218\ud558\uace0 \uc2b9\uc778", body)
 
-            # The AI/human sign-off is filled in automatically as soon as the pending
-            # chunk renders \u2014 no per-item or per-chunk confirmation click is needed.
+            approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
+            self.assertTrue(approve.disabled)
+            self.assertNotIn(
+                "approval:doc_streamlit_approval:chunk-streamlit:human_confirmed",
+                app.session_state.filtered_state,
+            )
+            _confirm_rendered_approval_rows(app)
             approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
             self.assertFalse(approve.disabled)
             approve.click().run()
@@ -412,6 +684,30 @@ class StreamlitApprovalAppTests(unittest.TestCase):
 
             edited = "사람이 직접 고친 최종 규정 본문"
             next(area for area in app.text_area if area.label == "제안 내용 수정").set_value(edited).run()
+            reflect_keys = [
+                button.key
+                for button in app.button
+                if button.label == "수정 필요로 판단"
+            ]
+            for key in reflect_keys:
+                next(button for button in app.button if button.key == key).click().run()
+            human_keys = [
+                checkbox.key
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+            ]
+            for key in human_keys:
+                next(checkbox for checkbox in app.checkbox if checkbox.key == key).set_value(
+                    True
+                ).run()
+            self.assertTrue(
+                all(
+                    not area.value
+                    for area in app.text_area
+                    if area.label == "수정 필요 항목 처리 메모"
+                )
+            )
             next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인").click().run()
 
             saved = JsonRepository(settings).get_chunks("doc_streamlit_approval")[0]
@@ -421,6 +717,230 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertEqual(edited, saved.retrieval_text)
         self.assertTrue(saved.metadata["human_review_edited"])
         self.assertEqual(64, len(saved.metadata["human_review_original_sha256"]))
+
+    def test_action_required_needs_edit_or_resolution_note_before_approval(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["document_id"] = "doc_streamlit_approval"
+            app.session_state["nav_page"] = "③ 검수하고 승인"
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+
+            reflect_keys = [
+                button.key
+                for button in app.button
+                if button.label == "수정 필요로 판단"
+            ]
+            for key in reflect_keys:
+                next(button for button in app.button if button.key == key).click().run()
+            human_checks = [
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+            ]
+            blocked_approve = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+            self.assertTrue(all(checkbox.disabled for checkbox in human_checks))
+            self.assertTrue(blocked_approve.disabled)
+
+            note_keys = [
+                area.key
+                for area in app.text_area
+                if area.label == "수정 필요 항목 처리 메모"
+            ]
+            for key in note_keys:
+                next(area for area in app.text_area if area.key == key).set_value(
+                    "원문 표와 대조해 현재 최종본이 맞음을 확인"
+                ).run()
+            human_keys = [
+                checkbox.key
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+            ]
+            for key in human_keys:
+                next(checkbox for checkbox in app.checkbox if checkbox.key == key).set_value(
+                    True
+                ).run()
+            resolved_approve = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+
+        self.assertFalse(app.exception)
+        self.assertTrue(note_keys)
+        self.assertFalse(resolved_approve.disabled)
+
+    def test_edit_after_confirmation_invalidates_sign_off(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["document_id"] = "doc_streamlit_approval"
+            app.session_state["nav_page"] = "③ 검수하고 승인"
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+            _confirm_rendered_approval_rows(app)
+            ready_button = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+            self.assertFalse(ready_button.disabled)
+
+            next(
+                area for area in app.text_area if area.label == "제안 내용 수정"
+            ).set_value("확인 뒤 다시 고친 본문").run()
+            blocked_button = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+
+        self.assertTrue(blocked_button.disabled)
+        self.assertFalse(
+            app.session_state[
+                "approval:doc_streamlit_approval:chunk-streamlit:human_confirmed"
+            ]
+        )
+
+    def test_paginated_approval_requires_confirmation_for_unseen_row(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_many_chunk_document(settings, chunk_count=26)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=30,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["document_id"] = "doc_streamlit_many"
+            app.session_state["nav_page"] = "③ 검수하고 승인"
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+
+            self.assertEqual(
+                25,
+                len([area for area in app.text_area if area.label == "제안 내용 수정"]),
+            )
+            self.assertNotIn(
+                "approval:doc_streamlit_many:chunk-many-26:human_confirmed",
+                app.session_state.filtered_state,
+            )
+            first_page_confirmations = [
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+            ]
+            self.assertEqual(25, len(first_page_confirmations))
+            for checkbox in first_page_confirmations:
+                checkbox.set_value(True)
+            app.run()
+            for index in range(1, 26):
+                self.assertTrue(
+                    app.session_state[
+                        f"approval:doc_streamlit_many:chunk-many-{index:02d}:human_confirmed"
+                    ]
+                )
+            first_page_button = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+            self.assertTrue(first_page_button.disabled)
+
+            page_control = next(
+                control
+                for control in app.number_input
+                if str(control.label).startswith("검증 시트 쪽")
+            )
+            page_control.set_value(2).run()
+            self.assertEqual(
+                1,
+                len([area for area in app.text_area if area.label == "제안 내용 수정"]),
+            )
+            second_page_confirmation = next(
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+            )
+            second_page_confirmation.set_value(True).run()
+            all_pages_button = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+            next(
+                control
+                for control in app.number_input
+                if str(control.label).startswith("검증 시트 쪽")
+            ).set_value(1).run()
+            first_page_after_round_trip = [
+                checkbox
+                for checkbox in app.checkbox
+                if checkbox.label
+                == "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다."
+            ]
+
+        self.assertFalse(app.exception)
+        self.assertFalse(all_pages_button.disabled)
+        self.assertEqual(25, len(first_page_after_round_trip))
+        self.assertTrue(all(checkbox.value for checkbox in first_page_after_round_trip))
 
     def test_primary_next_button_uses_transition_dialog_then_changes_page(self) -> None:
         if AppTest is None:
@@ -490,9 +1010,8 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
 
     def test_approval_tabs_approve_only_reviewed_compare_chunk(self) -> None:
-        # Historically only the single "selected" chunk was approved. The redesigned
-        # continuous-scroll screen auto-confirms and approves every pending chunk in
-        # the open regulation together with one click \u2014 there is no per-chunk focus.
+        # The continuous-scroll screen approves the open regulation only after every
+        # pending row has an explicit review decision and human confirmation.
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
@@ -513,6 +1032,9 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
+            approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
+            self.assertTrue(approve.disabled)
+            _confirm_rendered_approval_rows(app)
             approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
             approve.click().run()
 
@@ -547,9 +1069,9 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            # The bulk "AI 검수 완료" / "사람 확인 완료" buttons are gone — sign-off
-            # is filled in automatically as soon as the pending chunks render.
-
+            approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
+            self.assertTrue(approve.disabled)
+            _confirm_rendered_approval_rows(app)
             approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
             ai_decisions = app.session_state["approval:doc_streamlit_approval:chunk-streamlit:ai_decisions"]
             first_human = app.session_state["approval:doc_streamlit_approval:chunk-streamlit:human_confirmed"]
@@ -586,10 +1108,101 @@ class StreamlitApprovalAppTests(unittest.TestCase):
                 events_by_chunk[chunk_id],
             )
 
+    def test_override_approval_records_only_approved_without_review_event(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["document_id"] = "doc_streamlit_approval"
+            app.session_state["nav_page"] = "③ 검수하고 승인"
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+
+            reason = "별도 결재 문서에서 원문 대조를 완료한 긴급 배포"
+            next(
+                area for area in app.text_area if area.label == "확인 생략 승인 사유"
+            ).set_value(reason).run()
+            approve = next(
+                button
+                for button in app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            )
+            self.assertFalse(approve.disabled)
+            approve.click().run()
+
+            approvals = JsonRepository(settings).list_approval_records(
+                "doc_streamlit_approval"
+            )
+            review_events = [
+                event
+                for record in approvals
+                for event in record.get("review_decision_events", [])
+                if isinstance(event, dict)
+            ]
+
+        self.assertFalse(app.exception)
+        self.assertEqual(["approved_without_review"], [event["event"] for event in review_events])
+        self.assertEqual(reason, review_events[0]["override_reason"])
+        self.assertFalse(approvals[0]["human_review_confirmed"])
+        self.assertFalse(approvals[0]["ai_review_confirmed"])
+        self.assertEqual(reason, approvals[0]["approval_override_reason"])
+
+    def test_beginner_mode_does_not_expose_approval_override(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            _seed_streamlit_approval_document(settings)
+            set_runtime_settings_overrides(
+                data_dir=settings.data_dir,
+                artifact_root=settings.artifact_root,
+            )
+            self.addCleanup(clear_runtime_settings_overrides)
+
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=20,
+            )
+            _seed_app_institution_context(app)
+            app.session_state["document_id"] = "doc_streamlit_approval"
+            app.session_state["nav_page"] = "③ 검수하고 승인"
+            app.session_state["beginner_guide_enabled"] = True
+            app.session_state["ai_connection_overrides"] = {
+                "data_dir": settings.data_dir,
+                "artifact_root": settings.artifact_root,
+            }
+            app.run()
+
+            override_areas = [
+                area
+                for area in app.text_area
+                if area.label == "확인 생략 승인 사유"
+            ]
+
+        self.assertFalse(app.exception)
+        self.assertEqual([], override_areas)
+
     def test_bulk_confirm_preserves_chunk_state_and_allows_remaining_review(self) -> None:
-        # There is no more chunk picker or bulk confirm buttons: every pending chunk
-        # renders at once with its own independent editable text, and sign-off is
-        # filled in automatically for all of them without switching focus.
+        # Every pending chunk renders with independent editable text and sign-off.
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
@@ -620,6 +1233,9 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             self.assertIn("second draft content", values)
 
             self.assertFalse(app.exception)
+            approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
+            self.assertTrue(approve.disabled)
+            _confirm_rendered_approval_rows(app)
             self.assertTrue(
                 app.session_state["approval:doc_streamlit_approval:chunk-streamlit:human_confirmed"]
             )
@@ -679,10 +1295,15 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            # Per-item reflect buttons and the "나머지 부분 ... 전체 완료" fill-in
-            # buttons are gone — every AI-flagged item is auto-marked reflected and
-            # every pending chunk auto-marked human-confirmed as soon as it renders.
-
+            self.assertNotIn(
+                "approval:doc_streamlit_approval:chunk-streamlit:ai_decisions",
+                app.session_state.filtered_state,
+            )
+            self.assertNotIn(
+                "approval:doc_streamlit_approval:chunk-streamlit:human_confirmed",
+                app.session_state.filtered_state,
+            )
+            _confirm_rendered_approval_rows(app)
             decisions = app.session_state[
                 "approval:doc_streamlit_approval:chunk-streamlit:ai_decisions"
             ]
@@ -721,8 +1342,9 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            # The bulk buttons are gone; auto-confirm covers every pending chunk
-            # regardless of any stale "selected chunk ids" left in session state.
+            approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
+            self.assertTrue(approve.disabled)
+            _confirm_rendered_approval_rows(app)
             approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
             approve.click().run()
 
@@ -793,6 +1415,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             # '전체 규정 확인'을 켠 뒤에만 일괄 검수·확정 화면이 열린다.
             app.session_state["approval-bulk-open-doc_streamlit_approval"] = True
             app.session_state["approval-batch-loaded-doc_streamlit_approval"] = True
+            app.session_state["approval-bulk-sheet-doc_streamlit_approval"] = True
             app.session_state["nav_page"] = "③ 검수하고 승인"
             app.session_state["ai_connection_overrides"] = {
                 "data_dir": settings.data_dir,
@@ -800,9 +1423,13 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            # The bulk "AI 검수 완료" / "사람 확인 완료" buttons are gone — the
-            # multi-regulation summary auto-confirms every pending chunk in every
-            # selected regulation before the real approve/index button is checked.
+            approve = next(
+                button
+                for button in app.button
+                if button.label == "전체 규정 최종 확정 · 선택한 2개 승인·색인"
+            )
+            self.assertTrue(approve.disabled)
+            _confirm_rendered_approval_rows(app)
             approve = next(
                 button
                 for button in app.button
@@ -849,6 +1476,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
+            _confirm_rendered_approval_rows(app)
             next(
                 button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인"
             ).click().run()
@@ -875,7 +1503,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             _seed_app_institution_context(app)
             app.session_state["document_id"] = "doc_streamlit_bundle"
             app.session_state["workflow_opened_document_id"] = "doc_streamlit_bundle"
-            # 인사규정만 열어 둔 상태. 복무규정 조항은 화면에 그려지지도 않는다.
+            # 인사규정만 열어 둔 상태에서는 복무규정 조항을 확인하지 않았으므로 차단된다.
             app.session_state["approval-regulation-unit-doc_streamlit_bundle"] = "제1호|인사규정"
             app.session_state["nav_page"] = "③ 검수하고 승인"
             app.session_state["ai_connection_overrides"] = {
@@ -884,6 +1512,16 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
+            approve_all = next(
+                button
+                for button in app.button
+                if button.label == "이 파일의 전체 규정 2개 최종 확정 · 승인하고 색인"
+            )
+            self.assertTrue(approve_all.disabled)
+            _confirm_rendered_approval_rows(app)
+            app.session_state["approval-regulation-unit-doc_streamlit_bundle"] = "제2호|복무규정"
+            app.run()
+            _confirm_rendered_approval_rows(app)
             approve_all = next(
                 button
                 for button in app.button
@@ -969,6 +1607,14 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             ]
             self.assertTrue(any("인사규정" in label for label in row_labels))
             self.assertTrue(any("복무규정" in label for label in row_labels))
+            decision_keys = [
+                str(button.key or "")
+                for button in app.button
+                if button.label == "수정 필요로 판단"
+            ]
+            self.assertEqual(2, len(decision_keys))
+            self.assertTrue(any("chunk-streamlit:" in key for key in decision_keys))
+            self.assertTrue(any("chunk-streamlit-service:" in key for key in decision_keys))
 
             edited = "전체 규정 확인에서 고친 복무규정 본문"
             service_area = next(
@@ -977,6 +1623,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
                 if "doc_streamlit_service" in str(area.key or "")
             )
             service_area.set_value(edited).run()
+            _confirm_rendered_approval_rows(app)
             next(
                 button
                 for button in app.button
@@ -1060,6 +1707,59 @@ def _seed_streamlit_approval_document(settings: Settings) -> None:
                     ],
                 }
             },
+        )
+    )
+
+
+def _seed_streamlit_many_chunk_document(
+    settings: Settings,
+    *,
+    chunk_count: int,
+) -> None:
+    repository = JsonRepository(settings)
+    repository.upsert_document(
+        Document(
+            document_id="doc_streamlit_many",
+            filename="many.pdf",
+            document_name="다중 조항 규정",
+            file_type="pdf",
+            file_hash="many-hash",
+            tenant_id="default",
+            status="completed",
+            institution_name="테스트기관",
+            source_system="LOCAL",
+            source_url="https://example.test/many.pdf",
+            profile_id="test-profile",
+        )
+    )
+    repository.save_processing_result(
+        "doc_streamlit_many",
+        [],
+        [
+            Chunk(
+                chunk_id=f"chunk-many-{index:02d}",
+                document_id="doc_streamlit_many",
+                chunk_type="article",
+                text=f"제{index}조 본문",
+                retrieval_text=f"제{index}조 본문",
+                metadata={"raw_text": f"제{index}조 원본"},
+            )
+            for index in range(1, chunk_count + 1)
+        ],
+        [],
+    )
+    now = datetime.now(timezone.utc)
+    repository.upsert_run(
+        ProcessingRun(
+            run_id="run-streamlit-many",
+            document_id="doc_streamlit_many",
+            job_id="job-streamlit-many",
+            tenant_id="default",
+            status="completed",
+            started_at=now,
+            completed_at=now,
+            elapsed_seconds=0.1,
+            stats={},
         )
     )
 
@@ -1207,13 +1907,40 @@ def _seed_streamlit_multi_approval_documents(settings: Settings) -> None:
         ],
         [],
     )
+    now = datetime.now(timezone.utc)
+    repository.upsert_run(
+        ProcessingRun(
+            run_id="run-streamlit-service",
+            document_id="doc_streamlit_service",
+            job_id="job-streamlit-service",
+            tenant_id="default",
+            status="completed",
+            started_at=now,
+            completed_at=now,
+            elapsed_seconds=0.1,
+            stats={
+                "agent_review": {
+                    "status": "planned",
+                    "candidate_count": 1,
+                    "selected_count": 1,
+                    "selected_candidates": [
+                        {
+                            "chunk_id": "chunk-streamlit-service",
+                            "chunk_type": "article",
+                            "reasons": ["summary_only_service_check"],
+                        }
+                    ],
+                }
+            },
+        )
+    )
 
 
 class ApprovalCompareSheetVisibilityTests(unittest.TestCase):
     """'전체 규정 확인'을 켜도 비교 시트가 사라지지 않아야 한다.
 
     아래 전체 목록은 '상태 불러오기' 버튼과 별도 체크박스를 더 눌러야 나온다. 체크박스를
-    켰다는 이유만으로 위 시트를 감추면, 그 사이 ③ 화면에는 원본·전처리본·AI 검수본이
+    켰다는 이유만으로 위 시트를 감추면, 그 사이 ③ 화면에는 원본·전처리본·AI 검수 의견이
     하나도 남지 않는다.
     """
 

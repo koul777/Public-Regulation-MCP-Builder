@@ -25,21 +25,11 @@ if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
 } else {
     $BuildRoot = [System.IO.Path]::GetFullPath($BuildRoot)
 }
-$BuildVenv = Join-Path $ProjectRoot ".build-venv"
+$PreferredBuildVenv = Join-Path $ProjectRoot ".build-venv"
+$BuildVenv = $PreferredBuildVenv
 $BuildPython = Join-Path $BuildVenv "Scripts\python.exe"
 $BuildPip = Join-Path $BuildVenv "Scripts\pip.exe"
 $IsolationHelper = Join-Path $ProjectRoot "scripts\check_build_environment_isolation.py"
-$ExpectedBuildVenv = [System.IO.Path]::GetFullPath(
-    (Join-Path $ProjectRoot ".build-venv")
-)
-$NormalizedBuildVenv = [System.IO.Path]::GetFullPath($BuildVenv)
-if (-not [string]::Equals(
-    $NormalizedBuildVenv,
-    $ExpectedBuildVenv,
-    [System.StringComparison]::OrdinalIgnoreCase
-)) {
-    throw "The build virtual environment target is not the project .build-venv directory."
-}
 if ($RecreateBuildVenv -and $SkipExeBuild) {
     throw "-RecreateBuildVenv cannot be combined with -SkipExeBuild."
 }
@@ -63,6 +53,60 @@ function Write-Utf8NoBom {
 function Get-Sha256Lower {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
     return (Get-FileHash -LiteralPath $LiteralPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Test-PathWithinRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$RootPath
+    )
+    $ResolvedPath = [System.IO.Path]::GetFullPath($LiteralPath)
+    $ResolvedRoot = [System.IO.Path]::GetFullPath($RootPath)
+    if ([string]::Equals(
+        $ResolvedPath,
+        $ResolvedRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $true
+    }
+    $RootWithSeparator = $ResolvedRoot.TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
+    return $ResolvedPath.StartsWith(
+        $RootWithSeparator,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Assert-SafeBuildVenvPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][string]$BuildRoot
+    )
+    $ResolvedPath = [System.IO.Path]::GetFullPath($LiteralPath)
+    $ResolvedProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $ResolvedBuildRoot = [System.IO.Path]::GetFullPath($BuildRoot)
+    $ResolvedPreferred = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot ".build-venv"))
+    if ([string]::Equals(
+        $ResolvedPath,
+        $ResolvedProjectRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or [string]::Equals(
+        $ResolvedPath,
+        $ResolvedBuildRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "The build virtual environment path must not resolve to a broad workspace root."
+    }
+    if (
+        -not [string]::Equals(
+            $ResolvedPath,
+            $ResolvedPreferred,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -and
+        -not (Test-PathWithinRoot -LiteralPath $ResolvedPath -RootPath $BuildRoot)
+    ) {
+        throw "The build virtual environment path must stay within the project .build-venv or build root."
+    }
 }
 
 function Get-PortableWheelSourceFingerprint {
@@ -236,9 +280,16 @@ function Invoke-PortableExecutableProbe {
             Get-Content -LiteralPath $ProbeStderr -Raw
         } else { "" }
         if ($ProbeProcess.ExitCode -ne 0) {
-            throw "Executable $ProbeName probe failed with exit code $($ProbeProcess.ExitCode)."
+            $FailureDetail = ([string]$StderrText).Trim()
+            if ([string]::IsNullOrWhiteSpace($FailureDetail)) {
+                throw "Executable $ProbeName probe failed with exit code $($ProbeProcess.ExitCode)."
+            }
+            throw "Executable $ProbeName probe failed with exit code $($ProbeProcess.ExitCode): $FailureDetail"
         }
-        return "$StdoutText`n$StderrText"
+        # Functional contracts are emitted on stdout.  Dependency warnings on
+        # stderr (for example PyMuPDF's legacy `fitz` warning) must not alter a
+        # version string or JSON probe payload.
+        return $StdoutText
     }
     finally {
         Remove-Item -LiteralPath $ProbeStdout -Force -ErrorAction SilentlyContinue
@@ -388,6 +439,7 @@ try {
     $WheelSourceFingerprint = Get-PortableWheelSourceFingerprint -ProjectRoot $ProjectRoot
     New-Item -ItemType Directory -Path $DistRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $BuildRoot -Force | Out-Null
+    Assert-SafeBuildVenvPath -LiteralPath $BuildVenv -ProjectRoot $ProjectRoot -BuildRoot $BuildRoot
 
     if (-not $SkipExeBuild) {
         if ($RecreateBuildVenv -and (Test-Path -LiteralPath $BuildVenv)) {
@@ -397,7 +449,19 @@ try {
             ) {
                 throw "Refusing to recreate a build virtual environment through a reparse point."
             }
-            Remove-Item -LiteralPath $BuildVenv -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $BuildVenv -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                $BuildVenv = Join-Path $BuildRoot (".build-venv-" + [Guid]::NewGuid().ToString("N"))
+                Assert-SafeBuildVenvPath -LiteralPath $BuildVenv -ProjectRoot $ProjectRoot -BuildRoot $BuildRoot
+                $BuildPython = Join-Path $BuildVenv "Scripts\python.exe"
+                $BuildPip = Join-Path $BuildVenv "Scripts\pip.exe"
+                Write-Warning (
+                    "Unable to remove the existing .build-venv cleanly; " +
+                    "falling back to a new isolated build venv under build root."
+                )
+            }
         }
         if (-not (Test-Path -LiteralPath $BuildPython)) {
             & $BasePython -m venv $BuildVenv

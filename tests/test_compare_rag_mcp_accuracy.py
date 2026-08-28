@@ -7,10 +7,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.compare_rag_mcp_accuracy import _expected_term_hits, compare_rag_mcp_accuracy
+from scripts.compare_rag_mcp_accuracy import (
+    _citation_subset_metrics,
+    _expected_term_hits,
+    compare_rag_mcp_accuracy,
+)
 
 
 class CompareRagMcpAccuracyTests(unittest.TestCase):
+    def test_citation_subset_metrics_detect_extraneous_evidence(self) -> None:
+        precision, extraneous = _citation_subset_metrics(
+            [
+                {"document_id": "doc-a", "chunk_id": "chunk-good"},
+                {"document_id": "doc-b", "chunk_id": "chunk-extra"},
+            ],
+            ["chunk-good"],
+        )
+
+        self.assertEqual(0.5, precision)
+        self.assertEqual(1, extraneous)
+
     def test_expected_term_hits_accept_spacing_variants(self) -> None:
         hits = _expected_term_hits(
             ["\ubcc4\ud45c 2-1", "\uc5f0\uad6c\uc9c1 \uc784\uc6a9\uc790\uaca9\uae30\uc900\ud45c"],
@@ -93,6 +109,7 @@ class CompareRagMcpAccuracyTests(unittest.TestCase):
                             "expected_terms": ["three years", "allowance"],
                             "expected_article_nos": ["Article 10"],
                             "expected_article_titles": ["Childcare Leave"],
+                            "expected_evidence_ids": ["chunk-10"],
                         }
                     ],
                     out_json=out_json,
@@ -111,6 +128,8 @@ class CompareRagMcpAccuracyTests(unittest.TestCase):
         )
         self.assertEqual(["three years", "allowance"], report["items"][0]["mcp"]["metrics"]["expected_term_hits"])
         self.assertEqual(1.0, report["items"][0]["mcp"]["metrics"]["citation_completeness_ratio"])
+        self.assertEqual(1.0, report["items"][0]["mcp"]["metrics"]["citation_subset_precision"])
+        self.assertEqual(0, report["summary"]["mcp_extraneous_citation_count"])
 
     def test_report_records_query_spec_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

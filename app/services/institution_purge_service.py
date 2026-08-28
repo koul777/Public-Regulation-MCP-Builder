@@ -69,12 +69,22 @@ class InstitutionPurgePlan:
 @dataclass
 class InstitutionPurgeResult:
     profile_id: str
+    requested_document_count: int = 0
     deleted_document_count: int = 0
     deindexed_record_count: int = 0
     deleted_export_count: int = 0
     deleted_source_file_count: int = 0
     deleted_journal_records: dict[str, int] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
+
+    @property
+    def completed(self) -> bool:
+        """Whether every requested document was removed without a cleanup failure."""
+
+        return (
+            not self.failures
+            and self.deleted_document_count == self.requested_document_count
+        )
 
 
 class InstitutionPurgeService:
@@ -159,16 +169,84 @@ class InstitutionPurgeService:
 
     def purge(self, profile_id: str) -> InstitutionPurgeResult:
         documents = self.documents_for_profile(profile_id)
-        result = InstitutionPurgeResult(profile_id=str(profile_id or "").strip())
-        document_ids = [str(document.document_id) for document in documents]
+        result = InstitutionPurgeResult(
+            profile_id=str(profile_id or "").strip(),
+            requested_document_count=len(documents),
+        )
+        self._purge_document_objects(documents, result)
+        if result.completed:
+            self._remove_profile_directories(profile_id, result)
+        return result
+
+    def purge_documents(self, document_ids: list[str] | tuple[str, ...]) -> InstitutionPurgeResult:
+        """Purge an explicit document set without touching its institution profile.
+
+        UI document deletion must use the same deindex, export, and journal
+        cleanup contract as institution deletion.  Unknown/stale identifiers
+        fail closed so a partially resolved selection is never deleted.
+        """
+
+        targets = tuple(
+            dict.fromkeys(
+                str(document_id or "").strip()
+                for document_id in document_ids
+                if str(document_id or "").strip()
+            )
+        )
+        result = InstitutionPurgeResult(
+            profile_id="",
+            requested_document_count=len(targets),
+        )
+        if not targets:
+            return result
+        by_id = {
+            str(document.document_id): document
+            for document in self.repository.list_documents()
+            if str(document.document_id) in set(targets)
+        }
+        missing = [document_id for document_id in targets if document_id not in by_id]
+        if missing:
+            result.failures.append("삭제 대상을 다시 확인해 주세요. 문서 상태가 변경되었습니다.")
+            return result
+        self._purge_document_objects([by_id[document_id] for document_id in targets], result)
+        return result
+
+    def _purge_document_objects(
+        self,
+        documents: list,
+        result: InstitutionPurgeResult,
+    ) -> None:
         # 색인을 먼저 끊는다. 순서를 뒤집으면 원본이 사라진 상태에서 색인만 남아,
         # MCP가 근거를 확인할 수 없는 답변을 계속 내놓는다.
         #
         # 규정 하나씩 끊으면 그때마다 색인 파일 전체(수백 MB)와 BM25 색인을 다시 쓴다.
         # 규정 300개짜리 기관에서는 그것만으로 한 시간이 넘었다. 한 번에 끊는다.
+        failure_count_before_deindex = len(result.failures)
         result.deindexed_record_count += self._deindex_documents(documents, result)
+        if len(result.failures) != failure_count_before_deindex:
+            # 색인 해제가 실패한 뒤 문서만 지우면 RAG/MCP에 고아 근거가 남는다.
+            # 안전하게 아무 문서도 지우지 않고 운영자가 다시 시도하게 한다.
+            return
         for document in documents:
             document_id = str(document.document_id)
+            # Keep the durable document row until every discoverable side
+            # artifact is gone.  If cleanup fails, the next UI render can still
+            # find the document and retry instead of treating the institution as
+            # empty while an orphan vector/export/journal remains.
+            failure_count_before_document = len(result.failures)
+            self._remove_vector_artifacts(document_id, result)
+            if len(result.failures) != failure_count_before_document:
+                continue
+            for path in self._export_paths([document_id]):
+                try:
+                    path.unlink()
+                    result.deleted_export_count += 1
+                except OSError as exc:
+                    result.failures.append(
+                        f"내보내기 파일 삭제 실패: {path.name} ({exc})"
+                    )
+            if len(result.failures) != failure_count_before_document:
+                continue
             source_path = self._source_path(document)
             if source_path is not None:
                 try:
@@ -176,18 +254,28 @@ class InstitutionPurgeService:
                     result.deleted_source_file_count += 1
                 except OSError as exc:
                     result.failures.append(f"{document_id}: 원본 파일 삭제 실패 ({exc})")
-            if self.repository.delete_document(document_id):
-                result.deleted_document_count += 1
-            self._remove_vector_artifacts(document_id, result)
-        for path in self._export_paths(document_ids):
+                    # 원본을 못 지웠는데 작업만 지우면 나중에 주인 없는 업로드가 남는다.
+                    continue
             try:
-                path.unlink()
-                result.deleted_export_count += 1
+                removed_journals = self.repository.purge_document_records([document_id])
+            except (OSError, ValueError) as exc:
+                result.failures.append(
+                    f"{document_id}: 감사·실행 기록 삭제 실패 ({exc})"
+                )
+                continue
+            for journal_name, count in removed_journals.items():
+                result.deleted_journal_records[journal_name] = (
+                    result.deleted_journal_records.get(journal_name, 0) + int(count)
+                )
+            try:
+                deleted = self.repository.delete_document(document_id)
             except OSError as exc:
-                result.failures.append(f"내보내기 파일 삭제 실패: {path.name} ({exc})")
-        result.deleted_journal_records = self.repository.purge_document_records(document_ids)
-        self._remove_profile_directories(profile_id, result)
-        return result
+                result.failures.append(f"{document_id}: 문서 기록 삭제 실패 ({exc})")
+                continue
+            if not deleted:
+                result.failures.append(f"{document_id}: 문서 기록을 찾지 못해 삭제하지 않았습니다.")
+                continue
+            result.deleted_document_count += 1
 
     def _chunk_count(self, document_ids: tuple[str, ...]) -> int:
         """조항 수. 실행 기록에 없는 문서만 저장된 조항 파일을 연다."""
@@ -317,7 +405,12 @@ class InstitutionPurgeService:
                     ),
                     encoding="utf-8",
                 )
-                write_bm25_index(default_bm25_index_path(path), kept)
+            # Rebuild the sidecar even when this retry removed no vector rows.
+            # A prior attempt may have committed the vector JSONL and then failed
+            # while writing BM25.  Always converging BM25 to the current vector
+            # rows makes the next retry safe instead of deleting the document
+            # while a stale lexical index remains.
+            write_bm25_index(default_bm25_index_path(path), kept)
         except OSError as exc:
             result.failures.append(f"색인 해제 실패: {path.name} ({exc})")
             return 0

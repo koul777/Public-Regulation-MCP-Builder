@@ -148,6 +148,23 @@ def normalize_security_level(value: str | None) -> str:
 def chunk_review_attention_reasons(chunk: Chunk) -> list[str]:
     metadata = chunk.metadata or {}
     reasons: list[str] = []
+    searchable_text = "\n".join(
+        value
+        for value in (
+            chunk.text,
+            chunk.normalized_text or "",
+            chunk.retrieval_text or "",
+            chunk.ai_preprocessed_text or "",
+        )
+        if value
+    )
+    if "\ufffd" in searchable_text:
+        reasons.append("replacement_character")
+    if metadata.get("source_page_unavailable_reason"):
+        # The reason value is parser-provided metadata and may contain details
+        # that should not be echoed through an API error. The stable key is
+        # sufficient to require an explicit source-location review.
+        reasons.append("source_page_unavailable_reason")
     for key in REVIEW_ATTENTION_BOOL_METADATA_KEYS:
         if metadata.get(key):
             reasons.append(key)

@@ -11,7 +11,7 @@ from xml.etree import ElementTree
 
 from app.parsers.base import BaseParser, ParserError, document_name_from_path, parser_uncertainty_metadata
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
-from app.parsers.xml_safety import reject_unsafe_xml_declarations
+from app.parsers.xml_safety import elementtree_xml_input, reject_unsafe_xml_declarations
 
 try:
     import olefile
@@ -207,8 +207,14 @@ class HwpParser(BaseParser):
 
     def _looks_like_hwpml(self, path: Path) -> bool:
         with path.open("rb") as handle:
-            prefix = handle.read(256).lstrip()
-        return prefix.startswith(b"<?xml") and b"<HWPML" in prefix
+            prefix = handle.read(1024)
+        lowered = prefix.lower()
+        encodings = ("ascii", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+        return any(
+            "<?xml".encode(encoding) in lowered
+            and "<hwpml".encode(encoding) in lowered
+            for encoding in encodings
+        )
 
     def _parse_hwpml(self, path: Path, document_id: str) -> ParsedDocument:
         try:
@@ -222,11 +228,15 @@ class HwpParser(BaseParser):
                 f"({self.max_decompressed_document_bytes} bytes)."
             )
         reject_unsafe_xml_declarations(payload, format_name="HWPML")
-        raw_xml = payload.decode("utf-8-sig", errors="replace")
-        raw_xml = raw_xml.replace("&nbsp;", "&#160;")
+        safe_payload = payload
+        for encoding in ("ascii", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+            safe_payload = safe_payload.replace(
+                "&nbsp;".encode(encoding),
+                "&#160;".encode(encoding),
+            )
         try:
-            root = ElementTree.fromstring(raw_xml)
-        except ElementTree.ParseError as exc:
+            root = ElementTree.fromstring(elementtree_xml_input(safe_payload))
+        except (ElementTree.ParseError, LookupError, UnicodeError, ValueError) as exc:
             raise ParserError(f"HWPML file is not valid XML: {exc}") from exc
 
         document_title = self._first_xml_text(root, "TITLE") or document_name_from_path(path)

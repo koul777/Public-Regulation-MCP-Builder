@@ -12,24 +12,9 @@ from app.parsers.factory import get_parser
 from app.parsers.pdf_parser import PDFParser
 from app.schemas.parsed import ParsedBlock
 from app.utils.fitz_compat import fitz
-from app.utils.fitz_compat import import_fitz
 
 
 class PDFParserTests(unittest.TestCase):
-    def test_pymupdf_import_path_is_used_when_fitz_alias_is_unavailable(self) -> None:
-        fallback_backend = SimpleNamespace(open=object())
-        original_import = __import__
-
-        def import_with_missing_fitz(name: str, *args, **kwargs):
-            if name == "fitz":
-                raise ImportError("fitz alias unavailable")
-            if name == "pymupdf":
-                return fallback_backend
-            return original_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=import_with_missing_fitz):
-            self.assertIs(import_fitz(), fallback_backend)
-
     def test_factory_supports_pdf_extension(self) -> None:
         self.assertIsInstance(get_parser(Path("sample.pdf")), PDFParser)
 

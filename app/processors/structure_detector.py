@@ -9,7 +9,16 @@ from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 from app.schemas.structure import StructureNode
 
 
-ARTICLE_TITLE_DELIMITER_PATTERN = r"(?:\([^\)\n]{1,80}\)|\[[^\]\n]{1,80}\]|【[^】\n]{1,80}】)"
+ARTICLE_TITLE_DELIMITER_PATTERN = (
+    r"(?:\([^\)\n]{1,80}\)|（[^）\n]{1,80}）|\[[^\]\n]{1,80}\]|"
+    r"【[^】\n]{1,80}】|<[^>\n]{1,80}>|〈[^〉\n]{1,80}〉)"
+)
+ARTICLE_LIFECYCLE_ANNOTATION_PATTERN = (
+    r"(?:일부개정|전부개정|전문개정|개정|제정|시행|삭제|신설|변경|폐지|생략)"
+)
+ARTICLE_TITLE_ANGLE_GUARD = (
+    rf"(?!\s*{ARTICLE_LIFECYCLE_ANNOTATION_PATTERN}(?=\s|[.:：>〉]|$))"
+)
 
 # 줄마다 화면을 갱신하면 진행 표시가 구조 분석보다 비싸진다.
 DETECT_PROGRESS_LINE_STEP = 500
@@ -48,8 +57,15 @@ PATTERNS = {
     "subsection": re.compile(r"^\s*(제\s*\d+\s*관)\s+(.+)$"),
     "regulation": re.compile(r"^\s*(\d+-\d+-\d+)\.\s+(.+)$"),
     "article": re.compile(
-        r"^\s*(제\s*\d+\s*조(?:의\s*\d+)?)(?=\s*(?:\(|\[|【|<|삭제|$|\s))"
-        r"\s*(?:\(([^)\n]+)\)|\[([^\]\n]+)\]|【([^】\n]+)】)?\s*(.*)$"
+        r"^\s*(제\s*\d+\s*조(?:의\s*\d+)?)(?=\s*(?:\(|（|\[|【|<|〈|삭제|$|\s))"
+        r"\s*(?:"
+        r"\((?P<article_title_round>[^)\n]+)\)"
+        r"|（(?P<article_title_fullwidth_round>[^）\n]+)）"
+        r"|\[(?P<article_title_square>[^\]\n]+)\]"
+        r"|【(?P<article_title_lenticular>[^】\n]+)】"
+        rf"|<{ARTICLE_TITLE_ANGLE_GUARD}(?P<article_title_angle>[^>\n]+)>"
+        rf"|〈{ARTICLE_TITLE_ANGLE_GUARD}(?P<article_title_guillemet>[^〉\n]+)〉"
+        r")?\s*(?P<article_trailing>.*)$"
     ),
     "paragraph_symbol": re.compile(r"^\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚])\s*(.*)$"),
     "paragraph_je_hang": re.compile(r"^\s*(제\s*\d+\s*항)(?=\s|$)\s*(.*)$"),
@@ -333,12 +349,19 @@ class StructureDetector:
             title = next(
                 (
                     candidate.strip()
-                    for candidate in match.group(2, 3, 4)
+                    for candidate in (
+                        match.group("article_title_round"),
+                        match.group("article_title_fullwidth_round"),
+                        match.group("article_title_square"),
+                        match.group("article_title_lenticular"),
+                        match.group("article_title_angle"),
+                        match.group("article_title_guillemet"),
+                    )
                     if candidate and candidate.strip()
                 ),
                 None,
             )
-            trailing = (match.group(5) or "").strip()
+            trailing = (match.group("article_trailing") or "").strip()
             if not title:
                 title = self._article_lifecycle_title(trailing)
             if not title and self._looks_like_article_reference_tail(trailing):

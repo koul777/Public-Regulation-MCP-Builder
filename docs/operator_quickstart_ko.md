@@ -24,25 +24,37 @@
 그 뒤 공통 ①~③을 완료하고, 선택에 맞는 ④를 진행한다. 이 절은 약 5분 안에 읽을 수 있는
 화면 안내이며 실제 전처리 시간은 파일 크기와 형식에 따라 더 걸릴 수 있다.
 
-1. `① 문서 올려서 전처리`에서 **문서 업로드**로 재배포 가능한 합성 규정 파일 하나를
-   선택한 뒤 **전처리 시작**을 누르고 **전처리 완료**를 확인한다. 기본은 빠른 구조
+1. `① 문서 올려서 전처리`에서 실제 규정 파일이 없다면 **규정 파일이 없나요? 안전한 합성
+   샘플로 연습**을 열어 합성 DOCX를 내려받는다. **문서 업로드**에서 그 파일이나 재배포
+   가능한 규정 파일 하나를 선택한 뒤 **전처리 시작**을 누르고 **전처리 완료**를 확인한다. 기본은 빠른 구조
    전처리이며, 외부 AI 검수는 왼쪽 사이드바 **AI 검수**에서 켜고 API 키를 저장해 둔
    경우에만 실행된다. 켜 두면 이후 전처리에 자동으로 함께 실행되므로 이 화면에서
    따로 고르지 않는다.
-2. `② 결과 확인`의 **정리된 내용(청크)** 탭에서 원문과 전처리 결과를 좌우로 비교하고,
-   이어서 **이슈** 탭의 확인 필요 항목을 읽는다. 품질 통과 표시는 자동 승인이 아니며,
-   결과가 원문과 다르면 승인 단계로 넘기지 않는다.
+2. `② 결과 확인`의 **요약** 탭에서 **전처리된 글자 확인** 미리보기가 원본과 같은
+   한글로 보이는지 확인하고, **이슈**와 **표·별표** 탭의 확인 필요 항목을 읽는다. 화면
+   아래에서 **전처리된 글자가 원본 규정과 같은 한글로 보입니다**와 **품질 경고·이슈와
+   표·별표 결과를 확인했습니다**를 순서대로 선택한다. 초보자 모드에서는 중복 검수를
+   피하려고 `정리된 내용(청크)` 탭을 숨기며, 조항별 원본 대조는 다음 ③단계에서 한다.
+   품질 통과 표시는 자동 승인이 아니며, 결과가 원본과 다르면 승인 단계로 넘기지 않는다.
 3. `③ 검수하고 승인`은 세 단계뿐이다. **1단계** 규정 디렉터리에서 **규정 열기**를 눌러
    검수할 규정을 연다. **2단계** 규정을 위에서 아래로 스크롤하며 조항마다 **원본·전처리본·AI
-   검수본**을 비교한다. AI 추가 검수를 켜고 전처리했으면 AI 검수본이, 켜지 않았으면
-   전처리본이 ✅ 최종본이며, 제안이 틀리면 그 칸을 직접 고치면 된다. 확인 버튼을 따로
-   누를 필요는 없다. **3단계** **이 규정 최종 확정 · 승인하고 색인**을 누르면 고친 내용이
+   검수 의견**을 비교한다. AI 추가 검수는 본문을 다시 쓰지 않고 확인할 곳만 표시하므로,
+   검수를 켰는지와 무관하게 가운데 전처리본이 ✅ 최종본이다. 틀린 부분은 그 칸에서 직접
+   고친다. 각 AI 표시 항목마다 **수정 필요로 판단** 또는 **해당 없음**을 고른다. **수정
+   필요로 판단**했다면 가운데 최종본을 실제로 고치거나, 본문 수정이 필요 없었던 이유를
+   **수정 필요 항목 처리 메모**에 남겨야 한다. 마지막으로 **원본과 최종본을 직접
+   대조했다**는 확인란을 선택해야 한다. 조항이 여러 쪽이면 검증 시트
+   쪽을 이동해 모든 조항을 확인한다. **3단계** **이 규정 최종 확정 · 승인하고 색인**을 누르면 고친 내용이
    자동으로 반영되고 승인·색인까지 끝난다. 제외할 조항만 목록에서 고르고 사유와 확인을
    마친 뒤 **선택한 조항 반려**를 누른다. 규정을 여러 개 선택했다면 3단계 아래
    **전체 규정 확인**을 켜서 선택한 규정의 미승인 조항을 규정 순서대로 한 화면에서
    비교·수정하고 **전체 규정 최종 확정**으로 한 번에 승인·색인할 수 있다.
    **승인·색인 완료**가 함께 표시되거나 명시 반려로 처리 방향이 결정돼야 다음 단계로
    이동한다.
+
+   초보자 안내 모드에서는 확인 생략 승인 입력을 표시하지 않는다. 일반 모드에서만 관리자용
+   **확인 없이 승인해야 하는 경우**를 열 수 있으며, 사유를 입력해 실행하면 정상 검수 완료로
+   기록하지 않고 `approved_without_review` 감사 이벤트와 승인 우회 사유를 별도로 남긴다.
 4. ④는 첫 선택에 따라 나뉜다. **로컬 Qwen**을 골랐다면 `④ Qwen 규정 챗봇·AI 연결`에서
    **독립 Qwen 챗봇 실행**을 누른다. 새 브라우저 창에서 아래 여섯 단계를 따른다.
 
@@ -147,6 +159,18 @@ python scripts\run_release_harness.py --mode public --keep-going
 python scripts\run_public_release_gate.py --include-untracked --execute-harness --fail-on-blocked
 ```
 
+On Windows, use a standalone CPython 3.11+ executable for the portable build when
+the active `python` belongs to Anaconda/Miniconda or a stale build environment exists:
+
+```powershell
+python scripts\run_release_harness.py --mode public --keep-going `
+  --portable-python "C:\Users\<user>\AppData\Local\Programs\Python\Python311\python.exe"
+```
+
+The harness passes that executable to the portable build and recreates its isolated
+build virtual environment. Replace the example with the actual `python.exe` path on
+the build machine.
+
 For release evidence, use the public audit, cleanup plan, release gate, approval evidence, review-batch evidence, and MCP release evidence tools. Keep generated reports outside the tracked source tree.
 
 ## Official Chain
@@ -159,6 +183,10 @@ source file -> preprocessing -> quality flags -> human review -> approval journa
 ```
 
 Unreviewed results must remain `UNREVIEWED_PREVIEW` or `UNREVIEWED_POC_REVIEW`. They must not be treated as official approved vectors. Reindex approved chunks only after review flags are acknowledged, review-batch decisions are validated, and release evidence is regenerated.
+
+> 검색 정규화가 NFKC로 바뀐 버전으로 업그레이드하면 기존 BM25 v2 색인은 호환되지 않는
+> 것으로 판정된다. 승인 저널과 승인 범위는 그대로 유지하되, 승인된 청크의 색인을 다시
+> 생성한다. 재생성 전 검색은 오래된 색인을 섞어 쓰지 않고 안전한 fallback으로 동작한다.
 
 ## Excluded From Public Use
 

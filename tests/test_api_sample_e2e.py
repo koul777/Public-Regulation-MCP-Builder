@@ -9,6 +9,7 @@ from unittest.mock import patch
 from app.api import routes_documents, routes_exports
 from app.core.config import Settings
 from app.core.security import AuthContext
+from app.services.synthetic_sample_service import build_synthetic_regulation_docx
 
 class _UploadFile:
     def __init__(self, path: Path) -> None:
@@ -28,7 +29,12 @@ class ApiSampleEndToEndTests(unittest.TestCase):
             tmp_path = Path(tmp)
             sample = _write_synthetic_regulation_docx(tmp_path / "synthetic_regulation.docx")
             settings = Settings(data_dir=tmp_path / "data")
-            auth = AuthContext(actor="api-smoke-test", tenant_id="tenant-smoke", auth_mode="api_token")
+            auth = AuthContext(
+                actor="api-smoke-test",
+                tenant_id="tenant-smoke",
+                auth_mode="api_token",
+                role="admin",
+            )
             upload = _UploadFile(sample)
             try:
                 with patch.object(routes_documents, "get_settings", return_value=settings):
@@ -59,21 +65,7 @@ class ApiSampleEndToEndTests(unittest.TestCase):
 
 
 def _write_synthetic_regulation_docx(path: Path) -> Path:
-    try:
-        from docx import Document
-    except ImportError as exc:
-        raise unittest.SkipTest("python-docx is not installed") from exc
-
-    doc = Document()
-    doc.add_paragraph("합성 규정")
-    doc.add_paragraph("제1조(목적) 이 규정은 합성 테스트 문서의 처리 절차를 정함을 목적으로 한다.")
-    doc.add_paragraph("제2조(육아휴직) 직원은 승인 절차에 따라 육아휴직을 신청할 수 있다.")
-    table = doc.add_table(rows=2, cols=2)
-    table.cell(0, 0).text = "구분"
-    table.cell(0, 1).text = "내용"
-    table.cell(1, 0).text = "육아휴직"
-    table.cell(1, 1).text = "승인 후 사용"
-    doc.save(path)
+    path.write_bytes(build_synthetic_regulation_docx())
     return path
 
 

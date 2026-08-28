@@ -3653,6 +3653,80 @@ print(json.dumps({
         self.assertEqual(fetch_result["metadata"]["answer_keywords"], ["keyword-a", "keyword-b"])
         self.assertEqual(fetch_result["metadata"]["kordoc_table_match"]["table_id"], "kordoc-1")
 
+    def test_full_profile_citation_metadata_does_not_expose_local_paths(self) -> None:
+        result = {
+            "document_id": "doc-local-path",
+            "chunk_id": "chunk-local-path",
+            "text": "제1조(목적) 본문",
+            "source_url": "file://" + "/C:" + "/private/source.pdf",
+            "approval_review_batch_manifest_path": "C:" + "/private/review-batch.json",
+        }
+
+        search_result = search_regulations.__globals__["_mcp_search_result"](result)
+        fetch_result = search_regulations.__globals__["_mcp_fetch_result"](result)
+
+        for metadata in (search_result["metadata"], fetch_result["metadata"]):
+            self.assertEqual("", metadata["source_url"])
+            self.assertNotIn("approval_review_batch_manifest_path", metadata)
+
+    def test_citation_source_url_hides_secret_query_but_keeps_public_parameters(self) -> None:
+        public_result = search_regulations.__globals__["_mcp_search_result"](
+            {
+                "document_id": "doc-public-url",
+                "chunk_id": "chunk-public-url",
+                "source_url": "https://example.test/rules?apbaId=C0147&idx=2",
+            }
+        )
+        secret_query_result = search_regulations.__globals__["_mcp_search_result"](
+            {
+                "document_id": "doc-secret-query",
+                "chunk_id": "chunk-secret-query",
+                "source_url": "https://example.test/rules?access_token=do-not-expose",
+            }
+        )
+        secret_fragment_result = search_regulations.__globals__["_mcp_search_result"](
+            {
+                "document_id": "doc-secret-fragment",
+                "chunk_id": "chunk-secret-fragment",
+                "source_url": "https://example.test/rules#x-amz-signature=do-not-expose",
+            }
+        )
+        variant_token_result = search_regulations.__globals__["_mcp_search_result"](
+            {
+                "document_id": "doc-variant-token",
+                "chunk_id": "chunk-variant-token",
+                "source_url": "https://example.test/rules?api_token=do-not-expose",
+            }
+        )
+
+        self.assertEqual(
+            "https://example.test/rules?apbaId=C0147&idx=2",
+            public_result["metadata"]["source_url"],
+        )
+        self.assertEqual("", secret_query_result["metadata"]["source_url"])
+        self.assertEqual("", secret_fragment_result["metadata"]["source_url"])
+        self.assertEqual("", variant_token_result["metadata"]["source_url"])
+
+    def test_citation_source_url_hides_local_hosts_and_non_global_ip_addresses(self) -> None:
+        local_urls = (
+            "http://localhost:8080/private",
+            "http://service.local/private",
+            "http://127.0.0.1/private",
+            "http://10.20.30.40/private",
+            "http://[::1]/private",
+        )
+
+        for index, source_url in enumerate(local_urls):
+            with self.subTest(source_url=source_url):
+                result = search_regulations.__globals__["_mcp_search_result"](
+                    {
+                        "document_id": f"doc-local-{index}",
+                        "chunk_id": f"chunk-local-{index}",
+                        "source_url": source_url,
+                    }
+                )
+                self.assertEqual("", result["metadata"]["source_url"])
+
     def test_search_and_fetch_return_only_approved_local_regulation_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
@@ -3686,7 +3760,10 @@ print(json.dumps({
         self.assertTrue(search["results"][0]["metadata"]["content_hash"])
         self.assertTrue(search["results"][0]["metadata"]["approved_content_hash"])
         self.assertEqual(len(search["results"][0]["metadata"]["approval_worklist_report_sha256"]), 64)
-        self.assertEqual(search["results"][0]["metadata"]["approval_review_batch_manifest_path"], "reports/approval_review_batches_current.json")
+        self.assertNotIn(
+            "approval_review_batch_manifest_path",
+            search["results"][0]["metadata"],
+        )
         self.assertEqual(len(search["results"][0]["metadata"]["approval_review_batch_manifest_sha256"]), 64)
         self.assertTrue(search["results"][0]["metadata"]["approval_review_batch_id"].startswith("approval-"))
         self.assertEqual(len(search["results"][0]["metadata"]["approval_review_batch_chunk_fingerprint"]), 64)
@@ -4049,6 +4126,102 @@ print(json.dumps({
         )
 
         self.assertFalse(guard["refused"])
+
+    def test_search_promotes_lower_ranked_candidate_that_rescues_relevance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            auth = mcp_auth_context(tenant_id="tenant-a")
+            broad = {
+                "document_id": "doc-broad",
+                "chunk_id": "chunk-broad",
+                "score": 4.0,
+                "text": "현금 전환 절차는 회계 처리 기준에 따른다.",
+                "regulation_title": "회계 규정",
+                "article_title": "현금 전환",
+                "security_level": "internal",
+            }
+            precise = {
+                "document_id": "doc-precise",
+                "chunk_id": "chunk-precise",
+                "score": 3.8,
+                "text": "복지포인트의 현금 전환 가능 여부를 정한다.",
+                "regulation_title": "복리후생 규정",
+                "article_title": "복지포인트",
+                "security_level": "internal",
+            }
+            trace = {
+                "trace_id": "trace-rescue",
+                "candidate_regulations": [],
+                "timing_ms": {},
+            }
+            with patch.object(
+                regulation_tools,
+                "_resolve_mcp_profile_scope_with_runtime_token",
+                return_value=("profile-a", object()),
+            ), patch.object(
+                regulation_tools,
+                "_search_hierarchical_runtime",
+                return_value=([broad, precise], trace),
+            ):
+                response = search_regulations(
+                    settings=settings,
+                    auth=auth,
+                    query="복지포인트 현금 전환 규정이 있나요?",
+                    security_levels=["internal"],
+                    profile_id="profile-a",
+                )
+
+        self.assertEqual(2, response["metadata"]["result_count"])
+        self.assertIn("복리후생 규정", response["results"][0]["title"])
+        self.assertEqual(
+            regulation_tools._encode_result_id(
+                document_id="doc-precise",
+                chunk_id="chunk-precise",
+            ),
+            response["results"][0]["id"],
+        )
+
+    def test_mcp_relevance_guard_allows_primary_anchor_in_lower_ranked_candidate(self) -> None:
+        guard = _mcp_relevance_guard(
+            "복지포인트 현금 전환 규정이 있나요?",
+            [
+                {
+                    "score": 4.0,
+                    "text": "현금 전환 절차는 회계 처리 기준에 따른다.",
+                    "regulation_title": "회계 규정",
+                    "article_title": "현금 전환",
+                },
+                {
+                    "score": 3.8,
+                    "text": "복지포인트의 현금 전환 가능 여부를 정한다.",
+                    "regulation_title": "복리후생 규정",
+                    "article_title": "복지포인트",
+                },
+            ],
+        )
+
+        self.assertFalse(guard["refused"])
+        self.assertEqual(1, guard["promote_result_index"])
+
+    def test_mcp_relevance_guard_does_not_rescue_generic_lower_rank_overlap(self) -> None:
+        guard = _mcp_relevance_guard(
+            "복지포인트 현금 전환 규정이 있나요?",
+            [
+                {
+                    "score": 4.0,
+                    "text": "현금 전환 절차는 회계 처리 기준에 따른다.",
+                    "regulation_title": "회계 규정",
+                },
+                {
+                    "score": 3.8,
+                    "text": "현금 전환 신청과 지급 절차를 정한다.",
+                    "regulation_title": "지급 규정",
+                },
+            ],
+        )
+
+        self.assertTrue(guard["refused"])
+        self.assertNotIn("promote_result_index", guard)
 
     def test_mcp_normalize_query_token_strips_stacked_particles(self) -> None:
         # The relevance guard tokenizes with the regex fallback on cold start,
@@ -5194,7 +5367,7 @@ print(json.dumps({
         tool_manager = getattr(server, "_tool_manager")
         tool_names = set(tool_manager._tools)
 
-        self.assertLessEqual(
+        self.assertEqual(
             {
                 "search",
                 "lookup",
@@ -5206,6 +5379,7 @@ print(json.dumps({
                 "get_citation",
                 "get_index_status",
                 "get_regulation_history",
+                "get_document",
                 "list_regulations",
                 "get_regulation_toc",
                 "get_regulation_article",

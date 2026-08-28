@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import ast
-import importlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import sys
@@ -14,7 +14,7 @@ from typing import Any
 
 SCHEMA_VERSION = "build-environment-isolation-v1"
 REQUIRED_MODULE_GROUPS = {
-    "pymupdf_backend": ("fitz", "pymupdf"),
+    "pymupdf_backend": ("pymupdf", "fitz"),
 }
 
 
@@ -91,18 +91,20 @@ def inspect_current_environment(venv_root: str | Path) -> dict[str, Any]:
         for distribution in importlib.metadata.distributions()
     )
     module_files: dict[str, str | Path | None] = {}
-    for name in {
-        candidate
-        for candidates in REQUIRED_MODULE_GROUPS.values()
-        for candidate in candidates
-    }:
+    module_names = tuple(
+        dict.fromkeys(
+            candidate
+            for candidates in REQUIRED_MODULE_GROUPS.values()
+            for candidate in candidates
+        )
+    )
+    for name in module_names:
         try:
-            module = importlib.import_module(name)
+            spec = importlib.util.find_spec(name)
         except Exception:
             module_files[name] = None
             continue
-        module_file = getattr(module, "__file__", None)
-        module_files[name] = Path(module_file) if module_file else None
+        module_files[name] = Path(spec.origin) if spec and spec.origin else None
     return evaluate_build_environment_isolation(
         venv_root=venv_root,
         python_prefix=sys.prefix,

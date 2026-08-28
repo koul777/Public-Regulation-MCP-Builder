@@ -43,7 +43,12 @@ class ApiAuditTests(unittest.TestCase):
     def test_audit_api_event_records_only_filename_not_local_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
-            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="api_token",
+                role="admin",
+            )
 
             audit_api_event(
                 settings,
@@ -290,7 +295,12 @@ class ApiAuditTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
-            auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token")
+            auth = AuthContext(
+                actor="tester",
+                tenant_id="tenant-a",
+                auth_mode="api_token",
+                role="admin",
+            )
             with patch.object(routes_documents, "ProcessingService", FakeProcessingService), patch.object(
                 routes_documents, "_repository", return_value=_repository_with_document()
             ), patch.object(routes_documents, "get_settings", return_value=settings):

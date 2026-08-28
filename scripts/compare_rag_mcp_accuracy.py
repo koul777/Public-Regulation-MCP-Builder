@@ -14,10 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.mcp_server.regulation_tools import fetch_regulation, mcp_auth_context, search_regulations, settings_for_mcp_project
-from app.rag.extractive_answer import build_structured_extractive_answer, select_supporting_answer_results
-from scripts.export_mcp_demo_answers import REQUIRED_CITATION_FIELDS, normalize_query_specs, query_spec_fingerprint
-from scripts.report_metadata import current_repo_commit
+from app.mcp_server.regulation_tools import fetch_regulation, mcp_auth_context, search_regulations, settings_for_mcp_project  # noqa: E402
+from app.rag.extractive_answer import build_structured_extractive_answer, select_supporting_answer_results  # noqa: E402
+from scripts.export_mcp_demo_answers import REQUIRED_CITATION_FIELDS, normalize_query_specs, query_spec_fingerprint  # noqa: E402
+from scripts.report_metadata import current_repo_commit  # noqa: E402
 
 
 def compare_rag_mcp_accuracy(
@@ -49,6 +49,7 @@ def compare_rag_mcp_accuracy(
             expected_terms=[str(term) for term in spec.get("expected_terms") or []],
             expected_article_nos=[str(value) for value in spec.get("expected_article_nos") or []],
             expected_article_titles=[str(value) for value in spec.get("expected_article_titles") or []],
+            expected_evidence_ids=[str(value) for value in spec.get("expected_evidence_ids") or []],
             expect_no_evidence=bool(spec.get("expect_no_evidence") or spec.get("expected_no_evidence")),
             top_k=top_k,
             security_levels=levels,
@@ -99,6 +100,11 @@ def _normalize_specs(
     for spec in normalized:
         original = specs_by_query.get(str(spec.get("query") or "").strip()) or {}
         spec["expect_no_evidence"] = bool(original.get("expect_no_evidence") or original.get("expected_no_evidence"))
+        spec["expected_evidence_ids"] = [
+            str(value)
+            for value in original.get("expected_evidence_ids") or []
+            if str(value).strip()
+        ]
     return normalized
 
 
@@ -110,6 +116,7 @@ def _compare_query(
     expected_terms: list[str],
     expected_article_nos: list[str],
     expected_article_titles: list[str],
+    expected_evidence_ids: list[str],
     expect_no_evidence: bool,
     top_k: int,
     security_levels: list[str],
@@ -150,6 +157,7 @@ def _compare_query(
         expected_terms=expected_terms,
         expected_article_nos=expected_article_nos,
         expected_article_titles=expected_article_titles,
+        expected_evidence_ids=expected_evidence_ids,
         expect_no_evidence=expect_no_evidence,
     )
     mcp_metrics = _quality_metrics(
@@ -160,6 +168,7 @@ def _compare_query(
         expected_terms=expected_terms,
         expected_article_nos=expected_article_nos,
         expected_article_titles=expected_article_titles,
+        expected_evidence_ids=expected_evidence_ids,
         expect_no_evidence=expect_no_evidence,
     )
     score_delta = round(mcp_metrics["quality_score"] - baseline_metrics["quality_score"], 3)
@@ -170,6 +179,7 @@ def _compare_query(
         "expected_terms": expected_terms,
         "expected_article_nos": expected_article_nos,
         "expected_article_titles": expected_article_titles,
+        "expected_evidence_ids": expected_evidence_ids,
         "baseline": {
             "mode": "search_only_rag",
             "result_count": len(search_results),
@@ -209,12 +219,17 @@ def _quality_metrics(
     expected_terms: list[str],
     expected_article_nos: list[str],
     expected_article_titles: list[str],
+    expected_evidence_ids: list[str],
     expect_no_evidence: bool,
 ) -> dict[str, Any]:
     term_hits = _expected_term_hits(expected_terms, answer, evidence)
     article_no_hits = _expected_article_hits(expected_article_nos, citations, "article_no")
     article_title_hits = _expected_article_hits(expected_article_titles, citations, "article_title")
     citation_completeness_ratio = _citation_completeness_ratio(citations)
+    citation_subset_precision, extraneous_citation_count = _citation_subset_metrics(
+        citations,
+        expected_evidence_ids,
+    )
     unsupported_line_count = _unsupported_line_count(answer, evidence)
     evidence_char_count = sum(len(str(item.get("text") or "")) for item in evidence)
     if expect_no_evidence:
@@ -228,6 +243,7 @@ def _quality_metrics(
             and _ratio(len(article_no_hits), len(expected_article_nos)) >= 1.0
             and _ratio(len(article_title_hits), len(expected_article_titles)) >= 1.0
             and citation_completeness_ratio >= 0.8
+            and citation_subset_precision >= 1.0
             and unsupported_line_count == 0
         )
         quality_score = _quality_score(
@@ -247,6 +263,8 @@ def _quality_metrics(
         "expected_article_title_hits": article_title_hits,
         "expected_article_title_hit_ratio": _ratio(len(article_title_hits), len(expected_article_titles)),
         "citation_completeness_ratio": citation_completeness_ratio,
+        "citation_subset_precision": citation_subset_precision,
+        "extraneous_citation_count": extraneous_citation_count,
         "unsupported_line_count": unsupported_line_count,
         "evidence_char_count": evidence_char_count,
     }
@@ -296,6 +314,10 @@ def _summary(items: list[dict[str, Any]]) -> dict[str, Any]:
         "baseline_avg_quality_score": round(statistics.fmean(baseline_scores), 3) if baseline_scores else 0.0,
         "mcp_avg_quality_score": round(statistics.fmean(mcp_scores), 3) if mcp_scores else 0.0,
         "avg_score_delta": round(statistics.fmean([float(item["score_delta"]) for item in items]), 3) if items else 0.0,
+        "mcp_extraneous_citation_count": sum(
+            int(item["mcp"]["metrics"].get("extraneous_citation_count") or 0)
+            for item in items
+        ),
     }
 
 
@@ -418,6 +440,35 @@ def _citation_completeness_ratio(citations: list[dict[str, Any]]) -> float:
     return round(present / total, 3) if total else 0.0
 
 
+def _citation_subset_metrics(
+    citations: list[dict[str, Any]],
+    expected_evidence_ids: list[str],
+) -> tuple[float, int]:
+    """Measure whether citations stay inside an explicitly expected evidence set."""
+
+    expected = {str(value).strip() for value in expected_evidence_ids if str(value).strip()}
+    if not expected:
+        return 1.0, 0
+    matched = 0
+    for citation in citations:
+        document_id = str(citation.get("document_id") or "").strip()
+        chunk_id = str(citation.get("chunk_id") or "").strip()
+        identities = {
+            value
+            for value in (
+                document_id,
+                chunk_id,
+                f"{document_id}:{chunk_id}" if document_id and chunk_id else "",
+            )
+            if value
+        }
+        if identities.intersection(expected):
+            matched += 1
+    extraneous = max(0, len(citations) - matched)
+    precision = round(matched / len(citations), 3) if citations else 0.0
+    return precision, extraneous
+
+
 def _unsupported_line_count(answer: str, evidence: list[dict[str, Any]]) -> int:
     if not answer.strip():
         return 0
@@ -471,11 +522,12 @@ def _to_markdown(report: dict[str, Any]) -> str:
         f"- MCP better / not worse / regression: {summary.get('mcp_better_count')} / {summary.get('mcp_not_worse_count')} / {summary.get('mcp_regression_count')}",
         f"- Avg quality score baseline -> MCP: {summary.get('baseline_avg_quality_score')} -> {summary.get('mcp_avg_quality_score')} ({summary.get('avg_score_delta')})",
         f"- API calls: {report.get('api_call_count')}",
+        f"- MCP extraneous citations: {summary.get('mcp_extraneous_citation_count')}",
         "",
         str(report.get("comparison_note") or ""),
         "",
-        "| Query | Baseline score | MCP score | Delta | MCP passed | Regression fields | Term ratio | Article ratio | Citation ratio |",
-        "| --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |",
+        "| Query | Baseline score | MCP score | Delta | MCP passed | Regression fields | Term ratio | Article ratio | Citation completeness | Citation precision |",
+        "| --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for item in report.get("items") or []:
         baseline_metrics = item["baseline"]["metrics"]
@@ -497,6 +549,7 @@ def _to_markdown(report: dict[str, Any]) -> str:
                     _md_cell(mcp_metrics.get("expected_term_hit_ratio")),
                     _md_cell(article_ratio),
                     _md_cell(mcp_metrics.get("citation_completeness_ratio")),
+                    _md_cell(mcp_metrics.get("citation_subset_precision")),
                 ]
             )
             + " |"

@@ -10,7 +10,13 @@ from fastapi.testclient import TestClient
 
 from app.core.api_audit import api_audit_path
 from app.core.config import Settings, get_settings
-from app.core.security import API_WRITE_ROLES, AuthContext, authenticate_request, require_api_role
+from app.core.security import (
+    API_WRITE_ROLES,
+    AuthContext,
+    authenticate_request,
+    coerce_auth_context,
+    require_api_role,
+)
 from app.main import app
 from app.api import routes_documents, routes_exports
 from app.schemas.chunk import Chunk
@@ -19,6 +25,17 @@ from app.storage.repository import JsonRepository
 
 
 class ApiSecurityTests(unittest.TestCase):
+    def test_unspecified_or_coerced_auth_role_is_least_privileged(self) -> None:
+        implicit = AuthContext(
+            actor="implicit",
+            tenant_id="tenant-a",
+            auth_mode="test",
+        )
+        coerced = coerce_auth_context(None)
+
+        self.assertEqual("viewer", implicit.role)
+        self.assertEqual("viewer", coerced.role)
+
     def test_local_mode_allows_anonymous_actor_without_token(self) -> None:
         context = authenticate_request(Settings(api_auth_required=False), actor=None, tenant_id=None)
 

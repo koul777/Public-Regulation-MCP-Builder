@@ -68,10 +68,18 @@ from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import APPROVED_CHUNK_STATUS, stable_content_hash, vector_record_from_chunk
 from app.ingestion.vector_integrity import embedded_vector_integrity_reason
 from app.ingestion.vector_upsert import validate_vector_records
-from app.rag.local_llm import generate_local_llm_answer, local_llm_available, probe_local_llm
+from app.rag.local_llm import (
+    generate_local_llm_answer as generate_local_llm_answer,
+    local_llm_available,
+    probe_local_llm,
+)
 from app.rag.context_builder import ContextBuilder, GroundingContext
 from app.rag.output_filter import sanitize_rag_answer
-from app.rag.extractive_answer import build_structured_extractive_answer
+from app.rag.extractive_answer import (
+    NO_EVIDENCE_ANSWER,
+    build_structured_extractive_answer,
+    select_supporting_answer_results,
+)
 from app.pipelines.definitions import LOCAL_QA_PIPELINE_ID, PipelineStageTracker
 from app.retrieval.bm25_index import (
     BM25_RETRIEVAL_MODEL,
@@ -554,16 +562,20 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                 55,
                 "로컬 답변 엔진이 승인된 근거만 읽어 답변을 작성하는 중",
             )
-            answer = _chat_answer(
+            answer, citation_evidence_ids = _chat_answer(
                 backend,
                 execution_settings,
                 request.query,
                 results,
                 history=chat_history,
             )
+            citation_results = _results_for_evidence_ids(
+                results,
+                citation_evidence_ids,
+            )
             citations = [
                 _rag_chat_citation_for_metadata_profile(result, metadata_profile)
-                for result in results
+                for result in citation_results
             ]
             _emit_rag_chat_progress(
                 "citation_verify",
@@ -3107,11 +3119,15 @@ def _chat_answer(
     results: list[dict[str, Any]],
     *,
     history: list[dict[str, str]] | None = None,
-) -> str:
+) -> tuple[str, list[str]]:
     if backend == "extractive":
-        return _sanitize_rag_answer(_extractive_answer(query, results))
+        answer = _sanitize_rag_answer(_extractive_answer(query, results))
+        if answer == NO_EVIDENCE_ANSWER:
+            return answer, []
+        supporting = select_supporting_answer_results(query, results)
+        return answer, _result_evidence_ids(supporting)
     if not results:
-        return "승인된 규정 근거에서 확인할 수 없습니다."
+        return NO_EVIDENCE_ANSWER, []
     try:
         result = GroundedAnswerAgent(settings).run(
             {
@@ -3131,16 +3147,60 @@ def _chat_answer(
         raise HTTPException(status_code=503, detail=f"Local LLM backend request failed: {type(exc).__name__}") from exc
     if result.get("status") == "unavailable":
         raise HTTPException(status_code=503, detail="Local LLM backend request failed: backend unavailable")
-    verification = CitationVerifierAgent().run(
-        {
-            "answer": result.get("answer"),
-            "evidence": results,
-            "evidence_ids": result.get("evidence_ids") or [],
-        }
-    )
+    try:
+        verification = CitationVerifierAgent().run(
+            {
+                "answer": result.get("answer"),
+                "evidence": results,
+                "evidence_ids": result.get("evidence_ids") or [],
+            }
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Answer citation verification failed",
+        ) from exc
+    if verification.get("status") == "abstained":
+        return NO_EVIDENCE_ANSWER, []
     if verification.get("status") != "verified":
         raise HTTPException(status_code=503, detail="Answer citation verification failed")
-    return _sanitize_rag_answer(str(verification.get("verified_answer") or ""))
+    return (
+        _sanitize_rag_answer(str(verification.get("verified_answer") or "")),
+        [
+            str(item).strip()
+            for item in (verification.get("verified_evidence_ids") or [])
+            if str(item).strip()
+        ],
+    )
+
+
+def _result_evidence_ids(results: list[dict[str, Any]]) -> list[str]:
+    """Return stable public evidence identities without changing result order."""
+
+    return list(
+        dict.fromkeys(
+            evidence_id
+            for result in results
+            if (evidence_id := str(result.get("chunk_id") or result.get("document_id") or "").strip())
+        )
+    )
+
+
+def _results_for_evidence_ids(
+    results: list[dict[str, Any]],
+    evidence_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Keep only answer-supporting results while preserving retrieval order."""
+
+    requested = {str(item).strip() for item in evidence_ids if str(item).strip()}
+    if not requested:
+        return []
+    return [
+        result
+        for result in results
+        if str(result.get("chunk_id") or result.get("document_id") or "").strip()
+        in requested
+    ]
 
 
 def _sanitize_rag_answer(answer: str) -> str:
@@ -3221,7 +3281,7 @@ _RUNTIME_CONTENT_SIGNATURE_CACHE = rag_runtime._RUNTIME_CONTENT_SIGNATURE_CACHE
 
 _local_vector_path = rag_runtime.local_vector_path
 _RagRequestRepositoryCache = rag_runtime.RagRequestRepositoryCache
-load_visible_records = rag_runtime.load_visible_records
+load_visible_records = rag_runtime.load_visible_records  # noqa: F811 - compatibility hook
 _load_local_vector_records = rag_runtime.load_local_vector_records
 _read_local_vector_records = rag_runtime.read_local_vector_records
 _load_local_vector_record_by_chunk = (
@@ -3328,7 +3388,7 @@ def _load_cached_approval_snapshot(
     )
 
 
-def load_visible_records(**kwargs):
+def load_visible_records(**kwargs):  # noqa: F811 - retain route monkeypatch hook
     """Delegate through the route visibility hook for focused route tests."""
 
     return rag_runtime.load_visible_records(

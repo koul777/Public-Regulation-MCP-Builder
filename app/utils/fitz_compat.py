@@ -4,21 +4,21 @@ from types import ModuleType
 
 
 def import_fitz() -> ModuleType:
-    """Return a PyMuPDF-compatible module from either import path."""
+    """Return PyMuPDF through its current name, with the legacy alias as fallback."""
 
     try:
-        import fitz as backend  # type: ignore
+        import pymupdf as backend  # type: ignore
 
         return backend
     except (ImportError, OSError):
         try:
-            import pymupdf as backend  # type: ignore
+            import fitz as backend  # type: ignore
 
             return backend
-        except (ImportError, OSError) as pymupdf_error:
+        except (ImportError, OSError) as fitz_error:
             raise ImportError(
                 "PyMuPDF is not installed. Install package 'pymupdf'."
-            ) from pymupdf_error
+            ) from fitz_error
 
 
 fitz = import_fitz()

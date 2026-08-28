@@ -11,14 +11,14 @@ from fastapi import Depends, Header, HTTPException
 from app.core.api_audit import append_api_audit_record, redact_sensitive_paths
 from app.core.config import Settings, get_settings
 from app.core.security_primitives import (
-    API_READ_ROLES,
+    API_READ_ROLES as API_READ_ROLES,
     API_ROLE_ADMIN,
-    API_ROLE_OPERATOR,
+    API_ROLE_OPERATOR as API_ROLE_OPERATOR,
     API_ROLES,
     API_ROLE_VIEWER,
-    API_WRITE_ROLES,
-    ROLE_SECURITY_LEVELS,
-    SECURITY_LEVEL_ORDER,
+    API_WRITE_ROLES as API_WRITE_ROLES,
+    ROLE_SECURITY_LEVELS as ROLE_SECURITY_LEVELS,
+    SECURITY_LEVEL_ORDER as SECURITY_LEVEL_ORDER,
     AuthContext,
 )
 from app.core.tenant_access import CANONICAL_TENANT_ID_PATTERN
@@ -192,7 +192,12 @@ def audit_auth_denial(
 def coerce_auth_context(value: object) -> AuthContext:
     if isinstance(value, AuthContext):
         return value
-    return AuthContext(actor="local-direct", tenant_id="default", auth_mode="direct", role=API_ROLE_ADMIN)
+    return AuthContext(
+        actor="local-direct",
+        tenant_id="default",
+        auth_mode="direct",
+        role=API_ROLE_VIEWER,
+    )
 
 
 def require_api_role(auth_context: AuthContext, allowed_roles: set[str] | frozenset[str]) -> AuthContext:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from starlette.exceptions import HTTPException
 
@@ -401,6 +402,41 @@ _INTERNAL_CITATION_METADATA_KEYS = frozenset(
         "approval_review_strategy",
     }
 )
+_NEVER_EXPOSE_CITATION_METADATA_KEYS = frozenset(
+    {
+        "approval_review_batch_manifest_path",
+    }
+)
+_SENSITIVE_SOURCE_URL_QUERY_KEYS = frozenset(
+    {
+        "apikey",
+        "accesstoken",
+        "auth",
+        "authorization",
+        "credential",
+        "credentials",
+        "refreshtoken",
+        "idtoken",
+        "clientsecret",
+        "password",
+        "privatekey",
+        "secret",
+        "signature",
+        "sig",
+        "token",
+        "xamzsignature",
+        "xapikey",
+        "xgoogsignature",
+    }
+)
+_SENSITIVE_SOURCE_URL_QUERY_SUFFIXES = (
+    "credential",
+    "credentials",
+    "password",
+    "secret",
+    "signature",
+    "token",
+)
 _CHATGPT_DATA_FETCH_METADATA_KEYS = (
     "document_name",
     "institution_name",
@@ -721,6 +757,11 @@ def search_regulations(
         relevance_guard = _mcp_relevance_guard(query, results)
         if relevance_guard["refused"]:
             results = []
+        else:
+            promoted_index = relevance_guard.get("promote_result_index")
+            if isinstance(promoted_index, int) and 0 < promoted_index < len(results):
+                promoted = results[promoted_index]
+                results = [promoted, *results[:promoted_index], *results[promoted_index + 1 :]]
     except HTTPException as exc:
         _audit_mcp_exception(settings, auth, action="mcp.search", exc=exc, document_id=document_id)
         raise ValueError(str(exc.detail)) from exc
@@ -4980,6 +5021,35 @@ def _mcp_relevance_guard(query: str, results: list[dict[str, Any]]) -> dict[str,
             reason = "missing_primary_query_anchor"
     if not refused:
         return {"refused": False}
+
+    # A broad first hit can outrank a precise provision by a small lexical
+    # margin. Do not turn that ranking imperfection into a false "no result"
+    # when one of the next few already-authorized candidates contains the
+    # query's primary anchor. Lower-ranked generic overlap alone is not enough
+    # to rescue the response, which keeps the guard fail-closed for unrelated
+    # queries.
+    for candidate_index, candidate in enumerate(results[1:5], start=1):
+        candidate_tokens = _mcp_result_tokens(candidate)
+        candidate_overlap = [
+            token
+            for token in query_tokens
+            if _mcp_token_matches(token, candidate_tokens)
+        ]
+        candidate_anchor_hit = bool(
+            primary_anchor
+            and _mcp_token_matches(primary_anchor, candidate_tokens)
+        )
+        tolerated_semantic_match = bool(
+            primary_anchor
+            and len(candidate_overlap) >= 2
+            and _mcp_missing_anchor_tolerated(primary_anchor, candidate_overlap)
+        )
+        if candidate_anchor_hit or tolerated_semantic_match:
+            return {
+                "refused": False,
+                "promote_result_index": candidate_index,
+            }
+
     return {
         "refused": True,
         "refusal_reason": "insufficient_relevance",
@@ -5288,7 +5358,7 @@ def _citation_metadata(
         "institution_name": str(result.get("institution_name") or ""),
         "apba_id": str(result.get("apba_id") or ""),
         "source_system": str(result.get("source_system") or ""),
-        "source_url": str(result.get("source_url") or ""),
+        "source_url": _user_openable_http_url(result.get("source_url")),
         "source_record_id": str(result.get("source_record_id") or ""),
         "source_file_id": str(result.get("source_file_id") or ""),
         "profile_id": str(result.get("profile_id") or ""),
@@ -5418,9 +5488,18 @@ def _normalize_mcp_metadata_profile(metadata_profile: str) -> str:
 
 def _metadata_for_profile(metadata: dict[str, Any], metadata_profile: str) -> dict[str, Any]:
     normalized = _normalize_mcp_metadata_profile(metadata_profile)
+    safe_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key not in _NEVER_EXPOSE_CITATION_METADATA_KEYS
+    }
     if normalized == "full":
-        return metadata
-    return {key: value for key, value in metadata.items() if key not in _INTERNAL_CITATION_METADATA_KEYS}
+        return safe_metadata
+    return {
+        key: value
+        for key, value in safe_metadata.items()
+        if key not in _INTERNAL_CITATION_METADATA_KEYS
+    }
 
 
 def _clean_mcp_answer_facts(facts: Any) -> list[dict[str, str]]:
@@ -5515,7 +5594,38 @@ def _user_openable_http_url(value: Any) -> str:
         return ""
     if parsed.username is not None or parsed.password is not None:
         return ""
+    normalized_hostname = hostname.rstrip(".").casefold()
+    if (
+        normalized_hostname == "localhost"
+        or normalized_hostname.endswith(".localhost")
+        or normalized_hostname.endswith(".local")
+    ):
+        return ""
+    try:
+        address = ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        return ""
+    try:
+        query_keys = [key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)]
+        if "=" in parsed.fragment:
+            query_keys.extend(
+                key
+                for key, _value in parse_qsl(parsed.fragment, keep_blank_values=True)
+            )
+    except ValueError:
+        return ""
+    if any(_is_sensitive_source_url_query_key(key) for key in query_keys):
+        return ""
     return cleaned
+
+
+def _is_sensitive_source_url_query_key(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+    return normalized in _SENSITIVE_SOURCE_URL_QUERY_KEYS or normalized.endswith(
+        _SENSITIVE_SOURCE_URL_QUERY_SUFFIXES
+    )
 
 
 def _mcp_url(*, document_id: str, chunk_id: str | None = None) -> str:

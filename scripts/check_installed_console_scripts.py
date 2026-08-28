@@ -135,6 +135,15 @@ class ConsoleScriptIssue:
         return asdict(self)
 
 
+def _utf8_subprocess_env() -> dict[str, str]:
+    """Make Python console entry-point output deterministic on Windows locales."""
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def check_installed_console_scripts(
     *,
     commands: Sequence[str] = DEFAULT_COMMANDS,
@@ -165,6 +174,9 @@ def check_installed_console_scripts(
                     [resolved, "--help"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=_utf8_subprocess_env(),
                     timeout=timeout_seconds,
                     check=False,
                 )
@@ -298,6 +310,9 @@ def check_wheel_console_scripts(
                 [sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=_utf8_subprocess_env(),
                 timeout=setup_timeout_seconds,
                 check=True,
             )
@@ -315,6 +330,9 @@ def check_wheel_console_scripts(
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=_utf8_subprocess_env(),
                 timeout=setup_timeout_seconds,
                 check=True,
             )

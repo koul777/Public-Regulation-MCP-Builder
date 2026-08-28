@@ -277,6 +277,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         module = ast.parse(source)
         helper_names = {
             "_brief_long_operation_error",
+            "_safe_ui_error",
             "_long_operation_context_label",
             "_update_long_operation_error",
             "_long_operation_status",
@@ -317,6 +318,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             "Iterator": Iterator,
             "contextmanager": contextmanager,
             "redact_sensitive_paths": lambda value: value,
+            "sanitize_public_output": lambda value: value,
             "st": fake_st,
         }
         exec(
@@ -1029,9 +1031,10 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("선택한 규정 {len(selected_document_ids):,}개 상태 불러오기", source)
         self.assertIn("bulk_review_requested and not batch_loaded", source)
         self.assertIn("bulk_review_requested and batch_loaded", source)
-        # Bulk "AI 검수 완료" / "사람 확인 완료" buttons are gone — the multi-doc
-        # summary auto-confirms every pending chunk instead.
-        self.assertIn("AI·사람 확인은 자동으로 완료 표시됩니다", source)
+        self.assertIn(
+            "위 비교표에서 각 조항의 AI 판단과 사람 확인을 명시적으로 마쳐야",
+            source,
+        )
         # 초보자 모드에서도 전체 규정 승인을 쓸 수 있되, 확인란을 거쳐야 버튼이 열린다.
         self.assertIn("규정 {len(selected_document_ids):,}개를 한 번에 승인·색인하는 것에 동의합니다.", source)
         self.assertIn(
@@ -1086,7 +1089,9 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("_render_agent_review_findings(", source)
         self.assertIn("AI는 어디를 봐야 하는지 짚어 줄 뿐 본문을 고치지 않습니다.", source)
         self.assertIn("✅ 최종본 칸의 내용이 승인·색인되어 MCP에 들어갑니다.", source)
-        self.assertIn("_approval_auto_confirm_pending_chunks(", source)
+        self.assertNotIn("_approval_auto_confirm_pending_chunks", source)
+        self.assertIn("_render_approval_chunk_confirmation_controls(", source)
+        self.assertIn("_approval_sync_human_confirmation_from_widget", source)
         self.assertIn("승인하고 색인", source)
         self.assertIn("확인 생략 승인 사유", source)
         self.assertIn("review_decision_events", source)
@@ -2203,6 +2208,42 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("이전에 저장된 대기 규정", source)
         self.assertIn("if existing_institution_documents and not beginner_mode:", source)
         self.assertIn("pending_upload_selected", source)
+
+    def test_operator_errors_are_centralized_and_path_redacted(self):
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        helper = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_safe_ui_error"
+        )
+        namespace = {
+            "BaseException": BaseException,
+            "sanitize_public_output": lambda value: value.replace(
+                "C:\\Users\\operator\\private.docx", "[local-path-redacted]"
+            ).replace("api_key=super-secret-value", "[secret-redacted]"),
+        }
+        exec(
+            compile(ast.Module(body=[helper], type_ignores=[]), "<safe-ui-error>", "exec"),
+            namespace,
+        )
+
+        rendered = namespace["_safe_ui_error"](
+            RuntimeError(
+                "failed at C:\\Users\\operator\\private.docx "
+                "api_key=super-secret-value\nretry"
+            )
+        )
+        self.assertEqual(
+            "failed at [local-path-redacted] [secret-redacted] retry",
+            rendered,
+        )
+        self.assertNotIn("st.error(str(exc))", source)
+        self.assertNotIn("st.warning(str(exc))", source)
+        self.assertNotIn('f"{exc}"', source)
+        self.assertNotRegex(source, r"(?m)^\s*error_text = str\(exc\)")
+        self.assertIn("_safe_ui_error(index_status_error)", source)
+        self.assertIn('_safe_ui_error(index_status["validation_error"])', source)
 
 
 if __name__ == "__main__":

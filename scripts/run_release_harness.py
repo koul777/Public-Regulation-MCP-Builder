@@ -38,6 +38,7 @@ class HarnessOptions:
     project_root: Path
     artifact_dir: Path | None = None
     build_python: Path | None = None
+    portable_python: Path | None = None
     source_date_epoch: int | None = None
     real_parser_fixture_root: Path | None = None
     require_real_parser_fixtures: bool = False
@@ -168,6 +169,11 @@ def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
     root = options.project_root
     python = sys.executable
     build_python = _path_arg(root, options.build_python) if options.build_python is not None else python
+    portable_python = (
+        _path_arg(root, options.portable_python)
+        if options.portable_python is not None
+        else build_python
+    )
     if options.source_date_epoch is not None and not 0 <= options.source_date_epoch <= (1 << 32) - 1:
         raise ValueError("source_date_epoch must be between 0 and 4294967295.")
     build_env = (
@@ -282,11 +288,16 @@ def build_harness_steps(options: HarnessOptions) -> list[HarnessStep]:
                     "-File",
                     str(root / "scripts" / "build_windows_portable.ps1"),
                     "-BasePython",
-                    build_python,
+                    portable_python,
                     "-DistRoot",
                     _path_arg(root, options.build_dist_dir),
                     "-BuildRoot",
                     _path_arg(root, portable_build_root),
+                    # A release rehearsal must not reuse a venv created by a
+                    # different base interpreter.  Stale provenance can make
+                    # the same source pass or fail depending on the previous
+                    # local build order.
+                    "-RecreateBuildVenv",
                 ),
                 env=build_env,
             )
@@ -680,6 +691,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--portable-python",
+        default=None,
+        help=(
+            "Isolated CPython executable used to create the Windows portable build venv. "
+            "Set this separately when --build-python is Conda/Anaconda-based."
+        ),
+    )
+    parser.add_argument(
         "--source-date-epoch",
         type=_source_date_epoch_arg,
         default=None,
@@ -755,6 +774,7 @@ def options_from_args(args: argparse.Namespace) -> HarnessOptions:
         project_root=root.resolve(),
         artifact_dir=Path(args.artifact_dir) if args.artifact_dir else None,
         build_python=Path(args.build_python) if args.build_python else None,
+        portable_python=Path(args.portable_python) if args.portable_python else None,
         source_date_epoch=args.source_date_epoch,
         real_parser_fixture_root=(
             Path(args.real_parser_fixture_root) if args.real_parser_fixture_root else None

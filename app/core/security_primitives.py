@@ -25,5 +25,5 @@ class AuthContext:
     actor: str
     tenant_id: str
     auth_mode: str
-    role: str = API_ROLE_ADMIN
+    role: str = API_ROLE_VIEWER
     department_ids: tuple[str, ...] = ()

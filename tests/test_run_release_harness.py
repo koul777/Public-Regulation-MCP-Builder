@@ -60,6 +60,7 @@ class ReleaseHarnessTests(unittest.TestCase):
         self.assertIn(f"{expected_root}/dist", command)
         self.assertIn("-BuildRoot", command)
         self.assertIn(f"{expected_root}/windows-build", command)
+        self.assertIn("-RecreateBuildVenv", command)
 
     def test_windows_portable_step_can_be_explicitly_skipped(self) -> None:
         with patch(
@@ -305,6 +306,25 @@ class ReleaseHarnessTests(unittest.TestCase):
 
         self.assertEqual(steps["package_build"].command[0], str(root / build_python))
         self.assertEqual(steps["sdist_rehearsal"].command[0], sys.executable)
+
+    def test_windows_portable_can_use_isolated_python_separate_from_build_tool(self) -> None:
+        root = Path.cwd()
+        build_python = Path("reports/build-tool-venv/Scripts/python.exe")
+        portable_python = Path("C:/Python311/python.exe")
+        options = HarnessOptions(
+            project_root=root,
+            mode="public",
+            build_python=build_python,
+            portable_python=portable_python,
+        )
+
+        with patch("scripts.run_release_harness._WINDOWS_RELEASE_SUPPORTED", True):
+            steps = {step.name: step for step in build_harness_steps(options)}
+
+        portable_command = steps["windows_portable_build_smoke"].command
+        base_python_index = portable_command.index("-BasePython") + 1
+        self.assertEqual(str(portable_python), portable_command[base_python_index])
+        self.assertEqual(str(root / build_python), steps["package_build"].command[0])
 
     def test_console_check_validates_the_wheel_built_by_the_same_harness(self) -> None:
         root = Path.cwd()

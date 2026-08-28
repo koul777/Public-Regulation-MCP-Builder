@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class BeginnerQuickstartDocsTests(unittest.TestCase):
     def test_readme_puts_product_first_and_keeps_update_history_ordered(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        today_heading = "# 최근 업데이트: 2026년 8월 23일"
+        today_heading = "# 최근 업데이트: 2026년 8월 29일"
         # 첫 화면에는 제품 설명과 데모를 두고, 긴 변경 이력은 문서 뒤에서 최신순으로
         # 펼쳐 보게 한다. 새 절을 추가해도 과거 이력의 순서는 유지해야 한다.
         prior_headings = (
@@ -32,6 +32,13 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         self.assertIn("기존 사용자 변경 이력 펼치기", history)
         self.assertEqual(history.count("<details>"), history.count("</details>"))
         self.assertTrue(history.rstrip().endswith("</details>"))
+        for phrase in (
+            "초보자 검수, 파싱 안전성, 승인 RAG 정확성 강화",
+            "합성 DOCX 예제",
+            "추가 2,240개 실행 모두 통과",
+            "100페이지 합성 문서 처리 기준",
+        ):
+            self.assertIn(phrase, history)
         previous_index = readme.index(today_heading)
         for heading in prior_headings:
             self.assertLess(previous_index, readme.index(heading))

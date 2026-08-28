@@ -22,6 +22,7 @@ class ApprovalGovernanceTests(unittest.TestCase):
             ["item-a", "item-b"],
             {"item-a": "reflect", "item-b": "skip"},
             human_confirmed=True,
+            action_required_resolved=True,
         )
 
         self.assertFalse(partial["ai_confirmed"])
@@ -32,6 +33,40 @@ class ApprovalGovernanceTests(unittest.TestCase):
         self.assertTrue(complete["approve_enabled"])
         self.assertEqual(1, complete["reflected"])
         self.assertEqual(1, complete["skipped"])
+
+    def test_action_required_without_edit_or_note_blocks_approval(self) -> None:
+        state = approval_review_completion_state(
+            ["item-a"],
+            {"item-a": "reflect"},
+            human_confirmed=True,
+            action_required_resolved=False,
+        )
+
+        self.assertTrue(state["ai_confirmed"])
+        self.assertFalse(state["action_required_resolved"])
+        self.assertFalse(state["approve_enabled"])
+
+    def test_action_required_with_edit_or_resolution_note_allows_approval(self) -> None:
+        state = approval_review_completion_state(
+            ["item-a"],
+            {"item-a": "reflect"},
+            human_confirmed=True,
+            action_required_resolved=True,
+        )
+
+        self.assertTrue(state["action_required_resolved"])
+        self.assertTrue(state["approve_enabled"])
+
+    def test_not_applicable_without_text_change_allows_approval(self) -> None:
+        state = approval_review_completion_state(
+            ["item-a"],
+            {"item-a": "skip"},
+            human_confirmed=True,
+            action_required_resolved=False,
+        )
+
+        self.assertTrue(state["action_required_resolved"])
+        self.assertTrue(state["approve_enabled"])
 
     def test_ai_decisions_apply_only_to_preview_text(self) -> None:
         preview = apply_ai_review_decisions_to_preview_text(
@@ -44,7 +79,7 @@ class ApprovalGovernanceTests(unittest.TestCase):
         )
 
         self.assertIn("본문", preview)
-        self.assertIn("[AI 제안 반영 미리보기]", preview)
+        self.assertIn("[AI 제안 검토 메모]", preview)
         self.assertIn("표 구조", preview)
         self.assertNotIn("각주로 분류", preview)
 
@@ -55,6 +90,9 @@ class ApprovalGovernanceTests(unittest.TestCase):
             item_ids=["a", "b"],
             ai_decisions={"a": "reflect", "b": "skip"},
             human_confirmed=True,
+            action_required_resolved=True,
+            action_resolution_note="표 원본과 대조해 별도 수정이 필요 없음을 확인",
+            action_text_changed=False,
             table_source="kordoc",
             kordoc_table_promoted=True,
             approve_event="approved",
@@ -66,8 +104,12 @@ class ApprovalGovernanceTests(unittest.TestCase):
             ["ai_review_confirmed", "human_review_confirmed", "approved_without_review"],
             [event["event"] for event in events],
         )
-        self.assertEqual(1, events[0]["ai_reflected"])
+        self.assertEqual(1, events[0]["ai_action_required"])
+        self.assertNotIn("ai_reflected", events[0])
         self.assertEqual(1, events[0]["ai_skipped"])
+        self.assertTrue(events[0]["action_required_resolved"])
+        self.assertIn("표 원본", events[0]["action_resolution_note"])
+        self.assertFalse(events[0]["action_text_changed"])
         self.assertEqual({"a": "reflect", "b": "skip"}, events[0]["ai_decisions"])
         self.assertEqual("kordoc", events[0]["source_of_truth"]["table_source"])
         self.assertTrue(events[0]["source_of_truth"]["kordoc_table_promoted"])

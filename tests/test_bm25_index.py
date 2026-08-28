@@ -85,6 +85,19 @@ class Bm25IndexTests(unittest.TestCase):
         self.assertEqual(frozenset({"targetpolicy"}), context.matching_titles)
         self.assertEqual(1, title_spans.call_count)
 
+    def test_structured_locator_boost_normalizes_fullwidth_article_number(self) -> None:
+        metadata = {
+            "regulation_title": "복무규정",
+            "article_no": "제12조",
+            "article_title": "적용 범위",
+        }
+
+        ascii_boost = _structured_query_boost("복무규정 제12조 적용 범위", metadata)
+        fullwidth_boost = _structured_query_boost("복무규정 제１２조 적용 범위", metadata)
+
+        self.assertGreater(ascii_boost, 0.0)
+        self.assertEqual(ascii_boost, fullwidth_boost)
+
     def test_nfd_query_matches_nfc_indexed_document(self) -> None:
         # A document indexed in NFC must still be found by an NFD query; Unicode
         # composition differences must not silently drop an obvious match.
@@ -376,6 +389,22 @@ class Bm25IndexTests(unittest.TestCase):
         self.assertIn("doc:leave-eligibility", top_ids)
         self.assertIn("doc:leave-duration", top_ids)
         self.assertIn("doc:leave-allowance", top_ids)
+
+    def test_regulation_query_expansion_does_not_inject_institution_specific_facts(self) -> None:
+        childcare = searcher_module._expand_regulation_query(
+            "육아휴직 신청 요건과 기간, 수당은?"
+        )
+        foreign_travel = searcher_module._expand_regulation_query(
+            "휴직자 국외 출국 신고서는 언제 제출하나요?"
+        )
+
+        for expanded in (childcare, foreign_travel):
+            self.assertNotIn("제29조", expanded)
+            self.assertNotIn("제30조", expanded)
+            self.assertNotIn("제33조", expanded)
+            self.assertNotIn("7일 전", expanded)
+            self.assertNotIn("14일 이하", expanded)
+            self.assertNotIn("78퍼센트", expanded)
 
     def test_childcare_leave_query_keeps_eligibility_duration_and_allowance_in_top_results(self) -> None:
         records = [
@@ -1109,7 +1138,7 @@ def _record(
     *,
     article_title: str = "",
     regulation_title: str = "복무규정",
-    include_embedding: bool = True,
+    include_embedding: bool = False,
 ) -> dict:
     chunk_id = record_id.rsplit(":", 1)[-1]
     metadata = {
@@ -1122,7 +1151,7 @@ def _record(
         "regulation_title": regulation_title,
         "article_title": article_title,
     }
-    return {
+    record = {
         "id": record_id,
         "document_id": "doc",
         "chunk_id": chunk_id,

@@ -151,6 +151,47 @@ class ReviewWorkflowServiceTests(unittest.TestCase):
 
         self.assertEqual({"chunk-1": ["table_review_required"]}, attention)
 
+    def test_review_attention_requires_acknowledging_damaged_text_and_missing_source_page(self) -> None:
+        damaged = _chunk("chunk-damaged").model_copy(
+            update={
+                "text": "인코딩이 손상된 \ufffd 조문",
+                "metadata": {
+                    "source_page_unavailable_reason": "parser_source_page_missing",
+                },
+            }
+        )
+
+        reasons = chunk_review_attention_reasons(damaged)
+
+        self.assertEqual(
+            ["replacement_character", "source_page_unavailable_reason"],
+            reasons,
+        )
+        with self.assertRaises(ReviewWorkflowError) as raised:
+            validate_approval_preconditions(
+                chunks=[damaged],
+                chunk_ids=[damaged.chunk_id],
+                review_flags_acknowledged=False,
+            )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertIn("replacement_character", raised.exception.detail)
+
+        acknowledged = validate_approval_preconditions(
+            chunks=[damaged],
+            chunk_ids=[damaged.chunk_id],
+            review_flags_acknowledged=True,
+        )
+        self.assertEqual(
+            {
+                damaged.chunk_id: [
+                    "replacement_character",
+                    "source_page_unavailable_reason",
+                ]
+            },
+            acknowledged.review_attention,
+        )
+
     def test_require_chunk_ids_raises_service_errors_for_empty_or_missing_chunks(self) -> None:
         chunks = [_chunk("chunk-1"), _chunk("chunk-2")]
 
