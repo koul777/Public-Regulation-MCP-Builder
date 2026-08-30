@@ -1355,6 +1355,11 @@ SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES = 4
 WORKFLOW_OPENED_DOCUMENT_KEY = "workflow_opened_document_id"
 # 검증 시트는 조항 수가 수천 개까지 가므로 한 화면에 이만큼씩만 그린다.
 APPROVAL_SHEET_PAGE_SIZE = 25
+# 미검수 조항을 일괄 확정할 때 자동으로 채우는 감사 사유. 사유가 있으면 해당 배치는
+# approved_without_review로 기록되므로, 사람이 원문 대조를 하지 않았음을 그대로 남긴다.
+DEFAULT_UNREVIEWED_OVERRIDE_REASON = (
+    "미검수 조항 일괄 승인(운영자 판단). 사람이 원문을 직접 대조하지 않았습니다."
+)
 KORDOC_REPROCESS_NOTICE_KEY = "kordoc_reprocess_notice"
 DOCUMENT_CONTEXT_NAV_PAGES = {NAV_HOME, NAV_RESULTS, NAV_APPROVAL, NAV_MCP}
 
@@ -11029,9 +11034,17 @@ def _page_approval(ctx: dict | None) -> None:
     override_reason = ""
     if approve_enabled:
         st.success("모든 조항이 확인 완료 상태입니다. 아래에서 최종 확정할 수 있습니다.")
-    elif pending_compare_ids and not beginner_mode_active:
-        st.warning("확인이 끝나지 않은 조항이 있습니다. 필요하면 사유를 남기고 확인 없이 승인할 수 있습니다.")
-        with st.expander("확인 없이 승인해야 하는 경우", expanded=False):
+    elif pending_compare_ids:
+        # 초보자 모드든 아니든 사람 검수를 권장하는 경고를 항상 띄운다(막지 않고 권고만).
+        # 단일 규정 '이 규정 최종 확정'은 조항별 검수 게이트를 그대로 유지하므로, 여기
+        # 사유 입력창은 비운 채 둔다(사유를 적어야 미검수 상태로 이 규정을 승인할 수 있다).
+        # 파일 전체 '전체 규정 최종 확정'은 아래에서 기본 사유가 자동 적용돼 바로 눌린다.
+        st.warning(
+            "⚠️ 사람 검수를 권장합니다. 확인이 끝나지 않은 조항이 있습니다. "
+            "미검수 조항은 사람이 원문을 대조하지 않은 상태로 AI 검색에 노출되므로, "
+            "가능하면 위 검증 시트에서 조항을 직접 확인한 뒤 확정하세요."
+        )
+        with st.expander("확인 없이 이 규정만 승인하는 사유", expanded=False):
             override_reason = st.text_area(
                 "확인 생략 승인 사유",
                 key=override_reason_key,
@@ -11081,11 +11094,16 @@ def _page_approval(ctx: dict | None) -> None:
         approval_target_entries: list[dict[str, object]],
         *,
         vector_sync_batch_suffix: str = "guided-approval",
+        override_reason_text: str = override_reason_text,
     ) -> None:
         """고친 내용 저장 → 승인 → 색인을 한 번에 실행한다.
 
         '이 규정'과 '이 파일의 전체 규정' 버튼이 대상 조항 목록만 다르고 나머지 절차는
         같아서, 증빙 생성·승인 묶음·색인 순서가 두 갈래로 갈라지지 않도록 한 곳에 둔다.
+
+        override_reason_text는 미검수 상태로 승인할 때 감사 기록에 남기는 사유다. '이 규정'
+        버튼은 화면에서 입력한 값(기본 빈 값)을 그대로 쓰고, '전체 규정' 버튼은 문서 전체가
+        검수 완료가 아닐 때 기본 사유를 넣어 호출한다.
         """
         selected_security_level = str(st.session_state.get(security_level_key) or "internal")
         edited_chunk_total = _approval_save_text_edits(
@@ -11235,23 +11253,28 @@ def _page_approval(ctx: dict | None) -> None:
         except Exception as exc:
             st.error(_safe_ui_error(exc))
 
+    # 파일 전체 확정은 규정을 하나씩 열지 않고 눌러야 쓸모가 있으므로, 문서 전체가
+    # 검수 완료가 아니면 기본 사유를 자동으로 적용해 사유 입력 없이도 눌리게 한다.
+    # 화면에서 사유를 직접 적었으면 그 값을 우선 쓴다(감사 기록에 그대로 남는다).
+    document_bulk_override_reason_text = override_reason_text or (
+        DEFAULT_UNREVIEWED_OVERRIDE_REASON if not document_review_complete else ""
+    )
     if approve_all_col is not None and approve_all_col.button(
         f"이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정 · 승인하고 색인",
         key=approve_all_index_button_key,
-        disabled=(
-            not document_pending_compare_ids
-            or (not document_review_complete and not override_reason_text)
-        ),
+        disabled=not document_pending_compare_ids,
         help=(
             f"규정을 하나씩 열지 않고, 이 파일에 들어 있는 규정 {len(regulation_units):,}개의 "
             f"미승인 조항 {len(document_pending_compare_ids):,}개를 한 번에 승인·색인합니다. "
-            "열어 둔 규정만 처리하는 것이 아니므로 모든 조항의 명시적 검수가 끝나야 합니다."
+            "검수를 다 끝내지 않았으면 '미검수 일괄 승인'으로 감사 기록에 남습니다. "
+            "가능하면 각 조항을 직접 확인한 뒤 확정하세요."
         ),
     ):
         try:
             _execute_final_approval(
                 document_pending_review_entries,
                 vector_sync_batch_suffix="guided-approval-all",
+                override_reason_text=document_bulk_override_reason_text,
             )
         except Exception as exc:
             st.error(_safe_ui_error(exc))

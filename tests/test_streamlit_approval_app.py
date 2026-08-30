@@ -1164,7 +1164,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertFalse(approvals[0]["ai_review_confirmed"])
         self.assertEqual(reason, approvals[0]["approval_override_reason"])
 
-    def test_beginner_mode_does_not_expose_approval_override(self) -> None:
+    def test_beginner_mode_exposes_override_with_human_review_warning(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
@@ -1178,6 +1178,20 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             )
             self.addCleanup(clear_runtime_settings_overrides)
 
+            # 초보자 모드는 규정별 '결과 확인' 관문을 통과해야 3단계까지 도달한다.
+            # 관문 통과 키는 문서 컨텍스트 해시로 스코프되므로, AppTest 실행과 동일한
+            # 저장소(테스트 임시 디렉터리)로 계산해야 키가 일치한다.
+            from frontend import streamlit_app
+
+            with patch.object(
+                streamlit_app, "repository", JsonRepository(settings)
+            ):
+                results_confirmed_key = (
+                    streamlit_app._beginner_guide_results_confirmed_key(
+                        "doc_streamlit_approval"
+                    )
+                )
+
             app = AppTest.from_file(
                 str(REPO_ROOT / "frontend" / "streamlit_app.py"),
                 default_timeout=20,
@@ -1186,6 +1200,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             app.session_state["document_id"] = "doc_streamlit_approval"
             app.session_state["nav_page"] = "③ 검수하고 승인"
             app.session_state["beginner_guide_enabled"] = True
+            app.session_state[results_confirmed_key] = True
             app.session_state["ai_connection_overrides"] = {
                 "data_dir": settings.data_dir,
                 "artifact_root": settings.artifact_root,
@@ -1197,9 +1212,16 @@ class StreamlitApprovalAppTests(unittest.TestCase):
                 for area in app.text_area
                 if area.label == "확인 생략 승인 사유"
             ]
+            warning_texts = [str(getattr(warning, "value", "")) for warning in app.warning]
 
         self.assertFalse(app.exception)
-        self.assertEqual([], override_areas)
+        # 초보자 모드에서도 사유 입력창은 노출되어야 한다(예전엔 초보자 모드에서 숨겼다).
+        self.assertEqual(1, len(override_areas))
+        # 사람 검수를 권장하는 경고를 반드시 함께 띄운다(막지 않고 권고만 한다).
+        self.assertTrue(
+            any("사람 검수를 권장합니다" in text for text in warning_texts),
+            warning_texts,
+        )
 
     def test_bulk_confirm_preserves_chunk_state_and_allows_remaining_review(self) -> None:
         # Every pending chunk renders with independent editable text and sign-off.
@@ -1487,10 +1509,17 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertEqual("approved", chunks["chunk-bundle-personnel"].approval_status)
         self.assertNotEqual("approved", chunks["chunk-bundle-service"].approval_status)
 
-    def test_bundle_file_approves_every_regulation_from_the_opened_one(self) -> None:
-        """규정 하나를 열어 둔 채로도 옆 버튼 한 번에 파일 전체 규정을 승인·색인한다."""
+    def test_bundle_file_approves_every_regulation_without_confirming_each(self) -> None:
+        """규정 하나만 열어 둔 채로(다른 규정 미확인) 옆 버튼 한 번에 파일 전체를 확정한다.
+
+        규정을 하나씩 열기 어려운 통합본을 위해, '전체 규정 최종 확정'은 미검수 조항이
+        남아 있어도 눌린다(막지 않고 권고만 한다). 대신 미검수분은 감사 기록에
+        approved_without_review + 기본 사유로 남는다.
+        """
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        from frontend import streamlit_app
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1503,7 +1532,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             _seed_app_institution_context(app)
             app.session_state["document_id"] = "doc_streamlit_bundle"
             app.session_state["workflow_opened_document_id"] = "doc_streamlit_bundle"
-            # 인사규정만 열어 둔 상태에서는 복무규정 조항을 확인하지 않았으므로 차단된다.
+            # 인사규정만 열어 두고 복무규정 조항은 확인하지 않는다. 그래도 전체 버튼은 눌려야 한다.
             app.session_state["approval-regulation-unit-doc_streamlit_bundle"] = "제1호|인사규정"
             app.session_state["nav_page"] = "③ 검수하고 승인"
             app.session_state["ai_connection_overrides"] = {
@@ -1512,16 +1541,12 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            approve_all = next(
-                button
-                for button in app.button
-                if button.label == "이 파일의 전체 규정 2개 최종 확정 · 승인하고 색인"
+            # 사람 검수를 권장하는 경고는 띄우되, 버튼은 막지 않는다.
+            warning_texts = [str(getattr(warning, "value", "")) for warning in app.warning]
+            self.assertTrue(
+                any("사람 검수를 권장합니다" in text for text in warning_texts),
+                warning_texts,
             )
-            self.assertTrue(approve_all.disabled)
-            _confirm_rendered_approval_rows(app)
-            app.session_state["approval-regulation-unit-doc_streamlit_bundle"] = "제2호|복무규정"
-            app.run()
-            _confirm_rendered_approval_rows(app)
             approve_all = next(
                 button
                 for button in app.button
@@ -1530,7 +1555,9 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             self.assertFalse(approve_all.disabled)
             approve_all.click().run()
 
-            chunks = JsonRepository(settings).get_chunks("doc_streamlit_bundle")
+            repository = JsonRepository(settings)
+            chunks = repository.get_chunks("doc_streamlit_bundle")
+            approvals = repository.list_approval_records("doc_streamlit_bundle")
 
         self.assertFalse(app.exception)
         self.assertTrue(all(chunk.approval_status == "approved" for chunk in chunks))
@@ -1539,6 +1566,24 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             {"인사규정", "복무규정"},
             {str(chunk.metadata.get("regulation_title")) for chunk in chunks},
         )
+        # 미검수 일괄 승인은 감사 기록에 기본 사유와 함께 approved_without_review로 남는다.
+        self.assertTrue(approvals)
+        self.assertTrue(
+            all(
+                record.get("approval_override_reason")
+                == streamlit_app.DEFAULT_UNREVIEWED_OVERRIDE_REASON
+                for record in approvals
+            ),
+            [record.get("approval_override_reason") for record in approvals],
+        )
+        override_events = [
+            event["event"]
+            for record in approvals
+            for event in record.get("review_decision_events", [])
+            if isinstance(event, dict) and event.get("event", "").startswith("approved")
+        ]
+        self.assertTrue(override_events)
+        self.assertTrue(all(event == "approved_without_review" for event in override_events))
 
     def test_single_regulation_file_hides_the_whole_file_approval_button(self) -> None:
         """규정이 하나뿐인 파일에서는 '이 규정' 버튼이 이미 파일 전체라 옆 버튼을 만들지 않는다."""
