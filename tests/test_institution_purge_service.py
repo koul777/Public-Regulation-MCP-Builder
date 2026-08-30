@@ -8,16 +8,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.core.config import Settings
-from app.core.tenant_access import institution_storage_dir, tenant_storage_key
+from app.core.tenant_access import (
+    institution_storage_dir,
+    settings_for_tenant,
+    tenant_storage_key,
+)
 from app.retrieval.bm25_index import (
     default_bm25_index_path,
     load_bm25_index,
     write_bm25_index,
 )
+from app.schemas.authoring import AuthoringProjectCreateRequest
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.schemas.run import ProcessingRun
+from app.services.authoring_service import AuthoringService
 from app.services.institution_purge_service import InstitutionPurgeService
+from app.storage.authoring_repository import AuthoringRepository
 from app.storage.repository import JsonRepository
 
 
@@ -373,6 +380,185 @@ class InstitutionPurgeServiceTests(unittest.TestCase):
             self.assertEqual([], reopened.list_runs())
             self.assertEqual([], reopened.list_approval_records())
             self.assertEqual([], reopened.list_documents())
+
+    def test_plan_and_purge_include_authoring_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data")
+            repository = JsonRepository(settings)
+            project = AuthoringService(settings).create_project(
+                AuthoringProjectCreateRequest(
+                    profile_id="institution-abc",
+                    title="인사 규정",
+                ),
+                tenant_id="default",
+                actor="author",
+            )
+            authoring_export = (
+                settings.authoring_dir
+                / "exports"
+                / str(project.project_id)
+                / "00000000000000000001"
+                / "draft.md"
+            )
+            authoring_export.parent.mkdir(parents=True)
+            authoring_export.write_text("draft", encoding="utf-8")
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+
+            plan = service.plan("institution-abc")
+            result = service.purge("institution-abc")
+
+            self.assertEqual(1, plan.authoring_project_count)
+            self.assertFalse(plan.is_empty)
+            self.assertTrue(result.completed)
+            self.assertEqual(1, result.requested_authoring_project_count)
+            self.assertEqual(1, result.deleted_authoring_project_count)
+            self.assertFalse(authoring_export.exists())
+            self.assertNotIn(
+                "institution-abc",
+                service.profile_ids_with_stored_data(),
+            )
+
+    def test_authoring_purge_preserves_other_profile_and_tenant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            authoring = AuthoringService(settings)
+            target = authoring.create_project(
+                AuthoringProjectCreateRequest(
+                    profile_id="institution-abc",
+                    title="삭제 대상",
+                ),
+                tenant_id="tenant-a",
+                actor="author",
+            )
+            other_profile = authoring.create_project(
+                AuthoringProjectCreateRequest(
+                    profile_id="institution-other",
+                    title="다른 기관",
+                ),
+                tenant_id="tenant-a",
+                actor="author",
+            )
+            other_tenant = authoring.create_project(
+                AuthoringProjectCreateRequest(
+                    profile_id="institution-abc",
+                    title="다른 테넌트",
+                ),
+                tenant_id="tenant-b",
+                actor="author",
+            )
+            service = InstitutionPurgeService(settings=settings, repository=repository)
+
+            result = service.purge("institution-abc", tenant_id="tenant-a")
+
+            self.assertTrue(result.completed)
+            authoring_repository = AuthoringRepository(settings)
+            with self.assertRaises(KeyError):
+                authoring_repository.get_project(
+                    str(target.project_id), tenant_id="tenant-a"
+                )
+            self.assertEqual(
+                other_profile.project_id,
+                authoring_repository.get_project(
+                    str(other_profile.project_id), tenant_id="tenant-a"
+                ).project_id,
+            )
+            self.assertEqual(
+                other_tenant.project_id,
+                authoring_repository.get_project(
+                    str(other_tenant.project_id), tenant_id="tenant-b"
+                ).project_id,
+            )
+
+    def test_authoring_cleanup_failure_keeps_profile_data_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repository = JsonRepository(settings)
+            AuthoringService(settings).create_project(
+                AuthoringProjectCreateRequest(
+                    profile_id="institution-abc",
+                    title="삭제 실패 초안",
+                ),
+                tenant_id="default",
+                actor="author",
+            )
+            pending_dir = institution_storage_dir(
+                settings.data_dir / "pending_uploads",
+                "institution-abc",
+                create=True,
+            )
+            pending_file = pending_dir / "pending.hwp"
+            pending_file.write_bytes(b"hwp")
+            authoring_repository = AuthoringRepository(settings)
+            service = InstitutionPurgeService(
+                settings=settings,
+                repository=repository,
+                authoring_repository=authoring_repository,
+            )
+
+            with patch.object(
+                authoring_repository,
+                "_remove_project_directory",
+                side_effect=OSError("simulated authoring cleanup failure"),
+            ):
+                first = service.purge("institution-abc")
+
+            self.assertFalse(first.completed)
+            self.assertTrue(first.failures)
+            self.assertTrue(pending_file.is_file())
+            self.assertEqual(1, service.plan("institution-abc").authoring_project_count)
+
+            second = service.purge("institution-abc")
+            self.assertTrue(second.completed)
+            self.assertFalse(pending_dir.exists())
+
+    def test_optional_tenant_uses_validated_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp) / "data",
+                api_default_tenant_id=" Tenant-A ",
+            )
+            service = InstitutionPurgeService(
+                settings=settings,
+                repository=JsonRepository(settings),
+            )
+
+            with self.assertRaises(ValueError):
+                service.plan("institution-abc")
+
+    def test_tenant_isolated_authoring_root_is_planned_and_purged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp) / "data",
+                tenant_storage_isolation=True,
+            )
+            tenant_settings = settings_for_tenant(settings, "tenant-a")
+            project = AuthoringService(tenant_settings).create_project(
+                AuthoringProjectCreateRequest(
+                    profile_id="institution-abc",
+                    title="테넌트 분리 초안",
+                ),
+                tenant_id="tenant-a",
+                actor="author",
+            )
+            service = InstitutionPurgeService(
+                settings=settings,
+                repository=JsonRepository(settings),
+            )
+
+            plan = service.plan("institution-abc", tenant_id="tenant-a")
+            result = service.purge("institution-abc", tenant_id="tenant-a")
+
+            self.assertEqual(1, plan.authoring_project_count)
+            self.assertTrue(result.completed)
+            self.assertFalse(
+                (
+                    tenant_settings.authoring_dir
+                    / "projects"
+                    / f"{project.project_id}.json"
+                ).exists()
+            )
 
 
 if __name__ == "__main__":

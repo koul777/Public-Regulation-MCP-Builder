@@ -21,11 +21,16 @@ from app.core.tenant_access import (
     INSTITUTION_STORAGE_MARKER,
     institution_profile_id_from_storage_dir,
     institution_storage_dirname,
+    settings_for_tenant,
     tenant_directory_key,
     tenant_storage_key,
 )
 from app.retrieval.bm25_index import default_bm25_index_path, write_bm25_index
 from app.services.document_service import DocumentService
+from app.storage.authoring_repository import (
+    AuthoringRepository,
+    AuthoringRepositoryError,
+)
 from app.storage.file_store import FileStore
 from app.storage.repository import JsonRepository
 
@@ -49,6 +54,7 @@ class InstitutionPurgePlan:
     # 이것들만 남아 있을 수 있어, 세지 않으면 '지울 것이 없다'고 잘못 말하게 된다.
     pending_file_count: int = 0
     saved_project_count: int = 0
+    authoring_project_count: int = 0
     # 조항 수를 실제로 셌는지. 세지 않았으면 0을 '없음'으로 읽으면 안 된다.
     counted_chunks: bool = True
 
@@ -63,6 +69,7 @@ class InstitutionPurgePlan:
             or self.export_file_count
             or self.pending_file_count
             or self.saved_project_count
+            or self.authoring_project_count
         )
 
 
@@ -74,6 +81,8 @@ class InstitutionPurgeResult:
     deindexed_record_count: int = 0
     deleted_export_count: int = 0
     deleted_source_file_count: int = 0
+    requested_authoring_project_count: int = 0
+    deleted_authoring_project_count: int = 0
     deleted_journal_records: dict[str, int] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
 
@@ -84,6 +93,8 @@ class InstitutionPurgeResult:
         return (
             not self.failures
             and self.deleted_document_count == self.requested_document_count
+            and self.deleted_authoring_project_count
+            == self.requested_authoring_project_count
         )
 
 
@@ -93,11 +104,13 @@ class InstitutionPurgeService:
         settings: Settings | None = None,
         repository: JsonRepository | None = None,
         file_store: FileStore | None = None,
+        authoring_repository: AuthoringRepository | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.repository = repository or JsonRepository(self.settings)
         self.file_store = file_store or FileStore(self.settings)
         self.documents = DocumentService(self.settings, self.repository, self.file_store)
+        self.authoring_repository = authoring_repository
 
     def documents_for_profile(self, profile_id: str, *, documents: list | None = None) -> list:
         normalized = str(profile_id or "").strip().lower()
@@ -114,11 +127,17 @@ class InstitutionPurgeService:
         profile_ids: list[str],
         *,
         count_chunks: bool = True,
+        tenant_id: str | None = None,
     ) -> list[InstitutionPurgePlan]:
         """여러 기관을 한 번에 센다. 문서 목록을 한 번만 읽으려고 따로 둔다."""
         documents = self.repository.list_documents()
         return [
-            self.plan(profile_id, count_chunks=count_chunks, documents=documents)
+            self.plan(
+                profile_id,
+                count_chunks=count_chunks,
+                documents=documents,
+                tenant_id=tenant_id,
+            )
             for profile_id in profile_ids
         ]
 
@@ -128,6 +147,7 @@ class InstitutionPurgeService:
         *,
         count_chunks: bool = True,
         documents: list | None = None,
+        tenant_id: str | None = None,
     ) -> InstitutionPurgePlan:
         """무엇이 지워지는지 센다.
 
@@ -135,6 +155,8 @@ class InstitutionPurgeService:
         100여 개의 조항 파일을 다 열면 10초가 넘어 화면이 멈추는데, 실행 기록에는
         같은 수가 이미 들어 있다. ``count_chunks``를 끄면 그것마저 건너뛴다.
         """
+        canonical_tenant_id = self._canonical_tenant_id(tenant_id)
+        authoring_repository = self._authoring_repository(canonical_tenant_id)
         documents = self.documents_for_profile(profile_id, documents=documents)
         document_ids = tuple(str(document.document_id) for document in documents)
         chunk_count = 0
@@ -161,19 +183,58 @@ class InstitutionPurgeService:
             saved_project_count=self._directory_file_count(
                 self._profile_directory("operator_projects", profile_id)
             ),
+            authoring_project_count=authoring_repository.profile_project_count(
+                profile_id,
+                tenant_id=canonical_tenant_id,
+            ),
             document_names=tuple(
                 str(getattr(document, "document_name", "") or getattr(document, "filename", ""))
                 for document in documents
             ),
         )
 
-    def purge(self, profile_id: str) -> InstitutionPurgeResult:
+    def purge(
+        self,
+        profile_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> InstitutionPurgeResult:
+        canonical_tenant_id = self._canonical_tenant_id(tenant_id)
+        authoring_repository = self._authoring_repository(canonical_tenant_id)
         documents = self.documents_for_profile(profile_id)
         result = InstitutionPurgeResult(
             profile_id=str(profile_id or "").strip(),
             requested_document_count=len(documents),
+            requested_authoring_project_count=(
+                authoring_repository.profile_project_count(
+                    profile_id,
+                    tenant_id=canonical_tenant_id,
+                )
+            ),
         )
         self._purge_document_objects(documents, result)
+        documents_removed = (
+            not result.failures
+            and result.deleted_document_count == result.requested_document_count
+        )
+        if documents_removed:
+            try:
+                authoring_result = authoring_repository.purge_profile_projects(
+                    profile_id,
+                    tenant_id=canonical_tenant_id,
+                )
+            except (OSError, ValueError, AuthoringRepositoryError) as exc:
+                result.failures.append(
+                    f"작성 초안 삭제 실패 ({type(exc).__name__})"
+                )
+            else:
+                result.requested_authoring_project_count = (
+                    authoring_result.requested_project_count
+                )
+                result.deleted_authoring_project_count = (
+                    authoring_result.deleted_project_count
+                )
+                result.failures.extend(authoring_result.failures)
         if result.completed:
             self._remove_profile_directories(profile_id, result)
         return result
@@ -444,7 +505,11 @@ class InstitutionPurgeService:
             if path.is_file() and path.name != INSTITUTION_STORAGE_MARKER
         )
 
-    def profile_ids_with_stored_data(self) -> set[str]:
+    def profile_ids_with_stored_data(
+        self,
+        *,
+        tenant_id: str | None = None,
+    ) -> set[str]:
         """규정 데이터가 남아 있는 기관 ID.
 
         문서가 하나도 없어도 대기 중인 규정 파일이나 저장한 작업만 남아 있을 수 있다.
@@ -460,6 +525,12 @@ class InstitutionPurgeService:
             str(getattr(document, "profile_id", "") or "").strip().lower()
             for document in self.repository.list_documents()
         }
+        canonical_tenant_id = self._canonical_tenant_id(tenant_id)
+        found.update(
+            self._authoring_repository(canonical_tenant_id).profile_ids_with_projects(
+                tenant_id=canonical_tenant_id
+            )
+        )
         for name in ("pending_uploads", "operator_projects"):
             root = Path(self.settings.data_dir) / name
             if not root.is_dir():
@@ -472,6 +543,19 @@ class InstitutionPurgeService:
                 found.add(institution_profile_id_from_storage_dir(directory))
         found.discard("")
         return found
+
+    def _canonical_tenant_id(self, tenant_id: str | None) -> str:
+        candidate = (
+            self.settings.api_default_tenant_id
+            if tenant_id is None
+            else tenant_id
+        )
+        return tenant_directory_key(candidate)
+
+    def _authoring_repository(self, tenant_id: str) -> AuthoringRepository:
+        if self.authoring_repository is not None:
+            return self.authoring_repository
+        return AuthoringRepository(settings_for_tenant(self.settings, tenant_id))
 
     def _remove_profile_directories(self, profile_id: str, result: InstitutionPurgeResult) -> None:
         """이 기관에만 속한 보조 폴더(대기 업로드, 저장한 작업)를 함께 지운다."""

@@ -9,14 +9,113 @@ from unittest.mock import patch
 from dataclasses import replace
 
 from app.core.config import Settings
+from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
-from app.services.institution_purge_service import InstitutionPurgeService
+from app.services.institution_purge_service import (
+    InstitutionPurgePlan,
+    InstitutionPurgeResult,
+    InstitutionPurgeService,
+)
 from app.storage.repository import JsonRepository
 from frontend import streamlit_app
 
 
 class StreamlitApprovalHelperTests(unittest.TestCase):
+    def test_registered_institution_cleanup_forwards_profile_tenant(self) -> None:
+        registry = InstitutionProfileRegistry(
+            profiles={
+                "profile-a": InstitutionProfile(
+                    profile_id="profile-a",
+                    display_name="기관 A",
+                    institution_name="기관 A",
+                    tenant_id="tenant-a",
+                )
+            },
+            default_profile_id="profile-a",
+        )
+        completed = InstitutionPurgeResult(profile_id="profile-a")
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "institutions.json"
+            with (
+                patch.object(
+                    streamlit_app,
+                    "_institution_profiles_storage_path",
+                    return_value=registry_path,
+                ),
+                patch.object(
+                    streamlit_app,
+                    "_purge_institution_documents",
+                    return_value=completed,
+                ) as purge,
+                patch.object(streamlit_app.st, "session_state", {}),
+                patch.object(
+                    streamlit_app,
+                    "_selected_institution_profile_id",
+                    return_value=None,
+                ),
+            ):
+                result = streamlit_app._delete_registered_institution(
+                    registry,
+                    "profile-a",
+                    purge_documents=True,
+                )
+
+        self.assertIs(completed, result)
+        purge.assert_called_once_with("profile-a", tenant_id="tenant-a")
+
+    def test_keep_data_path_does_not_call_purge(self) -> None:
+        registry = InstitutionProfileRegistry(
+            profiles={
+                "profile-a": InstitutionProfile(
+                    profile_id="profile-a",
+                    display_name="기관 A",
+                    institution_name="기관 A",
+                    tenant_id="tenant-a",
+                )
+            },
+            default_profile_id="profile-a",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(
+                    streamlit_app,
+                    "_institution_profiles_storage_path",
+                    return_value=Path(tmp) / "institutions.json",
+                ),
+                patch.object(streamlit_app, "_purge_institution_documents") as purge,
+                patch.object(streamlit_app.st, "session_state", {}),
+                patch.object(
+                    streamlit_app,
+                    "_selected_institution_profile_id",
+                    return_value=None,
+                ),
+            ):
+                result = streamlit_app._delete_registered_institution(
+                    registry,
+                    "profile-a",
+                    purge_documents=False,
+                )
+
+        self.assertIsNone(result)
+        purge.assert_not_called()
+
+    def test_institution_purge_plan_forwards_explicit_tenant(self) -> None:
+        expected = InstitutionPurgePlan(profile_id="profile-a")
+        with patch.object(streamlit_app, "_institution_purge_service") as factory:
+            factory.return_value.plan.return_value = expected
+
+            actual = streamlit_app._institution_purge_plan(
+                "profile-a",
+                tenant_id="tenant-a",
+            )
+
+        self.assertIs(expected, actual)
+        factory.return_value.plan.assert_called_once_with(
+            "profile-a",
+            tenant_id="tenant-a",
+        )
+
     def test_source_context_resolves_pdf_page_bbox_and_uploaded_path(self) -> None:
         document = Document(
             document_id="doc_pdf",

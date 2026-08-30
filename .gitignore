@@ -44,6 +44,7 @@ data/private_release_runtime*/
 data/*_smoke_runtime_*/
 data/uploads/*
 data/exports/*
+data/authoring/
 data/reports/*
 !data/uploads/.gitkeep
 !data/exports/.gitkeep

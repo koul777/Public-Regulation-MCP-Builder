@@ -1,7 +1,7 @@
 # PR MCP Builder v1.2.21
 
 <p align="center">
-  <img src="docs/assets/pr-mcp-builder-brand-trailer.gif" alt="문서 구조화, 사람 승인, 승인 RAG 색인, 로컬 Qwen과 MCP 연결로 이어지는 PR MCP Builder 브랜드 트레일러" width="960">
+  <img src="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.gif" alt="문서 구조화, 사람 승인, 승인 RAG 색인, 로컬 Qwen과 MCP 연결로 이어지는 PR MCP Builder 브랜드 트레일러" width="960">
 </p>
 
 **사람이 승인·색인한 공공기관 규정을 독립 로컬 Qwen 챗봇에서 고르고 바로 대화하거나,
@@ -11,9 +11,21 @@ v1.2.21에서는 독립 Qwen 챗봇이 기본적으로 빠른 승인 BM25/lexica
 질문을 보내면 검색·답변·인용 검증의 실제 진행률과 경과 시간이 계속 보이고, 승인·색인이
 끝난 규정만 선택할 수 있습니다. MCP 생성·연결 경로와 기존 승인 데이터는 그대로 유지됩니다.
 
-![로컬 Qwen 챗봇에서 승인 규정을 선택하고 질문한 뒤 진행 게이지와 근거 조문을 확인하는 데모](docs/assets/public-regulation-qwen-rag-demo.gif)
+또한 원문이 없는 초보자도 **규정 새로 작성** 화면에서 제정·일부 개정·전부 개정 템플릿을
+고르고, 필수 항목과 조문·참조 검사를 거쳐 검토용 Markdown/JSON 초안을 만들 수 있습니다.
+이 작성 기능은 기존 승인·색인 저장소와 분리된 `LIMITED INTERNAL DRAFT` 단계이며,
+출력물은 공식 승인본이 아닙니다.
 
-[MP4로 데모 보기](docs/assets/public-regulation-qwen-rag-demo.mp4) ·
+![로컬 Qwen 챗봇에서 승인 규정을 선택하고 질문한 뒤 진행 게이지와 근거 조문을 확인하는 데모](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/public-regulation-qwen-rag-demo.gif)
+
+[MP4로 데모 보기](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/public-regulation-qwen-rag-demo.mp4) ·
+[원문 없이 규정 초안 만들기](docs/authoring_quickstart_ko.md) ·
+[초보자 사용성 검증 계획](docs/authoring_beginner_usability_test_plan_ko.md) ·
+[Claude 독립 감리](docs/authoring_claude_audit_ko.md) ·
+[작성 구현·검증 보고서](docs/authoring_verification_report_ko.md) ·
+[작성 MVP 계약](docs/authoring_mvp_contract_ko.md) ·
+[작성 보안 모델](docs/authoring_security_model_ko.md) ·
+[작성 롤아웃 계획](docs/authoring_workspace_rollout_plan_ko.md) ·
 [처음 사용자 1–6단계로 바로 이동](#qwen-first-chat) ·
 [문제 해결표로 이동](#4-문제-해결표) ·
 [업데이트 내역 보기](#update-history)
@@ -26,7 +38,7 @@ v1.2.21에서는 독립 Qwen 챗봇이 기본적으로 빠른 승인 BM25/lexica
 **흩어진 공공기관 규정을, AI가 목록·목차·조문·참조 관계까지 찾아 쓰는 승인형 규정
 MCP로 바꿉니다.**
 
-![기관 선택부터 규정 전처리, 검수·승인, MCP 생성과 AI 연결까지 보여 주는 PR MCP Builder 데모](docs/assets/pr-mcp-builder-demo.gif)
+![기관 선택부터 규정 전처리, 검수·승인, MCP 생성과 AI 연결까지 보여 주는 PR MCP Builder 데모](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-demo.gif)
 
 PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **사람이 원문과
 비교해 승인한 내용만** ChatGPT·Codex·Claude에서 조회하게 만드는 Windows용
@@ -52,6 +64,22 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 > 않으면 소스 실행으로 확인하거나, 새 portable 릴리스와 fresh-Windows 검증이 끝난 뒤
 > 다운로드하세요.
 
+### 원문 파일이 없다면 규정 초안부터 만들기
+
+로컬 소스 실행 화면의 **✍️ 규정 새로 작성**에서는 신규 제정·일부 개정·전부
+개정을 고르고, 한국어 범용 템플릿과 쉬운말 안내를 따라 초안을 만들 수 있습니다.
+외부 AI를 호출하지 않는 결정론적 검사로 필수정보, 빈 조문, 번호 중복과 내부 참조
+오류를 먼저 찾습니다. 자세한 순서는 [초보자용 규정 작성 빠른 시작](docs/authoring_quickstart_ko.md)을
+보세요. 브라우저를 닫은 뒤에도 생성된 초안 패키지를 무결성 확인 후 같은 파일로
+다시 내려받을 수 있어, 다운로드만을 위해 새 개정본을 만들 필요가 없습니다.
+
+> [!IMPORTANT]
+> 작성 화면의 **내용 동결**과 출력물은 `공식 승인 아님`입니다. 작성 데이터는 기존
+> 승인·벡터·MCP 저장소와 분리되며 P0에서는 공식 파이프라인으로 자동 가져오지
+> 않습니다. 법적 검토와 기관 결재 후에도 기존 전처리·사람 승인·색인 절차를 별도로
+> 거쳐야 합니다. 현재는 자동 테스트를 통과한 **로컬 실험 기능**이며, 5명 이상
+> 초보자 인간 사용성 파일럿은 아직 출시 게이트로 남아 있습니다.
+
 ### 먼저, 규정을 어디에서 질문할지 고르기
 
 첫 시작 화면의 **최종 사용 방법**에서 아래 둘 중 하나를 고릅니다. 둘 다 이미 승인된
@@ -59,7 +87,7 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 선택을 잘못해도 왼쪽 메뉴의 **Qwen 또는 MCP 선택**에서 언제든 바꿀 수 있고, MCP를
 고르더라도 로컬 Qwen 챗봇이 사라지지 않습니다.
 
-![첫 시작 화면에서 로컬 Qwen 챗봇 또는 MCP 연결을 고르는 화면](docs/assets/readme-qwen-01-mode-choice.png)
+![첫 시작 화면에서 로컬 Qwen 챗봇 또는 MCP 연결을 고르는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-qwen-01-mode-choice.png)
 
 | 첫 선택 | 이런 경우에 고르세요 | ④에서 하게 되는 일 | 미리 필요한 것 |
 | --- | --- | --- | --- |
@@ -165,7 +193,7 @@ Vercel 안내로 넘어가면 됩니다.
 <details>
 <summary><strong>프로그램 전체 화면 구성 보기</strong></summary>
 
-![규정 문서를 사람이 검토·승인한 뒤 로컬 AI와 HTTPS MCP로 연결하는 PR MCP Builder](docs/assets/pr-mcp-builder-hero.png)
+![규정 문서를 사람이 검토·승인한 뒤 로컬 AI와 HTTPS MCP로 연결하는 PR MCP Builder](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-hero.png)
 
 </details>
 
@@ -345,11 +373,11 @@ Windows 실행판 설치
 선택 화면입니다. 현재 버전에서는 이 이미지보다 앞에 안내 모드 선택 화면이 한 번 더
 나옵니다.
 
-![기관을 등록하거나 선택하는 시작 화면](docs/assets/readme-guide-01-start.png)
+![기관을 등록하거나 선택하는 시작 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-01-start.png)
 
 선택 후 대시보드에서 현재 작업 상태와 다음 단계를 확인합니다.
 
-![기관 선택 뒤 나타나는 작업 대시보드](docs/assets/readme-guide-01-dashboard.png)
+![기관 선택 뒤 나타나는 작업 대시보드](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-01-dashboard.png)
 
 **성공 신호:** 대시보드 위쪽에 지금 작업할 기관이 표시됩니다. 기관을 잘못 선택했다면
 규정 파일을 올리기 전에 돌아가서 바꿉니다.
@@ -362,13 +390,13 @@ Windows 실행판 설치
 4. 자동 인식된 규정명, 버전과 개정일을 원문과 비교합니다.
 5. 값이 맞으면 전처리를 시작합니다.
 
-![규정 파일을 올리는 화면](docs/assets/readme-guide-02-upload.png)
+![규정 파일을 올리는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-02-upload.png)
 
-![자동 인식된 규정 정보를 확인하는 화면](docs/assets/readme-guide-02-progress.png)
+![자동 인식된 규정 정보를 확인하는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-02-progress.png)
 
 처리가 끝나면 완료 표시가 나타납니다.
 
-![규정 전처리 완료 화면](docs/assets/readme-guide-02-preprocess-complete.png)
+![규정 전처리 완료 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-02-preprocess-complete.png)
 
 **왜 하나요?** 이 단계가 문서의 평면 텍스트를 규정명·버전·장·절·조·별표·부칙
 단위로 나눕니다. **성공 신호는 진행률 숫자가 아니라 전처리 완료 상태와 결과 확인
@@ -379,16 +407,16 @@ Windows 실행판 설치
 `② 결과 확인`에서 처리할 규정을 불러옵니다. 품질 결과가 표시되어도 자동 승인된 것은
 아닙니다.
 
-![전처리 결과를 불러오는 화면](docs/assets/readme-guide-03-load.png)
+![전처리 결과를 불러오는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-03-load.png)
 
 여러 규정을 올렸다면 각 규정의 품질과 상태를 확인합니다.
 
-![여러 규정의 처리 결과와 품질을 확인하는 화면](docs/assets/readme-guide-03-multi-regulation.png)
+![여러 규정의 처리 결과와 품질을 확인하는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-03-multi-regulation.png)
 
 원문, 전처리 결과와 앞뒤 문맥을 비교합니다. 조문 번호, 제목, 본문, 별표와 표 내용이
 원문과 다르면 승인하기 전에 수정하거나 다시 처리합니다.
 
-![원문과 전처리 결과 및 앞뒤 문맥을 비교하는 화면](docs/assets/readme-guide-03-chunk-context.png)
+![원문과 전처리 결과 및 앞뒤 문맥을 비교하는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-03-chunk-context.png)
 
 **성공 신호:** 규정명과 조문 번호가 원문과 일치하고, 조문 본문·표·별표가 엉뚱한
 조문에 섞이지 않았습니다. 다르면 다음 단계로 넘기지 말고 수정하거나 다시 처리합니다.
@@ -398,15 +426,15 @@ Windows 실행판 설치
 AI 제안은 참고용입니다. 사람이 원문을 확인하고 승인한 내용만 검색 색인과 MCP에
 들어갑니다.
 
-![AI 제안을 검토하고 사람이 승인하는 화면](docs/assets/readme-guide-04-human-review.png)
+![AI 제안을 검토하고 사람이 승인하는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-04-human-review.png)
 
 승인 화면에서 사용할 조문을 선택하고 승인 동작을 실행합니다.
 
-![검토한 조문을 승인하는 동작 화면](docs/assets/readme-guide-04-approval-actions.png)
+![검토한 조문을 승인하는 동작 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-04-approval-actions.png)
 
 색인 완료 상태가 표시돼야 Qwen 챗봇·MCP 연결 단계로 갈 수 있습니다.
 
-![승인 데이터의 검색 색인이 완료된 화면](docs/assets/readme-guide-04-indexed.png)
+![승인 데이터의 검색 색인이 완료된 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-guide-04-indexed.png)
 
 **성공 신호:** 승인 완료와 검색 색인 완료가 함께 표시됩니다. 승인만 끝나고 색인이
 실패했다면 `③ 검수하고 승인`에서 **문서 색인 복구**를 실행합니다. 이는 승인 청크를
@@ -425,7 +453,7 @@ MCP 파일 묶음을 만들거나 갱신할 때 자동으로 생성되므로, �
    자동으로 열리지 않으면 화면에 표시된 `127.0.0.1` 주소의 **열려 있는 Qwen 챗봇으로
    이동**을 누릅니다. 빌더와 챗봇은 서로 다른 로컬 프로세스이므로 빌더 화면 안에서 대화하지 않습니다.
 
-![빌더에서 독립 로컬 Qwen 챗봇을 한 번에 여는 화면](docs/assets/readme-qwen-02-launch.png)
+![빌더에서 독립 로컬 Qwen 챗봇을 한 번에 여는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-qwen-02-launch.png)
 
 2. **기관과 승인 규정 선택** — 독립 앱에서 기관을 고른 다음 목록의 **대화할 규정**을
    하나 선택합니다. `질문 가능`은 활성 청크의 검수 결정이 끝났고 승인 청크 수와 색인
@@ -437,7 +465,7 @@ MCP 파일 묶음을 만들거나 갱신할 때 자동으로 생성되므로, �
    버튼을 반복해서 누르지 않습니다. 실패하면 새 PowerShell에서 `ollama list`를 실행해
    `qwen3:8b`를 확인하고, 없으면 `ollama pull qwen3:8b`를 실행한 뒤 Ollama를 다시 시작합니다.
 
-![승인·색인 규정과 Ollama qwen3 8B 준비 상태를 확인하는 화면](docs/assets/readme-qwen-03-ready.png)
+![승인·색인 규정과 Ollama qwen3 8B 준비 상태를 확인하는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-qwen-03-ready.png)
 
 4. **답변 방식 선택** — 처음에는 **Qwen3 4B 정밀 근거 감사**를 끈 기본값 그대로 둡니다.
    기본 빠른 모드는 승인 BM25/lexical 검색 → Qwen3 8B 짧은 답변 → 결정론적 근거 ID 검증
@@ -449,14 +477,14 @@ MCP 파일 묶음을 만들거나 갱신할 때 자동으로 생성되므로, �
    정확한 단일 조문 질문은 이전 대화와 분리해 빠르게 찾고, `그 내용은?`처럼 앞 질문이
    필요한 후속 질문만 최근 사용자 질문을 검색 문맥으로 사용합니다.
 
-![질문 처리 단계와 진행률 및 경과 시간을 보여 주는 화면](docs/assets/readme-qwen-04-progress.png)
+![질문 처리 단계와 진행률 및 경과 시간을 보여 주는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-qwen-04-progress.png)
 
 6. **답변과 근거 조문 함께 확인** — 답변만 읽고 끝내지 말고 아래 **근거 조문**에서
    규정명·조문 번호·페이지·승인 인용을 원문과 비교합니다. 기본 모드에서도 답변의 모든
    `[E번호]`가 선언된 승인 검색 결과와 정확히 일치해야 표시됩니다. 존재하지 않는 조문이나
    근거가 부족한 질문은 비슷한 다른 조문으로 바꾸지 않고 고정된 근거 부족 답변을 표시합니다.
 
-![Qwen 답변과 승인된 근거 조문 및 인용을 함께 확인하는 화면](docs/assets/readme-qwen-05-answer-citations.png)
+![Qwen 답변과 승인된 근거 조문 및 인용을 함께 확인하는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-qwen-05-answer-citations.png)
 
 위 캡처와 데모는 **합성 샘플**만 사용했습니다. **실제 기관명**, 기관 문서, **사용자 로컬 경로**는
 포함하지 않았습니다.
@@ -476,7 +504,7 @@ MCP 파일 묶음을 만들거나 갱신할 때 자동으로 생성되므로, �
 `list_regulations` → `search` → `fetch`를 확인하세요. 이 선택은 독립 Qwen 앱, 승인 색인,
 기존 MCP 번들을 삭제하지 않으며 왼쪽 **Qwen 또는 MCP 선택**에서 언제든 바꿀 수 있습니다.
 
-![기존 MCP 생성과 외부 AI 연결 경로가 유지되는 화면](docs/assets/readme-qwen-06-mcp-path.png)
+![기존 MCP 생성과 외부 AI 연결 경로가 유지되는 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-qwen-06-mcp-path.png)
 
 > [!WARNING]
 > 원문 업로드, 미승인 데이터, API 키, 비밀번호와 기관 내부 비밀 자료를 공개 저장소나
@@ -783,7 +811,7 @@ Codex·Claude의 같은-PC 연결은 로컬 STDIO로 표시됩니다. 이전 화
 
 ##### Claude Desktop에 로컬 STDIO로 연결할 때
 
-![PR MCP Builder에서 Claude Desktop 로컬 STDIO 설정, 저장 폴더와 MCP 이름을 선택하는 실제 화면](docs/assets/readme-course-00d-builder-claude-selection.png)
+![PR MCP Builder에서 Claude Desktop 로컬 STDIO 설정, 저장 폴더와 MCP 이름을 선택하는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-00d-builder-claude-selection.png)
 
 Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 
@@ -843,7 +871,7 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 5. `reg-rag-mcp-vercel-stage`, `vercel`, `reg-rag-mcp-client-config-smoke`는 원격 배포 및 검증용입니다.
 6. 마지막 줄의 `search then fetch` 예시까지 성공해야 끝입니다. 서버 이름만 보여도 아직 완료가 아닙니다.
 
-![MCP 생성 완료 화면에서 로컬 STDIO와 Vercel HTTPS의 다음 단계를 구분하는 설명용 화면](docs/assets/readme-course-00-completion-guide.png)
+![MCP 생성 완료 화면에서 로컬 STDIO와 Vercel HTTPS의 다음 단계를 구분하는 설명용 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-00-completion-guide.png)
 
 </details>
 
@@ -859,7 +887,7 @@ Claude Desktop은 위 화면에서 다음 차이만 주의합니다.
 3. 저장 폴더와 MCP 이름을 넣고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
 4. 생성이 끝나면 Windows 파일 탐색기에서 방금 만든 번들 폴더를 엽니다.
 
-![Claude Code에 등록할 로컬 STDIO 번들 폴더를 찾는 설명용 화면](docs/assets/readme-course-01-stdio-bundle.png)
+![Claude Code에 등록할 로컬 STDIO 번들 폴더를 찾는 설명용 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-01-stdio-bundle.png)
 
 위 그림은 위치를 설명하는 예시입니다. 그림 속 `C:\MCP-Bundles\my-regulations`를
 입력하지 말고, 방금 Builder가 만든 **내 번들 폴더**를 여세요.
@@ -897,7 +925,7 @@ claude mcp get test2
 아래 그림처럼 `search`, `fetch`와 본문 반환이 모두 성공해야 끝입니다. 서버 이름만
 목록에 보이는 것은 아직 연결 완료가 아닙니다.
 
-![Claude Code 로컬 MCP의 initialize, search, fetch 성공 결과를 읽는 설명용 화면](docs/assets/readme-course-05-mcp-verification.png)
+![Claude Code 로컬 MCP의 initialize, search, fetch 성공 결과를 읽는 설명용 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-05-mcp-verification.png)
 
 </details>
 
@@ -1039,7 +1067,7 @@ args = [
 5. 빨간 **MCP로 쓸 파일 묶음 만들기** 버튼을 누릅니다.
 6. 파란 진행 막대가 `100%`가 되고 **MCP 파일 묶음 생성 완료**가 보일 때까지 기다립니다.
 
-![Builder에서 Claude Desktop 로컬 STDIO를 선택하는 실제 화면](docs/assets/readme-course-00d-builder-claude-selection.png)
+![Builder에서 Claude Desktop 로컬 STDIO를 선택하는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-00d-builder-claude-selection.png)
 
 ### C-2. Builder에서 JSON 복사하기
 
@@ -1058,7 +1086,7 @@ args = [
 > 복사하면 됩니다. 현재 Builder에서는
 > **처음 연결할 때: 설정 파일 전체에 붙여 넣을 JSON 복사**로 표시됩니다.
 
-![Builder에서 Claude Desktop용 JSON을 복사하는 실제 화면](docs/assets/readme-course-04b-builder-claude-direct-config.png)
+![Builder에서 Claude Desktop용 JSON을 복사하는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-04b-builder-claude-direct-config.png)
 
 스크린샷에서 개인정보 보호를 위해 가린 서버 이름과 경로를 직접 입력하지 마세요.
 **내 Builder 화면의 복사 아이콘으로 가져온 값만 사용합니다.**
@@ -1071,7 +1099,7 @@ args = [
 2. 왼쪽 아래 **프로필 영역**을 누릅니다.
 3. 열린 메뉴에서 톱니바퀴 모양 **설정**을 누릅니다.
 
-![Claude Desktop 왼쪽 아래에서 설정을 여는 실제 화면](docs/assets/readme-course-02-claude-settings-menu.png)
+![Claude Desktop 왼쪽 아래에서 설정을 여는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-02-claude-settings-menu.png)
 
 #### 2. 구성 편집 누르기
 
@@ -1081,7 +1109,7 @@ args = [
 
 클릭 경로는 **설정 > 개발자 > 로컬 MCP 서버 > 구성 편집**입니다.
 
-![Claude Desktop 개발자 화면에서 구성 편집을 누르는 실제 화면](docs/assets/readme-course-02c-claude-developer-config-edit.png)
+![Claude Desktop 개발자 화면에서 구성 편집을 누르는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-02c-claude-developer-config-edit.png)
 
 #### 3. 설정 파일 열기
 
@@ -1090,7 +1118,7 @@ args = [
 2. 파일을 두 번 클릭합니다.
 3. 어떤 앱으로 열지 묻는다면 **메모장** 또는 **Visual Studio Code**를 선택합니다.
 
-![파일 탐색기에서 claude_desktop_config 파일을 여는 실제 화면](docs/assets/readme-course-02d-claude-config-file-explorer.png)
+![파일 탐색기에서 claude_desktop_config 파일을 여는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-02d-claude-config-file-explorer.png)
 
 파일 확장명이 숨겨진 Windows에서는 `.json`이 보이지 않을 수 있습니다.
 파일 종류가 **JSON 원본 파일**이면 맞습니다.
@@ -1120,7 +1148,7 @@ args = [
 > 초보자는 `mcpServers` 안쪽 줄을 손으로 맞추지 않습니다. **파일 전체 선택 후 그대로
 > 붙여 넣기**만 하면 됩니다.
 
-![Claude Desktop 설정 파일 전체에 Builder JSON을 붙여 넣는 실제 화면](docs/assets/readme-course-07-claude-config-editor.png)
+![Claude Desktop 설정 파일 전체에 Builder JSON을 붙여 넣는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-07-claude-config-editor.png)
 
 스크린샷의 서버 이름, 경로, profile ID는 공개용으로 가렸고 Windows 작업표시줄도
 제거했습니다. 빈칸을 따라 입력하지 말고 C-2에서 복사한 JSON을 그대로 붙여 넣습니다.
@@ -1146,7 +1174,7 @@ args = [
 4. **로컬 MCP 서버**에서 방금 만든 서버 이름을 누릅니다.
 5. 서버 이름 옆 파란 배지가 **`running`**인지 확인합니다.
 
-![Claude Desktop 로컬 MCP 서버에서 running을 확인하는 실제 화면](docs/assets/readme-course-02b-claude-local-mcp-server.png)
+![Claude Desktop 로컬 MCP 서버에서 running을 확인하는 실제 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-02b-claude-local-mcp-server.png)
 
 이 화면에서는 다음 세 곳만 보면 됩니다.
 
@@ -1567,7 +1595,7 @@ vercel --prod --cwd "$StageDir"
 `https://my-regulation-mcp.vercel.app/mcp`입니다. **예시 주소를 입력하지 말고 내
 PowerShell에 나온 주소를 복사하세요.**
 
-![Vercel Production 배포 완료와 고정 Aliased URL을 찾는 설명용 화면](docs/assets/readme-course-03-vercel-production.png)
+![Vercel Production 배포 완료와 고정 Aliased URL을 찾는 설명용 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-03-vercel-production.png)
 
 배포마다 생기는 긴 Preview URL 대신 고정 `Aliased` 주소를 사용하세요. 같은 Vercel
 배포와 `/mcp` endpoint를 ChatGPT·Codex·Claude가 함께 사용하므로 앱마다 새 서버를
@@ -1726,14 +1754,14 @@ https://my-regulation-mcp.vercel.app/mcp
 - `PYTHONPATH`
 - `run_mcp_stdio_server.ps1`
 
-![Claude 사용자 지정 커넥터에 Vercel MCP URL을 등록하는 설명용 화면](docs/assets/readme-course-04-claude-remote-connector.png)
+![Claude 사용자 지정 커넥터에 Vercel MCP URL을 등록하는 설명용 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-04-claude-remote-connector.png)
 
 Vercel 연결 화면에는 로컬 `command`, `args`, `cwd`, `PYTHONPATH`를 입력하지 않습니다.
 필요한 것은 최종 HTTPS `/mcp` URL과, 비공개 서버일 때 승인된 인증뿐입니다.
 
 전체 흐름을 한 장으로 보면 다음과 같습니다.
 
-![승인 번들을 Vercel에 배포하고 고정 Production URL을 Claude 커넥터에 등록한 뒤 search와 fetch로 확인하는 순서](docs/assets/readme-vercel-claude-connection.svg)
+![승인 번들을 Vercel에 배포하고 고정 Production URL을 Claude 커넥터에 등록한 뒤 search와 fetch로 확인하는 순서](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-vercel-claude-connection.svg)
 
 </details>
 
@@ -1807,9 +1835,9 @@ list_regulation_reference_cycles로 현재 승인 규정 사이의 순환참조�
 - `search`는 되지만 결과마다 `id`가 없다.
 - `fetch`에 제목이나 본문을 넣고 있고, `search`가 준 `id`를 넣지 않았다.
 
-![MCP initialize와 search 및 fetch가 모두 성공한 설명용 검증 화면](docs/assets/readme-course-05-mcp-verification.png)
+![MCP initialize와 search 및 fetch가 모두 성공한 설명용 검증 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-course-05-mcp-verification.png)
 
-![Claude에서 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](docs/assets/readme-claude-mcp-03-verify.svg)
+![Claude에서 running 상태와 search 및 fetch 원문 반환을 확인하는 순서](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/readme-claude-mcp-03-verify.svg)
 
 다음 항목을 모두 체크하면 연결 완료입니다.
 
@@ -1979,13 +2007,36 @@ Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이
 
 <a id="update-history"></a>
 
-# 최근 업데이트: 2026년 8월 29일
+# 최근 업데이트: 2026년 8월 30일
 
 <details>
 <summary><strong>v1.2.21 상세 변경과 기존 사용자 변경 이력 펼치기</strong></summary>
 
 최신 버전은 처음 사용하는 사람이 화면을 보면서 **지금 해야 할 한 가지를 바로 이해하고,
 단계가 바뀌어도 안내를 잃지 않도록** 초보자 흐름도 함께 보완했습니다.
+
+## 2026년 8월 30일 — 초보자용 규정 작성 MVP와 안전한 검토 경계
+
+- 원문 없이 시작할 수 있는 신규 제정·일부 개정·전부 개정 템플릿과 단계별 쉬운말 안내를
+  추가했습니다.
+- 필수 메타데이터, 빈 조문, 조문 번호 중복, 끊어진 내부 참조와 체크리스트 누락을
+  검토 요청 전에 결정론적으로 검사합니다.
+- 작성 상태를 계획 → 작성 → 검토 요청 → 수정 요청 → 내용 동결 → 내보내기의 명시적
+  상태 머신으로 관리하고, 잘못 만든 작업은 별도로 폐기할 수 있습니다.
+- 작성 데이터는 기관·프로필별 저장소에 격리하고, revision 충돌·감사 이벤트·무결성 해시,
+  export/purge 경합과 비정상 종료 복구를 강화했습니다.
+- 로컬 1인 연습은 명시적 동의가 있어야 `training_only`로 동결할 수 있고, 보호 환경에서는
+  서로 다른 작성자·확인자만 동결할 수 있습니다. 작성 초안은 공식 승인·RAG·MCP로 자동
+  전달되지 않습니다.
+- 전체 테스트 **3,614개 통과**(`16개 건너뜀`), 작성 기능 집중 테스트 **108개 통과**
+  (`2개 건너뜀`), 브랜치 포함 작성 경로 커버리지 **85%**를 확인했습니다.
+- Claude 최종 읽기 전용 감리에서는 새 High/Medium/Low 코드 결함이 발견되지 않았습니다.
+  다만 일반 출시 전에는 초보자 5명 이상 실제 파일럿, 운영 계정 분리 증거, symlink 실행이
+  가능한 CI 검증이 필요합니다.
+
+구현 범위와 남은 출시 조건은 [작성 구현·검증 보고서](docs/authoring_verification_report_ko.md),
+[Claude 독립 감리](docs/authoring_claude_audit_ko.md),
+[초보자 사용성 검증 계획](docs/authoring_beginner_usability_test_plan_ko.md)에서 확인할 수 있습니다.
 
 ## 2026년 8월 29일 — 초보자 검수, 파싱 안전성, 승인 RAG 정확성 강화
 

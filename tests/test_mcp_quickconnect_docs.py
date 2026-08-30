@@ -22,6 +22,10 @@ QWEN_README_DEMO_FILENAMES = (
     "public-regulation-qwen-rag-demo.gif",
     "public-regulation-qwen-rag-demo.mp4",
 )
+PUBLIC_README_ASSET_PREFIX = (
+    "https://raw.githubusercontent.com/koul777/"
+    "Public-Regulation-MCP-Builder/main/docs/assets/"
+)
 PUBLIC_ASSET_FORBIDDEN_PATH_MARKERS = (
     "c:\\users\\",
     "c:/users/",
@@ -369,18 +373,24 @@ class McpQuickConnectDocsTests(unittest.TestCase):
 
         for filename in image_filenames:
             asset_path = f"docs/assets/{filename}"
+            public_asset_url = f"{PUBLIC_README_ASSET_PREFIX}{filename}"
             with self.subTest(filename=filename):
                 self.assertRegex(
                     text,
-                    rf"!\[[^\]]+\]\({re.escape(asset_path)}(?:\s+\"[^\"]*\")?\)",
+                    rf"!\[[^\]]+\]\({re.escape(public_asset_url)}"
+                    rf"(?:\s+\"[^\"]*\")?\)",
                 )
                 self.assertTrue((REPO_ROOT / asset_path).is_file(), asset_path)
 
         mp4_path = f"docs/assets/{QWEN_README_DEMO_FILENAMES[1]}"
+        public_mp4_url = (
+            f"{PUBLIC_README_ASSET_PREFIX}{QWEN_README_DEMO_FILENAMES[1]}"
+        )
         self.assertRegex(
             text,
-            rf"(?:\[[^\]]+\]\({re.escape(mp4_path)}(?:\s+\"[^\"]*\")?\)"
-            rf"|(?:src|href)=[\"']{re.escape(mp4_path)}[\"'])",
+            rf"(?:\[[^\]]+\]\({re.escape(public_mp4_url)}"
+            rf"(?:\s+\"[^\"]*\")?\)"
+            rf"|(?:src|href)=[\"']{re.escape(public_mp4_url)}[\"'])",
         )
         self.assertTrue((REPO_ROOT / mp4_path).is_file(), mp4_path)
         for public_safety_notice in (

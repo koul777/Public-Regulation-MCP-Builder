@@ -26,6 +26,12 @@ from urllib.request import urlopen
 import pandas as pd
 import streamlit as st
 
+from frontend.authoring_page import (
+    AUTHORING_NAV_LABEL,
+    authoring_profile_has_unsaved_state,
+    authoring_enabled,
+    render_authoring_page,
+)
 from app import __version__ as APP_VERSION
 from app.api.routes_documents import (
     ApprovalRequest,
@@ -246,6 +252,7 @@ MCP_CONNECTION_STATE_LABELS = {
     "stale": "이전 증거",
 }
 NAV_HOME = "🏠 시작하기"
+NAV_AUTHORING = AUTHORING_NAV_LABEL
 NAV_PREPROCESS = "① 문서 올려서 전처리"
 NAV_RESULTS = "② 결과 확인"
 NAV_APPROVAL = "③ 검수하고 승인"
@@ -3149,13 +3156,21 @@ def _document_purge_service() -> DocumentPurgeService:
     return DocumentPurgeService(settings=settings, repository=repository)
 
 
-def _institution_purge_plan(profile_id: str) -> InstitutionPurgePlan:
-    return _institution_purge_service().plan(profile_id)
+def _institution_purge_plan(
+    profile_id: str,
+    *,
+    tenant_id: str | None = None,
+) -> InstitutionPurgePlan:
+    return _institution_purge_service().plan(profile_id, tenant_id=tenant_id)
 
 
-def _purge_institution_documents(profile_id: str) -> InstitutionPurgeResult:
+def _purge_institution_documents(
+    profile_id: str,
+    *,
+    tenant_id: str | None = None,
+) -> InstitutionPurgeResult:
     """기관에 속한 규정·승인·색인 데이터를 실제로 지운다. 되돌릴 수 없다."""
-    return _institution_purge_service().purge(profile_id)
+    return _institution_purge_service().purge(profile_id, tenant_id=tenant_id)
 
 
 def _orphan_institution_data_plans() -> list[InstitutionPurgePlan]:
@@ -3178,9 +3193,17 @@ def _orphan_institution_data_plans() -> list[InstitutionPurgePlan]:
             str(profile_id or "").strip().lower() for profile_id in current_registry.profiles
         }
     service = _institution_purge_service()
-    orphan_ids = sorted(service.profile_ids_with_stored_data() - known_profile_ids)
+    orphan_tenant_id = _local_operator_tenant_id()
+    orphan_ids = sorted(
+        service.profile_ids_with_stored_data(tenant_id=orphan_tenant_id)
+        - known_profile_ids
+    )
     # 목록에서는 조항 수를 세지 않는다. 규정 300개의 조항까지 세면 첫 화면이 멈춘다.
-    plans = service.plan_many(orphan_ids, count_chunks=False)
+    plans = service.plan_many(
+        orphan_ids,
+        count_chunks=False,
+        tenant_id=orphan_tenant_id,
+    )
     return sorted(plans, key=lambda plan: (-plan.document_count, plan.profile_id))
 
 
@@ -3198,7 +3221,14 @@ def _delete_registered_institution(
     if purge_documents:
         # 규정 데이터를 먼저 지운다. 프로필을 먼저 지우면 중간에 실패했을 때 어느 기관
         # 데이터였는지 화면에서 다시 찾을 수 없다.
-        purge_result = _purge_institution_documents(profile_id)
+        profile = registry.profiles.get(str(profile_id or "").strip().lower())
+        profile_tenant_id = str(
+            getattr(profile, "tenant_id", "") or _local_operator_tenant_id()
+        ).strip()
+        purge_result = _purge_institution_documents(
+            profile_id,
+            tenant_id=profile_tenant_id or _local_operator_tenant_id(),
+        )
         if not purge_result.completed:
             # Keep the profile visible so the operator can retry cleanup.  A
             # hidden institution with live documents or indexes is harder to
@@ -3241,12 +3271,14 @@ def _institution_purge_plan_summary(plan: InstitutionPurgePlan) -> str:
 
 
 def _institution_purge_leftover_parts(plan: InstitutionPurgePlan) -> list[str]:
-    """전처리하지 않은 대기 규정 파일과 저장한 작업. 문서가 없어도 남아 있을 수 있다."""
+    """문서가 없어도 남을 수 있는 대기 파일, 저장 작업, 작성 초안."""
     parts: list[str] = []
     if plan.pending_file_count:
         parts.append(f"전처리 대기 규정 파일 {plan.pending_file_count:,}개")
     if plan.saved_project_count:
         parts.append(f"저장한 작업 {plan.saved_project_count:,}개")
+    if plan.authoring_project_count:
+        parts.append(f"작성 초안 {plan.authoring_project_count:,}개")
     return parts
 
 
@@ -3259,16 +3291,17 @@ def _render_institution_purge_result(display_name: str, purge_result) -> None:
             "아래 원인을 확인한 뒤 다시 시도해 주세요."
         )
         for failure in purge_result.failures[:5]:
-            st.warning(f"삭제 중단 원인: {failure}")
+            st.warning(f"삭제 중단 원인: {_safe_ui_error(failure)}")
         return
     st.success(
         f"'{display_name}' 기관과 규정 데이터를 삭제했습니다. "
         f"규정 {purge_result.deleted_document_count:,}개 · "
+        f"작성 초안 {purge_result.deleted_authoring_project_count:,}개 · "
         f"색인 기록 {purge_result.deindexed_record_count:,}건 · "
         f"원본 파일 {purge_result.deleted_source_file_count:,}개를 지웠습니다."
     )
     for failure in purge_result.failures[:5]:
-        st.warning(f"일부 항목을 지우지 못했습니다: {failure}")
+        st.warning(f"일부 항목을 지우지 못했습니다: {_safe_ui_error(failure)}")
 
 
 def _render_institution_delete_confirmation(registry, profile, display_name: str) -> None:
@@ -3278,7 +3311,13 @@ def _render_institution_delete_confirmation(registry, profile, display_name: str
     규정 데이터는 남겨 뒀는데, 기관 ID가 기관명 해시라서 같은 이름으로 다시 만들면
     남아 있던 규정이 전부 되살아났다. 운영자에게는 삭제가 안 된 것으로 보였다.
     """
-    plan = _institution_purge_plan(profile.profile_id)
+    profile_tenant_id = str(
+        getattr(profile, "tenant_id", "") or _local_operator_tenant_id()
+    ).strip()
+    plan = _institution_purge_plan(
+        profile.profile_id,
+        tenant_id=profile_tenant_id or _local_operator_tenant_id(),
+    )
     st.warning(
         f"'{display_name}' 기관을 삭제합니다. 함께 삭제되는 데이터: "
         + (_institution_purge_plan_summary(plan) if not plan.is_empty else "저장된 규정 데이터 없음")
@@ -3286,11 +3325,12 @@ def _render_institution_delete_confirmation(registry, profile, display_name: str
     if not plan.is_empty:
         st.caption(
             "되돌릴 수 없습니다. 승인·색인된 조항은 MCP 답변 근거에서도 함께 빠집니다. "
-            "기관 프로필만 남기고 규정은 보관하려면 아래 '규정 데이터는 남기기'를 켜세요. "
+            "기관 프로필만 지우고 데이터는 보관하려면 아래 "
+            "'규정·작성 초안 데이터는 남기기'를 켜세요. "
             "다만 같은 기관명으로 다시 등록하면 기관 ID가 똑같이 계산되어 남긴 규정이 다시 붙습니다."
         )
     keep_documents = st.checkbox(
-        "규정 데이터는 남기기 (기관 프로필만 삭제)",
+        "규정·작성 초안 데이터는 남기기 (기관 프로필만 삭제)",
         key=f"keep-documents-institution-{profile.profile_id}",
         value=False,
         disabled=plan.is_empty,
@@ -3390,7 +3430,13 @@ def _render_orphan_institution_data_cleanup() -> None:
         if selected_plans:
             service = _institution_purge_service()
             # 고른 것만 정확히 센다. 목록 전체를 세면 화면이 멈춘다.
-            detailed_plans = [service.plan(plan.profile_id) for plan in selected_plans]
+            detailed_plans = [
+                service.plan(
+                    plan.profile_id,
+                    tenant_id=_local_operator_tenant_id(),
+                )
+                for plan in selected_plans
+            ]
             st.warning(
                 "되돌릴 수 없습니다. 함께 삭제되는 데이터: "
                 + " / ".join(_institution_purge_plan_summary(plan) for plan in detailed_plans)
@@ -3409,7 +3455,10 @@ def _render_orphan_institution_data_cleanup() -> None:
             deleted_documents = 0
             failures: list[str] = []
             for plan in selected_plans:
-                result = service.purge(plan.profile_id)
+                result = service.purge(
+                    plan.profile_id,
+                    tenant_id=_local_operator_tenant_id(),
+                )
                 deleted_documents += result.deleted_document_count
                 failures.extend(result.failures)
             st.session_state.pop("orphan-institution-data-selection", None)
@@ -8130,6 +8179,16 @@ def _page_home(ctx: dict | None) -> None:
     )
     _render_operator_project_controls(NAV_HOME)
     _render_api_key_setup_cta("home")
+
+    if authoring_enabled(settings):
+        st.markdown("### 원문 파일이 아직 없나요?")
+        st.caption(
+            "질문형 안내와 한국어 템플릿으로 규정 초안부터 만들 수 있습니다. "
+            "작성 결과는 공식 승인·색인·MCP와 분리됩니다."
+        )
+        if st.button(NAV_AUTHORING, type="primary", key="home-open-authoring"):
+            st.session_state["nav_page"] = NAV_AUTHORING
+            st.rerun()
 
     selected_profile_id = _selected_institution_profile_id()
     selected_profile = institution_registry.profiles.get(selected_profile_id) if institution_registry else None
@@ -14785,6 +14844,10 @@ current_nav_page = str(st.session_state.get("nav_page") or NAV_HOME)
 if current_nav_page == LEGACY_NAV_CONNECT:
     current_nav_page = NAV_MCP
     st.session_state["nav_page"] = NAV_MCP
+if current_nav_page == NAV_AUTHORING and not authoring_enabled(settings):
+    st.error("규정 작성 기능이 꺼져 있어 이 화면을 열 수 없습니다.")
+    st.caption("관리자가 ENABLE_REGULATION_AUTHORING 설정을 확인해야 합니다.")
+    st.stop()
 document_id = st.session_state.get("document_id")
 # Large result files are preloaded in the visible transition dialog and reused
 # across widget reruns. Pages that do not show document details skip the read.
@@ -14816,38 +14879,88 @@ with st.sidebar:
             label_visibility="collapsed",
         )
         if switched_profile_id != current_profile_id:
-            _select_institution_profile(switched_profile_id)
-            st.rerun()
+            current_profile_tenant_id = (
+                institution_registry.profiles[current_profile_id].tenant_id
+                or _local_operator_tenant_id()
+            )
+            needs_authoring_confirmation = (
+                current_nav_page == NAV_AUTHORING
+                and authoring_profile_has_unsaved_state(
+                    current_profile_tenant_id,
+                    current_profile_id,
+                )
+            )
+            if needs_authoring_confirmation:
+                st.warning(
+                    "현재 초안에 저장하지 않은 입력 또는 해결하지 않은 충돌이 있습니다. "
+                    "필요한 문장을 먼저 복사하거나 현재 기관으로 돌아가 저장하세요."
+                )
+                switch_confirmed = st.checkbox(
+                    "미저장 입력이 있는 현재 기관을 떠나 다른 기관으로 전환하겠습니다.",
+                    key=(
+                        "authoring-institution-switch-confirm:"
+                        f"{current_profile_id}:{switched_profile_id}"
+                    ),
+                )
+                if st.button(
+                    "기관 전환 계속",
+                    disabled=not switch_confirmed,
+                    key=(
+                        "authoring-institution-switch-continue:"
+                        f"{current_profile_id}:{switched_profile_id}"
+                    ),
+                ):
+                    _select_institution_profile(switched_profile_id)
+                    st.rerun()
+            else:
+                _select_institution_profile(switched_profile_id)
+                st.rerun()
         current_profile = institution_registry.profiles[current_profile_id]
         st.caption(current_profile.institution_name or current_profile.display_name or current_profile_id)
         st.divider()
     st.markdown("### 공공기관 규정 MCP 빌더")
-    st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
-    st.markdown("**최종 사용 방법**")
-    st.session_state[AI_USAGE_PATH_SIDEBAR_WIDGET_KEY] = _ai_usage_path()
-    st.radio(
-        "Qwen 또는 MCP 선택",
-        AI_USAGE_PATH_OPTIONS,
-        key=AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,
-        format_func=_ai_usage_path_label,
-        on_change=_ai_usage_path_changed,
-        args=(AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,),
-        label_visibility="collapsed",
-    )
-    st.caption(
-        "Qwen과 MCP는 같은 승인 RAG를 공유합니다. 선택하면 ④ 메뉴와 첫 화면만 목적에 맞게 바뀝니다."
-    )
-    if _ai_usage_path() == AI_USAGE_PATH_QWEN:
-        _render_standalone_qwen_chat_launcher(
-            key="sidebar-launch-standalone-qwen-chat",
-            primary=True,
+    if current_nav_page == NAV_AUTHORING:
+        st.caption("지금은 로컬 1인 규정 초안 연습 화면입니다. 본문의 1~6단계를 따라가세요.")
+    else:
+        st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
+    if authoring_enabled(settings):
+        if st.button(
+            NAV_AUTHORING,
+            type="primary" if current_nav_page == NAV_AUTHORING else "secondary",
+            key="sidebar-open-authoring",
+            width="stretch",
+        ):
+            st.session_state["nav_page"] = NAV_AUTHORING
+            st.rerun()
+        st.caption("원문이 없을 때 초안부터 작성합니다. 공식 승인 아님.")
+        st.divider()
+    if current_nav_page != NAV_AUTHORING:
+        st.markdown("**최종 사용 방법**")
+        st.session_state[AI_USAGE_PATH_SIDEBAR_WIDGET_KEY] = _ai_usage_path()
+        st.radio(
+            "Qwen 또는 MCP 선택",
+            AI_USAGE_PATH_OPTIONS,
+            key=AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,
+            format_func=_ai_usage_path_label,
+            on_change=_ai_usage_path_changed,
+            args=(AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,),
+            label_visibility="collapsed",
         )
         st.caption(
-            "빌더와 별도 프로세스로 실행됩니다. 새 챗봇에서 승인·색인 완료 규정을 골라 대화하세요."
+            "Qwen과 MCP는 같은 승인 RAG를 공유합니다. 선택하면 ④ 메뉴와 첫 화면만 목적에 맞게 바뀝니다."
         )
-    _render_beginner_guide_sidebar(ctx, current_nav_page)
-    _render_beginner_orchestration_explanation(nav_page=current_nav_page)
-    _render_ai_review_sidebar(ctx)
+        if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+            _render_standalone_qwen_chat_launcher(
+                key="sidebar-launch-standalone-qwen-chat",
+                primary=True,
+            )
+            st.caption(
+                "빌더와 별도 프로세스로 실행됩니다. 새 챗봇에서 승인·색인 완료 규정을 골라 대화하세요."
+            )
+    if current_nav_page != NAV_AUTHORING:
+        _render_beginner_guide_sidebar(ctx, current_nav_page)
+        _render_beginner_orchestration_explanation(nav_page=current_nav_page)
+        _render_ai_review_sidebar(ctx)
     st.divider()
     # AI 추가 검수를 쓰지 않은 문서에서는 ②를 빼고 ①→③ 2단계로 보여 준다.
     primary_nav_pages = _primary_nav_pages(ctx, current_nav_page)
@@ -14859,18 +14972,25 @@ with st.sidebar:
     )
     if stored_primary_page != desired_primary_page:
         st.session_state["primary_nav_page"] = desired_primary_page
-    st.radio(
-        "기본 작업 순서",
-        primary_nav_pages,
-        key="primary_nav_page",
-        on_change=_go_primary_nav,
-        format_func=_primary_nav_display_label,
-    )
-    if NAV_RESULTS not in primary_nav_pages:
+    if current_nav_page == NAV_AUTHORING:
+        st.markdown("**규정 초안 연습 순서**")
         st.caption(
-            "이 규정은 AI 추가 검수를 쓰지 않아 '② 결과 확인'을 건너뜁니다. "
-            "품질 경고와 상세 정보는 '③ 검수하고 승인' 화면에서 볼 수 있습니다."
+            "새 초안 만들기 → 기본정보 → 조문 → 작성 검사 → "
+            "내용 확인 → 연습용 내보내기"
         )
+    else:
+        st.radio(
+            "기본 작업 순서",
+            primary_nav_pages,
+            key="primary_nav_page",
+            on_change=_go_primary_nav,
+            format_func=_primary_nav_display_label,
+        )
+        if NAV_RESULTS not in primary_nav_pages:
+            st.caption(
+                "이 규정은 AI 추가 검수를 쓰지 않아 '② 결과 확인'을 건너뜁니다. "
+                "품질 경고와 상세 정보는 '③ 검수하고 승인' 화면에서 볼 수 있습니다."
+            )
     if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) or current_nav_page in ADVANCED_NAV_PAGES:
         with st.expander("고급 기능·관리자 메뉴", expanded=current_nav_page in ADVANCED_NAV_PAGES):
             st.caption("일반 작업에서는 열 필요가 없습니다.")
@@ -14901,6 +15021,19 @@ with st.sidebar:
 
 if nav_page == NAV_HOME:
     _page_home(ctx)
+elif nav_page == NAV_AUTHORING:
+    selected_profile_id = _selected_institution_profile_id()
+    selected_profile = institution_registry.profiles[selected_profile_id]
+    render_authoring_page(
+        settings=settings,
+        profile_id=selected_profile_id,
+        institution_name=(
+            selected_profile.institution_name
+            or selected_profile.display_name
+            or selected_profile_id
+        ),
+        tenant_id=selected_profile.tenant_id or _local_operator_tenant_id(),
+    )
 elif nav_page == NAV_PREPROCESS:
     _page_preprocess()
 elif nav_page == NAV_RESULTS:
