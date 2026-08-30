@@ -3,12 +3,20 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field
 
 
+INSTITUTION_PROFILE_ID_MAX_LENGTH = 128
+INSTITUTION_PROFILE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+
+
 class InstitutionProfileUpsertRequest(BaseModel):
     """Tenant-scoped institution profile registration payload."""
 
     model_config = ConfigDict(extra="forbid")
 
-    profile_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    profile_id: str = Field(
+        min_length=1,
+        max_length=INSTITUTION_PROFILE_ID_MAX_LENGTH,
+        pattern=INSTITUTION_PROFILE_ID_PATTERN,
+    )
     display_name: str = Field(min_length=1, max_length=200)
     institution_name: str = Field(min_length=1, max_length=200)
     apba_id: str | None = Field(default=None, max_length=128)

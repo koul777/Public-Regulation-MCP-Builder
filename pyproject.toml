@@ -18,6 +18,10 @@ dependencies = [
   "kiwipiepy>=0.21",
 ]
 
+[project.urls]
+Repository = "https://github.com/koul777/Public-Regulation-MCP-Builder"
+Issues = "https://github.com/koul777/Public-Regulation-MCP-Builder/issues"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2",

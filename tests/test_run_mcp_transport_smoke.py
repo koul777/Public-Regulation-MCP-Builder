@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.mcp_server.regulation_server import StaticBearerTokenVerifier
 from scripts.run_mcp_smoke import run_mcp_smoke
 from scripts.run_mcp_transport_smoke import (
     TEMPORAL_AS_OF_CASES,
@@ -53,6 +54,20 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         args = build_parser().parse_args(["--transport", "streamable-http", "--http-bearer-token-env", "MCP_TOKEN"])
 
         self.assertEqual(args.http_bearer_token_env, "MCP_TOKEN")
+
+    def test_static_bearer_verifier_accepts_only_exact_token(self) -> None:
+        verifier = StaticBearerTokenVerifier("exact-secret")
+
+        accepted = asyncio.run(verifier.verify_token("exact-secret"))
+        rejected = asyncio.run(verifier.verify_token("exact-secret-x"))
+        non_ascii_rejected = asyncio.run(verifier.verify_token("exact-secret-한글"))
+        unicode_verifier = StaticBearerTokenVerifier("정확한-비밀")
+        unicode_accepted = asyncio.run(unicode_verifier.verify_token("정확한-비밀"))
+
+        self.assertIsNotNone(accepted)
+        self.assertIsNone(rejected)
+        self.assertIsNone(non_ascii_rejected)
+        self.assertIsNotNone(unicode_accepted)
 
     def test_run_mcp_transport_smoke_passes_with_synthetic_data(self) -> None:
         report = run_mcp_transport_smoke(

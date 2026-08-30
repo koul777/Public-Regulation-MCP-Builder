@@ -56,7 +56,15 @@ class ReadinessTests(unittest.TestCase):
                 data_dir=data_dir,
                 api_auth_required=True,
                 api_auth_token="",
-                api_auth_tokens=json.dumps({"operator-token": {"role": "operator", "actor": "batch-operator"}}),
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=True,
             )
 
@@ -114,7 +122,15 @@ class ReadinessTests(unittest.TestCase):
                 app_env="production",
                 data_dir=data_dir,
                 api_auth_required=True,
-                api_auth_token="secret",
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=False,
             )
 
@@ -133,7 +149,15 @@ class ReadinessTests(unittest.TestCase):
                 app_env="production",
                 data_dir=data_dir,
                 api_auth_required=True,
-                api_auth_token="secret",
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 api_audit_enabled=False,
                 tenant_storage_isolation=True,
             )
@@ -164,7 +188,15 @@ class ReadinessTests(unittest.TestCase):
                 app_env="production",
                 data_dir=missing_data_dir,
                 api_auth_required=True,
-                api_auth_token="secret",
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=True,
             )
 

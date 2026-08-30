@@ -280,7 +280,7 @@ class HwpxParserTests(unittest.TestCase):
             [block.text for block in parsed.pages[0].blocks],
         )
 
-    def test_unparsable_section_is_flagged_not_silently_dropped(self) -> None:
+    def test_unparsable_body_section_stops_instead_of_dropping_regulation_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "broken_section.hwpx"
             with zipfile.ZipFile(path, "w") as archive:
@@ -291,12 +291,126 @@ class HwpxParserTests(unittest.TestCase):
                 )
                 archive.writestr("Contents/section1.xml", "<root><hp:p>깨진 XML")
 
-            parsed = HwpxParser().parse(path, "doc_broken_section")
+            with self.assertRaisesRegex(
+                ParserError,
+                "processing stopped to prevent missing regulation content",
+            ):
+                HwpxParser().parse(path, "doc_broken_section")
 
-        self.assertIn("정상 섹션", parsed.raw_text)
-        self.assertEqual(parsed.metadata["parser_uncertainty_risk_level"], "medium")
+    def test_unparsable_bodytext_section_path_also_stops_processing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken_bodytext_section.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("BodyText/Section0.xml", "<root><hp:p>malformed XML")
+
+            with self.assertRaisesRegex(
+                ParserError,
+                "processing stopped to prevent missing regulation content",
+            ):
+                HwpxParser().parse(path, "doc_broken_bodytext_section")
+
+    def test_unknown_body_xml_encoding_stops_with_parser_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unknown-body-encoding.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/section0.xml",
+                    b'<?xml version="1.0" encoding="x-unknown"?><root/>',
+                )
+
+            with self.assertRaisesRegex(
+                ParserError,
+                "processing stopped to prevent missing regulation content",
+            ):
+                HwpxParser().parse(path, "doc_unknown_body_encoding")
+
+    def test_parses_explicit_big_endian_body_xml(self) -> None:
+        template = (
+            '<?xml version="1.0" encoding="{declaration}"?>'
+            '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+            '<hp:p><hp:run><hp:t>{article}</hp:t></hp:run></hp:p></root>'
+        )
+        for encoding, declaration, article in (
+            ("utf-16-be", "UTF-16-BE", "제3조 출장 절차"),
+            ("utf-32-be", "UTF-32-BE", "제4조 휴가 절차"),
+        ):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"body-{encoding}.hwpx"
+                payload = template.format(declaration=declaration, article=article).encode(encoding)
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("Contents/section0.xml", payload)
+
+                parsed = HwpxParser().parse(path, f"doc_body_{encoding}")
+
+                self.assertIn(article, parsed.raw_text)
+                self.assertNotIn("\ufffd", parsed.raw_text)
+
+    def test_unparsable_non_body_xml_is_flagged_for_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken_metadata.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/section0.xml",
+                    '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    "<hp:p><hp:run><hp:t>정상 본문</hp:t></hp:run></hp:p></root>",
+                )
+                archive.writestr("Contents/header.xml", "<root><hp:p>깨진 XML")
+
+            parsed = HwpxParser().parse(path, "doc_broken_metadata")
+
+        self.assertIn("정상 본문", parsed.raw_text)
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
         self.assertIn("hwpx_section_parse_error", parsed.metadata["parser_uncertainty_flags"])
-        self.assertLess(parsed.metadata["parser_uncertainty_confidence"], 0.92)
+        self.assertEqual(
+            "review_dropped_sections",
+            parsed.metadata["parser_uncertainty_recommendation"],
+        )
+
+    def test_unknown_non_body_xml_encoding_is_flagged_for_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unknown-metadata-encoding.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/section0.xml",
+                    '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    "<hp:p><hp:run><hp:t>정상 본문</hp:t></hp:run></hp:p></root>",
+                )
+                archive.writestr(
+                    "Contents/header.xml",
+                    b'<?xml version="1.0" encoding="x-unknown"?><root/>',
+                )
+
+            parsed = HwpxParser().parse(path, "doc_unknown_metadata_encoding")
+
+        self.assertIn("정상 본문", parsed.raw_text)
+        self.assertIn("hwpx_section_parse_error", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual(
+            "review_dropped_sections",
+            parsed.metadata["parser_uncertainty_recommendation"],
+        )
+
+    def test_parses_big_endian_non_body_xml_as_reviewable_content(self) -> None:
+        header_xml = (
+            '<?xml version="1.0" encoding="UTF-16-BE"?>'
+            '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+            '<hp:p><hp:run><hp:t>검수할 머리말</hp:t></hp:run></hp:p></root>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "big-endian-metadata.hwpx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "Contents/section0.xml",
+                    '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                    '<hp:p><hp:run><hp:t>정상 본문</hp:t></hp:run></hp:p></root>',
+                )
+                archive.writestr("Contents/header.xml", header_xml.encode("utf-16-be"))
+
+            parsed = HwpxParser().parse(path, "doc_big_endian_metadata")
+
+        self.assertIn("정상 본문", parsed.raw_text)
+        self.assertIn("검수할 머리말", parsed.raw_text)
+        self.assertIn("hwpx_non_body_xml_content", parsed.metadata["parser_uncertainty_flags"])
+        self.assertNotIn("hwpx_section_parse_error", parsed.metadata["parser_uncertainty_flags"])
 
     def test_rejects_dtd_and_entity_declarations_before_xml_parse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,6 +425,26 @@ class HwpxParserTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
                 HwpxParser().parse(path, "doc_unsafe_hwpx")
+
+    def test_rejects_utf16_and_utf32_encoded_dtd_declarations(self) -> None:
+        unsafe_xml = (
+            '<?xml version="1.0" encoding="{encoding}"?>'
+            '<!DOCTYPE root [<!ENTITY injected "blocked">]>'
+            '<root><hp:p xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+            '<hp:run><hp:t>&injected;</hp:t></hp:run></hp:p></root>'
+        )
+        for encoding, declaration_encoding in (
+            ("utf-16", "UTF-16"),
+            ("utf-32", "UTF-32"),
+        ):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"unsafe-{encoding}.hwpx"
+                payload = unsafe_xml.format(encoding=declaration_encoding).encode(encoding)
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("Contents/section0.xml", payload)
+
+                with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
+                    HwpxParser().parse(path, f"doc_unsafe_{encoding}")
 
     def test_marks_non_body_xml_role_for_review_instead_of_mixing_silently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

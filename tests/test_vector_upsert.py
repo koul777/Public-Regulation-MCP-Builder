@@ -31,7 +31,12 @@ from app.ingestion.vector_upsert import (
     validate_vector_record_tenant_scope,
     vector_upsert_target,
 )
-from app.retrieval.bm25_index import BM25_STRUCTURED_METADATA_VERSION, Bm25Index, load_bm25_index
+from app.retrieval.bm25_index import (
+    BM25_INDEX_VERSION,
+    BM25_STRUCTURED_METADATA_VERSION,
+    Bm25Index,
+    load_bm25_index,
+)
 
 
 class VectorUpsertTests(unittest.TestCase):
@@ -480,7 +485,7 @@ class VectorUpsertTests(unittest.TestCase):
                 self.assertEqual("external-test-model", model_stored[0]["embedding_model"])
 
     def test_local_jsonl_noop_rebuilds_malformed_incompatible_and_stale_bm25(self) -> None:
-        for invalid_state in ("malformed", "incompatible", "stale"):
+        for invalid_state in ("malformed", "incompatible", "legacy_index_version", "stale"):
             with self.subTest(invalid_state=invalid_state), tempfile.TemporaryDirectory() as tmp:
                 target_path = Path(tmp) / "store.jsonl"
                 target = LocalJsonlVectorTarget(target_path)
@@ -494,6 +499,10 @@ class VectorUpsertTests(unittest.TestCase):
                 elif invalid_state == "incompatible":
                     payload = json.loads(bm25_path.read_text(encoding="utf-8"))
                     payload["structured_metadata_version"] = BM25_STRUCTURED_METADATA_VERSION - 1
+                    bm25_path.write_text(json.dumps(payload), encoding="utf-8")
+                elif invalid_state == "legacy_index_version":
+                    payload = json.loads(bm25_path.read_text(encoding="utf-8"))
+                    payload["index_version"] = "reg-rag-bm25-index-v2"
                     bm25_path.write_text(json.dumps(payload), encoding="utf-8")
                 else:
                     stale = Bm25Index.build([_record("stale:chunk-1", "different corpus")])
@@ -509,6 +518,10 @@ class VectorUpsertTests(unittest.TestCase):
                 self.assertEqual(0, result["full_store_write_count"])
                 self.assertEqual(vector_before, vector_after)
                 self.assertIsNotNone(repaired)
+                self.assertEqual(
+                    BM25_INDEX_VERSION,
+                    repaired.index_version if repaired else None,
+                )
                 self.assertEqual(
                     BM25_STRUCTURED_METADATA_VERSION,
                     repaired.structured_metadata_version if repaired else None,

@@ -11,7 +11,7 @@ from xml.etree import ElementTree
 
 from app.parsers.base import BaseParser, ParserError, document_name_from_path, parser_uncertainty_metadata
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
-from app.parsers.xml_safety import reject_unsafe_xml_declarations
+from app.parsers.xml_safety import elementtree_xml_input, reject_unsafe_xml_declarations
 
 try:
     import olefile
@@ -54,6 +54,9 @@ HWP_ARTIFACT_TOKENS = (
     "湯慴",
     "湯湷",
     "†普",
+)
+HWP_CJK_PREFIX_RE = re.compile(
+    r"^(?P<prefix>[\u3400-\u9fff]{1,4}(?:\s+[\u3400-\u9fff]{1,4}){1,5})\s+(?=[가-힣])"
 )
 HWP_PUA_TRANSLATION = str.maketrans(
     {
@@ -204,8 +207,14 @@ class HwpParser(BaseParser):
 
     def _looks_like_hwpml(self, path: Path) -> bool:
         with path.open("rb") as handle:
-            prefix = handle.read(256).lstrip()
-        return prefix.startswith(b"<?xml") and b"<HWPML" in prefix
+            prefix = handle.read(1024)
+        lowered = prefix.lower()
+        encodings = ("ascii", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+        return any(
+            "<?xml".encode(encoding) in lowered
+            and "<hwpml".encode(encoding) in lowered
+            for encoding in encodings
+        )
 
     def _parse_hwpml(self, path: Path, document_id: str) -> ParsedDocument:
         try:
@@ -219,11 +228,15 @@ class HwpParser(BaseParser):
                 f"({self.max_decompressed_document_bytes} bytes)."
             )
         reject_unsafe_xml_declarations(payload, format_name="HWPML")
-        raw_xml = payload.decode("utf-8-sig", errors="replace")
-        raw_xml = raw_xml.replace("&nbsp;", "&#160;")
+        safe_payload = payload
+        for encoding in ("ascii", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+            safe_payload = safe_payload.replace(
+                "&nbsp;".encode(encoding),
+                "&#160;".encode(encoding),
+            )
         try:
-            root = ElementTree.fromstring(raw_xml)
-        except ElementTree.ParseError as exc:
+            root = ElementTree.fromstring(elementtree_xml_input(safe_payload))
+        except (ElementTree.ParseError, LookupError, UnicodeError, ValueError) as exc:
             raise ParserError(f"HWPML file is not valid XML: {exc}") from exc
 
         document_title = self._first_xml_text(root, "TITLE") or document_name_from_path(path)
@@ -817,10 +830,27 @@ class HwpParser(BaseParser):
         text = re.sub(r" *\n *", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = text.strip()
-        text = re.sub(r"^[\u3400-\u9fff]{1,4}(?:\s+[\u3400-\u9fff]{1,4}){1,5}\s+(?=[가-힣])", "", text)
+        text = self._strip_ascii_packed_hwp_prefix(text)
         text = self._strip_standalone_mojibake_lines(text)
         text = self._strip_known_hwp_artifact_tokens(text)
         return text.strip()
+
+    def _strip_ascii_packed_hwp_prefix(self, text: str) -> str:
+        """Drop CJK-looking prefixes only when their UTF-16 bytes spell ASCII."""
+
+        match = HWP_CJK_PREFIX_RE.match(text)
+        if not match or not self._looks_like_ascii_packed_hwp_artifact(match.group("prefix")):
+            return text
+        return text[match.end() :]
+
+    def _looks_like_ascii_packed_hwp_artifact(self, value: str) -> bool:
+        """Recognize HWP control bytes that were decoded as CJK code points."""
+
+        cjk_characters = [char for char in value if "\u3400" <= char <= "\u9fff"]
+        if not cjk_characters:
+            return False
+        packed_bytes = b"".join(ord(char).to_bytes(2, "little") for char in cjk_characters)
+        return all(0x20 <= byte <= 0x7E for byte in packed_bytes)
 
     def _strip_standalone_mojibake_lines(self, text: str) -> str:
         lines = text.splitlines()

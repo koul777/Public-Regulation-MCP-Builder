@@ -80,11 +80,12 @@ def tokenize(
     prefer_regex_if_kiwi_cold: bool = False,
     tokenizer_model: str | None = None,
 ) -> list[str]:
-    # Fold to NFC so decomposed (NFD) input — common from PDF/DOCX extraction
-    # and macOS filenames — produces the same tokens as its composed form.
+    # Fold to NFKC so decomposed (NFD) input and compatibility-width digits or
+    # punctuation — both common in Korean PDF/HWP extraction — produce the
+    # same tokens as ordinary keyboard input.
     # Both indexing and querying flow through here, keeping the two sides
     # consistent regardless of the source's Unicode composition.
-    raw_text = unicodedata.normalize("NFC", str(text or ""))
+    raw_text = unicodedata.normalize("NFKC", str(text or ""))
     article_tokens = [_normalize_article_no(match.group(0)) for match in _ARTICLE_NO_RE.finditer(raw_text)]
     if tokenizer_model == FALLBACK_TOKENIZER_MODEL:
         kiwi = None

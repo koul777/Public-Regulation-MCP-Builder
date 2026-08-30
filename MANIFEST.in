@@ -1,5 +1,6 @@
 include README.md
 include AGENTS.md
+recursive-include .claude *.md
 include CONTRIBUTING.md
 include SECURITY.md
 include THIRD_PARTY_NOTICES.md
@@ -11,6 +12,16 @@ include docs/operator_quickstart_ko.md
 include docs/harness_engineering_plan_ko.md
 include docs/hermes_engineering_plan_ko.md
 include docs/agent_orchestration_roles_ko.md
+include docs/authoring_beginner_improvement_backlog_ko.md
+include docs/authoring_beginner_pilot_facilitator_script_ko.md
+include docs/authoring_beginner_usability_test_plan_ko.md
+include docs/authoring_claude_audit_ko.md
+include docs/authoring_go_nogo_memo_template_ko.md
+include docs/authoring_mvp_contract_ko.md
+include docs/authoring_quickstart_ko.md
+include docs/authoring_security_model_ko.md
+include docs/authoring_workspace_rollout_plan_ko.md
+include docs/authoring_verification_report_ko.md
 include docs/image_pipeline_6hour_execution_plan_ko.md
 include docs/image_pipeline_implementation_ko.md
 include docs/local_ai_runtime_runbook_ko.md
@@ -19,6 +30,7 @@ include docs/local_llm_platform_implementation_plan_ko.md
 include docs/local_llm_regulation_platform_direction_ko.md
 include docs/prd_integrated_rag_chatbot_ko.md
 include docs/public_github_release_checklist_ko.md
+include docs/public_repository_history_policy_ko.md
 include docs/preprocessing_change_governance_ko.md
 include docs/public_release_report_allowlist.json
 include docs/public_release_report_allowlist.example.json

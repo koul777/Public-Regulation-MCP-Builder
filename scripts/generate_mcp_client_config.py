@@ -40,7 +40,7 @@ from scripts.mcp_client_status import (  # noqa: E402
     invalidate_runtime as invalidate_client_connection_runtime,
 )
 from app.api import routes_rag  # noqa: E402
-from app.core.tenant_access import resource_visible_to_tenant, tenant_storage_key  # noqa: E402
+from app.core.tenant_access import resource_visible_to_tenant, tenant_directory_key  # noqa: E402
 from app.ingestion.vector_adapter import stable_content_hash  # noqa: E402
 from app.mcp_server.regulation_tools import mcp_auth_context, settings_for_mcp_project  # noqa: E402
 from app.retrieval.bm25_index import (  # noqa: E402
@@ -2584,7 +2584,11 @@ def _prepare_mcp_runtime_data_bundle_inputs(
             "tenant_id": tenant_id,
             "profile_id": profile_id,
             "scope": resolved_scope,
-            "tenant_storage_isolation": bool(
+            # Runtime exports always use the portable flat repository layout;
+            # retain the source setting separately for provenance and reuse
+            # validation.
+            "tenant_storage_isolation": False,
+            "source_tenant_storage_isolation": bool(
                 getattr(source_settings, "tenant_storage_isolation", False)
             ),
             "document_id": document_id,
@@ -2655,7 +2659,7 @@ def _write_mcp_runtime_data_bundle_uncommitted(
     _prepare_runtime_data_export_dir(runtime_data_dir, source_settings.data_dir)
     runtime_repository_dir = runtime_data_dir / "repository"
     runtime_repository_dir.mkdir(parents=True, exist_ok=True)
-    runtime_vector_dir = runtime_data_dir / "vector_db" / tenant_storage_key(tenant_id)
+    runtime_vector_dir = runtime_data_dir / "vector_db" / tenant_directory_key(tenant_id)
     runtime_vector_dir.mkdir(parents=True, exist_ok=True)
 
     vector_path = runtime_vector_dir / "approved_vectors.jsonl"
@@ -2761,7 +2765,13 @@ def _write_mcp_runtime_data_bundle_uncommitted(
         "scope": resolved_scope,
         "synthetic_runtime": False,
         "provenance": "approved_runtime_bundle_export",
-        "tenant_storage_isolation": bool(getattr(source_settings, "tenant_storage_isolation", False)),
+        # The distributable data directory is deliberately flattened to
+        # data/repository and data/vector_db/<tenant>.  Runtime consumers must
+        # not prepend tenants/<tenant> to that exported layout.
+        "tenant_storage_isolation": False,
+        "source_tenant_storage_isolation": bool(
+            getattr(source_settings, "tenant_storage_isolation", False)
+        ),
         # The distributable runtime proves its own tenant/document/index
         # contents.  Do not leak the operator's source checkout, upload, or a
         # previous release-candidate path into the handoff manifest.
@@ -3067,7 +3077,7 @@ def _validate_reusable_runtime_data_bundle(
     _validate_runtime_data_bundle_consistency(runtime_data_dir)
 
     tenant_id = str(identity["tenant_id"])
-    vector_dir = runtime_data_dir / "vector_db" / tenant_storage_key(tenant_id)
+    vector_dir = runtime_data_dir / "vector_db" / tenant_directory_key(tenant_id)
     vector_path = vector_dir / "approved_vectors.jsonl"
     if not _strict_jsonl_matches_runtime_reuse(vector_path, prepared["records"]):
         raise ValueError("Reusable approved vector records no longer match the approved source projection.")
@@ -3325,13 +3335,13 @@ def _validate_reusable_runtime_data_bundle(
         "vector_jsonl": str(
             final_runtime_data_dir
             / "vector_db"
-            / tenant_storage_key(tenant_id)
+            / tenant_directory_key(tenant_id)
             / "approved_vectors.jsonl"
         ),
         "bm25_index": str(
             final_runtime_data_dir
             / "vector_db"
-            / tenant_storage_key(tenant_id)
+            / tenant_directory_key(tenant_id)
             / "bm25_index.json"
         ),
         "hierarchical_index": str(hierarchical_index_path(final_runtime_data_dir)),
@@ -5837,7 +5847,7 @@ def _validate_runtime_omission_disposition_snapshot(
 
     vector_pairs: set[tuple[str, str]] = set()
     vector_approval_bindings: dict[tuple[str, str], tuple[str, str]] = {}
-    vector_dir = runtime_data_dir / "vector_db" / tenant_storage_key(tenant_id)
+    vector_dir = runtime_data_dir / "vector_db" / tenant_directory_key(tenant_id)
     vector_path = vector_dir / "approved_vectors.jsonl"
     try:
         vector_records = list(_iter_strict_jsonl_for_runtime_reuse(vector_path))
@@ -5981,7 +5991,7 @@ def _runtime_hierarchy_index_issue(runtime_data_dir: Path) -> str | None:
     vector_path = (
         runtime_data_dir
         / "vector_db"
-        / tenant_storage_key(tenant_id)
+        / tenant_directory_key(tenant_id)
         / "approved_vectors.jsonl"
     )
     if not vector_path.is_file():
@@ -6008,7 +6018,7 @@ def _runtime_hierarchy_index_issue(runtime_data_dir: Path) -> str | None:
     bm25_path = (
         runtime_data_dir
         / "vector_db"
-        / tenant_storage_key(tenant_id)
+        / tenant_directory_key(tenant_id)
         / "bm25_index.json"
     )
     bm25_declared = bool(
@@ -6060,7 +6070,7 @@ def _unexpected_runtime_vector_store_files(runtime_data_dir: Path) -> list[Path]
     tenant_id = str(payload.get("tenant_id") or "").strip() if payload else ""
     if not tenant_id:
         return []
-    expected_storage_key = tenant_storage_key(tenant_id)
+    expected_storage_key = tenant_directory_key(tenant_id)
     vector_dir = runtime_data_dir / "vector_db"
     if not vector_dir.is_dir():
         return []
@@ -9047,6 +9057,70 @@ def _http_server_config(
     return config
 
 
+def _bundle_codex_quickstart(*, server_name: str) -> dict[str, Any]:
+    return {
+        "config_file_candidates": [
+            "%USERPROFILE%\\.codex\\config.toml",
+            "~/.codex/config.toml",
+        ],
+        "config_snippet_file": SETUP_BUNDLE_FILES["codex_config"],
+        "paste_toml_section": f"mcp_servers.{server_name}",
+        "transport": "stdio",
+        "verification_commands": [
+            {"command": "codex", "args": ["mcp", "list"]},
+            {"command": "codex", "args": ["mcp", "get", server_name]},
+        ],
+        "verification_tools": ["search", "fetch"],
+    }
+
+
+def _bundle_codex_claude_team_quickstart(*, server_name: str) -> dict[str, Any]:
+    return {
+        "team_id": "codex_claude_local_mcp_review_loop",
+        "shared_server_name": server_name,
+        "shared_transport": "stdio",
+        "shared_runtime_source": "approved_bundle_data",
+        "independence_rule": "claude_reviews_codex_changes_before_release",
+        "claude_project_agents": [
+            "regulation-security-auditor",
+            "regulation-release-reviewer",
+        ],
+        "shared_prerequisites": [
+            "validate_synthetic_chain",
+            "audit_index_visibility",
+            "validate_runtime_transport",
+        ],
+        "members": {
+            "codex": {
+                "quickstart_key": "codex",
+                "responsibility": "implementation_and_runtime_fix",
+                "verify_with": ["search", "fetch"],
+            },
+            "claude_code": {
+                "quickstart_key": "claude_code",
+                "responsibility": "independent_audit_and_regression_review",
+                "verify_with": ["search", "fetch"],
+            },
+        },
+        "handoff_sequence": [
+            "codex_register_stdio",
+            "claude_register_stdio",
+            "codex_implement_and_run_focused_tests",
+            "claude_security_audit",
+            "codex_remediate_confirmed_findings",
+            "claude_release_regression_review",
+            "validate_client_config_smoke",
+            "run_search_and_fetch_in_both_clients",
+        ],
+        "shared_artifacts": [
+            SETUP_BUNDLE_FILES["codex_config"],
+            SETUP_BUNDLE_FILES["claude_code_stdio"],
+            "validate_client_config_smoke.ps1",
+            "doctor_mcp_connection.ps1",
+        ],
+    }
+
+
 def _bundle_quickstart(
     *,
     server_name: str,
@@ -9209,6 +9283,7 @@ def _bundle_quickstart(
                 "~/Library/Application Support/Claude/claude_desktop_config.json",
             ],
         },
+        "codex": _bundle_codex_quickstart(server_name=server_name),
         "claude_code": {
             "command": "claude",
             "args": claude_code_cli_args,
@@ -9260,6 +9335,9 @@ def _bundle_quickstart(
             ],
             "authorization_token_env": remote_auth_token_env,
         },
+        "codex_claude_team": _bundle_codex_claude_team_quickstart(
+            server_name=server_name
+        ),
         "warnings": [],
         "copy_paste": {
             "validate_synthetic_chain_ps": _powershell_command("reg-rag-mcp-smoke", ["--fail-on-issue"]),

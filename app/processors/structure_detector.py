@@ -9,10 +9,20 @@ from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 from app.schemas.structure import StructureNode
 
 
-ARTICLE_TITLE_DELIMITER_PATTERN = r"(?:\([^\)\n]{1,80}\)|\[[^\]\n]{1,80}\]|【[^】\n]{1,80}】)"
+ARTICLE_TITLE_DELIMITER_PATTERN = (
+    r"(?:\([^\)\n]{1,80}\)|（[^）\n]{1,80}）|\[[^\]\n]{1,80}\]|"
+    r"【[^】\n]{1,80}】|<[^>\n]{1,80}>|〈[^〉\n]{1,80}〉)"
+)
+ARTICLE_LIFECYCLE_ANNOTATION_PATTERN = (
+    r"(?:일부개정|전부개정|전문개정|개정|제정|시행|삭제|신설|변경|폐지|생략)"
+)
+ARTICLE_TITLE_ANGLE_GUARD = (
+    rf"(?!\s*{ARTICLE_LIFECYCLE_ANNOTATION_PATTERN}(?=\s|[.:：>〉]|$))"
+)
 
 # 줄마다 화면을 갱신하면 진행 표시가 구조 분석보다 비싸진다.
 DETECT_PROGRESS_LINE_STEP = 500
+CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY = "_contextual_numeric_subitem"
 
 # Keep this set aligned with the internal-regulation title vocabulary used by
 # MetadataExtractor and the regulation metadata service.  The extra governance
@@ -47,8 +57,15 @@ PATTERNS = {
     "subsection": re.compile(r"^\s*(제\s*\d+\s*관)\s+(.+)$"),
     "regulation": re.compile(r"^\s*(\d+-\d+-\d+)\.\s+(.+)$"),
     "article": re.compile(
-        r"^\s*(제\s*\d+\s*조(?:의\s*\d+)?)(?=\s*(?:\(|\[|【|<|삭제|$|\s))"
-        r"\s*(?:\(([^)\n]+)\)|\[([^\]\n]+)\]|【([^】\n]+)】)?\s*(.*)$"
+        r"^\s*(제\s*\d+\s*조(?:의\s*\d+)?)(?=\s*(?:\(|（|\[|【|<|〈|삭제|$|\s))"
+        r"\s*(?:"
+        r"\((?P<article_title_round>[^)\n]+)\)"
+        r"|（(?P<article_title_fullwidth_round>[^）\n]+)）"
+        r"|\[(?P<article_title_square>[^\]\n]+)\]"
+        r"|【(?P<article_title_lenticular>[^】\n]+)】"
+        rf"|<{ARTICLE_TITLE_ANGLE_GUARD}(?P<article_title_angle>[^>\n]+)>"
+        rf"|〈{ARTICLE_TITLE_ANGLE_GUARD}(?P<article_title_guillemet>[^〉\n]+)〉"
+        r")?\s*(?P<article_trailing>.*)$"
     ),
     "paragraph_symbol": re.compile(r"^\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚])\s*(.*)$"),
     "paragraph_je_hang": re.compile(r"^\s*(제\s*\d+\s*항)(?=\s|$)\s*(.*)$"),
@@ -193,6 +210,7 @@ class StructureDetector:
             "paragraph": None,
             "item": None,
             "subitem": None,
+            "subitem_detail": None,
             "supplementary": None,
             "regulation_parent": None,
             "last_article": None,
@@ -216,6 +234,9 @@ class StructureDetector:
                 if not self._append_to_current(current, line):
                     pending_orphan_lines.append(line)
                 continue
+            detected = self._contextualize_parenthesized_numeric_subitem(current, detected)
+            if detected.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY):
+                detected = self._reindex_node(detected, len(nodes))
             if self._should_demote_unanchored_numbered_item(current, detected, pending_orphan_lines):
                 if not self._append_to_current(current, line):
                     pending_orphan_lines.append(line)
@@ -232,7 +253,7 @@ class StructureDetector:
             self._close_appendix_or_form_container(current, detected)
 
             node_type = detected.node_type
-            detected.parent_id = self._parent_id_for(node_type, current)
+            detected.parent_id = self._parent_id_for(detected, current)
             nodes.append(detected)
             if node_type == "regulation":
                 seen_regulation_keys.add(self._regulation_identity(detected))
@@ -328,12 +349,19 @@ class StructureDetector:
             title = next(
                 (
                     candidate.strip()
-                    for candidate in match.group(2, 3, 4)
+                    for candidate in (
+                        match.group("article_title_round"),
+                        match.group("article_title_fullwidth_round"),
+                        match.group("article_title_square"),
+                        match.group("article_title_lenticular"),
+                        match.group("article_title_angle"),
+                        match.group("article_title_guillemet"),
+                    )
                     if candidate and candidate.strip()
                 ),
                 None,
             )
-            trailing = (match.group(5) or "").strip()
+            trailing = (match.group("article_trailing") or "").strip()
             if not title:
                 title = self._article_lifecycle_title(trailing)
             if not title and self._looks_like_article_reference_tail(trailing):
@@ -1133,7 +1161,7 @@ class StructureDetector:
         clause_boundary = self._detected_clause_closes_attachment_container(article, detected)
         if boundary or clause_boundary:
             current["article"] = current.get("last_article") if clause_boundary else None
-            self._clear(current, "paragraph", "item", "subitem")
+            self._clear(current, "paragraph", "item", "subitem", "subitem_detail")
             if clause_boundary and "attachment_container_boundary_inferred" not in detected.warnings:
                 detected.warnings.append("attachment_container_boundary_inferred")
 
@@ -1488,7 +1516,7 @@ class StructureDetector:
         return True
 
     def _append_target(self, current: dict[str, StructureNode | None]) -> StructureNode | None:
-        for key in ("subitem", "item", "paragraph", "article", "supplementary"):
+        for key in ("subitem_detail", "subitem", "item", "paragraph", "article", "supplementary"):
             if current.get(key):
                 return current[key]
         if current.get("regulation"):
@@ -1637,6 +1665,23 @@ class StructureDetector:
 
     def _strip_internal_metadata(self, node: StructureNode) -> None:
         node.metadata.pop("_merged_hwpx_count_sources", None)
+        node.metadata.pop(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY, None)
+
+    def _contextualize_parenthesized_numeric_subitem(
+        self,
+        current: dict[str, StructureNode | None],
+        node: StructureNode,
+    ) -> StructureNode:
+        """Treat ``(1)`` as a detail only while a numbered item is active."""
+
+        if (
+            node.node_type == "paragraph"
+            and current.get("item") is not None
+            and re.fullmatch(r"\(\d+\)", node.number or "")
+        ):
+            node.node_type = "subitem"
+            node.metadata[CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY] = True
+        return node
 
     def _reindex_node(self, node: StructureNode, order_index: int) -> StructureNode:
         safe_type = node.node_type.replace(" ", "_")
@@ -1646,50 +1691,59 @@ class StructureDetector:
 
     def _update_current(self, current: dict[str, StructureNode | None], node: StructureNode) -> None:
         node_type = node.node_type
-        if node_type in {"part", "chapter", "section", "subsection", "article", "paragraph", "item", "subitem"}:
+        contextual_numeric_subitem = bool(node.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY))
+        if contextual_numeric_subitem:
+            current["subitem_detail"] = node
+        elif node_type in {"part", "chapter", "section", "subsection", "article", "paragraph", "item", "subitem"}:
             current[node_type] = node
+            if node_type == "subitem":
+                self._clear(current, "subitem_detail")
         elif node_type == "regulation":
             current["regulation"] = node
             current["regulation_parent"] = self._current_node_by_id(current, node.parent_id)
         if node_type == "part":
-            self._clear(current, "chapter", "section", "subsection", "regulation", "article", "paragraph", "item", "subitem", "supplementary", "regulation_parent", "last_article")
+            self._clear(current, "chapter", "section", "subsection", "regulation", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "regulation_parent", "last_article")
         elif node_type == "chapter":
             if self._is_within_active_regulation(current, node):
-                self._clear(current, "section", "subsection", "article", "paragraph", "item", "subitem", "supplementary", "last_article")
+                self._clear(current, "section", "subsection", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "last_article")
             else:
-                self._clear(current, "section", "subsection", "regulation", "article", "paragraph", "item", "subitem", "supplementary", "regulation_parent", "last_article")
+                self._clear(current, "section", "subsection", "regulation", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "regulation_parent", "last_article")
         elif node_type == "section":
             if self._is_within_active_regulation(current, node):
-                self._clear(current, "subsection", "article", "paragraph", "item", "subitem", "supplementary", "last_article")
+                self._clear(current, "subsection", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "last_article")
             else:
-                self._clear(current, "subsection", "regulation", "article", "paragraph", "item", "subitem", "supplementary", "regulation_parent", "last_article")
+                self._clear(current, "subsection", "regulation", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "regulation_parent", "last_article")
         elif node_type == "subsection":
             if self._is_within_active_regulation(current, node):
-                self._clear(current, "article", "paragraph", "item", "subitem", "supplementary", "last_article")
+                self._clear(current, "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "last_article")
             else:
-                self._clear(current, "regulation", "article", "paragraph", "item", "subitem", "supplementary", "regulation_parent", "last_article")
+                self._clear(current, "regulation", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "regulation_parent", "last_article")
         elif node_type == "regulation":
-            self._clear(current, "chapter", "section", "subsection", "article", "paragraph", "item", "subitem", "supplementary", "last_article")
+            self._clear(current, "chapter", "section", "subsection", "article", "paragraph", "item", "subitem", "subitem_detail", "supplementary", "last_article")
         elif node_type == "article":
             current["last_article"] = node
-            self._clear(current, "paragraph", "item", "subitem")
+            self._clear(current, "paragraph", "item", "subitem", "subitem_detail")
         elif node_type == "paragraph":
-            self._clear(current, "item", "subitem")
+            self._clear(current, "item", "subitem", "subitem_detail")
         elif node_type == "item":
-            self._clear(current, "subitem")
+            self._clear(current, "subitem", "subitem_detail")
         elif node_type in {"appendix", "form", "table"}:
             current["article"] = node
-            self._clear(current, "paragraph", "item", "subitem")
+            self._clear(current, "paragraph", "item", "subitem", "subitem_detail")
         elif node_type == "supplementary":
             current["supplementary"] = node
             current["article"] = node
-            self._clear(current, "paragraph", "item", "subitem")
+            self._clear(current, "paragraph", "item", "subitem", "subitem_detail")
 
     def _clear(self, current: dict[str, StructureNode | None], *keys: str) -> None:
         for key in keys:
             current[key] = None
 
-    def _parent_id_for(self, node_type: str, current: dict[str, StructureNode | None]) -> str | None:
+    def _parent_id_for(self, node: StructureNode, current: dict[str, StructureNode | None]) -> str | None:
+        node_type = node.node_type
+        if node.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY):
+            parent = current.get("subitem") or current.get("item")
+            return parent.node_id if parent else None
         if node_type in {"appendix", "form", "supplementary"}:
             regulation = current.get("regulation")
             return regulation.node_id if regulation else None

@@ -18,7 +18,15 @@ class PrivateReleaseReadinessCLITests(unittest.TestCase):
                 app_env="production",
                 data_dir=data_dir,
                 api_auth_required=True,
-                api_auth_token="secret",
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=True,
                 api_audit_enabled=True,
             )
@@ -46,7 +54,15 @@ class PrivateReleaseReadinessCLITests(unittest.TestCase):
                 data_dir=data_dir,
                 api_auth_required=True,
                 api_auth_token="",
-                api_auth_tokens=json.dumps({"operator-token": {"role": "operator", "actor": "batch-operator"}}),
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=True,
                 api_audit_enabled=True,
             )
@@ -57,6 +73,25 @@ class PrivateReleaseReadinessCLITests(unittest.TestCase):
         checks = {check["name"]: check for check in report["checks"]}
         self.assertTrue(checks["api_auth_token_nonempty_for_shared_deployment"]["passed"])
         self.assertTrue(checks["explicit_tenant_header_required_for_shared_deployment"]["passed"])
+
+    def test_shared_deployment_readiness_rejects_legacy_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            data_dir.mkdir()
+            settings = Settings(
+                app_env="production",
+                data_dir=data_dir,
+                api_auth_required=True,
+                api_auth_token="legacy-secret",
+                tenant_storage_isolation=True,
+                api_audit_enabled=True,
+            )
+
+            report = build_readiness_report(settings, require_shared_deployment=True)
+
+        self.assertFalse(report["passed"])
+        self.assertIn("api_auth_token_nonempty_for_shared_deployment", report["failed_check_names"])
+        self.assertIn("explicit_tenant_header_required_for_shared_deployment", report["failed_check_names"])
 
     def test_shared_deployment_readiness_fails_for_invalid_role_token_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +162,15 @@ class PrivateReleaseReadinessCLITests(unittest.TestCase):
                 app_env="production",
                 data_dir=data_dir,
                 api_auth_required=True,
-                api_auth_token="secret",
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=True,
                 api_audit_enabled=True,
             )
@@ -169,7 +212,15 @@ class PrivateReleaseReadinessCLITests(unittest.TestCase):
                 app_env="production",
                 data_dir=data_dir,
                 api_auth_required=True,
-                api_auth_token="secret",
+                api_auth_tokens=json.dumps(
+                    {
+                        "operator-token": {
+                            "role": "operator",
+                            "actor": "batch-operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
                 tenant_storage_isolation=True,
                 api_audit_enabled=True,
             )

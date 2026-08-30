@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.api import routes_documents
 from app.core.config import Settings
 from app.core.security import AuthContext
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.ingestion.vector_upsert import load_vector_records_jsonl
 from app.mcp_server.regulation_tools import (
     compare_versions,
@@ -168,7 +168,7 @@ def _run_smoke_with_data_dir(
     vector_path = (
         repository_settings.data_dir
         / "vector_db"
-        / tenant_storage_key(tenant_id)
+        / tenant_directory_key(tenant_id)
         / "approved_vectors.jsonl"
     )
     vector_records = load_vector_records_jsonl(vector_path)

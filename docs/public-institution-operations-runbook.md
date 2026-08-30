@@ -31,7 +31,7 @@ python -m unittest discover -s tests -q
 python -m build --sdist --wheel
 python scripts\audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan
 python scripts\run_fresh_clone_rehearsal.py --mode public --dry-run --fail-on-issue
-python scripts\run_public_release_gate.py --include-untracked --execute-harness --fail-on-issue
+python scripts\run_public_release_gate.py --include-untracked --execute-harness --fail-on-blocked
 ```
 
 For authority-backed evidence, the public release process may use an artifact such as `--authoritative-artifact mcp_connection_readiness=reports/mcp_connection_readiness_current.json`, but generated reports remain untracked and must not contain local absolute paths or institution identifiers.

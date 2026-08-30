@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import Settings
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from scripts.export_vectordb_ingestion import _iter_batch_chunks, load_json
 
 
@@ -529,7 +529,7 @@ def load_runtime_chunks(
 ) -> tuple[list[dict[str, Any]], Path, bool]:
     isolation = tenant_storage_isolation
     if isolation is None:
-        isolation = runtime_data_dir.joinpath("tenants", tenant_storage_key(tenant_id)).is_dir()
+        isolation = runtime_data_dir.joinpath("tenants", tenant_directory_key(tenant_id)).is_dir()
     effective_dir = settings_for_tenant(
         Settings(data_dir=runtime_data_dir, tenant_storage_isolation=isolation),
         tenant_id,

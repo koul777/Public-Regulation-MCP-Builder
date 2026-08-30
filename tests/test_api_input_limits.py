@@ -97,6 +97,7 @@ class ReviewApiInputLimitTests(unittest.TestCase):
                 data_dir=Path(tmp) / "data",
                 api_auth_required=True,
                 api_auth_token="secret",
+                api_default_tenant_id="tenant-a",
             )
             headers = {
                 "Authorization": "Bearer secret",

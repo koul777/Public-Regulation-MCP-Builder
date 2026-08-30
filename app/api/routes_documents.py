@@ -33,7 +33,12 @@ from app.core.input_limits import (
     validate_json_value_budget,
 )
 from app.core.institution_profiles import apply_institution_profile_to_metadata, load_institution_profile_registry
-from app.core.tenant_access import resource_visible_to_tenant, settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import (
+    resource_visible_to_tenant,
+    settings_for_tenant,
+    tenant_directory_key,
+    tenant_storage_key,
+)
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, embed_vector_records
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import (
@@ -582,7 +587,7 @@ def _vector_artifact_dir(settings: Settings, document_id: str) -> Path:
 
 
 def _default_vector_target_path(settings: Settings, auth: AuthContext, target_type: str) -> Path:
-    tenant_key = tenant_storage_key(auth.tenant_id)
+    tenant_key = tenant_directory_key(auth.tenant_id)
     filename_by_type = {
         "local-jsonl": "approved_vectors.jsonl",
         "qdrant-local-jsonl": "approved_qdrant_points.jsonl",

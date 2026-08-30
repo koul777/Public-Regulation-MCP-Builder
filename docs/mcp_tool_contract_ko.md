@@ -6,7 +6,7 @@
 
 | Profile | Intended client | Exposed tools |
 | --- | --- | --- |
-| `full` | Claude Desktop, Claude Code, 내부 운영자용 생성형 AI | `search`, `fetch`, `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `list_documents`, `get_article`, `get_table`, `compare_versions`, `get_citation`, `get_index_status` |
+| `full` | Claude Desktop, Claude Code, 내부 운영자용 생성형 AI | `search`, `lookup`, `fetch`, `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `get_regulation_history`, `list_documents`, `get_document`, `get_article`, `get_table`, `compare_versions`, `get_citation`, `get_index_status` |
 | `chatgpt-data` | ChatGPT 웹 원격 MCP, Codex, Claude의 원격 HTTPS MCP | `list_regulations`, `get_regulation_toc`, `get_regulation_article`, `get_regulation_references`, `list_regulation_reference_cycles`, `search`, `fetch` |
 
 서버 CLI 기본값은 `full`이다. 생성 번들은 ChatGPT 웹 원격 MCP·Codex·외부 모델 연결에 `--tool-profile chatgpt-data`를 명시해 내부 진단·식별자 노출을 줄인다.
@@ -111,12 +111,17 @@ Kordoc table parser 품질 증거가 있어야 합니다. 증거 없이 처리�
 
 ## Catalog and Full Profile Tools
 
+- `search`: 승인된 규정 본문을 질문·필터로 검색하고 후속 `fetch`용 결과 ID 반환
+- `lookup`: 문서 ID·조문 번호를 알 때 직접 조회하고, 정확 일치가 없을 때 승인 RAG 검색으로 보완(`full` 전용)
+- `fetch`: `search`가 반환한 결과 ID로 승인 원문과 인용 메타데이터 조회
 - `list_regulations`: 개별 파일·통합 규정집에서 자동 분리한 승인 규정의 조문 체계 카탈로그 확인(`chatgpt-data`, `full`)
 - `get_regulation_toc`: 규정 단위 ID 기준 장·절·조·별표 목차 조회(`chatgpt-data`, `full`)
 - `get_regulation_article`: 규정 단위 ID와 조문 번호로 정확 조문 즉시 조회(`chatgpt-data`, `full`)
 - `get_regulation_references`: 규정·조문 간 outgoing/incoming 참조와 해결 상태 조회(`chatgpt-data`, `full`)
 - `list_regulation_reference_cycles`: 규정 그래프의 순환참조 묶음 조회(`chatgpt-data`, `full`)
+- `get_regulation_history`: 규정 ID 기준 개정 이력·효력 기간·선행 버전 메타데이터 조회(`full` 전용)
 - `list_documents`: MCP-visible 승인 문서 목록 확인
+- `get_document`: 문서 ID 기준 승인된 전체 문서와 청크 원문 조회(`full` 전용)
 - `get_article`: 문서 ID와 조문 번호 기준 근거 조회
 - `get_table`: 표/별표 chunk 조회
 - `compare_versions`: 두 문서 버전 간 조문 비교

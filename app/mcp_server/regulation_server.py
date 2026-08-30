@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -119,10 +120,11 @@ VALID_TOOL_PROFILES = {"full", "chatgpt-data"}
 class StaticBearerTokenVerifier:
     def __init__(self, token: str, *, client_id: str = "govreg-mcp-client") -> None:
         self._token = token
+        self._token_bytes = token.encode("utf-8")
         self._client_id = client_id
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        if token != self._token:
+        if not hmac.compare_digest(token.encode("utf-8"), self._token_bytes):
             return None
         return AccessToken(token=token, client_id=self._client_id, scopes=["mcp:read"])
 

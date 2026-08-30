@@ -34,6 +34,15 @@ class ApiTenantIsolationTests(unittest.TestCase):
         self.assertEqual(chunks.status_code, 404)
         self.assertEqual(quality.status_code, 404)
 
+    def test_tenant_bound_token_cannot_select_another_tenant(self) -> None:
+        with tenant_client() as context:
+            response = context.client.get(
+                "/api/documents",
+                headers=context.headers("tenant-b", token_tenant_id="tenant-a"),
+            )
+
+        self.assertEqual(403, response.status_code)
+
     def test_export_file_is_not_served_cross_tenant(self) -> None:
         with tenant_client() as context:
             response = context.client.get("/api/documents/doc_b/export?format=jsonl", headers=context.headers("tenant-a"))
@@ -111,7 +120,20 @@ class tenant_client:
         self.settings = Settings(
             data_dir=Path(self.tmp.name),
             api_auth_required=True,
-            api_auth_token="secret",
+            api_auth_tokens=json.dumps(
+                {
+                    "tenant-a-secret": {
+                        "role": "admin",
+                        "actor": "tester",
+                        "tenant_id": "tenant-a",
+                    },
+                    "tenant-b-secret": {
+                        "role": "admin",
+                        "actor": "tester",
+                        "tenant_id": "tenant-b",
+                    },
+                }
+            ),
             api_default_tenant_id="default",
             tenant_storage_isolation=self.tenant_storage_isolation,
         )
@@ -138,9 +160,10 @@ class tenant_client:
         self.stack.close()
         self.tmp.cleanup()
 
-    def headers(self, tenant_id: str) -> dict[str, str]:
+    def headers(self, tenant_id: str, *, token_tenant_id: str | None = None) -> dict[str, str]:
+        token_tenant_id = token_tenant_id or tenant_id
         return {
-            "Authorization": "Bearer secret",
+            "Authorization": f"Bearer {token_tenant_id}-secret",
             "X-Actor": "tester",
             "X-Tenant-Id": tenant_id,
         }

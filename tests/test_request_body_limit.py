@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from app.core.request_body_limit import JsonRequestBodyLimitMiddleware
 
 
-def _scope(*, content_type: str, content_length: int | None = None) -> dict[str, Any]:
+def _scope(
+    *,
+    content_type: str,
+    content_length: int | None = None,
+    path: str = "/test",
+) -> dict[str, Any]:
     headers = [(b"content-type", content_type.encode("ascii"))]
     if content_length is not None:
         headers.append((b"content-length", str(content_length).encode("ascii")))
@@ -21,8 +26,8 @@ def _scope(*, content_type: str, content_length: int | None = None) -> dict[str,
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/test",
-        "raw_path": b"/test",
+        "path": path,
+        "raw_path": path.encode("ascii"),
         "query_string": b"",
         "headers": headers,
         "client": ("127.0.0.1", 1234),
@@ -36,6 +41,8 @@ async def _invoke(
     messages: list[dict[str, Any]],
     max_body_bytes: int,
     content_length: int | None = None,
+    path: str = "/test",
+    rejection_observer: Any = None,
 ) -> tuple[list[dict[str, Any]], int]:
     received = 0
     sent: list[dict[str, Any]] = []
@@ -63,9 +70,17 @@ async def _invoke(
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": body})
 
-    middleware = JsonRequestBodyLimitMiddleware(downstream, max_body_bytes=max_body_bytes)
+    middleware = JsonRequestBodyLimitMiddleware(
+        downstream,
+        max_body_bytes=max_body_bytes,
+        rejection_observer=rejection_observer,
+    )
     await middleware(
-        _scope(content_type=content_type, content_length=content_length),
+        _scope(
+            content_type=content_type,
+            content_length=content_length,
+            path=path,
+        ),
         receive,
         send,
     )
@@ -99,6 +114,24 @@ class JsonRequestBodyLimitMiddlewareTests(unittest.TestCase):
         self.assertEqual(413, sent[0]["status"])
         self.assertEqual(0, receive_count)
 
+    def test_audit_observer_failure_cannot_weaken_oversize_denial(self) -> None:
+        async def failing_observer(scope: dict[str, Any], status_code: int) -> None:
+            del scope, status_code
+            raise RuntimeError("simulated audit storage failure")
+
+        sent, receive_count = asyncio.run(
+            _invoke(
+                content_type="application/json",
+                content_length=101,
+                messages=[{"type": "http.request", "body": b"{}", "more_body": False}],
+                max_body_bytes=100,
+                rejection_observer=failing_observer,
+            )
+        )
+
+        self.assertEqual(413, sent[0]["status"])
+        self.assertEqual(0, receive_count)
+
     def test_chunked_json_is_rejected_when_cumulative_bytes_cross_limit(self) -> None:
         sent, receive_count = asyncio.run(
             _invoke(
@@ -126,17 +159,49 @@ class JsonRequestBodyLimitMiddlewareTests(unittest.TestCase):
 
         self.assertEqual(413, sent[0]["status"])
 
-    def test_multipart_upload_bypasses_json_limit(self) -> None:
+    def test_document_multipart_upload_bypasses_json_limit(self) -> None:
         sent, _ = asyncio.run(
             _invoke(
                 content_type="multipart/form-data; boundary=test",
                 content_length=1000,
                 messages=[{"type": "http.request", "body": b"x" * 1000, "more_body": False}],
                 max_body_bytes=10,
+                path="/api/documents",
             )
         )
 
         self.assertEqual(200, sent[0]["status"])
+
+    def test_multipart_on_non_upload_route_cannot_bypass_declared_limit(self) -> None:
+        sent, receive_count = asyncio.run(
+            _invoke(
+                content_type="multipart/form-data; boundary=test",
+                content_length=1000,
+                messages=[
+                    {"type": "http.request", "body": b"x" * 1000, "more_body": False}
+                ],
+                max_body_bytes=10,
+                path="/api/authoring/projects",
+            )
+        )
+
+        self.assertEqual(413, sent[0]["status"])
+        self.assertEqual(0, receive_count)
+
+    def test_multipart_on_non_upload_route_cannot_bypass_streamed_limit(self) -> None:
+        sent, _ = asyncio.run(
+            _invoke(
+                content_type="multipart/form-data; boundary=test",
+                messages=[
+                    {"type": "http.request", "body": b"123456", "more_body": True},
+                    {"type": "http.request", "body": b"78901", "more_body": False},
+                ],
+                max_body_bytes=10,
+                path="/api/authoring/projects",
+            )
+        )
+
+        self.assertEqual(413, sent[0]["status"])
 
     def test_forged_non_json_content_type_cannot_bypass_declared_limit(self) -> None:
         # A forged non-multipart Content-Type (text/plain) must not skip the

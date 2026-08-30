@@ -35,7 +35,7 @@ from app.ingestion.vector_adapter import (
 from app.ingestion.embedding_adapter import EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION
 from app.ingestion.embedding_adapter import MAX_EMBEDDING_DIMENSIONS
 from app.ingestion.vector_integrity import embedded_vector_integrity_reason
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 from app.retrieval.bm25_index import (
     BM25_STRUCTURED_METADATA_VERSION,
     default_bm25_index_path,
@@ -940,8 +940,8 @@ def canonical_vector_target_path(
         return None
     base = Path(data_dir)
     if tenant_storage_isolation:
-        base = base / "tenants" / tenant_storage_key(tenant_id)
-    tenant_key = tenant_storage_key(tenant_id)
+        base = base / "tenants" / tenant_directory_key(tenant_id)
+    tenant_key = tenant_directory_key(tenant_id)
     return base / "vector_db" / tenant_key / filename
 
 

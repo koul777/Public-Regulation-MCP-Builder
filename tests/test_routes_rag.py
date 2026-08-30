@@ -39,6 +39,152 @@ class RoutesRagTests(unittest.TestCase):
         routes_rag._RAG_RUNTIME_APPROVAL_IDENTITY_CACHE.clear()
         routes_rag._RAG_VISIBLE_RECORDS_CACHE.clear()
 
+    def test_extractive_chat_returns_only_answer_supporting_evidence_ids(self) -> None:
+        results = [
+            {
+                "document_id": "doc-leave",
+                "chunk_id": "chunk-leave",
+                "article_no": "제30조",
+                "article_title": "휴직 기간",
+                "text": "제30조 육아휴직 기간은 2년 이내로 한다.",
+            },
+            {
+                "document_id": "doc-trip",
+                "chunk_id": "chunk-trip",
+                "article_no": "제10조",
+                "article_title": "출장 여비",
+                "text": "출장 여비는 별도로 지급한다.",
+            },
+        ]
+
+        answer, evidence_ids = routes_rag._chat_answer(
+            "extractive",
+            Settings(data_dir=Path("data")),
+            "육아휴직 기간",
+            results,
+        )
+
+        self.assertIn("육아휴직", answer)
+        self.assertEqual(["chunk-leave"], evidence_ids)
+        self.assertEqual(
+            [results[0]],
+            routes_rag._results_for_evidence_ids(results, evidence_ids),
+        )
+
+    def test_chat_without_evidence_abstains_without_citations(self) -> None:
+        answer, evidence_ids = routes_rag._chat_answer(
+            "extractive",
+            Settings(data_dir=Path("data")),
+            "확인할 규정",
+            [],
+        )
+
+        self.assertEqual(routes_rag.NO_EVIDENCE_ANSWER, answer)
+        self.assertEqual([], evidence_ids)
+        self.assertEqual([], routes_rag._results_for_evidence_ids([], evidence_ids))
+
+    def test_local_chat_preserves_only_verified_evidence_ids(self) -> None:
+        results = [
+            {"document_id": "doc-1", "chunk_id": "chunk-1", "text": "근거"},
+            {"document_id": "doc-2", "chunk_id": "chunk-2", "text": "검색 후보"},
+        ]
+        grounded_result = {
+            "status": "success",
+            "answer": "근거 기반 답변",
+            "evidence_ids": ["chunk-1"],
+        }
+        verified_result = {
+            "status": "verified",
+            "verified_answer": "근거 기반 답변",
+            "verified_evidence_ids": ["chunk-1"],
+        }
+
+        with patch.object(
+            routes_rag.GroundedAnswerAgent,
+            "run",
+            return_value=grounded_result,
+        ), patch.object(
+            routes_rag.CitationVerifierAgent,
+            "run",
+            return_value=verified_result,
+        ):
+            answer, evidence_ids = routes_rag._chat_answer(
+                "ollama",
+                Settings(data_dir=Path("data")),
+                "질문",
+                results,
+            )
+
+        self.assertEqual("근거 기반 답변", answer)
+        self.assertEqual(["chunk-1"], evidence_ids)
+        self.assertEqual(
+            [results[0]],
+            routes_rag._results_for_evidence_ids(results, evidence_ids),
+        )
+
+    def test_local_chat_preserves_model_abstention_without_citations(self) -> None:
+        results = [
+            {"document_id": "doc-1", "chunk_id": "chunk-1", "text": "검색 후보"},
+        ]
+        grounded_result = {
+            "status": "success",
+            "answer": routes_rag.NO_EVIDENCE_ANSWER,
+            "evidence_ids": ["chunk-1"],
+        }
+        abstained_result = {
+            "status": "abstained",
+            "verified_answer": routes_rag.NO_EVIDENCE_ANSWER,
+            "verified_evidence_ids": [],
+        }
+
+        with patch.object(
+            routes_rag.GroundedAnswerAgent,
+            "run",
+            return_value=grounded_result,
+        ), patch.object(
+            routes_rag.CitationVerifierAgent,
+            "run",
+            return_value=abstained_result,
+        ):
+            answer, evidence_ids = routes_rag._chat_answer(
+                "ollama",
+                Settings(data_dir=Path("data")),
+                "질문",
+                results,
+            )
+
+        self.assertEqual(routes_rag.NO_EVIDENCE_ANSWER, answer)
+        self.assertEqual([], evidence_ids)
+
+    def test_local_chat_maps_verifier_input_failure_to_service_unavailable(self) -> None:
+        results = [
+            {"document_id": "doc-1", "chunk_id": "chunk-1", "text": "검색 후보"},
+        ]
+        grounded_result = {
+            "status": "success",
+            "answer": "답변",
+            "evidence_ids": ["chunk-1"],
+        }
+
+        with patch.object(
+            routes_rag.GroundedAnswerAgent,
+            "run",
+            return_value=grounded_result,
+        ), patch.object(
+            routes_rag.CitationVerifierAgent,
+            "run",
+            side_effect=ValueError("non-approved evidence"),
+        ), self.assertRaises(HTTPException) as raised:
+            routes_rag._chat_answer(
+                "ollama",
+                Settings(data_dir=Path("data")),
+                "질문",
+                results,
+            )
+
+        self.assertEqual(503, raised.exception.status_code)
+        self.assertEqual("Answer citation verification failed", raised.exception.detail)
+
     def test_candidate_reference_label_does_not_match_longer_numbered_appendix(self) -> None:
         # Labels normalize by stripping spaces, so "별표2" is a substring of
         # "별표21".  A chunk that only cites 별표 21 must not be treated as a
@@ -1285,7 +1431,15 @@ class RoutesRagTests(unittest.TestCase):
                 data_dir=Path(tmp) / "data",
                 artifact_root=Path(tmp),
                 api_auth_required=True,
-                api_auth_tokens=json.dumps({"op-secret": {"role": "operator", "actor": "operator"}}),
+                api_auth_tokens=json.dumps(
+                    {
+                        "op-secret": {
+                            "role": "operator",
+                            "actor": "operator",
+                            "tenant_id": "tenant-a",
+                        }
+                    }
+                ),
             )
             repository = JsonRepository(settings)
             repository.upsert_document(

@@ -4,11 +4,11 @@
 
 ## 보호 범위
 
-- `app/parsers/`, `app/processors/`
-- `app/ingestion/`, `app/retrieval/`의 Vector metadata, BM25, 계층 색인·검색 로직
-- `app/core/pipeline.py`, `app/services/processing_service.py`
-- 파싱·구조·품질·chunk 관련 schema
+- `app/` 전체. 파서·전처리뿐 아니라 API 인증, tenant/profile 격리, 승인 journal,
+  저장소, Vector/RAG/MCP 조회, 출력 필터와 에이전트 실행 경계도 같은 보호 계약을 따른다.
 - 배치 전처리와 회귀 판정에 관여하는 핵심 script
+- tenant 저장 경로, 승인 재검토, RAG 보안 증거, 시계열·버전 audit를 읽거나 쓰는 운영 script
+- 공개 소스 위생, orphan snapshot, public release gate와 자동 릴리스 workflow
 - `app/mcp_server/`의 도구·전송·HTTP 보안 경계
 - MCP 번들 생성, 연결 readiness, stdio/Streamable HTTP smoke, 서버 실행 script
 - `frontend/streamlit_app.py`의 MCP 프로필·연결 대상·상태 안내
@@ -17,7 +17,7 @@
 
 보호 파일이 바뀌면 `preprocessing-change-policy`는 다음 조건을 모두 요구한다.
 
-1. 파서·전처리·MCP 연결 또는 기준값 변경에는 관련 `unittest` 파일도 같은 PR에서 추가하거나 수정한다. 삭제된 테스트는 증거로 인정하지 않는다.
+1. 파서·전처리·MCP 연결 또는 기준값 변경에는 관련 `unittest` 파일도 같은 PR에서 추가하거나 수정한다. Guard는 보호 파일마다 경로·파일명 토큰이 대응하는 테스트가 있는지 확인하므로, 예를 들어 HWPX 파서 변경을 API 보안 테스트만으로 통과시킬 수 없다. 삭제된 테스트는 증거로 인정하지 않는다.
 2. PR template의 변경 요약, 영향 형식, 불변조건, 회귀 근거, 기준값 변경 항목을 실제 내용으로 채운다.
 3. 골든/기대값을 바꾸면 단순히 새 결과에 맞추지 말고 변경 전후 수치와 사람 검수 근거를 기록한다.
 4. Code Owner가 증거를 검토한 뒤 `preprocessing-reviewed` 라벨을 붙인다.

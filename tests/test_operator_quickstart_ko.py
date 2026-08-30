@@ -23,6 +23,8 @@ class OperatorQuickstartKoTests(unittest.TestCase):
             "audit_release_hygiene.py",
             "run_fresh_clone_rehearsal.py",
             "run_release_harness.py",
+            "--portable-python",
+            "standalone CPython 3.11+",
             "UNREVIEWED_PREVIEW",
             "UNREVIEWED_POC_REVIEW",
             "approved local regulation DB/vector index",

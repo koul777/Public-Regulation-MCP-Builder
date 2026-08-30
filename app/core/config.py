@@ -18,6 +18,12 @@ def _default_api_auth_required() -> bool:
     return os.getenv("APP_ENV", "local").lower() not in {"local", "dev", "development", "test"}
 
 
+def _default_regulation_authoring_enabled() -> bool:
+    """Keep the beginner workspace available locally and opt-in when deployed."""
+
+    return os.getenv("APP_ENV", "local").lower() in {"local", "dev", "development", "test"}
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str = os.getenv("APP_ENV", "local")
@@ -31,6 +37,10 @@ class Settings:
     api_audit_enabled: bool = _env_bool("API_AUDIT_ENABLED", True)
     api_default_tenant_id: str = os.getenv("API_DEFAULT_TENANT_ID", "default")
     tenant_storage_isolation: bool = _env_bool("TENANT_STORAGE_ISOLATION", False)
+    enable_regulation_authoring: bool = _env_bool(
+        "ENABLE_REGULATION_AUTHORING",
+        _default_regulation_authoring_enabled(),
+    )
     enable_agent_review: bool = _env_bool("ENABLE_AGENT_REVIEW", False)
     llm_provider: str = os.getenv("LLM_PROVIDER", "openai")
     rag_llm_backend: str = os.getenv("RAG_LLM_BACKEND", "extractive")
@@ -132,6 +142,12 @@ class Settings:
     @property
     def exports_dir(self) -> Path:
         return self.data_dir / "exports"
+
+    @property
+    def authoring_dir(self) -> Path:
+        """Storage root isolated from official document, approval, and vector data."""
+
+        return self.data_dir / "authoring"
 
 
 # Operator-supplied overrides applied on top of the env-based base settings.

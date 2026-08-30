@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.institution_profiles import load_institution_profile_registry, normalize_profile_id
 from app.core.config import Settings
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 
 
 GENERIC_PROFILE_IDS = {"public_institution", "default-public-institution"}
@@ -278,7 +278,7 @@ def _load_runtime_profile_rows(
         tenant_storage_isolation = Settings(data_dir=runtime_data_dir).tenant_storage_isolation
     if tenant_storage_isolation:
         effective_dir = runtime_data_dir / "tenants" / tenant_id
-    path = effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    path = effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     if not path.is_file():
         return []
     rows: list[dict[str, Any]] = []

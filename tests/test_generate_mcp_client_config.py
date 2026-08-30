@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.core.config import Settings
+from app.core.tenant_access import settings_for_tenant
 from app.ingestion.vector_adapter import stable_content_hash
 from app.mcp_server.regulation_tools import (
     fetch_regulation as fetch_mcp_regulation,
@@ -2769,6 +2770,23 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertNotIn("mcp_servers", config["claude_remote"])
         self.assertNotIn("tools", config["claude_remote"])
         self.assertNotIn("betas", config["claude_remote"])
+        self.assertEqual(
+            config["quickstart"]["codex"],
+            {
+                "config_file_candidates": [
+                    "%USERPROFILE%\\.codex\\config.toml",
+                    "~/.codex/config.toml",
+                ],
+                "config_snippet_file": "codex_config_snippet.toml",
+                "paste_toml_section": "mcp_servers.aks_mcp",
+                "transport": "stdio",
+                "verification_commands": [
+                    {"command": "codex", "args": ["mcp", "list"]},
+                    {"command": "codex", "args": ["mcp", "get", "aks_mcp"]},
+                ],
+                "verification_tools": ["search", "fetch"],
+            },
+        )
         self.assertEqual(config["quickstart"]["claude_code"]["command"], "claude")
         self.assertEqual(
             config["quickstart"]["claude_code"]["args"][:7],
@@ -2850,6 +2868,53 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
                     "approved_public_unauthenticated",
                 ],
                 "authorization_token_env": "MCP_AUTH_TOKEN",
+            },
+        )
+        self.assertEqual(
+            config["quickstart"]["codex_claude_team"],
+            {
+                "team_id": "codex_claude_local_mcp_review_loop",
+                "shared_server_name": "aks_mcp",
+                "shared_transport": "stdio",
+                "shared_runtime_source": "approved_bundle_data",
+                "independence_rule": "claude_reviews_codex_changes_before_release",
+                "claude_project_agents": [
+                    "regulation-security-auditor",
+                    "regulation-release-reviewer",
+                ],
+                "shared_prerequisites": [
+                    "validate_synthetic_chain",
+                    "audit_index_visibility",
+                    "validate_runtime_transport",
+                ],
+                "members": {
+                    "codex": {
+                        "quickstart_key": "codex",
+                        "responsibility": "implementation_and_runtime_fix",
+                        "verify_with": ["search", "fetch"],
+                    },
+                    "claude_code": {
+                        "quickstart_key": "claude_code",
+                        "responsibility": "independent_audit_and_regression_review",
+                        "verify_with": ["search", "fetch"],
+                    },
+                },
+                "handoff_sequence": [
+                    "codex_register_stdio",
+                    "claude_register_stdio",
+                    "codex_implement_and_run_focused_tests",
+                    "claude_security_audit",
+                    "codex_remediate_confirmed_findings",
+                    "claude_release_regression_review",
+                    "validate_client_config_smoke",
+                    "run_search_and_fetch_in_both_clients",
+                ],
+                "shared_artifacts": [
+                    "codex_config_snippet.toml",
+                    "claude_code_add_stdio.ps1",
+                    "validate_client_config_smoke.ps1",
+                    "doctor_mcp_connection.ps1",
+                ],
             },
         )
         self.assertEqual(
@@ -7506,6 +7571,71 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertNotIn(settings.data_dir, seen_data_dirs)
         self.assertIn("No MCP-visible approved records", str(raised.exception))
 
+    def test_runtime_bundle_manifest_separates_flat_export_layout_from_isolated_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _seed_runtime_bundle_document(
+                Path(tmp),
+                file_type="txt",
+                metadata={},
+                tenant_storage_isolation=True,
+            )
+            output_dir = Path(tmp) / "bundle"
+            records = [_runtime_export_record("doc-kordoc", "chunk-1")]
+
+            with patch(
+                "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                return_value=records,
+            ):
+                runtime_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                    tenant_storage_isolation=True,
+                    require_kordoc_table_parser=False,
+                )
+
+            persisted_manifest = json.loads(
+                (output_dir / "data" / "mcp_runtime_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            flat_repository_exists = (output_dir / "data" / "repository").is_dir()
+            isolated_runtime_exists = (output_dir / "data" / "tenants").exists()
+            with (
+                patch(
+                    "scripts.generate_mcp_client_config._runtime_visible_records_for_export",
+                    return_value=records,
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_vector_records_with_offsets",
+                    side_effect=AssertionError("isolated source identity must reuse"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.write_bm25_index",
+                    side_effect=AssertionError("isolated source identity must reuse"),
+                ),
+                patch(
+                    "scripts.generate_mcp_client_config.build_hierarchical_runtime_index",
+                    side_effect=AssertionError("isolated source identity must reuse"),
+                ),
+            ):
+                reused_manifest = write_mcp_runtime_data_bundle(
+                    source_data_dir=settings.data_dir,
+                    out_dir=output_dir,
+                    tenant_id="tenant-a",
+                    document_id="doc-kordoc",
+                    tenant_storage_isolation=True,
+                    require_kordoc_table_parser=False,
+                )
+
+        self.assertFalse(runtime_manifest["tenant_storage_isolation"])
+        self.assertTrue(runtime_manifest["source_tenant_storage_isolation"])
+        self.assertEqual(runtime_manifest, persisted_manifest)
+        self.assertEqual(runtime_manifest, reused_manifest)
+        self.assertTrue(flat_repository_exists)
+        self.assertFalse(isolated_runtime_exists)
+
     def test_runtime_bundle_rejects_stale_vector_when_current_chunk_is_draft(self) -> None:
         metadata = {
             "kordoc_table_inventory": {"status": "parsed", "parser": "kordoc", "table_count": 1, "tables": []},
@@ -9381,9 +9511,18 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
             build_mcp_client_config(client_profile="unknown-client")
 
 
-def _seed_runtime_bundle_document(root: Path, *, file_type: str, metadata: dict) -> Settings:
-    settings = Settings(data_dir=root / "data")
-    repository = JsonRepository(settings)
+def _seed_runtime_bundle_document(
+    root: Path,
+    *,
+    file_type: str,
+    metadata: dict,
+    tenant_storage_isolation: bool = False,
+) -> Settings:
+    settings = Settings(
+        data_dir=root / "data",
+        tenant_storage_isolation=tenant_storage_isolation,
+    )
+    repository = JsonRepository(settings_for_tenant(settings, "tenant-a"))
     document = Document(
         document_id="doc-kordoc",
         filename=f"rules.{file_type}",

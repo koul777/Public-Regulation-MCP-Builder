@@ -57,6 +57,7 @@ class GroundedAnswerAgent(BaseAgent):
         if backend == "extractive":
             answer = build_structured_extractive_answer(query, evidence)
             return self._result(
+                query=query,
                 answer=answer,
                 status="success",
                 answer_mode="grounded_extractive",
@@ -107,6 +108,7 @@ class GroundedAnswerAgent(BaseAgent):
                 allow_fallback=_allow_fallback(payload),
             )
         return self._result(
+            query=query,
             answer=answer,
             status="success",
             answer_mode="grounded_local",
@@ -130,6 +132,7 @@ class GroundedAnswerAgent(BaseAgent):
         if allow_fallback:
             answer = build_structured_extractive_answer(query, evidence)
             return self._result(
+                query=query,
                 answer=answer,
                 status="fallback",
                 answer_mode="grounded_extractive",
@@ -156,6 +159,7 @@ class GroundedAnswerAgent(BaseAgent):
     def _result(
         self,
         *,
+        query: str,
         answer: str,
         status: str,
         answer_mode: str,
@@ -165,15 +169,20 @@ class GroundedAnswerAgent(BaseAgent):
         backend: str | None = None,
         fallback_reason: str | None = None,
     ) -> AgentResult:
-        supporting = select_supporting_answer_results("", evidence)
+        supporting = select_supporting_answer_results(query, evidence)
+        supporting_evidence_ids = _evidence_ids(supporting)
         result: dict[str, Any] = {
             "role_id": "grounded_answerer",
             "status": status,
             "answer": sanitize_rag_answer(answer),
             "answer_mode": answer_mode,
             "abstained": False,
-            "evidence_ids": evidence_ids,
-            "supporting_evidence_ids": _evidence_ids(supporting),
+            # ``evidence_ids`` is the downstream citation contract: include
+            # only evidence selected for this answer. Keep the broader
+            # retrieved scope separately for diagnostics/audit.
+            "evidence_ids": supporting_evidence_ids,
+            "supporting_evidence_ids": supporting_evidence_ids,
+            "retrieved_evidence_ids": evidence_ids,
             "model": model,
             "backend": backend,
             "fallback_reason": fallback_reason,

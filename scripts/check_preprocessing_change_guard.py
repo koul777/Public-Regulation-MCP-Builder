@@ -5,7 +5,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,30 +13,39 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REVIEW_LABEL = "preprocessing-reviewed"
 
 LOGIC_PREFIXES = (
-    "app/parsers/",
-    "app/processors/",
-    "app/ingestion/",
-    "app/retrieval/",
-    "app/mcp_server/",
+    # Runtime modules share approval, tenant, retrieval, and output-security
+    # boundaries.  Protect the complete package so moving a check between
+    # layers cannot silently move it outside the review contract.
+    "app/",
 )
 LOGIC_FILES = {
-    "app/core/pipeline.py",
-    "app/services/processing_service.py",
-    "app/schemas/chunk.py",
-    "app/schemas/parsed.py",
-    "app/schemas/quality.py",
-    "app/schemas/structure.py",
     "frontend/streamlit_app.py",
     "scripts/analyze_regulation_corpus.py",
+    "scripts/apply_reapproval_plan_shadow.py",
+    "scripts/audit_mcp_product_readiness.py",
+    "scripts/audit_public_release_readiness.py",
+    "scripts/audit_release_hygiene.py",
+    "scripts/audit_runtime_version_drift.py",
     "scripts/audit_table_preprocessing_claim_gate.py",
+    "scripts/audit_temporal_metadata_coverage.py",
     "scripts/batch_process_regulations.py",
+    "scripts/build_profile_provenance_report.py",
+    "scripts/build_rag_security_evidence.py",
+    "scripts/build_reapproval_worklist.py",
+    "scripts/build_regulation_migration_manifest.py",
+    "scripts/build_temporal_backfill_shadow_runtime.py",
     "scripts/check_parsing_goldset_table_drift.py",
     "scripts/check_mcp_connection_readiness.py",
     "scripts/check_regression_expectations.py",
+    "scripts/evaluate_rag_retrieval.py",
     "scripts/refresh_table_exports.py",
     "scripts/generate_mcp_client_config.py",
     "scripts/mcp_bundle_contract.py",
+    "scripts/mcp_publish_approval_evidence.py",
+    "scripts/create_public_orphan_snapshot.py",
     "scripts/run_mcp_client_config_smoke.py",
+    "scripts/run_mcp_smoke.py",
+    "scripts/run_public_release_gate.py",
     "scripts/run_mcp_transport_smoke.py",
     "scripts/run_regulation_mcp.py",
     "scripts/run_ci_regression_gate.py",
@@ -49,6 +57,7 @@ BASELINE_FILES = {"config/quality_profiles.example.json"}
 GOVERNANCE_FILES = {
     ".github/CODEOWNERS",
     ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/workflows/auto-release.yml",
     ".github/workflows/preprocessing-change-policy.yml",
     ".github/workflows/preprocessing-regression.yml",
     "scripts/check_preprocessing_change_guard.py",
@@ -56,6 +65,7 @@ GOVERNANCE_FILES = {
     "tests/test_preprocessing_change_guard.py",
 }
 GUARD_IMPLEMENTATION_FILES = {
+    ".github/workflows/auto-release.yml",
     ".github/workflows/preprocessing-change-policy.yml",
     ".github/workflows/preprocessing-regression.yml",
     "scripts/check_preprocessing_change_guard.py",
@@ -64,28 +74,36 @@ GUARD_TEST_FILES = {
     "tests/test_github_workflow_templates.py",
     "tests/test_preprocessing_change_guard.py",
 }
-FOCUSED_TEST_KEYWORDS = (
-    "archive_safety",
-    "article_validity",
-    "chunk",
-    "bm25",
-    "hierarchical",
-    "hwp_inventory",
-    "input_packaging",
-    "metadata_extractor",
-    "mcp",
-    "normalizer",
-    "parser",
-    "parsing",
-    "pipeline",
-    "preprocess",
-    "processing_service",
-    "quality",
-    "retrieval",
-    "structure",
-    "streamlit_operator",
-    "table",
-    "vector_ingestion",
+GENERIC_LOGIC_PATH_TOKENS = {
+    "app",
+    "base",
+    "common",
+    "detector",
+    "helper",
+    "helpers",
+    "manager",
+    "processor",
+    "processors",
+    "route",
+    "routes",
+    "script",
+    "scripts",
+    "server",
+    "service",
+    "services",
+    "tools",
+    "utility",
+    "utils",
+}
+LOGIC_TEST_ALIASES = (
+    ("app/retrieval/hierarchical_index.py", {"hierarchical", "input", "packaging"}),
+    ("app/api/", {"api", "routes"}),
+    ("app/ingestion/", {"ingestion", "vector"}),
+    ("app/mcp_server/", {"mcp"}),
+    ("app/rag/", {"rag", "chat", "orchestrated"}),
+    ("app/retrieval/", {"retrieval"}),
+    ("app/storage/", {"repository", "storage"}),
+    ("frontend/streamlit_app.py", {"streamlit"}),
 )
 BODY_FIELDS = (
     "summary",
@@ -216,10 +234,33 @@ def _is_deleted(change: dict[str, str]) -> bool:
 
 
 def _is_focused_test(path: str) -> bool:
-    if not path.startswith("tests/test_") or not path.endswith(".py"):
-        return False
-    filename = Path(path).name.casefold()
-    return any(keyword in filename for keyword in FOCUSED_TEST_KEYWORDS)
+    return path.startswith("tests/test_") and path.endswith(".py")
+
+
+def _path_tokens(path: str) -> set[str]:
+    normalized = normalize_path(path).casefold()
+    stem = Path(normalized).stem
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", stem)
+        if len(token) >= 3 and token not in GENERIC_LOGIC_PATH_TOKENS
+    }
+    for prefix, aliases in LOGIC_TEST_ALIASES:
+        if normalized.startswith(prefix) or normalized == prefix:
+            tokens.update(aliases)
+    if tokens:
+        return tokens
+    if normalized.startswith("app/parsers/"):
+        return {"parser", "parsing"}
+    if normalized.startswith("app/processors/"):
+        return {"preprocess", "processing"}
+    return set()
+
+
+def _test_maps_to_protected_file(test_path: str, protected_path: str) -> bool:
+    test_tokens = _path_tokens(test_path)
+    required_tokens = _path_tokens(protected_path)
+    return bool(required_tokens and test_tokens.intersection(required_tokens))
 
 
 def extract_body_fields(body: str) -> dict[str, str | None]:
@@ -277,6 +318,20 @@ def evaluate_guard(
     focused_tests = sorted(path for path in changed_tests if _is_focused_test(path))
     guard_tests = sorted(path for path in changed_tests if path in GUARD_TEST_FILES)
     guard_implementation_files = sorted(path for path in paths if path in GUARD_IMPLEMENTATION_FILES)
+    regression_protected_files = sorted(set(logic_files + baseline_files))
+    mapped_tests_by_protected_file = {
+        protected_path: sorted(
+            test_path
+            for test_path in changed_tests
+            if _test_maps_to_protected_file(test_path, protected_path)
+        )
+        for protected_path in regression_protected_files
+    }
+    unmatched_protected_files = sorted(
+        path
+        for path, mapped_tests in mapped_tests_by_protected_file.items()
+        if not mapped_tests
+    )
 
     label_values = sorted({str(label).strip() for label in labels if str(label).strip()})
     label_present = review_label.casefold() in {label.casefold() for label in label_values}
@@ -296,6 +351,17 @@ def evaluate_guard(
                 {
                     "code": "missing-focused-regression-test",
                     "detail": "Protected parsing/preprocessing, MCP connection, or baseline changes require a changed focused unittest module.",
+                }
+            )
+        if unmatched_protected_files:
+            failures.append(
+                {
+                    "code": "missing-mapped-regression-test",
+                    "detail": (
+                        "Every protected logic or baseline file must have a changed unittest module "
+                        "whose filename maps to that component."
+                    ),
+                    "files": unmatched_protected_files,
                 }
             )
     if guard_implementation_files and not guard_tests:
@@ -356,6 +422,8 @@ def evaluate_guard(
         "changed_tests": changed_tests,
         "focused_tests": focused_tests,
         "guard_tests": guard_tests,
+        "mapped_tests_by_protected_file": mapped_tests_by_protected_file,
+        "unmatched_protected_files": unmatched_protected_files,
         "body_field_status": field_status,
         "failure_count": len(failures),
         "failures": failures,

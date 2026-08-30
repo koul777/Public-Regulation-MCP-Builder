@@ -45,6 +45,17 @@ def _function(module: ast.Module, name: str) -> ast.FunctionDef:
     )
 
 
+class StreamlitSyntheticSampleSourceTests(unittest.TestCase):
+    def test_beginner_preprocess_page_offers_in_memory_synthetic_docx(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_preprocess")) or ""
+
+        self.assertIn("합성 DOCX 샘플 받기", page_source)
+        self.assertIn("build_synthetic_regulation_docx()", page_source)
+        self.assertIn("SYNTHETIC_SAMPLE_FILENAME", page_source)
+        self.assertIn("실제 기관명·개인정보·로컬 경로가 없는", page_source)
+
+
 def _write_sealed_runtime_fixture(
     runtime_data_dir: Path,
     *,
@@ -528,19 +539,13 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             control_keys("chunk-1:warning:1"),
         )
         self.assertNotIn('control_key_prefix="ai-"', source)
-        # Per-item reflect/skip buttons are gone — the program marks every AI-flagged
-        # item as reflected automatically so the operator only edits the proposed text.
-        page_source = ast.get_source_segment(source, _function(module, "_page_approval")) or ""
-        self.assertNotIn("key=reflect_button_key", page_source)
-        self.assertNotIn("key=skip_button_key", page_source)
-        auto_confirm_source = ast.get_source_segment(
-            source, _function(module, "_approval_auto_confirm_pending_chunks")
+        controls_source = ast.get_source_segment(
+            source, _function(module, "_render_approval_chunk_confirmation_controls")
         ) or ""
-        self.assertIn(
-            'auto_ai_decisions = {item_id: "reflect" for item_id in item_ids}',
-            auto_confirm_source,
-        )
-        self.assertIn("_approval_auto_confirm_pending_chunks(", page_source)
+        self.assertIn("key=reflect_button_key", controls_source)
+        self.assertIn("key=skip_button_key", controls_source)
+        self.assertIn("_approval_record_ai_decision(", controls_source)
+        self.assertNotIn("_approval_auto_confirm_pending_chunks", source)
         self.assertIn('div[class~="st-key-{safe_control_key}"] button', source)
 
     def test_beginner_multi_chunk_review_moves_then_unlocks_single_approval(self) -> None:
@@ -599,9 +604,8 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
 
         page = _function(module, "_page_approval")
         page_source = ast.get_source_segment(source, page) or ""
-        # There is no more per-chunk "next pending" navigation: every pending chunk
-        # renders in one continuous scroll, and confirmation bookkeeping is filled in
-        # automatically instead of requiring a click to unlock the next one.
+        # There is no more per-chunk "next pending" navigation: visible rows carry
+        # their own explicit confirmation controls.
         self.assertNotIn("다음 미검수 청크", page_source)
         # 조항이 수천 개인 규정이 있어 한 쪽씩만 그리되, 승인 대상은 여전히 미승인 조항 전체다.
         sheet_source = (
@@ -610,15 +614,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("for row in visible_rows:", sheet_source)
         self.assertIn("visible_rows = rows[sheet_start", sheet_source)
         self.assertIn("APPROVAL_SHEET_PAGE_SIZE", sheet_source)
+        self.assertIn("_render_approval_chunk_confirmation_controls(", sheet_source)
         self.assertIn("_render_approval_compare_sheet(", page_source)
-        self.assertIn("_approval_auto_confirm_pending_chunks(", page_source)
-        auto_confirm_source = ast.get_source_segment(
-            source, _function(module, "_approval_auto_confirm_pending_chunks")
-        ) or ""
-        self.assertIn(
-            'st.session_state[human_confirmed_key] = True',
-            auto_confirm_source,
-        )
+        self.assertNotIn("_approval_auto_confirm_pending_chunks", source)
         # 승인 대상은 확인이 끝난 미승인 조항 전체이며, 별도의 청크 이동 관문은 없다.
         self.assertNotIn("beginner_review_navigation", page_source)
 
@@ -682,35 +680,30 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 for call in ast.walk(statement)
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Name)
                 and call.func.id == "_approval_auto_confirm_pending_chunks"
                 for statement in approve_all_if.body
                 for call in ast.walk(statement)
-            ),
-            "전체 규정 확정은 열지 않은 규정의 검수 표시를 눌린 순간에 채워야 한다.",
+            )
         )
+        self.assertIn("document_pending_review_entries", page_source)
 
-        approval_target_fallback = next(
+        approval_target_assignment = next(
             node
             for node in ast.walk(page)
-            if isinstance(node, ast.If)
+            if isinstance(node, ast.Assign)
             and any(
-                isinstance(descendant, ast.Assign)
-                and any(
-                    isinstance(target, ast.Name)
-                    and target.id == "approval_target_entries"
-                    for target in descendant.targets
-                )
-                for statement in node.body
-                for descendant in ast.walk(statement)
+                isinstance(target, ast.Name)
+                and target.id == "approval_target_entries"
+                for target in node.targets
             )
-            and "compare_chunk_approvable" in ast.unparse(node.test)
         )
-        fallback_condition = ast.unparse(approval_target_fallback.test)
-        self.assertIn("approve_enabled or override_reason_text", fallback_condition)
+        approval_target_value = ast.unparse(approval_target_assignment.value)
+        self.assertIn("pending_review_entries", approval_target_value)
+        self.assertIn("approve_enabled or override_reason_text", approval_target_value)
 
         can_approve_assignment = next(
             node
@@ -871,7 +864,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         for required in (
             "자동 인식한 규정 정보 확인",
             "품질 경고·이슈 확인",
-            "규정 스크롤하며 원본·전처리·AI 검수본 비교",
+            "규정 스크롤하며 원본·전처리·AI 검수 의견 비교",
             "다음 미완료 규정으로 이동해 같은 검수 반복",
             "선택한 모든 규정의 검수·승인·색인 완료 확인",
             "MCP 원리와 변환 과정 확인",
@@ -1339,17 +1332,15 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         page = _function(module, "_page_approval")
         page_source = ast.get_source_segment(source, page) or ""
 
-        # There is no "사람 검증 확인" tab left to click at all — human sign-off is
-        # filled in automatically per pending chunk instead of via a separate control.
+        controls_source = ast.get_source_segment(
+            source, _function(module, "_render_approval_chunk_confirmation_controls")
+        ) or ""
         self.assertNotIn("사람 검증 확인' 탭을 누르세요", page_source)
         self.assertNotIn("'2. 사람 검증 확인' 탭을 여세요", page_source)
         self.assertNotIn("control_key_prefix=human_confirmed_widget_key", page_source)
-        self.assertNotIn("key=human_confirmed_widget_key", page_source)
-        self.assertIn("_approval_auto_confirm_pending_chunks(", page_source)
-        auto_confirm_source = ast.get_source_segment(
-            source, _function(module, "_approval_auto_confirm_pending_chunks")
-        ) or ""
-        self.assertIn("st.session_state[human_confirmed_key] = True", auto_confirm_source)
+        self.assertIn("key=human_confirmed_widget_key", controls_source)
+        self.assertIn("_approval_sync_human_confirmation_from_widget", controls_source)
+        self.assertNotIn("_approval_auto_confirm_pending_chunks", source)
 
     def test_approval_guides_ai_result_human_comparison_and_index_separately(self) -> None:
         source, module = _source_and_module()
@@ -1370,6 +1361,13 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         # 좌우로 옮겨 다니면 조항마다 어디를 고쳐야 하는지 알 수 없다.
         self.assertIn("edit_col = row_cols[1]", sheet_source)
         self.assertNotIn("edit_col = row_cols[2]", sheet_source)
+        self.assertIn("항상 가운데 '전처리본 · ✅ 최종본' 칸을 직접 타이핑해 고치세요", page_source)
+        self.assertIn("오른쪽 AI 검수 의견은", page_source)
+        self.assertIn("읽기 전용 참고 정보입니다", page_source)
+        self.assertNotIn("AI 검수본이 있으면 오른쪽 칸을", page_source)
+        self.assertIn("'요약' 탭의 '전처리된 글자 확인'", page_source)
+        self.assertNotIn("문서 구조·정리된 내용(청크)을 확인", page_source)
+        self.assertIn("여러 규정의 AI 실행 상태는 서로 다를 수 있습니다", sheet_source)
         # AI가 다시 쓴 본문을 승인 대상으로 삼는 경로가 남아 있으면 안 된다.
         self.assertNotIn("ai_preprocessed_text", sheet_source)
         for text in (
@@ -1417,6 +1415,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             item_ids=["item-1"],
             ai_decisions={"item-1": "reflect"},
             human_confirmed=True,
+            action_required_resolved=True,
         )
         self.assertTrue(unconfirmed["ai_confirmed"])
         self.assertFalse(unconfirmed["ai_result_confirmed"])
@@ -1429,6 +1428,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             item_ids=["item-1"],
             ai_decisions={"item-1": "reflect"},
             human_confirmed=True,
+            action_required_resolved=True,
         )
         self.assertTrue(confirmed["ai_result_confirmed"])
         self.assertTrue(confirmed["approve_enabled"])
@@ -1439,6 +1439,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             item_ids=["item-1"],
             ai_decisions={"item-1": "skip"},
             human_confirmed=True,
+            action_required_resolved=False,
         )
         self.assertFalse(changed["ai_result_confirmed"])
         self.assertFalse(changed["approve_enabled"])
@@ -2546,7 +2547,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "현재 규정의 결과 두 곳 확인하러 가기",
             "규정마다 결과 확인을 끝낸 뒤에만 원본·전처리·AI 검수 내용을 검토",
             "다음 미완료 규정을 하나씩 계속 확인하세요",
-            "결과 확인 두 곳부터 원본·전처리·AI 검수본 비교, 승인 또는 반려, 색인까지",
+            "결과 확인 두 곳부터 원본·전처리·AI 검수 의견 비교, 승인 또는 반려, 색인까지",
             "다음 미완료 규정 결과 확인",
         ):
             self.assertIn(text, page_source)

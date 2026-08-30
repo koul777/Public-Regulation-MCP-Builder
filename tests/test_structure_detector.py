@@ -205,19 +205,44 @@ class StructureDetectorTests(unittest.TestCase):
                 [
                     "제1조【목적】 이 규정의 목적을 정한다.",
                     "제2조 [정의] 이 규정에서 사용하는 용어를 정의한다.",
-                    "제3조 적용범위",
+                    "제3조（적용범위） 모든 임직원에게 적용한다.",
+                    "제4조〈권한〉 권한을 정한다.",
+                    "제5조<책임> 책임을 정한다.",
+                    "제6조 보칙",
                     "이 규정은 모든 임직원에게 적용한다.",
                 ]
             )
         )
         articles = [node for node in nodes if node.node_type == "article"]
 
-        self.assertEqual(["제1조", "제2조", "제3조"], [node.number for node in articles])
-        self.assertEqual(["목적", "정의", "적용범위"], [node.title for node in articles])
+        self.assertEqual(
+            ["제1조", "제2조", "제3조", "제4조", "제5조", "제6조"],
+            [node.number for node in articles],
+        )
+        self.assertEqual(
+            ["목적", "정의", "적용범위", "권한", "책임", "보칙"],
+            [node.title for node in articles],
+        )
         self.assertEqual("이 규정의 목적을 정한다.", articles[0].metadata["article_lead_text"])
         self.assertEqual("이 규정에서 사용하는 용어를 정의한다.", articles[1].metadata["article_lead_text"])
-        self.assertNotIn("article_lead_text", articles[2].metadata)
-        self.assertIn("이 규정은 모든 임직원에게 적용한다.", articles[2].text)
+        self.assertEqual("모든 임직원에게 적용한다.", articles[2].metadata["article_lead_text"])
+        self.assertNotIn("article_lead_text", articles[5].metadata)
+        self.assertIn("이 규정은 모든 임직원에게 적용한다.", articles[5].text)
+
+    def test_angle_bracket_lifecycle_annotations_are_not_article_titles(self) -> None:
+        for text, annotation in (
+            ("제10조 <개정 2020. 1. 1.> 이 규정은 사업 운영에 적용한다.", "개정 2020. 1. 1."),
+            ("제12조의2 〈신설 2021. 5. 1.〉", "신설 2021. 5. 1."),
+            ("제13조 <전문개정 2022. 6. 1.> 이 규정에 따른다.", "전문개정 2022. 6. 1."),
+        ):
+            with self.subTest(text=text):
+                nodes = StructureDetector().detect_from_text(text)
+                article = next(node for node in nodes if node.node_type == "article")
+
+                self.assertIsNone(article.title)
+                self.assertIn("article_title_missing", article.warnings)
+                self.assertNotIn("article_lead_text", article.metadata)
+                self.assertIn(annotation, article.text)
 
     def test_bracketed_inline_article_title_splits_without_splitting_reference(self) -> None:
         nodes = StructureDetector().detect_from_text(
@@ -1191,6 +1216,63 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertEqual(paragraphs[0].parent_id, article.node_id)
         self.assertTrue(all(node.parent_id == paragraphs[0].node_id for node in items))
         self.assertTrue(all(node.parent_id == items[0].node_id for node in subitems))
+
+    def test_parenthesized_numeric_details_preserve_hangul_subitem_siblings(self) -> None:
+        text = "\n".join(
+            [
+                "제1조(목적) 본문.",
+                "1. 첫째 호",
+                "가. 첫째 목",
+                "(1) 첫째 세목",
+                "(2) 둘째 세목",
+                "둘째 세목의 계속 문장",
+                "나. 둘째 목",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        by_number = {node.number: node for node in nodes if node.number}
+
+        self.assertEqual("subitem", by_number["(1)"].node_type)
+        self.assertEqual("subitem", by_number["(2)"].node_type)
+        self.assertEqual(by_number["가."].node_id, by_number["(1)"].parent_id)
+        self.assertEqual(by_number["가."].node_id, by_number["(2)"].parent_id)
+        self.assertIn("둘째 세목의 계속 문장", by_number["(2)"].text)
+        self.assertEqual(by_number["1."].node_id, by_number["나."].parent_id)
+
+    def test_parenthesized_numeric_marker_at_article_start_remains_paragraph(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(
+                [
+                    "제1조(목적) 본문.",
+                    "(1) 첫째 항",
+                    "(2) 둘째 항",
+                ]
+            )
+        )
+        article = next(node for node in nodes if node.node_type == "article")
+        paragraphs = [node for node in nodes if node.node_type == "paragraph"]
+
+        self.assertEqual(["(1)", "(2)"], [node.number for node in paragraphs])
+        self.assertTrue(all(node.parent_id == article.node_id for node in paragraphs))
+
+    def test_parenthesized_numeric_details_directly_under_item_are_siblings(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(
+                [
+                    "제1조(목적) 본문.",
+                    "1. 첫째 호",
+                    "(1) 첫째 세목",
+                    "(2) 둘째 세목",
+                    "2. 둘째 호",
+                ]
+            )
+        )
+        by_number = {node.number: node for node in nodes if node.number}
+
+        self.assertEqual(by_number["1."].node_id, by_number["(1)"].parent_id)
+        self.assertEqual(by_number["1."].node_id, by_number["(2)"].parent_id)
+        self.assertEqual(by_number["1."].parent_id, by_number["2."].parent_id)
 
     def test_je_hang_and_je_ho_lines_are_detected_as_paragraph_and_item(self) -> None:
         text = "\n".join(

@@ -1,4 +1,6 @@
 # Parsing/preprocessing and MCP connection behavior require repository-owner review.
+/app/ @koul777
+/scripts/ @koul777
 /app/parsers/ @koul777
 /app/processors/ @koul777
 /app/ingestion/ @koul777
@@ -14,11 +16,15 @@
 /tests/ @koul777
 /tests/fixtures/regression/ @koul777
 /scripts/check_preprocessing_change_guard.py @koul777
+/scripts/audit_public_release_readiness.py @koul777
+/scripts/audit_release_hygiene.py @koul777
+/scripts/create_public_orphan_snapshot.py @koul777
 /scripts/check_mcp_connection_readiness.py @koul777
 /scripts/generate_mcp_client_config.py @koul777
 /scripts/mcp_bundle_contract.py @koul777
 /scripts/run_mcp_client_config_smoke.py @koul777
 /scripts/run_mcp_transport_smoke.py @koul777
+/scripts/run_public_release_gate.py @koul777
 /scripts/run_regulation_mcp.py @koul777
 /.github/ @koul777
 /docs/preprocessing_change_governance_ko.md @koul777

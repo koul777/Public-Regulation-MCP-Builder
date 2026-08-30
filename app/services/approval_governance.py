@@ -22,6 +22,7 @@ def approval_review_completion_state(
     ai_decisions: dict[str, str],
     *,
     human_confirmed: bool,
+    action_required_resolved: bool = False,
 ) -> dict[str, Any]:
     """Return tab completion state without changing approval status."""
     unique_item_ids = [str(item_id) for item_id in dict.fromkeys(item_ids) if str(item_id).strip()]
@@ -34,12 +35,16 @@ def approval_review_completion_state(
     skipped = sum(1 for decision in normalized_decisions.values() if decision == AI_DECISION_SKIP)
     undecided = [item_id for item_id in unique_item_ids if item_id not in normalized_decisions]
     ai_confirmed = not undecided
+    actionable_resolution_complete = not reflected or bool(action_required_resolved)
     return {
         "item_ids": unique_item_ids,
         "ai_decisions": normalized_decisions,
         "ai_confirmed": ai_confirmed,
         "human_confirmed": bool(human_confirmed),
-        "approve_enabled": bool(ai_confirmed and human_confirmed),
+        "action_required_resolved": actionable_resolution_complete,
+        "approve_enabled": bool(
+            ai_confirmed and human_confirmed and actionable_resolution_complete
+        ),
         "total": len(unique_item_ids),
         "reflected": reflected,
         "skipped": skipped,
@@ -82,13 +87,21 @@ def build_approval_review_events(
     item_ids: list[str],
     ai_decisions: dict[str, str],
     human_confirmed: bool,
+    action_required_resolved: bool = False,
+    action_resolution_note: str | None = None,
+    action_text_changed: bool = False,
     table_source: str | None = None,
     kordoc_table_promoted: bool = False,
     approve_event: str | None = None,
     override_reason: str | None = None,
     timestamp: str | None = None,
 ) -> list[dict[str, Any]]:
-    state = approval_review_completion_state(item_ids, ai_decisions, human_confirmed=human_confirmed)
+    state = approval_review_completion_state(
+        item_ids,
+        ai_decisions,
+        human_confirmed=human_confirmed,
+        action_required_resolved=action_required_resolved,
+    )
     event_time = timestamp or utc_event_timestamp()
     source_of_truth = {
         "table_source": str(table_source or ""),
@@ -102,7 +115,13 @@ def build_approval_review_events(
                 "timestamp": event_time,
                 "actor": actor,
                 "chunk_id": chunk_id,
-                "ai_reflected": state["reflected"],
+                # ``reflect`` is a legacy decision code meaning that the
+                # operator judged the finding actionable. It does not prove
+                # the final text was edited.
+                "ai_action_required": state["reflected"],
+                "action_required_resolved": state["action_required_resolved"],
+                "action_resolution_note": str(action_resolution_note or "")[:1000],
+                "action_text_changed": bool(action_text_changed),
                 "ai_skipped": state["skipped"],
                 "ai_total": state["total"],
                 "ai_decisions": state["ai_decisions"],
@@ -139,7 +158,7 @@ def apply_ai_review_decisions_to_preview_text(
     review_items: list[dict[str, Any]],
     ai_decisions: dict[str, str],
 ) -> str:
-    """Apply reflected AI suggestions to a preview string without approving anything."""
+    """Append actionable AI suggestions as a review memo, never as final text."""
     reflected: list[str] = []
     for item in review_items:
         if not isinstance(item, dict):
@@ -153,7 +172,7 @@ def apply_ai_review_decisions_to_preview_text(
             reflected.append(f"- {title}: {suggestion}")
     if not reflected:
         return str(text or "")
-    return str(text or "").rstrip() + "\n\n[AI 제안 반영 미리보기]\n" + "\n".join(reflected)
+    return str(text or "").rstrip() + "\n\n[AI 제안 검토 메모]\n" + "\n".join(reflected)
 
 
 def sanitize_review_decision_events(events: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -170,7 +189,7 @@ def sanitize_review_decision_events(events: list[dict[str, Any]] | None) -> list
             "actor": str(raw.get("actor") or "")[:120],
             "chunk_id": str(raw.get("chunk_id") or "")[:160],
         }
-        for key in ("override_reason", "table_source"):
+        for key in ("override_reason", "table_source", "action_resolution_note"):
             if raw.get(key) is not None:
                 clean[key] = str(raw.get(key) or "")[:1000]
         if isinstance(raw.get("source_of_truth"), dict):
@@ -179,12 +198,17 @@ def sanitize_review_decision_events(events: list[dict[str, Any]] | None) -> list
                 "table_source": str(source.get("table_source") or "")[:120],
                 "kordoc_table_promoted": bool(source.get("kordoc_table_promoted")),
             }
-        for key in ("ai_reflected", "ai_skipped", "ai_total"):
+        # Preserve old persisted ``ai_reflected`` events while new events use
+        # the semantically accurate ``ai_action_required`` field.
+        for key in ("ai_action_required", "ai_reflected", "ai_skipped", "ai_total"):
             if raw.get(key) is not None:
                 try:
                     clean[key] = max(0, int(raw.get(key) or 0))
                 except (TypeError, ValueError):
                     clean[key] = 0
+        for key in ("action_required_resolved", "action_text_changed"):
+            if raw.get(key) is not None:
+                clean[key] = bool(raw.get(key))
         if isinstance(raw.get("ai_decisions"), dict):
             clean["ai_decisions"] = {
                 str(item_id)[:160]: str(decision)

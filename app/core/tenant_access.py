@@ -10,6 +10,11 @@ from typing import Any
 from app.core.config import Settings
 
 
+CANONICAL_TENANT_ID_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
+)
+
+
 def tenant_scoped_value_matches(resource_tenant_id: str | None, requester_tenant_id: str | None) -> bool:
     if resource_tenant_id in (None, ""):
         return False
@@ -24,6 +29,14 @@ def tenant_storage_key(tenant_id: str | None) -> str:
     raw = str(tenant_id or "default").strip() or "default"
     key = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")
     return key or "default"
+
+
+def tenant_directory_key(tenant_id: str | None) -> str:
+    """Return a collision-free tenant directory name or reject the identifier."""
+    raw = str(tenant_id or "default")
+    if raw != raw.strip() or not CANONICAL_TENANT_ID_PATTERN.fullmatch(raw):
+        raise ValueError("tenant_id must be a canonical lowercase tenant ID")
+    return raw
 
 
 def institution_storage_dirname(profile_id: str | None) -> str:
@@ -78,4 +91,7 @@ def institution_profile_id_from_storage_dir(directory: Path) -> str:
 def settings_for_tenant(settings: Settings, tenant_id: str | None) -> Settings:
     if not settings.tenant_storage_isolation:
         return settings
-    return replace(settings, data_dir=settings.data_dir / "tenants" / tenant_storage_key(tenant_id))
+    return replace(
+        settings,
+        data_dir=settings.data_dir / "tenants" / tenant_directory_key(tenant_id),
+    )

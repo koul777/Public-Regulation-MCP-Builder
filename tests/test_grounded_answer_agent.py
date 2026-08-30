@@ -41,6 +41,39 @@ class GroundedAnswerAgentTests(TestCase):
         self.assertEqual(result["evidence_ids"], ["chunk-1"])
         self.assertFalse(result["abstained"])
 
+    def test_answer_evidence_ids_exclude_retrieved_but_unused_chunks(self) -> None:
+        evidence = [
+            {
+                "document_id": "doc-leave",
+                "chunk_id": "chunk-leave",
+                "approval_status": "approved",
+                "approval_id": "approval-leave",
+                "regulation_title": "인사규정",
+                "article_no": "제30조",
+                "article_title": "휴직 기간",
+                "text": "제30조 육아휴직 기간은 2년 이내로 한다.",
+            },
+            {
+                "document_id": "doc-trip",
+                "chunk_id": "chunk-trip",
+                "approval_status": "approved",
+                "approval_id": "approval-trip",
+                "regulation_title": "여비규정",
+                "article_no": "제40조",
+                "article_title": "출장 여비",
+                "text": "출장 여비는 별도로 지급한다.",
+            },
+        ]
+
+        result = self._agent().run({"query": "육아휴직 기간", "evidence": evidence})
+
+        self.assertEqual(["chunk-leave"], result["evidence_ids"])
+        self.assertEqual(["chunk-leave"], result["supporting_evidence_ids"])
+        self.assertEqual(
+            ["chunk-leave", "chunk-trip"],
+            result["retrieved_evidence_ids"],
+        )
+
     def test_empty_evidence_abstains_without_calling_model(self) -> None:
         with patch("app.agents.grounded_answer_agent.generate_local_llm_answer") as generate:
             result = self._agent(rag_llm_backend="ollama").run(

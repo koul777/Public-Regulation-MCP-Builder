@@ -10,6 +10,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.check_installed_console_scripts import (
     APP_VERSION,
@@ -74,6 +75,21 @@ class CheckInstalledConsoleScriptsTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(0, report["issue_count"])
         self.assertTrue(report["checked"][0]["help_checked"])
+
+    def test_help_process_forces_utf8_output_on_windows_locales(self) -> None:
+        completed = subprocess.CompletedProcess(["reg-rag-test", "--help"], 0, "도움말", "")
+        with patch("scripts.check_installed_console_scripts.shutil.which", return_value="reg-rag-test"), patch(
+            "scripts.check_installed_console_scripts.subprocess.run",
+            return_value=completed,
+        ) as run_process:
+            report = check_installed_console_scripts(commands=["reg-rag-test"], run_help=True)
+
+        self.assertTrue(report["passed"])
+        kwargs = run_process.call_args.kwargs
+        self.assertEqual("utf-8", kwargs["encoding"])
+        self.assertEqual("replace", kwargs["errors"])
+        self.assertEqual("1", kwargs["env"]["PYTHONUTF8"])
+        self.assertEqual("utf-8", kwargs["env"]["PYTHONIOENCODING"])
 
     def test_cli_writes_json_and_returns_nonzero_when_requested(self) -> None:
         stdout = io.StringIO()

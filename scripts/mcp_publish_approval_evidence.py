@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Sequence
 
-from app.core.tenant_access import tenant_storage_key
+from app.core.tenant_access import tenant_directory_key
 from scripts.build_approval_review_batches import build_approval_review_batches
 from scripts.build_approval_worklist import build_approval_worklist
 
@@ -34,7 +34,7 @@ def build_publish_approval_evidence(
         raise ValueError("No chunk IDs were provided for approval evidence.")
 
     safe_prefix = _safe_artifact_stem(artifact_prefix)
-    tenant_key = tenant_storage_key(tenant_id)
+    tenant_key = tenant_directory_key(tenant_id)
     reports_dir = artifact_root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     worklist_relative = f"reports/{safe_prefix}_{tenant_key}_approval_worklist.json"

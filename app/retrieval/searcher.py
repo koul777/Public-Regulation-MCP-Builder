@@ -397,7 +397,7 @@ def _apply_query_boosts(
 ) -> list[tuple[float, dict[str, Any]]]:
     if not scored:
         return scored
-    compact_query = str(query or "").replace(" ", "")
+    compact_query = unicodedata.normalize("NFKC", str(query or "")).replace(" ", "")
     if structured_context is None:
         structured_context = _build_structured_query_context(query, scored)
     generic_appendix_form_query = (
@@ -460,7 +460,7 @@ def _promote_enumeration_definitions(
     scored: list[tuple[float, dict[str, Any]]],
     records: list[dict[str, Any]],
 ) -> tuple[list[tuple[float, dict[str, Any]]], dict[str, Any]]:
-    compact_query = str(query or "").replace(" ", "")
+    compact_query = unicodedata.normalize("NFKC", str(query or "")).replace(" ", "")
     if "종류" not in compact_query or not scored:
         return scored, {}
 
@@ -564,7 +564,9 @@ def _definition_record_for_term(term: str, records: list[dict[str, Any]]) -> dic
 
 
 def _literal_substring_search(query: str, records: list[dict[str, Any]]) -> list[tuple[float, dict[str, Any]]]:
-    normalized_query = " ".join(str(query or "").split()).lower()
+    normalized_query = " ".join(
+        unicodedata.normalize("NFKC", str(query or "")).split()
+    ).lower()
     compact_query = normalized_query.replace(" ", "")
     terms = [term for term in normalized_query.split() if len(term) >= 2]
     if not compact_query and not terms:
@@ -572,15 +574,18 @@ def _literal_substring_search(query: str, records: list[dict[str, Any]]) -> list
     scored: list[tuple[float, dict[str, Any]]] = []
     for record in records:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        blob = " ".join(
-            str(value or "")
-            for value in (
-                record.get("text"),
-                metadata.get("regulation_title"),
-                metadata.get("article_title"),
-                metadata.get("article_no"),
-                metadata.get("document_name"),
-            )
+        blob = unicodedata.normalize(
+            "NFKC",
+            " ".join(
+                str(value or "")
+                for value in (
+                    record.get("text"),
+                    metadata.get("regulation_title"),
+                    metadata.get("article_title"),
+                    metadata.get("article_no"),
+                    metadata.get("document_name"),
+                )
+            ),
         ).lower()
         compact_blob = blob.replace(" ", "")
         score = 0.0
@@ -600,17 +605,24 @@ def _record_query_boost(
     generic_appendix_form_query: bool | None = None,
     structured_context: _StructuredQueryContext | None = None,
 ) -> float:
-    compact = str(query or "").replace(" ", "") if compact_query is None else compact_query
+    compact = (
+        unicodedata.normalize("NFKC", str(query or "")).replace(" ", "")
+        if compact_query is None
+        else compact_query
+    )
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    blob = " ".join(
-        str(value or "")
-        for value in (
-            record.get("text"),
-            metadata.get("regulation_title"),
-            metadata.get("article_no"),
-            metadata.get("article_title"),
-            metadata.get("hierarchy_path"),
-        )
+    blob = unicodedata.normalize(
+        "NFKC",
+        " ".join(
+            str(value or "")
+            for value in (
+                record.get("text"),
+                metadata.get("regulation_title"),
+                metadata.get("article_no"),
+                metadata.get("article_title"),
+                metadata.get("hierarchy_path"),
+            )
+        ),
     )
     boost = _structured_query_boost(
         query,
@@ -768,7 +780,7 @@ def _build_structured_query_context(
     query: str,
     scored: list[tuple[float, dict[str, Any]]],
 ) -> _StructuredQueryContext:
-    normalized_query = unicodedata.normalize("NFC", str(query or "")).strip().lower()
+    normalized_query = unicodedata.normalize("NFKC", str(query or "")).strip().lower()
     compact_query = _compact_match_text(normalized_query)
     has_named_regulation = _NAMED_REGULATION_PATTERN.search(normalized_query) is not None
     has_locator_intent = _STRUCTURAL_LOCATOR_PATTERN.search(normalized_query) is not None
@@ -844,8 +856,8 @@ def _metadata_locator_match(
 ) -> bool:
     if not context.has_locator_intent:
         return False
-    for field in fields:
-        for value in _metadata_values(metadata.get(field)):
+    for field_name in fields:
+        for value in _metadata_values(metadata.get(field_name)):
             locator = _cached_compact_match_text(context, value)
             matched = context.locator_match_cache.get(locator)
             if matched is None:
@@ -861,8 +873,8 @@ def _metadata_text_match(
     fields: tuple[str, ...],
     context: _StructuredQueryContext,
 ) -> bool:
-    for field in fields:
-        for value in _metadata_values(metadata.get(field)):
+    for field_name in fields:
+        for value in _metadata_values(metadata.get(field_name)):
             compact_value = _cached_compact_match_text(context, value)
             if len(compact_value) >= 3 and compact_value in context.compact_query:
                 return True
@@ -882,7 +894,7 @@ def _cached_compact_match_text(
 
 
 def _compact_match_text(value: Any) -> str:
-    normalized = unicodedata.normalize("NFC", str(value or ""))
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
     return re.sub(r"[^0-9A-Za-z\uac00-\ud7a3]+", "", normalized).lower()
 
 
@@ -898,7 +910,7 @@ def _query_named_title_spans(
         return []
     separator = r"[^0-9A-Za-z\uac00-\ud7a3]*"
     title_pattern = separator.join(re.escape(character) for character in compact_title)
-    normalized_query = unicodedata.normalize("NFC", str(query or "")).lower()
+    normalized_query = unicodedata.normalize("NFKC", str(query or "")).lower()
     return [
         match.span()
         for match in re.finditer(
@@ -947,13 +959,13 @@ def _is_attachment_chunk(metadata: dict[str, Any]) -> bool:
     if chunk_type in {"appendix", "form"}:
         return True
     return chunk_type == "table" and any(
-        metadata.get(field)
-        for field in ("table_appendix_no", "appendix_refs", "form_refs")
+        metadata.get(field_name)
+        for field_name in ("table_appendix_no", "appendix_refs", "form_refs")
     )
 
 
 def _unnumbered_attachment_markers(query: str) -> frozenset[str]:
-    normalized_query = unicodedata.normalize("NFC", str(query or ""))
+    normalized_query = unicodedata.normalize("NFKC", str(query or ""))
     residual_query = _NUMBERED_APPENDIX_FORM_PATTERN.sub(" ", normalized_query)
     return frozenset(
         match.group("marker")
@@ -971,8 +983,8 @@ def _attachment_markers_match(
         candidate_markers.add("\ubcc4\ud45c")
     elif chunk_type == "form":
         candidate_markers.update(("\ubcc4\uc9c0", "\uc11c\uc2dd"))
-    for field in ("table_appendix_no", "appendix_refs", "form_refs"):
-        for value in _metadata_values(metadata.get(field)):
+    for field_name in ("table_appendix_no", "appendix_refs", "form_refs"):
+        for value in _metadata_values(metadata.get(field_name)):
             compact_value = _compact_match_text(value)
             candidate_markers.update(
                 marker
@@ -988,68 +1000,42 @@ def _expand_regulation_query(
     has_named_candidate: bool = False,
 ) -> str:
     normalized = str(query or "").strip()
-    compact = normalized.replace(" ", "")
+    normalized_for_matching = unicodedata.normalize("NFKC", normalized)
+    compact = normalized_for_matching.replace(" ", "")
     additions: list[str] = []
     if "육아휴직" in compact and any(term in compact for term in ("얼마나", "기간", "신청", "최대", "수당", "요건", "대상", "조건")):
-        additions.append(
-            "제29조 휴직 제29조 제3항 만 8세 이하 초등학교 2학년 이하 자녀 양육 임신 출산 "
-            "특별한 사정이 없는 한 휴직을 명하여야 한다 제30조 휴직 기간 제29조 제3항 자녀 1명 3년 이내 "
-            "시간선택제 교직원보수규정 제33조 육아휴직수당 30일 이상 기본연봉월액 78퍼센트 62.4퍼센트 "
-            "250만원 200만원 160만원 지급기간 1년 18개월"
-        )
+        additions.append("육아휴직 휴직 신청 요건 대상 기간 복직 수당")
     if _is_leave_foreign_travel_report_query(compact):
-        additions.append(
-            "제29조의3 휴직자의 복무실태 점검 별지 제16호서식 "
-            "휴직자 국외 출국 신고서 출국 7일 전 14일 이하 영유아 신고 생략"
-        )
+        additions.append("휴직자 복무실태 국외 출국 신고 신고서 제출 기한")
     general_leave_query = "휴직" in compact and any(
         term in compact for term in ("종류", "절차", "사유", "운영", "신청", "복직")
     )
     if general_leave_query:
-        additions.append(
-            "제29조 제29조 제29조 휴직 휴직 사유 본인의 의사에 불구하고 휴직을 명하여야 한다 "
-            "교직원이 다음 각 호 어느 하나 해당 휴직을 원하는 경우 인사위원회 심의 휴직을 명할 수 있다 "
-            "제30조 휴직 기간 제31조 휴직의 운영 복직 신고"
-        )
+        additions.append("휴직 사유 종류 기간 절차 신청 운영 복직 신고")
     performance_pay_exclusion_query = "성과연봉" in compact and any(
         term in compact
         for term in ("제외", "제한", "지급대상", "대상제외", "못받", "미지급", "지급하지", "중징계", "징계")
     )
     if performance_pay_exclusion_query:
-        additions.append(
-            "제27조의2 성과연봉 지급대상 제외 평가대상 기간 중 중징계 처분 징계 사유 시효 5년 비위 "
-            "성폭력 성매매 성희롱 음주운전 음주측정 불응 지급 대상에서 제외"
-        )
+        additions.append("성과연봉 지급 대상 제외 제한 미지급 징계")
     if "성과연봉" in compact and not performance_pay_exclusion_query and any(
         term in compact for term in ("언제", "시기", "지급", "방법")
     ):
-        additions.append("제24조 성과연봉 지급 방법 지급시기 6월 12월 일시금 이등분")
+        additions.append("성과연봉 지급 방법 지급 시기")
     faculty_hiring_query = (
         ("전임" in compact and "교원" in compact and any(term in compact for term in ("채용", "임용", "절차")))
         or ("교원" in compact and "임용" in compact and "절차" in compact)
     )
     if faculty_hiring_query:
-        additions.append(
-            "전임 교원 교수 부교수 조교수 교원 임용 세칙 초빙교수 객원교수를 제외한 교원의 임용 "
-            "제7조 신규임용의 시기 제8조 신규임용 후보자 심사 "
-            "지원 마감일 전까지 15일 이상 공고 단계별 심사 기초심사 연구실적심사 "
-            "공개발표심사 면접심사"
-        )
+        additions.append("전임 교원 채용 신규 임용 절차 공고 심사")
     if "교원인사위원회" in compact and "심의" in compact:
-        additions.append(
-            "인사규정 제8조 위원회 기능 교원 인사위원회 교원의 신규 채용 재계약 승진 "
-            "정년보장 강임 면직 징계 심의"
-        )
+        additions.append("교원 인사위원회 기능 심의 대상 신규 채용 재계약 승진 징계")
     if (
         _is_appendix_form_query(compact)
         and not has_named_candidate
-        and _is_generic_appendix_form_query(normalized)
+        and _is_generic_appendix_form_query(normalized_for_matching)
     ):
-        additions.append(
-            "원규관리규정 제18조 별표와 별지 서식 내용이 길거나 복잡한 표 그림 계산식 "
-            "분량이 많거나 이해하기 어려운 사항 별표로 구분 별지 서식 일정한 형식 "
-            "본칙에 부수되는 별표 별지 서식 작성방식 일부개정 전부개정"
-        )
+        additions.append("별표 별지 서식 첨부 작성 방식 근거")
     if not additions:
         return normalized
     return " ".join([normalized, *additions])
@@ -1064,7 +1050,7 @@ def _is_leave_foreign_travel_report_query(compact_query: str) -> bool:
 
 
 def _is_generic_appendix_form_query(query: str) -> bool:
-    normalized_query = unicodedata.normalize("NFC", str(query or ""))
+    normalized_query = unicodedata.normalize("NFKC", str(query or ""))
     if _NUMBERED_APPENDIX_FORM_PATTERN.search(normalized_query):
         return False
     if _NAMED_REGULATION_PATTERN.search(normalized_query):

@@ -37,6 +37,12 @@ jobs:
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
 
+      - name: Audit public source hygiene
+        run: python scripts/audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan
+
+      - name: Run public release gate
+        run: python scripts/run_public_release_gate.py --root . --include-untracked --fail-on-blocked
+
       - name: Determine and write the release version
         id: version
         shell: bash

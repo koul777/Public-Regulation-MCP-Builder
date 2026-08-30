@@ -71,6 +71,54 @@ class PreprocessingChangeGuardTests(unittest.TestCase):
         self.assertEqual(["tests/test_hwpx_parser.py"], report["focused_tests"])
         self.assertTrue(report["review_label_present"])
 
+    def test_unrelated_focused_test_cannot_satisfy_parser_change(self) -> None:
+        report = evaluate_guard(
+            [
+                {"path": "app/parsers/hwpx_parser.py", "status": "modified"},
+                {"path": "tests/test_api_security.py", "status": "modified"},
+            ],
+            pr_body=completed_body(),
+            labels=["preprocessing-reviewed"],
+        )
+
+        self.assertFalse(report["passed"])
+        failure = next(
+            item
+            for item in report["failures"]
+            if item["code"] == "missing-mapped-regression-test"
+        )
+        self.assertEqual(["app/parsers/hwpx_parser.py"], failure["files"])
+        self.assertEqual(
+            [],
+            report["mapped_tests_by_protected_file"]["app/parsers/hwpx_parser.py"],
+        )
+
+    def test_each_protected_component_requires_its_own_mapped_test(self) -> None:
+        report = evaluate_guard(
+            [
+                {"path": "app/parsers/hwpx_parser.py", "status": "modified"},
+                {"path": "app/core/security.py", "status": "modified"},
+                {"path": "tests/test_hwpx_parser.py", "status": "modified"},
+            ],
+            pr_body=completed_body(),
+            labels=["preprocessing-reviewed"],
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(["app/core/security.py"], report["unmatched_protected_files"])
+
+        complete = evaluate_guard(
+            [
+                {"path": "app/parsers/hwpx_parser.py", "status": "modified"},
+                {"path": "app/core/security.py", "status": "modified"},
+                {"path": "tests/test_hwpx_parser.py", "status": "modified"},
+                {"path": "tests/test_api_security.py", "status": "modified"},
+            ],
+            pr_body=completed_body(),
+            labels=["preprocessing-reviewed"],
+        )
+        self.assertTrue(complete["passed"])
+
     def test_mcp_bundle_change_requires_focused_mcp_test_and_review_contract(self) -> None:
         unreviewed = evaluate_guard(
             [{"path": "scripts/generate_mcp_client_config.py", "status": "modified"}],
@@ -134,6 +182,75 @@ class PreprocessingChangeGuardTests(unittest.TestCase):
                 )
                 self.assertTrue(reviewed["passed"])
                 self.assertEqual([test_path], reviewed["focused_tests"])
+
+    def test_approval_tenant_and_runtime_security_boundaries_are_protected(self) -> None:
+        cases = (
+            ("app/api/routes_documents.py", "tests/test_routes_documents.py"),
+            ("app/api/routes_rag.py", "tests/test_routes_rag.py"),
+            ("app/core/security.py", "tests/test_api_security.py"),
+            ("app/core/tenant_access.py", "tests/test_tenant_access.py"),
+            ("app/storage/repository.py", "tests/test_repository.py"),
+            ("app/services/approval_validation.py", "tests/test_approval_validation.py"),
+            ("app/services/regulation_rag_runtime.py", "tests/test_regulation_mcp_tools.py"),
+            ("app/agents/execution_guard.py", "tests/test_agent_execution_guard.py"),
+        )
+        for logic_path, test_path in cases:
+            with self.subTest(logic_path=logic_path):
+                unreviewed = evaluate_guard(
+                    [{"path": logic_path, "status": "modified"}],
+                    pr_body="",
+                    labels=[],
+                )
+                self.assertFalse(unreviewed["passed"])
+                self.assertTrue(unreviewed["protected_change"])
+                self.assertIn(logic_path, unreviewed["logic_files"])
+
+                reviewed = evaluate_guard(
+                    [
+                        {"path": logic_path, "status": "modified"},
+                        {"path": test_path, "status": "modified"},
+                    ],
+                    pr_body=completed_body(),
+                    labels=["preprocessing-reviewed"],
+                )
+                self.assertTrue(reviewed["passed"])
+                self.assertEqual([test_path], reviewed["focused_tests"])
+
+    def test_public_release_boundary_changes_require_guard_review(self) -> None:
+        for path in (
+            ".github/workflows/auto-release.yml",
+            "scripts/audit_release_hygiene.py",
+            "scripts/audit_public_release_readiness.py",
+            "scripts/run_public_release_gate.py",
+            "scripts/create_public_orphan_snapshot.py",
+        ):
+            with self.subTest(path=path):
+                report = evaluate_guard(
+                    [{"path": path, "status": "modified"}],
+                    pr_body="",
+                    labels=[],
+                )
+                self.assertFalse(report["passed"])
+                self.assertTrue(report["protected_change"])
+
+    def test_tenant_runtime_scripts_require_focused_review_contract(self) -> None:
+        for protected_path, focused_test in (
+            ("scripts/apply_reapproval_plan_shadow.py", "tests/test_apply_reapproval_plan_shadow.py"),
+            ("scripts/build_rag_security_evidence.py", "tests/test_build_rag_security_evidence.py"),
+            ("scripts/run_mcp_smoke.py", "tests/test_run_mcp_smoke.py"),
+        ):
+            with self.subTest(protected_path=protected_path):
+                report = evaluate_guard(
+                    [
+                        {"path": protected_path, "status": "modified"},
+                        {"path": focused_test, "status": "modified"},
+                    ],
+                    pr_body=completed_body(),
+                    labels=["preprocessing-reviewed"],
+                )
+                self.assertIn(protected_path, report["logic_files"])
+                self.assertEqual([focused_test], report["focused_tests"])
+                self.assertTrue(report["passed"])
 
     def test_deleted_test_does_not_count_as_regression_evidence(self) -> None:
         report = evaluate_guard(

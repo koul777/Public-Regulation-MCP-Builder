@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import Settings
-from app.core.tenant_access import settings_for_tenant, tenant_storage_key
+from app.core.tenant_access import settings_for_tenant, tenant_directory_key
 from app.ingestion.vector_adapter import ALLOWED_SECURITY_LEVELS, stable_vector_id
 from app.processors.chunker import CHUNKER_VERSION
 from app.services.review_workflow_service import review_content_hash
@@ -423,7 +423,7 @@ def _tenant_storage_isolation(data_dir: Path, tenant_storage_isolation: bool | N
 
 
 def _load_vector_records(effective_dir: Path, *, tenant_id: str) -> list[dict[str, Any]]:
-    vector_path = effective_dir / "vector_db" / tenant_storage_key(tenant_id) / "approved_vectors.jsonl"
+    vector_path = effective_dir / "vector_db" / tenant_directory_key(tenant_id) / "approved_vectors.jsonl"
     if not vector_path.is_file():
         return []
     rows: list[dict[str, Any]] = []

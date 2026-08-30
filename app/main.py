@@ -7,6 +7,11 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app import __version__
+from app.api.authoring_request_guard import (
+    install_authoring_request_handlers,
+    make_authoring_body_limit_observer,
+)
+from app.api.routes_authoring import router as authoring_router
 from app.api.routes_documents import router as documents_router
 from app.api.routes_institutions import router as institutions_router
 from app.api.routes_exports import router as exports_router
@@ -35,7 +40,10 @@ app = FastAPI(title="PR MCP Builder", version=__version__)
 app.add_middleware(
     JsonRequestBodyLimitMiddleware,
     max_body_bytes=Settings().max_json_request_body_mb * 1024 * 1024,
+    rejection_observer=make_authoring_body_limit_observer(),
 )
+install_authoring_request_handlers(app)
+app.include_router(authoring_router)
 app.include_router(documents_router)
 app.include_router(institutions_router)
 app.include_router(jobs_router)
@@ -93,6 +101,18 @@ def readiness_checks(settings: Settings) -> list[dict[str, object]]:
     ]
     if settings.api_audit_enabled:
         checks.append(_writeable_directory_check("api_audit_dir_writeable", api_audit_path(settings).parent))
+    if settings.enable_regulation_authoring:
+        authoring_root = (
+            settings.data_dir / "tenants"
+            if settings.tenant_storage_isolation
+            else settings.authoring_dir
+        )
+        checks.append(
+            _writeable_directory_check(
+                "authoring_storage_writeable_when_enabled",
+                authoring_root,
+            )
+        )
     return checks
 
 

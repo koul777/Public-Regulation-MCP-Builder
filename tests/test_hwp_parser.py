@@ -189,6 +189,17 @@ class HwpParserTests(unittest.TestCase):
 
         self.assertEqual(parser._clean_text("捤獥 汤捯 湰灧 공공기관 지침"), "공공기관 지침")
 
+    def test_preserves_legal_hanja_prefix_before_korean_text(self) -> None:
+        parser = HwpParser()
+
+        self.assertEqual(parser._clean_text("施行 規則 개정"), "施行 規則 개정")
+        self.assertEqual(parser._clean_text("職務 遂行 중 발생한"), "職務 遂行 중 발생한")
+
+    def test_strips_unregistered_ascii_packed_hwp_mojibake_prefix(self) -> None:
+        parser = HwpParser()
+
+        self.assertEqual(parser._clean_text("晦潬 敭湵 공공기관 지침"), "공공기관 지침")
+
     def test_strips_standalone_hwp_mojibake_lines_when_other_text_exists(self) -> None:
         parser = HwpParser()
 
@@ -228,6 +239,76 @@ class HwpParserTests(unittest.TestCase):
         self.assertEqual(parsed.pages[0].blocks[0].metadata["hwp_extraction_mode"], HWPML_EXTRACTION_MODE)
         self.assertEqual([block.text for block in parsed.pages[0].blocks], ["Sample Regulation", "Article 1 Purpose"])
 
+    def test_parses_utf16_hwpml_without_replacement_characters(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-16"?>
+<HWPML Version="2.1">
+  <HEAD><DOCSUMMARY><TITLE>합성 복무규정</TITLE></DOCSUMMARY></HEAD>
+  <BODY><P><TEXT><CHAR>제1조 목적과 적용 범위</CHAR></TEXT></P></BODY>
+</HWPML>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "utf16-hwpml.hwp"
+            path.write_bytes(xml.encode("utf-16"))
+
+            parsed = HwpParser().parse(path, "doc_utf16_hwpml")
+
+        self.assertEqual("합성 복무규정", parsed.document_name)
+        self.assertIn("제1조 목적과 적용 범위", parsed.raw_text)
+        self.assertNotIn("\ufffd", parsed.raw_text)
+
+    def test_parses_utf32_hwpml_without_replacement_characters(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-32"?>
+<HWPML Version="2.1">
+  <HEAD><DOCSUMMARY><TITLE>합성 복무규정</TITLE></DOCSUMMARY></HEAD>
+  <BODY><P><TEXT><CHAR>제2조 휴가 신청 절차</CHAR></TEXT></P></BODY>
+</HWPML>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "utf32-hwpml.hwp"
+            path.write_bytes(xml.encode("utf-32"))
+
+            parsed = HwpParser().parse(path, "doc_utf32_hwpml")
+
+        self.assertEqual("합성 복무규정", parsed.document_name)
+        self.assertIn("제2조 휴가 신청 절차", parsed.raw_text)
+        self.assertNotIn("\ufffd", parsed.raw_text)
+
+    def test_parses_explicit_big_endian_hwpml_without_replacement_characters(self) -> None:
+        template = """<?xml version="1.0" encoding="{declaration}"?>
+<HWPML Version="2.1">
+  <HEAD><DOCSUMMARY><TITLE>합성 복무규정</TITLE></DOCSUMMARY></HEAD>
+  <BODY><P><TEXT><CHAR>{article}</CHAR></TEXT></P></BODY>
+</HWPML>
+"""
+        for encoding, declaration, article in (
+            ("utf-16-be", "UTF-16-BE", "제3조 출장 절차"),
+            ("utf-32-be", "UTF-32-BE", "제4조 휴가 절차"),
+        ):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"{encoding}-hwpml.hwp"
+                path.write_bytes(
+                    template.format(declaration=declaration, article=article).encode(encoding)
+                )
+
+                parsed = HwpParser().parse(path, f"doc_{encoding}_hwpml")
+
+                self.assertEqual("합성 복무규정", parsed.document_name)
+                self.assertIn(article, parsed.raw_text)
+                self.assertNotIn("\ufffd", parsed.raw_text)
+
+    def test_rejects_truncated_utf32_hwpml_without_replacement_decode(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-32"?>'
+            '<HWPML><BODY><P><TEXT><CHAR>제1조 목적</CHAR></TEXT></P></BODY></HWPML>'
+        )
+        payload = xml.encode("utf-32")[:-1]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "truncated-utf32-hwpml.hwp"
+            path.write_bytes(payload)
+
+            with self.assertRaisesRegex(ParserError, "not valid XML"):
+                HwpParser().parse(path, "doc_truncated_utf32_hwpml")
+
     def test_rejects_hwpml_dtd_and_entity_declarations(self) -> None:
         xml = """<?xml version=\"1.0\"?>
 <!DOCTYPE HWPML [<!ENTITY injected \"blocked\">]>
@@ -239,6 +320,54 @@ class HwpParserTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
                 HwpParser().parse(path, "doc_unsafe_hwpml")
+
+    def test_rejects_utf16_hwpml_dtd_and_entity_declarations(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-16"?>
+<!DOCTYPE HWPML [<!ENTITY injected "blocked">]>
+<HWPML><BODY><P><TEXT><CHAR>&injected;</CHAR></TEXT></P></BODY></HWPML>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unsafe-utf16.hwp"
+            path.write_bytes(xml.encode("utf-16"))
+
+            with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
+                HwpParser().parse(path, "doc_unsafe_utf16_hwpml")
+
+    def test_rejects_utf32_hwpml_dtd_and_entity_declarations(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-32"?>
+<!DOCTYPE HWPML [<!ENTITY injected "blocked">]>
+<HWPML><BODY><P><TEXT><CHAR>&injected;</CHAR></TEXT></P></BODY></HWPML>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unsafe-utf32.hwp"
+            path.write_bytes(xml.encode("utf-32"))
+
+            with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
+                HwpParser().parse(path, "doc_unsafe_utf32_hwpml")
+
+    def test_rejects_utf16_big_endian_hwpml_dtd_and_entity_declarations(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-16-BE"?>
+<!DOCTYPE HWPML [<!ENTITY injected "blocked">]>
+<HWPML><BODY><P><TEXT><CHAR>&injected;</CHAR></TEXT></P></BODY></HWPML>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unsafe-utf16-be.hwp"
+            path.write_bytes(xml.encode("utf-16-be"))
+
+            with self.assertRaisesRegex(ParserError, "DTD and entity declarations"):
+                HwpParser().parse(path, "doc_unsafe_utf16_be_hwpml")
+
+    def test_rejects_unknown_hwpml_declared_encoding(self) -> None:
+        payload = (
+            b'<?xml version="1.0" encoding="x-unknown"?>'
+            b'<HWPML><BODY><P><TEXT><CHAR>body</CHAR></TEXT></P></BODY></HWPML>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unknown-encoding.hwp"
+            path.write_bytes(payload)
+
+            with self.assertRaisesRegex(ParserError, "not valid XML"):
+                HwpParser().parse(path, "doc_unknown_hwpml_encoding")
 
     def test_rejects_hwpml_payload_past_document_limit(self) -> None:
         xml = '<?xml version="1.0"?><HWPML><BODY><P><TEXT><CHAR>oversized</CHAR></TEXT></P></BODY></HWPML>'

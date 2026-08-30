@@ -18,7 +18,9 @@ from app.retrieval.tokenizer import (
 )
 
 
-BM25_INDEX_VERSION = "reg-rag-bm25-index-v2"
+# v3 records NFKC tokenization semantics. Loading an older NFC-built index as
+# current would make compatibility-width characters query-asymmetric.
+BM25_INDEX_VERSION = "reg-rag-bm25-index-v3"
 BM25_RETRIEVAL_MODEL = "kiwi-bm25-v1"
 DEFAULT_BM25_FILENAME = "bm25_index.json"
 BM25_STRUCTURED_METADATA_VERSION = 3
