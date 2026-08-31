@@ -50,7 +50,7 @@ from app.api.routes_documents import (
 )
 from app.core.api_audit import redact_sensitive_paths
 from app.core.config import Settings, get_settings, set_runtime_settings_overrides
-from app.core.pipeline import kordoc_table_command_status
+from app.core.pipeline import kordoc_table_command_status, processing_options_payload
 from app.agents.role_registry import workflow_roles
 from app.agents.provider_config import (
     SUPPORTED_AGENT_REVIEW_PROVIDERS,
@@ -167,12 +167,12 @@ UNREVIEWED_PREVIEW_WARNING = (
     "UNREVIEWED_POC_REVIEW (legacy UNREVIEWED_PREVIEW) is an isolated PoC Review mode "
     "for quick parsing, search, quality, and connection UX checks only. "
     "It must not write to official approved vectors, release evidence, or deployment handoff outputs. "
-    "Official RAG/MCP remains blocked until human review, approval, index/reindex, "
+    "Official RAG/MCP remains blocked until explicit operator approval, index/reindex, "
     "and MCP visibility audit are complete."
 )
 UNREVIEWED_PREVIEW_WARNING_KO = (
     "지금은 '미검수 미리보기' 모드입니다. 이 상태의 결과는 참고용일 뿐이며, "
-    "사람 검수와 승인을 마치기 전에는 공식 AI 답변 근거로 사용할 수 없습니다."
+    "운영자가 명시적으로 승인하고 색인하기 전에는 공식 AI 답변 근거로 사용할 수 없습니다."
 )
 
 GOLDSET_STRUCTURE_LABELS = {
@@ -310,7 +310,7 @@ BEGINNER_GUIDE_STEPS: tuple[tuple[str, str, str], ...] = (
     (
         NAV_APPROVAL,
         "검수·승인·색인하기",
-        "사람이 원문을 확인한 내용만 승인하고 AI 검색에 등록합니다.",
+        "사람 검수 권고를 확인한 뒤 최종 버튼으로 승인하고 AI 검색에 등록합니다.",
     ),
     (
         NAV_MCP,
@@ -506,7 +506,7 @@ def _ai_review_setup_blocker(settings_snapshot) -> str:
     return (
         f"{detail} 이대로 전처리하면 AI는 아무것도 보지 않고 넘어갑니다. "
         + where
-        + " 지금 그대로 진행해도 파서 전처리본과 사람 검수만으로 승인·색인할 수 있습니다."
+        + " 지금 그대로 진행해도 파서 전처리본을 운영자가 명시적으로 승인·색인할 수 있습니다."
     )
 
 
@@ -1347,6 +1347,8 @@ WORKFLOW_DOCUMENT_IDS_KEY = "workflow_document_ids"
 WORKFLOW_SELECTED_DOCUMENT_IDS_KEY = "workflow_selected_document_ids"
 WORKFLOW_MCP_GATE_CACHE_KEY = "workflow_mcp_gate_cache"
 DOCUMENT_CONTEXT_CACHE_KEY = "document_context_cache"
+PENDING_UPLOAD_CACHE_KEY = "pending_upload_file_cache_v1"
+PENDING_UPLOAD_CACHE_MAX_ENTRIES = 128
 # 규정 이름을 올린 파일 이름에서 가져올지, 본문에서 찾은 제목에서 가져올지.
 PREPROCESS_DOCUMENT_NAME_MODE_KEY = "preprocess-document-name-mode"
 SELECTED_APPROVAL_CONTEXT_CACHE_KEY = "selected_approval_context_cache"
@@ -2525,7 +2527,7 @@ _AGENT_TRACE_NEXT_ACTIONS = {
     "completed": "이 역할의 결과를 다음 단계가 이어서 사용합니다.",
     "skipped": "현재 설정에서는 사용하지 않아 건너뛰었습니다.",
     "degraded": "모델 대신 안전한 대체 경로로 이어서 처리했습니다.",
-    "review_required": "사람이 결과를 확인해야 다음 단계로 갈 수 있습니다.",
+    "review_required": "사람이 결과를 확인하도록 권고하는 상태입니다. 최종 승인 단계는 계속 진행할 수 있습니다.",
     "blocked": "안전 조건을 만족하지 못해 멈췄습니다. 입력과 안내 사유를 확인하세요.",
     "failed": "처리에 실패했습니다. 사유를 확인한 뒤 다시 실행하세요.",
     "verified": "검증이 끝났습니다. 검증된 결과를 다음 화면에서 사용할 수 있습니다.",
@@ -3908,7 +3910,90 @@ def _pending_upload_display_name(path: Path) -> str:
     return path.name.split(marker, 1)[1] if marker in path.name else path.name
 
 
-def _persist_pending_upload(profile_id: str, uploaded_file: object) -> Path:
+def _pending_upload_cache_identity(profile_id: str, uploaded_file: object) -> str | None:
+    """Return a stable, non-sensitive identity for a Streamlit upload instance."""
+
+    file_id = str(getattr(uploaded_file, "file_id", "") or "").strip()
+    if not file_id:
+        return None
+    filename = Path(str(getattr(uploaded_file, "name", "pending_upload"))).name or "pending_upload"
+    raw = json.dumps(
+        [str(profile_id or "").strip(), file_id, filename, _uploaded_file_size(uploaded_file)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cached_pending_upload_path(
+    profile_id: str,
+    uploaded_file: object,
+    cache: dict[str, object],
+) -> Path | None:
+    cache_identity = _pending_upload_cache_identity(profile_id, uploaded_file)
+    if not cache_identity:
+        return None
+    record = cache.get(cache_identity)
+    if not isinstance(record, dict):
+        return None
+    filename = Path(str(getattr(uploaded_file, "name", "pending_upload"))).name or "pending_upload"
+    try:
+        path = Path(str(record.get("path") or ""))
+        stat = path.stat()
+        expected_directory = _pending_upload_dir(profile_id).resolve()
+        if path.resolve().parent != expected_directory:
+            return None
+        digest_prefix, marker, stored_filename = path.name.partition("__")
+        if (
+            marker != "__"
+            or stored_filename != filename
+            or len(digest_prefix) != 64
+            or any(character not in "0123456789abcdef" for character in digest_prefix)
+        ):
+            return None
+        if stat.st_size != int(record.get("size") or -1):
+            return None
+        if stat.st_size != _uploaded_file_size(uploaded_file):
+            return None
+        if stat.st_mtime_ns != int(record.get("mtime_ns") or -1):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    return path
+
+
+def _remember_pending_upload_path(
+    profile_id: str,
+    uploaded_file: object,
+    path: Path,
+    cache: dict[str, object],
+) -> None:
+    cache_identity = _pending_upload_cache_identity(profile_id, uploaded_file)
+    if not cache_identity:
+        return
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    cache[cache_identity] = {
+        "path": str(path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    while len(cache) > PENDING_UPLOAD_CACHE_MAX_ENTRIES:
+        cache.pop(next(iter(cache)), None)
+
+
+def _persist_pending_upload(
+    profile_id: str,
+    uploaded_file: object,
+    *,
+    cache: dict[str, object] | None = None,
+) -> Path:
+    if cache is not None:
+        cached_path = _cached_pending_upload_path(profile_id, uploaded_file, cache)
+        if cached_path is not None:
+            return cached_path
     directory = _pending_upload_dir(profile_id)
     filename = Path(str(getattr(uploaded_file, "name", "pending_upload"))).name or "pending_upload"
     source = uploaded_file
@@ -3932,10 +4017,60 @@ def _persist_pending_upload(profile_id: str, uploaded_file: object) -> Path:
             temporary.unlink(missing_ok=True)
         else:
             temporary.replace(target)
+        if cache is not None:
+            _remember_pending_upload_path(profile_id, uploaded_file, target, cache)
         return target
     finally:
         seek(0)
         temporary.unlink(missing_ok=True)
+
+
+def _find_reusable_preprocessing_run(
+    target_repository: JsonRepository,
+    pending_path: Path | None,
+    *,
+    processing_options: dict[str, object],
+    upload_metadata: dict[str, object],
+    tenant_id: str,
+):
+    """Find an exact reusable UI result without changing explicit lifecycle intent."""
+
+    if pending_path is None or not pending_path.is_file():
+        return None
+    explicit_lifecycle_fields = (
+        "regulation_id",
+        "regulation_version",
+        "revision_date",
+        "effective_from",
+        "effective_to",
+        "repealed_at",
+        "supersedes_document_id",
+    )
+    if any(str(upload_metadata.get(field) or "").strip() for field in explicit_lifecycle_fields):
+        return None
+    regulation_status = str(upload_metadata.get("regulation_status") or "draft").strip().casefold()
+    if regulation_status not in {"", "draft"}:
+        return None
+    reusable = target_repository.find_reusable_run(
+        file_hash=_sha256_file(pending_path),
+        options=processing_options,
+        tenant_id=tenant_id,
+        source_system=str(upload_metadata.get("source_system") or "") or None,
+        source_record_id=str(upload_metadata.get("source_record_id") or "") or None,
+        source_file_id=str(upload_metadata.get("source_file_id") or "") or None,
+        profile_id=str(upload_metadata.get("profile_id") or "") or None,
+        document_name=str(upload_metadata.get("document_name") or "") or None,
+        institution_name=str(upload_metadata.get("institution_name") or "") or None,
+        source_url=str(upload_metadata.get("source_url") or "") or None,
+        source_disclosure_date=str(upload_metadata.get("source_disclosure_date") or "") or None,
+        source_posted_date=str(upload_metadata.get("source_posted_date") or "") or None,
+    )
+    if reusable is None:
+        return None
+    document, _run = reusable
+    if str(getattr(document, "tenant_id", "") or "").strip() != str(tenant_id or "").strip():
+        return None
+    return reusable
 
 
 def _format_upload_mb(num_bytes: int) -> str:
@@ -6221,7 +6356,40 @@ def _approval_pending_entries(ctx: dict) -> list[dict[str, object]]:
     ]
 
 
-def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str = "internal") -> dict[str, object]:
+def _approval_entries_complete(entries: list[dict[str, object]]) -> bool:
+    """Return whether every pending entry carries explicit AI and human sign-off."""
+
+    return bool(entries) and all(
+        bool(dict(entry["state"]).get("approve_enabled"))
+        for entry in entries
+    )
+
+
+def _approval_override_reason_for_entries(
+    entries: list[dict[str, object]],
+    *,
+    explicit_reason: str = "",
+) -> str:
+    """Keep one-click approval honest when explicit review is incomplete.
+
+    The UI never fabricates human-review completion. A non-empty override reason
+    is attached only when at least one pending entry lacks explicit sign-off, so
+    the approval journal records ``approved_without_review`` while the normal
+    security scan, evidence, tenant, and indexing gates remain in force.
+    """
+
+    if not entries or _approval_entries_complete(entries):
+        return ""
+    normalized_reason = str(explicit_reason or "").strip()
+    return normalized_reason or DEFAULT_UNREVIEWED_OVERRIDE_REASON
+
+
+def _prepare_reviewed_document_approval_plan(
+    ctx: dict,
+    *,
+    security_level: str = "internal",
+    approval_override_reason: str = "",
+) -> dict[str, object]:
     """Build one regulation's approval requests while preserving its own evidence and hierarchy."""
     document_id = str(ctx["document_id"])
     chunks = list(ctx["chunks"])
@@ -6229,7 +6397,11 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
     incomplete_entries = [
         entry for entry in pending_entries if not bool(dict(entry["state"]).get("approve_enabled"))
     ]
-    if incomplete_entries:
+    effective_override_reason = _approval_override_reason_for_entries(
+        pending_entries,
+        explicit_reason=approval_override_reason,
+    )
+    if incomplete_entries and not effective_override_reason:
         document_label = _workflow_document_label(ctx.get("document"))
         raise ValueError(
             f"{document_label}: 아직 AI·사람 검수가 끝나지 않은 청크가 {len(incomplete_entries):,}개 있습니다."
@@ -6254,6 +6426,10 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
         for entry in pending_entries:
             target_chunk = entry["chunk"]
             target_chunk_id = str(entry["chunk_id"])
+            entry_override_reason = _approval_override_reason_for_entries(
+                [entry],
+                explicit_reason=effective_override_reason,
+            )
             hold_events_key = _approval_chunk_state_key(document_id, target_chunk_id, "hold_events")
             review_events.extend(list(st.session_state.get(hold_events_key) or []))
             review_events.extend(
@@ -6271,6 +6447,7 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
                     table_source=str(target_chunk.metadata.get("table_source") or ""),
                     kordoc_table_promoted=bool(target_chunk.metadata.get("kordoc_table_promoted")),
                     approve_event="approved",
+                    override_reason=entry_override_reason or None,
                 )
             )
         for template in templates:
@@ -6280,7 +6457,7 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
                 ApprovalRequest(
                     chunk_ids=chunk_ids,
                     security_level=security_level,
-                    review_flags_acknowledged=True,
+                    review_flags_acknowledged=not bool(incomplete_entries),
                     worklist_report_path=str(template["worklist_report_path"]),
                     worklist_report_sha256=str(template["worklist_report_sha256"]),
                     review_batch_manifest_path=str(template["review_batch_manifest_path"]),
@@ -6293,6 +6470,7 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
                         for event in review_events
                         if str(event.get("chunk_id") or "") in template_chunk_ids
                     ],
+                    approval_override_reason=effective_override_reason or None,
                     note="approval_screen_selected_regulations_batch",
                 )
             )
@@ -6309,6 +6487,7 @@ def _prepare_reviewed_document_approval_plan(ctx: dict, *, security_level: str =
         "pending_vector_sync_batch_ids": pending_vector_sync_batch_ids,
         "pending_chunk_count": len(pending_entries),
         "edited_chunk_count": edited_chunk_total,
+        "approval_override_reason": effective_override_reason,
         "evidence": evidence,
     }
 
@@ -7429,12 +7608,12 @@ def _render_kordoc_preprocess_preflight() -> bool:
         "일반 본문의 조문·항·호 구조를 처음 읽는 파서 자체가 Kordoc인 것은 아닙니다. "
         "하지만 PDF·HWP·HWPX·DOCX를 공식 MCP 파일 묶음으로 만들려면 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다. "
         "지금 설치하지 않고 빠른 구조 전처리는 할 수 있지만, 미설치 상태에서 처리한 문서는 나중에 Kordoc 설치 후 새 초안으로 "
-        "다시 전처리·검수·승인해야 합니다."
+        "다시 전처리하고 검수 권고를 확인한 뒤 승인해야 합니다."
     )
     st.info(
         "지금은 빠른 구조 전처리로 계속할 수 있습니다. 아래 '파일 올리기'에서 규정 파일을 선택하세요. "
         "다만 ④ 공식 MCP 파일 묶음을 만들기 전에는 Kordoc을 설치한 뒤 같은 원본을 새 초안으로 "
-        "다시 전처리·검수·승인해야 합니다."
+        "다시 전처리하고 검수 권고를 확인한 뒤 승인해야 합니다."
     )
     st.caption(
         "아래 버튼은 Node.js/npm을 사용해 Kordoc을 현재 사용자 환경에 전역 설치하고 "
@@ -7849,7 +8028,7 @@ def _next_action(ctx: dict | None) -> tuple[str, str]:
         return ("전처리 결과와 품질 검사 내용을 확인하세요.", NAV_RESULTS)
     if not workflow_states[2]:
         return (
-            "사람 검수 결정을 모두 마치고 승인한 내용을 색인(AI에 등록)하세요.",
+            "사람 검수 권고 내용을 확인한 뒤 승인·색인(AI에 등록)하세요.",
             NAV_APPROVAL,
         )
     if not workflow_states[3]:
@@ -7990,7 +8169,7 @@ def _render_document_regulation_directory(
             "상태": (
                 "승인 완료"
                 if not int(unit.get("pending") or 0)
-                else "검수 필요"
+                else "검수 권고"
             ),
         }
         for unit in units
@@ -8531,11 +8710,16 @@ def _page_preprocess() -> None:
     selected_pending_paths: list[Path] = []
     if profile_id:
         try:
+            pending_upload_cache = st.session_state.setdefault(PENDING_UPLOAD_CACHE_KEY, {})
+            if not isinstance(pending_upload_cache, dict):
+                pending_upload_cache = {}
+                st.session_state[PENDING_UPLOAD_CACHE_KEY] = pending_upload_cache
             current_pending_by_name: dict[str, Path] = {}
             for uploaded_file in uploaded_files:
                 current_pending_by_name[str(getattr(uploaded_file, "name", ""))] = _persist_pending_upload(
                     profile_id,
                     uploaded_file,
+                    cache=pending_upload_cache,
                 )
             pending_paths = _pending_upload_paths(profile_id)
             current_pending_paths = set(current_pending_by_name.values())
@@ -8945,7 +9129,7 @@ def _page_preprocess() -> None:
         if OFFICIAL_RAG_MCP_REVIEW_REQUIRED_KEY not in st.session_state:
             official_review_checkbox_kwargs["value"] = True
         official_review_required = st.checkbox(
-            "휴먼리뷰 후 공식 RAG/MCP 사용",
+            "운영자 승인 후 공식 RAG/MCP 사용",
             **official_review_checkbox_kwargs,
         )
         unreviewed_poc_review_acknowledged = True
@@ -9072,6 +9256,11 @@ def _page_preprocess() -> None:
             enable_table_extraction=enable_table_extraction,
             enable_agent_review=ai_review_requested,
         )
+        reusable_processing_options = processing_options_payload(
+            options,
+            settings=upload_settings,
+            quality_profiles_sha256=upload_processing_service.quality_profiles_sha256,
+        )
         max_single_upload_bytes = int(upload_settings.max_upload_mb) * 1024 * 1024
         max_batch_upload_bytes = int(getattr(upload_settings, "max_batch_upload_mb", upload_settings.max_upload_mb)) * 1024 * 1024
         oversized_files = [
@@ -9102,6 +9291,7 @@ def _page_preprocess() -> None:
             st.stop()
 
         completed_documents = []
+        reused_document_count = 0
         total_files = len(upload_sources)
         current_preprocess_regulation = "선택한 업로드 문서"
         preprocessing_started = time.monotonic()
@@ -9314,6 +9504,28 @@ def _page_preprocess() -> None:
                     # 파일마다 자기 파일 이름을 쓴다. 한 이름을 여러 규정에 공통 적용하지 않는다.
                     file_upload_metadata["document_name"] = Path(filename).stem
                 _update_file_progress(file_index, filename, 0.0, "Saving uploaded file", status_label="탑재 중")
+                pending_path = source.get("pending_path")
+                reusable = _find_reusable_preprocessing_run(
+                    upload_repository,
+                    pending_path if isinstance(pending_path, Path) else None,
+                    processing_options=reusable_processing_options,
+                    upload_metadata=file_upload_metadata,
+                    tenant_id=_local_operator_tenant_id(),
+                )
+                if reusable is not None:
+                    document, _reusable_run = reusable
+                    reused_document_count += 1
+                    _update_file_progress(
+                        file_index,
+                        filename,
+                        1.0,
+                        "Processing skipped; reusable completed run exists",
+                        status_label="완료 · 기존 결과 재사용",
+                    )
+                    completed_documents.append(document)
+                    if isinstance(pending_path, Path):
+                        pending_path.unlink(missing_ok=True)
+                    continue
                 pending_stream = None
                 if source["kind"] == "pending":
                     pending_stream = Path(source["path"]).open("rb")
@@ -9354,12 +9566,16 @@ def _page_preprocess() -> None:
                         text=f"{unit_label} {total_units}/{total_units} 완료",
                     )
                 completed_documents.append(document)
-                pending_path = source.get("pending_path")
                 if isinstance(pending_path, Path):
                     pending_path.unlink(missing_ok=True)
 
             document = completed_documents[-1]
             status.update(label=f"{len(completed_documents)}개 문서 전처리 완료", state="complete")
+            if reused_document_count:
+                st.caption(
+                    f"동일 원본·동일 전처리 버전 결과 재사용: {reused_document_count:,}개 · "
+                    "Kordoc·파이프라인·품질 설정이 달라지면 자동으로 새 전처리를 실행합니다."
+                )
             if beginner_mode_active:
                 beginner_status_box.success(
                     "전처리가 정상적으로 끝났습니다.\n\n"
@@ -9700,16 +9916,16 @@ def _page_results(ctx: dict | None) -> None:
             attention_all = bool(chunks) and len(review_attention) >= len(chunks)
             st.caption(
                 (
-                    "이 규정은 모든 조항을 사람이 직접 확인해야 합니다. "
+                    "이 규정은 모든 조항을 사람이 직접 확인할 것을 권고합니다. "
                     if attention_all
-                    else f"이 규정은 조항 {len(review_attention):,}개를 사람이 직접 확인해야 합니다. "
+                    else f"이 규정은 조항 {len(review_attention):,}개를 사람이 직접 확인할 것을 권고합니다. "
                 )
                 + "확인은 다음 '③ 검수하고 승인' 단계에서 원본과 나란히 놓고 진행합니다."
             )
         elif not ai_review_requested:
             # AI를 켜지 않았는데 후보 0 / 선정 0 숫자를 늘어놓으면 "AI가 봤는데 아무것도 없다"로 읽힌다.
             st.caption(
-                f"이 규정은 사람이 확인해야 하는 조항이 {len(review_attention):,}개입니다. "
+                f"이 규정은 사람이 확인하도록 권고된 조항이 {len(review_attention):,}개입니다. "
                 "확인은 '③ 검수하고 승인' 단계에서 원본·전처리본을 나란히 놓고 진행합니다."
             )
         else:
@@ -9737,7 +9953,7 @@ def _page_results(ctx: dict | None) -> None:
             ai_cols[2].metric(
                 "사람이 꼭 볼 청크",
                 f"{len(review_attention):,}",
-                help="경고가 있어 다음 ③ 검수·승인 단계에서 사람이 반드시 확인해야 하는 청크 수입니다.",
+                help="경고가 있어 다음 ③ 검수·승인 단계에서 사람이 우선 확인하도록 권고하는 청크 수입니다.",
             )
             st.caption(_ai_review_scope_caption(agent_review_summary))
 
@@ -9819,9 +10035,9 @@ def _page_results(ctx: dict | None) -> None:
             tcol1.metric("표 후보 청크", f"{int(metrics.get('table_like_chunks') or 0):,}")
             tcol2.metric("구조화 행", f"{int(metrics.get('table_cell_row_count') or 0):,}")
             tcol3.metric("인용 가능 청크", f"{int(metrics.get('table_citation_ready_chunks') or 0):,}")
-            tcol4.metric("검수 필요", f"{int(metrics.get('table_review_required_chunks') or 0):,}")
+            tcol4.metric("검수 권고", f"{int(metrics.get('table_review_required_chunks') or 0):,}")
             if int(metrics.get("table_review_required_chunks") or 0):
-                st.warning("인용 가능한 운영형 RAG에 사용하기 전에 일부 표/별표 행은 수동 검수가 필요합니다.")
+                st.warning("인용 가능한 운영형 RAG에 사용하기 전에 일부 표/별표 행을 사람이 확인할 것을 권고합니다.")
             elif int(metrics.get("table_like_chunks") or 0):
                 st.success("감지된 표/별표 행에 자동 검수 플래그가 없습니다.")
             else:
@@ -9835,7 +10051,7 @@ def _page_results(ctx: dict | None) -> None:
                         "행 유형": row.get("row_kind"),
                         "행 번호": row.get("row_index"),
                         "셀 수": row.get("cell_count"),
-                        "검수 필요": row.get("review_required"),
+                        "검수 권고": row.get("review_required"),
                         "검수 사유": ", ".join(row.get("review_flags") or row.get("row_quality_flags") or []),
                         "원문 행": row.get("raw"),
                     }
@@ -9934,12 +10150,12 @@ def _page_results(ctx: dict | None) -> None:
             f"초보자 안내에서는 선택한 {len(selected_document_ids):,}개 규정을 현재 화면의 규정부터 1개씩 검수합니다. "
             "이 규정을 승인한 뒤 문서 목록에서 다음 규정을 선택하면 같은 순서로 이어갈 수 있습니다."
         )
-    beginner_results_confirmation_required = bool(
+    beginner_results_confirmation_shown = bool(
         st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
     )
     results_confirmation_key = _beginner_guide_results_confirmed_key(document_id)
     results_confirmed = bool(st.session_state.get(results_confirmation_key))
-    if beginner_results_confirmation_required:
+    if beginner_results_confirmation_shown:
         structure_confirmation_key = _beginner_guide_results_item_key(
             document_id,
             "structure",
@@ -9982,18 +10198,24 @@ def _page_results(ctx: dict | None) -> None:
             "품질 경고·이슈와 표·별표 결과를 확인했습니다.",
             key=issues_confirmation_key,
             disabled=not structure_confirmed,
-            help="첫 번째 확인 후 품질 경고와 검증 이슈까지 살펴봐야 선택할 수 있습니다.",
+            help="첫 번째 확인 후 품질 경고와 검증 이슈까지 살펴보는 권고 순서입니다.",
         )
         results_confirmed = bool(structure_confirmed and issues_confirmed)
         st.session_state[results_confirmation_key] = results_confirmed
-    if not beginner_results_confirmation_required or results_confirmed:
-        _render_beginner_action_marker(
-            2,
-            "결과 확인을 마쳤다면 검수 화면으로 이동하세요",
-            "품질·이슈·원문과 전처리 결과를 살펴본 뒤 바로 아래 버튼을 누르세요.",
-            control_key_prefix="results-goto-approval",
-            substep=4,
-        )
+    _render_beginner_action_marker(
+        2,
+        (
+            "결과 확인을 마쳤다면 검수 화면으로 이동하세요"
+            if results_confirmed
+            else "권고 내용을 확인하거나 바로 검수 화면으로 이동할 수 있습니다"
+        ),
+        (
+            "품질·이슈·원문과 전처리 결과를 살펴본 뒤 바로 아래 버튼을 누르세요. "
+            "두 확인란은 권고 절차이며 이동을 막지 않습니다."
+        ),
+        control_key_prefix="results-goto-approval",
+        substep=4,
+    )
     _render_workflow_next_button(
         (
             f"현재 규정 ③ 검수·승인으로 이동 (선택 {len(selected_document_ids):,}개 중 1개씩 진행)"
@@ -10002,10 +10224,7 @@ def _page_results(ctx: dict | None) -> None:
         ),
         NAV_APPROVAL,
         key="results-goto-approval",
-        disabled=(
-            not selected_document_ids
-            or (beginner_results_confirmation_required and not results_confirmed)
-        ),
+        disabled=not selected_document_ids,
     )
 
 
@@ -10316,7 +10535,7 @@ def _render_approval_chunk_confirmation_controls(
             "수정 필요 항목 처리 메모",
             key=str(action_resolution["action_resolution_note_key"]),
             placeholder="본문을 직접 고치지 않았다면 어떻게 해결·확인했는지 적어 주세요.",
-            help="최종본을 수정했거나 이 메모를 남겨야 승인할 수 있습니다.",
+            help="최종본을 수정했거나 확인 방법을 메모해 두는 것을 권고합니다. 비워 두어도 최종 승인 버튼은 사용할 수 있습니다.",
             on_change=_approval_sync_action_resolution_note,
             kwargs={
                 "human_confirmed_key": human_confirmed_key,
@@ -10409,8 +10628,8 @@ def _render_approval_chunk_confirmation_controls(
         st.success("이 조항의 명시적 검수가 완료되었습니다.")
     else:
         st.caption(
-            "AI 항목 판단, 수정 필요 항목의 해결, 사람 확인이 모두 끝나야 최종 확정에 "
-            "포함됩니다."
+            "AI 항목 판단, 수정 필요 항목의 해결, 사람 확인을 마치면 명시적 검수 완료로 기록됩니다. "
+            "완료하지 않아도 최종 확정은 가능하며 미검수 승인으로 감사 기록에 남습니다."
         )
 
 
@@ -10460,7 +10679,7 @@ def _render_approval_compare_sheet(
                 f"한 쪽에 조항 {APPROVAL_SHEET_PAGE_SIZE}개씩 보여줍니다."
                 if read_only
                 else f"한 쪽에 조항 {APPROVAL_SHEET_PAGE_SIZE}개씩 보여줍니다. "
-                "각 쪽의 조항을 명시적으로 확인해야 미승인 조항 전체를 최종 확정할 수 있습니다."
+                "각 쪽의 조항을 명시적으로 확인할 것을 권고하지만, 확인하지 않아도 최종 확정할 수 있습니다."
             ),
         )
         st.caption(
@@ -10672,25 +10891,24 @@ def _page_approval(ctx: dict | None) -> None:
     beginner_current_results_confirmed = bool(
         st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
     )
-    # ②를 건너뛰는 규정에서 이 관문을 그대로 두면, 갈 수 없는 화면을 요구하며 막힌다.
+    # 결과 확인은 초보자에게 권고하되 최종 승인·색인 화면을 막는 관문으로 사용하지 않는다.
     if beginner_mode_active and _results_step_is_used(ctx) and not beginner_current_results_confirmed:
         _render_beginner_action_marker(
             3,
-            "현재 규정의 결과 두 곳을 먼저 확인하세요",
+            "현재 규정의 결과 두 곳 확인을 권고합니다",
             "'② 결과 확인'으로 돌아가 '요약' 탭의 '전처리된 글자 확인'을 보고, 이어서 '이슈'와 "
-            "'표·별표' 탭을 확인한 뒤 화면 아래 두 확인란을 차례로 선택하세요.",
+            "'표·별표' 탭을 확인할 수 있습니다. 확인하지 않아도 아래 최종 승인·색인 버튼으로 진행할 수 있습니다.",
             control_key_prefix="approval-goto-current-results",
-            prerequisite=True,
+            substep=1,
         )
         st.warning(
-            "초보자 안내 모드에서는 규정마다 결과 확인을 끝낸 뒤에만 원본·전처리·AI 검수 내용을 검토할 수 있습니다."
+            "사람이 결과를 확인할 것을 권고합니다. 이 권고는 진행을 막지 않으며, 확인 없이 승인하면 감사 저널에 미검수 승인으로 기록됩니다."
         )
         _render_workflow_next_button(
             "현재 규정의 결과 두 곳 확인하러 가기",
             NAV_RESULTS,
             key="approval-goto-current-results",
         )
-        return
     if not chunks:
         st.info(
             "이 문서에는 승인할 청크가 없습니다. 위 규정 디렉터리에서 다른 규정을 열거나, "
@@ -10714,7 +10932,7 @@ def _page_approval(ctx: dict | None) -> None:
         status_cols = st.columns(4)
         status_cols[0].metric("전체 청크", f"{total_chunks:,}")
         status_cols[1].metric("승인된 청크 (Approved chunks)", f"{approved_count:,}")
-        status_cols[2].metric("검수 주의 청크", f"{len(review_attention):,}", help="파서·표 관련 경고가 있어 사람이 꼭 봐야 하는 청크입니다.")
+        status_cols[2].metric("검수 주의 청크", f"{len(review_attention):,}", help="파서·표 관련 경고가 있어 사람이 우선 확인하도록 권고하는 청크입니다.")
         if index_status_error:
             status_cols[3].metric("색인 상태", "확인 불가")
             st.warning(
@@ -10984,10 +11202,6 @@ def _page_approval(ctx: dict | None) -> None:
         )
         for chunk in document_pending_chunks
     ]
-    document_review_complete = bool(document_pending_review_entries) and all(
-        bool(dict(entry["state"]).get("approve_enabled"))
-        for entry in document_pending_review_entries
-    )
 
     st.markdown(f"### 3단계 · '{opened_regulation_label}' 최종 확정")
     st.caption(
@@ -11024,8 +11238,8 @@ def _page_approval(ctx: dict | None) -> None:
     if pending_review_entries and len(reviewed_approval_entries) < len(pending_review_entries):
         remaining_review_count = len(pending_review_entries) - len(reviewed_approval_entries)
         st.warning(
-            f"명시적 검수가 필요한 조항이 {remaining_review_count:,}개 남았습니다. "
-            "조항이 여러 쪽이면 위의 검증 시트 쪽을 이동해 모두 확인하세요."
+            f"명시적 검수가 권고된 조항이 {remaining_review_count:,}개 남았습니다. "
+            "조항이 여러 쪽이면 위 검증 시트에서 확인할 수 있으며, 그대로 진행하면 미검수 승인으로 기록됩니다."
         )
 
     approve_enabled = bool(pending_review_entries) and len(reviewed_approval_entries) == len(pending_review_entries)
@@ -11035,20 +11249,21 @@ def _page_approval(ctx: dict | None) -> None:
     if approve_enabled:
         st.success("모든 조항이 확인 완료 상태입니다. 아래에서 최종 확정할 수 있습니다.")
     elif pending_compare_ids:
-        # 초보자 모드든 아니든 사람 검수를 권장하는 경고를 항상 띄운다(막지 않고 권고만).
-        # 단일 규정 '이 규정 최종 확정'은 조항별 검수 게이트를 그대로 유지하므로, 여기
-        # 사유 입력창은 비운 채 둔다(사유를 적어야 미검수 상태로 이 규정을 승인할 수 있다).
-        # 파일 전체 '전체 규정 최종 확정'은 아래에서 기본 사유가 자동 적용돼 바로 눌린다.
+        # 초보자/일반 모드 모두 같은 원클릭 정책을 쓴다. 사람 검수는 분명히 권고하지만
+        # 버튼을 막지는 않으며, 그대로 진행하면 기본 사유와 approved_without_review
+        # 이벤트를 남긴다. 별도 결재 등 더 정확한 사유가 있으면 선택적으로 바꿀 수 있다.
         st.warning(
             "⚠️ 사람 검수를 권장합니다. 확인이 끝나지 않은 조항이 있습니다. "
             "미검수 조항은 사람이 원문을 대조하지 않은 상태로 AI 검색에 노출되므로, "
-            "가능하면 위 검증 시트에서 조항을 직접 확인한 뒤 확정하세요."
+            "가능하면 위 검증 시트에서 조항을 직접 확인한 뒤 확정하세요. "
+            "지금 최종 확정해도 진행되며, 미검수 사실은 감사 기록에 남습니다."
         )
-        with st.expander("확인 없이 이 규정만 승인하는 사유", expanded=False):
+        with st.expander("미검수 승인 감사 사유 바꾸기 (선택)", expanded=False):
             override_reason = st.text_area(
                 "확인 생략 승인 사유",
                 key=override_reason_key,
                 placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
+                help="비워 두면 사람이 원문을 직접 대조하지 않았다는 기본 사유가 자동 기록됩니다.",
             )
 
     approve_index_button_key = f"approval-approve-index-{document_id}"
@@ -11079,16 +11294,12 @@ def _page_approval(ctx: dict | None) -> None:
         approve_col, index_col = st.columns([2, 2])
         approve_all_col = None
 
-    override_reason_text = str(override_reason or "").strip()
-    approval_target_entries = (
-        pending_review_entries
-        if approve_enabled or override_reason_text
-        else []
+    override_reason_text = _approval_override_reason_for_entries(
+        pending_review_entries,
+        explicit_reason=str(override_reason or ""),
     )
-    can_approve = bool(approval_target_entries) and (
-        all(bool(dict(entry["state"]).get("approve_enabled")) for entry in approval_target_entries)
-        or bool(override_reason_text)
-    )
+    approval_target_entries = pending_review_entries
+    can_approve = bool(approval_target_entries)
 
     def _execute_final_approval(
         approval_target_entries: list[dict[str, object]],
@@ -11121,6 +11332,10 @@ def _page_approval(ctx: dict | None) -> None:
         for entry in approval_target_entries:
             target_chunk = entry["chunk"]
             target_chunk_id = str(entry["chunk_id"])
+            entry_override_reason = _approval_override_reason_for_entries(
+                [entry],
+                explicit_reason=override_reason_text,
+            )
             target_hold_events_key = _approval_chunk_state_key(document_id, target_chunk_id, "hold_events")
             review_events.extend(list(st.session_state.get(target_hold_events_key) or []))
             review_events.extend(
@@ -11138,7 +11353,7 @@ def _page_approval(ctx: dict | None) -> None:
                     table_source=str(target_chunk.metadata.get("table_source") or ""),
                     kordoc_table_promoted=bool(target_chunk.metadata.get("kordoc_table_promoted")),
                     approve_event="approved",
-                    override_reason=override_reason_text or None,
+                    override_reason=entry_override_reason or None,
                 )
             )
         approved_chunk_total = 0
@@ -11256,8 +11471,9 @@ def _page_approval(ctx: dict | None) -> None:
     # 파일 전체 확정은 규정을 하나씩 열지 않고 눌러야 쓸모가 있으므로, 문서 전체가
     # 검수 완료가 아니면 기본 사유를 자동으로 적용해 사유 입력 없이도 눌리게 한다.
     # 화면에서 사유를 직접 적었으면 그 값을 우선 쓴다(감사 기록에 그대로 남는다).
-    document_bulk_override_reason_text = override_reason_text or (
-        DEFAULT_UNREVIEWED_OVERRIDE_REASON if not document_review_complete else ""
+    document_bulk_override_reason_text = _approval_override_reason_for_entries(
+        document_pending_review_entries,
+        explicit_reason=str(override_reason or ""),
     )
     if approve_all_col is not None and approve_all_col.button(
         f"이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정 · 승인하고 색인",
@@ -11397,7 +11613,7 @@ def _page_approval(ctx: dict | None) -> None:
                             if approval_ctx_chunks and approved_chunks == len(approval_ctx_chunks)
                             else "승인·색인 가능"
                             if pending_entries and ready_count == len(pending_entries)
-                            else "검수 필요"
+                            else "검수 권고"
                         )
                     ),
                 }
@@ -11486,26 +11702,20 @@ def _page_approval(ctx: dict | None) -> None:
             key=f"workflow-security-level-{document_id}",
             format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
         )
-        # 초보자 모드에서도 전체 규정 승인을 쓸 수 있게 열되, 확인 한 단계를 반드시 거치게 한다.
-        # (승인한 내용은 곧바로 AI 답변 근거가 되므로 실수로 눌리면 되돌리기 번거롭다.)
-        beginner_bulk_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
-        beginner_bulk_confirmed = True
-        if beginner_bulk_mode_active:
+        # 초보자/일반 모드 모두 같은 정책이다. 사람 검수를 권고하되 추가 체크박스로
+        # 버튼을 막지 않는다. 미완료 조항은 규정별 승인 요청에서 기본 우회 사유와
+        # approved_without_review 이벤트를 남겨, 검수가 끝난 것처럼 가장하지 않는다.
+        if workflow_pending_count > workflow_ready_count:
             st.warning(
-                f"'전체 규정 최종 확정'은 선택한 규정 {len(selected_document_ids):,}개의 "
-                f"미승인 조항 {workflow_pending_count:,}개를 한 번에 승인하고 색인합니다. "
-                "승인한 내용은 AI가 답변 근거로 그대로 씁니다. "
-                "규정을 하나씩 열어 확인한 뒤 사용하시길 권합니다."
+                f"⚠️ 사람 검수를 권장합니다. 선택한 규정 {len(selected_document_ids):,}개의 "
+                f"미승인 조항 {workflow_pending_count:,}개 중 "
+                f"{workflow_pending_count - workflow_ready_count:,}개는 명시적 확인이 끝나지 않았습니다. "
+                "지금 최종 확정해도 진행되며, 미검수 조항은 감사 기록에 구분해 남습니다."
             )
-            beginner_bulk_confirmed = st.checkbox(
-                f"규정 {len(selected_document_ids):,}개를 한 번에 승인·색인하는 것에 동의합니다.",
-                key=f"workflow-beginner-bulk-ack-{document_id}",
-                help="이 확인란을 선택해야 아래 '전체 규정 최종 확정' 버튼이 열립니다.",
+        else:
+            st.caption(
+                "선택한 모든 미승인 조항의 AI 판단과 사람 확인이 완료됐습니다."
             )
-        beginner_bulk_review_disabled = beginner_bulk_mode_active and not beginner_bulk_confirmed
-        st.caption(
-            "위 비교표에서 각 조항의 AI 판단과 사람 확인을 명시적으로 마쳐야 일괄 승인·색인할 수 있습니다."
-        )
 
         if st.button(
             (
@@ -11516,15 +11726,10 @@ def _page_approval(ctx: dict | None) -> None:
             type="primary",
             key=f"workflow-approve-index-{document_id}",
             disabled=(
-                beginner_bulk_review_disabled
-                or not workflow_contexts_complete
+                not workflow_contexts_complete
                 or (
                     workflow_pending_count == 0
                     and workflow_deferred_sync_count == 0
-                )
-                or (
-                    workflow_pending_count > 0
-                    and workflow_ready_count < workflow_pending_count
                 )
             ),
             width="stretch",
@@ -11696,7 +11901,10 @@ def _page_approval(ctx: dict | None) -> None:
                         )
                 st.error(_brief_long_operation_error(exc))
         if workflow_ready_count < workflow_pending_count:
-            st.info("선택한 모든 규정의 AI 검수와 사람 확인을 완료하면 규정별 일괄 승인·색인 버튼이 활성화됩니다.")
+            st.info(
+                "위 비교 화면에서 사람 검수를 계속할 수 있습니다. 검수를 생략하고 최종 확정하면 "
+                "기본 미검수 사유와 approved_without_review 감사 이벤트가 자동 기록됩니다."
+            )
 
     st.divider()
     beginner_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
@@ -11738,7 +11946,7 @@ def _page_approval(ctx: dict | None) -> None:
         )
         if beginner_current_document_incomplete:
             st.info(
-                "현재 규정의 모든 검수 결정을 마치고 승인·색인을 완료해야 다음 규정이나 Qwen 챗봇·MCP 단계로 이동할 수 있습니다."
+                "현재 규정은 최종 승인·색인을 완료해야 다음 규정이나 Qwen 챗봇·MCP 단계로 이동할 수 있습니다. 사람 검수 결정은 권고되지만 최종 버튼을 막지 않습니다."
             )
         elif beginner_selected_documents_incomplete:
             pending_labels = [
@@ -12619,7 +12827,7 @@ def _page_connect(
             st.warning(
                 "챗봇은 승인·색인이 끝난 내용만 사용합니다. 먼저 '③ 검수하고 승인'을 완료해 주세요.\n\n"
                 "Local RAG uses approved and indexed chunks only. "
-                "Complete human review, approval, and index/reindex before asking a question."
+                "Complete explicit operator approval and index/reindex before asking a question."
             )
         if qwen_path:
             st.markdown("#### 처음 사용하는 분은 새 창에서 이 순서만 따라 하세요")
@@ -12683,7 +12891,7 @@ def _page_connect(
                 **규정이 MCP로 준비되는 순서**
 
                 1. 업로드한 원문을 규정 → 장·절 → 조문 → 항·호 → 별표·서식 계층으로 나눕니다.
-                2. AI 제안과 사람의 왼쪽 원본/오른쪽 처리 결과 비교를 거쳐 승인한 청크만 남깁니다.
+                2. AI 제안과 원본/처리 결과 비교 권고를 확인한 뒤, 운영자가 최종 승인한 청크만 남깁니다.
                 3. 승인 청크에 규정명·조문 번호·상위 계층·원문 출처를 붙여 계층 색인과 검색 색인을 만듭니다.
                 4. 선택한 규정 범위의 승인 데이터, MCP 서버 실행 명령, 앱별 연결 설정과 사용 안내를 한 묶음으로 생성합니다.
                 5. AI 앱에 그 연결을 등록하면 질문할 때 아래 도구를 호출하고, 서버는 승인 데이터만 돌려줍니다.
@@ -12758,7 +12966,7 @@ def _page_connect(
                         st.rerun()
                     else:
                         st.success(
-                            "출처 메타데이터를 보완했습니다. 검수·승인 후 색인을 실행하면 MCP 생성 버튼이 활성화됩니다."
+                            "출처 메타데이터를 보완했습니다. 사람 검수 권고를 확인하고 승인·색인을 실행하면 MCP 생성 버튼이 활성화됩니다."
                         )
                         st.rerun()
                 except Exception as exc:

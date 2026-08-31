@@ -39,7 +39,11 @@ from app.core.tenant_access import (
     tenant_directory_key,
     tenant_storage_key,
 )
-from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, embed_vector_records
+from app.ingestion.embedding_adapter import (
+    LOCAL_HASH_EMBEDDING_MODEL,
+    embed_vector_records,
+    summarize_embedded_records,
+)
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import (
     APPROVED_CHUNK_STATUS,
@@ -72,13 +76,15 @@ from app.core.security import (
 from app.services.document_service import DocumentService
 from app.services.processing_service import ProcessingService
 from app.services.regulation_catalog_service import latest_history_version
+from app.services.regulation_rag_runtime import (
+    approval_journal_match_index,
+    approval_journal_match_key,
+)
 from app.services.regulation_lifecycle_service import (
     RegulationLifecycleError,
     apply_transition as apply_regulation_transition,
 )
 from app.services.review_decision_service import (
-    APPROVAL_WORKLIST_METADATA_KEYS,
-    approval_worklist_metadata as _approval_worklist_metadata,
     approved_content_hash as _approved_content_hash,
     chunk_hashes as _chunk_hashes,
     department_acl_set as _department_acl_set,
@@ -121,6 +127,9 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 _PROCESSING_FAILURE_DETAIL = "Document processing failed. Review server audit logs for details."
 _INDEXING_FAILURE_DETAIL = "Document indexing failed. Review server audit logs for details."
+_DEFAULT_UNREVIEWED_APPROVAL_REASON = (
+    "Explicit operator approval without completed human review."
+)
 
 
 def _safe_expected_error_detail(exc: Exception, *, max_chars: int = 1000) -> str:
@@ -154,6 +163,7 @@ class ApprovalRequest(BaseModel):
         max_length=MAX_REVIEW_DECISION_EVENTS,
     )
     approval_override_reason: str | None = Field(default=None, max_length=1000)
+    allow_reapproval: bool = False
     defer_vector_sync: bool = False
     vector_sync_batch_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_CHARS)
 
@@ -171,6 +181,33 @@ class ApprovalRequest(BaseModel):
     def validate_deferred_vector_sync(self) -> Self:
         if self.defer_vector_sync and not str(self.vector_sync_batch_id or "").strip():
             raise ValueError("vector_sync_batch_id is required when defer_vector_sync is true.")
+        requested_chunk_ids = {str(chunk_id) for chunk_id in self.chunk_ids}
+        if any(
+            not str(event.get("chunk_id") or "")
+            or str(event.get("chunk_id") or "") not in requested_chunk_ids
+            for event in self.review_decision_events
+            if isinstance(event, dict)
+        ):
+            raise ValueError("review_decision_events must reference requested chunk_ids only.")
+        human_review_chunk_ids = {
+            str(event.get("chunk_id") or "")
+            for event in self.review_decision_events
+            if isinstance(event, dict)
+            and str(event.get("event") or "").strip() == "human_review_confirmed"
+        }
+        unreviewed_approval_chunk_ids = {
+            str(event.get("chunk_id") or "")
+            for event in self.review_decision_events
+            if isinstance(event, dict)
+            and str(event.get("event") or "").strip() == "approved_without_review"
+        }
+        contradictory_chunk_ids = sorted(
+            (human_review_chunk_ids & unreviewed_approval_chunk_ids) - {""}
+        )
+        if contradictory_chunk_ids:
+            raise ValueError(
+                "A chunk cannot be both human_review_confirmed and approved_without_review."
+            )
         return self
 
 
@@ -342,6 +379,7 @@ def _chunks_visible_to_auth(
     allowed_levels = ROLE_SECURITY_LEVELS.get(auth.role, frozenset())
     auth_departments = set(auth.department_ids)
     approval_journal_records = repository.list_approval_journal_records(document_id)
+    approval_match_index = approval_journal_match_index(approval_journal_records)
     return [
         chunk
         for chunk in chunks
@@ -352,6 +390,7 @@ def _chunks_visible_to_auth(
             chunk=chunk,
             document_id=document_id,
             auth=auth,
+            match_index=approval_match_index,
         )
     ]
 
@@ -751,11 +790,18 @@ def _require_approval_journal_records(
     auth: AuthContext,
 ) -> None:
     approval_journal_records = repository.list_approval_journal_records(document_id)
+    approval_match_index = approval_journal_match_index(approval_journal_records)
     missing: list[str] = []
     for chunk in chunks:
         if chunk.approval_status != APPROVED_CHUNK_STATUS:
             continue
-        if not _has_matching_approval_journal_record(approval_journal_records, chunk=chunk, document_id=document_id, auth=auth):
+        if not _has_matching_approval_journal_record(
+            approval_journal_records,
+            chunk=chunk,
+            document_id=document_id,
+            auth=auth,
+            match_index=approval_match_index,
+        ):
             missing.append(chunk.chunk_id)
     if missing:
         sample = ", ".join(sorted(missing)[:20])
@@ -768,44 +814,22 @@ def _has_matching_approval_journal_record(
     chunk: Chunk,
     document_id: str,
     auth: AuthContext,
+    match_index: set[tuple[Any, ...]] | None = None,
 ) -> bool:
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        if str(record.get("document_id") or "") != document_id:
-            continue
-        if str(record.get("tenant_id") or "") != auth.tenant_id:
-            continue
-        if str(record.get("approval_id") or "") != str(chunk.approval_id or ""):
-            continue
-        if chunk.chunk_id not in {str(value) for value in (record.get("chunk_ids") or [])}:
-            continue
-        if _approval_record_chunk_hash(record, chunk.chunk_id) != str(chunk.approved_content_hash or ""):
-            continue
-        worklist_evidence = record.get("worklist_evidence") or {}
-        if not isinstance(worklist_evidence, dict):
-            continue
-        evidence_metadata = _approval_worklist_metadata(worklist_evidence)
-        if set(evidence_metadata) != set(APPROVAL_WORKLIST_METADATA_KEYS):
-            continue
-        if any(str(chunk.metadata.get(key) or "") != str(value or "") for key, value in evidence_metadata.items()):
-            continue
-        return True
-    return False
-
-
-def _approval_record_chunk_hash(record: dict, chunk_id: str) -> str:
-    approved_hashes = record.get("approved_content_hashes")
-    if isinstance(approved_hashes, dict):
-        value = approved_hashes.get(chunk_id)
-        if value:
-            return str(value)
-    for item in record.get("approved_chunks") or []:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("chunk_id") or "") == chunk_id and item.get("approved_content_hash"):
-            return str(item.get("approved_content_hash") or "")
-    return ""
+    approval_match_index = (
+        approval_journal_match_index(records)
+        if match_index is None
+        else match_index
+    )
+    expected_key = approval_journal_match_key(
+        chunk_id=chunk.chunk_id,
+        document_id=document_id,
+        tenant_id=auth.tenant_id,
+        approval_id=str(chunk.approval_id or ""),
+        approved_content_hash=str(chunk.approved_content_hash or ""),
+        expected_metadata=dict(chunk.metadata or {}),
+    )
+    return expected_key in approval_match_index
 
 
 def _run_security_scan_record(
@@ -1022,6 +1046,7 @@ def index_documents_batch(
         preparation_started = time.perf_counter()
         prepared_items: dict[str, dict[str, Any]] = {}
         records_by_document: dict[str, list[dict[str, Any]]] = {}
+        all_records: list[dict[str, Any]] = []
         report(0, "규정별 승인 데이터 준비")
         for index, document_id in enumerate(normalized_ids, start=1):
             _require_document_access(repository, document_id, auth)
@@ -1044,23 +1069,41 @@ def index_documents_batch(
                     status_code=400,
                     detail=f"No approved chunks are available for batch indexing: {document_id}",
                 )
-            embedded_records, embedding_summary = embed_vector_records(
-                records,
-                dimensions=request.embedding_dimensions,
-                model=request.embedding_model,
-            )
             prepared_items[document_id] = {
                 "records": records,
-                "embedded_records": embedded_records,
                 "vector_summary": vector_summary,
-                "embedding_summary": embedding_summary,
                 "document_label": document_label,
             }
-            records_by_document[document_id] = embedded_records
+            all_records.extend(records)
             report(
                 index,
-                f"규정 {index:,}/{len(normalized_ids):,} 색인 데이터 준비 완료 · {document_label}",
+                f"규정 {index:,}/{len(normalized_ids):,} 승인 데이터 준비 완료 · {document_label}",
             )
+        embedded_batch, _batch_embedding_summary = embed_vector_records(
+            all_records,
+            dimensions=request.embedding_dimensions,
+            model=request.embedding_model,
+        )
+        embedded_offset = 0
+        for document_id in normalized_ids:
+            item = prepared_items[document_id]
+            record_count = len(item["records"])
+            embedded_records = embedded_batch[
+                embedded_offset : embedded_offset + record_count
+            ]
+            embedded_offset += record_count
+            item["embedded_records"] = embedded_records
+            item["embedding_summary"] = summarize_embedded_records(
+                embedded_records,
+                model=request.embedding_model,
+                dimensions=request.embedding_dimensions,
+            )
+            records_by_document[document_id] = embedded_records
+        if embedded_offset != len(embedded_batch):
+            raise ValueError(
+                "Batch embedding output could not be partitioned by document."
+            )
+        report(len(normalized_ids), "규정 전체 임베딩 준비 완료")
         batch_timing_ms["document_preparation"] = round(
             (time.perf_counter() - preparation_started) * 1000,
             3,
@@ -2739,6 +2782,39 @@ def approve_review_chunks(
                 ),
             )
             return response_record
+        approved_request_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.chunk_id in requested_ids
+            and chunk.approval_status == APPROVED_CHUNK_STATUS
+        ]
+        already_durably_approved: list[Chunk] = []
+        if approved_request_chunks:
+            approval_journal_records = repository.list_approval_journal_records(document_id)
+            approval_match_index = approval_journal_match_index(approval_journal_records)
+            already_durably_approved = [
+                chunk
+                for chunk in approved_request_chunks
+                if _has_matching_approval_journal_record(
+                    approval_journal_records,
+                    chunk=chunk,
+                    document_id=document_id,
+                    auth=auth,
+                    match_index=approval_match_index,
+                )
+            ]
+        if already_durably_approved and not request.allow_reapproval:
+            sample = ", ".join(
+                chunk.chunk_id
+                for chunk in sorted(already_durably_approved, key=lambda item: item.chunk_id)[:20]
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Chunks are already approved; set allow_reapproval only for an explicit "
+                    f"reapproval operation: {sample}"
+                ),
+            )
         chunks, preapproval_scan = _run_security_scan_record(
             settings=request_settings,
             repository=repository,
@@ -2837,19 +2913,52 @@ def approve_review_chunks(
         if document is not None and document.profile_id:
             approval_record["profile_id"] = document.profile_id
         approval_record["vector_sync_event_id"] = f"approval_vector_sync_{uuid.uuid4().hex[:12]}"
-        review_decision_events = _sanitize_review_decision_events(request.review_decision_events)
-        if request.approval_override_reason and not any(
-            event.get("event") == "approved_without_review" for event in review_decision_events
+        requested_chunk_id_set = {str(chunk_id) for chunk_id in requested_ids}
+        default_unreviewed_reason = (
+            str(request.approval_override_reason or "").strip()
+            or _DEFAULT_UNREVIEWED_APPROVAL_REASON
+        )
+        review_decision_events: list[dict[str, Any]] = []
+        for event in _sanitize_review_decision_events(request.review_decision_events):
+            chunk_id = str(event.get("chunk_id") or "")
+            if chunk_id not in requested_chunk_id_set:
+                continue
+            normalized_event = {
+                **event,
+                "actor": auth.actor,
+                "chunk_id": chunk_id,
+            }
+            if (
+                normalized_event.get("event") == "approved_without_review"
+                and not str(normalized_event.get("override_reason") or "").strip()
+            ):
+                normalized_event["override_reason"] = default_unreviewed_reason
+            review_decision_events.append(normalized_event)
+        human_review_chunk_ids = {
+            str(event.get("chunk_id") or "")
+            for event in review_decision_events
+            if event.get("event") == "human_review_confirmed"
+            and str(event.get("chunk_id") or "") in requested_chunk_id_set
+        }
+        unreviewed_approval_chunk_ids = {
+            str(event.get("chunk_id") or "")
+            for event in review_decision_events
+            if event.get("event") == "approved_without_review"
+            and str(event.get("chunk_id") or "") in requested_chunk_id_set
+        }
+        for chunk_id in sorted(
+            requested_chunk_id_set - human_review_chunk_ids - unreviewed_approval_chunk_ids
         ):
             review_decision_events.append(
                 {
                     "event": "approved_without_review",
                     "timestamp": approved_at,
                     "actor": auth.actor,
-                    "chunk_id": ",".join(sorted(requested_ids)[:20]),
-                    "override_reason": request.approval_override_reason,
+                    "chunk_id": chunk_id,
+                    "override_reason": default_unreviewed_reason,
                 }
             )
+            unreviewed_approval_chunk_ids.add(chunk_id)
         if review_decision_events:
             approval_record["review_decision_events"] = review_decision_events
             approval_record["review_decision_event_counts"] = {
@@ -2860,11 +2969,29 @@ def approve_review_chunks(
             approval_record["ai_review_confirmed"] = any(
                 event.get("event") == "ai_review_confirmed" for event in review_decision_events
             )
-            approval_record["human_review_confirmed"] = any(
-                event.get("event") == "human_review_confirmed" for event in review_decision_events
+            human_review_status = (
+                "complete"
+                if requested_chunk_id_set and human_review_chunk_ids == requested_chunk_id_set
+                else ("partial" if human_review_chunk_ids else "none")
             )
-        if request.approval_override_reason:
-            approval_record["approval_override_reason"] = request.approval_override_reason
+            approval_record["human_review_confirmed"] = human_review_status == "complete"
+            approval_record["human_review_coverage"] = {
+                "status": human_review_status,
+                "requested_chunk_count": len(requested_chunk_id_set),
+                "confirmed_chunk_count": len(human_review_chunk_ids),
+                "approved_without_review_chunk_count": len(unreviewed_approval_chunk_ids),
+            }
+        if unreviewed_approval_chunk_ids:
+            event_override_reasons = [
+                str(event.get("override_reason") or "").strip()
+                for event in review_decision_events
+                if event.get("event") == "approved_without_review"
+                and str(event.get("override_reason") or "").strip()
+            ]
+            approval_record["approval_override_reason"] = (
+                str(request.approval_override_reason or "").strip()
+                or (event_override_reasons[0] if event_override_reasons else default_unreviewed_reason)
+            )
         approval_record["approval_state_transition"] = _approval_state_transition(
             [
                 chunk.approval_status

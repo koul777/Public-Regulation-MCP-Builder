@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from dataclasses import replace
 
@@ -854,14 +855,18 @@ class StreamlitResultsStepVisibilityTests(unittest.TestCase):
             source,
         )
 
-    def test_beginner_gate_does_not_demand_a_page_that_is_hidden(self) -> None:
+    def test_beginner_results_advisory_does_not_block_approval_page(self) -> None:
         source = Path(streamlit_app.__file__).read_text(encoding="utf-8")
 
-        self.assertIn(
+        advisory = (
             "if beginner_mode_active and _results_step_is_used(ctx) "
-            "and not beginner_current_results_confirmed:",
-            source,
+            "and not beginner_current_results_confirmed:"
         )
+        self.assertIn(advisory, source)
+        advisory_start = source.index(advisory)
+        advisory_end = source.index("if not chunks:", advisory_start)
+        self.assertNotIn("return", source[advisory_start:advisory_end])
+        self.assertIn("이 권고는 진행을 막지 않으며", source[advisory_start:advisory_end])
 
 
 class PreprocessProgressGaugeTests(unittest.TestCase):
@@ -898,6 +903,165 @@ class PreprocessProgressGaugeTests(unittest.TestCase):
         self.assertIn("last_fraction = max(last_fraction, reported_fraction)", loop_source)
         # 낱개를 셀 수 없는 단계로 넘어가면 이전 단계 숫자를 남기지 않는다.
         self.assertIn("regulation_progress_box.empty()", loop_source)
+
+
+class PendingUploadCacheTests(unittest.TestCase):
+    class CountingUpload(io.BytesIO):
+        def __init__(self, payload: bytes, *, name: str, file_id: str = "upload-1") -> None:
+            super().__init__(payload)
+            self.name = name
+            self.file_id = file_id
+            self.size = len(payload)
+            self.read_calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_calls += 1
+            return super().read(size)
+
+    def test_same_streamlit_upload_reuses_pending_file_without_rereading_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            upload = self.CountingUpload(b"large regulation bytes", name="regulation.hwp")
+            cache: dict[str, object] = {}
+            with patch.object(streamlit_app, "settings", settings):
+                first = streamlit_app._persist_pending_upload(
+                    "profile-a",
+                    upload,
+                    cache=cache,
+                )
+                self.assertGreater(upload.read_calls, 0)
+                upload.read_calls = 0
+                second = streamlit_app._persist_pending_upload(
+                    "profile-a",
+                    upload,
+                    cache=cache,
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(0, upload.read_calls)
+
+    def test_cached_path_outside_profile_pending_directory_is_never_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data")
+            upload = self.CountingUpload(b"regulation", name="regulation.hwp")
+            outside = root / ("0" * 64 + "__regulation.hwp")
+            outside.write_bytes(b"regulation")
+            identity = streamlit_app._pending_upload_cache_identity("profile-a", upload)
+            self.assertIsNotNone(identity)
+            cache: dict[str, object] = {
+                str(identity): {
+                    "path": str(outside),
+                    "size": outside.stat().st_size,
+                    "mtime_ns": outside.stat().st_mtime_ns,
+                }
+            }
+
+            with patch.object(streamlit_app, "settings", settings):
+                result = streamlit_app._persist_pending_upload(
+                    "profile-a",
+                    upload,
+                    cache=cache,
+                )
+                expected_directory = streamlit_app._pending_upload_dir("profile-a").resolve()
+
+            self.assertNotEqual(outside, result)
+            self.assertEqual(expected_directory, result.resolve().parent)
+            self.assertGreater(upload.read_calls, 0)
+
+    def test_upload_without_stable_file_id_uses_streaming_fallback_each_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            upload = self.CountingUpload(
+                b"regulation",
+                name="regulation.hwp",
+                file_id="",
+            )
+            cache: dict[str, object] = {}
+            with patch.object(streamlit_app, "settings", settings):
+                streamlit_app._persist_pending_upload("profile-a", upload, cache=cache)
+                upload.read_calls = 0
+                streamlit_app._persist_pending_upload("profile-a", upload, cache=cache)
+
+            self.assertGreater(upload.read_calls, 0)
+            self.assertEqual({}, cache)
+
+    def test_deleted_cached_pending_file_is_recreated_from_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data")
+            upload = self.CountingUpload(b"regulation", name="regulation.hwp")
+            cache: dict[str, object] = {}
+            with patch.object(streamlit_app, "settings", settings):
+                first = streamlit_app._persist_pending_upload(
+                    "profile-a",
+                    upload,
+                    cache=cache,
+                )
+                first.unlink()
+                upload.read_calls = 0
+                second = streamlit_app._persist_pending_upload(
+                    "profile-a",
+                    upload,
+                    cache=cache,
+                )
+
+            self.assertEqual(first, second)
+            self.assertTrue(second.is_file())
+            self.assertGreater(upload.read_calls, 0)
+            self.assertEqual(b"regulation", second.read_bytes())
+
+    def test_reusable_preprocessing_lookup_forwards_tenant_and_exact_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_path = Path(tmp) / "pending.hwp"
+            pending_path.write_bytes(b"same source")
+            document = SimpleNamespace(tenant_id="tenant-a")
+            reusable_run = SimpleNamespace(run_id="run-a")
+            repository = SimpleNamespace(
+                find_reusable_run=Mock(return_value=(document, reusable_run))
+            )
+            options = {
+                "pipeline_version": "pipeline-v1",
+                "kordoc_table_command_version": "4.12.0",
+            }
+
+            result = streamlit_app._find_reusable_preprocessing_run(
+                repository,
+                pending_path,
+                processing_options=options,
+                upload_metadata={
+                    "profile_id": "profile-a",
+                    "source_system": "LOCAL_UPLOAD",
+                    "document_name": "pending",
+                    "regulation_status": "draft",
+                },
+                tenant_id="tenant-a",
+            )
+
+            self.assertEqual((document, reusable_run), result)
+            forwarded = repository.find_reusable_run.call_args.kwargs
+            self.assertEqual("tenant-a", forwarded["tenant_id"])
+            self.assertIs(options, forwarded["options"])
+            self.assertEqual("4.12.0", forwarded["options"]["kordoc_table_command_version"])
+
+    def test_reusable_preprocessing_is_disabled_for_explicit_revision_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_path = Path(tmp) / "pending.hwp"
+            pending_path.write_bytes(b"same source")
+            repository = SimpleNamespace(find_reusable_run=Mock())
+
+            result = streamlit_app._find_reusable_preprocessing_run(
+                repository,
+                pending_path,
+                processing_options={"pipeline_version": "pipeline-v1"},
+                upload_metadata={
+                    "profile_id": "profile-a",
+                    "regulation_id": "manual-regulation-id",
+                },
+                tenant_id="tenant-a",
+            )
+
+            self.assertIsNone(result)
+            repository.find_reusable_run.assert_not_called()
 
 
 class InstitutionStorageDirAgreementTests(unittest.TestCase):

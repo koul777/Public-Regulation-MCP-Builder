@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.ingestion.embedding_adapter import (
     EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION,
     LOCAL_HASH_EMBEDDING_MODEL,
@@ -52,6 +54,65 @@ class EmbeddingAdapterTests(unittest.TestCase):
         self.assertEqual(summary["record_count"], 2)
         self.assertEqual(summary["duplicate_id_count"], 1)
         self.assertEqual(summary["local_path_leak_count"], 1)
+
+    def test_embed_vector_records_batches_qwen_documents_once_and_preserves_records(self) -> None:
+        first = _record("doc:chunk-1", " first text ")
+        second = _record("doc:chunk-2", "second text")
+        adapter = _RecordingEmbeddingAdapter([[1.0, 0.0], [0.0, 1.0]])
+
+        with patch(
+            "app.ingestion.embedding_adapter._qwen_embedding_adapter",
+            return_value=adapter,
+        ) as adapter_factory:
+            embedded, summary = embed_vector_records(
+                [first, second],
+                dimensions=2,
+                model=QWEN3_EMBEDDING_MODEL,
+            )
+
+        adapter_factory.assert_called_once_with(2)
+        self.assertEqual([["first text", "second text"]], adapter.calls)
+        self.assertEqual(["doc:chunk-1", "doc:chunk-2"], [item["id"] for item in embedded])
+        self.assertEqual([[1.0, 0.0], [0.0, 1.0]], [item["embedding"] for item in embedded])
+        self.assertIs(first["metadata"], embedded[0]["metadata"])
+        self.assertIs(second["metadata"], embedded[1]["metadata"])
+        self.assertTrue(all(item["embedding_semantic"] for item in embedded))
+        self.assertEqual(2, summary["record_count"])
+        self.assertEqual(0, summary["invalid_embedding_dimension_count"])
+
+    def test_embed_vector_records_rejects_qwen_result_count_mismatch(self) -> None:
+        adapter = _RecordingEmbeddingAdapter([[1.0, 0.0]])
+
+        with patch(
+            "app.ingestion.embedding_adapter._qwen_embedding_adapter",
+            return_value=adapter,
+        ):
+            with self.assertRaisesRegex(ValueError, "1 embeddings for 2 vector records"):
+                embed_vector_records(
+                    [_record("doc:chunk-1", "first"), _record("doc:chunk-2", "second")],
+                    dimensions=2,
+                    model=QWEN3_EMBEDDING_MODEL,
+                )
+
+        self.assertEqual([["first", "second"]], adapter.calls)
+
+    def test_embed_vector_records_skips_qwen_adapter_for_empty_input(self) -> None:
+        with patch("app.ingestion.embedding_adapter._qwen_embedding_adapter") as adapter_factory:
+            embedded, summary = embed_vector_records([], model=QWEN3_EMBEDDING_MODEL)
+
+        adapter_factory.assert_not_called()
+        self.assertEqual([], embedded)
+        self.assertEqual(0, summary["record_count"])
+
+
+class _RecordingEmbeddingAdapter:
+    def __init__(self, embeddings: list[list[float]]) -> None:
+        self.embeddings = embeddings
+        self.calls: list[list[str]] = []
+
+    def encode_documents(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return self.embeddings
 
 
 def _record(record_id: str, text: str) -> dict:

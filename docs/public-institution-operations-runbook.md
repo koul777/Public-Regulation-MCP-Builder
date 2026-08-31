@@ -12,7 +12,7 @@ This public runbook covers source-only local operation and evidence contracts. I
 
 ## Approval and Indexing Contract
 
-The official path is source preprocessing, quality validation, human review, approval decision, append-only approval journal, approved local regulation DB/vector index, and citation-grounded RAG/MCP retrieval.
+The official path is source preprocessing, quality validation, human-review recommendation, explicit operator approval, append-only approval journal, approved local regulation DB/vector index, and citation-grounded RAG/MCP retrieval. Completed human review is recommended but does not block the approval button; approval without it must emit `approved_without_review` evidence.
 
 Required evidence fields include:
 

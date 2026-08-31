@@ -297,6 +297,7 @@ class BuildRagSecurityEvidenceTests(unittest.TestCase):
                         chunk_ids=["chunk-1"],
                         approval_id="approval-evidence",
                         security_level="confidential",
+                        allow_reapproval=True,
                         **evidence,
                     ),
                     auth,

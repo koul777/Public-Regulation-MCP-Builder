@@ -18,10 +18,10 @@
 
 ## Official Chain
 
-Preprocessing output is preview/schema validation only. Official indexing starts only after human review, approval, append-only approval journal, and approved vector synchronization.
+Preprocessing output is preview/schema validation only. Human review is recommended; official indexing starts only after explicit operator approval, append-only approval journal, and approved vector synchronization. Approval without completed human review must remain visible as `approved_without_review` evidence.
 
 ```text
-source -> preprocess -> review flags -> reviewer decision -> approval journal
+source -> preprocess -> review flags -> operator decision -> approval journal
 -> approved local DB/vector index -> RAG/MCP answer with citation
 ```
 

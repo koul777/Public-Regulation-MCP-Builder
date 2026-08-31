@@ -5266,7 +5266,7 @@ def _require_kordoc_table_parser_evidence(repository: JsonRepository, document_i
         raise ValueError(
             "MCP bundle creation requires Kordoc table parsing for HWP/HWPX/PDF/DOCX documents. "
             f"Missing or failed Kordoc evidence: {sample}. "
-            "Install Kordoc (`npm install -g kordoc`) and rerun preprocessing, human approval, "
+            "Install Kordoc (`npm install -g kordoc@4.12.0`) and rerun preprocessing, operator approval, "
             "and indexing before creating the MCP bundle."
         )
     return summary

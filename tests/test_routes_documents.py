@@ -22,6 +22,60 @@ from app.storage.repository import JsonRepository
 
 
 class RoutesDocumentsTests(unittest.TestCase):
+    def test_approval_journal_index_is_built_once_for_many_chunks(self) -> None:
+        auth = AuthContext(
+            actor="viewer",
+            tenant_id="tenant-a",
+            auth_mode="api_token",
+            role="viewer",
+        )
+        document_id = "doc-linear-approval"
+        chunks = [
+            Chunk(
+                chunk_id=f"chunk-{index}",
+                document_id=document_id,
+                chunk_type="article",
+                text=f"article {index}",
+                retrieval_text=f"article {index}",
+                approval_status="approved",
+                approval_id="approval-linear",
+                approved_content_hash=f"hash-{index}",
+                security_level="public",
+            )
+            for index in range(250)
+        ]
+        match_index = {
+            routes_documents.approval_journal_match_key(
+                chunk_id=chunk.chunk_id,
+                document_id=document_id,
+                tenant_id=auth.tenant_id,
+                approval_id=str(chunk.approval_id or ""),
+                approved_content_hash=str(chunk.approved_content_hash or ""),
+                expected_metadata=dict(chunk.metadata or {}),
+            )
+            for chunk in chunks
+        }
+
+        class FakeRepository:
+            @staticmethod
+            def list_approval_journal_records(_document_id: str) -> list[dict]:
+                return [{"approval_id": "approval-linear"}]
+
+        with patch.object(
+            routes_documents,
+            "approval_journal_match_index",
+            return_value=match_index,
+        ) as build_index:
+            visible = routes_documents._chunks_visible_to_auth(
+                FakeRepository(),
+                document_id,
+                chunks,
+                auth,
+            )
+
+        self.assertEqual(250, len(visible))
+        build_index.assert_called_once()
+
     def test_upload_document_uses_streaming_service_path(self) -> None:
         captured: dict[str, object] = {}
 
@@ -972,6 +1026,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                             chunk_ids=["chunk-1"],
                             approval_id="approval-after-failure",
                             security_level="internal",
+                            allow_reapproval=True,
                             **second_evidence,
                         ),
                         auth,
@@ -1878,7 +1933,11 @@ class RoutesDocumentsTests(unittest.TestCase):
                     )
 
             progress: list[tuple[int, str, int | None, int | None]] = []
-            with patch.object(routes_documents, "get_settings", return_value=settings):
+            with patch.object(routes_documents, "get_settings", return_value=settings), patch.object(
+                routes_documents,
+                "embed_vector_records",
+                wraps=routes_documents.embed_vector_records,
+            ) as embed_batch:
                 response = routes_documents.index_documents_batch(
                     document_ids,
                     routes_documents.IndexRequest(
@@ -1904,6 +1963,7 @@ class RoutesDocumentsTests(unittest.TestCase):
         self.assertEqual(2, response["document_count"])
         self.assertEqual(2, response["record_count"])
         self.assertEqual(1, response["upsert_summary"]["full_store_write_count"])
+        embed_batch.assert_called_once()
         self.assertEqual(2, len(stored))
         self.assertEqual({document_id for document_id in document_ids}, {row["document_id"] for row in stored})
         self.assertEqual({"batch_index"}, {rows[-1]["action"] for rows in jobs.values()})
@@ -1952,7 +2012,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                 {
                     "event": "ai_review_confirmed",
                     "timestamp": "2026-07-12T00:00:00+00:00",
-                    "actor": "tester",
+                    "actor": "spoofed-actor",
                     "chunk_id": "chunk-1",
                     "ai_reflected": 1,
                     "ai_skipped": 1,
@@ -1968,11 +2028,10 @@ class RoutesDocumentsTests(unittest.TestCase):
                     "source_of_truth": {"table_source": "kordoc", "kordoc_table_promoted": True},
                 },
                 {
-                    "event": "approved_without_review",
+                    "event": "approved",
                     "timestamp": "2026-07-12T00:00:00+00:00",
                     "actor": "tester",
                     "chunk_id": "chunk-1",
-                    "override_reason": "offline director approval",
                 },
             ]
 
@@ -1984,29 +2043,298 @@ class RoutesDocumentsTests(unittest.TestCase):
                         approval_id="approval-events",
                         security_level="internal",
                         review_decision_events=review_events,
-                        approval_override_reason="offline director approval",
                         **evidence,
                     ),
                     _auth_context(),
                 )
+                with self.assertRaises(HTTPException) as duplicate_approval:
+                    routes_documents.approve_review_chunks(
+                        "doc_review_events",
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-1"],
+                            approval_id="approval-events-retry",
+                            security_level="internal",
+                            review_decision_events=review_events,
+                            **evidence,
+                        ),
+                        _auth_context(),
+                    )
             approvals = JsonRepository(settings).list_approval_records("doc_review_events")
             journal = JsonRepository(settings).list_approval_journal_records("doc_review_events")
 
         self.assertEqual("approval-events", response["approval_id"])
-        self.assertEqual(["ai_review_confirmed", "human_review_confirmed", "approved_without_review"], [
+        self.assertEqual(409, duplicate_approval.exception.status_code)
+        self.assertEqual(1, len(approvals))
+        self.assertEqual(["ai_review_confirmed", "human_review_confirmed", "approved"], [
             event["event"] for event in approvals[0]["review_decision_events"]
         ])
         self.assertEqual(1, approvals[0]["review_decision_event_counts"]["ai_review_confirmed"])
         self.assertTrue(approvals[0]["ai_review_confirmed"])
         self.assertTrue(approvals[0]["human_review_confirmed"])
-        self.assertEqual("offline director approval", approvals[0]["approval_override_reason"])
+        self.assertNotIn("approval_override_reason", approvals[0])
         self.assertEqual(["pending_human_review"], approvals[0]["approval_state_transition"]["from_statuses"])
         self.assertEqual(
             ["pending_human_review", "reviewed", "approved"],
             approvals[0]["approval_state_transition"]["required_sequence"],
         )
         self.assertEqual(approvals[0]["review_decision_events"], journal[0]["review_decision_events"])
+        self.assertEqual(
+            {"tester"},
+            {event["actor"] for event in approvals[0]["review_decision_events"]},
+        )
         self.assertEqual("kordoc", approvals[0]["review_decision_events"][0]["source_of_truth"]["table_source"])
+
+    def test_approval_request_rejects_contradictory_review_events_for_same_chunk(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "both human_review_confirmed and approved_without_review",
+        ):
+            routes_documents.ApprovalRequest(
+                chunk_ids=["chunk-1"],
+                approval_override_reason="operator one-click approval",
+                review_decision_events=[
+                    {
+                        "event": "human_review_confirmed",
+                        "chunk_id": "chunk-1",
+                    },
+                    {
+                        "event": "approved_without_review",
+                        "chunk_id": "chunk-1",
+                    },
+                ],
+            )
+
+    def test_approval_request_rejects_out_of_scope_review_events(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "must reference requested chunk_ids only",
+        ):
+            routes_documents.ApprovalRequest(
+                chunk_ids=["chunk-1"],
+                review_decision_events=[
+                    {
+                        "event": "human_review_confirmed",
+                        "chunk_id": "other-chunk",
+                        "actor": "spoofed-actor",
+                    }
+                ],
+            )
+
+    def test_approval_record_marks_mixed_human_review_coverage_as_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            document_id = "doc_mixed_review_coverage"
+            repository.upsert_document(
+                Document(
+                    document_id=document_id,
+                    filename="mixed-review.pdf",
+                    document_name="Mixed Review",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            chunks = [
+                Chunk(
+                    chunk_id=f"chunk-{index}",
+                    document_id=document_id,
+                    chunk_type="article",
+                    text=f"article {index}",
+                    retrieval_text=f"article {index}",
+                )
+                for index in (1, 2)
+            ]
+            repository.save_processing_result(document_id, [], chunks, [])
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id=document_id,
+                chunks=repository.get_chunks(document_id),
+            )
+            review_events = [
+                {
+                    "event": "human_review_confirmed",
+                    "timestamp": "2026-08-31T00:00:00+00:00",
+                    "actor": "tester",
+                    "chunk_id": "chunk-1",
+                },
+                {
+                    "event": "approved",
+                    "timestamp": "2026-08-31T00:00:00+00:00",
+                    "actor": "tester",
+                    "chunk_id": "chunk-1",
+                },
+                {
+                    "event": "approved_without_review",
+                    "timestamp": "2026-08-31T00:00:00+00:00",
+                    "actor": "tester",
+                    "chunk_id": "chunk-2",
+                    "override_reason": "operator one-click approval",
+                },
+            ]
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                routes_documents.approve_review_chunks(
+                    document_id,
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-1", "chunk-2"],
+                        security_level="internal",
+                        review_decision_events=review_events,
+                        approval_override_reason="operator one-click approval",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+            approval = JsonRepository(settings).list_approval_records(document_id)[0]
+
+        self.assertFalse(approval["human_review_confirmed"])
+        self.assertEqual(
+            {
+                "status": "partial",
+                "requested_chunk_count": 2,
+                "confirmed_chunk_count": 1,
+                "approved_without_review_chunk_count": 1,
+            },
+            approval["human_review_coverage"],
+        )
+
+    def test_override_only_batch_records_each_unreviewed_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            document_id = "doc_override_batch"
+            repository.upsert_document(
+                Document(
+                    document_id=document_id,
+                    filename="override-batch.pdf",
+                    document_name="Override Batch",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            chunks = [
+                Chunk(
+                    chunk_id=f"chunk-{index}",
+                    document_id=document_id,
+                    chunk_type="article",
+                    text=f"article {index}",
+                    retrieval_text=f"article {index}",
+                )
+                for index in (1, 2)
+            ]
+            repository.save_processing_result(document_id, [], chunks, [])
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id=document_id,
+                chunks=repository.get_chunks(document_id),
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                routes_documents.approve_review_chunks(
+                    document_id,
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-1", "chunk-2"],
+                        security_level="internal",
+                        approval_override_reason="operator one-click approval",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+            approval = JsonRepository(settings).list_approval_records(document_id)[0]
+
+        self.assertEqual(
+            ["chunk-1", "chunk-2"],
+            [
+                event["chunk_id"]
+                for event in approval["review_decision_events"]
+                if event["event"] == "approved_without_review"
+            ],
+        )
+        self.assertEqual(
+            {
+                "status": "none",
+                "requested_chunk_count": 2,
+                "confirmed_chunk_count": 0,
+                "approved_without_review_chunk_count": 2,
+            },
+            approval["human_review_coverage"],
+        )
+
+    def test_direct_approval_without_review_payload_records_server_fallback_per_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data", artifact_root=root)
+            repository = JsonRepository(settings)
+            document_id = "doc_server_unreviewed_fallback"
+            repository.upsert_document(
+                Document(
+                    document_id=document_id,
+                    filename="server-unreviewed-fallback.pdf",
+                    document_name="Server Unreviewed Fallback",
+                    file_type="pdf",
+                    file_hash="hash",
+                    tenant_id="tenant-a",
+                    status="completed",
+                )
+            )
+            chunks = [
+                Chunk(
+                    chunk_id=f"chunk-{index}",
+                    document_id=document_id,
+                    chunk_type="article",
+                    text=f"article {index}",
+                    retrieval_text=f"article {index}",
+                )
+                for index in (1, 2)
+            ]
+            repository.save_processing_result(document_id, [], chunks, [])
+            evidence = _write_approval_evidence(
+                root,
+                settings=settings,
+                document_id=document_id,
+                chunks=repository.get_chunks(document_id),
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                routes_documents.approve_review_chunks(
+                    document_id,
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-1", "chunk-2"],
+                        security_level="internal",
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+            approval = JsonRepository(settings).list_approval_records(document_id)[0]
+
+        fallback_events = [
+            event
+            for event in approval["review_decision_events"]
+            if event["event"] == "approved_without_review"
+        ]
+        self.assertEqual(["chunk-1", "chunk-2"], [event["chunk_id"] for event in fallback_events])
+        self.assertTrue(all(event["actor"] == "tester" for event in fallback_events))
+        self.assertTrue(all(event["override_reason"] for event in fallback_events))
+        self.assertEqual(
+            routes_documents._DEFAULT_UNREVIEWED_APPROVAL_REASON,
+            approval["approval_override_reason"],
+        )
+        self.assertEqual(
+            {
+                "status": "none",
+                "requested_chunk_count": 2,
+                "confirmed_chunk_count": 0,
+                "approved_without_review_chunk_count": 2,
+            },
+            approval["human_review_coverage"],
+        )
 
     def test_approve_review_chunks_requires_ack_for_parser_review_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4099,6 +4427,7 @@ class RoutesDocumentsTests(unittest.TestCase):
                         chunk_ids=["scope-1"],
                         approval_id="approval-scope",
                         security_level="confidential",
+                        allow_reapproval=True,
                         **updated_evidence,
                     ),
                     _auth_context(),

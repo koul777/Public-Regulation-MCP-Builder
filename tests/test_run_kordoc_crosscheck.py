@@ -165,6 +165,69 @@ class KordocCrosscheckTests(unittest.TestCase):
         self.assertEqual(result["table_cell_count"], 2)
         self.assertEqual(result["command_label"], Path(sys.executable).name)
 
+    def test_run_kordoc_parse_treats_structured_failure_json_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "fake_kordoc_failure.py"
+            fake.write_text(
+                textwrap.dedent(
+                    r"""
+                    import json
+
+                    print(json.dumps({
+                        "success": False,
+                        "code": "UNSUPPORTED_FORMAT",
+                        "error": r"conversion failed at C:\private\institution\secret.hwp",
+                        "path": r"C:\private\institution\secret.hwp",
+                    }))
+                    raise SystemExit(1)
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+            result = run_kordoc_parse(
+                root / "sample.hwp",
+                command=f'"{sys.executable}" "{fake}"',
+                timeout_seconds=10,
+            )
+
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["error_code"], "UNSUPPORTED_FORMAT")
+        self.assertNotIn("private", encoded)
+        self.assertNotIn("secret.hwp", encoded)
+
+    def test_run_kordoc_parse_replaces_unsafe_structured_failure_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "fake_kordoc_unsafe_failure.py"
+            fake.write_text(
+                textwrap.dedent(
+                    r"""
+                    import json
+
+                    print(json.dumps({
+                        "success": False,
+                        "code": r"C:\private\institution\secret.hwp",
+                        "error": "SECRET_DIAGNOSTIC",
+                    }))
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+            result = run_kordoc_parse(
+                root / "sample.hwp",
+                command=f'"{sys.executable}" "{fake}"',
+                timeout_seconds=10,
+            )
+
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "kordoc_conversion_failed")
+        self.assertNotIn("private", encoded)
+        self.assertNotIn("SECRET_DIAGNOSTIC", encoded)
+
     def test_run_kordoc_parse_passes_silent_json_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

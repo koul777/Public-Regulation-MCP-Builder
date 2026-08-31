@@ -4,6 +4,7 @@ import unittest
 import tempfile
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from app.processors.mojibake import (
     MOJIBAKE_REMOVED_BLOCKS_KEY,
@@ -862,6 +863,74 @@ class QualityGateContentCoverageTests(unittest.TestCase):
             metrics["raw_chunk_to_source_char_ratio"], metrics["content_to_source_char_ratio"]
         )
 
+    def test_coverage_reuses_compacted_source_and_chunk_text(self) -> None:
+        gate = QualityGate()
+        chunks = [
+            chunk("chunk-a", text="제1조(목적) 본문"),
+            chunk("chunk-b", text="제2조(적용) 본문"),
+        ]
+        source_line_metrics = {
+            "source_lines_checked": 0,
+            "source_lines_missing_count": 0,
+            "source_line_coverage_ratio": 1.0,
+        }
+
+        with patch.object(
+            gate,
+            "_source_line_metrics",
+            return_value=source_line_metrics,
+        ), patch.object(gate, "_compact_text", wraps=gate._compact_text) as compact_text:
+            report = gate.evaluate(
+                [article_node()],
+                chunks,
+                [],
+                "doc_quality",
+                source_text="제1조(목적) 본문 제2조(적용) 본문",
+            )
+
+        self.assertEqual(2, compact_text.call_count)
+        self.assertEqual(
+            report.coverage_metrics["chunk_compact_chars"],
+            report.coverage_metrics["source_coverage_chunk_compact_chars"],
+        )
+
+    def test_source_line_metrics_reuses_precomputed_eligible_lines(self) -> None:
+        gate = QualityGate()
+        chunks = [
+            chunk("chunk-a", text="제1조(목적) 적용 대상과 기준 본문"),
+            chunk("chunk-b", text="제2조(적용) 처리 절차와 예외 본문"),
+        ]
+
+        with patch.object(gate, "_missing_source_lines", wraps=gate._missing_source_lines) as missing_lines:
+            metrics = gate._source_line_metrics(
+                "제1조(목적) 적용 대상과 기준 본문\n제2조(적용) 처리 절차와 예외 본문",
+                chunks,
+            )
+
+        self.assertEqual(2, metrics["source_lines_checked"])
+        self.assertEqual(0, metrics["source_lines_missing_count"])
+        self.assertIn("eligible_lines", missing_lines.call_args.kwargs)
+        self.assertEqual(2, len(missing_lines.call_args.kwargs["eligible_lines"]))
+
+    def test_missing_source_lines_can_use_caller_precomputed_eligible_lines(self) -> None:
+        gate = QualityGate()
+        source_text = "제1조(목적) 적용 대상과 기준 본문\n제2조(적용) 처리 절차와 예외 누락"
+        chunks = [chunk("chunk-a", text="제1조(목적) 적용 대상과 기준 본문")]
+        eligible_lines = gate._eligible_source_lines(source_text)
+
+        with patch.object(
+            gate,
+            "_eligible_source_lines",
+            side_effect=AssertionError("eligible source lines should be reused"),
+        ):
+            missing = gate._missing_source_lines(
+                source_text,
+                chunks,
+                eligible_lines=eligible_lines,
+            )
+
+        self.assertEqual(["제2조(적용) 처리 절차와 예외 누락"], missing)
+
 
 class QualitySourceLineCoverageTests(unittest.TestCase):
     """별표·별지의 산문이 통째로 빠져도 글자 수 비율은 통과시켰다.
@@ -927,6 +996,35 @@ class QualitySourceLineCoverageTests(unittest.TestCase):
         self.assertTrue(self._check(report).passed)
         self.assertEqual(0, report.coverage_metrics["source_lines_missing_count"])
         self.assertEqual(1.0, report.coverage_metrics["source_line_coverage_ratio"])
+
+    def test_repeated_present_lines_keep_per_occurrence_metrics(self) -> None:
+        line = "Article one purpose clause remains present in indexed chunk text."
+        source = "\n".join([line, line, line])
+        report = self._report([line], source)
+
+        self.assertTrue(self._check(report).passed)
+        self.assertEqual(3, report.coverage_metrics["source_lines_checked"])
+        self.assertEqual(0, report.coverage_metrics["source_lines_missing_count"])
+        self.assertEqual(1.0, report.coverage_metrics["source_line_coverage_ratio"])
+
+    def test_repeated_normalized_missing_lines_keep_counts_and_samples(self) -> None:
+        source_lines = [
+            "Repeated missing source clause alpha beta gamma.",
+            "Repeatedmissingsourceclausealphabetagamma.",
+            "  Repeated missing source clause alpha beta gamma.  ",
+        ]
+        source = "\n".join(source_lines)
+        gate = QualityGate()
+        report = self._report(["Unrelated indexed content that is long enough for comparison."], source)
+
+        self.assertFalse(self._check(report).passed)
+        self.assertEqual(3, report.coverage_metrics["source_lines_checked"])
+        self.assertEqual(3, report.coverage_metrics["source_lines_missing_count"])
+        self.assertEqual(0.0, report.coverage_metrics["source_line_coverage_ratio"])
+        self.assertEqual(
+            [line.strip() for line in source_lines],
+            gate._missing_source_lines(source, []),
+        )
 
     def test_line_split_across_two_chunks_is_not_a_false_alarm(self) -> None:
         source = "제1조(목적) 이 규정은 교직원 표창에 관한 사항을 정함을 목적으로 한다."

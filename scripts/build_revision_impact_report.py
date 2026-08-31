@@ -439,7 +439,7 @@ def make_markdown(result: dict[str, Any]) -> str:
             f"{cell(short_hash(row.get('after_content_hash')))} | {cell(row.get('after_snippet') or row.get('before_snippet'))} |"
         )
     lines.extend(["", "## Operational Meaning", ""])
-    lines.append("- `changed` and `added`: send only those units to human review and approval before reindexing.")
+    lines.append("- `changed` and `added`: show a human-review recommendation for only those units, then require explicit operator approval before reindexing; review completion is not an indexing gate.")
     lines.append("- `removed`: confirm removal, then deindex the prior approved vector records.")
     lines.append("- `unchanged`: candidate for previous approval reuse if tenant/security metadata also matches.")
     return "\n".join(lines) + "\n"

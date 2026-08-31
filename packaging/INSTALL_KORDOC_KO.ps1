@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$KordocPackage = "kordoc@4.12.0"
 
 function Fail-KordocSetup([string]$Message) {
     Write-Error $Message
@@ -17,10 +18,10 @@ if (-not $npm) {
 }
 
 if (-not $SkipInstall) {
-    Write-Host "Kordoc을 현재 사용자 환경에 전역 설치합니다..."
-    & $npm.Source install -g kordoc
+    Write-Host "검증된 Kordoc 4.12.0 고정 버전을 현재 사용자 환경에 전역 설치·업데이트합니다..."
+    & $npm.Source install -g $KordocPackage
     if ($LASTEXITCODE -ne 0) {
-        Fail-KordocSetup "npm install -g kordoc가 실패했습니다. 위 npm 오류를 확인하세요."
+        Fail-KordocSetup "npm install -g $KordocPackage가 실패했습니다. 위 npm 오류를 확인하세요."
     }
 }
 

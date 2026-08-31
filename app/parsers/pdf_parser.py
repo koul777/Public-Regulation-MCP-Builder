@@ -28,6 +28,15 @@ ROMAN_FOOTNOTE_MARKERS = {chr(code) for code in range(0x2170, 0x2178)}
 PADDLE_OCR_BACKENDS = {"paddle", "paddleocr", "ppocrv5", "korean-ppocrv5"}
 
 
+def _median_of_sorted(values: list[float]) -> float:
+    """Return the median of a non-empty ascending list without sorting it again."""
+
+    midpoint = len(values) // 2
+    if len(values) % 2:
+        return values[midpoint]
+    return (values[midpoint - 1] + values[midpoint]) / 2.0
+
+
 class PDFParser(BaseParser):
     supported_extensions = {".pdf"}
 
@@ -72,7 +81,23 @@ class PDFParser(BaseParser):
         try:
             with fitz.open(path) as doc:
                 for page_index, page in enumerate(doc, start=1):
-                    blocks = self._layout_line_blocks(page, page_index)
+                    # PyMuPDF's raw layout and drawing extraction are among the
+                    # more expensive per-page operations.  Capture them once and
+                    # share the immutable snapshots across layout, table, and
+                    # footnote analysis instead of asking the page to rebuild
+                    # the same structures for every helper.
+                    raw_dict = page.get_text("rawdict")
+                    drawings = page.get_drawings()
+                    roman_footnote_markers = self._roman_footnote_markers(
+                        page,
+                        raw_dict=raw_dict,
+                    )
+                    blocks = self._layout_line_blocks(
+                        page,
+                        page_index,
+                        raw_dict=raw_dict,
+                        drawings=drawings,
+                    )
                     if not blocks:
                         blocks = self._text_block_fallback(page)
                     try:
@@ -89,9 +114,28 @@ class PDFParser(BaseParser):
                         # be treated as a low-risk text document.
                         if page_images:
                             missing_content_pages.append(page_index)
-                    table_regions.extend(self._table_regions(page, page_index, blocks))
-                    footnote_links.extend(self._footnote_links(page, page_index))
-                    footnote_marker_references.extend(self._footnote_marker_references(page, page_index))
+                    table_regions.extend(
+                        self._table_regions(
+                            page,
+                            page_index,
+                            blocks,
+                            drawings=drawings,
+                        )
+                    )
+                    footnote_links.extend(
+                        self._footnote_links(
+                            page,
+                            page_index,
+                            markers=roman_footnote_markers,
+                        )
+                    )
+                    footnote_marker_references.extend(
+                        self._footnote_marker_references(
+                            page,
+                            page_index,
+                            markers=roman_footnote_markers,
+                        )
+                    )
                     if any(block.metadata.get("pdf_layout_reading_order_review") for block in blocks):
                         ambiguous_two_column_pages.append(page_index)
                     for block in blocks:
@@ -379,20 +423,33 @@ class PDFParser(BaseParser):
             merged.append(page.model_copy(update={"blocks": blocks}))
         return merged
 
-    def _layout_line_blocks(self, page, page_no: int) -> list[ParsedBlock]:
-        groups = self._visual_char_groups(page)
+    def _layout_line_blocks(
+        self,
+        page,
+        page_no: int,
+        *,
+        raw_dict: dict | None = None,
+        drawings: list[dict] | None = None,
+    ) -> list[ParsedBlock]:
+        groups = self._visual_char_groups(page, raw_dict=raw_dict)
         blocks: list[ParsedBlock] = []
         page_width = float(page.rect.width)
         page_height = float(page.rect.height)
-        column_boundary = self._two_column_boundary(page, groups, page_width=page_width)
+        column_boundary = self._two_column_boundary(
+            page,
+            groups,
+            page_width=page_width,
+            drawings=drawings,
+        )
         for line_index, chars in enumerate(groups, start=1):
             segments = self._visual_line_segments(
                 chars,
                 page_width=page_width,
                 column_boundary=column_boundary,
+                already_ordered=True,
             )
             for segment_index, segment_chars in enumerate(segments, start=1):
-                text = self._text_from_chars(segment_chars)
+                text = self._text_from_chars(segment_chars, already_ordered=True)
                 if not text:
                     continue
                 x0 = min(item["bbox"][0] for item in segment_chars)
@@ -433,8 +490,8 @@ class PDFParser(BaseParser):
             )
         return blocks
 
-    def _visual_char_groups(self, page) -> list[list[dict]]:
-        raw = page.get_text("rawdict")
+    def _visual_char_groups(self, page, *, raw_dict: dict | None = None) -> list[list[dict]]:
+        raw = raw_dict if raw_dict is not None else page.get_text("rawdict")
         chars: list[dict] = []
         for block in raw.get("blocks", []):
             for line in block.get("lines", []):
@@ -454,24 +511,37 @@ class PDFParser(BaseParser):
                         )
         chars.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
         groups: list[list[dict]] = []
+        # chars는 y 좌표로 먼저 정렬되어 있으므로 각 그룹에 추가되는 y 값도 오름차순이다.
+        # 그룹 후보를 확인할 때마다 statistics.median이 같은 좌표를 다시 정렬하지 않도록
+        # 정렬된 y 목록을 나란히 유지한다. 그룹 선택 기준과 최종 순서는 기존과 동일하다.
+        group_y_values: list[list[float]] = []
         for char in chars:
             y0 = char["bbox"][1]
             size = float(char.get("size") or 10)
             tolerance = max(2.2, size * 0.32)
-            target: list[dict] | None = None
-            for group in reversed(groups[-8:]):
-                group_y = median(item["bbox"][1] for item in group)
+            target_index: int | None = None
+            first_candidate_index = max(0, len(groups) - 8)
+            for group_index in range(len(groups) - 1, first_candidate_index - 1, -1):
+                group_y = _median_of_sorted(group_y_values[group_index])
                 if abs(y0 - group_y) <= tolerance:
-                    target = group
+                    target_index = group_index
                     break
-            if target is None:
+            if target_index is None:
                 groups.append([char])
+                group_y_values.append([y0])
             else:
-                target.append(char)
+                groups[target_index].append(char)
+                group_y_values[target_index].append(y0)
         for group in groups:
             group.sort(key=lambda item: item["bbox"][0])
-        groups.sort(key=lambda group: (median(item["bbox"][1] for item in group), min(item["bbox"][0] for item in group)))
-        return groups
+        grouped_with_y = list(zip(groups, group_y_values))
+        grouped_with_y.sort(
+            key=lambda item: (
+                _median_of_sorted(item[1]),
+                item[0][0]["bbox"][0],
+            )
+        )
+        return [group for group, _y_values in grouped_with_y]
 
     def _visual_line_segments(
         self,
@@ -479,8 +549,9 @@ class PDFParser(BaseParser):
         *,
         page_width: float,
         column_boundary: float | None = None,
+        already_ordered: bool = False,
     ) -> list[list[dict]]:
-        ordered = sorted(chars, key=lambda item: item["bbox"][0])
+        ordered = chars if already_ordered else sorted(chars, key=lambda item: item["bbox"][0])
         if len(ordered) < 8:
             return [ordered]
         widths = [max(0.1, item["bbox"][2] - item["bbox"][0]) for item in ordered]
@@ -510,18 +581,32 @@ class PDFParser(BaseParser):
             segments.append(current)
         if len(segments) <= 1:
             return [ordered]
-        if any(len(self._text_from_chars(segment).replace(" ", "")) < 6 for segment in segments):
+        if any(
+            len(self._text_from_chars(segment, already_ordered=True).replace(" ", "")) < 6
+            for segment in segments
+        ):
             return [ordered]
         return segments
 
-    def _two_column_boundary(self, page, groups: list[list[dict]], *, page_width: float) -> float | None:
-        get_drawings = getattr(page, "get_drawings", None)
-        if callable(get_drawings):
-            try:
-                if len(get_drawings()) >= 16:
-                    return None
-            except (RuntimeError, TypeError, ValueError):
-                pass
+    def _two_column_boundary(
+        self,
+        page,
+        groups: list[list[dict]],
+        *,
+        page_width: float,
+        drawings: list[dict] | None = None,
+    ) -> float | None:
+        if drawings is not None:
+            if len(drawings) >= 16:
+                return None
+        else:
+            get_drawings = getattr(page, "get_drawings", None)
+            if callable(get_drawings):
+                try:
+                    if len(get_drawings()) >= 16:
+                        return None
+                except (RuntimeError, TypeError, ValueError):
+                    pass
 
         boundary = page_width / 2.0
         margin = page_width * 0.015
@@ -529,7 +614,11 @@ class PDFParser(BaseParser):
         right_segments: list[list[dict]] = []
         split_group_count = 0
         for chars in groups:
-            segments = self._visual_line_segments(chars, page_width=page_width)
+            segments = self._visual_line_segments(
+                chars,
+                page_width=page_width,
+                already_ordered=True,
+            )
             if len(segments) > 1:
                 split_group_count += 1
             for segment in segments:
@@ -653,7 +742,12 @@ class PDFParser(BaseParser):
             *sorted(footer_blocks, key=visual_key),
         ]
 
-    def _text_from_chars(self, chars: list[dict]) -> str:
+    def _text_from_chars(
+        self,
+        chars: list[dict],
+        *,
+        already_ordered: bool = False,
+    ) -> str:
         if not chars:
             return ""
         widths = [max(0.1, item["bbox"][2] - item["bbox"][0]) for item in chars]
@@ -662,7 +756,8 @@ class PDFParser(BaseParser):
         parts: list[str] = []
         previous_x1: float | None = None
         previous_char = ""
-        for item in sorted(chars, key=lambda value: value["bbox"][0]):
+        ordered = chars if already_ordered else sorted(chars, key=lambda value: value["bbox"][0])
+        for item in ordered:
             char = str(item.get("c") or "")
             if not char.strip():
                 continue
@@ -689,10 +784,18 @@ class PDFParser(BaseParser):
             return True
         return False
 
-    def _table_regions(self, page, page_no: int, blocks: list[ParsedBlock]) -> list[dict]:
+    def _table_regions(
+        self,
+        page,
+        page_no: int,
+        blocks: list[ParsedBlock],
+        *,
+        drawings: list[dict] | None = None,
+    ) -> list[dict]:
         horizontal: list[tuple[float, float, float, float]] = []
         vertical: list[tuple[float, float, float, float]] = []
-        for drawing in page.get_drawings():
+        page_drawings = drawings if drawings is not None else page.get_drawings()
+        for drawing in page_drawings:
             for item in drawing.get("items", []):
                 kind = item[0]
                 if kind == "l":
@@ -760,12 +863,15 @@ class PDFParser(BaseParser):
         if not values:
             return []
         clusters: list[list[float]] = []
+        cluster_medians: list[float] = []
         for value in sorted(values):
-            if clusters and abs(value - median(clusters[-1])) <= tolerance:
+            if clusters and abs(value - cluster_medians[-1]) <= tolerance:
                 clusters[-1].append(value)
+                cluster_medians[-1] = _median_of_sorted(clusters[-1])
             else:
                 clusters.append([value])
-        return [round(float(median(cluster)), 3) for cluster in clusters]
+                cluster_medians.append(value)
+        return [round(float(center), 3) for center in cluster_medians]
 
     def _table_title_above(self, blocks: list[ParsedBlock], x0: float, y0: float, x1: float) -> str | None:
         candidates: list[tuple[float, float, str]] = []
@@ -788,8 +894,8 @@ class PDFParser(BaseParser):
         candidates.sort(key=lambda item: (item[0], -item[1]))
         return candidates[0][2]
 
-    def _roman_footnote_markers(self, page) -> list[dict]:
-        raw = page.get_text("rawdict")
+    def _roman_footnote_markers(self, page, *, raw_dict: dict | None = None) -> list[dict]:
+        raw = raw_dict if raw_dict is not None else page.get_text("rawdict")
         markers: list[dict] = []
         for block in raw.get("blocks", []):
             for line in block.get("lines", []):
@@ -802,8 +908,14 @@ class PDFParser(BaseParser):
                         markers.append({"marker": value, "bbox": bbox, "size": float(span.get("size") or 0)})
         return markers
 
-    def _footnote_links(self, page, page_no: int) -> list[dict]:
-        markers = self._roman_footnote_markers(page)
+    def _footnote_links(
+        self,
+        page,
+        page_no: int,
+        *,
+        markers: list[dict] | None = None,
+    ) -> list[dict]:
+        markers = markers if markers is not None else self._roman_footnote_markers(page)
         if not markers:
             return []
         page_height = float(page.rect.height)
@@ -827,8 +939,14 @@ class PDFParser(BaseParser):
             )
         return result
 
-    def _footnote_marker_references(self, page, page_no: int) -> list[dict]:
-        markers = self._roman_footnote_markers(page)
+    def _footnote_marker_references(
+        self,
+        page,
+        page_no: int,
+        *,
+        markers: list[dict] | None = None,
+    ) -> list[dict]:
+        markers = markers if markers is not None else self._roman_footnote_markers(page)
         if not markers:
             return []
         page_height = float(page.rect.height)

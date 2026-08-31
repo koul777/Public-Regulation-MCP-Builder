@@ -1649,6 +1649,7 @@ class RoutesRagTests(unittest.TestCase):
                         chunk_ids=["scope-1"],
                         approval_id="approval-scope",
                         security_level="confidential",
+                        allow_reapproval=True,
                     ),
                     admin,
                 )
@@ -3089,6 +3090,7 @@ def _approval_request_with_evidence(
     approval_id: str,
     security_level: str = "internal",
     review_flags_acknowledged: bool = False,
+    allow_reapproval: bool = False,
 ) -> routes_documents.ApprovalRequest:
     evidence = _write_approval_evidence(
         root,
@@ -3101,6 +3103,7 @@ def _approval_request_with_evidence(
         approval_id=approval_id,
         security_level=security_level,
         review_flags_acknowledged=review_flags_acknowledged,
+        allow_reapproval=allow_reapproval,
         **evidence,
     )
 

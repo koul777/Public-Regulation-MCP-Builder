@@ -28,6 +28,9 @@ from scripts.analyze_regulation_corpus import summarize_pipeline_counts
 
 DEFAULT_KORDOC_COMMAND = os.getenv("KORDOC_COMMAND", "kordoc")
 WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py")
+KORDOC_ERROR_CODE_MAX_LENGTH = 64
+KORDOC_ERROR_CODE_FALLBACK = "kordoc_conversion_failed"
+KORDOC_ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 LOCAL_PATH_PATTERN = re.compile(
     r"(?i)(?:\b[a-z]:\\[^\s'\"<>|]+|\\\\[^\s'\"<>|]+|/(?:users|home|tmp|var|etc)/[^\s'\"<>|]+)"
 )
@@ -117,6 +120,23 @@ def run_kordoc_parse(path: Path, command: str = DEFAULT_KORDOC_COMMAND, timeout_
         temp_dir.cleanup()
 
     if completed.returncode != 0:
+        try:
+            failure_payload = load_json_payload(completed.stdout or "")
+        except json.JSONDecodeError:
+            failure_payload = None
+        failure_code = _kordoc_failure_code(failure_payload)
+        if failure_code is not None:
+            result = {
+                "status": "failed",
+                "command_label": command_label,
+                "returncode": completed.returncode,
+                "error_code": failure_code,
+                "stderr_chars": len(completed.stderr or ""),
+                "stdout_chars": len(completed.stdout or ""),
+            }
+            if normalized_input_path:
+                result["input_path_normalized_for_kordoc"] = True
+            return result
         return {
             "status": "failed",
             "command_label": command_label,
@@ -135,6 +155,17 @@ def run_kordoc_parse(path: Path, command: str = DEFAULT_KORDOC_COMMAND, timeout_
             "stdout_chars": len(completed.stdout or ""),
         }
 
+    failure_code = _kordoc_failure_code(payload)
+    if failure_code is not None:
+        result = {
+            "status": "failed",
+            "command_label": command_label,
+            "error_code": failure_code,
+        }
+        if normalized_input_path:
+            result["input_path_normalized_for_kordoc"] = True
+        return result
+
     metrics = extract_kordoc_metrics(payload)
     metrics.update(
         {
@@ -145,6 +176,22 @@ def run_kordoc_parse(path: Path, command: str = DEFAULT_KORDOC_COMMAND, timeout_
     if normalized_input_path:
         metrics["input_path_normalized_for_kordoc"] = True
     return metrics
+
+
+def _kordoc_failure_code(payload: Any) -> str | None:
+    """Recognize Kordoc 4.10+'s structured failure JSON safely."""
+
+    if not isinstance(payload, dict) or payload.get("success") is not False:
+        return None
+    value = payload.get("code")
+    code = value.strip() if isinstance(value, str) else ""
+    if (
+        not code
+        or len(code) > KORDOC_ERROR_CODE_MAX_LENGTH
+        or KORDOC_ERROR_CODE_PATTERN.fullmatch(code) is None
+    ):
+        return KORDOC_ERROR_CODE_FALLBACK
+    return code
 
 
 def extract_kordoc_metrics(payload: Any) -> dict[str, Any]:
@@ -341,7 +388,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             "",
             "- Treat this as an internal QA signal only.",
             "- Do not index Kordoc output directly.",
-            "- Convert disagreements into AI review draft and human review tasks before approval.",
+            "- Convert disagreements into an AI review draft and show human-review recommendations before explicit operator approval; review completion is not an indexing gate.",
         ]
     )
     return "\n".join(lines).strip() + "\n"
