@@ -10,7 +10,8 @@
 
 - Use synthetic or explicitly redistributable samples only.
 - Streamlit is a local-only operator console, not a protected shared-deployment UI.
-- Preprocessing output is a review preview. Official RAG/MCP indexing starts only after human review and approval.
+- Preprocessing output is a review preview. Official RAG/MCP indexing starts only after an operator's explicit
+  approval action; unreviewed approval remains distinguishable in the audit journal.
 
 ## 처음 사용자 화면 흐름
 
@@ -29,22 +30,21 @@
    가능한 규정 파일 하나를 선택한 뒤 **전처리 시작**을 누르고 **전처리 완료**를 확인한다. 기본은 빠른 구조
    전처리이며, 외부 AI 검수는 왼쪽 사이드바 **AI 검수**에서 켜고 API 키를 저장해 둔
    경우에만 실행된다. 켜 두면 이후 전처리에 자동으로 함께 실행되므로 이 화면에서
-   따로 고르지 않는다.
+   따로 고르지 않는다. 같은 기관에서 원본 hash와 전처리 옵션이 모두 같은 완료 결과가
+   있으면 업로드 화면은 기존 결과를 재사용한다. 파이프라인·품질 프로필·Kordoc 버전이
+   달라지거나 사용자가 개정 메타데이터를 직접 지정하면 재사용하지 않고 새로 전처리한다.
 2. `② 결과 확인`의 **요약** 탭에서 **전처리된 글자 확인** 미리보기가 원본과 같은
    한글로 보이는지 확인하고, **이슈**와 **표·별표** 탭의 확인 필요 항목을 읽는다. 화면
-   아래에서 **전처리된 글자가 원본 규정과 같은 한글로 보입니다**와 **품질 경고·이슈와
-   표·별표 결과를 확인했습니다**를 순서대로 선택한다. 초보자 모드에서는 중복 검수를
-   피하려고 `정리된 내용(청크)` 탭을 숨기며, 조항별 원본 대조는 다음 ③단계에서 한다.
-   품질 통과 표시는 자동 승인이 아니며, 결과가 원본과 다르면 승인 단계로 넘기지 않는다.
+   아래의 두 확인란은 권고 절차이며, 순서대로 확인하면 좋다. 선택하지 않아도 ③으로
+   이동할 수 있다. 초보자 모드에서는 중복 검수를 피하려고 `정리된 내용(청크)` 탭을
+   숨기며, 조항별 원본 대조는 다음 ③단계에서 한다. 품질 통과 표시는 자동 승인이
+   아니며, 결과가 원본과 다르면 승인 단계로 넘기지 않는다.
 3. `③ 검수하고 승인`은 세 단계뿐이다. **1단계** 규정 디렉터리에서 **규정 열기**를 눌러
-   검수할 규정을 연다. **2단계** 규정을 위에서 아래로 스크롤하며 조항마다 **원본·전처리본·AI
-   검수 의견**을 비교한다. AI 추가 검수는 본문을 다시 쓰지 않고 확인할 곳만 표시하므로,
-   검수를 켰는지와 무관하게 가운데 전처리본이 ✅ 최종본이다. 틀린 부분은 그 칸에서 직접
-   고친다. 각 AI 표시 항목마다 **수정 필요로 판단** 또는 **해당 없음**을 고른다. **수정
-   필요로 판단**했다면 가운데 최종본을 실제로 고치거나, 본문 수정이 필요 없었던 이유를
-   **수정 필요 항목 처리 메모**에 남겨야 한다. 마지막으로 **원본과 최종본을 직접
-   대조했다**는 확인란을 선택해야 한다. 조항이 여러 쪽이면 검증 시트
-   쪽을 이동해 모든 조항을 확인한다. **3단계** **이 규정 최종 확정 · 승인하고 색인**을 누르면 고친 내용이
+   검수할 규정을 연다. **2단계**에는 조항마다 **원본·전처리본·AI 검수 의견**이 표시된다.
+   가능하면 규정을 위에서 아래로 대조하고 틀린 부분을 가운데 ✅ 최종본에서 직접 고친다.
+   AI 추가 검수는 본문을 다시 쓰지 않고 사람이 확인할 곳만 표시한다. 확인하지 않은 조항이
+   남으면 초보자·일반 모드 모두 사람 검수를 권고하는 경고를 표시하지만, 별도 확인 체크를
+   요구하지는 않는다. **3단계** **이 규정 최종 확정 · 승인하고 색인**을 누르면 현재 최종본이
    자동으로 반영되고 승인·색인까지 끝난다. 제외할 조항만 목록에서 고르고 사유와 확인을
    마친 뒤 **선택한 조항 반려**를 누른다. 규정을 여러 개 선택했다면 3단계 아래
    **전체 규정 확인**을 켜서 선택한 규정의 미승인 조항을 규정 순서대로 한 화면에서
@@ -52,9 +52,11 @@
    **승인·색인 완료**가 함께 표시되거나 명시 반려로 처리 방향이 결정돼야 다음 단계로
    이동한다.
 
-   초보자 안내 모드에서는 확인 생략 승인 입력을 표시하지 않는다. 일반 모드에서만 관리자용
-   **확인 없이 승인해야 하는 경우**를 열 수 있으며, 사유를 입력해 실행하면 정상 검수 완료로
-   기록하지 않고 `approved_without_review` 감사 이벤트와 승인 우회 사유를 별도로 남긴다.
+   사람 검수 확인 없이 최종 버튼을 누르면 초보자·일반 모드 모두 기본 미검수 승인 사유와
+   `approved_without_review` 감사 이벤트를 남긴다. 이는 정상 검수 완료로 기록되지 않는다.
+   일반 모드에서는 선택 입력을 열어 기본 감사 사유를 더 구체적인 사유로 바꿀 수 있다.
+   이 단축 흐름도 보안 검사, 불명확한 문서 경계 차단, tenant 격리, 승인 journal·내용 hash
+   검증을 건너뛰지 않는다.
 4. ④는 첫 선택에 따라 나뉜다. **로컬 Qwen**을 골랐다면 `④ Qwen 규정 챗봇·AI 연결`에서
    **독립 Qwen 챗봇 실행**을 누른다. 새 브라우저 창에서 아래 여섯 단계를 따른다.
 
@@ -98,9 +100,13 @@
 필요한 Kordoc이 없으면 화면은 Node.js/npm을 이용한 사용자 전역 설치임을 먼저 설명한다.
 설치에 동의할 때만 **Kordoc 설치·검증 시작**을 누른다. 설치 없이 전처리할 수는 있지만,
 설치 후에는 앱을 완전히 종료하고 `START_HERE.bat`으로 다시 실행해 **Kordoc 사용 가능**을
-확인한다. 설치 없이 먼저 처리했다면 나중에 새 초안을 전처리하고 다시 검수·승인해야 한다.
+확인한다. 설치 스크립트는 회귀 검증 기준과 같은 Kordoc `4.12.0`을 설치한다. 이 버전은
+HWP3 도형·텍스트 상자 복구와 구조화 실패 코드 처리를 포함하며, 실제 해석된 버전은 전처리
+옵션 증거에 기록된다. 설치 없이 먼저 처리했거나 기록된 Kordoc 버전이 달라졌다면 나중에 새
+초안을 전처리하고 검수 권고를 확인한 운영자가 승인해야 한다.
 재전처리는 MCP 화면에 들어가기만 해서는 시작되지 않고, 사용자가 **안전 재전처리** 버튼을
-직접 눌렀을 때만 시작된다.
+직접 눌렀을 때만 시작된다. 재전처리 후에도 사람 검수는 권고 사항이며, 생략 승인은
+사유와 감사 이벤트로 따로 남는다.
 
 마지막 단계의 **AI 앱에서 search와 fetch 도구 호출이 성공한 것을 확인했습니다**는
 MCP 이름 입력이나 파일 생성만으로 선택하지 않는다. 화면 아래의 앱별 등록·연결 진단을 먼저 마치고,
@@ -178,11 +184,11 @@ For release evidence, use the public audit, cleanup plan, release gate, approval
 The official path is:
 
 ```text
-source file -> preprocessing -> quality flags -> human review -> approval journal
+source file -> preprocessing -> quality flags -> review recommendation -> explicit operator approval journal
 -> approved local regulation DB/vector index -> RAG/MCP tools
 ```
 
-Unreviewed results must remain `UNREVIEWED_PREVIEW` or `UNREVIEWED_POC_REVIEW`. They must not be treated as official approved vectors. Reindex approved chunks only after review flags are acknowledged, review-batch decisions are validated, and release evidence is regenerated.
+Results that have not received an explicit operator approval must remain `UNREVIEWED_PREVIEW` or `UNREVIEWED_POC_REVIEW`; they must not be treated as official vectors. Human review is recommended but does not block the final approval button. An approval without review must record its reason and an `approved_without_review` event. Reindex only explicitly approved chunks after approval evidence is validated and release evidence is regenerated.
 
 > 검색 정규화가 NFKC로 바뀐 버전으로 업그레이드하면 기존 BM25 v2 색인은 호환되지 않는
 > 것으로 판정된다. 승인 저널과 승인 범위는 그대로 유지하되, 승인된 청크의 색인을 다시

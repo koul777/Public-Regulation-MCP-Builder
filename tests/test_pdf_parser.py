@@ -169,6 +169,92 @@ class PDFParserTests(unittest.TestCase):
         self.assertEqual("review_embedded_images", parsed.metadata["parser_uncertainty_recommendation"])
         self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
 
+    def test_parse_snapshots_raw_layout_and_drawings_once_per_page(self) -> None:
+        page = _FakePdfPage(
+            width=600,
+            height=800,
+            lines=[[_fake_chars("Article purpose \u2170", x=40, y=100)]],
+        )
+
+        class FakePdfDocument:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def __iter__(self):
+                return iter([page])
+
+        fake_fitz = SimpleNamespace(open=lambda path: FakePdfDocument())
+        with patch("app.utils.fitz_compat.fitz", fake_fitz):
+            parsed = PDFParser().parse(Path("snapshot.pdf"), "doc_snapshot_pdf")
+
+        self.assertIn("Article", parsed.raw_text)
+        self.assertEqual(1, page.get_text_calls["rawdict"])
+        self.assertEqual(1, page.get_drawings_calls)
+        self.assertEqual(
+            ["\u2170"],
+            parsed.metadata["pdf_footnote_marker_references"][0]["markers"],
+        )
+
+    def test_visual_char_groups_reuses_sorted_y_values_without_recomputing_median(self) -> None:
+        page = _FakePdfPage(
+            width=600,
+            height=800,
+            lines=[
+                [[
+                    {"c": "B", "bbox": (45.0, 100.0, 50.0, 110.0)},
+                    {"c": "A", "bbox": (40.0, 101.0, 45.0, 111.0)},
+                ]],
+                [[
+                    {"c": "D", "bbox": (45.0, 120.0, 50.0, 130.0)},
+                    {"c": "C", "bbox": (40.0, 121.0, 45.0, 131.0)},
+                ]],
+            ],
+        )
+
+        with patch(
+            "app.parsers.pdf_parser.median",
+            side_effect=AssertionError("visual grouping must not sort the same y values again"),
+        ):
+            groups = PDFParser()._visual_char_groups(page)
+
+        self.assertEqual(
+            [["A", "B"], ["C", "D"]],
+            [[str(item["c"]) for item in group] for group in groups],
+        )
+
+    def test_cluster_positions_reuses_sorted_values_without_recomputing_median(self) -> None:
+        with patch(
+            "app.parsers.pdf_parser.median",
+            side_effect=AssertionError("clustering must reuse sorted values"),
+        ):
+            clusters = PDFParser()._cluster_positions([10.0, 11.0, 11.5, 50.0, 51.0])
+
+        self.assertEqual([11.0, 50.5], clusters)
+
+    def test_layout_line_blocks_passes_ordered_segments_to_text_rebuilder(self) -> None:
+        page = _FakePdfPage(
+            width=600,
+            height=800,
+            lines=[[_fake_chars("ordered segment", x=40, y=100)]],
+        )
+        ordered_flags: list[bool] = []
+        parser = PDFParser()
+        original = PDFParser._text_from_chars
+
+        def _record_ordered(self, chars, *, already_ordered: bool = False):  # type: ignore[no-untyped-def]
+            ordered_flags.append(already_ordered)
+            return original(self, chars, already_ordered=already_ordered)
+
+        with patch.object(PDFParser, "_text_from_chars", _record_ordered):
+            blocks = parser._layout_line_blocks(page, 1)
+
+        self.assertTrue(blocks)
+        self.assertTrue(ordered_flags)
+        self.assertTrue(all(ordered_flags))
+
     def test_layout_line_blocks_split_wide_two_column_lines(self) -> None:
         page = _FakePdfPage(
             width=600,
@@ -364,8 +450,11 @@ class _FakePdfPage:
         self.rect = _FakeRect(width, height)
         self._lines = lines
         self._drawings = drawings or []
+        self.get_text_calls: dict[str, int] = {}
+        self.get_drawings_calls = 0
 
     def get_text(self, mode: str):
+        self.get_text_calls[mode] = self.get_text_calls.get(mode, 0) + 1
         if mode == "blocks":
             return []
         if mode != "rawdict":
@@ -390,6 +479,7 @@ class _FakePdfPage:
         }
 
     def get_drawings(self) -> list[dict]:
+        self.get_drawings_calls += 1
         return self._drawings
 
     def get_images(self, *, full: bool = False) -> list[tuple]:

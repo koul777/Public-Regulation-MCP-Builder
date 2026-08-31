@@ -304,7 +304,7 @@ class QualityGate:
         # 여기에 실어 두지 않으면 손상된 원본이 조용히 통과한다.
         text_quality_metrics.update(self._normalizer_mojibake_metrics(normalizer_metadata))
         coverage_metrics = self._coverage_metrics(source_text, chunks)
-        if source_text and self._compact_text(source_text) and not nodes:
+        if source_text and int(coverage_metrics.get("source_compact_chars") or 0) and not nodes:
             structure_metrics["nonempty_source_without_structure"] = 1
 
         checks = [
@@ -776,12 +776,23 @@ class QualityGate:
         }
 
     def _coverage_metrics(self, source_text: str | None, chunks: list[Chunk]) -> dict[str, int | float]:
-        source_chars = len(self._compact_text(source_text or ""))
-        raw_chunk_chars = len(self._compact_text("\n".join(chunk.normalized_text or chunk.text for chunk in chunks)))
+        source_compact = self._compact_text(source_text or "")
+        all_chunk_text = "\n".join(chunk.normalized_text or chunk.text for chunk in chunks)
+        all_chunk_compact = self._compact_text(all_chunk_text)
+        source_chars = len(source_compact)
+        raw_chunk_chars = len(all_chunk_compact)
         source_coverage_chunks = [chunk for chunk in chunks if not self._source_coverage_exempt(chunk)]
-        source_coverage_chunk_chars = len(
-            self._compact_text("\n".join(chunk.normalized_text or chunk.text for chunk in source_coverage_chunks))
-        )
+        if len(source_coverage_chunks) == len(chunks):
+            source_coverage_chunk_chars = raw_chunk_chars
+        else:
+            source_coverage_chunk_chars = len(
+                self._compact_text(
+                    "\n".join(
+                        chunk.normalized_text or chunk.text
+                        for chunk in source_coverage_chunks
+                    )
+                )
+            )
         exempt_chunk_chars = max(0, raw_chunk_chars - source_coverage_chunk_chars)
         ratio = round(source_coverage_chunk_chars / source_chars, 3) if source_chars else 0.0
         raw_ratio = round(raw_chunk_chars / source_chars, 3) if source_chars else 0.0
@@ -789,10 +800,8 @@ class QualityGate:
         # ``raw_chunk_to_source_char_ratio``는 서식 문자 때문에 실측 228건에서 100~119%로
         # 부풀어 있어, 본문이 빠져도 그 완충재가 손실을 가려 준다. 기준을 바로 조이면
         # 표 내용이 ``table_cell_rows``에만 있는 문서를 오탐으로 반려하므로, 먼저 관측만 한다.
-        content_chunk_chars = len(
-            self._coverage_text("\n".join(chunk.normalized_text or chunk.text for chunk in chunks))
-        )
-        content_source_chars = len(self._coverage_text(source_text or ""))
+        content_chunk_chars = len(TABLE_SCAFFOLD_PATTERN.sub("", all_chunk_compact))
+        content_source_chars = len(TABLE_SCAFFOLD_PATTERN.sub("", source_compact))
         content_ratio = (
             round(content_chunk_chars / content_source_chars, 3) if content_source_chars else 0.0
         )
@@ -811,11 +820,9 @@ class QualityGate:
         }
 
     def _source_line_metrics(self, source_text: str | None, chunks: list[Chunk]) -> dict[str, int | float]:
-        source = str(source_text or "")
-        checked = sum(
-            1 for line in source.splitlines() if len(self._compact_text(line)) >= SOURCE_LINE_MIN_CHARS
-        )
-        missing = self._missing_source_lines(source_text, chunks)
+        eligible_lines = self._eligible_source_lines(source_text)
+        checked = len(eligible_lines)
+        missing = self._missing_source_lines(source_text, chunks, eligible_lines=eligible_lines)
         return {
             "source_lines_checked": checked,
             "source_lines_missing_count": len(missing),
@@ -842,7 +849,24 @@ class QualityGate:
         text = str(chunk.normalized_text or chunk.text or "")
         return CONTEXT_HEADER_PATTERN.sub("", text, count=1)
 
-    def _missing_source_lines(self, source_text: str | None, chunks: list[Chunk]) -> list[str]:
+    def _eligible_source_lines(self, source_text: str | None) -> list[tuple[str, str]]:
+        source = str(source_text or "")
+        eligible: list[tuple[str, str]] = []
+        for line in source.splitlines():
+            content_line = self._coverage_text(line)
+            # 짧은 줄은 다른 조문에 우연히 들어 있기 쉬워 신호가 되지 않는다.
+            if len(content_line) < SOURCE_LINE_MIN_CHARS:
+                continue
+            eligible.append((line.strip(), content_line))
+        return eligible
+
+    def _missing_source_lines(
+        self,
+        source_text: str | None,
+        chunks: list[Chunk],
+        *,
+        eligible_lines: list[tuple[str, str]] | None = None,
+    ) -> list[str]:
         """원문에는 있는데 색인될 본문 어디에도 없는 줄을 찾는다.
 
         글자 수 비율만 보면 표 서식이 완충재가 되어 누락을 가린다. 실제로 별표의
@@ -872,14 +896,21 @@ class QualityGate:
             )
         )
         missing: list[str] = []
-        for line in source.splitlines():
-            # 길이 판단은 서식을 뺀 내용 기준이어야 대조 대상과 어긋나지 않는다.
-            content_line = self._coverage_text(line)
-            # 짧은 줄은 다른 조문에 우연히 들어 있기 쉬워 신호가 되지 않는다.
-            if len(content_line) < SOURCE_LINE_MIN_CHARS:
-                continue
-            if content_line not in haystack:
-                missing.append(line.strip())
+        # Large regulations often repeat identical boilerplate lines. Cache the
+        # substring result by normalized content so each distinct line scans the
+        # combined chunk text only once, while retaining one output entry for
+        # every eligible source-line occurrence.
+        missing_by_content_line: dict[str, bool] = {}
+        candidate_lines = (
+            self._eligible_source_lines(source_text) if eligible_lines is None else eligible_lines
+        )
+        for raw_line, content_line in candidate_lines:
+            is_missing = missing_by_content_line.get(content_line)
+            if is_missing is None:
+                is_missing = content_line not in haystack
+                missing_by_content_line[content_line] = is_missing
+            if is_missing:
+                missing.append(raw_line)
         return missing
 
     def _profile(self, profile_id: str | None) -> QualityGateProfile:

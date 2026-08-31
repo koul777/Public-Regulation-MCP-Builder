@@ -38,8 +38,9 @@ class RagMcpReviewGateDocsTests(unittest.TestCase):
         overview = (REPO_ROOT / "docs" / "pilot_overview_ko.md").read_text(encoding="utf-8")
 
         self.assertIn("사람 검수", readme)
-        self.assertIn("승인된 규정만 MCP 데이터로 생성", readme)
-        self.assertIn("Official indexing starts only after human review", pilot)
+        self.assertIn("운영자가 명시적으로 승인한 규정만 MCP 데이터로 생성", readme)
+        self.assertIn("Official indexing starts only after explicit operator approval", pilot)
+        self.assertIn("approved_without_review", matrix)
         self.assertIn("Preprocessing output is preview/schema validation only", matrix)
         self.assertIn("preview-only", ui_scope)
         self.assertIn("Review handoff", runbook)

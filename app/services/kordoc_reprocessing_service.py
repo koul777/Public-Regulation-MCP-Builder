@@ -204,7 +204,8 @@ def _reprocessing_chunk_options(
     # Kordoc recovery is a parser-quality repair, not implicit consent to send
     # regulation text to an external AI provider.  Preserve an explicit prior
     # choice when the newer run manifest recorded it; legacy/no-run recovery
-    # defaults to the local-only path and still requires human review.
+    # defaults to the local-only path and still requires explicit operator
+    # approval even when completed human review remains advisory.
     values.setdefault("enable_agent_review", False)
     return ChunkOptions.model_validate(values)
 

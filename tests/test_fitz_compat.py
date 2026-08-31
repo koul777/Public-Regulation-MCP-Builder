@@ -9,7 +9,7 @@ from app.utils.fitz_compat import import_fitz
 
 class FitzCompatTests(unittest.TestCase):
     def test_current_pymupdf_import_path_is_preferred(self) -> None:
-        current_backend = SimpleNamespace(open=object())
+        current_backend = SimpleNamespace(open=lambda *args, **kwargs: None, Matrix=object())
         original_import = __import__
         imported_names: list[str] = []
 
@@ -25,7 +25,7 @@ class FitzCompatTests(unittest.TestCase):
         self.assertNotIn("fitz", imported_names)
 
     def test_legacy_fitz_alias_is_used_when_pymupdf_name_is_unavailable(self) -> None:
-        fallback_backend = SimpleNamespace(open=object())
+        fallback_backend = SimpleNamespace(open=lambda *args, **kwargs: None, Matrix=object())
         original_import = __import__
 
         def import_with_missing_pymupdf(name: str, *args, **kwargs):
@@ -38,6 +38,25 @@ class FitzCompatTests(unittest.TestCase):
         with patch("builtins.__import__", side_effect=import_with_missing_pymupdf):
             self.assertIs(import_fitz(), fallback_backend)
 
+    def test_legacy_fitz_alias_is_used_when_pymupdf_module_is_incomplete(self) -> None:
+        incomplete_backend = SimpleNamespace()
+        fallback_backend = SimpleNamespace(open=lambda *args, **kwargs: None, Matrix=object())
+        original_import = __import__
+        imported_names: list[str] = []
+
+        def import_with_incomplete_pymupdf(name: str, *args, **kwargs):
+            imported_names.append(name)
+            if name == "pymupdf":
+                return incomplete_backend
+            if name == "fitz":
+                return fallback_backend
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_with_incomplete_pymupdf):
+            self.assertIs(import_fitz(), fallback_backend)
+
+        self.assertIn("fitz", imported_names)
+
     def test_missing_current_and_legacy_modules_raise_actionable_error(self) -> None:
         original_import = __import__
 
@@ -48,6 +67,18 @@ class FitzCompatTests(unittest.TestCase):
 
         with patch("builtins.__import__", side_effect=import_without_pymupdf):
             with self.assertRaisesRegex(ImportError, "Install package 'pymupdf'"):
+                import_fitz()
+
+    def test_incomplete_current_and_legacy_modules_raise_actionable_error(self) -> None:
+        original_import = __import__
+
+        def import_without_required_api(name: str, *args, **kwargs):
+            if name in {"pymupdf", "fitz"}:
+                return SimpleNamespace()
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_without_required_api):
+            with self.assertRaisesRegex(ImportError, "does not expose the required API"):
                 import_fitz()
 
 

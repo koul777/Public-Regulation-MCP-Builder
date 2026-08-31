@@ -11,10 +11,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class BeginnerQuickstartDocsTests(unittest.TestCase):
     def test_readme_puts_product_first_and_keeps_update_history_ordered(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        today_heading = "# 최근 업데이트: 2026년 8월 29일"
+        today_heading = "# 최근 업데이트: 2026년 8월 31일"
         # 첫 화면에는 제품 설명과 데모를 두고, 긴 변경 이력은 문서 뒤에서 최신순으로
         # 펼쳐 보게 한다. 새 절을 추가해도 과거 이력의 순서는 유지해야 한다.
         prior_headings = (
+            "## 2026년 8월 29일 — 초보자 검수, 파싱 안전성, 승인 RAG 정확성 강화",
             "# 이전 업데이트: 2026년 8월 3일",
             "# 이전 업데이트: 2026년 7월 29일~8월 1일",
         )
@@ -55,7 +56,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(
                     phrase,
-                    readme[readme.index(today_heading) : readme.index(prior_headings[0])],
+                    readme[readme.index(prior_headings[0]) : readme.index(prior_headings[1])],
                 )
         for phrase in (
             "초보자 안내 모드 추가",

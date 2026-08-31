@@ -226,7 +226,7 @@ def _recommended_artifacts(
 def _recommended_action(category: str) -> str:
     actions = {
         "table_parentage_or_structure_review": (
-            "Check the improved draft table/unit review artifacts, confirm source-table parentage, then approve/index only after human review."
+            "Check the improved draft table/unit review artifacts, confirm source-table parentage, and show the human-review recommendation before explicit operator approval/indexing; if review is skipped, preserve the override reason and audit event."
         ),
         "form_parentage_review": (
             "Confirm the form/별지 governing article relationship in the improved draft and review triage before official approval."

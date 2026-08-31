@@ -33,7 +33,7 @@ class PublicGithubReleaseChecklistTests(unittest.TestCase):
         text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("사람에게 승인되지 않은 청크", text)
-        self.assertIn("승인된 규정만 MCP 데이터로 생성", text)
+        self.assertIn("운영자가 명시적으로 승인한 규정만 MCP 데이터로 생성", text)
         self.assertIn("MCP로 쓸 파일 묶음 만들기", text)
         self.assertIn("Codex CLI / Codex IDE", text)
         self.assertIn("Claude Code", text)

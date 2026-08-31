@@ -22,6 +22,35 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class StreamlitOperatorModeTests(unittest.TestCase):
+    def test_unreviewed_override_reason_is_applied_only_to_incomplete_entries(self):
+        from frontend.streamlit_app import (
+            DEFAULT_UNREVIEWED_OVERRIDE_REASON,
+            _approval_override_reason_for_entries,
+        )
+
+        reviewed = {"state": {"approve_enabled": True}}
+        unreviewed = {"state": {"approve_enabled": False}}
+
+        self.assertEqual("", _approval_override_reason_for_entries([reviewed]))
+        self.assertEqual(
+            "",
+            _approval_override_reason_for_entries(
+                [reviewed],
+                explicit_reason="stale custom reason",
+            ),
+        )
+        self.assertEqual(
+            DEFAULT_UNREVIEWED_OVERRIDE_REASON,
+            _approval_override_reason_for_entries([unreviewed]),
+        )
+        self.assertEqual(
+            "offline approval",
+            _approval_override_reason_for_entries(
+                [reviewed, unreviewed],
+                explicit_reason=" offline approval ",
+            ),
+        )
+
     def test_reviewed_document_plan_reuses_index_created_during_revision_approval(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
@@ -1031,17 +1060,11 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("선택한 규정 {len(selected_document_ids):,}개 상태 불러오기", source)
         self.assertIn("bulk_review_requested and not batch_loaded", source)
         self.assertIn("bulk_review_requested and batch_loaded", source)
-        self.assertIn(
-            "위 비교표에서 각 조항의 AI 판단과 사람 확인을 명시적으로 마쳐야",
-            source,
-        )
-        # 초보자 모드에서도 전체 규정 승인을 쓸 수 있되, 확인란을 거쳐야 버튼이 열린다.
-        self.assertIn("규정 {len(selected_document_ids):,}개를 한 번에 승인·색인하는 것에 동의합니다.", source)
-        self.assertIn(
-            "beginner_bulk_review_disabled = beginner_bulk_mode_active and not beginner_bulk_confirmed",
-            source,
-        )
-        self.assertGreaterEqual(source.count("beginner_bulk_review_disabled"), 2)
+        self.assertIn("사람 검수를 권장합니다", source)
+        self.assertIn("미검수 조항은 감사 기록에 구분해 남습니다", source)
+        # 초보자와 일반 모드 모두 같은 최종 버튼을 쓰며 추가 동의 체크를 요구하지 않는다.
+        self.assertNotIn("workflow-beginner-bulk-ack", source)
+        self.assertNotIn("beginner_bulk_review_disabled", source)
         self.assertIn("_prepare_reviewed_document_approval_plan", source)
         self.assertIn("_execute_reviewed_document_approval_plan", source)
         self.assertIn("규정별 문서 ID·규정 ID·목차 계층", source)
@@ -1055,7 +1078,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("OFFICIAL_RAG_MCP_REVIEW_REQUIRED_KEY", source)
         self.assertIn("UNREVIEWED_PREVIEW_WARNING", source)
         self.assertIn("UNREVIEWED_POC_REVIEW_ACK_KEY", source)
-        self.assertIn("휴먼리뷰 후 공식 RAG/MCP 사용", source)
+        self.assertIn("운영자 승인 후 공식 RAG/MCP 사용", source)
         self.assertIn("UNREVIEWED_POC_REVIEW", source)
         self.assertIn("isolated PoC Review mode", source)
         self.assertIn("must not write to official approved vectors", source)
@@ -1214,7 +1237,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         )
         self.assertIn("enable_agent_review=ai_review_requested", source)
         self.assertNotIn("enable_agent_review=True", source)
-        self.assertIn("휴먼리뷰 후 공식 RAG/MCP 사용", source)
+        self.assertIn("운영자 승인 후 공식 RAG/MCP 사용", source)
         self.assertIn("공식 승인·보안 확인은 그대로 진행됩니다.", source)
         self.assertIn("사람 승인과 보안 게이트를 대신하지 않습니다.", source)
 
@@ -1259,7 +1282,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("PDF·HWP·HWPX·DOCX를 공식 MCP로 만들려면 Kordoc을 준비하세요", source)
         self.assertIn("공식 MCP 파일 묶음에는 PDF·HWP·HWPX·DOCX 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다.", source)
         self.assertIn("미설치 상태에서 처리한 문서는 나중에 Kordoc 설치 후 새 초안으로", source)
-        self.assertIn("다시 전처리·검수·승인해야 합니다.", source)
+        self.assertIn("다시 전처리하고 검수 권고를 확인한 뒤 승인해야 합니다.", source)
         self.assertNotIn("HWP/HWPX의 표·별표가 중요한 문서", source)
 
     def test_single_chunk_rejection_reuses_guarded_backend_action(self):

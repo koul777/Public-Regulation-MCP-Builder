@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.test_chunker import parsed_fixture
 from app.processors.chunker import Chunker
@@ -59,6 +60,26 @@ class ExporterTests(unittest.TestCase):
         self.assertTrue(table_jsonl_exists)
         self.assertTrue(table_csv_exists)
         self.assertEqual((len(self.chunks), len(self.chunks)), progress[-1])
+
+    def test_progress_reporting_uses_ceil_stride_and_preserves_boundaries(self) -> None:
+        expected_by_total = {
+            0: [],
+            1: [1],
+            99: list(range(1, 100)),
+            101: [1, *range(2, 101, 2), 101],
+            150: [1, *range(2, 151, 2)],
+            1000: [1, *range(10, 1001, 10)],
+        }
+
+        for total, expected in expected_by_total.items():
+            with self.subTest(total=total):
+                reported = [
+                    current
+                    for current in range(1, total + 1)
+                    if self.exporter._should_report_progress(current, total)
+                ]
+                self.assertEqual(expected, reported)
+                self.assertLessEqual(len(reported), 101)
 
     def test_csv_contains_required_columns(self) -> None:
         content = self.exporter.to_csv(self.chunks)
@@ -265,6 +286,91 @@ class ExporterTests(unittest.TestCase):
         self.assertEqual(manifest["table_row_count"], 3)
         self.assertEqual(manifest["structured_table_row_count"], 0)
         self.assertEqual(manifest["raw_table_row_count"], 3)
+
+    def test_manifest_table_counts_match_exported_rows_without_building_payloads(self) -> None:
+        structured = Chunk(
+            chunk_id="chunk_structured",
+            document_id="doc_tables",
+            chunk_type="appendix",
+            text="structured",
+            metadata={
+                "table_cell_rows": [
+                    {"row_index": 0, "cells": ["header"]},
+                    {"row_index": 1, "cells": ["value"]},
+                ],
+                "table_records": [
+                    {"row_index": 1, "record": {"header": "value"}},
+                ],
+            },
+        )
+        raw = Chunk(
+            chunk_id="chunk_raw",
+            document_id="doc_tables",
+            chunk_type="form",
+            text="raw",
+            metadata={
+                "table_like": True,
+                "table_rows": ["first", " ", {"cells": ["second"]}, {"raw": ""}],
+            },
+        )
+        chunks = [structured, raw]
+        exported_rows = self.exporter.table_rows(chunks)
+
+        with (
+            mock.patch.object(self.exporter, "_table_context", wraps=self.exporter._table_context) as context,
+            mock.patch.object(self.exporter, "_table_evidence", wraps=self.exporter._table_evidence) as evidence,
+            mock.patch.object(
+                self.exporter,
+                "_table_record_for_row",
+                wraps=self.exporter._table_record_for_row,
+            ) as record,
+        ):
+            manifest = self.exporter.manifest(chunks, [])
+
+        expected_structured = sum(row["row_kind"] == "cell" for row in exported_rows)
+        expected_raw = sum(row["row_kind"] == "raw" for row in exported_rows)
+        self.assertEqual(manifest["structured_table_row_count"], expected_structured)
+        self.assertEqual(manifest["raw_table_row_count"], expected_raw)
+        self.assertEqual(manifest["table_row_count"], len(exported_rows))
+        context.assert_not_called()
+        evidence.assert_not_called()
+        record.assert_not_called()
+
+    def test_large_structured_table_indexes_records_once_and_preserves_matches(self) -> None:
+        class CountingRecord(dict):
+            row_index_reads = 0
+
+            def get(self, key, default=None):
+                if key == "row_index":
+                    type(self).row_index_reads += 1
+                return super().get(key, default)
+
+        row_count = 2_000
+        records = [
+            CountingRecord(row_index=index, record={"value": str(index)})
+            for index in range(row_count)
+        ]
+        records.append(CountingRecord(row_index=row_count - 1, record={"value": "duplicate"}))
+        chunk = Chunk(
+            chunk_id="chunk_large_table",
+            document_id="doc_large_table",
+            chunk_type="appendix",
+            text="large table",
+            metadata={
+                "table_cell_rows": [
+                    {"row_index": index, "cells": [str(index)]}
+                    for index in range(row_count)
+                ],
+                "table_records": records,
+            },
+        )
+
+        rows = self.exporter.table_rows([chunk])
+
+        self.assertEqual(len(rows), row_count)
+        self.assertEqual(rows[0]["record"], {"value": "0"})
+        self.assertEqual(rows[-1]["record"], {"value": str(row_count - 1)})
+        self.assertEqual(CountingRecord.row_index_reads, len(records))
 
     def test_jsonl_appends_table_markdown_to_retrieval_text(self) -> None:
         chunk = Chunk(

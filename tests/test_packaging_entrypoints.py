@@ -604,7 +604,8 @@ class PackagingEntrypointTests(unittest.TestCase):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
         self.assertIn("Get-Command npm", installer)
-        self.assertIn("npm install -g kordoc", installer)
+        self.assertIn('$KordocPackage = "kordoc@4.12.0"', installer)
+        self.assertIn("install -g $KordocPackage", installer)
         self.assertIn("npm prefix -g", installer)
         self.assertIn("where.exe kordoc", installer)
         self.assertIn("kordoc --version", installer)

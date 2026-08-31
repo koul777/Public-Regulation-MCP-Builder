@@ -25,13 +25,7 @@ def embed_vector_record(
     dimensions: int = 384,
     model: str = LOCAL_HASH_EMBEDDING_MODEL,
 ) -> dict[str, Any]:
-    if record.get("schema_version") not in {VECTOR_RECORD_SCHEMA_VERSION, EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION}:
-        raise ValueError(f"Unsupported vector record schema_version: {record.get('schema_version')}")
-    if model not in {LOCAL_HASH_EMBEDDING_MODEL, QWEN3_EMBEDDING_MODEL}:
-        raise ValueError(f"Unsupported embedding model: {model}")
-    text = str(record.get("text") or "").strip()
-    if not text:
-        raise ValueError(f"Vector record {record.get('id') or ''} is missing text.")
+    text = _validated_record_text(record, model=model)
     if model == LOCAL_HASH_EMBEDDING_MODEL:
         embedding = local_hash_embedding(text, dimensions=dimensions)
         runtime = "deterministic_hash"
@@ -41,6 +35,27 @@ def embed_vector_record(
         dimensions = len(embedding)
         runtime = "sentence_transformers"
         semantic = True
+    return _embedded_record(
+        record,
+        text=text,
+        embedding=embedding,
+        dimensions=dimensions,
+        model=model,
+        runtime=runtime,
+        semantic=semantic,
+    )
+
+
+def _embedded_record(
+    record: dict[str, Any],
+    *,
+    text: str,
+    embedding: list[float],
+    dimensions: int,
+    model: str,
+    runtime: str,
+    semantic: bool,
+) -> dict[str, Any]:
     embedded = dict(record)
     embedded["schema_version"] = EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION
     embedded["source_schema_version"] = record.get("schema_version")
@@ -62,8 +77,42 @@ def embed_vector_records(
     dimensions: int = 384,
     model: str = LOCAL_HASH_EMBEDDING_MODEL,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    embedded = [embed_vector_record(record, dimensions=dimensions, model=model) for record in records]
+    record_list = list(records)
+    if model != QWEN3_EMBEDDING_MODEL or not record_list:
+        embedded = [embed_vector_record(record, dimensions=dimensions, model=model) for record in record_list]
+        return embedded, summarize_embedded_records(embedded, model=model, dimensions=dimensions)
+
+    texts = [_validated_record_text(record, model=model) for record in record_list]
+    embeddings = _qwen_embedding_adapter(dimensions).encode_documents(texts)
+    if len(embeddings) != len(record_list):
+        raise ValueError(
+            "Qwen3 embedding adapter returned "
+            f"{len(embeddings)} embeddings for {len(record_list)} vector records."
+        )
+    embedded = [
+        _embedded_record(
+            record,
+            text=text,
+            embedding=embedding,
+            dimensions=len(embedding),
+            model=model,
+            runtime="sentence_transformers",
+            semantic=True,
+        )
+        for record, text, embedding in zip(record_list, texts, embeddings)
+    ]
     return embedded, summarize_embedded_records(embedded, model=model, dimensions=dimensions)
+
+
+def _validated_record_text(record: dict[str, Any], *, model: str) -> str:
+    if record.get("schema_version") not in {VECTOR_RECORD_SCHEMA_VERSION, EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION}:
+        raise ValueError(f"Unsupported vector record schema_version: {record.get('schema_version')}")
+    if model not in {LOCAL_HASH_EMBEDDING_MODEL, QWEN3_EMBEDDING_MODEL}:
+        raise ValueError(f"Unsupported embedding model: {model}")
+    text = str(record.get("text") or "").strip()
+    if not text:
+        raise ValueError(f"Vector record {record.get('id') or ''} is missing text.")
+    return text
 
 
 def local_hash_embedding(text: str, *, dimensions: int = 384) -> list[float]:

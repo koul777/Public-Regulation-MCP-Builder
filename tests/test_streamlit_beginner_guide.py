@@ -548,7 +548,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertNotIn("_approval_auto_confirm_pending_chunks", source)
         self.assertIn('div[class~="st-key-{safe_control_key}"] button', source)
 
-    def test_beginner_multi_chunk_review_moves_then_unlocks_single_approval(self) -> None:
+    def test_beginner_multi_chunk_review_moves_and_keeps_one_click_approval(self) -> None:
         source, module = _source_and_module()
         helper = _function(module, "_beginner_pending_review_navigation")
         namespace: dict[str, object] = {}
@@ -702,8 +702,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             )
         )
         approval_target_value = ast.unparse(approval_target_assignment.value)
-        self.assertIn("pending_review_entries", approval_target_value)
-        self.assertIn("approve_enabled or override_reason_text", approval_target_value)
+        self.assertEqual("pending_review_entries", approval_target_value)
 
         can_approve_assignment = next(
             node
@@ -1280,12 +1279,12 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertNotIn('if st.session_state.get("document_id"):', page_source)
         self.assertIn("전처리가 끝날 때까지 기다리세요", page_source)
 
-    def test_results_confirmation_checkbox_is_required_only_in_beginner_mode(self) -> None:
+    def test_results_confirmation_checkboxes_are_advisory_in_beginner_mode(self) -> None:
         source, module = _source_and_module()
         page = _function(module, "_page_results")
         page_source = ast.get_source_segment(source, page) or ""
 
-        self.assertIn("beginner_results_confirmation_required", page_source)
+        self.assertIn("beginner_results_confirmation_shown", page_source)
         self.assertIn("results_confirmation_key = _beginner_guide_results_confirmed_key(document_id)", page_source)
         self.assertIn("조항 비교는 다음 '③ 검수하고 승인' 단계에서 합니다", page_source)
         self.assertIn("structure_confirmation_key", page_source)
@@ -1294,10 +1293,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("control_key_prefix=issues_confirmation_key", page_source)
         self.assertIn("disabled=not structure_confirmed", page_source)
         self.assertIn("results_confirmed = bool(structure_confirmed and issues_confirmed)", page_source)
-        self.assertIn(
-            "beginner_results_confirmation_required and not results_confirmed",
-            page_source,
-        )
+        self.assertIn("두 확인란은 권고 절차이며 이동을 막지 않습니다", page_source)
+        self.assertIn("disabled=not selected_document_ids", page_source)
+        self.assertNotIn("beginner_results_confirmation_required and not results_confirmed", page_source)
         self.assertNotIn("beginner_results_document_id", page_source)
         self.assertNotIn("_mark_beginner_guide_results_confirmed", source)
 
@@ -2535,7 +2533,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("현재 규정 ③ 검수·승인으로 이동", page_source)
         self.assertIn("문서 목록에서 다음 규정을 선택", page_source)
 
-    def test_beginner_approval_requires_results_for_every_regulation_and_opens_next_one(self) -> None:
+    def test_beginner_approval_recommends_results_without_blocking_and_opens_next_one(self) -> None:
         source, module = _source_and_module()
         page_source = ast.get_source_segment(
             source,
@@ -2543,9 +2541,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         ) or ""
 
         for text in (
-            "현재 규정의 결과 두 곳을 먼저 확인하세요",
+            "현재 규정의 결과 두 곳 확인을 권고합니다",
             "현재 규정의 결과 두 곳 확인하러 가기",
-            "규정마다 결과 확인을 끝낸 뒤에만 원본·전처리·AI 검수 내용을 검토",
+            "이 권고는 진행을 막지 않으며",
             "다음 미완료 규정을 하나씩 계속 확인하세요",
             "결과 확인 두 곳부터 원본·전처리·AI 검수 의견 비교, 승인 또는 반려, 색인까지",
             "다음 미완료 규정 결과 확인",
@@ -2555,6 +2553,11 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "_beginner_guide_results_confirmed_key(document_id)",
             page_source,
         )
+        advisory_start = page_source.index(
+            "if beginner_mode_active and _results_step_is_used(ctx) and not beginner_current_results_confirmed:"
+        )
+        advisory_end = page_source.index("if not chunks:", advisory_start)
+        self.assertNotIn("return", page_source[advisory_start:advisory_end])
         self.assertIn('st.session_state["document_id"] = next_document_id', page_source)
         self.assertIn("_queue_workflow_navigation(\n                    NAV_RESULTS", page_source)
 
@@ -2585,22 +2588,19 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertLess(principle_gate, scope_control)
         self.assertIn("return", page_source[principle_gate:scope_control])
 
-    def test_beginner_mode_disables_batch_and_advanced_approval_paths(self) -> None:
+    def test_beginner_mode_uses_one_click_batch_override_and_hides_advanced_path(self) -> None:
         source, module = _source_and_module()
         page = _function(module, "_page_approval")
         page_source = "\n".join(source.splitlines()[page.lineno - 1 : page.end_lineno])
 
-        # 전체 규정 승인은 열되, 초보자에게는 명시적 동의 한 단계를 요구한다.
-        self.assertIn("한 번에 승인하고 색인합니다", page_source)
-        self.assertIn('key=f"workflow-beginner-bulk-ack-{document_id}"', page_source)
-        self.assertIn(
-            "beginner_bulk_review_disabled = beginner_bulk_mode_active and not beginner_bulk_confirmed",
-            page_source,
-        )
-        self.assertIn(
-            "beginner_bulk_review_disabled\n                or not workflow_contexts_complete",
-            page_source,
-        )
+        # 초보/일반 모드 모두 권고 경고를 보여 주되 추가 동의 체크 없이
+        # 같은 최종 버튼 한 번으로 미검수 승인·색인을 실행한다.
+        self.assertIn("사람 검수를 권장합니다", page_source)
+        self.assertIn("지금 최종 확정해도 진행되며", page_source)
+        self.assertIn("approved_without_review", page_source)
+        self.assertNotIn("workflow-beginner-bulk-ack", page_source)
+        self.assertNotIn("beginner_bulk_review_disabled", page_source)
+        self.assertIn("not workflow_contexts_complete", page_source)
         self.assertIn("disabled=beginner_mode_active", page_source)
         self.assertIn("show_advanced_approval = False", page_source)
         self.assertIn(

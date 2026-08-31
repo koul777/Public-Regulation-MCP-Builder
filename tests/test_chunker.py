@@ -30,6 +30,169 @@ def parsed_fixture() -> ParsedDocument:
 
 
 class ChunkerTests(unittest.TestCase):
+    def test_split_parts_reuse_node_static_context_with_isolated_metadata(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_cached_context",
+            source_file="cached.txt",
+            document_name="운영규정",
+            file_type="text",
+            raw_text="제1조 본문\n① 세부 내용",
+        )
+        article = StructureNode(
+            node_id="article_cached",
+            document_id=parsed.document_id,
+            node_type="article",
+            number="제1조",
+            title="목적",
+            text="제1조 본문",
+            order_index=1,
+            warnings=["review_article"],
+        )
+        paragraph = StructureNode(
+            node_id="paragraph_cached",
+            document_id=parsed.document_id,
+            node_type="paragraph",
+            number="①",
+            text="① 세부 내용",
+            parent_id=article.node_id,
+            order_index=2,
+            metadata={
+                "paragraph_label": "①",
+                "source_bboxes": [[1.0, 2.0, 3.0, 4.0]],
+            },
+        )
+        chunker = Chunker()
+
+        with (
+            mock.patch.object(
+                chunker,
+                "_split_node",
+                return_value=["제1조 첫 부분", "제1조 둘째 부분"],
+            ),
+            mock.patch.object(chunker, "_ancestors", wraps=chunker._ancestors) as ancestors,
+            mock.patch.object(chunker, "_metadata_for", wraps=chunker._metadata_for) as metadata_for,
+            mock.patch.object(
+                chunker,
+                "_related_source_metadata",
+                wraps=chunker._related_source_metadata,
+            ) as related_source,
+            mock.patch.object(
+                chunker,
+                "_structural_child_unit_metadata",
+                wraps=chunker._structural_child_unit_metadata,
+            ) as structural_child,
+            mock.patch.object(
+                chunker,
+                "_document_regulation_identity",
+                wraps=chunker._document_regulation_identity,
+            ) as document_identity,
+        ):
+            chunks = chunker.build_chunks(
+                [article, paragraph],
+                parsed,
+                ChunkOptions(include_context_header=False),
+            )
+
+        self.assertEqual(2, len(chunks))
+        self.assertEqual(1, ancestors.call_count)
+        self.assertEqual(1, metadata_for.call_count)
+        self.assertEqual(1, related_source.call_count)
+        self.assertEqual(1, structural_child.call_count)
+        self.assertEqual(1, document_identity.call_count)
+        self.assertEqual(chunks[0].metadata["paragraph_labels"], chunks[1].metadata["paragraph_labels"])
+        self.assertIsNot(chunks[0].metadata["paragraph_labels"], chunks[1].metadata["paragraph_labels"])
+        self.assertIsNot(chunks[0].metadata["source_bboxes"], chunks[1].metadata["source_bboxes"])
+        chunks[0].metadata["paragraph_labels"][0]["label"] = "changed"
+        chunks[0].metadata["source_bboxes"][0][0] = 999.0
+        self.assertEqual("①", chunks[1].metadata["paragraph_labels"][0]["label"])
+        self.assertEqual(1.0, chunks[1].metadata["source_bboxes"][0][0])
+
+    def test_cached_metadata_inputs_are_equivalent_to_direct_helpers(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_cached_equivalence",
+            source_file="combined.txt",
+            document_name="통합규정집",
+            file_type="text",
+        )
+        regulation = StructureNode(
+            node_id="reg_cached",
+            document_id=parsed.document_id,
+            node_type="regulation",
+            number="1-1",
+            title="인사규정",
+            text="인사규정",
+            order_index=1,
+        )
+        article = StructureNode(
+            node_id="article_cached_equivalence",
+            document_id=parsed.document_id,
+            node_type="article",
+            number="제1조",
+            title="목적",
+            text="제1조 본문",
+            order_index=2,
+        )
+        lookup = {item.node_id: item for item in (regulation, article)}
+        chunker = Chunker()
+
+        direct = chunker._metadata_for(article, lookup, parsed, [regulation])
+        ancestors = chunker._ancestors(article, lookup)
+        cached = chunker._metadata_for(
+            article,
+            lookup,
+            parsed,
+            [regulation],
+            ancestors=ancestors,
+            document_identity_getter=lambda: chunker._document_regulation_identity(parsed),
+            regulation_order_indices=[regulation.order_index],
+        )
+
+        self.assertEqual(direct, cached)
+
+    def test_bisect_regulation_lookup_preserves_first_duplicate_order_semantics(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc_duplicate_regulation_order",
+            source_file="combined.txt",
+            document_name="통합규정집",
+            file_type="text",
+        )
+        first = StructureNode(
+            node_id="reg_first",
+            document_id=parsed.document_id,
+            node_type="regulation",
+            number="1-1",
+            title="첫 규정",
+            text="첫 규정",
+            order_index=1,
+        )
+        second = StructureNode(
+            node_id="reg_second",
+            document_id=parsed.document_id,
+            node_type="regulation",
+            number="1-2",
+            title="둘째 규정",
+            text="둘째 규정",
+            order_index=1,
+        )
+        article = StructureNode(
+            node_id="article_after_duplicates",
+            document_id=parsed.document_id,
+            node_type="article",
+            number="제1조",
+            title="목적",
+            text="제1조 본문",
+            order_index=2,
+        )
+
+        chunk = Chunker().build_chunks(
+            [first, second, article],
+            parsed,
+            ChunkOptions(include_context_header=False),
+        )[0]
+
+        self.assertEqual("reg_first", chunk.metadata["regulation_source_node_id"])
+        self.assertEqual("첫 규정", chunk.metadata["regulation_title"])
+
     def test_preserves_compact_two_row_table_evidence_for_review(self) -> None:
         metadata = Chunker()._table_metadata("Item | Standard\nManager | 10", "appendix")
 

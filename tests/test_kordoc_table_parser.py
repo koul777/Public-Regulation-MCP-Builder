@@ -396,6 +396,69 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(result["kordoc_timeout_seconds"], 4)
         self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
+    def test_parse_file_handles_structured_kordoc_failure_before_table_extraction(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        payload = {
+            "success": False,
+            "code": "UNSUPPORTED_FORMAT",
+            "error": r"conversion failed at C:\private\institution\secret.hwp",
+            "path": r"C:\private\institution\secret.hwp",
+        }
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run",
+            return_value=SimpleNamespace(returncode=1, stdout=json.dumps(payload), stderr="conversion failed"),
+        ), patch(
+            "app.processors.kordoc_table_parser.extract_kordoc_table_inventory"
+        ) as extract_inventory:
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["parser"], "kordoc")
+        self.assertEqual(result["table_count"], 0)
+        self.assertEqual(result["tables"], [])
+        self.assertEqual(result["error_code"], "UNSUPPORTED_FORMAT")
+        self.assertEqual(result["stderr_chars"], len("conversion failed"))
+        self.assertNotIn("private", encoded)
+        self.assertNotIn("secret.hwp", encoded)
+        extract_inventory.assert_not_called()
+
+    def test_parse_file_replaces_unsafe_or_oversized_kordoc_error_code(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+        )
+        unsafe_codes = [r"C:\private\secret.hwp", "X" * 65, "", None]
+        for unsafe_code in unsafe_codes:
+            with self.subTest(unsafe_code=unsafe_code), patch(
+                "app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"
+            ), patch(
+                "app.processors.kordoc_table_parser.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": False, "code": unsafe_code, "error": "SECRET_PATH"}),
+                    stderr="",
+                ),
+            ):
+                result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+            encoded = json.dumps(result, ensure_ascii=False)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["error_code"], "kordoc_conversion_failed")
+            self.assertLessEqual(len(result["error_code"]), 64)
+            self.assertNotIn("SECRET_PATH", encoded)
+            self.assertNotIn("private", encoded)
+
     def test_parse_file_runs_windows_cmd_shim_through_cmd_exe(self) -> None:
         # npm installs CLIs like `kordoc` as .cmd shims on Windows; CreateProcess
         # cannot launch them in list form, so parse_file must route through cmd.exe.

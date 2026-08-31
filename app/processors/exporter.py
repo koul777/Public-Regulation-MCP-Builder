@@ -236,6 +236,7 @@ class Exporter:
             metadata = chunk.metadata
             cell_rows = metadata.get("table_cell_rows") or []
             if cell_rows:
+                table_records_by_row_index = self._table_records_by_row_index(metadata)
                 for table_row in cell_rows:
                     cells = table_row.get("cells") or []
                     yield {
@@ -246,7 +247,10 @@ class Exporter:
                             "cell_count": len(cells),
                             "cells": cells,
                             "header_cells": metadata.get("table_header_cells") or [],
-                            "record": self._table_record_for_row(metadata, table_row),
+                            "record": self._table_record_for_row(
+                                table_row,
+                                table_records_by_row_index,
+                            ),
                             "raw": table_row.get("raw"),
                             "source_page_start": chunk.source_page_start,
                             "source_page_end": chunk.source_page_end,
@@ -292,12 +296,23 @@ class Exporter:
         table_row_count = 0
         structured_table_row_count = 0
         raw_table_row_count = 0
-        for row in self.iter_table_rows(chunks):
-            table_row_count += 1
-            if row.get("row_kind") == "cell":
-                structured_table_row_count += 1
-            elif row.get("row_kind") == "raw":
-                raw_table_row_count += 1
+        for chunk in chunks:
+            metadata = chunk.metadata
+            cell_rows = metadata.get("table_cell_rows") or []
+            if cell_rows:
+                row_count = len(cell_rows)
+                table_row_count += row_count
+                structured_table_row_count += row_count
+                continue
+            if not metadata.get("table_like"):
+                continue
+            row_count = sum(
+                1
+                for table_row in metadata.get("table_rows") or []
+                if self._raw_table_row_text(table_row)
+            )
+            table_row_count += row_count
+            raw_table_row_count += row_count
         return {
             "chunk_count": len(chunks),
             "issue_count": len(issues),
@@ -336,7 +351,7 @@ class Exporter:
         return {column: flat.get(column) for column in TABLE_CSV_COLUMNS}
 
     def _should_report_progress(self, current: int, total: int) -> bool:
-        interval = max(1, total // 100) if total else 1
+        interval = max(1, (total + 99) // 100) if total else 1
         return current == 1 or current == total or current % interval == 0
 
     def _raw_table_row_text(self, table_row) -> str:
@@ -448,11 +463,22 @@ class Exporter:
             parts.append(page_label)
         return " / ".join(parts)
 
-    def _table_record_for_row(self, metadata: dict, table_row: dict) -> dict:
-        row_index = table_row.get("row_index")
+    def _table_records_by_row_index(self, metadata: dict) -> dict[object, dict]:
+        records_by_row_index: dict[object, dict] = {}
         for record in metadata.get("table_records") or []:
-            if record.get("row_index") == row_index:
-                return record.get("record") or {}
+            row_index = record.get("row_index")
+            if row_index not in records_by_row_index:
+                records_by_row_index[row_index] = record.get("record") or {}
+        return records_by_row_index
+
+    def _table_record_for_row(
+        self,
+        table_row: dict,
+        records_by_row_index: dict[object, dict],
+    ) -> dict:
+        row_index = table_row.get("row_index")
+        if row_index in records_by_row_index:
+            return records_by_row_index[row_index]
         return table_row.get("record") or {}
 
     def _flat_chunk(self, chunk: Chunk) -> dict:

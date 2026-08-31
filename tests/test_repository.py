@@ -1324,6 +1324,41 @@ class JsonRepositoryTests(unittest.TestCase):
                 progress,
             )
 
+    def test_json_array_writer_caps_progress_callbacks_with_ceil_stride(self) -> None:
+        expected_by_total = {
+            0: [0],
+            1: [1],
+            99: list(range(1, 100)),
+            101: [1, *range(2, 101, 2), 101],
+            150: [1, *range(2, 151, 2)],
+            1000: [1, *range(10, 1001, 10)],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = JsonRepository(Settings(data_dir=Path(tmp)))
+            for total, expected in expected_by_total.items():
+                with self.subTest(total=total):
+                    path = repo.root / f"writer-progress-{total}.json"
+                    records = [{"id": index} for index in range(total)]
+                    progress: list[tuple[str, int, int]] = []
+
+                    repo._write_json_array(
+                        path,
+                        iter(records),
+                        total=total,
+                        phase="contract",
+                        progress_callback=lambda phase, current, count: progress.append(
+                            (phase, current, count)
+                        ),
+                    )
+
+                    self.assertEqual(records, json.loads(path.read_text(encoding="utf-8")))
+                    self.assertEqual(expected, [current for _, current, _ in progress])
+                    self.assertTrue(
+                        all(phase == "contract" and count == total for phase, _, count in progress)
+                    )
+                    self.assertLessEqual(len(progress), 101)
+
     def test_json_array_writer_preserves_target_and_cleans_temp_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = JsonRepository(Settings(data_dir=Path(tmp)))
@@ -1848,6 +1883,94 @@ class JsonRepositoryTests(unittest.TestCase):
             self.assertIsNotNone(reusable)
             self.assertEqual(reusable[0].document_id, "doc_reusable")
             self.assertEqual(reusable[1].run_id, "run_reusable")
+
+    def test_reusable_run_is_scoped_to_requested_tenant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            options = {"chunk_mode": "article"}
+            for tenant_id in ("tenant-a", "tenant-b"):
+                document = Document(
+                    document_id=f"doc_{tenant_id}",
+                    filename="sample.hwp",
+                    file_type="hwp",
+                    file_hash="same-hash",
+                    tenant_id=tenant_id,
+                    profile_id="shared-profile",
+                )
+                repo.upsert_document(document)
+                artifacts = _save_reusable_outputs(settings, repo, document.document_id)
+                repo.upsert_run(
+                    ProcessingRun(
+                        run_id=f"run_{tenant_id}",
+                        document_id=document.document_id,
+                        job_id=f"job_{tenant_id}",
+                        status="completed",
+                        started_at=datetime.now(timezone.utc),
+                        elapsed_seconds=0.5,
+                        options=options,
+                        artifacts=artifacts,
+                    )
+                )
+
+            reusable = repo.find_reusable_run(
+                file_hash="same-hash",
+                options=options,
+                tenant_id="tenant-a",
+                profile_id="shared-profile",
+            )
+
+            self.assertIsNotNone(reusable)
+            self.assertEqual("tenant-a", reusable[0].tenant_id)
+
+    def test_reusable_lookup_validates_run_journal_once_across_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            options = {"chunk_mode": "article"}
+            for index in range(8):
+                document = Document(
+                    document_id=f"doc_candidate_{index}",
+                    filename=f"sample-{index}.hwp",
+                    file_type="hwp",
+                    file_hash="same-hash",
+                    tenant_id="tenant-a",
+                    profile_id="shared-profile",
+                )
+                repo.upsert_document(document)
+                artifacts = _save_reusable_outputs(
+                    settings,
+                    repo,
+                    document.document_id,
+                )
+                repo.upsert_run(
+                    ProcessingRun(
+                        run_id=f"run_candidate_{index}",
+                        document_id=document.document_id,
+                        job_id=f"job_candidate_{index}",
+                        status="completed",
+                        started_at=datetime.fromtimestamp(index, tz=timezone.utc),
+                        elapsed_seconds=0.5,
+                        options=options,
+                        artifacts=artifacts,
+                    )
+                )
+
+            with patch.object(
+                repo,
+                "list_runs",
+                wraps=repo.list_runs,
+            ) as list_runs:
+                reusable = repo.find_reusable_run(
+                    file_hash="same-hash",
+                    options=options,
+                    tenant_id="tenant-a",
+                    profile_id="shared-profile",
+                )
+
+            self.assertIsNotNone(reusable)
+            self.assertEqual("doc_candidate_7", reusable[0].document_id)
+            self.assertEqual(1, list_runs.call_count)
 
     def test_reusable_run_rejects_completed_run_with_missing_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import re
+from copy import deepcopy
 import json
+import re
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any, Callable
@@ -43,7 +44,7 @@ HWPX_SOURCE_LIST_METADATA_KEYS = (
     "source_hwpx_xml_block_indices",
 )
 
-CHUNKER_VERSION = "0.1.11"
+CHUNKER_VERSION = "0.1.12"
 PDF_TABLE_REGION_DUPLICATE_COVERAGE = 0.8
 STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
 AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
@@ -121,6 +122,14 @@ class Chunker:
         lookup = {node.node_id: node for node in nodes}
         children_by_parent = self._children_by_parent(nodes)
         regulation_nodes = [node for node in nodes if node.node_type == "regulation"]
+        document_identity: object | tuple[str | None, str | None] = object()
+
+        def document_identity_getter() -> tuple[str | None, str | None]:
+            nonlocal document_identity
+            if not isinstance(document_identity, tuple):
+                document_identity = self._document_regulation_identity(parsed)
+            return document_identity
+
         chunks: list[Chunk] = []
         chunkable = [
             node
@@ -132,6 +141,7 @@ class Chunker:
         ]
 
         regulation_nodes = sorted(regulation_nodes, key=lambda item: item.order_index)
+        regulation_order_indices = [node.order_index for node in regulation_nodes]
         next_regulation_index = 0
 
         def report_regulations_through(order_index: int) -> None:
@@ -160,8 +170,42 @@ class Chunker:
                 }
             )
             parts = self._split_node(working_node, options)
+            ancestors = self._ancestors(working_node, lookup)
+            base_metadata = self._metadata_for(
+                working_node,
+                lookup,
+                parsed,
+                regulation_nodes,
+                ancestors=ancestors,
+                document_identity_getter=document_identity_getter,
+                regulation_order_indices=regulation_order_indices,
+            )
+            supplementary_context = self._is_supplementary_context(
+                working_node,
+                lookup,
+                ancestors=ancestors,
+            )
+            supplementary_metadata = self._supplementary_context_metadata(
+                working_node,
+                lookup,
+                {**base_metadata, "is_supplementary_provision": True},
+                ancestors=ancestors,
+            )
+            related_label_metadata = self._related_label_metadata(
+                related_nodes,
+                {"is_supplementary_provision": True},
+            )
+            related_source_metadata = self._related_source_metadata(related_nodes)
+            structural_child_metadata = self._structural_child_unit_metadata(
+                working_node,
+                related_nodes,
+                lookup,
+                ancestors=ancestors,
+            )
             for part_index, text in enumerate(parts, start=1):
-                metadata = self._metadata_for(working_node, lookup, parsed, regulation_nodes)
+                # Every split part receives independent mutable metadata while
+                # node-static context is derived only once above.
+                metadata = deepcopy(base_metadata)
                 metadata["part_index"] = part_index
                 metadata["part_count"] = len(parts)
                 metadata.update(self._entity_trace_metadata(working_node, text))
@@ -172,15 +216,20 @@ class Chunker:
                     self.metadata_extractor.extract(
                         text,
                         metadata.get("article_no"),
-                        supplementary_context=self._is_supplementary_context(working_node, lookup),
+                        supplementary_context=supplementary_context,
                         current_regulation_no=metadata.get("regulation_no"),
                         current_regulation_title=metadata.get("regulation_title"),
                     )
                 )
-                metadata.update(self._supplementary_context_metadata(working_node, lookup, metadata))
-                metadata.update(self._related_label_metadata(related_nodes, metadata))
-                metadata.update(self._related_source_metadata(related_nodes))
-                metadata.update(self._structural_child_unit_metadata(working_node, related_nodes, lookup))
+                if metadata.get("is_supplementary_provision"):
+                    metadata.update(deepcopy(supplementary_metadata))
+                    metadata.update(deepcopy(related_label_metadata))
+                elif related_label_metadata.get("paragraph_labels"):
+                    metadata["paragraph_labels"] = deepcopy(
+                        related_label_metadata["paragraph_labels"]
+                    )
+                metadata.update(deepcopy(related_source_metadata))
+                metadata.update(deepcopy(structural_child_metadata))
                 answer_profile = build_answer_profile(text, metadata)
                 metadata.update(answer_profile)
                 hierarchy_path = metadata.get("hierarchy_path", parsed.document_name or parsed.source_file)
@@ -215,13 +264,32 @@ class Chunker:
                 )
         if regulation_progress_callback is not None and len(regulation_nodes) > 1:
             report_regulations_through(max((node.order_index for node in nodes), default=0) + 1)
-        chunks.extend(self._pdf_table_region_chunks(parsed, len(chunks), chunks, regulation_nodes))
+        chunks.extend(
+            self._pdf_table_region_chunks(
+                parsed,
+                len(chunks),
+                chunks,
+                regulation_nodes,
+                document_identity_getter=document_identity_getter,
+            )
+        )
         if not chunks:
-            chunks.extend(self._fallback_document_chunks(parsed, options))
+            chunks.extend(
+                self._fallback_document_chunks(
+                    parsed,
+                    options,
+                    document_identity_getter=document_identity_getter,
+                )
+            )
         self._attach_pdf_document_metadata(chunks, parsed)
         self._attach_document_inventory_metadata(chunks, parsed)
         if getattr(self.settings, "kordoc_table_as_main", False):
-            self._promote_kordoc_main_tables(chunks, parsed, options)
+            self._promote_kordoc_main_tables(
+                chunks,
+                parsed,
+                options,
+                document_identity_getter=document_identity_getter,
+            )
         else:
             attach_kordoc_table_matches(chunks, parsed.metadata.get("kordoc_table_inventory"))
         self._inherit_temporal_metadata_from_chunks(chunks)
@@ -274,7 +342,12 @@ class Chunker:
     )
 
     def _promote_kordoc_main_tables(
-        self, chunks: list[Chunk], parsed: ParsedDocument, options: ChunkOptions
+        self,
+        chunks: list[Chunk],
+        parsed: ParsedDocument,
+        options: ChunkOptions,
+        *,
+        document_identity_getter: Callable[[], tuple[str | None, str | None]] | None = None,
     ) -> None:
         """Make a confidently matched Kordoc table the main content of a table
         chunk (structure + rendered body); demote the primary parser's table to
@@ -344,6 +417,7 @@ class Chunker:
                 claimed_table_keys=claimed_table_keys,
                 offset=len(chunks),
                 inventory_metadata=inventory_metadata,
+                document_identity_getter=document_identity_getter,
             )
         )
 
@@ -379,6 +453,7 @@ class Chunker:
         claimed_table_keys: set[str],
         offset: int,
         inventory_metadata: dict[str, Any],
+        document_identity_getter: Callable[[], tuple[str | None, str | None]] | None = None,
     ) -> list[Chunk]:
         if str(parsed.file_type or "").lower() not in self._KORDOC_UNMATCHED_TABLE_FILE_TYPES:
             return []
@@ -408,7 +483,15 @@ class Chunker:
                 warnings=["kordoc_unmatched_table_review_required"],
                 metadata={"kordoc_table_only": True},
             )
-            metadata = self._metadata_for(pseudo_node, {pseudo_node.node_id: pseudo_node}, parsed, [])
+            metadata = self._metadata_for(
+                pseudo_node,
+                {pseudo_node.node_id: pseudo_node},
+                parsed,
+                [],
+                ancestors=[],
+                document_identity_getter=document_identity_getter,
+                regulation_order_indices=[],
+            )
             metadata.update(
                 self._kordoc_table_main_metadata(
                     table=table,
@@ -798,11 +881,14 @@ class Chunker:
         node: StructureNode,
         related_nodes: list[StructureNode],
         lookup: dict[str, StructureNode],
+        *,
+        ancestors: list[StructureNode] | None = None,
     ) -> dict[str, Any]:
         if node.node_type != "article":
             return {}
         excluded_containers = {"appendix", "form", "supplementary", "table"}
-        if any(ancestor.node_type in excluded_containers for ancestor in self._ancestors(node, lookup)):
+        node_ancestors = ancestors if ancestors is not None else self._ancestors(node, lookup)
+        if any(ancestor.node_type in excluded_containers for ancestor in node_ancestors):
             return {}
         descendants = [item for item in related_nodes if item.node_id != node.node_id]
         paragraph_item_units = [
@@ -1254,9 +1340,13 @@ class Chunker:
         lookup: dict[str, StructureNode],
         parsed: ParsedDocument,
         regulation_nodes: list[StructureNode] | None = None,
+        *,
+        ancestors: list[StructureNode] | None = None,
+        document_identity_getter: Callable[[], tuple[str | None, str | None]] | None = None,
+        regulation_order_indices: list[int] | None = None,
     ) -> dict:
-        ancestors = self._ancestors(node, lookup)
-        source_hierarchy_path = self._hierarchy_path(parsed, ancestors, node)
+        node_ancestors = ancestors if ancestors is not None else self._ancestors(node, lookup)
+        source_hierarchy_path = self._hierarchy_path(parsed, node_ancestors, node)
         metadata = {
             "document_id": parsed.document_id,
             "document_name": parsed.document_name or parsed.source_file,
@@ -1312,7 +1402,7 @@ class Chunker:
         ):
             if parsed.metadata.get(key):
                 metadata[key] = parsed.metadata[key]
-        for ancestor in ancestors + [node]:
+        for ancestor in node_ancestors + [node]:
             key_prefix = {
                 "part": "part",
                 "chapter": "chapter",
@@ -1333,7 +1423,11 @@ class Chunker:
                 if key_prefix == "paragraph" and ancestor.metadata.get("paragraph_label"):
                     metadata["paragraph_label"] = ancestor.metadata["paragraph_label"]
         if not metadata.get("regulation_no") and not metadata.get("regulation_title"):
-            inferred = self._nearest_preceding_regulation(node, regulation_nodes or [])
+            inferred = self._nearest_preceding_regulation(
+                node,
+                regulation_nodes or [],
+                regulation_order_indices=regulation_order_indices,
+            )
             if inferred:
                 metadata["regulation_no"] = inferred.number
                 metadata["regulation_title"] = inferred.title
@@ -1341,7 +1435,10 @@ class Chunker:
                 metadata["regulation_source_node_id"] = inferred.node_id
                 metadata["regulation_node_id"] = inferred.node_id
         if not metadata.get("regulation_title"):
-            document_regulation_no, document_regulation_title = self._document_regulation_identity(parsed)
+            if document_identity_getter is None:
+                document_regulation_no, document_regulation_title = self._document_regulation_identity(parsed)
+            else:
+                document_regulation_no, document_regulation_title = document_identity_getter()
             if document_regulation_title:
                 # A title is not a regulation number. Older standalone fallback
                 # metadata copied the title into both fields, which made the
@@ -1357,27 +1454,40 @@ class Chunker:
         if canonical_regulation_no:
             metadata["canonical_regulation_no"] = canonical_regulation_no
         metadata["canonical_hierarchy_path"] = self._canonical_hierarchy_path(
-            ancestors,
+            node_ancestors,
             node,
             regulation_title=canonical_regulation_title,
             regulation_no=canonical_regulation_no,
         )
         return metadata
 
-    def _is_supplementary_context(self, node: StructureNode, lookup: dict[str, StructureNode]) -> bool:
+    def _is_supplementary_context(
+        self,
+        node: StructureNode,
+        lookup: dict[str, StructureNode],
+        *,
+        ancestors: list[StructureNode] | None = None,
+    ) -> bool:
         if node.node_type == "supplementary":
             return True
-        return any(ancestor.node_type == "supplementary" for ancestor in self._ancestors(node, lookup))
+        node_ancestors = ancestors if ancestors is not None else self._ancestors(node, lookup)
+        return any(ancestor.node_type == "supplementary" for ancestor in node_ancestors)
 
     def _supplementary_context_metadata(
         self,
         node: StructureNode,
         lookup: dict[str, StructureNode],
         metadata: dict,
+        *,
+        ancestors: list[StructureNode] | None = None,
     ) -> dict:
         if not metadata.get("is_supplementary_provision"):
             return {}
-        supplementary = self._nearest_supplementary_context_node(node, lookup)
+        supplementary = self._nearest_supplementary_context_node(
+            node,
+            lookup,
+            ancestors=ancestors,
+        )
         if not supplementary:
             return {}
         updates: dict[str, Any] = {}
@@ -1400,10 +1510,13 @@ class Chunker:
         self,
         node: StructureNode,
         lookup: dict[str, StructureNode],
+        *,
+        ancestors: list[StructureNode] | None = None,
     ) -> StructureNode | None:
         if node.node_type == "supplementary":
             return node
-        for ancestor in reversed(self._ancestors(node, lookup)):
+        node_ancestors = ancestors if ancestors is not None else self._ancestors(node, lookup)
+        for ancestor in reversed(node_ancestors):
             if ancestor.node_type == "supplementary":
                 return ancestor
         return None
@@ -1629,6 +1742,8 @@ class Chunker:
         offset: int,
         existing_chunks: list[Chunk] | None = None,
         regulation_nodes: list[StructureNode] | None = None,
+        *,
+        document_identity_getter: Callable[[], tuple[str | None, str | None]] | None = None,
     ) -> list[Chunk]:
         regions = parsed.metadata.get("pdf_table_regions") or []
         if not isinstance(regions, list):
@@ -1660,6 +1775,7 @@ class Chunker:
                 parsed,
                 region,
                 regulation_nodes or [],
+                document_identity_getter=document_identity_getter,
             )
             source_hierarchy_path = " > ".join(
                 part for part in [parsed.document_name or parsed.source_file, title] if part
@@ -1748,6 +1864,8 @@ class Chunker:
         parsed: ParsedDocument,
         region: dict[str, Any],
         regulation_nodes: list[StructureNode],
+        *,
+        document_identity_getter: Callable[[], tuple[str | None, str | None]] | None = None,
     ) -> tuple[str | None, str | None, StructureNode | None]:
         """Resolve a standalone PDF table to the regulation active at its layout position.
 
@@ -1804,7 +1922,10 @@ class Chunker:
             _, node = min(candidates, key=lambda item: item[0])
             return node.number or None, node.title or None, node
 
-        regulation_no, regulation_title = self._document_regulation_identity(parsed)
+        if document_identity_getter is None:
+            regulation_no, regulation_title = self._document_regulation_identity(parsed)
+        else:
+            regulation_no, regulation_title = document_identity_getter()
         return regulation_no, regulation_title, None
 
     def _pdf_table_region_duplicate_target(
@@ -2135,7 +2256,18 @@ class Chunker:
         self,
         node: StructureNode,
         regulation_nodes: list[StructureNode],
+        *,
+        regulation_order_indices: list[int] | None = None,
     ) -> StructureNode | None:
+        if regulation_order_indices is not None:
+            cutoff = bisect_left(regulation_order_indices, node.order_index)
+            if cutoff <= 0:
+                return None
+            nearest_order_index = regulation_order_indices[cutoff - 1]
+            # ``max(..., key=order_index)`` historically chose the first item
+            # for duplicate order indices. Preserve that stable-list behavior.
+            first_nearest = bisect_left(regulation_order_indices, nearest_order_index)
+            return regulation_nodes[first_nearest]
         candidates = [item for item in regulation_nodes if item.order_index < node.order_index]
         return max(candidates, key=lambda item: item.order_index) if candidates else None
 
@@ -2430,7 +2562,13 @@ class Chunker:
         page = f"p{node.page_start}" if node.page_start is not None else "p0"
         return f"{document_id}_{node.node_type}_{number}_{node.order_index + 1:04d}_{page}_{part_index:03d}"
 
-    def _fallback_document_chunks(self, parsed: ParsedDocument, options: ChunkOptions) -> list[Chunk]:
+    def _fallback_document_chunks(
+        self,
+        parsed: ParsedDocument,
+        options: ChunkOptions,
+        *,
+        document_identity_getter: Callable[[], tuple[str | None, str | None]] | None = None,
+    ) -> list[Chunk]:
         text = parsed.raw_text.strip() or "\n".join(
             block.text.strip() for page in parsed.pages for block in page.blocks if block.text.strip()
         )
@@ -2453,8 +2591,17 @@ class Chunker:
         hierarchy_path = parsed.document_name or parsed.source_file
         parts = self._split_node(pseudo_node, options)
         chunks: list[Chunk] = []
+        base_metadata = self._metadata_for(
+            pseudo_node,
+            {pseudo_node.node_id: pseudo_node},
+            parsed,
+            [],
+            ancestors=[],
+            document_identity_getter=document_identity_getter,
+            regulation_order_indices=[],
+        )
         for part_index, part in enumerate(parts, start=1):
-            metadata = self._metadata_for(pseudo_node, {pseudo_node.node_id: pseudo_node}, parsed, [])
+            metadata = deepcopy(base_metadata)
             metadata.update(
                 {
                     "part_index": part_index,

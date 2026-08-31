@@ -1206,6 +1206,23 @@ class JsonRepository:
         processing_claim_id: str | None = None,
     ) -> ProcessingRun | None:
         document_runs = self.list_runs(document_id)
+        return self._latest_completed_run_from_document_runs(
+            document_id,
+            document_runs,
+            options=options,
+            require_outputs=require_outputs,
+            processing_claim_id=processing_claim_id,
+        )
+
+    def _latest_completed_run_from_document_runs(
+        self,
+        document_id: str,
+        document_runs: list[ProcessingRun],
+        *,
+        options: dict | None = None,
+        require_outputs: bool = False,
+        processing_claim_id: str | None = None,
+    ) -> ProcessingRun | None:
         if require_outputs:
             owner_run_id = self._reusable_output_owner_run_id(
                 document_id,
@@ -1275,6 +1292,7 @@ class JsonRepository:
         *,
         file_hash: str,
         options: dict,
+        tenant_id: str | None = None,
         source_system: str | None = None,
         source_record_id: str | None = None,
         source_file_id: str | None = None,
@@ -1305,6 +1323,13 @@ class JsonRepository:
             candidates = self._find_documents_by_hash_and_profile(file_hash, profile_id)
         else:
             candidates = self._find_documents_by_hash_and_profile(file_hash, profile_id)
+        if tenant_id:
+            normalized_tenant_id = self._normalize_key(tenant_id)
+            candidates = [
+                document
+                for document in candidates
+                if self._normalize_key(document.tenant_id) == normalized_tenant_id
+            ]
         candidates = self._filter_documents_by_provenance(
             candidates,
             document_name=document_name,
@@ -1313,8 +1338,16 @@ class JsonRepository:
             source_disclosure_date=source_disclosure_date,
             source_posted_date=source_posted_date,
         )
+        runs_by_document: dict[str, list[ProcessingRun]] = {}
+        for run in self.list_runs():
+            runs_by_document.setdefault(run.document_id, []).append(run)
         for document in reversed(candidates):
-            run = self.latest_completed_run(document.document_id, options=options, require_outputs=True)
+            run = self._latest_completed_run_from_document_runs(
+                document.document_id,
+                runs_by_document.get(document.document_id, []),
+                options=options,
+                require_outputs=True,
+            )
             if run is not None:
                 return document, run
         return None
@@ -1957,7 +1990,7 @@ class JsonRepository:
         tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
         encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
         write_buffer_chars = 64 * 1024
-        progress_interval = max(1, total // 100) if total else 1
+        progress_interval = max(1, (total + 99) // 100) if total else 1
         try:
             with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write("[")

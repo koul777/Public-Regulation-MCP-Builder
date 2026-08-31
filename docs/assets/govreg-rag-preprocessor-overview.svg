@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
   <title id="title">공공규정 MCP 빌더 운영 흐름</title>
-  <desc id="desc">규정 파일을 업로드하고 전처리, 사람 검토와 승인, 승인된 규정 DB, MCP 서버, 기관 AI 조회로 이어지는 흐름</desc>
+  <desc id="desc">규정 파일을 업로드하고 전처리, 사람 검토 권고와 운영자 승인, 승인된 규정 DB, MCP 서버, 기관 AI 조회로 이어지는 흐름</desc>
   <defs>
     <style>
       .bg { fill: #f7f4ec; }
@@ -37,7 +37,7 @@
   <text class="small" x="158" y="396">조문, 표, 별표 후보 추출</text>
   <circle class="badge" cx="120" cy="452" r="22" />
   <text class="badgeText" x="114" y="459">3</text>
-  <text class="body" x="158" y="450">사람 검토</text>
+  <text class="body" x="158" y="450">사람 검토 권고</text>
   <text class="small" x="158" y="476">애매한 부분만 확인</text>
   <circle class="badge" cx="120" cy="532" r="22" />
   <text class="badgeText" x="114" y="539">4</text>
@@ -54,8 +54,8 @@
   <text class="small" x="790" y="350">조문, 표, 별표 정리</text>
   <path class="arrow" d="M960 331 H1035" />
   <rect class="panelSoft" x="1050" y="285" width="120" height="92" rx="16" />
-  <text class="body" x="1076" y="323">검수</text>
-  <text class="small" x="1075" y="350">사람 승인</text>
+  <text class="body" x="1076" y="323">검수 권고</text>
+  <text class="small" x="1075" y="350">운영자 승인</text>
   <rect class="panelGreen" x="470" y="430" width="210" height="92" rx="16" />
   <text class="body" x="500" y="468">승인된 규정 DB</text>
   <text class="small" x="500" y="495">감사 이력 보관</text>
@@ -67,5 +67,5 @@
   <rect class="panelSoft" x="1050" y="430" width="120" height="92" rx="16" />
   <text class="body" x="1078" y="468">기관 AI</text>
   <text class="small" x="1072" y="495">근거 조회</text>
-  <text class="small" x="470" y="565">Kordoc은 표 구조 추출에 사용합니다. 단, 사람 승인 전에는 공식 답변 근거로 확정하지 않습니다.</text>
+  <text class="small" x="470" y="565">Kordoc은 표 구조 추출에 사용합니다. 단, 운영자 최종 승인 전에는 공식 답변 근거로 확정하지 않습니다.</text>
 </svg>

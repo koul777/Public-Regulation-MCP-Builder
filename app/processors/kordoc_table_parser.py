@@ -16,6 +16,9 @@ from app.core.config import Settings
 
 
 WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py")
+KORDOC_ERROR_CODE_MAX_LENGTH = 64
+KORDOC_ERROR_CODE_FALLBACK = "kordoc_conversion_failed"
+KORDOC_ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class KordocTableParser:
@@ -103,6 +106,16 @@ class KordocTableParser:
         if temp_dir is not None:
             temp_dir.cleanup()
         if completed.returncode != 0:
+            try:
+                failure_payload = _load_json_payload(completed.stdout or "")
+            except json.JSONDecodeError:
+                failure_payload = None
+            failure_result = _kordoc_failure_result(failure_payload)
+            if failure_result is not None:
+                failure_result["stderr_chars"] = len(completed.stderr or "")
+                if copied_to_ascii_path:
+                    failure_result["input_path_normalized_for_kordoc"] = True
+                return finish(failure_result)
             return finish({
                 "status": "failed",
                 "parser": "kordoc",
@@ -114,6 +127,11 @@ class KordocTableParser:
             payload = _load_json_payload(completed.stdout or "")
         except json.JSONDecodeError:
             return finish({"status": "invalid_json", "parser": "kordoc", "table_count": 0, "tables": []})
+        failure_result = _kordoc_failure_result(payload)
+        if failure_result is not None:
+            if copied_to_ascii_path:
+                failure_result["input_path_normalized_for_kordoc"] = True
+            return finish(failure_result)
         max_tables = max(1, int(getattr(self.settings, "kordoc_table_max_tables", 500)))
         result = extract_kordoc_table_inventory(payload, max_tables=max_tables)
         if copied_to_ascii_path:
@@ -332,6 +350,36 @@ def _load_json_payload(stdout: str) -> Any:
         except json.JSONDecodeError:
             continue
     raise json.JSONDecodeError("No JSON payload found in Kordoc stdout.", text, 0)
+
+
+def _kordoc_failure_result(payload: Any) -> dict[str, Any] | None:
+    """Translate Kordoc's structured failure contract without leaking details.
+
+    Kordoc 4.10+ reports conversion failure as valid JSON, including alongside
+    a non-zero process exit.  Only the bounded machine-readable code is
+    retained; free-form error messages, paths, and diagnostic fields are
+    intentionally excluded from parser metadata.
+    """
+
+    if not isinstance(payload, dict) or payload.get("success") is not False:
+        return None
+    return {
+        "status": "failed",
+        "parser": "kordoc",
+        "table_count": 0,
+        "tables": [],
+        "error_code": _safe_kordoc_error_code(payload.get("code")),
+    }
+
+
+def _safe_kordoc_error_code(value: Any) -> str:
+    code = value if isinstance(value, str) else ""
+    code = code.strip()
+    if not code or len(code) > KORDOC_ERROR_CODE_MAX_LENGTH:
+        return KORDOC_ERROR_CODE_FALLBACK
+    if KORDOC_ERROR_CODE_PATTERN.fullmatch(code) is None:
+        return KORDOC_ERROR_CODE_FALLBACK
+    return code
 
 
 def _repair_windows_executable_path(parts: list[str]) -> list[str]:

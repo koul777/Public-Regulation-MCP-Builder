@@ -9,7 +9,7 @@ This public document describes a source-only evaluation plan. It is different fr
 - Keep OCR-required files visible as review candidates.
 - Keep Streamlit local-only and treat shared deployment as a separate protected configuration.
 - Treat legacy repository records without `tenant_id` as migration candidates, not as silently accepted data.
-- Official indexing starts only after human review, approval, and approval-journal validation.
+- Human review is recommended. Official indexing starts only after explicit operator approval and approval-journal validation; unreviewed approval must be recorded as such.
 
 ## Public Evidence
 
@@ -27,7 +27,7 @@ Raw `batch_quality_*` exports, source uploads, runtime databases, and institutio
 - `average_quality_score >= 98` for the declared synthetic pilot set.
 - `failed_count = 0` and `ocr_required_count = 0` for the release candidate, or every exception is explicitly listed as a review flag.
 - `api_call_count=0` for deterministic local validation unless a separate approved integration test is declared.
-- every official RAG/MCP record has human review, approval, citation metadata, and tenant scope.
+- every official RAG/MCP record has explicit operator approval, review-coverage evidence, citation metadata, and tenant scope.
 - the result is an auditable preprocessing and review gateway, not a claim that raw preprocessing output is ready for downstream indexing.
 
 ## Release Boundary
