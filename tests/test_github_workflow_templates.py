@@ -78,6 +78,10 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertIn("tests.test_run_mcp_client_config_smoke", text)
         self.assertIn("tests.test_run_mcp_transport_smoke", text)
         self.assertIn("tests.test_check_mcp_connection_readiness", text)
+        self.assertIn("tests.test_beginner_workflow_services", text)
+        self.assertIn("tests.test_local_llm_doctor", text)
+        self.assertIn("tests.test_qwen_chat_app", text)
+        self.assertIn("tests.test_streamlit_ai_usage_path", text)
         self.assertIn("python -m build --sdist --wheel", text)
         self.assertIn("--include-source-path-scan", text)
 

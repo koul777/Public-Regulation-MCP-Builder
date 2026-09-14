@@ -812,23 +812,27 @@ class StreamlitOperatorModeTests(unittest.TestCase):
 
         refreshed, reason = namespace["_refresh_mcp_connection_observation"](
             "fixture-bundle",
-            "chatgpt-desktop-local",
+            "claude-desktop",
             "regulation_mcp",
         )
 
         self.assertTrue(refreshed)
         self.assertEqual("observation_recorded_pending", reason)
-        self.assertEqual("chatgpt-desktop-local", calls[0][1])
+        self.assertEqual("claude-desktop", calls[0][1])
         self.assertIn("--bundle-status", calls[0])
         self.assertIn("--bundle-dir", calls[0])
-        self.assertIn("--adopt-manual-registration", calls[0])
+        self.assertNotIn("--adopt-manual-registration", calls[0])
         self.assertNotIn("--fail-on-issue", calls[0])
 
     def test_streamlit_distinguishes_configured_from_desktop_connected(self):
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        service_source = (
+            REPO_ROOT / "app" / "services" / "mcp_connection_service.py"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("diagnostic_from_bundle_status", source)
-        self.assertIn('status_path = Path(bundle_dir) / "bundle_status.json"', source)
+        self.assertIn('status_path = Path(bundle_dir) / "bundle_status.json"', service_source)
+        self.assertIn("read_mcp_connection_diagnostic", source)
         self.assertIn("MCP 연결 상태 새로고침", source)
         self.assertNotIn('"chatgpt-desktop-local": "ChatGPT Desktop 연결 진단"', source)
         self.assertIn("Codex CLI 연결 진단", source)
@@ -836,7 +840,11 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("Claude Desktop 연결 진단", source)
         self.assertNotIn("ChatGPT Desktop·Codex CLI 7단계 연결 진단", source)
         self.assertNotIn("재시작 후 최종 확인 프롬프트", source)
-        self.assertIn('if diagnostic_state == "connected":', source)
+        self.assertIn(
+            "if connection_readiness.state == OperatorReadinessState.READY:",
+            source,
+        )
+        self.assertIn("adapt_readiness_report(", source)
         self.assertIn('"codex": "Codex CLI",', source)
         self.assertIn('"claude-code": "Claude Code",', source)
         self.assertIn('f"{diagnostic_client_label} 연결 완료', source)
@@ -846,6 +854,15 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("아래 최종 도구 호출 성공은 해당 대화에서 직접 확인", source)
         self.assertIn("support_summary:", source)
         self.assertIn("next_action:", source)
+        self.assertIn("next_stage.display_name", source)
+        self.assertIn("MCP_CONNECTION_REFRESH_MESSAGES.get", source)
+        self.assertIn("MCP_CONNECTION_REASON_LABELS.get", source)
+        self.assertIn('"상태 설명"', source)
+        self.assertNotIn('"사유 코드": str(stage.get("reason_code")', source)
+        self.assertNotIn(
+            'f"연결 관찰을 갱신하지 못했습니다: {refresh_message or \'refresh_failed\'}"',
+            source,
+        )
         self.assertNotIn("st.code(agent_prompt_text, language=None)", source)
         self.assertNotIn("_mcp_agent_prompt_display_kind(prompt_path)", source)
         self.assertIn("_refresh_mcp_connection_observation(", source)

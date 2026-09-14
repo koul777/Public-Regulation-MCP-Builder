@@ -63,11 +63,20 @@ def diagnose_local_llm(
         result["reason"] = "local_endpoint_configuration_valid"
         return result
     health = probe_local_llm(settings)
+    if not isinstance(health, dict):
+        result.pop("endpoint", None)
+        result.update(
+            {
+                "reason": "local_probe_invalid",
+                "endpoint_host": None,
+            }
+        )
+        return result
     result.update(
         {
-            "passed": bool(health.get("available")),
+            "passed": health.get("available") is True,
             "health": health,
-            "reason": "available" if health.get("available") else "local_backend_unavailable",
+            "reason": "available" if health.get("available") is True else "local_backend_unavailable",
         }
     )
     result.pop("endpoint", None)

@@ -63,6 +63,10 @@ jobs:
             tests.test_run_mcp_transport_smoke \
             tests.test_run_regulation_mcp \
             tests.test_check_mcp_connection_readiness \
+            tests.test_beginner_workflow_services \
+            tests.test_local_llm_doctor \
+            tests.test_qwen_chat_app \
+            tests.test_streamlit_ai_usage_path \
             tests.test_streamlit_operator_mode
 
       - name: Build source and wheel distributions

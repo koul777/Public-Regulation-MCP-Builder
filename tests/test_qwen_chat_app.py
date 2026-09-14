@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from app.core.config import Settings
 from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
 from app.core.security_primitives import AuthContext
+from app.services.readiness_adapter import OperatorReadinessState
 from frontend.qwen_chat_app import (
     build_chat_request,
     completed_documents_for_profile,
@@ -20,6 +20,7 @@ from frontend.qwen_chat_app import (
     qwen_runtime_configuration_issue,
     safe_citation_rows,
     start_rag_chat_worker,
+    _qwen_probe_readiness,
 )
 from scripts import run_qwen_chat
 
@@ -77,6 +78,24 @@ class QwenChatSecurityAndGateTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_qwen_probe_readiness_uses_common_beginner_state_contract(self) -> None:
+        ready = _qwen_probe_readiness(
+            {"signature": "current", "available": True},
+            signature="current",
+        )
+        unavailable = _qwen_probe_readiness(
+            {"signature": "current", "available": False},
+            signature="current",
+        )
+        stale = _qwen_probe_readiness(
+            {"signature": "old", "available": True},
+            signature="current",
+        )
+
+        self.assertEqual(OperatorReadinessState.READY, ready.state)
+        self.assertEqual(OperatorReadinessState.ACTION_REQUIRED, unavailable.state)
+        self.assertEqual(OperatorReadinessState.UNKNOWN, stale.state)
 
     def test_registry_path_prefers_configuration_and_falls_back_to_data_dir(self) -> None:
         self.assertEqual(

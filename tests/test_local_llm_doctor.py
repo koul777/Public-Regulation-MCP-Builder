@@ -41,6 +41,21 @@ class LocalLlmDoctorTests(unittest.TestCase):
         available.assert_called_once()
         probe.assert_called_once()
 
+    @patch("scripts.local_llm_doctor.probe_local_llm", return_value=["invalid"])
+    @patch("scripts.local_llm_doctor.local_llm_available", return_value=True)
+    def test_malformed_probe_response_fails_closed(self, available, probe) -> None:
+        report = diagnose_local_llm(
+            backend="ollama",
+            endpoint="http://127.0.0.1:11434",
+            model="qwen3:8b",
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual("local_probe_invalid", report["reason"])
+        self.assertNotIn("health", report)
+        available.assert_called_once()
+        probe.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

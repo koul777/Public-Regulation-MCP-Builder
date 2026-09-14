@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """Standalone localhost UI for approved, document-scoped Qwen regulation chat.
 
 This module deliberately does not import the operator/builder Streamlit app.  It
 is launched as its own Streamlit process by ``scripts.run_qwen_chat`` and only
 reads the repository that the local builder already produced.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 import queue
@@ -28,6 +28,12 @@ from app.core.institution_profiles import (
 )
 from app.core.security_primitives import API_ROLE_ADMIN, AuthContext
 from app.rag.local_llm import local_llm_available, probe_local_llm
+from app.services.readiness_adapter import (
+    OperatorReadinessState,
+    ReadinessCard,
+    adapt_local_llm_probe,
+    adapt_readiness_report,
+)
 from app.storage.repository import JsonRepository
 
 
@@ -568,6 +574,21 @@ def _probe_signature(settings: Settings) -> str:
     )
 
 
+def _qwen_probe_readiness(
+    probe_state: dict[str, Any] | None,
+    *,
+    signature: str,
+) -> ReadinessCard:
+    """Adapt the cached local probe without retaining its raw response."""
+
+    if not isinstance(probe_state, dict) or probe_state.get("signature") != signature:
+        return adapt_readiness_report(None, component="Qwen3 8B")
+    return adapt_local_llm_probe(
+        {"available": probe_state.get("available") is True},
+        component="Qwen3 8B",
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="로컬 Qwen 규정 챗봇", page_icon="💬", layout="wide")
     st.title("로컬 Qwen 규정 챗봇")
@@ -678,21 +699,27 @@ def main() -> None:
     st.markdown("### 4. Ollama와 Qwen3 8B 연결을 확인하세요")
     probe_signature = _probe_signature(settings)
     probe_state = st.session_state.get(PROBE_SESSION_KEY)
-    probe_ok = bool(
-        isinstance(probe_state, dict)
-        and probe_state.get("signature") == probe_signature
-        and probe_state.get("available") is True
-    )
+    probe_readiness = _qwen_probe_readiness(probe_state, signature=probe_signature)
     if st.button("Ollama · qwen3:8b 연결 확인", width="stretch"):
         with st.spinner("이 PC의 Ollama에 짧은 확인 질문을 보내고 있습니다."):
             result = probe_local_llm(settings)
-        probe_ok = bool(result.get("available"))
+        probe_ok = isinstance(result, dict) and result.get("available") is True
         st.session_state[PROBE_SESSION_KEY] = {
             "signature": probe_signature,
             "available": probe_ok,
         }
-    if probe_ok:
+        probe_readiness = _qwen_probe_readiness(
+            st.session_state[PROBE_SESSION_KEY],
+            signature=probe_signature,
+        )
+    probe_ok = probe_readiness.state == OperatorReadinessState.READY
+    if probe_readiness.state == OperatorReadinessState.READY:
         st.success("연결되었습니다. 이제 아래 입력창에 규정 질문을 적을 수 있습니다.")
+    elif probe_readiness.state == OperatorReadinessState.ACTION_REQUIRED:
+        st.warning(
+            "Qwen3 8B 연결 확인에 조치가 필요합니다. Ollama 실행 상태와 "
+            "`ollama pull qwen3:8b` 설치 여부를 확인한 뒤 다시 시도하세요."
+        )
     else:
         st.info(
             "위 버튼으로 연결을 먼저 확인해 주세요. 실패하면 Ollama가 실행 중인지, "

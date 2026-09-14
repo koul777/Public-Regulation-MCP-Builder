@@ -26,9 +26,30 @@ v1.2.21에서는 독립 Qwen 챗봇이 기본적으로 빠른 승인 BM25/lexica
 [작성 MVP 계약](docs/authoring_mvp_contract_ko.md) ·
 [작성 보안 모델](docs/authoring_security_model_ko.md) ·
 [작성 롤아웃 계획](docs/authoring_workspace_rollout_plan_ko.md) ·
+[초보자·유지보수 오케스트레이션 계획](docs/beginner_maintenance_orchestration_plan_ko.md) ·
 [처음 사용자 1–6단계로 바로 이동](#qwen-first-chat) ·
 [문제 해결표로 이동](#4-문제-해결표) ·
 [업데이트 내역 보기](#update-history)
+
+## 초보자·유지보수 개선 현황
+
+초보자가 화면에서 다음 행동을 바로 찾을 수 있도록 전처리·결과 확인·승인·연결 단계를
+공통 상태로 표시합니다. MCP와 로컬 Qwen 연결 진단은 `등록 필요`, `연결 대기`, `조치 필요`,
+`오래된 상태`, `사용 가능`을 구분하고, 각 상태에 맞는 복구 안내를 제공합니다.
+
+연결 진단·준비 상태·워크플로 진행 계산은 독립 서비스로 분리되어 화면 코드와 분리된
+테스트가 가능합니다. 비정상 응답, 빈 경로, 허용되지 않은 경로, 과도하게 큰 설정 파일,
+비정상 종료는 성공으로 표시하지 않도록 fail-closed로 처리합니다. 자세한 범위와 다음
+단계는 [초보자·유지보수 오케스트레이션 계획](docs/beginner_maintenance_orchestration_plan_ko.md)을
+참조하세요.
+
+이번 변경은 다음 명령으로 검증했습니다.
+
+```powershell
+python -m unittest discover -s tests -q
+python -m build --sdist --wheel
+python scripts\audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan
+```
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&logoColor=white)](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import hashlib
 import html
-import io
 import json
 import os
 import queue
@@ -109,6 +108,20 @@ from app.services.approval_governance import (
     approval_review_completion_state,
     build_approval_review_events,
 )
+from app.services.mcp_connection_service import (
+    MCP_CONNECTION_STAGE_ORDER,
+    diagnostic_from_bundle_status,
+    refresh_mcp_client_connection,
+)
+from app.services.readiness_adapter import (
+    OperatorReadinessState,
+    adapt_local_llm_probe,
+    adapt_readiness_report,
+)
+from app.services.workflow_readiness import (
+    WorkflowStage,
+    safe_summarize_workflow_readiness,
+)
 from app.storage.repository import JsonRepository
 from scripts.generate_mcp_client_config import (
     KORDOC_TABLE_REQUIRED_FILE_TYPES,
@@ -120,11 +133,6 @@ from scripts.generate_mcp_client_config import (
     write_mcp_setup_bundle,
     write_mcp_setup_bundle_zip,
 )
-from scripts.mcp_connection_diagnostic import (
-    STAGE_ORDER as MCP_CONNECTION_STAGE_ORDER,
-    diagnostic_from_bundle_status,
-)
-from scripts.refresh_mcp_client_connection import run as refresh_mcp_client_connection
 from scripts.analyze_regulation_corpus import (
     GOLDSET_COMPLETE_LABEL_STATUSES,
     GOLDSET_SCORE_SPECS,
@@ -250,6 +258,33 @@ MCP_CONNECTION_STATE_LABELS = {
     "verified": "확인됨",
     "failed": "실패",
     "stale": "이전 증거",
+}
+MCP_CONNECTION_REASON_LABELS = {
+    "ok": "확인됨",
+    "not_checked": "아직 확인하지 않음",
+    "not_required_for_client": "선택한 앱에서는 확인하지 않음",
+    "not_applicable": "해당 없음",
+    "registration_required": "AI 앱에 MCP 설정 등록 필요",
+    "probe_pending": "실제 연결 확인 대기",
+    "observation_ready": "실행 관찰 완료·대화 확인 필요",
+    "observation_recorded_pending": "관찰 기록 완료·최종 확인 대기",
+    "claude_desktop_registration_not_verified": "Claude Desktop 등록 확인 필요",
+    "claude_code_registration_not_verified": "Claude Code 등록 확인 필요",
+    "chatgpt_local_unsupported": "ChatGPT 로컬 연결은 지원하지 않음",
+    "stale_attempt": "이전 실행 기록이라 다시 확인 필요",
+    "stale_config_fingerprint": "설정이 바뀌어 다시 확인 필요",
+    "evidence_attempt_missing": "현재 실행 증거가 없음",
+    "config_entry_changed": "설정 변경 후 다시 확인 필요",
+    "runtime_changed": "실행 환경 변경 후 다시 확인 필요",
+    "bundle_location_changed": "번들 위치 변경 후 다시 확인 필요",
+    "legacy_evidence_unattributed": "현재 실행과 연결되지 않은 이전 기록",
+    "stale": "이전 확인 기록이라 다시 확인 필요",
+    "stale_evidence": "이전 확인 증거라 다시 확인 필요",
+}
+MCP_CONNECTION_REFRESH_MESSAGES = {
+    "refresh_failed": "Claude Desktop 실행 상태와 설정을 확인한 뒤 다시 시도하세요.",
+    "refresh_report_invalid": "연결 관찰 결과를 읽지 못했습니다. 설정 묶음을 다시 확인한 뒤 시도하세요.",
+    "target_not_observable": "선택한 클라이언트는 직접 연결 관찰을 지원하지 않습니다. 지원되는 클라이언트를 선택하세요.",
 }
 NAV_HOME = "🏠 시작하기"
 NAV_AUTHORING = AUTHORING_NAV_LABEL
@@ -7196,114 +7231,17 @@ def _read_mcp_connection_diagnostic(
     bundle_dir: str | Path,
     connection_target: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
-    """Read bundle_status on every call and return a conservative diagnostic."""
+    """Read the current bundle status through the application service facade."""
 
-    status_path = Path(bundle_dir) / "bundle_status.json"
-    try:
-        payload = json.loads(status_path.read_text(encoding="utf-8"))
-    except OSError:
-        return (
-            diagnostic_from_bundle_status({}, connection_target=connection_target),
-            "bundle_status_unavailable",
-        )
-    except (UnicodeError, json.JSONDecodeError):
-        return (
-            diagnostic_from_bundle_status({}, connection_target=connection_target),
-            "bundle_status_invalid",
-        )
-    if not isinstance(payload, dict):
-        return (
-            diagnostic_from_bundle_status({}, connection_target=connection_target),
-            "bundle_status_invalid",
-        )
+    from app.services.mcp_connection_service import (
+        read_mcp_connection_diagnostic as read_diagnostic,
+    )
 
-    v5_connections = (
-        payload.get("client_connections")
-        if payload.get("schema_version") == "mcp-bundle-status-v5"
-        and isinstance(payload.get("client_connections"), dict)
-        else None
+    return read_diagnostic(
+        bundle_dir,
+        connection_target,
+        diagnostic_builder=diagnostic_from_bundle_status,
     )
-    selected_record = (
-        v5_connections.get(connection_target)
-        if isinstance(v5_connections, dict)
-        and isinstance(v5_connections.get(connection_target), dict)
-        else None
-    )
-    selected_effective = (
-        selected_record.get("effective")
-        if isinstance(selected_record, dict)
-        and isinstance(selected_record.get("effective"), dict)
-        else {}
-    )
-    selected_last_attempt = (
-        selected_record.get("last_attempt")
-        if isinstance(selected_record, dict)
-        and isinstance(selected_record.get("last_attempt"), dict)
-        else {}
-    )
-    if selected_record is not None:
-        attempt_id = str(
-            selected_effective.get("attempt_id")
-            or selected_last_attempt.get("id")
-            or ""
-        ).strip() or None
-    else:
-        attempt_id = str(
-            payload.get("installation_attempt_id")
-            or payload.get("attempt_id")
-            or ""
-        ).strip() or None
-    is_claude_desktop = connection_target == "claude-desktop"
-    is_claude_code = connection_target == "claude-code"
-    if is_claude_desktop:
-        fingerprint_field = "claude_desktop_config_fingerprint"
-        path_field: str | None = "claude_desktop_config_path"
-        registration_field = "claude_desktop_config_registered"
-    elif is_claude_code:
-        fingerprint_field = "claude_code_config_fingerprint"
-        path_field = None
-        registration_field = "claude_code_registered"
-    else:
-        fingerprint_field = "installed_config_fingerprint"
-        path_field = "direct_config_path"
-        registration_field = "direct_config_registered"
-    if selected_record is not None:
-        config_fingerprint = str(
-            selected_effective.get("config_entry_fingerprint") or ""
-        ).strip() or None
-    else:
-        config_fingerprint = str(
-            payload.get(fingerprint_field)
-            or payload.get("config_fingerprint")
-            or ""
-        ).strip() or None
-    legacy_projection_matches_target = (
-        selected_record is None or payload.get("legacy_projection_target") == connection_target
-    )
-    if (
-        path_field
-        and legacy_projection_matches_target
-        and payload.get(registration_field) is True
-    ):
-        installed_config_path = str(payload.get(path_field) or "").strip()
-        try:
-            current_config_path = Path(installed_config_path)
-            if not installed_config_path or not current_config_path.is_file():
-                config_fingerprint = None
-            else:
-                config_fingerprint = "sha256:" + hashlib.sha256(
-                    current_config_path.read_bytes()
-                ).hexdigest()
-        except OSError:
-            config_fingerprint = None
-    diagnostic = diagnostic_from_bundle_status(
-        payload,
-        attempt_id=attempt_id,
-        config_fingerprint=config_fingerprint,
-        checked_at=payload.get("updated_at") or payload.get("generated_at"),
-        connection_target=connection_target,
-    )
-    return diagnostic, None
 
 
 def _refresh_mcp_connection_observation(
@@ -7311,38 +7249,18 @@ def _refresh_mcp_connection_observation(
     connection_target: str,
     server_name: str,
 ) -> tuple[bool, str]:
-    """Run a path-free, read-only Desktop observation and refresh its status fields."""
+    """Run a read-only desktop observation through the application service."""
 
-    if connection_target not in {"chatgpt-desktop-local", "claude-desktop"}:
-        return False, "target_not_observable"
-    status_path = Path(bundle_dir) / "bundle_status.json"
-    output = io.StringIO()
-    refresh_args = [
-            "--target",
-            connection_target,
-            "--server-name",
-            server_name,
-            "--bundle-status",
-            str(status_path),
-            "--bundle-dir",
-            str(Path(bundle_dir)),
-        ]
-    if connection_target == "chatgpt-desktop-local":
-        refresh_args.append("--adopt-manual-registration")
-    exit_code = refresh_mcp_client_connection(
-        refresh_args,
-        stdout=output,
+    from app.services.mcp_connection_service import (
+        refresh_mcp_connection_observation as refresh_observation,
     )
-    try:
-        output.seek(0)
-        result = json.loads(output.read())
-    except (TypeError, json.JSONDecodeError):
-        return False, "refresh_report_invalid"
-    if not isinstance(result, dict) or result.get("status_updated") is not True:
-        return False, str(result.get("error_code") or "refresh_failed")
-    if exit_code == 0 and result.get("ok") is True:
-        return True, "observation_ready"
-    return True, "observation_recorded_pending"
+
+    return refresh_observation(
+        bundle_dir,
+        connection_target,
+        server_name,
+        refresh_runner=refresh_mcp_client_connection,
+    )
 
 
 def _mcp_connection_diagnostic_rows(diagnostic: dict[str, Any]) -> list[dict[str, Any]]:
@@ -7362,13 +7280,14 @@ def _mcp_connection_diagnostic_rows(diagnostic: dict[str, Any]) -> list[dict[str
             if key != "config_fingerprint" and value not in (None, False, "", [], {})
         )
         state = str(stage.get("state") or "not_checked")
+        reason_code = str(stage.get("reason_code") or "not_checked").strip().lower()
         rows.append(
             {
                 "단계": MCP_CONNECTION_STAGE_LABELS.get(stage_name, stage_name),
                 "상태": MCP_CONNECTION_STATE_LABELS.get(state, state),
                 "시도 ID": str(stage.get("attempt_id") or "없음"),
                 "확인 시각": str(stage.get("checked_at") or "미확인"),
-                "사유 코드": str(stage.get("reason_code") or "not_checked"),
+                "상태 설명": MCP_CONNECTION_REASON_LABELS.get(reason_code, "상세 확인 필요"),
                 "증거 항목": ", ".join(safe_evidence_keys) if safe_evidence_keys else "없음",
             }
         )
@@ -8022,19 +7941,21 @@ def _workflow_states(ctx: dict | None) -> list[bool]:
 def _next_action(ctx: dict | None) -> tuple[str, str]:
     """(안내 문구, 이동할 화면)"""
     workflow_states = _workflow_states(ctx)
-    if not workflow_states[0]:
+    readiness = safe_summarize_workflow_readiness(workflow_states)
+    next_stage = readiness.current_stage
+    if next_stage == WorkflowStage.PREPROCESS:
         return ("규정 문서 파일을 올리고 '전처리 시작'을 누르세요.", NAV_PREPROCESS)
-    if not workflow_states[1]:
+    if next_stage == WorkflowStage.RESULTS:
         return ("전처리 결과와 품질 검사 내용을 확인하세요.", NAV_RESULTS)
-    if not workflow_states[2]:
+    if next_stage == WorkflowStage.APPROVAL:
         return (
             "사람 검수 권고 내용을 확인한 뒤 승인·색인(AI에 등록)하세요.",
             NAV_APPROVAL,
         )
-    if not workflow_states[3]:
+    if next_stage == WorkflowStage.USE:
         if _ai_usage_path() == AI_USAGE_PATH_QWEN:
             return ("로컬 Qwen 챗봇을 켜고 질문한 뒤 답변과 근거 조문을 함께 확인하세요.", NAV_MCP)
-        return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. Claude, ChatGPT, Codex 연결용 ④ 단계입니다.", NAV_MCP)
+        return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. ChatGPT 웹 HTTPS 또는 Claude·Codex 연결용 ④ 단계입니다.", NAV_MCP)
     if _ai_usage_path() == AI_USAGE_PATH_QWEN:
         return ("Qwen 답변과 근거 조문을 확인했습니다. ④ 화면에서 다음 질문을 이어가세요.", NAV_MCP)
     return ("MCP 설정 묶음까지 생성됐습니다. ④ 화면에서 검색 점검과 연결 상태를 확인해 보세요.", NAV_MCP)
@@ -12584,10 +12505,16 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
                 rag_llm_model=rag_model or DEFAULT_LOCAL_LLM_MODEL,
             )
             result = probe_local_llm(probe_settings)
-            if result.get("available"):
+            probe_readiness = adapt_local_llm_probe(result, component="Qwen3 8B")
+            if probe_readiness.state == OperatorReadinessState.READY:
                 st.success(f"로컬 LLM 연결 가능 · {result.get('model') or rag_model}")
+            elif probe_readiness.state == OperatorReadinessState.ACTION_REQUIRED:
+                st.warning(
+                    "Qwen3 8B 연결에 조치가 필요합니다. Ollama 실행 상태와 "
+                    "`ollama pull qwen3:8b` 설치 여부를 확인한 뒤 다시 시도하세요."
+                )
             else:
-                st.warning("Qwen3 8B 연결을 확인하지 못했습니다. Ollama 실행·모델 설치·endpoint를 확인하세요.")
+                st.info("Qwen3 8B 연결 결과를 확인할 수 없습니다. 잠시 후 다시 점검하세요.")
 
     review_level, review_message = _review_api_connection_status(settings_snapshot)
     st.markdown("**검수용 외부 AI (문서 검수 초안 생성)**")
@@ -14285,27 +14212,49 @@ def _page_connect(
                             "현재 관찰 결과를 기록했습니다. 앱 재시작 또는 제품 화면 확인이 아직 필요합니다."
                         )
                     else:
+                        refresh_failure_message = MCP_CONNECTION_REFRESH_MESSAGES.get(
+                            refresh_message,
+                            "연결 관찰을 갱신하지 못했습니다. 설정과 실행 상태를 확인한 뒤 다시 시도하세요.",
+                        )
                         st.warning(
-                            f"연결 관찰을 갱신하지 못했습니다: {refresh_message or 'refresh_failed'}"
+                            f"연결 관찰을 갱신하지 못했습니다: {refresh_failure_message}"
                         )
 
-                diagnostic_state = str(connection_diagnostic.get("overall_state") or "pending")
-                if diagnostic_state == "connected":
+                connection_readiness = adapt_readiness_report(
+                    None if diagnostic_read_error else connection_diagnostic,
+                    component=diagnostic_client_label,
+                )
+                if connection_readiness.state == OperatorReadinessState.READY:
                     st.success(
                         f"{diagnostic_client_label} 연결 완료 — 현재 시도의 등록·실행 및 "
                         "새 대화 또는 task 실제 도구 호출 증명까지 확인했습니다."
                     )
-                elif diagnostic_state == "configured":
+                elif connection_readiness.state == OperatorReadinessState.CONFIGURED_PENDING:
                     st.info(
                         f"MCP 구성 확인 완료 · {diagnostic_client_label} 최종 확인 대기 — "
                         "서버 실행 준비는 확인됐지만 새 대화 또는 task의 실제 도구 호출은 "
                         "아직 별도 확인이 필요합니다."
                     )
+                elif connection_readiness.state == OperatorReadinessState.REGISTRATION_REQUIRED:
+                    st.warning(
+                        f"{diagnostic_client_label} 등록이 필요합니다. "
+                        f"{connection_readiness.next_action}"
+                    )
+                elif connection_readiness.state == OperatorReadinessState.STALE:
+                    st.warning(
+                        f"{diagnostic_client_label} 확인 기록이 오래됐습니다. "
+                        f"{connection_readiness.next_action}"
+                    )
+                elif connection_readiness.state == OperatorReadinessState.ACTION_REQUIRED:
+                    st.warning(
+                        f"{diagnostic_client_label} 연결 확인에 조치가 필요합니다. "
+                        f"{connection_readiness.next_action}"
+                    )
                 else:
                     st.warning(
-                        "MCP 연결 진단 대기 — 현재 시도에서 설정·실행 검증이 아직 모두 끝나지 않았습니다."
+                        f"MCP 연결 진단을 확인할 수 없습니다. {connection_readiness.next_action}"
                     )
-                if diagnostic_read_error == "bundle_status_unavailable":
+                if diagnostic_read_error in {"bundle_dir_unavailable", "bundle_status_unavailable"}:
                     st.warning("연결 상태 파일을 아직 읽을 수 없습니다. 파일 묶음을 다시 확인하세요.")
                 elif diagnostic_read_error == "bundle_status_invalid":
                     st.warning("연결 상태 파일 형식이 올바르지 않아 보수적으로 미확인 처리했습니다.")
@@ -15232,6 +15181,22 @@ with st.sidebar:
     nav_page = current_nav_page
     st.divider()
     if ctx:
+        workflow_states = _workflow_states(ctx)
+        workflow_readiness = safe_summarize_workflow_readiness(workflow_states)
+        if workflow_readiness.is_complete:
+            st.caption("진행 상태: 전체 4단계 완료")
+        else:
+            next_stage = workflow_readiness.current_stage or WorkflowStage.USE
+            next_message, next_target = _next_action(ctx)
+            st.caption(
+                f"진행 상태: {workflow_readiness.completed_steps}/"
+                f"{workflow_readiness.total_steps}단계 완료 · "
+                f"현재 단계: {next_stage.display_name}"
+            )
+            st.info(
+                f"지금 할 일: {next_message}\n\n"
+                f"이동 위치: {next_target}"
+            )
         quality_report = ctx["quality_report"]
         st.markdown("**현재 작업 중인 문서**")
         st.caption(f"문서 ID: {ctx['document_id'][:12]}")
