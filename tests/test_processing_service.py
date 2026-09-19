@@ -436,6 +436,103 @@ class ProcessingServiceTests(unittest.TestCase):
             review_events,
         )
 
+    def test_form_with_colon_lines_still_gets_ai_review_findings(self) -> None:
+        """별지 서식이 섞인 규정도 AI를 연결했으면 검수 의견이 나와야 한다.
+
+        운영자가 신고한 증상이다. 서식의 ``확인자(지도교수)`` 다음 줄에 ``:`` 하나만
+        있는 줄 때문에 유출 차단이 걸려, 조항 6,571개짜리 규정이 제공자를 한 번도
+        못 부르고 ``provider_execution_blocked`` 로 끝났다. 승인 화면은 조항마다
+        의견이 비어 있었다.
+        """
+
+        form_text = (
+            "제1조(목적) 이 규정은 연구비 지급에 필요한 사항을 정한다.\n"
+            "[별지 제7호 서식]\n"
+            "지도교수\n"
+            ":\n"
+            "확인자(연구책임자)\n"
+            ":\n"
+            "(서명/인)\n"
+            "Please approve our request to make a change as follows:\n"
+            "1. 변경 사유"
+        )
+
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="연구비 지급 규정",
+                    file_type="pdf",
+                    pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(type="table", text=form_text)])],
+                    raw_text=form_text,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_model="review-model",
+            )
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+            sent_payloads: list[dict] = []
+
+            def _fake_post(url, headers, payload, timeout):
+                sent = json.loads(payload["messages"][1]["content"])
+                sent_payloads.append(sent)
+                items = [
+                    {
+                        "chunk_id": item["chunk_id"],
+                        "risk_level": "high",
+                        "issues": ["별지 서식의 표 경계가 본문과 붙어 있습니다."],
+                        "recommended_human_check": "별지 제7호 서식을 원문과 대조하세요.",
+                    }
+                    for item in sent["items"]
+                ]
+                return {
+                    "id": "req_form",
+                    "choices": [{"message": {"content": json.dumps({"items": items})}}],
+                }
+
+            service.agent_review_executor.http_post = _fake_post
+            document = Document(
+                document_id="doc_form_review",
+                filename="form-regulation.pdf",
+                document_name="연구비 지급 규정",
+                file_type="pdf",
+                file_hash="form-regulation-hash",
+                tenant_id="tenant-a",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={"status": "disabled", "table_count": 0, "tables": []},
+            ):
+                job = service.process(document.document_id, ChunkOptions(enable_agent_review=True))
+
+            chunks = repo.get_chunks(document.document_id)
+            completed_run = repo.latest_completed_run(document.document_id)
+
+        self.assertEqual("completed", job.status)
+        agent_review = completed_run.stats["agent_review"]
+        # 차단되지 않고 실제로 제공자를 불러야 한다.
+        self.assertEqual("executed", agent_review["status"])
+        self.assertGreater(int(agent_review["api_call_count"]), 0)
+        self.assertTrue(sent_payloads)
+        # 그리고 그 결과가 조항에 붙어 승인 화면에서 보여야 한다.
+        self.assertGreater(
+            sum(1 for chunk in chunks if (chunk.metadata or {}).get("agent_review_findings")),
+            0,
+        )
+
     def test_reuploading_the_same_regulation_keeps_the_ai_review_visible(self) -> None:
         """같은 규정을 두 번 올리면 두 번째 문서에도 검수 의견이 남아야 한다.
 

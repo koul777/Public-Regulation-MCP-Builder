@@ -102,7 +102,7 @@ class AgentReviewExecutor:
             )
             return result
         for payload in payloads:
-            payload_leak_reason = _payload_local_path_leak_reason(payload["request"])
+            payload_leak_reason = _payload_local_path_leak_reason(payload["leak_scan"])
             if payload_leak_reason:
                 result.update(
                     {
@@ -382,7 +382,7 @@ class AgentReviewExecutor:
         candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """한 묶음의 요청 본문과, 그 묶음이 무엇을 담고 있는지를 함께 돌려준다."""
-        openai_payload, chunk_ids = self._chat_payload(plan, chunks, candidates=candidates)
+        openai_payload, chunk_ids, user_payload = self._chat_payload(plan, chunks, candidates=candidates)
         if provider == "anthropic":
             request: dict[str, Any] = {
                 "model": openai_payload["model"],
@@ -393,7 +393,12 @@ class AgentReviewExecutor:
             }
         else:
             request = openai_payload
-        return {"request": request, "chunk_ids": chunk_ids, "_item_count": len(chunk_ids)}
+        return {
+            "request": request,
+            "chunk_ids": chunk_ids,
+            "_item_count": len(chunk_ids),
+            "leak_scan": _leak_scan_view(request, user_payload),
+        }
 
     def _chat_payload(
         self,
@@ -401,7 +406,7 @@ class AgentReviewExecutor:
         chunks: list[Chunk],
         *,
         candidates: list[dict[str, Any]] | None = None,
-    ) -> tuple[dict[str, Any], list[str]]:
+    ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
         chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
         items: list[dict[str, Any]] = []
         selected = plan.get("selected_candidates") or [] if candidates is None else candidates
@@ -463,6 +468,7 @@ class AgentReviewExecutor:
                 ],
             },
             [str(item["chunk_id"]) for item in items],
+            user_payload,
         )
 
     def _append_execution_audit(
@@ -521,6 +527,30 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
     if not isinstance(parsed, dict):
         raise RuntimeError("AI provider response was not a JSON object.")
     return parsed
+
+
+def _leak_scan_view(request: dict[str, Any], user_payload: dict[str, Any]) -> dict[str, Any]:
+    """유출 검사용 보기. 직렬화한 사용자 메시지를 직렬화 이전 값으로 되돌린다.
+
+    검사를 ``json.dumps`` 결과 문자열에 걸면 안 된다. 직렬화하면 줄바꿈이 역슬래시와
+    n 두 글자로 바뀌어, ``확인자(지도교수)`` 다음 줄에 ``:`` 하나만 있는 평범한 별지
+    서식이 ``n:\\`` 이 되고 윈도우 경로로 오인된다. 실제로 조항 6,571개짜리 규정이
+    서식 네 장 때문에 제공자를 한 번도 못 부르고 통째로 막혔다.
+
+    원문 값에 걸면 진짜 경로만 잡히고, 걸렸을 때 남는 자리 표시도
+    ``...content.items[3].text`` 처럼 어느 조항인지 가리킨다.
+    """
+    view = dict(request)
+    messages = view.get("messages")
+    if not isinstance(messages, list):
+        return view
+    restored: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and str(message.get("role") or "") == "user":
+            message = {**message, "content": user_payload}
+        restored.append(message)
+    view["messages"] = restored
+    return view
 
 
 def _payload_local_path_leak_reason(value: Any) -> str:

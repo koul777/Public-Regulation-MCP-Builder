@@ -43,6 +43,10 @@ v1.2.21에서는 독립 Qwen 챗봇이 기본적으로 빠른 승인 BM25/lexica
 단계는 [초보자·유지보수 오케스트레이션 계획](docs/beginner_maintenance_orchestration_plan_ko.md)을
 참조하세요.
 
+코드와 실제 MCP STDIO 경로를 먼저 검증하려면 [초보자 첫 성공 검증](docs/beginner_first_success_ko.md)을
+실행하세요. 합성 샘플과 임시 tenant만 사용하며, `list_regulations`·`search`·`fetch`까지
+통과해야 성공으로 판정합니다.
+
 이번 변경은 다음 명령으로 검증했습니다.
 
 ```powershell
@@ -82,8 +86,10 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 > [!NOTE]
 > 이 작업 트리에 새로 추가된 **초보자 안내 모드와 Windows 실행 보완은 다음 portable
 > 릴리스에 포함될 예정**입니다. 현재 `releases/latest` 실행판에 첫 선택 화면이 보이지
-> 않으면 소스 실행으로 확인하거나, 새 portable 릴리스와 fresh-Windows 검증이 끝난 뒤
-> 다운로드하세요.
+> 않으면 정상입니다. 현재 실행판은 일반 모드로 시작하므로 아래 ①부터 바로 진행하세요.
+> 초보자 안내 모드가 필요하면 [개발자용 실행과 검증](#개발자용-실행과-검증)의
+> `START_HERE.bat` 소스 실행을 사용하세요. 새 portable 릴리스와 fresh-Windows 검증이
+> 끝난 뒤에는 실행판에서도 안내 모드를 다시 확인할 수 있습니다.
 
 ### 원문 파일이 없다면 규정 초안부터 만들기
 
@@ -121,6 +127,9 @@ PR MCP Builder는 PDF·HWP·HWPX·DOCX로 흩어진 규정을 정리하고, **�
 돌아갑니다.
 
 - [ ] 작업할 기관을 만들거나 정확한 기존 기관을 선택했다.
+- [ ] PDF·HWP·HWPX·DOCX로 **공식 MCP 묶음**을 만들 예정이면 업로드 전에 화면에
+      `Kordoc 사용 가능`이 표시되는지 확인했다. 설치했다면 앱을 완전히 종료하고
+      `PR MCP Builder.exe` 또는 `START_HERE.bat`을 다시 실행했다.
 - [ ] 결과 확인 화면에서 규정명·조문·표·별표를 원문과 비교했다.
 - [ ] 검수·승인 화면에서 사람이 최종본을 확정했다.
 - [ ] 규정 상태에 **승인 완료**와 **색인 완료**가 함께 표시된다.
