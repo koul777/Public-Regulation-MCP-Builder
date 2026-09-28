@@ -25,7 +25,9 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         product_heading = "# PR MCP Builder v1.2.21"
         history_anchor = '<a id="update-history"></a>'
 
-        self.assertTrue(readme.startswith(product_heading))
+        self.assertTrue(readme.startswith('<p align="center">'))
+        self.assertLess(readme.index("docs/assets/pr-mcp-builder-brand-trailer.gif"), readme.index(product_heading))
+        self.assertLess(readme.index("## 초보자 클릭 안내 시연"), readme.index("## 로컬 Qwen 질문 시연"))
         self.assertLess(readme.index(product_heading), readme.index(today_heading))
         self.assertIn('[업데이트 내역 보기](#update-history)', readme)
         self.assertGreater(readme.index(history_anchor), readme.index("## Kordoc 사용 고지"))

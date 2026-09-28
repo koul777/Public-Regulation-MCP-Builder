@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -429,6 +430,34 @@ class QwenChatSecurityAndGateTests(unittest.TestCase):
 
 
 class QwenChatLauncherTests(unittest.TestCase):
+    def test_english_windows_output_keeps_korean_launch_and_error_messages(self) -> None:
+        for protected in (False, True):
+            with self.subTest(protected=protected):
+                stdout_bytes, stderr_bytes = io.BytesIO(), io.BytesIO()
+                stdout = io.TextIOWrapper(stdout_bytes, encoding="cp1252")
+                stderr = io.TextIOWrapper(stderr_bytes, encoding="cp1252")
+                environment = {"APP_ENV": "production" if protected else "local"}
+                try:
+                    with patch.object(run_qwen_chat.sys, "stdout", stdout), patch.object(
+                        run_qwen_chat.sys, "stderr", stderr
+                    ), patch.object(run_qwen_chat, "launch_environment", return_value=environment), patch.object(
+                        run_qwen_chat, "resolve_launch_port", return_value=9876
+                    ), patch.object(run_qwen_chat.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+                        result = run_qwen_chat.main(["--port", "9876", "--headless"])
+                    stdout.flush()
+                    stderr.flush()
+                    if protected:
+                        self.assertEqual(2, result)
+                        self.assertIn("[실행 중단]", stderr_bytes.getvalue().decode("utf-8"))
+                        run.assert_not_called()
+                    else:
+                        self.assertEqual(0, result)
+                        self.assertIn("로컬 Qwen 규정 챗봇", stdout_bytes.getvalue().decode("utf-8"))
+                        run.assert_called_once()
+                finally:
+                    stdout.close()
+                    stderr.close()
+
     def test_loopback_validation_rejects_public_bind_addresses(self) -> None:
         self.assertEqual("127.0.0.1", run_qwen_chat.validate_loopback_host("127.0.0.1"))
         self.assertEqual("::1", run_qwen_chat.validate_loopback_host("::1"))

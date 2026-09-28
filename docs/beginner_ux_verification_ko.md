@@ -1,5 +1,22 @@
 # 초보자 화면 안내 실행 검증
 
+## 2026-09-29 README 홍보 영상과 영문 Windows 보완
+
+README 첫 화면에 Kordoc 4.16.0, 초보자 클릭 안내, 승인된 규정의 로컬 Qwen·MCP
+연결을 소개하는 **20초 홍보 영상**을 배치했다. GIF(960×540), MP4(1280×720,
+H.264), 정지 화면을 제공하며 실제 앱의 65초 클릭 시연은 바로 아래에 둔다.
+홍보 영상의 도식은 기능 소개이고 실제 앱 녹화와 구분한다. 네 장면의 한글과 배치,
+MP4 길이·코덱을 확인했다. 상대 경로를 사용해 현재 GitHub 브랜치의 영상을 표시한다.
+
+GitHub의 영문 Windows Python 3.11 회귀에서 Qwen 실행 안내를 cp1252로 출력하다
+중단되는 오류를 발견했다. 독립 실행기의 표준 출력과 오류 출력을 UTF-8로 설정하고,
+실제 cp1252 텍스트 스트림으로 정상 실행과 보호 모드 거부를 검사했다.
+관련 Qwen·README **34개 검사가 실패 없이 통과**했다.
+
+```powershell
+python -m unittest tests.test_qwen_chat_app tests.test_beginner_quickstart_docs -q
+```
+
 ## 2026-09-29 Orca 토론 후 보완
 
 [역할 분담과 토론 결정](beginner_overnight_plan_ko.md)에 따라 Kordoc 준비 확인,

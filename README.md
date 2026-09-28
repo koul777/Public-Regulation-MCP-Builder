@@ -1,8 +1,36 @@
-# PR MCP Builder v1.2.21
+<p align="center">
+  <img src="docs/assets/pr-mcp-builder-brand-trailer.gif" alt="Kordoc 4.16.0 연동, 초보자 클릭 안내, 문서와 표 구조화, 사람 승인, 로컬 Qwen과 MCP를 소개하는 20초 홍보 영상" width="960">
+</p>
+
+<p align="center"><strong>Kordoc 4.16.0 연동 · 초보자 클릭 안내 · 승인된 규정 기반 로컬 RAG</strong></p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.gif" alt="문서 구조화, 사람 승인, 승인 RAG 색인, 로컬 Qwen과 MCP 연결로 이어지는 PR MCP Builder 브랜드 트레일러" width="960">
+  <a href="docs/assets/pr-mcp-builder-brand-trailer.mp4">20초 홍보 영상 MP4</a> ·
+  <a href="docs/assets/pr-mcp-builder-brand-trailer.png">정지 화면 보기</a> ·
+  <a href="#초보자-클릭-안내-시연">실제 사용 시연 바로 보기</a>
 </p>
+
+# PR MCP Builder v1.2.21
+
+최신 Kordoc **4.16.0** 연동과 설치 도구를 반영했습니다(2026년 9월 29일 확인).
+홍보 영상은 기능 소개이며, 아래 영상은 실제 앱의 클릭 과정을 녹화한 시연입니다.
+
+## 초보자 클릭 안내 시연
+
+**초보자 안내 시작**을 누르면 지금 눌러야 할 실제 항목만 밝게 표시됩니다.
+직접 입력하거나 클릭해 작업을 마치면 다음 안내가 이어집니다.
+
+![실제 앱에서 기관 등록, 파일 업로드, 전처리와 조항별 검수를 따라가는 초보자 클릭 안내 시연](docs/assets/beginner-click-guide.gif)
+
+[65초 MP4 시연 파일](docs/assets/beginner-click-guide.mp4) ·
+[실행 검증과 시연 재현 방법](docs/beginner_ux_verification_ko.md)
+
+영상 순서: **안내 시작 → 기관명 입력·생성 → 파일 업로드 → 인식 정보 확인 →
+전처리 → 검수 항목 판단 → 검수 확인·원문 대조 체크 → 안내 멈춤·이어 보기**.
+공개 합성 문서로 현재 소스 화면을 녹화했습니다. 파일은 업로드 입력에 직접 전달하며,
+Windows 파일 선택창은 영상에 포함하지 않습니다. 시연은 첫 조항의 검수 조작까지이며,
+다음 조항 이동·최종 승인·색인과 Qwen 답변은 포함하지 않습니다.
+안내창의 다음 버튼은 설명만 넘기고 실제 승인을 대신하지 않습니다.
 
 **사람이 승인·색인한 공공기관 규정을 독립 로컬 Qwen 챗봇에서 고르고 바로 대화하거나,
 같은 승인 데이터를 MCP로 연결하는 Windows용 규정 전처리·RAG 빌더입니다.**
@@ -15,23 +43,6 @@ v1.2.21에서는 독립 Qwen 챗봇이 기본적으로 빠른 승인 BM25/lexica
 고르고, 필수 항목과 조문·참조 검사를 거쳐 검토용 Markdown/JSON 초안을 만들 수 있습니다.
 이 작성 기능은 기존 승인·색인 저장소와 분리된 `LIMITED INTERNAL DRAFT` 단계이며,
 출력물은 공식 승인본이 아닙니다.
-
-## 초보자 클릭 안내 시연
-
-**초보자 안내 시작**을 누르면 지금 눌러야 할 실제 항목만 밝게 표시됩니다.
-직접 입력하거나 클릭해 작업을 마치면 다음 안내가 이어집니다.
-
-![실제 앱에서 기관 등록, 파일 업로드, 전처리와 조항별 검수를 따라가는 초보자 클릭 안내 시연](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/a91eb60a2250dbb54f8e6a7d8139db1e5c64c919/docs/assets/beginner-click-guide.gif)
-
-[큰 화면으로 65초 MP4 시연 보기](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/a91eb60a2250dbb54f8e6a7d8139db1e5c64c919/docs/assets/beginner-click-guide.mp4) ·
-[실행 검증과 시연 재현 방법](docs/beginner_ux_verification_ko.md)
-
-영상 순서: **안내 시작 → 기관명 입력·생성 → 파일 업로드 → 인식 정보 확인 →
-전처리 → 검수 항목 판단 → 검수 확인·원문 대조 체크 → 안내 멈춤·이어 보기**.
-공개 합성 문서로 현재 소스 화면을 녹화했습니다. 파일은 업로드 입력에 직접 전달하며,
-Windows 파일 선택창은 영상에 포함하지 않습니다. 시연은 첫 조항의 검수 조작까지이며,
-다음 조항 이동·최종 승인·색인과 Qwen 답변은 포함하지 않습니다.
-안내창의 다음 버튼은 설명만 넘기고 실제 승인을 대신하지 않습니다.
 
 ## 로컬 Qwen 질문 시연
 
@@ -2079,6 +2090,10 @@ Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이
 
 ## 2026년 9월 29일 — 실제 조항 안내 검증과 Kordoc·Qwen 복구 보완
 
+- README 맨 위의 20초 홍보 영상에 **Kordoc 4.16.0**, 초보자 클릭 안내, 사람 승인과
+  로컬 Qwen·MCP를 담았습니다. GIF·MP4·정지 화면과 바로 아래 65초 실제 사용 시연을 제공합니다.
+- 영문 Windows 환경에서도 독립 Qwen 실행 안내와 오류 메시지를 한글로 출력하도록
+  UTF-8을 적용했습니다. 출력 때문에 앱 실행이나 보호 모드 안내가 중단되지 않습니다.
 - 실제 Streamlit 브라우저에서 공개 합성 문서를 올리고 첫 검수 항목 → 제1조 → 제2조로
   안내 대상이 이동하는 것을 조항 ID로 확인했습니다. 안내를 멈춘 상태의 화면 재실행과
   이어 보기도 검사했으며, 안내 조작만으로 승인 저널이나 색인이 생성되지 않았습니다.
