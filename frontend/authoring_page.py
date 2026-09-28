@@ -698,9 +698,13 @@ def _render_create_form(*, service: Any, tenant_id: str, profile_id: str) -> Non
         submitted = st.form_submit_button(
             "초안 공간 만들기",
             type="primary",
-            disabled=not title.strip(),
         )
     if not submitted:
+        return
+    # Form inputs reach Python only on submit; disabling this button based on
+    # the initial empty title prevents users from ever submitting their title.
+    if not title.strip():
+        st.error("규정명을 입력한 뒤 초안 공간을 만들어 주세요.")
         return
     try:
         project = service.create_project(

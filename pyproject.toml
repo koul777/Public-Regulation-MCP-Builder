@@ -140,6 +140,9 @@ reg-rag-real-parser-fixtures = "scripts.verify_real_parser_regression_fixtures:m
 [tool.setuptools.packages.find]
 include = ["app*", "frontend*", "scripts*"]
 
+[tool.setuptools.package-data]
+frontend = ["assets/beginner_tour.js", "assets/beginner_tour.css"]
+
 [tool.setuptools.data-files]
 "." = ["packaging/INSTALL_KORDOC_KO.ps1"]
 

@@ -384,6 +384,27 @@ class AgentReviewPolicyTests(unittest.TestCase):
 
         self.assertNotEqual(first.cache_scope_hash(), second.cache_scope_hash())
 
+    def test_cache_scope_changes_when_provider_endpoint_changes(self) -> None:
+        for provider, field in (
+            ("openai-compatible", "agent_review_api_base_url"),
+            ("azure-openai", "azure_openai_endpoint"),
+            ("anthropic", "anthropic_api_base_url"),
+        ):
+            with self.subTest(provider=provider):
+                first = AgentReviewPolicy(Settings(llm_provider=provider, **{field: "http://127.0.0.1:18001"}))
+                second = AgentReviewPolicy(Settings(llm_provider=provider, **{field: "http://127.0.0.1:18002"}))
+                self.assertNotEqual(first.cache_scope_hash(), second.cache_scope_hash())
+
+    def test_cache_scope_changes_when_review_coverage_limits_change(self) -> None:
+        baseline = AgentReviewPolicy(Settings()).cache_scope_hash()
+        for override in (
+            {"agent_review_all_chunks": False},
+            {"agent_review_max_chunks_per_document": 2},
+            {"agent_review_max_input_tokens_per_document": 100},
+        ):
+            with self.subTest(override=override):
+                self.assertNotEqual(baseline, AgentReviewPolicy(Settings(**override)).cache_scope_hash())
+
     def test_candidate_selection_is_deterministic_input_order_not_random_sampling(self) -> None:
         policy = AgentReviewPolicy(
             Settings(

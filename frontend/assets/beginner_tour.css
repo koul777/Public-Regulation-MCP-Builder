@@ -1,0 +1,47 @@
+.rr-journey {border:1px solid #dce9e3;background:#fff;border-radius:16px;padding:20px 22px;margin:8px 0 24px;color:#183e32}
+.rr-journey-heading {display:flex;justify-content:space-between;gap:12px;font-size:13px;font-weight:600;margin-bottom:14px;color:#526c62}
+.rr-journey-track {display:flex;gap:10px;padding:0!important;margin:0!important;list-style:none}
+.rr-journey-card {flex:1;border:1px solid #e6ece9;border-radius:10px;padding:15px 12px!important;margin:0!important;position:relative;font-size:14px}
+.rr-journey-number {display:inline-grid;place-items:center;width:23px;height:23px;border-radius:6px;background:#edf3ef;margin-right:7px;font-size:12px;font-weight:700}
+.rr-journey-card.current {background:#effbf5;border-color:#169b70;box-shadow:0 0 0 1px #169b7022}
+.rr-journey-card.current .rr-journey-number {background:#11845e;color:white}
+.rr-journey-card.done .rr-journey-number {background:#d9f4e7;color:#14764f}
+.rr-journey-card p {font-size:12px!important;color:#64796f;margin:9px 0 0!important;line-height:1.6!important}
+.rr-journey-badge {float:right;font-size:10px;color:#6d8177;margin:5px 0 0 5px}
+.rr-journey-card.current .rr-journey-badge {color:#11845e;font-weight:700}
+.rr-beginner-compass {border:1px solid #dce9e3!important;border-left:4px solid #169b70!important;background:#f5fbf8!important;border-radius:10px!important;padding:14px 18px!important;box-shadow:none!important}
+.rr-beginner-compass h3 {display:none}
+.rr-beginner-compass-kicker {color:#17734f!important}
+.rr-beginner-compass .rr-beginner-compass-action {color:#184a35!important;font-size:16px!important}
+.rr-beginner-marker {border:1px solid #c6e7d8!important;border-left:3px solid #169b70!important;background:#f2fbf6!important;padding:13px 16px!important;box-shadow:none!important}
+.rr-beginner-marker strong,.rr-beginner-marker p {color:#255740!important}
+.rr-beginner-marker-number {background:#13885f!important;color:#fff!important;border:0!important}
+.rr-beginner-marker-arrow {color:#13885f!important}
+.rr-beginner-marker-progress {display:none}
+#rr-tour-root {font-family:Inter,"Pretendard","Malgun Gothic",system-ui,sans-serif;color:#163b2d;font-size:14px;line-height:1.6}
+#rr-tour-root * {box-sizing:border-box}
+#rr-tour-root [hidden] {display:none!important}
+.rr-tour-shade {position:fixed;background:rgba(14,32,27,.57);z-index:1000000;pointer-events:auto;backdrop-filter:blur(1px)}
+.rr-tour-ring {position:fixed;z-index:1000001;pointer-events:none;border:2px solid #fff;border-radius:10px;box-shadow:0 0 0 3px #17ad7b}
+.rr-tour-card {position:fixed;z-index:1000002;width:370px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto;background:white;border:1px solid #deebe4;border-radius:14px;box-shadow:0 20px 80px #061b2940;padding:23px;animation:rr-tour-enter .18s ease-out}
+.rr-tour-top {display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.rr-tour-tag {font-size:10px;letter-spacing:1px;color:#13865e;background:#e8f8ef;border:1px solid #c7e9d7;border-radius:20px;padding:3px 9px;font-weight:700}
+.rr-tour-card h2 {font-size:21px!important;line-height:1.45!important;color:#17372b!important;margin:0 0 12px!important;font-weight:750!important;letter-spacing:-.6px!important}
+.rr-tour-card p {font-size:13px!important;line-height:1.85!important;color:#50655b!important;margin:0 0 16px!important;word-break:keep-all}
+.rr-tour-tip {background:#f0faf5;border:1px solid #cde9db;padding:12px;border-radius:7px;font-size:12px;color:#386b51;margin-bottom:22px}
+.rr-tour-footer {border-top:1px solid #e7eee9;padding-top:15px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.rr-tour-actions {display:flex;gap:6px}
+#rr-tour-root button {font:inherit;cursor:pointer;border:1px solid #dde6e0;border-radius:7px;background:#fff;color:#365146;padding:8px 11px;font-size:12px}
+#rr-tour-root button:focus-visible {outline:3px solid #f8c74c;outline-offset:3px}
+#rr-tour-root button.rr-tour-primary {background:#11885f;border-color:#11885f;color:#fff;font-weight:700}
+#rr-tour-root button.rr-tour-skip {border:0;padding:3px;background:transparent;color:#667c70;font-size:11px}
+.rr-tour-dots {display:flex;gap:4px}
+.rr-tour-dot {width:5px;height:5px;border-radius:4px;background:#dce8e1}
+.rr-tour-dot.active {width:17px;background:#11885f}
+.rr-tour-optout {display:flex;align-items:center;gap:6px;color:#718078;font-size:11px;margin-top:14px}
+.rr-tour-dock {position:fixed;right:26px;bottom:22px;z-index:999990;display:flex;align-items:center;gap:10px;background:white;border:1px solid #cae3d5;padding:10px 12px;border-radius:12px;box-shadow:0 5px 25px #1c503b18;max-width:calc(100vw - 28px)}
+.rr-tour-dock span {font-size:12px;max-width:230px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+.rr-tour-dock small {display:block;font-size:10px;color:#17805a;font-weight:700}
+@keyframes rr-tour-enter {from {opacity:0;transform:translateY(5px)}to {opacity:1;transform:translateY(0)}}
+@media (max-width:800px) {.rr-journey-track {display:grid;grid-template-columns:repeat(2,1fr)}.rr-tour-dock {right:14px;bottom:12px}.rr-tour-dock span {max-width:150px}.rr-journey {padding:16px}}
+@media (prefers-reduced-motion:reduce) {.rr-tour-card {animation:none}}

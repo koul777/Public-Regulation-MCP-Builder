@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -604,7 +605,7 @@ class PackagingEntrypointTests(unittest.TestCase):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
         self.assertIn("Get-Command npm", installer)
-        self.assertIn('$KordocPackage = "kordoc@4.12.0"', installer)
+        self.assertIn('$KordocPackage = "kordoc@4.15.0"', installer)
         self.assertIn("install -g $KordocPackage", installer)
         self.assertIn("npm prefix -g", installer)
         self.assertIn("where.exe kordoc", installer)
@@ -614,6 +615,28 @@ class PackagingEntrypointTests(unittest.TestCase):
         self.assertEqual(
             pyproject["tool"]["setuptools"]["data-files"]["."],
             ["packaging/INSTALL_KORDOC_KO.ps1"],
+        )
+
+    def test_shipped_kordoc_version_notes_match_the_installer_pin(self) -> None:
+        """Operator docs and the sample env must name the version the installer actually pins."""
+
+        installer = (ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1").read_text(encoding="utf-8")
+        pinned = re.search(r'\$KordocPackage = "kordoc@([0-9]+\.[0-9]+\.[0-9]+)"', installer)
+        self.assertIsNotNone(pinned)
+        version = pinned.group(1)
+
+        self.assertIn(f"검증된 Kordoc {version} 고정 버전을", installer)
+
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertEqual(
+            [version],
+            re.findall(r"npm install -g kordoc@([0-9]+\.[0-9]+\.[0-9]+)", env_example),
+        )
+
+        quickstart = (ROOT / "docs" / "operator_quickstart_ko.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            [version],
+            re.findall(r"Kordoc `([0-9]+\.[0-9]+\.[0-9]+)`", quickstart),
         )
 
     def test_readme_discloses_kordoc_source_and_bundle_scope(self) -> None:

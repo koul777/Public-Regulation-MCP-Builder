@@ -1207,7 +1207,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         # AI 검수 결과가 숨은 비용 익스팬더가 아니라 결과 화면의 정식 패널로 노출돼야 한다.
         self.assertIn("AI 검수 결과", source)
         self.assertIn("def _ai_review_status_text", source)
-        self.assertIn("AI가 살펴본 후보", source)
+        self.assertIn("프로그램이 고른 검수 후보", source)
         self.assertIn("AI가 검토 대상으로 고른 청크", source)
         self.assertIn("사람이 꼭 볼 청크", source)
         # 기술 상세(비용 가드)는 유지하되 전산 담당자용으로 접어 둔다.

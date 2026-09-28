@@ -4,11 +4,14 @@ import ast
 import hashlib
 import json
 import os
+import socket
 import tempfile
+import threading
 import unittest
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 try:
     from streamlit.testing.v1 import AppTest
@@ -16,12 +19,20 @@ except Exception:  # pragma: no cover - optional in minimal environments
     AppTest = None
 
 from app.core.config import Settings
+from app.core import config as config_module
 from app.core.institution_profiles import (
     InstitutionProfile,
     InstitutionProfileRegistry,
     institution_profile_registry_to_bytes,
 )
 from app.services.approval_governance import approval_review_completion_state
+from app.core.tenant_access import institution_storage_dir
+from app.services.synthetic_sample_service import (
+    SYNTHETIC_SAMPLE_FILENAME,
+    build_synthetic_regulation_docx,
+)
+from app.storage.repository import JsonRepository
+from frontend.beginner_tour import TOUR_REQUEST_KEY
 from scripts.generate_mcp_client_config import (
     RUNTIME_DATA_ZIP_EXCLUDED_FILENAMES,
     validate_mcp_runtime_data_bundle_integrity,
@@ -3065,6 +3076,240 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("**경과 시간:**", source)
         self.assertIn("thread.join(timeout=0.7)", source)
         self.assertNotIn("time.sleep(0.7)", source)
+
+
+@unittest.skipIf(AppTest is None, "streamlit.testing.v1.AppTest is not available")
+class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
+    """Exercise real local UI actions with synthetic data and denied networking."""
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.settings = Settings(
+            app_env="test",
+            data_dir=self.root / "data",
+            artifact_root=self.root,
+            institution_profiles_path=str(self.root / "profiles.json"),
+            quality_profiles_path="",
+            api_auth_required=False,
+            tenant_storage_isolation=False,
+            api_default_tenant_id="default",
+            enable_agent_review=False,
+            local_structure_review_enabled=False,
+            enable_kordoc_table_parser=False,
+            kordoc_table_command="",
+            pdf_ocr_backend="",
+            rag_llm_backend="extractive",
+            openai_api_key="",
+            openai_compatible_api_key="",
+            azure_openai_api_key="",
+            anthropic_api_key="",
+        )
+        self.enterContext(patch.object(config_module, "_runtime_overrides", {}))
+        self.enterContext(patch.object(config_module, "_base_settings", return_value=self.settings))
+        # Windows asyncio implements its internal wake-up socketpair using a
+        # loopback connect. Permit only connections made inside socketpair;
+        # ordinary local model calls and all external connections still fail.
+        socketpair_scope = threading.local()
+        original_connect = socket.socket.connect
+        original_socketpair = socket.socketpair
+        self.network = Mock(side_effect=AssertionError(
+            "Synthetic beginner UI tests must not use networking"
+        ))
+
+        def socketpair(*args, **kwargs):
+            socketpair_scope.active = True
+            try:
+                return original_socketpair(*args, **kwargs)
+            finally:
+                socketpair_scope.active = False
+
+        def connect(sock, address):
+            if getattr(socketpair_scope, "active", False):
+                return original_connect(sock, address)
+            return self.network(address)
+
+        self.enterContext(patch.object(socket, "socketpair", socketpair))
+        self.enterContext(patch.object(socket.socket, "connect", connect))
+        self.addCleanup(self.network.assert_not_called)
+        self.app = AppTest.from_file(str(APP_PATH), default_timeout=30)
+        self.app.session_state["ai_connection_overrides"] = vars(self.settings).copy()
+
+    def _run(self) -> None:
+        self.app.run()
+        self.assertFalse(self.app.exception)
+
+    def _create_institution(self) -> str:
+        self._run()
+        self.app.button(key="beginner-guide-first-start").click().run()
+        self.assertFalse(self.app.exception)
+        next(item for item in self.app.text_input if item.label == "기관명").input("합성 안내 검증 기관")
+        next(button for button in self.app.button if button.label == "기관 생성").click().run()
+        self.assertFalse(self.app.exception)
+        self.assertEqual("① 문서 올려서 전처리", self.app.session_state["nav_page"])
+        self.assertTrue(Path(self.settings.institution_profiles_path).is_file())
+        return self.app.session_state["selected_institution_profile_id"]
+
+    def _file_snapshot(self) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(self.root)): path.read_bytes()
+            for path in self.root.rglob("*") if path.is_file()
+        }
+
+    def test_institution_creation_toggle_and_replay_preserve_workflow_data(self) -> None:
+        profile_id = self._create_institution()
+        initial_files = self._file_snapshot()
+        first_request = self.app.session_state[TOUR_REQUEST_KEY]
+        self.assertNotIn("document_id", self.app.session_state)
+        self.assertIn("0 / 4 완료", "\n".join(str(item.value) for item in self.app.markdown))
+
+        for enabled in (False, True):
+            next(item for item in self.app.toggle if item.label == "초보자 안내 모드").set_value(enabled).run()
+            self.assertFalse(self.app.exception)
+            self.assertEqual(enabled, self.app.session_state["beginner_guide_enabled"])
+            self.assertTrue(self.app.session_state["beginner_guide_choice_made"])
+            self.assertEqual(profile_id, self.app.session_state["selected_institution_profile_id"])
+            self.assertNotIn("document_id", self.app.session_state)
+            self.assertEqual(initial_files, self._file_snapshot())
+
+        self.app.button(key="beginner-guide-restart").click().run()
+        self.assertFalse(self.app.exception)
+        self.assertGreater(self.app.session_state[TOUR_REQUEST_KEY], first_request)
+        self.assertEqual(initial_files, self._file_snapshot())
+        self.assertNotIn("document_id", self.app.session_state)
+
+    def test_synthetic_docx_processing_moves_to_review_without_automatic_approval(self) -> None:
+        profile_id = self._create_institution()
+        pending_dir = institution_storage_dir(
+            self.settings.data_dir / "pending_uploads", profile_id, create=True,
+        )
+        (pending_dir / SYNTHETIC_SAMPLE_FILENAME).write_bytes(build_synthetic_regulation_docx())
+        self._run()
+        self.app.button(key="pending-upload-select-all").click().run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(self.app.button(key="preprocess-start").disabled)
+
+        next(
+            item for item in self.app.checkbox
+            if item.label == "자동 인식한 규정 정보와 필요한 수정값을 확인했습니다."
+        ).check().run()
+        self.assertFalse(self.app.exception)
+        self.assertFalse(self.app.button(key="preprocess-start").disabled)
+        self.app.button(key="preprocess-start").click().run()
+        self.assertFalse(self.app.exception)
+        document_id = self.app.session_state["document_id"]
+        self.assertTrue(document_id)
+        self.assertFalse(self.app.session_state["unreviewed_preview_requested"])
+        repository = JsonRepository(self.settings)
+        self.assertEqual("completed", repository.get_document(document_id).status)
+        chunks = repository.get_chunks(document_id)
+        self.assertTrue(chunks)
+        self.assertTrue(all(chunk.approval_status != "approved" for chunk in chunks))
+        self.assertEqual([], repository.list_approval_journal_records(document_id))
+        next_button = self.app.button(key="preprocess-goto-results")
+        self.assertEqual("③ 검수하고 승인으로 이동", next_button.label)
+
+        next_button.click().run()
+        self.assertFalse(self.app.exception)
+        # AppTest returns before the dialog-triggered full-app rerun; flush
+        # the queued navigation using the same subsequent render as the UI.
+        if "_nav_target" in self.app.session_state:
+            self._run()
+        self.assertEqual("③ 검수하고 승인", self.app.session_state["nav_page"])
+        self.assertEqual(document_id, self.app.session_state["document_id"])
+        journey = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-journey" in str(item.value))
+        self.assertIn("1 / 3 완료", journey)
+        self.assertNotIn("결과 살펴보기", journey)
+        primary = self.app.radio(key="primary_nav_page")
+        self.assertNotIn("② 결과 확인", primary.options)
+        before = self._file_snapshot()
+        self.assertFalse(list(self.settings.data_dir.rglob("approved_vectors.jsonl")))
+        for journal in self.settings.data_dir.rglob("approvals.jsonl"):
+            self.assertFalse(journal.read_text(encoding="utf-8").strip())
+
+        # Attempting the final stage must route the beginner back to actual
+        # unfinished review; clicking guidance never signs an approval journal.
+        primary.set_value("④ Qwen 규정 챗봇·AI 연결").run()
+        self.assertFalse(self.app.exception)
+        self.assertEqual("③ 검수하고 승인", self.app.session_state["nav_page"])
+        self.assertEqual(before, self._file_snapshot())
+        self.assertEqual([], repository.list_approval_journal_records(document_id))
+
+    def test_tour_cannot_open_operator_ui_in_protected_or_isolated_mode(self) -> None:
+        for setting in ("api_auth_required", "tenant_storage_isolation"):
+            with self.subTest(setting=setting):
+                app = AppTest.from_file(str(APP_PATH), default_timeout=30)
+                app.session_state["ai_connection_overrides"] = {
+                    **vars(self.settings), setting: True,
+                }
+                app.session_state["beginner_guide_enabled"] = True
+                app.run()
+                self.assertFalse(app.exception)
+                self.assertIn("Streamlit 화면을 사용할 수 없습니다", str(app.error[0].value))
+                self.assertEqual(0, len(app.button))
+                self.assertEqual(0, len(app.get("iframe")))
+                self.assertEqual({}, self._file_snapshot())
+
+    def test_completed_current_document_opens_next_pending_document_before_ai_handoff(self) -> None:
+        from tests.test_streamlit_approval_app import (
+            _seed_app_institution_context,
+            _seed_streamlit_multi_approval_documents,
+        )
+
+        _seed_streamlit_multi_approval_documents(self.settings)
+        _seed_app_institution_context(self.app)
+        first_id = "doc_streamlit_approval"
+        second_id = "doc_streamlit_service"
+        self.app.session_state["document_id"] = first_id
+        self.app.session_state["workflow_opened_document_id"] = first_id
+        self.app.session_state["workflow_document_ids"] = [first_id, second_id]
+        self.app.session_state["workflow_selected_document_ids"] = [first_id, second_id]
+        for document_id in (first_id, second_id):
+            self.app.session_state[f"workflow-document-selected-{document_id}"] = True
+        self.app.session_state["beginner_guide_enabled"] = True
+        self.app.session_state["beginner_guide_choice_made"] = True
+        self.app.session_state["nav_page"] = "③ 검수하고 승인"
+        # A narrower future export choice must not hide pending selected work.
+        self.app.session_state[f"mcp-data-scope-{first_id}"] = "current_document"
+        self._run()
+        fake_embedding = SimpleNamespace(
+            encode_documents=lambda texts: [[0.0] * 384 for _ in texts]
+        )
+        with patch(
+            "app.ingestion.embedding_adapter._qwen_embedding_adapter",
+            return_value=fake_embedding,
+        ):
+            next(
+                button for button in self.app.button
+                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+            ).click().run()
+        self.assertFalse(self.app.exception)
+
+        repository = JsonRepository(self.settings)
+        self.assertTrue(all(chunk.approval_status == "approved" for chunk in repository.get_chunks(first_id)))
+        self.assertTrue(all(chunk.approval_status != "approved" for chunk in repository.get_chunks(second_id)))
+        jobs = repository.list_indexing_jobs(first_id)
+        self.assertTrue(jobs)
+        self.assertTrue(all(job["status"] == "indexed" for job in jobs))
+        self.assertEqual([], repository.list_approval_journal_records(second_id))
+
+        next_document = self.app.button(key=f"approval-next-regulation-{first_id}-{second_id}")
+        self.assertFalse(next_document.disabled)
+        self.assertTrue(self.app.button(key="approval-goto-connect-simple").disabled)
+        self.assertTrue(self.app.button(key="beginner-guide-next").disabled)
+        self.assertIn(
+            "다음 미완료 규정을 하나씩 계속 확인하세요",
+            "\n".join(str(item.value) for item in self.app.markdown),
+        )
+        before = self._file_snapshot()
+        next_document.click().run()
+        self.assertFalse(self.app.exception)
+        if "_nav_target" in self.app.session_state:
+            self._run()
+        self.assertEqual(second_id, self.app.session_state["document_id"])
+        self.assertEqual(second_id, self.app.session_state["workflow_opened_document_id"])
+        self.assertEqual("② 결과 확인", self.app.session_state["nav_page"])
+        self.assertEqual(before, self._file_snapshot())
+        self.assertEqual([], repository.list_approval_journal_records(second_id))
 
 
 if __name__ == "__main__":
