@@ -85,6 +85,23 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertIn("python -m build --sdist --wheel", text)
         self.assertIn("--include-source-path-scan", text)
 
+    def test_beginner_contracts_run_before_the_broader_regression_suite(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "preprocessing-regression.yml"
+        text = path.read_text(encoding="utf-8")
+        start = text.index("- name: Run beginner service and recovery contracts first")
+        end = text.index("- name: Run parsing and preprocessing regression suite")
+        self.assertLess(start, end)
+        fast_step = text[start:end]
+        for module in (
+            "test_readiness_adapter", "test_local_llm_readiness_service",
+            "test_operator_setup_service", "test_local_app_service",
+            "test_authoring_service", "test_authoring_official_isolation",
+            "test_streamlit_setup", "test_streamlit_authoring",
+        ):
+            self.assertIn(f"tests.{module}", fast_step)
+            self.assertTrue((REPO_ROOT / "tests" / f"{module}.py").is_file())
+        self.assertNotIn("continue-on-error", fast_step)
+
     def test_ci_template_exercises_mcp_connection_paths(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
         if not path.exists():

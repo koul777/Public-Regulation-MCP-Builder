@@ -8,6 +8,13 @@ from scripts.local_llm_doctor import diagnose_local_llm
 
 
 class LocalLlmDoctorTests(unittest.TestCase):
+    @patch("scripts.local_llm_doctor.probe_local_llm", side_effect=RuntimeError("synthetic-private-error"))
+    def test_cli_diagnostic_uses_safe_service_failure_contract(self, probe) -> None:
+        report = diagnose_local_llm(backend="ollama")
+        self.assertFalse(report["passed"])
+        self.assertEqual("local_probe_failed", report["reason"])
+        self.assertNotIn("synthetic-private-error", str(report))
+
     def test_extractive_mode_passes_without_local_model(self) -> None:
         report = diagnose_local_llm(backend="extractive", data_dir=Path("data"))
 

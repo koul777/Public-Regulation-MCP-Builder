@@ -97,6 +97,19 @@ class QwenChatSecurityAndGateTests(unittest.TestCase):
         self.assertEqual(OperatorReadinessState.ACTION_REQUIRED, unavailable.state)
         self.assertEqual(OperatorReadinessState.UNKNOWN, stale.state)
 
+    def test_safe_diagnostic_card_keeps_recovery_reason_and_invalidates_on_settings_change(self) -> None:
+        from app.services.local_llm_readiness_service import check_local_llm_readiness
+
+        card = check_local_llm_readiness(
+            Settings(rag_llm_backend="ollama"), probe_runner=lambda _: {"available": "invalid"},
+        )
+        state = {"signature": "current", "card": card, "available": False}
+        current = _qwen_probe_readiness(state, signature="current")
+        changed = _qwen_probe_readiness(state, signature="changed")
+        self.assertEqual("local_probe_invalid", current.reason_code)
+        self.assertIn("해석하지 못했습니다", current.next_action)
+        self.assertEqual(OperatorReadinessState.UNKNOWN, changed.state)
+
     def test_registry_path_prefers_configuration_and_falls_back_to_data_dir(self) -> None:
         self.assertEqual(
             Path("configured/profiles.json"),

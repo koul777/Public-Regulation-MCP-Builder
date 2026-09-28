@@ -29,7 +29,6 @@ from app.services.authoring_safety_service import (
     REDACTED_AUTHORING_REASON,
     sanitize_authoring_reason,
 )
-from app.services.authoring_template_service import AuthoringTemplateService
 
 
 AUTHORING_NAV_LABEL = "✍️ 규정 새로 작성"
@@ -678,7 +677,7 @@ def _project_label(project: AuthoringProject) -> str:
 
 
 def _render_create_form(*, service: Any, tenant_id: str, profile_id: str) -> None:
-    templates = AuthoringTemplateService().list_templates()
+    templates = service.list_templates()
     template_map = {template.template_id: template for template in templates}
     with st.form("authoring-create-form", clear_on_submit=False):
         mode = st.radio(

@@ -28,6 +28,7 @@ from app.core.institution_profiles import (
 )
 from app.core.security_primitives import API_ROLE_ADMIN, AuthContext
 from app.rag.local_llm import local_llm_available, probe_local_llm
+from app.services.local_llm_readiness_service import check_local_llm_readiness
 from app.services.readiness_adapter import (
     OperatorReadinessState,
     ReadinessCard,
@@ -583,6 +584,8 @@ def _qwen_probe_readiness(
 
     if not isinstance(probe_state, dict) or probe_state.get("signature") != signature:
         return adapt_readiness_report(None, component="Qwen3 8B")
+    if isinstance(probe_state.get("card"), ReadinessCard):
+        return probe_state["card"]
     return adapt_local_llm_probe(
         {"available": probe_state.get("available") is True},
         component="Qwen3 8B",
@@ -702,11 +705,12 @@ def main() -> None:
     probe_readiness = _qwen_probe_readiness(probe_state, signature=probe_signature)
     if st.button("Ollama · qwen3:8b 연결 확인", width="stretch"):
         with st.spinner("이 PC의 Ollama에 짧은 확인 질문을 보내고 있습니다."):
-            result = probe_local_llm(settings)
-        probe_ok = isinstance(result, dict) and result.get("available") is True
+            card = check_local_llm_readiness(settings, probe_runner=probe_local_llm)
+        probe_ok = card.state == OperatorReadinessState.READY
         st.session_state[PROBE_SESSION_KEY] = {
             "signature": probe_signature,
             "available": probe_ok,
+            "card": card,
         }
         probe_readiness = _qwen_probe_readiness(
             st.session_state[PROBE_SESSION_KEY],
@@ -716,10 +720,7 @@ def main() -> None:
     if probe_readiness.state == OperatorReadinessState.READY:
         st.success("연결되었습니다. 이제 아래 입력창에 규정 질문을 적을 수 있습니다.")
     elif probe_readiness.state == OperatorReadinessState.ACTION_REQUIRED:
-        st.warning(
-            "Qwen3 8B 연결 확인에 조치가 필요합니다. Ollama 실행 상태와 "
-            "`ollama pull qwen3:8b` 설치 여부를 확인한 뒤 다시 시도하세요."
-        )
+        st.warning(f"{probe_readiness.display_name} · {probe_readiness.next_action}")
     else:
         st.info(
             "위 버튼으로 연결을 먼저 확인해 주세요. 실패하면 Ollama가 실행 중인지, "

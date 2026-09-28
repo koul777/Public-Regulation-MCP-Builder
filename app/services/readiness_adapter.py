@@ -67,6 +67,16 @@ _NEXT_ACTIONS = {
     OperatorReadinessState.STALE: "최신 상태를 다시 확인하고 새 번들을 다시 등록하세요.",
 }
 
+_LOCAL_REASON_ACTIONS = {
+    "model_free_mode": "모델 설치 없이 승인된 규정의 근거로 답변할 수 있습니다.",
+    "available": "로컬 모델의 응답을 확인했습니다. 승인·색인한 규정을 선택해 질문하세요.",
+    "endpoint_not_allowed_or_missing": "로컬 QA 주소가 비어 있거나 허용되지 않는 주소입니다. 이 PC의 localhost 주소로 바꾼 뒤 다시 점검하세요.",
+    "local_endpoint_configuration_valid": "주소 설정을 확인했습니다. 연결 점검을 눌러 실제 모델 응답을 확인하세요.",
+    "local_backend_unavailable": "로컬 모델이 응답하지 않았습니다. Ollama 실행 상태와 선택한 모델의 설치 여부를 확인한 뒤 다시 점검하세요.",
+    "local_probe_invalid": "연결 점검 결과를 해석하지 못했습니다. 로컬 모델 서버의 상태를 확인한 뒤 다시 점검하세요.",
+    "local_probe_failed": "연결 점검을 완료하지 못했습니다. 로컬 모델 서버를 다시 실행한 뒤 점검하세요.",
+}
+
 
 def adapt_readiness_report(
     report: Mapping[str, Any] | object | None,
@@ -93,6 +103,11 @@ def adapt_readiness_report(
         return _card(safe_component, OperatorReadinessState.OPTIONAL_UNUSED, reason or "not_required")
     if _has_blocking_finding(report):
         return _card(safe_component, OperatorReadinessState.ACTION_REQUIRED, reason or "readiness_failed")
+    if report.get("passed") is False or report.get("deploy_ready") is False:
+        return _card(safe_component, OperatorReadinessState.ACTION_REQUIRED, reason or "readiness_failed")
+    health = report.get("health")
+    if isinstance(health, Mapping) and health.get("available") is False:
+        return _card(safe_component, OperatorReadinessState.ACTION_REQUIRED, "local_backend_unavailable")
     if _is_stale(report, reason):
         return _card(safe_component, OperatorReadinessState.STALE, reason or "stale_evidence")
     if not _has_readiness_signal(report):
@@ -154,11 +169,14 @@ def _card(
     state: OperatorReadinessState,
     reason: str,
 ) -> ReadinessCard:
+    action = _LOCAL_REASON_ACTIONS.get(reason, _NEXT_ACTIONS[state])
+    if reason in {"available", "model_free_mode"} and state != OperatorReadinessState.READY:
+        action = _NEXT_ACTIONS[state]
     return ReadinessCard(
         component=component,
         state=state,
         reason_code=_safe_reason(reason),
-        next_action=_NEXT_ACTIONS[state],
+        next_action=action,
     )
 
 

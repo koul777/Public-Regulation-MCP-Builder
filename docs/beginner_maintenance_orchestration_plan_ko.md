@@ -133,14 +133,14 @@ diagnostic builder를 `app/`으로 옮기는 역방향 의존성 개선은 별�
 - 테스트는 서비스 계약, 보안 경계, Streamlit 연결 계약의 세 층으로 나누어야
   작은 변경을 빠르게 검증할 수 있다.
 
-## Sprint 2 — 다음 구현 순서
+## Sprint 2 — 구현 순서와 현재 상태
 
-1. **준비 상태 어댑터 통합 — 초기 계약 완료**
+1. **준비 상태 어댑터 통합 — CLI·화면 연결 완료**
    - 기존 MCP doctor와 local LLM doctor의 결과를 화면용 공통 상태 모델로 변환한다.
    - 준비 완료, 사용자의 조치 필요, 선택 기능 미설치, 확인 대기 상태를 구분한다.
    - 현재 `app/services/readiness_adapter.py`와 MCP 연결 화면, 운영자·독립
-     Qwen 화면에 공통 계약을 반영했다. local LLM doctor 전체 호출과 진단
-     payload 변환은 다음 작은 변경으로 확장한다.
+     Qwen 화면에 공통 계약을 반영했다. 2026-09-28에는 local LLM doctor의
+     전체 진단을 서비스로 옮겨 CLI와 두 운영자 화면을 같은 계약에 연결했다.
    - 대상 후보: `scripts/check_mcp_connection_readiness.py`,
      `scripts/local_llm_doctor.py`, `scripts/mcp_connection_diagnostic.py`.
 
@@ -154,20 +154,20 @@ diagnostic builder를 `app/`으로 옮기는 역방향 의존성 개선은 별�
    | 실패 reason 또는 보안 gate 실패 | 조치 필요 | 원인과 재시도 방법 확인 |
    | 선택 기능 미설치·미선택 경로 | 선택 기능 사용 안 함 | 기본 로컬 경로로 진행하거나 설치 |
    | 최신 증거와 현재 설정 불일치 | 오래된 확인 | 새 번들 생성 후 다시 등록·확인 |
-2. **작성 화면 facade**
+2. **작성 화면 facade — 템플릿 경계 통합 완료**
    - `frontend/authoring_page.py`의 저장·검증·템플릿 호출을 서비스 facade로 옮긴다.
    - Streamlit 위젯은 입력과 표시만 담당하게 한다.
    - 기존 저장소·승인 서비스의 계약을 재사용하고, 작성 초안이 공식 RAG/MCP 색인으로
      자동 연결되지 않는 경계를 테스트로 고정한다.
    - 현재 화면은 이미 `AuthoringService`를 주입받고 있으므로, 중복 facade를 만들지
      말고 실제 책임 중복이 확인되는 작은 호출부터 분리한다.
-3. **시작 화면 진단 개선**
+3. **시작 화면 진단 개선 — Kordoc·로컬 QA 반영**
    - 설치 실패 시 숨겨진 명령 출력 대신 원인·사용자 조치·재시도 버튼을 한곳에 표시한다.
    - Kordoc, Ollama, Node 같은 선택 의존성은 필수/선택 여부를 명확히 표시한다.
    - 화면이 직접 외부 프로세스 인자를 조립하지 않도록
      `scripts/generate_mcp_client_config.py`, `scripts/analyze_regulation_corpus.py`,
      `scripts/find_available_ui_port.py` 호출을 작은 application service 계약 뒤로 둔다.
-4. **승인 위험 신호 정책 결정**
+4. **승인 위험 신호 정책 결정 — 실제 파일럿 대기**
    - 원클릭 승인 자체를 막을지, 위험 신호가 있는 문서만 추가 확인을 요구할지
      실제 초보자 파일럿 결과를 보고 결정한다.
 
@@ -203,3 +203,92 @@ diagnostic builder를 `app/`으로 옮기는 역방향 의존성 개선은 별�
 - 기관별 런타임 batch evidence가 없는 public source checkout에서는
   PUBLIC_PORTAL·integrated PDF 재사용 gate를 성공으로 주장하지 않는다. 해당
   gate는 별도의 release evidence bundle이 준비된 뒤 실행한다.
+
+## Sprint 2 개발 반영 — 2026-09-28
+
+이 절은 개발·자동 검증 범위를 기록한다. 실제 초보자 5명의 파일럿 완료나 승인 위험
+정책의 변경을 의미하지 않는다. 이번 개발은 단일 구현 작업으로 진행했으며 새로운
+Opus·Luna 검토를 받은 것으로 기록하지 않는다.
+
+### 준비 상태와 복구 안내
+
+- `app/services/local_llm_readiness_service.py`가 CLI와 두 운영자 화면의 로컬
+  모델 진단을 담당한다. 모델 없는 답변은 설치 없이 사용 가능, 주소만 확인한
+  상태는 연결 확인 대기, 실제 응답 성공은 준비 완료로 구분한다.
+- 진단은 현재 실행의 모델·주소·시간 제한을 그대로 사용한다. 외부 주소와 자격
+  증명이 들어간 주소는 요청 전에 차단하며 예외·잘못된 응답은 성공으로 바꾸지 않는다.
+- `readiness_adapter`는 성공 표시와 명시적 실패가 충돌하면 조치 필요로 판정한다.
+  초보자에게는 원본 JSON이나 예외 대신 원인에 맞는 한국어 다음 행동을 표시한다.
+- 설정이 달라지면 이전 연결 확인을 다시 사용하지 않는다. 설정 화면의 확인 결과와
+  Kordoc 실패 안내는 다른 위젯을 조작해도 유지된다.
+- `operator_setup_service`가 Kordoc 설치 위치와 프로세스 실행을 담당한다. 설치
+  실패·시간 초과·설치 도구 누락·실행 불가를 구분하고, 화면에는 원인과 복구 행동을
+  함께 표시한다. 설치 출력은 경로뿐 아니라 인증 정보를 포함할 수 있어 노출하지 않는다.
+- 설치 버튼은 사용자가 직접 눌러야 실행된다. Node.js/npm 미설치 시 설치는
+  비활성화하지만 준비 상태 재확인과 빠른 구조 전처리는 계속할 수 있다. Kordoc의
+  공식 MCP 품질 게이트와 재처리 초안·사람 승인 조건은 유지한다.
+
+### 유지보수 경계
+
+- 독립 Qwen 챗봇의 포트 선택과 실행 인자 조립은 `local_app_service`로 옮겼다.
+  Windows에서는 숨김으로 실행하며, 프로세스 시작만으로 모델 연결 완료를 표시하지 않는다.
+  기존 화면 함수와 환경 필터링, 실제 앱 health 확인은 호환 경계로 남겼다.
+- 작성 화면이 별도 템플릿 서비스를 만들던 부분은 기존 `AuthoringService.list_templates()`로
+  연결했다. 목록 선택과 초안 생성이 같은 주입 템플릿을 사용한다. 저장·린트는 이미
+  서비스에서 수행하므로 중복 facade를 추가하지 않았다.
+- `generate_mcp_client_config`는 기존 Python 호출과 승인 게이트를 유지한다.
+  `analyze_regulation_corpus`에서 화면이 가져오는 값은 점수 상수와 순수 변환 함수다.
+  이번 조사에서 이 두 경계의 외부 프로세스 인자 조립은 확인되지 않아 포장만 추가하지 않았다.
+- PR의 기존 `preprocessing-regression` 작업은 새 서비스·복구 화면·작성 격리 테스트를
+  먼저 실행하고, 이후 기존 전처리 회귀·빌드·공개 소스 감사를 계속 수행한다.
+
+### 검증 명령
+
+```powershell
+python -m unittest tests.test_readiness_adapter tests.test_local_llm_readiness_service tests.test_operator_setup_service tests.test_local_app_service tests.test_streamlit_setup tests.test_qwen_chat_app tests.test_local_llm_doctor tests.test_github_workflow_templates -v
+python -m unittest discover -s tests -v
+python -m build --sdist --wheel
+python scripts/audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan
+```
+
+집중 검증은 47개 실행에서 실패·오류 없이 완료했으며 선택적 CI 템플릿 2개를
+건너뛰었다. 테스트는 합성 응답·임시 저장소를 사용한다. 로컬 HTTP 서버와 실제
+모델 probe 코드를 연결해 응답 확인을 검사하고, Streamlit AppTest로 실패 안내 유지,
+재시도, 설치 비활성화 및 재확인을 실행한다. 실제 모델 설치나 사용자 전역 설치는
+자동 테스트에서 실행하지 않는다.
+
+호환성 재검증은 작성 화면·운영자 화면·로컬 QA·설치 서비스 90개 테스트가 모두
+통과했다. 기존 UI 테스트 대역에는 새 템플릿 목록 메서드를 제공하고, 실행 인자의
+소유 위치를 검사하던 테스트는 새 실행 서비스 계약에 맞췄다. 승인·저널·초안
+격리에 관한 기존 단언은 유지했다.
+
+최종 전체 회귀는 `python -m unittest discover -s tests -v`로 3,753개를
+590.414초 동안 실행해 실패·오류 없이 완료했고 선택적 테스트 16개를 건너뛰었다.
+`python -m build --sdist --wheel`과 위의 공개 소스 위생 감사도 통과했다.
+배포용 sdist·wheel에 새 서비스 3개가 포함되는지 확인했다.
+
+`python scripts/run_beginner_first_success.py --timeout-seconds 45`는 합성 문서로
+실제 stdio MCP 프로세스의 초기화·규정 목록·검색·본문/인용 조회·계층 조회를
+통과했다. 별도 임시 환경에서는 새 실행 서비스로 숨김 Qwen 앱을 시작해 loopback
+health의 HTTP 200을 확인하고 해당 테스트 프로세스 트리를 종료했다. 이는 앱
+프로세스 시작 확인이며 실제 Qwen 모델 응답이나 기관 문서 승인 증거는 아니다.
+
+### 파일럿 이후 결정할 승인 위험 정책
+
+기존 원클릭 승인과 위험 표시 정책을 유지한다. 다음 기록은 실제 참여자가 수행한
+결과로만 채운다. 테스트 대역·자동 클릭 결과를 사용자 파일럿 수에 합산하지 않는다.
+
+| 익명 참여자 | 다음 행동 파악 시간 | 작성·전처리·승인·질문 완료 | 위험 경고 이해 | 막힌 단계·복구 결과 |
+| --- | --- | --- | --- | --- |
+| P01 | 미실시 | 미실시 | 미실시 | 미실시 |
+| P02 | 미실시 | 미실시 | 미실시 | 미실시 |
+| P03 | 미실시 | 미실시 | 미실시 | 미실시 |
+| P04 | 미실시 | 미실시 | 미실시 | 미실시 |
+| P05 | 미실시 | 미실시 | 미실시 | 미실시 |
+
+진행자는 공개 합성 문서를 사용하고 기관명·실명·키·원본 파일은 기록하지 않는다.
+각 단계의 화면 표시부터 참여자가 다음 행동을 짚을 때까지 시간을 재고, 10초 이내
+비율이 80% 이상인지 계산한다. OCR·표 검증 실패·`action_required` 각각의 경고를
+알아본 비율과 성급한 승인 시도를 함께 기록한다. 담당자가 증거를 검토한 후에만
+현행 유지 또는 위험 문서 추가 확인 정책을 결정하며, 결정 이유와 담당자·날짜를
+별도 검토 기록에 남긴다.

@@ -1172,7 +1172,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("review_strategy=review_strategy", source)
         self.assertIn("독립 로컬 Qwen 규정 챗봇", source)
         self.assertIn("_render_standalone_qwen_chat_launcher", source)
-        self.assertIn('"scripts.run_qwen_chat"', source)
+        self.assertIn("start_local_qwen_chat(", source)
         self.assertIn('"RAG_LLM_MODEL": DEFAULT_LOCAL_LLM_MODEL', source)
         self.assertIn("Local RAG uses approved and indexed chunks only.", source)
         self.assertNotIn("st.chat_input(", source)

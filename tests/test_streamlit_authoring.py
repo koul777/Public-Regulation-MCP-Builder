@@ -225,6 +225,9 @@ projects = [
 ]
 
 class Service:
+    def list_templates(self):
+        from app.services.authoring_template_service import AuthoringTemplateService
+        return AuthoringTemplateService().list_templates()
     def list_projects(self, *, tenant_id, profile_id):
         return projects
     def get_project(self, project_id, *, tenant_id, profile_id):
@@ -762,6 +765,7 @@ class StreamlitAuthoringTests(unittest.TestCase):
 
         app = AppTest.from_string(_REVIEW_ACTION_BUFFER_APP, default_timeout=30)
         app.run()
+        self.assertFalse(app.exception)
         project_a = "00000000-0000-0000-0000-000000000021"
         project_b = "00000000-0000-0000-0000-000000000022"
         next(
@@ -824,6 +828,7 @@ class StreamlitAuthoringTests(unittest.TestCase):
 
         app = AppTest.from_string(_REVIEW_ACTION_BUFFER_APP, default_timeout=30)
         app.run()
+        self.assertFalse(app.exception)
         change_comment = next(
             area for area in app.text_area if area.label == "수정 요청 메모"
         )

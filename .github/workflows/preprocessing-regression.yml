@@ -31,6 +31,18 @@ jobs:
       - name: Install project and build tooling
         run: python -m pip install --disable-pip-version-check -e . build
 
+      - name: Run beginner service and recovery contracts first
+        run: |
+          python -m unittest -v \
+            tests.test_readiness_adapter \
+            tests.test_local_llm_readiness_service \
+            tests.test_operator_setup_service \
+            tests.test_local_app_service \
+            tests.test_authoring_service \
+            tests.test_authoring_official_isolation \
+            tests.test_streamlit_setup \
+            tests.test_streamlit_authoring
+
       - name: Run parsing and preprocessing regression suite
         run: |
           python -m unittest -v \

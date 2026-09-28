@@ -123,7 +123,6 @@ from app.services.mcp_connection_service import (
 )
 from app.services.readiness_adapter import (
     OperatorReadinessState,
-    adapt_local_llm_probe,
     adapt_readiness_report,
 )
 from app.services.workflow_readiness import (
@@ -146,7 +145,13 @@ from scripts.analyze_regulation_corpus import (
     GOLDSET_SCORE_SPECS,
     optional_int,
 )
-from scripts.find_available_ui_port import select_available_port
+from app.services.local_app_service import start_local_qwen_chat
+from app.services.local_llm_readiness_service import check_local_llm_readiness
+from app.services.operator_setup_service import (
+    kordoc_installer_candidates,
+    kordoc_installer_guidance,
+    run_kordoc_installer,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -3849,42 +3854,12 @@ def _launch_standalone_qwen_chat(current_settings: Settings) -> dict[str, object
             ).start()
             return previous
 
-    port = select_available_port(8502, host="127.0.0.1", search_count=100)
-    app_url = f"http://127.0.0.1:{port}"
-    packaged_executable = str(os.getenv("REG_RAG_PACKAGED_EXE") or "").strip()
-    if packaged_executable:
-        command = [
-            packaged_executable,
-            "--qwen-chat",
-            "--port",
-            str(port),
-            "--headless",
-        ]
-    else:
-        command = [
-            sys.executable,
-            "-m",
-            "scripts.run_qwen_chat",
-            "--port",
-            str(port),
-            "--headless",
-        ]
-    popen_kwargs: dict[str, object] = {
-        "cwd": str(PROJECT_ROOT),
-        "env": _standalone_qwen_chat_environment(current_settings),
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    process = subprocess.Popen(command, **popen_kwargs)
-    launch_state: dict[str, object] = {
-        "url": app_url,
-        "pid": int(process.pid),
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "_process": process,
-    }
+    launch_state = start_local_qwen_chat(
+        project_root=PROJECT_ROOT,
+        environment=_standalone_qwen_chat_environment(current_settings),
+        packaged_executable=str(os.getenv("REG_RAG_PACKAGED_EXE") or "").strip(),
+    )
+    app_url = str(launch_state["url"])
     st.session_state[QWEN_CHAT_APP_LAUNCH_STATE_KEY] = launch_state
     threading.Thread(
         target=_open_standalone_qwen_chat_when_ready,
@@ -7546,74 +7521,13 @@ def _replace_workflow_document_id(source_document_id: str, draft_document_id: st
 
 
 def _kordoc_installer_candidates() -> list[Path]:
-    """Return source and portable locations for the explicit Kordoc setup script."""
-
-    candidates: list[Path] = []
-    try:
-        executable_dir = Path(sys.executable).resolve().parent
-        candidates.append(executable_dir / "INSTALL_KORDOC_KO.ps1")
-    except OSError:
-        executable_dir = None
-    try:
-        candidates.append(Path(sys.prefix).resolve() / "INSTALL_KORDOC_KO.ps1")
-    except OSError:
-        pass
-    if executable_dir is not None:
-        candidates.append(executable_dir.parent / "INSTALL_KORDOC_KO.ps1")
-    candidates.extend(
-        (
-            PROJECT_ROOT / "INSTALL_KORDOC_KO.ps1",
-            PROJECT_ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1",
-        )
-    )
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate).casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        if candidate.is_file():
-            unique.append(candidate)
-    return unique
+    """Compatibility wrapper for the shared setup service."""
+    return kordoc_installer_candidates(PROJECT_ROOT)
 
 
 def _run_kordoc_installer() -> dict[str, Any]:
-    """Run the explicit Windows installer and return redacted operator output."""
-
-    if sys.platform != "win32":
-        return {"ok": False, "error": "windows_only", "output": ""}
-    candidates = _kordoc_installer_candidates()
-    if not candidates:
-        return {"ok": False, "error": "installer_missing", "output": ""}
-    try:
-        completed = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(candidates[0]),
-                "-PersistUserPath",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "installer_timeout", "output": ""}
-    except OSError:
-        return {"ok": False, "error": "installer_unavailable", "output": ""}
-    output = redact_sensitive_paths("\n".join(part for part in (completed.stdout, completed.stderr) if part))
-    return {
-        "ok": completed.returncode == 0,
-        "error": "" if completed.returncode == 0 else "installer_failed",
-        "output": output[-4000:],
-    }
+    """Keep the UI/test call boundary; setup owns process execution."""
+    return run_kordoc_installer(_kordoc_installer_candidates())
 
 
 def _application_restart_instruction() -> str:
@@ -7622,10 +7536,26 @@ def _application_restart_instruction() -> str:
     return "앱을 완전히 종료하고 'START_HERE.bat'을 다시 실행하세요."
 
 
+def _render_kordoc_install_feedback(result: dict[str, Any]) -> None:
+    """Present a safe cause, recovery action and the existing retry button."""
+    if result.get("ok") is True:
+        st.success(
+            "Kordoc 설치·검증이 완료됐습니다. 새 PATH를 적용하려면 "
+            f"{_application_restart_instruction()} 다시 연 화면에서 'Kordoc 사용 가능'을 확인하세요."
+        )
+    else:
+        cause, action = kordoc_installer_guidance(result.get("error"))
+        st.error(cause)
+        st.info(action)
+
+
 def _render_kordoc_preprocess_preflight() -> bool:
     """Show the MCP quality prerequisite without conflating it with structure parsing."""
 
     command = str(getattr(settings, "kordoc_table_command", "") or "")
+    if st.button("Kordoc 준비 상태 다시 확인", key="preprocess-kordoc-recheck"):
+        kordoc_table_command_status.cache_clear()
+        st.session_state.pop("preprocess-kordoc-install-result", None)
     command_status = kordoc_table_command_status(command)
     command_label = str(command_status.get("label") or "kordoc")
     if command_status.get("available"):
@@ -7680,31 +7610,22 @@ def _render_kordoc_preprocess_preflight() -> bool:
             "https://nodejs.org",
             key="preprocess-nodejs-link",
         )
+    previous = st.session_state.get("preprocess-kordoc-install-result")
+    if not isinstance(previous, dict) or previous.get("command") != command:
+        previous = None
     if st.button(
-        "Kordoc 설치·검증 시작",
+        "Kordoc 설치·검증 다시 시도" if previous and not previous.get("ok") else "Kordoc 설치·검증 시작",
         key="preprocess-kordoc-install-run",
         help="Node.js LTS/npm이 설치된 Windows PC에서만 실행됩니다.",
         disabled=not npm_available,
     ):
         with st.spinner("Kordoc 설치·검증 중..."):
-            install_result = _run_kordoc_installer()
-        if install_result.get("ok"):
+            previous = {**_run_kordoc_installer(), "command": command}
+        st.session_state["preprocess-kordoc-install-result"] = previous
+        if previous.get("ok") is True:
             kordoc_table_command_status.cache_clear()
-            st.success(
-                "Kordoc 설치·검증이 완료됐습니다. 새 PATH를 적용하려면 "
-                f"{_application_restart_instruction()} 다시 연 화면에서 'Kordoc 사용 가능'을 "
-                "확인한 뒤 전처리를 시작하세요."
-            )
-            if install_result.get("output"):
-                st.code(str(install_result["output"]), language="text")
-        else:
-            error_code = str(install_result.get("error") or "installer_failed")
-            st.error(
-                f"Kordoc 설치·검증을 완료하지 못했습니다 ({error_code}). "
-                "Node.js LTS/npm 설치 여부를 확인한 뒤 다시 시도하세요."
-            )
-            if install_result.get("output"):
-                st.code(str(install_result["output"]), language="text")
+    if previous:
+        _render_kordoc_install_feedback(previous)
     return False
 
 
@@ -12720,17 +12641,18 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
                 rag_llm_endpoint=rag_endpoint,
                 rag_llm_model=rag_model or DEFAULT_LOCAL_LLM_MODEL,
             )
-            result = probe_local_llm(probe_settings)
-            probe_readiness = adapt_local_llm_probe(result, component="Qwen3 8B")
-            if probe_readiness.state == OperatorReadinessState.READY:
-                st.success(f"로컬 LLM 연결 가능 · {result.get('model') or rag_model}")
-            elif probe_readiness.state == OperatorReadinessState.ACTION_REQUIRED:
-                st.warning(
-                    "Qwen3 8B 연결에 조치가 필요합니다. Ollama 실행 상태와 "
-                    "`ollama pull qwen3:8b` 설치 여부를 확인한 뒤 다시 시도하세요."
-                )
-            else:
-                st.info("Qwen3 8B 연결 결과를 확인할 수 없습니다. 잠시 후 다시 점검하세요.")
+            with st.spinner("로컬 QA 준비 상태를 확인하고 있습니다."):
+                card = check_local_llm_readiness(probe_settings, probe_runner=probe_local_llm)
+            st.session_state["local-qa-readiness"] = {
+                "configuration": (rag_backend, rag_endpoint, rag_model), "card": card,
+            }
+    saved = st.session_state.get("local-qa-readiness")
+    if isinstance(saved, dict) and saved.get("configuration") == (rag_backend, rag_endpoint, rag_model):
+        card = saved["card"]
+        renderer = st.success if card.state == OperatorReadinessState.READY else st.warning
+        renderer(f"{card.display_name} · {card.next_action}")
+    else:
+        st.caption("설정을 바꿨다면 연결 점검을 다시 실행하세요. 모델 없는 답변은 별도 설치가 필요하지 않습니다.")
 
     review_level, review_message = _review_api_connection_status(settings_snapshot)
     st.markdown("**검수용 외부 AI (문서 검수 초안 생성)**")
@@ -13344,22 +13266,9 @@ def _page_connect(
                     ):
                         with st.spinner("Kordoc 설치·검증 중..."):
                             install_result = _run_kordoc_installer()
-                        if install_result.get("ok"):
+                        if install_result.get("ok") is True:
                             kordoc_table_command_status.cache_clear()
-                            st.success(
-                                "Kordoc 설치·검증이 완료됐습니다. 새 PATH를 적용하려면 "
-                                f"{_application_restart_instruction()} 그 뒤 새 초안을 다시 전처리해야 합니다."
-                            )
-                            if install_result.get("output"):
-                                st.code(str(install_result["output"]), language="text")
-                        else:
-                            error_code = str(install_result.get("error") or "installer_failed")
-                            st.error(
-                                f"Kordoc 설치·검증을 완료하지 못했습니다 ({error_code}). "
-                                "Node.js LTS 설치 여부와 npm 오류를 확인한 뒤 README의 수동 명령을 실행하세요."
-                            )
-                            if install_result.get("output"):
-                                st.code(str(install_result["output"]), language="text")
+                        _render_kordoc_install_feedback(install_result)
                 missing_ids = ", ".join(missing_document_ids[:10])
                 if missing_ids:
                     st.info(

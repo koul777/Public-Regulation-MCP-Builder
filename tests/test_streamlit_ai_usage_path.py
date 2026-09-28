@@ -301,10 +301,8 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             "OPENAI_COMPATIBLE_API_KEY",
         ):
             self.assertIn(secret_name, environment_source)
-        self.assertIn('"--qwen-chat"', launcher_source)
-        self.assertIn('"scripts.run_qwen_chat"', launcher_source)
-        self.assertIn('select_available_port(8502, host="127.0.0.1"', launcher_source)
-        self.assertIn("subprocess.Popen", launcher_source)
+        self.assertIn("start_local_qwen_chat(", launcher_source)
+        self.assertNotIn("subprocess.Popen", launcher_source)
         self.assertIn("독립 Qwen 챗봇 실행", renderer_source)
         self.assertIn("_render_standalone_qwen_chat_launcher", self.source)
         page_source = _function_source(self.source, self.module, "_page_connect")

@@ -369,7 +369,7 @@ class StreamlitApprovalHelperTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertNotIn("C:\\Users\\someone", result["output"])
-        self.assertIn("[local-path-redacted]", result["output"])
+        self.assertEqual("", result["output"])
         self.assertIn("-PersistUserPath", run.call_args.args[0])
 
     def test_replace_workflow_document_id_switches_only_the_reprocessed_source(self) -> None:
