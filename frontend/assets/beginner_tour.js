@@ -37,6 +37,7 @@
   const dock = find(".rr-tour-dock");
   let active = null, target = null, slide = 0, opened = false, disposed = false;
   let frame = 0, scanTimer = 0, lastFocus = null, suspended = false;
+  let chatInput = null;
   const visible = element => !!element && element.getClientRects().length > 0
     && win.getComputedStyle(element).visibility !== "hidden";
   const resolve = marker => {
@@ -63,9 +64,23 @@
   const box = (element, left, top, width, height) => Object.assign(element.style, {
     left: left + "px", top: top + "px", width: Math.max(0, width) + "px", height: Math.max(0, height) + "px"
   });
+  const placeDock = () => {
+    // Streamlit pins the composer to the bottom. Keep the collapsed guide above
+    // it, including when a multiline draft grows or the window becomes narrow.
+    const input = [...doc.querySelectorAll('[data-testid="stChatInput"]')].find(visible) || null;
+    if (input !== chatInput) {
+      chatInputObserver.disconnect(); chatInput = input;
+      if (chatInput) chatInputObserver.observe(chatInput);
+    }
+    const rect = chatInput?.getBoundingClientRect();
+    dock.style.bottom = rect && rect.top < win.innerHeight && rect.bottom > 0
+      ? Math.max(12, win.innerHeight - rect.top + 12) + "px" : "";
+  };
   const place = () => {
     frame = 0;
-    if (!opened || disposed) return;
+    if (disposed) return;
+    placeDock();
+    if (!opened) return;
     const w = win.innerWidth, h = win.innerHeight;
     const rect = visible(target) ? target.getBoundingClientRect() : null;
     const gap = 8;
@@ -90,6 +105,7 @@
   };
   const schedulePlace = () => {if (!frame) frame=win.requestAnimationFrame(place);};
   const resizeObserver = new win.ResizeObserver(schedulePlace);
+  const chatInputObserver = new win.ResizeObserver(schedulePlace);
   const watchLayout = () => {
     resizeObserver.disconnect();
     // Dataframes and other async widgets can move the target without scrolling.
@@ -97,6 +113,7 @@
   };
   const close = ({pause=false, dismiss=true, restoreFocus=true} = {}) => {
     opened=false; card.hidden=true; ring.hidden=true; shades.forEach(e=>{e.hidden=true;}); dock.hidden=false;
+    placeDock();
     saved.seen=true; saved.hidden=!!find("input").checked;
     if (pause) saved.paused=true;
     dock.querySelector("button").textContent=saved.paused || saved.hidden ? "안내 이어서 보기" : "한 단계씩 안내";
@@ -132,6 +149,7 @@
   const open = index => {lastFocus=doc.activeElement; show(index);};
   const scan = () => {
     if (disposed) return;
+    placeDock();
     // Don't cover Streamlit's own confirmation or progress dialogs.
     const otherDialog=[...doc.querySelectorAll('[role="dialog"]')].some(e=>!root.contains(e)&&visible(e));
     if (otherDialog) {
@@ -199,7 +217,7 @@
   observer.observe(doc.body,{childList:true,subtree:true,attributes:true,
     attributeFilter:["data-rr-tour","data-rr-tour-current","data-rr-tour-priority","open","disabled","class","style","hidden"]});
   const dispose=()=>{
-    disposed=true; observer.disconnect(); resizeObserver.disconnect(); win.clearTimeout(scanTimer); win.cancelAnimationFrame(frame);
+    disposed=true; observer.disconnect(); resizeObserver.disconnect(); chatInputObserver.disconnect(); win.clearTimeout(scanTimer); win.cancelAnimationFrame(frame);
     doc.removeEventListener("keydown",onKey,true); doc.removeEventListener("click",onClick,true);
     win.removeEventListener("resize",schedulePlace); doc.removeEventListener("scroll",schedulePlace,true);
     window.removeEventListener("pagehide",dispose);

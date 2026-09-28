@@ -23,7 +23,8 @@
 ![실제 앱에서 기관 등록, 파일 업로드, 전처리와 조항별 검수를 따라가는 초보자 클릭 안내 시연](docs/assets/beginner-click-guide.gif)
 
 [65초 MP4 시연 파일](docs/assets/beginner-click-guide.mp4) ·
-[실행 검증과 시연 재현 방법](docs/beginner_ux_verification_ko.md)
+[실행 검증과 시연 재현 방법](docs/beginner_ux_verification_ko.md) ·
+[가상 규정으로 승인·색인·Qwen 답변까지 직접 클릭한 결과](docs/beginner_live_verification_ko.md)
 
 영상 순서: **안내 시작 → 기관명 입력·생성 → 파일 업로드 → 인식 정보 확인 →
 전처리 → 검수 항목 판단 → 검수 확인·원문 대조 체크 → 안내 멈춤·이어 보기**.
@@ -2090,6 +2091,10 @@ Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이
 
 ## 2026년 9월 29일 — 실제 조항 안내 검증과 Kordoc·Qwen 복구 보완
 
+- 합성 DOCX의 8개 항목을 초보 안내에 따라 검수·승인·색인하고 실제 Qwen3 8B에
+  연속 질문했습니다. 신청 기한·보관 기간과 근거 조문, 규정에 없는 내용의 답변
+  제한을 확인했습니다. 안내 막대가 추가 질문의 전송 버튼을 덮는 문제를 수정했으며,
+  설치·원문 대조 등 남은 불편도 [실제 클릭 검증 결과](docs/beginner_live_verification_ko.md)에 공개했습니다.
 - README 맨 위의 20초 홍보 영상에 **Kordoc 4.16.0**, 초보자 클릭 안내, 사람 승인과
   로컬 Qwen·MCP를 담았습니다. GIF·MP4·정지 화면과 바로 아래 65초 실제 사용 시연을 제공합니다.
 - 영문 Windows 환경에서도 독립 Qwen 실행 안내와 오류 메시지를 한글로 출력하도록
