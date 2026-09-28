@@ -22,8 +22,8 @@
 | --- | --- | --- |
 | 안내창의 실제 클릭 동작 | `tests/browser/beginner-tour.cjs`를 Chromium에서 실행 | 다음 항목 전환, 같은 항목 반복 방지, 우선순위, 접힌 메뉴, 앱 확인창, 멈춤·재개, 자동 안내 중지, 재실행 정리, 배치 이동 |
 | 키보드·작은 화면 | 같은 브라우저 검사 | Tab, Esc, 390px 화면 경계와 가로 넘침, 모션 줄이기 |
-| 실제 빌더 화면 | 격리된 로컬 Streamlit 앱과 공개 합성 DOCX | 시작 안내, 기관명 입력·기관 생성, 업로드, 인식 정보 확인, 전처리, 검수 화면 이동, 항목별 판단·검수 확인·원문 대조·다음 조항, 안내 멈춤·재개 |
-| Qwen의 단계 연결 | `tests.test_qwen_chat_app`의 Streamlit AppTest | 기관·규정 선택, 연결 확인 전 질문 차단, 연속 질문 2회, 실제 인용이 있는 마지막 답변 안내 |
+| 실제 빌더 화면 | 격리된 로컬 Streamlit 앱과 공개 합성 DOCX | 시작 안내, 기관명 입력·기관 생성, 업로드, 인식 정보 확인, 전처리, 검수 화면 이동, 첫 조항의 판단·검수 확인·원문 대조 체크, 안내 멈춤·재개; 다음 조항 이동은 미포함 |
+| Qwen의 단계 연결 | `tests.test_qwen_chat_app`의 Streamlit AppTest | 기관·규정 선택, 연결 확인 전 질문 차단, 연속 질문 2회, 합성 인용이 있는 마지막 답변 안내 |
 | 실행 상태 격리 | Qwen 화면 테스트 뒤 저장소·저널 테스트 100개 실행 | AppTest가 교체한 `__main__` 복원 후 Windows 자식 프로세스 회귀 통과 |
 | Kordoc 패치 | 설치 기준 4.15.7 및 실제 실행 파일 확인 | 공개 합성 DOCX의 2×2 표 1개 추출, 표 안의 한글 내용 유지 |
 
@@ -38,6 +38,21 @@ python -m unittest tests.test_beginner_tour tests.test_streamlit_beginner_guide 
 Qwen 연결·답변은 이 테스트에서 합성 응답으로 대체한다. 실제 모델 답변 품질, 외부 AI 앱의
 설정 화면, 사람 5명 사용성 파일럿은 이 검증의 범위가 아니다. 실제 기관 원문, 전달받은
 참고 영상, 테스트용 런타임 데이터는 공개 저장소에 포함하지 않는다.
+
+### 통합 검증 기록 — 2026-09-29
+
+`c0bb557`의 코드 기준으로 다음 검증을 마쳤다. 아래 결과가 실제 사용자 평가나
+실제 Qwen 모델 품질까지 입증하는 것은 아니다.
+
+| 명령 | 결과 |
+| --- | --- |
+| `python -X utf8 -m unittest discover -s tests -v` | 3,755개 실행, 실패 없음, 16개 건너뜀, 633.271초 |
+| `python -X utf8 -m build --sdist --wheel` | sdist와 wheel 빌드 성공 |
+| `python -X utf8 scripts/audit_release_hygiene.py --workflow-scope available --include-untracked --include-source-path-scan` | 공개 소스 위생 감사 통과 |
+
+별도 Chromium 안내 회귀 검사와 실제 앱 녹화도 통과했다. 녹화 스크립트는 첫 조항의
+검수 조작 이후 앱 예외·브라우저 오류가 없음을 검사하지만, 다음 조항 이동이나 저장된
+검수 상태 전체를 단언하지 않는다. 이 범위는 이후 실제 앱 회귀 검사로 보완한다.
 
 ### README 시연 재현
 
