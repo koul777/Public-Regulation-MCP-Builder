@@ -103,7 +103,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "초보자 안내 시작",
             "일반 모드로 계속",
             "초보자 안내 모드",
-            "빨간 테두리",
+            "초록색 테두리",
             "화살표",
             "안내 건너뛰기",
             "처음부터 다시 보기",

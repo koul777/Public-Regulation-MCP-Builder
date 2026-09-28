@@ -31,17 +31,18 @@
 .rr-tour-tip {background:#f0faf5;border:1px solid #cde9db;padding:12px;border-radius:7px;font-size:12px;color:#386b51;margin-bottom:22px}
 .rr-tour-footer {border-top:1px solid #e7eee9;padding-top:15px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .rr-tour-actions {display:flex;gap:6px}
-#rr-tour-root button {font:inherit;cursor:pointer;border:1px solid #dde6e0;border-radius:7px;background:#fff;color:#365146;padding:8px 11px;font-size:12px}
+#rr-tour-root button {font:inherit;cursor:pointer;border:1px solid #dde6e0;border-radius:7px;background:#fff;color:#365146;padding:8px 11px;font-size:13px;min-height:44px}
 #rr-tour-root button:focus-visible {outline:3px solid #f8c74c;outline-offset:3px}
 #rr-tour-root button.rr-tour-primary {background:#11885f;border-color:#11885f;color:#fff;font-weight:700}
 #rr-tour-root button.rr-tour-skip {border:0;padding:3px;background:transparent;color:#667c70;font-size:11px}
 .rr-tour-dots {display:flex;gap:4px}
 .rr-tour-dot {width:5px;height:5px;border-radius:4px;background:#dce8e1}
 .rr-tour-dot.active {width:17px;background:#11885f}
-.rr-tour-optout {display:flex;align-items:center;gap:6px;color:#718078;font-size:11px;margin-top:14px}
+.rr-tour-optout {display:flex;align-items:center;gap:8px;color:#52655c;font-size:12px;margin-top:14px;min-height:44px;cursor:pointer}
 .rr-tour-dock {position:fixed;right:26px;bottom:22px;z-index:999990;display:flex;align-items:center;gap:10px;background:white;border:1px solid #cae3d5;padding:10px 12px;border-radius:12px;box-shadow:0 5px 25px #1c503b18;max-width:calc(100vw - 28px)}
 .rr-tour-dock span {font-size:12px;max-width:230px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
 .rr-tour-dock small {display:block;font-size:10px;color:#17805a;font-weight:700}
 @keyframes rr-tour-enter {from {opacity:0;transform:translateY(5px)}to {opacity:1;transform:translateY(0)}}
 @media (max-width:800px) {.rr-journey-track {display:grid;grid-template-columns:repeat(2,1fr)}.rr-tour-dock {right:14px;bottom:12px}.rr-tour-dock span {max-width:150px}.rr-journey {padding:16px}}
+@media (max-width:500px) {.rr-tour-card {padding:16px;max-height:60vh}.rr-tour-card h2 {font-size:18px!important}.rr-tour-card p {font-size:14px!important}.rr-tour-tip {margin-bottom:12px}.rr-tour-top {margin-bottom:8px}}
 @media (prefers-reduced-motion:reduce) {.rr-tour-card {animation:none}}

@@ -36,6 +36,7 @@ from app.services.readiness_adapter import (
     adapt_readiness_report,
 )
 from app.storage.repository import JsonRepository
+from frontend.beginner_tour import marker_attributes, render_beginner_style, render_tour
 
 
 LOCAL_APP_ENVS = frozenset({"local", "dev", "development", "test"})
@@ -592,6 +593,31 @@ def _qwen_probe_readiness(
     )
 
 
+def _qwen_tour_step(probe_ok: bool, messages: list[dict[str, Any]]) -> tuple[int, str, str, str]:
+    """Choose guidance from real connection/answer state, without changing it."""
+    if not probe_ok:
+        return (3, "Qwen 연결 확인 버튼을 누르세요",
+                "Ollama와 qwen3:8b가 준비됐는지 확인합니다. 실패하면 화면의 복구 안내를 따라 다시 누르세요.",
+                "div.st-key-qwen-probe")
+    last = messages[-1] if messages else {}
+    if last.get("role") == "assistant" and not last.get("error") and last.get("citations"):
+        return (5, "답변 아래 근거 인용을 확인하세요",
+                "답변과 함께 규정명·조문·원문 쪽을 확인하세요. 새 질문은 아래 입력창에 적을 수 있습니다.",
+                f"div.st-key-qwen-answer-{len(messages)-1}")
+    return (4, "아래 입력창에 규정 질문을 적으세요",
+            "질문을 입력한 뒤 전송 버튼을 누르세요. 답변이 끝나면 근거 인용을 확인합니다.",
+            "div.st-key-qwen-question")
+
+
+def _render_qwen_tour(enabled: bool, action: tuple[int, str, str, str]) -> None:
+    if enabled:
+        substep, title, description, selector = action
+        render_beginner_style()
+        attributes = marker_attributes(title, description, selectors=[selector], step=4, substep=substep)
+        st.markdown(f'<span {attributes} data-rr-tour-current="true"></span>', unsafe_allow_html=True)
+    render_tour(enabled=enabled, page="qwen-chat")
+
+
 def main() -> None:
     st.set_page_config(page_title="로컬 Qwen 규정 챗봇", page_icon="💬", layout="wide")
     st.title("로컬 Qwen 규정 챗봇")
@@ -630,11 +656,19 @@ def main() -> None:
         st.warning("현재 로컬 테넌트에서 사용할 수 있는 기관 프로필이 없습니다.")
         st.stop()
 
+    guided = st.toggle("한 단계씩 클릭 안내", value=True, key="qwen-guided-mode")
     selected_profile_id = st.selectbox(
         "1. 질문할 기관을 선택하세요",
         options=list(profiles),
         format_func=lambda profile_id: _profile_label(profiles[profile_id]),
+        index=None if guided else 0,
+        key="qwen-profile",
     )
+    if selected_profile_id is None:
+        _render_qwen_tour(guided, (1, "질문할 기관을 선택하세요",
+                                  "밝게 표시된 선택 상자를 누르고 작업할 기관을 고르세요.",
+                                  "div.st-key-qwen-profile"))
+        return
 
     try:
         repository = JsonRepository(settings)
@@ -692,7 +726,14 @@ def main() -> None:
         "3. 질문할 규정 하나를 선택하세요",
         options=list(ready_by_id),
         format_func=lambda document_id: _document_label(ready_by_id[document_id].document),
+        index=None if guided else 0,
+        key=f"qwen-document-{selected_profile_id}",
     )
+    if selected_document_id is None:
+        _render_qwen_tour(guided, (2, "질문할 규정을 선택하세요",
+                                  "승인·색인이 끝난 규정만 선택할 수 있습니다. 질문할 규정 하나를 고르세요.",
+                                  'div[class*="st-key-qwen-document-"]'))
+        return
     selected = ready_by_id[selected_document_id]
     st.success(
         f"질문 범위가 ‘{_document_label(selected.document)}’ 한 건으로 고정되었습니다. "
@@ -703,7 +744,7 @@ def main() -> None:
     probe_signature = _probe_signature(settings)
     probe_state = st.session_state.get(PROBE_SESSION_KEY)
     probe_readiness = _qwen_probe_readiness(probe_state, signature=probe_signature)
-    if st.button("Ollama · qwen3:8b 연결 확인", width="stretch"):
+    if st.button("Ollama · qwen3:8b 연결 확인", width="stretch", key="qwen-probe"):
         with st.spinner("이 PC의 Ollama에 짧은 확인 질문을 보내고 있습니다."):
             card = check_local_llm_readiness(settings, probe_runner=probe_local_llm)
         probe_ok = card.state == OperatorReadinessState.READY
@@ -749,19 +790,22 @@ def main() -> None:
             ),
         )
 
-    for message in messages:
+    for index, message in enumerate(messages):
         role = str(message.get("role") or "assistant")
         with st.chat_message(role if role in {"user", "assistant"} else "assistant"):
             if role == "assistant":
-                _render_assistant_message(message)
+                with st.container(key=f"qwen-answer-{index}"):
+                    _render_assistant_message(message)
             else:
                 st.markdown(str(message.get("content") or ""))
 
     question = st.chat_input(
         "선택한 규정에 대해 질문하세요",
         disabled=not probe_ok,
+        key="qwen-question",
     )
     if not question:
+        _render_qwen_tour(guided, _qwen_tour_step(probe_ok, messages))
         return
 
     request = build_chat_request(
@@ -785,7 +829,8 @@ def main() -> None:
                 "trace_id": str(response.get("trace_id") or ""),
             }
             messages.append(assistant_message)
-            _render_assistant_message(assistant_message)
+            with st.container(key=f"qwen-answer-{len(messages)-1}"):
+                _render_assistant_message(assistant_message)
         except Exception as exc:
             failure = {
                 "role": "assistant",
@@ -794,6 +839,7 @@ def main() -> None:
             }
             messages.append(failure)
             _render_assistant_message(failure)
+    _render_qwen_tour(guided, _qwen_tour_step(probe_ok, messages))
 
 
 if __name__ == "__main__":

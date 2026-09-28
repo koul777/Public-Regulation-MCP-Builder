@@ -21,6 +21,7 @@ from frontend.qwen_chat_app import (
     safe_citation_rows,
     start_rag_chat_worker,
     _qwen_probe_readiness,
+    _qwen_tour_step,
 )
 from scripts import run_qwen_chat
 
@@ -29,6 +30,40 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class QwenChatSecurityAndGateTests(unittest.TestCase):
+    def test_guided_chat_requires_selection_and_probe_then_accepts_two_questions(self) -> None:
+        import sys
+        from streamlit.testing.v1 import AppTest
+
+        # AppTest replaces __main__; restore it before later multiprocessing tests.
+        self.addCleanup(sys.modules.__setitem__, "__main__", sys.modules["__main__"])
+        app = AppTest.from_function(_synthetic_guided_chat, default_timeout=20).run()
+        self.assertFalse(app.exception)
+        self.assertIsNone(app.selectbox(key="qwen-profile").value)
+        self.assertEqual(0, len(app.chat_input))
+        app.selectbox(key="qwen-profile").select("demo").run()
+        self.assertFalse(app.exception)
+        self.assertIsNone(app.selectbox(key="qwen-document-demo").value)
+        app.selectbox(key="qwen-document-demo").select("doc").run()
+        self.assertTrue(app.chat_input[0].disabled)
+        app.button(key="qwen-probe").click().run()
+        self.assertFalse(app.chat_input[0].disabled)
+        for question in ("휴가는 며칠인가요?", "신청은 어떻게 하나요?"):
+            app.chat_input[0].set_value(question).run()
+            self.assertFalse(app.exception)
+        markup = "\n".join(str(item.value) for item in app.markdown)
+        self.assertIn("답변 아래 근거 인용을 확인하세요", markup)
+        self.assertIn("qwen-answer-3", markup)
+
+    def test_click_guide_requires_live_probe_and_grounded_answer(self) -> None:
+        answered = [{"role": "assistant", "citations": [{"article_no": "제1조"}]}]
+        self.assertEqual(3, _qwen_tour_step(False, answered)[0])
+        self.assertEqual(4, _qwen_tour_step(True, [])[0])
+        self.assertEqual(4, _qwen_tour_step(True, [{"role": "assistant", "error": True}])[0])
+        self.assertEqual(4, _qwen_tour_step(True, [{"role": "assistant", "citations": []}])[0])
+        self.assertEqual(5, _qwen_tour_step(True, answered)[0])
+        self.assertEqual("div.st-key-qwen-answer-0", _qwen_tour_step(True, answered)[3])
+        self.assertEqual([{"role": "assistant", "citations": [{"article_no": "제1조"}]}], answered)
+
     def test_protected_and_shared_modes_fail_closed(self) -> None:
         self.assertIsNotNone(
             protected_or_shared_mode_reason(
@@ -393,6 +428,32 @@ class QwenChatLauncherTests(unittest.TestCase):
         self.assertIn("-m scripts.run_qwen_chat", batch_source)
         self.assertIn("sys.version_info >= (3, 11)", batch_source)
         self.assertNotIn("sys.version_info ^>=", batch_source)
+
+
+def _synthetic_guided_chat() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from app.core.config import Settings
+    from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
+    from app.services.readiness_adapter import adapt_local_llm_probe
+    from frontend import qwen_chat_app as chat
+
+    settings = Settings(app_env="test", api_auth_required=False, tenant_storage_isolation=False,
+                        api_default_tenant_id="default", rag_llm_backend="ollama", rag_llm_model="qwen3:8b",
+                        rag_llm_endpoint="http://127.0.0.1:11434")
+    registry = InstitutionProfileRegistry(profiles={"demo": InstitutionProfile(
+        profile_id="demo", display_name="공개 합성 기관", institution_name="공개 합성 기관", tenant_id="default")})
+    document = SimpleNamespace(document_id="doc", title="합성 규정", original_filename="sample.docx",
+                               status="completed", tenant_id="default", profile_id="demo", processed_at="2026-01-01")
+    ready = chat.DocumentReadiness(document, 1, 1, 0, 0, {"ready": True, "indexing_status": "indexed"}, {})
+    response = {"answer": "합성 답변입니다.", "citations": [{"regulation_title": "합성 규정", "article_no": "제1조"}]}
+    with patch.object(chat, "get_settings", return_value=settings), \
+         patch.object(chat, "load_local_institution_registry", return_value=registry), \
+         patch.object(chat, "JsonRepository", return_value=SimpleNamespace(list_documents=lambda: [document])), \
+         patch.object(chat, "document_readiness", return_value=ready), \
+         patch.object(chat, "check_local_llm_readiness", return_value=adapt_local_llm_probe({"available": True}, component="Qwen3 8B")), \
+         patch.object(chat, "run_rag_chat_with_visible_progress", return_value=response):
+        chat.main()
 
 
 class _Repository:

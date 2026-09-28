@@ -1,5 +1,71 @@
 # 초보자 화면 안내 실행 검증
 
+## 2026-09-28 추가 검증 — 실제 클릭으로 이어지는 안내
+
+이번 보완은 밝게 표시된 실제 항목을 직접 누르면 다음 미완료 항목으로 안내가 이어지는
+흐름을 대상으로 한다. 안내창을 넘기거나 닫는 것만으로 승인·색인 상태를 바꾸지 않는다.
+
+- Streamlit의 HTML 정제 경로에서 스크립트가 제거되는 실제 재현을 확인했다.
+  지원되는 버전은 높이 1px의 `st.iframe`, 이전 버전은 높이 0의 HTML 컴포넌트로 저장소에 포함된
+  안내 코드만 실행한다. 문서 내용이나 AI 응답을 실행 코드에 넣지 않는다.
+- 현재 절차와 전처리 완료 후 이동 버튼의 우선순위를 사용해 지금 누를 항목을 고른다.
+  접힌 메뉴 안의 항목은 먼저 메뉴 제목을 가리킨다.
+- 화면이 다시 실행돼도 진행 중인 안내와 일시정지·자동 안내 중지 설정이 유지된다.
+  안내의 설명을 넘겨도 작업 완료를 만들지 않으며, 앱 확인창이 열리면 안내가 물러난다.
+- 표나 위젯이 늦게 렌더링되어 배치가 바뀌는 경우에도 강조 테두리 위치를 다시 계산한다.
+- 독립 Qwen 화면은 기관·규정을 명시적으로 선택한 후 연결 확인·질문·근거 확인을 안내한다.
+  연결 실패, 오류 답변, 인용 없는 답변을 근거 확인 단계로 올리지 않는다.
+
+### 확인 방법과 범위
+
+| 확인 | 방법 | 범위 |
+| --- | --- | --- |
+| 안내창의 실제 클릭 동작 | `tests/browser/beginner-tour.cjs`를 Chromium에서 실행 | 다음 항목 전환, 같은 항목 반복 방지, 우선순위, 접힌 메뉴, 앱 확인창, 멈춤·재개, 자동 안내 중지, 재실행 정리, 배치 이동 |
+| 키보드·작은 화면 | 같은 브라우저 검사 | Tab, Esc, 390px 화면 경계와 가로 넘침, 모션 줄이기 |
+| 실제 빌더 화면 | 격리된 로컬 Streamlit 앱과 공개 합성 DOCX | 시작 안내, 기관명 입력·기관 생성, 업로드, 인식 정보 확인, 전처리, 검수 화면 이동, 항목별 판단·검수 확인·원문 대조·다음 조항, 안내 멈춤·재개 |
+| Qwen의 단계 연결 | `tests.test_qwen_chat_app`의 Streamlit AppTest | 기관·규정 선택, 연결 확인 전 질문 차단, 연속 질문 2회, 실제 인용이 있는 마지막 답변 안내 |
+| 실행 상태 격리 | Qwen 화면 테스트 뒤 저장소·저널 테스트 100개 실행 | AppTest가 교체한 `__main__` 복원 후 Windows 자식 프로세스 회귀 통과 |
+| Kordoc 패치 | 설치 기준 4.15.7 및 실제 실행 파일 확인 | 공개 합성 DOCX의 2×2 표 1개 추출, 표 안의 한글 내용 유지 |
+
+브라우저 회귀 검사는 별도 Playwright 설치가 필요하다. Python 제품 의존성에는 추가하지
+않는다. 설치된 Playwright가 Node.js에서 보이는 환경에서 다음 명령을 실행한다.
+
+```powershell
+node tests/browser/beginner-tour.cjs
+python -m unittest tests.test_beginner_tour tests.test_streamlit_beginner_guide tests.test_qwen_chat_app -v
+```
+
+Qwen 연결·답변은 이 테스트에서 합성 응답으로 대체한다. 실제 모델 답변 품질, 외부 AI 앱의
+설정 화면, 사람 5명 사용성 파일럿은 이 검증의 범위가 아니다. 실제 기관 원문, 전달받은
+참고 영상, 테스트용 런타임 데이터는 공개 저장소에 포함하지 않는다.
+
+### README 시연 재현
+
+README의 GIF·MP4는 실제 빌더 화면을 Chromium에서 녹화한 것이다. 주황색 원은
+녹화용 마우스 포인터이며 제품 기능은 아니다. 합성 기관과 합성 DOCX만 사용하고,
+외부 AI 검수 및 Kordoc 호출은 이 UI 시연에서 끈다. 최종 승인·색인이나 모델 답변까지
+수행한 영상으로 해석하지 않는다. Kordoc 4.15.7 실행 검증은 별도로 수행했다.
+
+첫 터미널에서 격리된 앱을 실행한다. 실제 사용자 저장소 대신 `tmp/guide-demo-*`를 사용한다.
+
+```powershell
+python -m streamlit run tests/browser/beginner_demo_app.py --server.address 127.0.0.1 --server.port 8766 --server.headless true --browser.gatherUsageStats false
+```
+
+Playwright와 Chromium이 설치된 다른 터미널에서 녹화한다.
+
+```powershell
+node scripts/capture_beginner_click_demo.cjs
+ffmpeg -y -ss 2 -i tmp/beginner-click-recording/beginner-click-guide.webm -c:v libx264 -crf 23 -pix_fmt yuv420p -movflags +faststart -an docs/assets/beginner-click-guide.mp4
+ffmpeg -y -i docs/assets/beginner-click-guide.mp4 -filter_complex "fps=5,scale=960:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" -loop 0 docs/assets/beginner-click-guide.gif
+```
+
+파일 선택은 브라우저 업로드 입력에 합성 파일을 전달한다. Windows 파일 선택창은 녹화하지
+않는다. 기관 생성, 전처리와 검수 확인은 실제 화면의 컨트롤을 클릭한다. 녹화 원본과
+런타임은 `tmp/`에만 남기며 공개하는 파일은 검사한 GIF·MP4·PNG 세 개다.
+
+아래는 앞선 검증 시점의 기록이다.
+
 검증일: 2026-09-26. Windows, Python 3.13.3, Streamlit 1.64.0, Node.js 24.14.0에서 저장소의 가상환경으로 실행했다. 이 문서는 초보자 안내와 실제 화면 이동에 대한 집중 검증 기록이며, 전체 릴리스 승인 기록은 아니다.
 
 ## 실행 결과

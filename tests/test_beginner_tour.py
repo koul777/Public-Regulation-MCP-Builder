@@ -117,6 +117,7 @@ class BeginnerTourTests(unittest.TestCase):
                     beginner_tour, "st", SimpleNamespace(
                         session_state=MappingProxyType(state),
                         html=native_html if native else legacy_html,
+                        iframe=host_render if native else None,
                     )
                 ), patch.object(beginner_tour.components, "html") as iframe_render:
                     beginner_tour.render_tour(enabled=enabled, page=page)
@@ -131,15 +132,14 @@ class BeginnerTourTests(unittest.TestCase):
                     self.assertEqual(enabled, config["enabled"])
                     self.assertEqual(page, config["page"])
                     self.assertEqual(7, config["request"])
-                    self.assertEqual(native, config["native"])
+                    self.assertFalse(config["native"])
                     self.assertEqual(config["mount"], parsed.tags[0][1]["data-rr-tour-mount"])
                     if native:
-                        self.assertEqual({"unsafe_allow_javascript": True}, render.call_args.kwargs)
+                        self.assertEqual({"height": 1, "tab_index": -1}, render.call_args.kwargs)
                         iframe_render.assert_not_called()
                     else:
                         self.assertEqual(
-                            {"height": 0, "scrolling": False, "tab_index": -1},
-                            render.call_args.kwargs,
+                            {"height": 0, "scrolling": False, "tab_index": -1}, render.call_args.kwargs,
                         )
                         host_render.assert_not_called()
         self.assertEqual(

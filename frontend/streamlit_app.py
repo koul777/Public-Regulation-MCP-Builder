@@ -2810,6 +2810,9 @@ def _render_beginner_action_marker(
     if int(step) == 1 and int(substep) == 2:
         tour_attributes = ""
     tour_priority = 100 if control_key_prefix == "preprocess-goto-results" else 0
+    tour_current = str(
+        int(st.session_state.get(BEGINNER_GUIDE_SUBSTEP_KEY) or 0) == int(substep)
+    ).lower()
     if safe_control_keys:
         exact_selectors = ",\n".join(
             selector
@@ -2854,7 +2857,7 @@ def _render_beginner_action_marker(
             progress_note = f"{progress_note} · 지금 할 차례"
     st.markdown(
         f"""
-        <div class="rr-beginner-marker" {tour_attributes} data-rr-tour-priority="{tour_priority}" role="note" aria-label="초보자 안내 {html.escape(progress_note)}">
+        <div class="rr-beginner-marker" {tour_attributes} data-rr-tour-priority="{tour_priority}" data-rr-tour-current="{tour_current}" role="note" aria-label="초보자 안내 {html.escape(progress_note)}">
           <span class="rr-beginner-marker-number" aria-hidden="true">{html.escape(marker_label)}</span>
           <div>
             <strong>{html.escape(title)}</strong>
@@ -10522,7 +10525,10 @@ def _render_approval_chunk_confirmation_controls(
                 f"{item['severity']} · {item['title']} — {item['suggestion']}"
             )
             reflect_button_key, skip_button_key = _approval_ai_decision_control_keys(item_id)
-            reflect_col, skip_col, status_col = st.columns([1, 1, 3])
+            decision_group_key = _approval_chunk_state_key(document_id, chunk_id, f"decision-{item_id}")
+            decision_guide = st.empty()
+            with st.container(key=decision_group_key):
+                reflect_col, skip_col, status_col = st.columns([1, 1, 3])
             if reflect_col.button(
                 "수정 필요로 판단",
                 key=reflect_button_key,
@@ -10546,6 +10552,13 @@ def _render_approval_chunk_confirmation_controls(
                     decision="skip",
                 )
             current_decision = dict(st.session_state.get(ai_decisions_key) or {}).get(item_id)
+            if current_decision not in {"reflect", "skip"}:
+                with decision_guide.container():
+                    _render_beginner_action_marker(
+                        3, "검수 항목을 읽고 판단하세요",
+                        "위 검수 의견을 원문과 비교하세요. 수정이 필요하면 '수정 필요로 판단', 해당하지 않으면 '해당 없음'을 직접 선택하세요.",
+                        control_keys=(decision_group_key,), substep=2,
+                    )
             status_col.caption(
                 "판단 완료: 수정 필요"
                 if current_decision == "reflect"
@@ -10590,6 +10603,11 @@ def _render_approval_chunk_confirmation_controls(
             ai_decisions=ai_decisions,
         )
         if not bool(action_resolution["action_required_resolved"]):
+            _render_beginner_action_marker(
+                3, "수정하거나 처리 방법을 기록하세요",
+                "위의 가운데 최종본을 수정하거나, 이 입력란에 확인·해결한 방법을 적으세요. 입력 후 Tab을 눌러 저장합니다.",
+                control_keys=(str(action_resolution["action_resolution_note_key"]),), substep=2,
+            )
             st.warning(
                 "'수정 필요'로 판단한 항목이 있습니다. 최종본을 수정하거나 처리 메모를 "
                 "남겨야 사람 확인을 완료할 수 있습니다."
@@ -10619,6 +10637,12 @@ def _render_approval_chunk_confirmation_controls(
             st.session_state[ai_result_confirmed_widget_key] = False
         else:
             st.session_state.setdefault(ai_result_confirmed_widget_key, True)
+        if ai_state["ai_confirmed"] and st.session_state.get(ai_result_confirmed_key) != signature:
+            _render_beginner_action_marker(
+                3, "이 조항의 검수 항목 확인을 마치세요",
+                "위 검수 항목에 대한 판단을 확인한 뒤 표시된 확인란을 누르세요. 검수 항목이 없는 조항도 확인합니다.",
+                control_keys=(ai_result_confirmed_widget_key,), substep=2,
+            )
         st.checkbox(
             (
                 "AI 검수 항목에 대한 판단을 모두 확인했습니다."
@@ -10643,6 +10667,15 @@ def _render_approval_chunk_confirmation_controls(
         human_confirmed_widget_key,
         bool(st.session_state.get(human_confirmed_key)),
     )
+    if (
+        ai_result_confirmed and bool(action_resolution["action_required_resolved"])
+        and not st.session_state.get(human_confirmed_key)
+    ):
+        _render_beginner_action_marker(
+            3, "원문과 최종본을 직접 대조하세요",
+            "위의 왼쪽 원문과 가운데 최종본을 비교하세요. 내용이 맞고 승인·색인에 동의할 때만 이 확인란을 누르세요. 다음 조항의 안내가 이어집니다.",
+            control_keys=(human_confirmed_widget_key,), substep=2,
+        )
     st.checkbox(
         "원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다.",
         key=human_confirmed_widget_key,

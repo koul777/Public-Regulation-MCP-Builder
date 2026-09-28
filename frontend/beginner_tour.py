@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import html
-import inspect
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -80,14 +79,13 @@ def render_tour(*, enabled: bool, page: str) -> None:
     browser remembers only tour preferences, scoped to this tab and app path.
     """
     request = int(st.session_state.get(TOUR_REQUEST_KEY, 0))
-    # Feature detection keeps the declared Streamlit >=1.35 compatibility.
-    # Recent st.html runs trusted local scripts directly in the host document;
-    # older st.html sanitizes them, so those versions still need the iframe.
-    native = "unsafe_allow_javascript" in inspect.signature(st.html).parameters
+    # Use the component execution path consistently. Some Streamlit HTML
+    # sanitization paths strip scripts despite accepting the unsafe JS flag.
+    # The minimal-height frame executes only our bundled, trusted controller.
     mount = uuid4().hex
     config = json.dumps({
         "enabled": enabled, "page": page, "request": request,
-        "native": native, "mount": mount,
+        "native": False, "mount": mount,
     }).replace("<", "\\u003c")
     script = (ASSETS / "beginner_tour.js").read_text(encoding="utf-8")
     style = (ASSETS / "beginner_tour.css").read_text(encoding="utf-8")
@@ -98,8 +96,9 @@ def render_tour(*, enabled: bool, page: str) -> None:
         '<script>(() => { const config = ' + config + ';\nconst tourCSS = '
         + json.dumps(style).replace("<", "\\u003c") + ';\n' + script + '\n})();</script>'
     )
-    if native:
-        st.html(body, unsafe_allow_javascript=True)
+    iframe = getattr(st, "iframe", None)
+    if callable(iframe):
+        iframe(body, height=1, tab_index=-1)
     else:
         components.html(body, height=0, scrolling=False, tab_index=-1)
 
