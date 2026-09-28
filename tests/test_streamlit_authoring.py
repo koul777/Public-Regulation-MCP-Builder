@@ -225,6 +225,9 @@ projects = [
 ]
 
 class Service:
+    def list_templates(self):
+        from app.services.authoring_template_service import AuthoringTemplateService
+        return AuthoringTemplateService().list_templates()
     def list_projects(self, *, tenant_id, profile_id):
         return projects
     def get_project(self, project_id, *, tenant_id, profile_id):
@@ -495,7 +498,7 @@ def _create_drafting_project(app, *, title: str) -> str:
     )
     next(item for item in app.date_input if item.label == "시행 예정일").set_value(
         date(2026, 10, 1)
-    )
+    ).run()
     next(
         button for button in app.button if button.label == "기본정보 저장"
     ).click().run()
@@ -762,6 +765,7 @@ class StreamlitAuthoringTests(unittest.TestCase):
 
         app = AppTest.from_string(_REVIEW_ACTION_BUFFER_APP, default_timeout=30)
         app.run()
+        self.assertFalse(app.exception)
         project_a = "00000000-0000-0000-0000-000000000021"
         project_b = "00000000-0000-0000-0000-000000000022"
         next(
@@ -824,6 +828,7 @@ class StreamlitAuthoringTests(unittest.TestCase):
 
         app = AppTest.from_string(_REVIEW_ACTION_BUFFER_APP, default_timeout=30)
         app.run()
+        self.assertFalse(app.exception)
         change_comment = next(
             area for area in app.text_area if area.label == "수정 요청 메모"
         )
@@ -1204,6 +1209,29 @@ for severity in AuthoringLintSeverity:
         )
         self.assertTrue(any("안내 · unknown_field" in item.value for item in app.info))
 
+    def test_authoring_create_form_rejects_blank_title_without_locking_submit(self) -> None:
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            app = AppTest.from_file(
+                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                default_timeout=30,
+            )
+            _seed_app(app, enabled=True, data_dir=data_dir, nav_page=AUTHORING_NAV_LABEL)
+            app.run()
+            create = next(button for button in app.button if button.label == "초안 공간 만들기")
+            self.assertFalse(create.disabled)
+            create.click().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any("규정명을 입력" in item.value for item in app.error))
+            self.assertEqual([], list((data_dir / "authoring" / "projects").glob("*.json")))
+            next(item for item in app.text_input if item.label == "규정명").set_value("입력 재시도 규정")
+            next(button for button in app.button if button.label == "초안 공간 만들기").click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(1, len(list((data_dir / "authoring" / "projects").glob("*.json"))))
+
     def test_authoring_screen_creates_isolated_beginner_project(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
@@ -1296,7 +1324,7 @@ for severity in AuthoringLintSeverity:
                 selected_after_abandon = ""
             abandoned_editor_keys = [
                 str(key)
-                for key in app.session_state.filtered_state
+                for key in app.session_state
                 if str(key).startswith(
                     (
                         f"authoring-v2-editor:default:test-profile:{project_id}:",
@@ -1307,7 +1335,7 @@ for severity in AuthoringLintSeverity:
                 )
             ]
             flash_message_pending = (
-                AUTHORING_FLASH_MESSAGE_KEY in app.session_state.filtered_state
+                AUTHORING_FLASH_MESSAGE_KEY in app.session_state
             )
 
         self.assertFalse(app.exception)
@@ -1359,7 +1387,7 @@ for severity in AuthoringLintSeverity:
             ).set_value("저장된 담당부서")
             next(
                 item for item in app.date_input if item.label == "시행 예정일"
-            ).set_value(date(2026, 10, 1))
+            ).set_value(date(2026, 10, 1)).run()
             next(
                 button for button in app.button if button.label == "기본정보 저장"
             ).click().run()
@@ -1741,7 +1769,7 @@ for severity in AuthoringLintSeverity:
             )
             next(
                 item for item in app.date_input if item.label == "시행 예정일"
-            ).set_value(date(2026, 10, 1))
+            ).set_value(date(2026, 10, 1)).run()
             next(
                 button for button in app.button if button.label == "기본정보 저장"
             ).click().run()
@@ -1759,6 +1787,7 @@ for severity in AuthoringLintSeverity:
                 area.set_value(
                     "담당부서는 기준에 따라 업무를 처리하고 결과를 기록한다."
                 )
+            app.run()
             next(
                 button for button in app.button if button.label == "조문 저장"
             ).click().run()
@@ -1772,9 +1801,13 @@ for severity in AuthoringLintSeverity:
             checklist_labels = [item.label for item in checklist]
             for item in checklist:
                 item.set_value(True)
-            next(
+            app.run()
+            self.assertFalse(app.exception)
+            save_checklist = next(
                 button for button in app.button if button.label == "확인 목록 저장"
-            ).click().run()
+            )
+            self.assertFalse(save_checklist.disabled)
+            save_checklist.click().run()
 
             next(
                 button for button in app.button if button.label == "작성 검사"

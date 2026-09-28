@@ -497,6 +497,75 @@ class AgentReviewBatchingTests(unittest.TestCase):
 
 
 class AgentReviewExecutorTests(unittest.TestCase):
+    def test_fenced_json_review_is_accepted_without_losing_findings(self) -> None:
+        response = openai_response(["chunk_review"])
+        response["choices"][0]["message"]["content"] = (
+            "```json\n" + response["choices"][0]["message"]["content"] + "\n```"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = AgentReviewExecutor(
+                Settings(data_dir=Path(tmp), enable_agent_review=True, openai_api_key="test-only",
+                         agent_review_max_attempts=1),
+                http_post=lambda *args: response,
+            )
+            result = executor.execute(document_id="doc_review", run_id="run_review",
+                                      plan=planned_review(), chunks=[review_chunk()])
+
+        self.assertEqual("executed", result["status"])
+        self.assertEqual("chunk_review", result["provider_review_json"]["items"][0]["chunk_id"])
+
+    def test_invalid_review_shape_or_foreign_chunk_cannot_be_reported_as_clean(self) -> None:
+        invalid_reviews = [
+            {},
+            {"items": "not a list"},
+            {"items": ["not an item"]},
+            {"items": [{"chunk_id": "chunk_review", "issues": "missing text"}]},
+            {"items": [{"chunk_id": "chunk_review", "issues": [], "risk_level": []}]},
+            {"items": [{"chunk_id": "chunk_elsewhere", "issues": ["wrong chunk"]}]},
+        ]
+        for review in invalid_reviews:
+            with self.subTest(review=review), tempfile.TemporaryDirectory() as tmp:
+                response = {"choices": [{"message": {"content": json.dumps(review)}}]}
+                executor = AgentReviewExecutor(
+                    Settings(data_dir=Path(tmp), enable_agent_review=True, openai_api_key="test-only",
+                             agent_review_max_attempts=1),
+                    http_post=lambda *args: response,
+                )
+                result = executor.execute(document_id="doc_review", run_id="run_review",
+                                          plan=planned_review(), chunks=[review_chunk()])
+                self.assertEqual("provider_execution_failed", result["status"])
+                self.assertEqual(["chunk_review"], result["unreviewed_chunk_ids"])
+                self.assertEqual({"items": []}, result["provider_review_json"])
+
+    def test_truncated_response_is_not_a_completed_clean_review(self) -> None:
+        for provider, response in (
+            ("openai", {"choices": [{"finish_reason": "length", "message": {"content": '{"items":[]}'}}]}),
+            ("anthropic", {"stop_reason": "max_tokens", "content": [{"type": "text", "text": '{"items":[]}'}]}),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp:
+                executor = AgentReviewExecutor(
+                    Settings(data_dir=Path(tmp), enable_agent_review=True, llm_provider=provider,
+                             openai_api_key="test-only", anthropic_api_key="test-only",
+                             agent_review_max_attempts=1),
+                    http_post=lambda *args: response,
+                )
+                result = executor.execute(document_id="doc_review", run_id="run_review",
+                                          plan=planned_review(), chunks=[review_chunk()])
+                self.assertEqual("provider_execution_failed", result["status"])
+                self.assertEqual("provider_response_truncated", result["skip_reason"])
+
+    def test_clean_review_counts_requested_chunks_as_reviewed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = AgentReviewExecutor(
+                Settings(data_dir=Path(tmp), enable_agent_review=True, openai_api_key="test-only"),
+                http_post=lambda *args: openai_response([]),
+            )
+            result = executor.execute(document_id="doc_review", run_id="run_review",
+                                      plan=planned_review(), chunks=[review_chunk()])
+        self.assertEqual(1, result["reviewed_chunk_count"])
+        self.assertEqual(["chunk_review"], result["reviewed_chunk_ids"])
+        self.assertEqual([], result["unreviewed_chunk_ids"])
+
     def test_missing_api_key_keeps_configuration_needed_without_http_call(self) -> None:
         calls: list[dict[str, Any]] = []
         executor = AgentReviewExecutor(
@@ -748,8 +817,49 @@ class AgentReviewExecutorTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "provider_execution_blocked")
         self.assertTrue(str(result["skip_reason"]).startswith("provider_payload_local_path_leak:"))
+        # 막았으면 어느 조항이 문제인지도 가리켜야 운영자가 손댈 곳을 안다.
+        self.assertIn("items[0].text", str(result["skip_reason"]))
         self.assertEqual(result["api_call_count"], 0)
         self.assertEqual(calls, [])
+
+    def test_line_break_before_colon_is_not_treated_as_local_path(self) -> None:
+        """별지 서식의 줄바꿈이 경로 유출로 오인되면 안 된다.
+
+        본문을 JSON으로 굳히면 줄바꿈이 역슬래시와 n 두 글자가 된다. 검사를 그
+        문자열에 걸면 ``확인자(지도교수)`` 다음 줄의 ``:`` 가 ``n:\\`` 이 되어 윈도우
+        경로로 잡히고, 서식 한 장 때문에 규정 전체 검수가 호출 0회로 막혔다.
+        """
+        calls: list[dict[str, Any]] = []
+
+        def fake_post(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+            calls.append({"payload": payload})
+            return {
+                "id": "chatcmpl-form",
+                "choices": [{"message": {"content": '{"items":[]}'}}],
+                "usage": {"total_tokens": 1},
+            }
+
+        form_text = "확인자(지도교수)\n:\n(서명/인)\nPlease approve our request as follows:\n1. 변경 사유"
+        chunk = review_chunk().model_copy(update={"text": form_text, "normalized_text": form_text})
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_agent_review=True,
+            llm_provider="openai",
+            openai_api_key="secret-key",
+            agent_review_model="review-model",
+        )
+        executor = AgentReviewExecutor(settings, http_post=fake_post)
+
+        result = executor.execute(
+            document_id="doc_review",
+            run_id="run_review",
+            plan=planned_review(),
+            chunks=[chunk],
+        )
+
+        self.assertEqual(result["status"], "executed")
+        self.assertEqual(result["api_call_count"], 1)
+        self.assertEqual(len(calls), 1)
 
     def test_payload_includes_bounded_table_review_context(self) -> None:
         calls: list[dict[str, Any]] = []

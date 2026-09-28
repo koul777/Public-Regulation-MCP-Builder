@@ -8,6 +8,13 @@ from scripts.local_llm_doctor import diagnose_local_llm
 
 
 class LocalLlmDoctorTests(unittest.TestCase):
+    @patch("scripts.local_llm_doctor.probe_local_llm", side_effect=RuntimeError("synthetic-private-error"))
+    def test_cli_diagnostic_uses_safe_service_failure_contract(self, probe) -> None:
+        report = diagnose_local_llm(backend="ollama")
+        self.assertFalse(report["passed"])
+        self.assertEqual("local_probe_failed", report["reason"])
+        self.assertNotIn("synthetic-private-error", str(report))
+
     def test_extractive_mode_passes_without_local_model(self) -> None:
         report = diagnose_local_llm(backend="extractive", data_dir=Path("data"))
 
@@ -38,6 +45,21 @@ class LocalLlmDoctorTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(report["model"], "qwen3:8b")
         self.assertEqual(report["reason"], "available")
+        available.assert_called_once()
+        probe.assert_called_once()
+
+    @patch("scripts.local_llm_doctor.probe_local_llm", return_value=["invalid"])
+    @patch("scripts.local_llm_doctor.local_llm_available", return_value=True)
+    def test_malformed_probe_response_fails_closed(self, available, probe) -> None:
+        report = diagnose_local_llm(
+            backend="ollama",
+            endpoint="http://127.0.0.1:11434",
+            model="qwen3:8b",
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual("local_probe_invalid", report["reason"])
+        self.assertNotIn("health", report)
         available.assert_called_once()
         probe.assert_called_once()
 

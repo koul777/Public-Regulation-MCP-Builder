@@ -182,7 +182,7 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             namespace["_connect_nav_display_label"](),
         )
 
-    def test_beginner_step_four_uses_five_qwen_procedures_or_the_mcp_course(self) -> None:
+    def test_beginner_step_four_uses_two_qwen_handoff_procedures_or_the_mcp_course(self) -> None:
         qwen_procedures = _literal_assignment(self.module, "BEGINNER_QWEN_PROCEDURES")
         mcp_procedures = _literal_assignment(self.module, "BEGINNER_GUIDE_PROCEDURES")
         selected = {"value": "qwen"}
@@ -204,7 +204,7 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             namespace,
         )
 
-        self.assertEqual(5, len(qwen_procedures))
+        self.assertEqual(2, len(qwen_procedures))
         self.assertEqual(qwen_procedures, namespace["_beginner_guide_procedures"](4))
         selected["value"] = "mcp"
         self.assertEqual(mcp_procedures[3], namespace["_beginner_guide_procedures"](4))
@@ -237,9 +237,6 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             (
                 "승인·색인된 규정 준비 상태 확인",
                 "독립 Qwen 챗봇 실행",
-                "대화할 규정 선택",
-                "Qwen 연결 확인 후 질문 입력",
-                "답변과 근거 조문 함께 확인",
             ),
             procedures,
         )
@@ -251,18 +248,83 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
         returns = [node for node in ast.walk(states) if isinstance(node, ast.Return)]
         self.assertEqual(1, len(returns))
         self.assertEqual(
-            (
-                "approval_ready",
-                "standalone_running",
-                "False",
-                "False",
-                "False",
-            ),
+            ("approval_ready", "standalone_running"),
             tuple(ast.unparse(item) for item in returns[0].value.elts),
         )
         states_source = ast.get_source_segment(self.source, states) or ""
         self.assertIn("QWEN_CHAT_APP_LAUNCH_STATE_KEY", states_source)
         self.assertIn("_standalone_qwen_chat_is_healthy(app_url)", states_source)
+
+    def test_qwen_handoff_states_require_scoped_approval_and_healthy_live_app(self) -> None:
+        calls: list[str] = []
+        health = {"ready": True}
+
+        def check_health(url: str) -> bool:
+            calls.append(url)
+            return health["ready"]
+
+        session_state: dict[str, object] = {}
+        namespace: dict[str, object] = {
+            "st": SimpleNamespace(session_state=session_state),
+            "QWEN_CHAT_APP_LAUNCH_STATE_KEY": "qwen-launch",
+            "_selected_institution_profile_id": lambda: "agency-a",
+            "_standalone_qwen_chat_is_healthy": check_health,
+        }
+        exec(
+            compile(
+                ast.Module(
+                    body=[_function(self.module, "_qwen_beginner_procedure_states")],
+                    type_ignores=[],
+                ),
+                str(APP_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        handoff_states = namespace["_qwen_beginner_procedure_states"]
+        context = {
+            "document": SimpleNamespace(profile_id="agency-a"),
+            "approved_count": 1,
+            "mcp_connection_gate": {"ready": True},
+        }
+        live_process = SimpleNamespace(poll=lambda: None)
+        session_state["qwen-launch"] = {
+            "url": "http://127.0.0.1:8502",
+            "_process": live_process,
+        }
+        self.assertEqual((True, True), handoff_states(context))
+        self.assertEqual(["http://127.0.0.1:8502"], calls)
+
+        health["ready"] = False
+        self.assertEqual((True, False), handoff_states(context))
+        health["ready"] = True
+        calls.clear()
+        session_state["qwen-launch"] = {
+            "url": "http://127.0.0.1:8502",
+            "_process": SimpleNamespace(poll=lambda: 1),
+        }
+        self.assertEqual((True, False), handoff_states(context))
+        self.assertEqual([], calls, "a dead process must not be probed as ready")
+
+        session_state["qwen-launch"] = {"url": "http://127.0.0.1:8502"}
+        self.assertEqual((True, False), handoff_states(context))
+        session_state.pop("qwen-launch")
+        self.assertEqual((True, False), handoff_states(context))
+
+        session_state["qwen-launch"] = {
+            "url": "http://127.0.0.1:8502",
+            "_process": live_process,
+        }
+        self.assertEqual(
+            (False, True),
+            handoff_states({**context, "document": SimpleNamespace(profile_id="agency-b")}),
+        )
+        self.assertEqual((False, True), handoff_states({**context, "approved_count": 0}))
+        self.assertEqual(
+            (False, True),
+            handoff_states({**context, "mcp_connection_gate": {"ready": False}}),
+        )
+        self.assertFalse(all(handoff_states({**context, "approved_count": 0})))
 
     def test_long_orchestration_guide_is_closed_by_default(self) -> None:
         guide_source = _function_source(
@@ -301,10 +363,8 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             "OPENAI_COMPATIBLE_API_KEY",
         ):
             self.assertIn(secret_name, environment_source)
-        self.assertIn('"--qwen-chat"', launcher_source)
-        self.assertIn('"scripts.run_qwen_chat"', launcher_source)
-        self.assertIn('select_available_port(8502, host="127.0.0.1"', launcher_source)
-        self.assertIn("subprocess.Popen", launcher_source)
+        self.assertIn("start_local_qwen_chat(", launcher_source)
+        self.assertNotIn("subprocess.Popen", launcher_source)
         self.assertIn("독립 Qwen 챗봇 실행", renderer_source)
         self.assertIn("_render_standalone_qwen_chat_launcher", self.source)
         page_source = _function_source(self.source, self.module, "_page_connect")

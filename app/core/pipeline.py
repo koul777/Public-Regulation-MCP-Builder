@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shlex
+import re
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -10,11 +10,12 @@ from typing import Any
 
 from app.agents.review_policy import AgentReviewPolicy
 from app.processors.chunker import CHUNKER_VERSION
-from app.processors.kordoc_table_parser import resolve_kordoc_command
+from app.processors.kordoc_table_parser import resolve_kordoc_command, split_command
 from app.schemas.chunk import ChunkOptions
 
 
 PREPROCESSOR_PIPELINE_VERSION = "2026.08.03-canonical-regulation-parity-2"
+_SAFE_VERSION = re.compile(r"(?<![A-Za-z0-9])v?(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?![A-Za-z0-9])")
 
 
 def processing_options_payload(
@@ -73,25 +74,29 @@ def processing_options_payload(
 @lru_cache(maxsize=32)
 def kordoc_table_command_status(command: str) -> dict[str, Any]:
     parts = _split_command_for_status(command)
-    label = parts[0] if parts else ""
+    label = parts[0].replace("\\", "/").rsplit("/", 1)[-1] if parts else ""
     status: dict[str, Any] = {
         "label": label,
         "available": False,
         "resolved_name": "",
         "version": "",
+        "reason": "command_empty" if not parts else "command_not_found",
     }
     if not label:
         return status
-    resolved = resolve_kordoc_command(label)
+    resolved = resolve_kordoc_command(parts[0])
     if not resolved:
         return status
     # Preserve a stable evidence label even when a Windows path is inspected
     # by a non-Windows CI runner (and vice versa).
     status["resolved_name"] = str(resolved).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    version = _command_version(resolved)
+    version = _command_version(resolved, *parts[1:])
     if version:
         status["available"] = True
         status["version"] = version
+        status["reason"] = "" if version != "unverified" else "version_unrecognized"
+    else:
+        status["reason"] = "version_probe_failed"
     return status
 
 
@@ -99,34 +104,38 @@ def _split_command_for_status(command: str) -> list[str]:
     command = str(command or "").strip()
     if not command:
         return []
-    try:
-        return [part.strip('"') for part in shlex.split(command, posix=os.name != "nt")]
-    except ValueError:
-        return [command]
+    return split_command(command)
 
 
-def _command_version(resolved: str) -> str:
-    argv = [resolved, "--version"]
+def _command_version(resolved: str, *configured_args: str) -> str:
+    """Probe the actual configured CLI, returning only a safe version token."""
+    argv = [resolved, *configured_args, "--version"]
     if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
         argv = ["cmd", "/c", *argv]
+    elif os.name == "nt" and resolved.lower().endswith(".ps1"):
+        argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
     try:
         completed = subprocess.run(
             argv,
             check=False,
+            shell=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=3,
+            **options,
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
     if completed.returncode != 0:
         return ""
-    text = (completed.stdout or completed.stderr or "").strip()
+    text = (completed.stdout or completed.stderr or "")[:4096].strip()
     if not text:
         return ""
-    return text.splitlines()[0].strip()[:80]
+    match = _SAFE_VERSION.search(text.splitlines()[0][:256])
+    return match.group(1)[:80] if match else "unverified"
 
 
 def quality_profile_config_hash(path: str | Path | None) -> str:

@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """Standalone localhost UI for approved, document-scoped Qwen regulation chat.
 
 This module deliberately does not import the operator/builder Streamlit app.  It
 is launched as its own Streamlit process by ``scripts.run_qwen_chat`` and only
 reads the repository that the local builder already produced.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 import queue
@@ -28,7 +28,15 @@ from app.core.institution_profiles import (
 )
 from app.core.security_primitives import API_ROLE_ADMIN, AuthContext
 from app.rag.local_llm import local_llm_available, probe_local_llm
+from app.services.local_llm_readiness_service import check_local_llm_readiness
+from app.services.readiness_adapter import (
+    OperatorReadinessState,
+    ReadinessCard,
+    adapt_local_llm_probe,
+    adapt_readiness_report,
+)
 from app.storage.repository import JsonRepository
+from frontend.beginner_tour import marker_attributes, render_beginner_style, render_tour
 
 
 LOCAL_APP_ENVS = frozenset({"local", "dev", "development", "test"})
@@ -440,7 +448,7 @@ def run_rag_chat_with_visible_progress(
 
         progress_bar.progress(100, text=_STAGE_LABELS["completed"])
         detail.caption(f"완료 · 총 {time.monotonic() - started_at:.1f}초")
-        status.update(label="Qwen 답변과 근거 확인 완료", state="complete", expanded=False)
+        status.update(label="답변 생성 완료 · 근거 인용을 아래에서 확인하세요", state="complete", expanded=False)
 
     if not isinstance(outcome_value, dict):
         raise RuntimeError("Qwen chat returned an invalid response")
@@ -453,26 +461,40 @@ def safe_citation_rows(citations: Any) -> list[dict[str, Any]]:
     if not isinstance(citations, list):
         return []
     rows: list[dict[str, Any]] = []
+
+    def readable(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())[:4000]
+
+    def page_number(value: Any) -> str:
+        if isinstance(value, bool):
+            return ""
+        text = str(value) if isinstance(value, int) else readable(value)
+        return text if text.isascii() and text.isdigit() and 0 < len(text) <= 7 else ""
+
     for citation in citations:
         if not isinstance(citation, dict):
             continue
-        page_start = citation.get("source_page_start")
-        page_end = citation.get("source_page_end")
+        page_start = page_number(citation.get("source_page_start"))
+        page_end = page_number(citation.get("source_page_end"))
         page_label = ""
         if page_start not in (None, ""):
             page_label = str(page_start)
             if page_end not in (None, "", page_start):
                 page_label = f"{page_label}–{page_end}"
         row = {
-            "규정명": citation.get("regulation_title") or citation.get("document_title"),
-            "조문": citation.get("article_no"),
-            "조문 제목": citation.get("article_title"),
-            "항": citation.get("paragraph_no"),
+            "규정명": readable(citation.get("regulation_title")) or readable(citation.get("document_title")),
+            "조문": readable(citation.get("article_no")),
+            "조문 제목": readable(citation.get("article_title")),
+            "항": readable(citation.get("paragraph_no")),
             "원문 쪽": page_label,
-            "근거 인용문": citation.get("support_quote"),
+            "근거 인용문": readable(citation.get("support_quote")),
         }
         row = {key: value for key, value in row.items() if value not in (None, "")}
-        if row:
+        # A page number or heading alone is not enough for a reader to check
+        # what text supports the answer, even inside the selected document.
+        if "조문" in row or "근거 인용문" in row:
             rows.append(row)
     return rows
 
@@ -545,6 +567,11 @@ def _render_assistant_message(message: dict[str, Any]) -> None:
     if citation_rows:
         with st.expander(f"근거 인용 {len(citation_rows)}건", expanded=True):
             st.dataframe(citation_rows, hide_index=True, width="stretch")
+    else:
+        st.warning(
+            "확인할 수 있는 근거 인용이 없습니다. 이 답변을 규정 근거로 사용하지 마세요. "
+            "질문을 더 구체적으로 바꾸거나 빌더에서 이 규정의 승인·색인 상태를 확인하세요."
+        )
 
 
 def _friendly_chat_error(exc: Exception) -> str:
@@ -565,6 +592,67 @@ def _probe_signature(settings: Settings) -> str:
             str(settings.rag_llm_model or "").strip().lower(),
             str(settings.rag_llm_endpoint or "").strip().lower(),
         )
+    )
+
+
+def _qwen_probe_readiness(
+    probe_state: dict[str, Any] | None,
+    *,
+    signature: str,
+) -> ReadinessCard:
+    """Adapt the cached local probe without retaining its raw response."""
+
+    if not isinstance(probe_state, dict) or probe_state.get("signature") != signature:
+        return adapt_readiness_report(None, component="Qwen3 8B")
+    if isinstance(probe_state.get("card"), ReadinessCard):
+        return probe_state["card"]
+    return adapt_local_llm_probe(
+        {"available": probe_state.get("available") is True},
+        component="Qwen3 8B",
+    )
+
+
+def _qwen_tour_step(probe_ok: bool, messages: list[dict[str, Any]]) -> tuple[int, str, str, str]:
+    """Choose guidance from real connection/answer state, without changing it."""
+    if not probe_ok:
+        return (3, "Qwen 연결 확인 버튼을 누르세요",
+                "Ollama와 qwen3:8b가 준비됐는지 확인합니다. 실패하면 화면의 복구 안내를 따라 다시 누르세요.",
+                "div.st-key-qwen-probe")
+    last = messages[-1] if messages else {}
+    if last.get("role") == "assistant" and not last.get("error"):
+        answer_target = f"div.st-key-qwen-answer-{len(messages)-1}"
+        if safe_citation_rows(last.get("citations")):
+            return (5, "답변 아래 근거 인용을 확인하세요",
+                    "답변과 함께 규정명·조문·원문 쪽을 직접 확인하세요. 새 질문은 아래 입력창에 적을 수 있습니다.",
+                    answer_target)
+        return (5, "근거 인용이 없는 답변을 확인하세요",
+                "이 답변을 규정 근거로 사용하지 마세요. 질문을 바꾸거나 빌더에서 승인·색인 상태를 확인하세요.",
+                answer_target)
+    return (4, "아래 입력창에 규정 질문을 적으세요",
+            "질문을 입력한 뒤 전송 버튼을 누르세요. 답변이 끝나면 근거 인용을 확인합니다.",
+            "div.st-key-qwen-question")
+
+
+def _render_qwen_tour(enabled: bool, action: tuple[int, str, str, str]) -> None:
+    if enabled:
+        substep, title, description, selector = action
+        render_beginner_style()
+        attributes = marker_attributes(title, description, selectors=[selector], step=4, substep=substep)
+        st.markdown(f'<span {attributes} data-rr-tour-current="true"></span>', unsafe_allow_html=True)
+    render_tour(enabled=enabled, page="qwen-chat")
+
+
+def _render_qwen_blocked_state(
+    guided: bool, *, title: str, reason: str, next_action: str,
+) -> None:
+    """Keep a visible recovery step when no safe chat selection exists."""
+    with st.container(key="qwen-recovery"):
+        st.warning(reason)
+        st.info(next_action)
+        st.button("빌더에서 조치한 뒤 다시 확인", key="qwen-recovery-recheck")
+    _render_qwen_tour(
+        guided,
+        (1, title, next_action, "div.st-key-qwen-recovery-recheck"),
     )
 
 
@@ -591,26 +679,49 @@ def main() -> None:
         )
         st.stop()
 
+    guided = st.toggle("한 단계씩 클릭 안내", value=True, key="qwen-guided-mode")
     try:
         tenant_id = local_tenant_id(settings)
         registry = load_local_institution_registry(settings)
     except FileNotFoundError:
-        st.error("기관 프로필 파일을 찾지 못했습니다. 먼저 빌더에서 기관을 등록해 주세요.")
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 기관을 먼저 등록하세요",
+            reason="기관 프로필 파일을 찾지 못해 질문할 기관을 선택할 수 없습니다.",
+            next_action="빌더 창으로 돌아가 기관을 등록한 뒤 이 Qwen 화면을 새로고침하세요.",
+        )
         st.stop()
     except (OSError, ValueError):
-        st.error("기관 프로필 파일을 안전하게 읽지 못했습니다. 빌더에서 기관 설정을 확인해 주세요.")
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 기관 설정을 확인하세요",
+            reason="기관 프로필을 안전하게 읽지 못해 질문을 시작할 수 없습니다.",
+            next_action="빌더 창에서 기관 설정을 확인한 뒤 이 Qwen 화면을 새로고침하세요.",
+        )
         st.stop()
 
     profiles = local_profiles(registry, tenant_id)
     if not profiles:
-        st.warning("현재 로컬 테넌트에서 사용할 수 있는 기관 프로필이 없습니다.")
+        _render_qwen_blocked_state(
+            guided,
+            title="현재 기관을 먼저 등록하세요",
+            reason="현재 로컬 테넌트에서 선택할 수 있는 기관 프로필이 없습니다.",
+            next_action="빌더 창에서 현재 기관을 등록한 뒤 이 Qwen 화면을 새로고침하세요.",
+        )
         st.stop()
 
     selected_profile_id = st.selectbox(
         "1. 질문할 기관을 선택하세요",
         options=list(profiles),
         format_func=lambda profile_id: _profile_label(profiles[profile_id]),
+        index=None if guided else 0,
+        key="qwen-profile",
     )
+    if selected_profile_id is None:
+        _render_qwen_tour(guided, (1, "질문할 기관을 선택하세요",
+                                  "밝게 표시된 선택 상자를 누르고 작업할 기관을 고르세요.",
+                                  "div.st-key-qwen-profile"))
+        return
 
     try:
         repository = JsonRepository(settings)
@@ -624,7 +735,12 @@ def main() -> None:
         st.stop()
 
     if not documents:
-        st.info("이 기관에는 전처리가 완료된 규정이 없습니다. 먼저 빌더에서 전처리를 완료해 주세요.")
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 규정 전처리를 완료하세요",
+            reason="선택한 기관에 전처리가 완료된 규정이 없습니다.",
+            next_action="빌더 창에서 이 기관의 규정 파일을 선택해 전처리를 완료한 뒤 이 Qwen 화면을 새로고침하세요. 전처리 후에도 사람 검토와 승인·색인이 필요합니다.",
+        )
         st.stop()
 
     auth = AuthContext(
@@ -657,10 +773,11 @@ def main() -> None:
         if item.ready
     }
     if not ready_by_id:
-        st.warning(
-            "아직 질문 가능한 규정이 없습니다. 빌더의 ‘③ 승인·색인’에서 남은 조항을 모두 승인 또는 "
-            "반려한 뒤 ‘승인된 내용 색인’을 완료해 주세요. "
-            "승인 조항 수와 색인 조항 수가 정확히 같아야 합니다."
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 남은 검토와 색인을 완료하세요",
+            reason="이 기관에 아직 질문 가능한 규정이 없습니다. 검토 대기나 승인·색인 불일치가 있는 규정은 질문에서 제외됩니다.",
+            next_action="빌더 창의 ‘③ 검수하고 승인’에서 원문을 확인하고 남은 조항을 직접 승인 또는 반려하세요. 승인된 조항을 색인한 뒤 이 화면을 새로고침하세요. 승인 수와 색인 수가 같아야 합니다.",
         )
         st.stop()
 
@@ -668,7 +785,14 @@ def main() -> None:
         "3. 질문할 규정 하나를 선택하세요",
         options=list(ready_by_id),
         format_func=lambda document_id: _document_label(ready_by_id[document_id].document),
+        index=None if guided else 0,
+        key=f"qwen-document-{selected_profile_id}",
     )
+    if selected_document_id is None:
+        _render_qwen_tour(guided, (2, "질문할 규정을 선택하세요",
+                                  "승인·색인이 끝난 규정만 선택할 수 있습니다. 질문할 규정 하나를 고르세요.",
+                                  'div[class*="st-key-qwen-document-"]'))
+        return
     selected = ready_by_id[selected_document_id]
     st.success(
         f"질문 범위가 ‘{_document_label(selected.document)}’ 한 건으로 고정되었습니다. "
@@ -678,21 +802,25 @@ def main() -> None:
     st.markdown("### 4. Ollama와 Qwen3 8B 연결을 확인하세요")
     probe_signature = _probe_signature(settings)
     probe_state = st.session_state.get(PROBE_SESSION_KEY)
-    probe_ok = bool(
-        isinstance(probe_state, dict)
-        and probe_state.get("signature") == probe_signature
-        and probe_state.get("available") is True
-    )
-    if st.button("Ollama · qwen3:8b 연결 확인", width="stretch"):
+    probe_readiness = _qwen_probe_readiness(probe_state, signature=probe_signature)
+    if st.button("Ollama · qwen3:8b 연결 확인", width="stretch", key="qwen-probe"):
         with st.spinner("이 PC의 Ollama에 짧은 확인 질문을 보내고 있습니다."):
-            result = probe_local_llm(settings)
-        probe_ok = bool(result.get("available"))
+            card = check_local_llm_readiness(settings, probe_runner=probe_local_llm)
+        probe_ok = card.state == OperatorReadinessState.READY
         st.session_state[PROBE_SESSION_KEY] = {
             "signature": probe_signature,
             "available": probe_ok,
+            "card": card,
         }
-    if probe_ok:
+        probe_readiness = _qwen_probe_readiness(
+            st.session_state[PROBE_SESSION_KEY],
+            signature=probe_signature,
+        )
+    probe_ok = probe_readiness.state == OperatorReadinessState.READY
+    if probe_readiness.state == OperatorReadinessState.READY:
         st.success("연결되었습니다. 이제 아래 입력창에 규정 질문을 적을 수 있습니다.")
+    elif probe_readiness.state == OperatorReadinessState.ACTION_REQUIRED:
+        st.warning(f"{probe_readiness.display_name} · {probe_readiness.next_action}")
     else:
         st.info(
             "위 버튼으로 연결을 먼저 확인해 주세요. 실패하면 Ollama가 실행 중인지, "
@@ -721,19 +849,22 @@ def main() -> None:
             ),
         )
 
-    for message in messages:
+    for index, message in enumerate(messages):
         role = str(message.get("role") or "assistant")
         with st.chat_message(role if role in {"user", "assistant"} else "assistant"):
             if role == "assistant":
-                _render_assistant_message(message)
+                with st.container(key=f"qwen-answer-{index}"):
+                    _render_assistant_message(message)
             else:
                 st.markdown(str(message.get("content") or ""))
 
     question = st.chat_input(
         "선택한 규정에 대해 질문하세요",
         disabled=not probe_ok,
+        key="qwen-question",
     )
     if not question:
+        _render_qwen_tour(guided, _qwen_tour_step(probe_ok, messages))
         return
 
     request = build_chat_request(
@@ -757,7 +888,8 @@ def main() -> None:
                 "trace_id": str(response.get("trace_id") or ""),
             }
             messages.append(assistant_message)
-            _render_assistant_message(assistant_message)
+            with st.container(key=f"qwen-answer-{len(messages)-1}"):
+                _render_assistant_message(assistant_message)
         except Exception as exc:
             failure = {
                 "role": "assistant",
@@ -766,6 +898,7 @@ def main() -> None:
             }
             messages.append(failure)
             _render_assistant_message(failure)
+    _render_qwen_tour(guided, _qwen_tour_step(probe_ok, messages))
 
 
 if __name__ == "__main__":

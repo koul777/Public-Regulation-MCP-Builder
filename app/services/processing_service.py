@@ -176,6 +176,8 @@ class ProcessingService:
             phase_timings_ms[name] = round((time.perf_counter() - phase_started) * 1000, 3)
 
         document = self.documents.get(document_id)
+        if document.regulation_status not in {"draft", "pending_approval"}:
+            raise ValueError("Create a reprocessing draft before processing an approved regulation.")
         job = ProcessingJob(
             job_id=f"job_{uuid.uuid4().hex[:12]}",
             document_id=document_id,
@@ -284,6 +286,14 @@ class ProcessingService:
                 require_outputs=True,
                 processing_claim_id=run_id,
             )
+            if reusable_run is not None and options.enable_agent_review:
+                previous_review = (reusable_run.stats or {}).get("agent_review") or {}
+                if (
+                    str(previous_review.get("status") or "") == "provider_execution_failed"
+                    or int(previous_review.get("failed_batch_count") or 0) > 0
+                    or previous_review.get("unreviewed_chunk_ids")
+                ):
+                    reusable_run = None
             if reusable_run is not None:
                 job.status = "completed"
                 job.progress = 100
@@ -814,6 +824,7 @@ class ProcessingService:
                 job.total_units = safe_total
                 job.unit_label = "AI 검수 묶음"
                 job.message = f"AI 검수 묶음 {safe_completed:,}/{safe_total:,} 완료"
+                self.repository.upsert_job(job)
                 self._notify_progress(job, progress_callback)
 
             agent_review_plan = self.agent_review_executor.execute(
@@ -1180,7 +1191,7 @@ class ProcessingService:
         for run in self.repository.list_runs():
             if run.status != "completed":
                 continue
-            if tenant_key and str(run.tenant_id or "").strip() != tenant_key:
+            if str(run.tenant_id or "").strip() != tenant_key:
                 continue
             agent_review = (run.stats or {}).get("agent_review") or {}
             if str(agent_review.get("cache_scope_hash") or "").strip() != expected_scope:
@@ -1270,6 +1281,10 @@ class ProcessingService:
         return {chunk.chunk_id: _agent_review_findings_of(chunk) for chunk in source_chunks}
 
     def _agent_review_has_provider_result(self, agent_review: dict) -> bool:
+        if str(agent_review.get("status") or "").strip().lower() in {
+            "provider_execution_failed", "provider_execution_blocked", "api_configuration_needed",
+        }:
+            return False
         if int(agent_review.get("api_call_count") or 0) > 0:
             return True
         if str(agent_review.get("provider_request_id") or "").strip():

@@ -119,6 +119,7 @@ DEFAULT_COMMANDS = (
     "reg-rag-mcp-retrieval-quality",
     "reg-rag-qwen-chat",
     "reg-rag-local-llm-doctor",
+    "reg-rag-beginner-first-success",
     "reg-rag-revision-impact",
     "reg-rag-real-parser-fixtures",
 )

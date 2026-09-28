@@ -406,6 +406,14 @@ class ProcessingServiceTests(unittest.TestCase):
             )
             repo.upsert_document(document)
             progress_events: list[tuple[int, str]] = []
+            persisted_review_events: list[tuple[int, str]] = []
+
+            def capture_progress(current_job: ProcessingJob) -> None:
+                progress_events.append((current_job.progress, current_job.message))
+                if current_job.message.startswith("AI 검수 묶음 "):
+                    stored_job = JsonRepository(settings).get_job(current_job.job_id)
+                    self.assertIsNotNone(stored_job)
+                    persisted_review_events.append((stored_job.progress, stored_job.message))
 
             with patch(
                 "app.services.processing_service.get_parser",
@@ -418,9 +426,7 @@ class ProcessingServiceTests(unittest.TestCase):
                 job = service.process(
                     document.document_id,
                     ChunkOptions(enable_agent_review=True),
-                    progress_callback=lambda current_job: progress_events.append(
-                        (current_job.progress, current_job.message)
-                    ),
+                    progress_callback=capture_progress,
                 )
 
         self.assertEqual("completed", job.status)
@@ -430,10 +436,108 @@ class ProcessingServiceTests(unittest.TestCase):
             if message.startswith("AI 검수 묶음 ")
         ]
         self.assertTrue(review_events, progress_events)
+        self.assertEqual(review_events, persisted_review_events)
         self.assertTrue(all(85 <= percent <= 91 for percent, _message in review_events), review_events)
         self.assertTrue(
             any(message.endswith("1/1 완료") for _percent, message in review_events),
             review_events,
+        )
+
+    def test_form_with_colon_lines_still_gets_ai_review_findings(self) -> None:
+        """별지 서식이 섞인 규정도 AI를 연결했으면 검수 의견이 나와야 한다.
+
+        운영자가 신고한 증상이다. 서식의 ``확인자(지도교수)`` 다음 줄에 ``:`` 하나만
+        있는 줄 때문에 유출 차단이 걸려, 조항 6,571개짜리 규정이 제공자를 한 번도
+        못 부르고 ``provider_execution_blocked`` 로 끝났다. 승인 화면은 조항마다
+        의견이 비어 있었다.
+        """
+
+        form_text = (
+            "제1조(목적) 이 규정은 연구비 지급에 필요한 사항을 정한다.\n"
+            "[별지 제7호 서식]\n"
+            "지도교수\n"
+            ":\n"
+            "확인자(연구책임자)\n"
+            ":\n"
+            "(서명/인)\n"
+            "Please approve our request to make a change as follows:\n"
+            "1. 변경 사유"
+        )
+
+        class Parser:
+            def parse(self, path: Path, document_id: str) -> ParsedDocument:
+                return ParsedDocument(
+                    document_id=document_id,
+                    source_file=path.name,
+                    document_name="연구비 지급 규정",
+                    file_type="pdf",
+                    pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(type="table", text=form_text)])],
+                    raw_text=form_text,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                data_dir=Path(tmp),
+                enable_agent_review=True,
+                openai_api_key="configured",
+                agent_review_model="review-model",
+            )
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+            sent_payloads: list[dict] = []
+
+            def _fake_post(url, headers, payload, timeout):
+                sent = json.loads(payload["messages"][1]["content"])
+                sent_payloads.append(sent)
+                items = [
+                    {
+                        "chunk_id": item["chunk_id"],
+                        "risk_level": "high",
+                        "issues": ["별지 서식의 표 경계가 본문과 붙어 있습니다."],
+                        "recommended_human_check": "별지 제7호 서식을 원문과 대조하세요.",
+                    }
+                    for item in sent["items"]
+                ]
+                return {
+                    "id": "req_form",
+                    "choices": [{"message": {"content": json.dumps({"items": items})}}],
+                }
+
+            service.agent_review_executor.http_post = _fake_post
+            document = Document(
+                document_id="doc_form_review",
+                filename="form-regulation.pdf",
+                document_name="연구비 지급 규정",
+                file_type="pdf",
+                file_hash="form-regulation-hash",
+                tenant_id="tenant-a",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+
+            with patch(
+                "app.services.processing_service.get_parser",
+                return_value=Parser(),
+            ), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={"status": "disabled", "table_count": 0, "tables": []},
+            ):
+                job = service.process(document.document_id, ChunkOptions(enable_agent_review=True))
+
+            chunks = repo.get_chunks(document.document_id)
+            completed_run = repo.latest_completed_run(document.document_id)
+
+        self.assertEqual("completed", job.status)
+        agent_review = completed_run.stats["agent_review"]
+        # 차단되지 않고 실제로 제공자를 불러야 한다.
+        self.assertEqual("executed", agent_review["status"])
+        self.assertGreater(int(agent_review["api_call_count"]), 0)
+        self.assertTrue(sent_payloads)
+        # 그리고 그 결과가 조항에 붙어 승인 화면에서 보여야 한다.
+        self.assertGreater(
+            sum(1 for chunk in chunks if (chunk.metadata or {}).get("agent_review_findings")),
+            0,
         )
 
     def test_reuploading_the_same_regulation_keeps_the_ai_review_visible(self) -> None:
@@ -1039,6 +1143,65 @@ class ProcessingServiceTests(unittest.TestCase):
 
             get_parser.assert_called_once()
 
+    def test_process_retries_failed_ai_review_instead_of_reusing_completed_preprocessing(self) -> None:
+        for review in (
+            {"status": "provider_execution_failed", "api_call_count": 1},
+            {"status": "executed", "failed_batch_count": 1,
+             "skip_reason": "provider_partial_batches_failed"},
+        ):
+            with self.subTest(review=review), tempfile.TemporaryDirectory() as tmp:
+                settings = Settings(data_dir=Path(tmp), enable_agent_review=True, openai_api_key="test-only")
+                repo = JsonRepository(settings)
+                options = ChunkOptions(enable_agent_review=True)
+                document = Document(document_id="doc_retry", filename="synthetic.pdf", file_type="pdf",
+                                    file_hash="synthetic", status="completed")
+                repo.upsert_document(document)
+                artifacts = _save_reusable_outputs(settings, repo, document.document_id)
+                repo.upsert_run(ProcessingRun(
+                    run_id="run_failed_review", document_id=document.document_id, job_id="job_old",
+                    status="completed", started_at=datetime.now(timezone.utc), elapsed_seconds=1,
+                    options=processing_options_payload(options, settings=settings), artifacts=artifacts,
+                    stats={"agent_review": review},
+                ))
+                service = ProcessingService(settings=settings, repository=repo)
+                with patch("app.services.processing_service.get_parser", side_effect=RuntimeError("retry started")):
+                    with self.assertRaisesRegex(RuntimeError, "retry started"):
+                        service.process(document.document_id, options)
+
+    def test_ai_review_retry_cannot_replace_approved_document_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp), enable_agent_review=True, openai_api_key="test-only")
+            repo = JsonRepository(settings)
+            document = Document(document_id="doc_approved", filename="synthetic.pdf", file_type="pdf",
+                                file_hash="synthetic", status="completed", regulation_status="approved")
+            repo.upsert_document(document)
+            _save_reusable_outputs(settings, repo, document.document_id)
+            original_chunks = [chunk.model_dump(mode="json") for chunk in repo.get_chunks(document.document_id)]
+            service = ProcessingService(settings=settings, repository=repo)
+            with patch("app.services.processing_service.get_parser") as get_parser:
+                with self.assertRaisesRegex(ValueError, "reprocessing draft"):
+                    service.process(document.document_id, ChunkOptions(enable_agent_review=True))
+            get_parser.assert_not_called()
+            self.assertEqual(original_chunks, [chunk.model_dump(mode="json") for chunk in repo.get_chunks(document.document_id)])
+            self.assertEqual("approved", repo.get_document(document.document_id).regulation_status)
+            self.assertEqual([], repo.list_runs(document.document_id))
+
+    def test_failed_ai_review_is_not_reused_as_a_clean_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repo = JsonRepository(settings)
+            service = ProcessingService(settings=settings, repository=repo)
+            scope = service.agent_review_policy.cache_scope_hash()
+            repo.upsert_run(ProcessingRun(
+                run_id="run_failed_review", document_id="doc_failed", job_id="job_failed", tenant_id="tenant-a",
+                status="completed", started_at=datetime.now(timezone.utc), elapsed_seconds=1,
+                stats={"agent_review": {"status": "provider_execution_failed", "api_call_count": 1,
+                                        "cache_scope_hash": scope,
+                                        "selected_candidates": [{"chunk_id": "chunk_failed", "content_hash": "sha256:failed"}]}},
+            ))
+            self.assertEqual({}, service._agent_review_cache_index("tenant-a", cache_scope_hash=scope))
+            self.assertEqual({}, service._agent_review_cache_index(None, cache_scope_hash=scope))
+
     def test_process_does_not_reuse_completed_run_when_agent_review_api_becomes_ready(self) -> None:
         class ParserExpected:
             def parse(self, *args, **kwargs):
@@ -1220,6 +1383,7 @@ class ProcessingServiceTests(unittest.TestCase):
                 service._agent_review_cache_index("tenant-a", cache_scope_hash=cache_scope_hash),
                 {executed_hash: ("doc_run_executed", "chunk_executed")},
             )
+            self.assertEqual({}, service._agent_review_cache_index(None, cache_scope_hash=cache_scope_hash))
 
     def _chunk_with_findings(self, chunk_id: str, text: str, findings: dict | None):
         return Chunk(

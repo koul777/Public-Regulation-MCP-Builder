@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import os
+import io
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from app.core.config import Settings
 from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
 from app.core.security_primitives import AuthContext
+from app.services.readiness_adapter import OperatorReadinessState
 from frontend.qwen_chat_app import (
     build_chat_request,
     completed_documents_for_profile,
@@ -20,6 +21,8 @@ from frontend.qwen_chat_app import (
     qwen_runtime_configuration_issue,
     safe_citation_rows,
     start_rag_chat_worker,
+    _qwen_probe_readiness,
+    _qwen_tour_step,
 )
 from scripts import run_qwen_chat
 
@@ -27,7 +30,124 @@ from scripts import run_qwen_chat
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _synthetic_visible_progress() -> None:
+    from unittest.mock import patch
+    from app.core.security_primitives import AuthContext
+    from frontend import qwen_chat_app as chat
+
+    request = chat.build_chat_request(question="공개 합성 질문", messages=[], document_id="doc", profile_id="demo")
+    auth = AuthContext(actor="synthetic", tenant_id="demo", auth_mode="test")
+    with patch.object(chat, "rag_chat", return_value={"answer": "합성 답변", "citations": []}):
+        result = chat.run_rag_chat_with_visible_progress(request, auth)
+    chat._render_assistant_message({"content": result["answer"], "citations": result["citations"]})
+
+
 class QwenChatSecurityAndGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import sys
+
+        self.addCleanup(sys.modules.__setitem__, "__main__", sys.modules["__main__"])
+
+    def test_malformed_or_blank_citations_never_become_evidence(self) -> None:
+        for value in ([], {}, 42, True, "   ", "\n\t"):
+            with self.subTest(value=value):
+                citations = [{"article_no": value, "support_quote": value, "source_page_start": 3}]
+                self.assertEqual([], safe_citation_rows(citations))
+                step = _qwen_tour_step(True, [{"role": "assistant", "citations": citations}])
+                self.assertIn("근거 인용이 없는", step[1])
+        self.assertEqual(
+            [{"조문": "제1조", "근거 인용문": "공개 합성 근거"}],
+            safe_citation_rows([{"article_no": "  제1조 ", "support_quote": "공개\n합성 근거", "source_page_start": {"private": "value"}}]),
+        )
+
+    def test_citationless_worker_completion_does_not_claim_evidence_review(self) -> None:
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_synthetic_visible_progress).run()
+        self.assertFalse(app.exception)
+        self.assertEqual(1, len(app.status))
+        self.assertEqual("답변 생성 완료 · 근거 인용을 아래에서 확인하세요", app.status[0].label)
+        self.assertTrue(any("규정 근거로 사용하지 마세요" in item.value for item in app.warning))
+
+    def test_guided_chat_requires_selection_and_probe_then_accepts_two_questions(self) -> None:
+        import sys
+        from streamlit.testing.v1 import AppTest
+
+        # AppTest replaces __main__; restore it before later multiprocessing tests.
+        self.addCleanup(sys.modules.__setitem__, "__main__", sys.modules["__main__"])
+        app = AppTest.from_function(_synthetic_guided_chat, default_timeout=20).run()
+        self.assertFalse(app.exception)
+        self.assertIsNone(app.selectbox(key="qwen-profile").value)
+        self.assertEqual(0, len(app.chat_input))
+        app.selectbox(key="qwen-profile").select("demo").run()
+        self.assertFalse(app.exception)
+        self.assertIsNone(app.selectbox(key="qwen-document-demo").value)
+        app.selectbox(key="qwen-document-demo").select("doc").run()
+        self.assertTrue(app.chat_input[0].disabled)
+        app.button(key="qwen-probe").click().run()
+        self.assertFalse(app.chat_input[0].disabled)
+        for question in ("휴가는 며칠인가요?", "신청은 어떻게 하나요?"):
+            app.chat_input[0].set_value(question).run()
+            self.assertFalse(app.exception)
+        markup = "\n".join(str(item.value) for item in app.markdown)
+        self.assertIn("답변 아래 근거 인용을 확인하세요", markup)
+        self.assertIn("qwen-answer-3", markup)
+
+    def test_click_guide_requires_live_probe_and_grounded_answer(self) -> None:
+        answered = [{"role": "assistant", "citations": [{"article_no": "제1조"}]}]
+        self.assertEqual(3, _qwen_tour_step(False, answered)[0])
+        self.assertEqual(4, _qwen_tour_step(True, [])[0])
+        self.assertEqual(4, _qwen_tour_step(True, [{"role": "assistant", "error": True}])[0])
+        uncited = _qwen_tour_step(True, [{"role": "assistant", "citations": []}])
+        self.assertEqual(5, uncited[0])
+        self.assertIn("근거 인용이 없는", uncited[1])
+        self.assertEqual("div.st-key-qwen-answer-0", uncited[3])
+        malformed = _qwen_tour_step(True, [{"role": "assistant", "citations": [{"chunk_id": "private"}]}])
+        self.assertIn("근거 인용이 없는", malformed[1])
+        page_only = _qwen_tour_step(True, [{"role": "assistant", "citations": [{"source_page_start": 3}]}])
+        self.assertIn("근거 인용이 없는", page_only[1])
+        self.assertEqual(5, _qwen_tour_step(True, answered)[0])
+        self.assertEqual("div.st-key-qwen-answer-0", _qwen_tour_step(True, answered)[3])
+        self.assertEqual([{"role": "assistant", "citations": [{"article_no": "제1조"}]}], answered)
+
+    def test_citation_free_answer_warns_without_exposing_unusable_citation(self) -> None:
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(
+            _synthetic_answer_render,
+            args=([{"chunk_id": "private"}, {"source_page_start": 3}],),
+        ).run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any("규정 근거로 사용하지 마세요" in item.value for item in app.warning))
+        self.assertEqual(0, len(app.expander))
+
+    def test_blocked_states_show_next_action_and_never_open_chat(self) -> None:
+        import sys
+        from streamlit.testing.v1 import AppTest
+
+        self.addCleanup(sys.modules.__setitem__, "__main__", sys.modules["__main__"])
+        for scenario, expected in (
+            ("missing_profile", "기관을 등록"),
+            ("no_profiles", "현재 기관을 등록"),
+            ("no_documents", "전처리를 완료"),
+            ("not_ready", "직접 승인 또는 반려"),
+        ):
+            with self.subTest(scenario=scenario):
+                app = AppTest.from_function(
+                    _synthetic_blocked_chat, args=(scenario,), default_timeout=20,
+                ).run()
+                if scenario in {"no_documents", "not_ready"}:
+                    app.selectbox(key="qwen-profile").select("demo").run()
+                self.assertFalse(app.exception)
+                self.assertEqual(0, len(app.chat_input))
+                self.assertTrue(any(expected in str(item.value) for item in app.info))
+                markup = "\n".join(str(item.value) for item in app.markdown)
+                self.assertIn("st-key-qwen-recovery", markup)
+                self.assertFalse(app.button(key="qwen-recovery-recheck").disabled)
+                app.button(key="qwen-recovery-recheck").click().run()
+                self.assertFalse(app.exception)
+                self.assertEqual(0, len(app.chat_input))
+
     def test_protected_and_shared_modes_fail_closed(self) -> None:
         self.assertIsNotNone(
             protected_or_shared_mode_reason(
@@ -77,6 +197,37 @@ class QwenChatSecurityAndGateTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_qwen_probe_readiness_uses_common_beginner_state_contract(self) -> None:
+        ready = _qwen_probe_readiness(
+            {"signature": "current", "available": True},
+            signature="current",
+        )
+        unavailable = _qwen_probe_readiness(
+            {"signature": "current", "available": False},
+            signature="current",
+        )
+        stale = _qwen_probe_readiness(
+            {"signature": "old", "available": True},
+            signature="current",
+        )
+
+        self.assertEqual(OperatorReadinessState.READY, ready.state)
+        self.assertEqual(OperatorReadinessState.ACTION_REQUIRED, unavailable.state)
+        self.assertEqual(OperatorReadinessState.UNKNOWN, stale.state)
+
+    def test_safe_diagnostic_card_keeps_recovery_reason_and_invalidates_on_settings_change(self) -> None:
+        from app.services.local_llm_readiness_service import check_local_llm_readiness
+
+        card = check_local_llm_readiness(
+            Settings(rag_llm_backend="ollama"), probe_runner=lambda _: {"available": "invalid"},
+        )
+        state = {"signature": "current", "card": card, "available": False}
+        current = _qwen_probe_readiness(state, signature="current")
+        changed = _qwen_probe_readiness(state, signature="changed")
+        self.assertEqual("local_probe_invalid", current.reason_code)
+        self.assertIn("해석하지 못했습니다", current.next_action)
+        self.assertEqual(OperatorReadinessState.UNKNOWN, changed.state)
 
     def test_registry_path_prefers_configuration_and_falls_back_to_data_dir(self) -> None:
         self.assertEqual(
@@ -279,6 +430,34 @@ class QwenChatSecurityAndGateTests(unittest.TestCase):
 
 
 class QwenChatLauncherTests(unittest.TestCase):
+    def test_english_windows_output_keeps_korean_launch_and_error_messages(self) -> None:
+        for protected in (False, True):
+            with self.subTest(protected=protected):
+                stdout_bytes, stderr_bytes = io.BytesIO(), io.BytesIO()
+                stdout = io.TextIOWrapper(stdout_bytes, encoding="cp1252")
+                stderr = io.TextIOWrapper(stderr_bytes, encoding="cp1252")
+                environment = {"APP_ENV": "production" if protected else "local"}
+                try:
+                    with patch.object(run_qwen_chat.sys, "stdout", stdout), patch.object(
+                        run_qwen_chat.sys, "stderr", stderr
+                    ), patch.object(run_qwen_chat, "launch_environment", return_value=environment), patch.object(
+                        run_qwen_chat, "resolve_launch_port", return_value=9876
+                    ), patch.object(run_qwen_chat.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+                        result = run_qwen_chat.main(["--port", "9876", "--headless"])
+                    stdout.flush()
+                    stderr.flush()
+                    if protected:
+                        self.assertEqual(2, result)
+                        self.assertIn("[실행 중단]", stderr_bytes.getvalue().decode("utf-8"))
+                        run.assert_not_called()
+                    else:
+                        self.assertEqual(0, result)
+                        self.assertIn("로컬 Qwen 규정 챗봇", stdout_bytes.getvalue().decode("utf-8"))
+                        run.assert_called_once()
+                finally:
+                    stdout.close()
+                    stderr.close()
+
     def test_loopback_validation_rejects_public_bind_addresses(self) -> None:
         self.assertEqual("127.0.0.1", run_qwen_chat.validate_loopback_host("127.0.0.1"))
         self.assertEqual("::1", run_qwen_chat.validate_loopback_host("::1"))
@@ -361,6 +540,69 @@ class QwenChatLauncherTests(unittest.TestCase):
         self.assertIn("-m scripts.run_qwen_chat", batch_source)
         self.assertIn("sys.version_info >= (3, 11)", batch_source)
         self.assertNotIn("sys.version_info ^>=", batch_source)
+
+
+def _synthetic_guided_chat() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from app.core.config import Settings
+    from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
+    from app.services.readiness_adapter import adapt_local_llm_probe
+    from frontend import qwen_chat_app as chat
+
+    settings = Settings(app_env="test", api_auth_required=False, tenant_storage_isolation=False,
+                        api_default_tenant_id="default", rag_llm_backend="ollama", rag_llm_model="qwen3:8b",
+                        rag_llm_endpoint="http://127.0.0.1:11434")
+    registry = InstitutionProfileRegistry(profiles={"demo": InstitutionProfile(
+        profile_id="demo", display_name="공개 합성 기관", institution_name="공개 합성 기관", tenant_id="default")})
+    document = SimpleNamespace(document_id="doc", title="합성 규정", original_filename="sample.docx",
+                               status="completed", tenant_id="default", profile_id="demo", processed_at="2026-01-01")
+    ready = chat.DocumentReadiness(document, 1, 1, 0, 0, {"ready": True, "indexing_status": "indexed"}, {})
+    response = {"answer": "합성 답변입니다.", "citations": [{"regulation_title": "합성 규정", "article_no": "제1조"}]}
+    with patch.object(chat, "get_settings", return_value=settings), \
+         patch.object(chat, "load_local_institution_registry", return_value=registry), \
+         patch.object(chat, "JsonRepository", return_value=SimpleNamespace(list_documents=lambda: [document])), \
+         patch.object(chat, "document_readiness", return_value=ready), \
+         patch.object(chat, "check_local_llm_readiness", return_value=adapt_local_llm_probe({"available": True}, component="Qwen3 8B")), \
+         patch.object(chat, "run_rag_chat_with_visible_progress", return_value=response):
+        chat.main()
+
+
+def _synthetic_answer_render(citations: list[dict[str, str]]) -> None:
+    from frontend.qwen_chat_app import _render_assistant_message
+
+    _render_assistant_message({"role": "assistant", "content": "합성 답변", "citations": citations})
+
+
+def _synthetic_blocked_chat(scenario: str) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from app.core.config import Settings
+    from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
+    from frontend import qwen_chat_app as chat
+
+    settings = Settings(app_env="test", api_auth_required=False, tenant_storage_isolation=False,
+                        api_default_tenant_id="default", rag_llm_backend="ollama", rag_llm_model="qwen3:8b",
+                        rag_llm_endpoint="http://127.0.0.1:11434")
+    profile = InstitutionProfile(
+        profile_id="demo", display_name="공개 합성 기관", institution_name="공개 합성 기관",
+        tenant_id="default",
+    )
+    registry = InstitutionProfileRegistry(profiles={} if scenario == "no_profiles" else {"demo": profile})
+    document = SimpleNamespace(document_id="doc", status="completed", tenant_id="default", profile_id="demo")
+    readiness = chat.DocumentReadiness(
+        document, 1, 0, 0, 1, {"ready": False, "reason": "pending_review"}, None,
+    )
+    registry_result = FileNotFoundError() if scenario == "missing_profile" else registry
+    documents = [] if scenario == "no_documents" else [document]
+    with patch.object(chat, "get_settings", return_value=settings), \
+         patch.object(chat, "qwen_runtime_configuration_issue", return_value=None), \
+         patch.object(chat, "load_local_institution_registry", side_effect=registry_result if isinstance(registry_result, Exception) else None, return_value=registry), \
+         patch.object(chat, "JsonRepository", return_value=SimpleNamespace(list_documents=lambda: documents)), \
+         patch.object(chat, "document_readiness", return_value=readiness), \
+         patch.object(chat, "rag_chat") as rag_chat:
+        chat.main()
+        rag_chat.assert_not_called()
 
 
 class _Repository:

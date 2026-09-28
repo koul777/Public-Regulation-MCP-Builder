@@ -23,6 +23,7 @@ from app.schemas.authoring import (
     AuthoringProjectSummary,
     AuthoringProjectUpdateRequest,
     AuthoringTransitionRequest,
+    AuthoringTemplate,
     BeginnerChecklistItem,
     ClauseDraft,
     FrozenAuthoringArtifact,
@@ -107,6 +108,10 @@ class AuthoringService:
         self.repository = repository or AuthoringRepository(self.settings)
         self.lint_service = lint_service or AuthoringLintService()
         self.template_service = template_service or AuthoringTemplateService()
+
+    def list_templates(self) -> list[AuthoringTemplate]:
+        """Use the same template provider for selection and draft creation."""
+        return self.template_service.list_templates()
 
     def create_project(
         self,

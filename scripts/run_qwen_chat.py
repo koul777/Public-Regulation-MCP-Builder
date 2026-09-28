@@ -157,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # English Windows pipes can default to cp1252, which cannot print Korean.
+    # StringIO/captured streams already accept Unicode and need no reconfiguration.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
     try:
         host = validate_loopback_host(args.host)

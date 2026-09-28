@@ -15,7 +15,8 @@ PUBLIC_ASSET_PREFIX = (
     "Public-Regulation-MCP-Builder/main/docs/assets/"
 )
 README_PUBLIC_ASSET_RE = re.compile(
-    re.escape(PUBLIC_ASSET_PREFIX) + r"([A-Za-z0-9._-]+)"
+    re.escape(PUBLIC_ASSET_PREFIX.removesuffix("main/docs/assets/"))
+    + r"(?:main|[0-9a-f]{40})/docs/assets/([A-Za-z0-9._-]+)"
 )
 
 
@@ -73,7 +74,7 @@ class AuthoringSdistLinkTests(unittest.TestCase):
 
     def test_readme_media_uses_public_absolute_urls_without_bloating_sdist(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertNotIn("docs/assets/", readme.replace(PUBLIC_ASSET_PREFIX, ""))
+        self.assertNotIn("docs/assets/", README_PUBLIC_ASSET_RE.sub("", readme))
         linked_assets = sorted(set(README_PUBLIC_ASSET_RE.findall(readme)))
         self.assertTrue(linked_assets)
         missing = [

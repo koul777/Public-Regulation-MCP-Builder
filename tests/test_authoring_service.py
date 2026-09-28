@@ -34,6 +34,31 @@ from app.storage.authoring_repository import AuthoringRepositoryIntegrityError
 
 
 class AuthoringServiceTests(unittest.TestCase):
+    def test_template_selection_and_creation_share_the_injected_provider(self) -> None:
+        from app.services.authoring_template_service import AuthoringTemplateService
+
+        class CustomTemplates(AuthoringTemplateService):
+            def list_templates(self):
+                templates = super().list_templates()[:1]
+                templates[0].name_ko = "합성 운영자 템플릿"
+                return templates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = CustomTemplates()
+            service = AuthoringService(Settings(data_dir=Path(tmp)), template_service=provider)
+            templates = service.list_templates()
+            self.assertEqual(1, len(templates))
+            self.assertEqual("합성 운영자 템플릿", templates[0].name_ko)
+            project = service.create_project(
+                AuthoringProjectCreateRequest(title="합성 규정", profile_id="synthetic", template_id=templates[0].template_id),
+                tenant_id="tenant-a", actor="author-a",
+            )
+            report = service.lint_project(project.project_id, tenant_id="tenant-a", profile_id="synthetic")
+            self.assertEqual(templates[0].template_id, project.template_id)
+            self.assertEqual(project.revision, report.revision)
+            self.assertEqual(AuthoringProjectStatus.PLANNING, project.status)
+            self.assertFalse((Path(tmp) / "vector_store").exists())
+
     def test_freeze_staging_failure_does_not_publish_state_or_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = _service(tmp, api_auth_required=True)

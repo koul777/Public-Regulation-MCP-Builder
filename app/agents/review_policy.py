@@ -8,6 +8,7 @@ from app.agents.review_context import review_context_for_metadata
 from app.agents.provider_config import (
     agent_review_configuration_reason,
     agent_review_provider_ready,
+    normalize_agent_review_provider,
 )
 from app.core.config import Settings
 from app.schemas.chunk import Chunk, ChunkOptions
@@ -16,7 +17,7 @@ from app.schemas.quality import QualityReport
 
 MILLION = Decimal("1000000")
 AGENT_REVIEW_CONTENT_HASH_VERSION = "agent-review-content-v2"
-AGENT_REVIEW_POLICY_VERSION = "main-parser-ai-review-v1"
+AGENT_REVIEW_POLICY_VERSION = "main-parser-ai-review-v2"
 HWPX_COMPLEX_STRUCTURE_METADATA_KEYS = (
     "source_hwpx_nested_table_count",
     "source_hwpx_table_image_count",
@@ -190,13 +191,19 @@ class AgentReviewPolicy:
         }
 
     def cache_scope_hash(self) -> str:
+        provider = normalize_agent_review_provider(self.settings.llm_provider)
+        endpoint = {
+            "azure-openai": self.settings.azure_openai_endpoint,
+            "anthropic": self.settings.anthropic_api_base_url,
+        }.get(provider, self.settings.agent_review_api_base_url)
         payload = {
             "policy_version": AGENT_REVIEW_POLICY_VERSION,
             "content_hash_version": AGENT_REVIEW_CONTENT_HASH_VERSION,
-            "provider": self.settings.llm_provider,
+            "provider": provider,
             "model": self.settings.agent_review_model,
-            "trigger_score_below": self.settings.agent_review_trigger_score_below,
-            "max_output_tokens_per_chunk": self.settings.agent_review_max_output_tokens_per_chunk,
+            "endpoint": str(endpoint or "").strip().rstrip("/"),
+            "all_chunks": self.settings.agent_review_all_chunks,
+            "limits": self._limits(),
         }
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

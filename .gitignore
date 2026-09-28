@@ -63,3 +63,7 @@ vercel-mcp-stage-*/
 
 .claude/worktrees/
 .claude/launch.json
+
+debug.log
+poc-*.png
+demo-video-skill/

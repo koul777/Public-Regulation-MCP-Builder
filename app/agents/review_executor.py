@@ -102,7 +102,7 @@ class AgentReviewExecutor:
             )
             return result
         for payload in payloads:
-            payload_leak_reason = _payload_local_path_leak_reason(payload["request"])
+            payload_leak_reason = _payload_local_path_leak_reason(payload["leak_scan"])
             if payload_leak_reason:
                 result.update(
                     {
@@ -120,6 +120,7 @@ class AgentReviewExecutor:
         failures: list[dict[str, Any]] = []
         api_call_count = 0
         succeeded_batches = 0
+        reviewed_chunk_ids: list[str] = []
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
@@ -155,15 +156,16 @@ class AgentReviewExecutor:
                 )
                 continue
             succeeded_batches += 1
+            reviewed_chunk_ids.extend(payload["chunk_ids"])
             response_texts.append(str(outcome["response_text"]))
             batch_items = outcome["review_json"].get("items")
             if isinstance(batch_items, list):
                 review_items.extend(item for item in batch_items if isinstance(item, dict))
         elapsed_seconds = round(time.perf_counter() - started, 3)
 
-        reviewed_chunk_ids = {
-            str(item.get("chunk_id") or "") for item in review_items if str(item.get("chunk_id") or "").strip()
-        }
+        # A valid empty findings list still covers every input in that batch.
+        # Count coverage from successful requests, never from finding count.
+        reviewed_chunk_ids = list(dict.fromkeys(reviewed_chunk_ids))
         failed_chunk_ids = [
             chunk_id
             for failure in failures
@@ -189,6 +191,7 @@ class AgentReviewExecutor:
                 "failed_batch_count": len(failures),
                 "failed_batches": failures,
                 "unreviewed_chunk_ids": failed_chunk_ids,
+                "reviewed_chunk_ids": reviewed_chunk_ids,
                 "reviewed_chunk_count": len(reviewed_chunk_ids),
                 "provider_request_id": provider_request_id,
                 "provider_request_ids": request_ids,
@@ -262,12 +265,17 @@ class AgentReviewExecutor:
         if max_parallel == 1 or total == 1:
             outcomes = []
             for payload in payloads:
-                outcomes.append(self._request_batch_with_retries(payload["request"], provider=provider))
+                outcomes.append(self._request_batch_with_retries(
+                    payload["request"], provider=provider, expected_chunk_ids=payload["chunk_ids"]
+                ))
                 report_completed()
             return outcomes
         with ThreadPoolExecutor(max_workers=min(max_parallel, total)) as pool:
             futures = [
-                pool.submit(self._request_batch_with_retries, payload["request"], provider=provider)
+                pool.submit(
+                    self._request_batch_with_retries, payload["request"],
+                    provider=provider, expected_chunk_ids=payload["chunk_ids"],
+                )
                 for payload in payloads
             ]
             # 완료 순서로 세고, 결과는 보낸 순서로 돌려준다.
@@ -275,7 +283,9 @@ class AgentReviewExecutor:
                 report_completed()
             return [future.result() for future in futures]
 
-    def _request_batch_with_retries(self, payload: dict[str, Any], *, provider: str) -> dict[str, Any]:
+    def _request_batch_with_retries(
+        self, payload: dict[str, Any], *, provider: str, expected_chunk_ids: list[str]
+    ) -> dict[str, Any]:
         """한 묶음을 성공할 때까지 정해진 횟수만큼 다시 부른다.
 
         네트워크 지연이나 일시적인 제공자 오류로 검수가 통째로 없어지면 안 된다.
@@ -319,6 +329,7 @@ class AgentReviewExecutor:
             try:
                 response_text = _extract_provider_text(response, provider=provider)
                 review_json = _parse_json_object(response_text)
+                _validate_review_items(review_json, expected_chunk_ids=set(expected_chunk_ids))
             except ValueError as exc:
                 last_error = str(exc)
                 last_reason = str(exc) or "provider_response_invalid_json"
@@ -382,7 +393,7 @@ class AgentReviewExecutor:
         candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """한 묶음의 요청 본문과, 그 묶음이 무엇을 담고 있는지를 함께 돌려준다."""
-        openai_payload, chunk_ids = self._chat_payload(plan, chunks, candidates=candidates)
+        openai_payload, chunk_ids, user_payload = self._chat_payload(plan, chunks, candidates=candidates)
         if provider == "anthropic":
             request: dict[str, Any] = {
                 "model": openai_payload["model"],
@@ -393,7 +404,12 @@ class AgentReviewExecutor:
             }
         else:
             request = openai_payload
-        return {"request": request, "chunk_ids": chunk_ids, "_item_count": len(chunk_ids)}
+        return {
+            "request": request,
+            "chunk_ids": chunk_ids,
+            "_item_count": len(chunk_ids),
+            "leak_scan": _leak_scan_view(request, user_payload),
+        }
 
     def _chat_payload(
         self,
@@ -401,7 +417,7 @@ class AgentReviewExecutor:
         chunks: list[Chunk],
         *,
         candidates: list[dict[str, Any]] | None = None,
-    ) -> tuple[dict[str, Any], list[str]]:
+    ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
         chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
         items: list[dict[str, Any]] = []
         selected = plan.get("selected_candidates") or [] if candidates is None else candidates
@@ -463,6 +479,7 @@ class AgentReviewExecutor:
                 ],
             },
             [str(item["chunk_id"]) for item in items],
+            user_payload,
         )
 
     def _append_execution_audit(
@@ -523,6 +540,30 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
     return parsed
 
 
+def _leak_scan_view(request: dict[str, Any], user_payload: dict[str, Any]) -> dict[str, Any]:
+    """유출 검사용 보기. 직렬화한 사용자 메시지를 직렬화 이전 값으로 되돌린다.
+
+    검사를 ``json.dumps`` 결과 문자열에 걸면 안 된다. 직렬화하면 줄바꿈이 역슬래시와
+    n 두 글자로 바뀌어, ``확인자(지도교수)`` 다음 줄에 ``:`` 하나만 있는 평범한 별지
+    서식이 ``n:\\`` 이 되고 윈도우 경로로 오인된다. 실제로 조항 6,571개짜리 규정이
+    서식 네 장 때문에 제공자를 한 번도 못 부르고 통째로 막혔다.
+
+    원문 값에 걸면 진짜 경로만 잡히고, 걸렸을 때 남는 자리 표시도
+    ``...content.items[3].text`` 처럼 어느 조항인지 가리킨다.
+    """
+    view = dict(request)
+    messages = view.get("messages")
+    if not isinstance(messages, list):
+        return view
+    restored: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and str(message.get("role") or "") == "user":
+            message = {**message, "content": user_payload}
+        restored.append(message)
+    view["messages"] = restored
+    return view
+
+
 def _payload_local_path_leak_reason(value: Any) -> str:
     stack: list[tuple[str, Any]] = [("payload", value)]
     while stack:
@@ -541,6 +582,8 @@ def _payload_local_path_leak_reason(value: Any) -> str:
 
 def _extract_provider_text(response: dict[str, Any], *, provider: str) -> str:
     if provider == "anthropic":
+        if response.get("stop_reason") == "max_tokens":
+            raise ValueError("provider_response_truncated")
         content = response.get("content")
         if isinstance(content, list):
             return "".join(
@@ -552,6 +595,8 @@ def _extract_provider_text(response: dict[str, Any], *, provider: str) -> str:
     choices = response.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0] if isinstance(choices[0], dict) else {}
+        if first.get("finish_reason") == "length":
+            raise ValueError("provider_response_truncated")
         message = first.get("message") if isinstance(first.get("message"), dict) else {}
         content = message.get("content")
         if isinstance(content, str):
@@ -571,6 +616,12 @@ def _append_api_path(base_url: str, path: str) -> str:
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
+    text = text.strip()
+    # Accept a single JSON code fence, but never extract a convenient object
+    # from arbitrary prose or a truncated response.
+    fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
     if not text.strip():
         raise ValueError("provider_response_missing_content")
     try:
@@ -580,6 +631,30 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("provider_response_not_json_object")
     return parsed
+
+
+def _validate_review_items(review: dict[str, Any], *, expected_chunk_ids: set[str]) -> None:
+    items = review.get("items")
+    if not isinstance(items, list):
+        raise ValueError("provider_response_invalid_review_schema")
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("provider_response_invalid_review_schema")
+        chunk_id = item.get("chunk_id")
+        if not isinstance(chunk_id, str) or chunk_id not in expected_chunk_ids:
+            raise ValueError("provider_response_unknown_chunk")
+        if chunk_id in seen:
+            raise ValueError("provider_response_duplicate_chunk")
+        seen.add(chunk_id)
+        issues = item.get("issues")
+        if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
+            raise ValueError("provider_response_invalid_review_schema")
+        if not isinstance(item.get("recommended_human_check", ""), str):
+            raise ValueError("provider_response_invalid_review_schema")
+        risk_level = item.get("risk_level", "medium")
+        if not isinstance(risk_level, str) or risk_level not in {"low", "medium", "high"}:
+            raise ValueError("provider_response_invalid_review_schema")
 
 
 def _safe_int(value: Any) -> int:

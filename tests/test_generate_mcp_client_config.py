@@ -5357,6 +5357,21 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
         self.assertIn("requires Kordoc table parsing", str(raised.exception))
         self.assertIn("rerun preprocessing", str(raised.exception))
 
+    def test_kordoc_remediation_hint_matches_pinned_installer_version(self) -> None:
+        """The bundle blocker must not point operators at a version the installer no longer ships."""
+
+        repo_root = Path(__file__).resolve().parents[1]
+        installer = (repo_root / "packaging" / "INSTALL_KORDOC_KO.ps1").read_text(encoding="utf-8")
+        generator = (repo_root / "scripts" / "generate_mcp_client_config.py").read_text(encoding="utf-8")
+
+        pinned = re.search(r'\$KordocPackage = "kordoc@([0-9]+\.[0-9]+\.[0-9]+)"', installer)
+        self.assertIsNotNone(pinned)
+        hinted = re.findall(r"npm install -g kordoc@([0-9]+\.[0-9]+\.[0-9]+)", generator)
+
+        self.assertTrue(hinted)
+        self.assertEqual({pinned.group(1)}, set(hinted))
+        self.assertEqual("4.16.0", pinned.group(1))
+
     def test_runtime_bundle_exports_only_selected_document_set(self) -> None:
         records = [
             _runtime_export_record(

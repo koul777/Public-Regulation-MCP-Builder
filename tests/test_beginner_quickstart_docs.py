@@ -11,7 +11,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class BeginnerQuickstartDocsTests(unittest.TestCase):
     def test_readme_puts_product_first_and_keeps_update_history_ordered(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        today_heading = "# 최근 업데이트: 2026년 8월 31일"
+        today_match = re.search(r"^# 최근 업데이트: \d{4}년 \d{1,2}월 \d{1,2}일$", readme, re.MULTILINE)
+        self.assertIsNotNone(today_match)
+        today_heading = today_match.group(0) if today_match else ""
         # 첫 화면에는 제품 설명과 데모를 두고, 긴 변경 이력은 문서 뒤에서 최신순으로
         # 펼쳐 보게 한다. 새 절을 추가해도 과거 이력의 순서는 유지해야 한다.
         prior_headings = (
@@ -23,7 +25,9 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         product_heading = "# PR MCP Builder v1.2.21"
         history_anchor = '<a id="update-history"></a>'
 
-        self.assertTrue(readme.startswith(product_heading))
+        self.assertTrue(readme.startswith('<p align="center">'))
+        self.assertLess(readme.index("docs/assets/pr-mcp-builder-brand-trailer.gif"), readme.index(product_heading))
+        self.assertLess(readme.index("## 초보자 클릭 안내 시연"), readme.index("## 로컬 Qwen 질문 시연"))
         self.assertLess(readme.index(product_heading), readme.index(today_heading))
         self.assertIn('[업데이트 내역 보기](#update-history)', readme)
         self.assertGreater(readme.index(history_anchor), readme.index("## Kordoc 사용 고지"))
@@ -101,7 +105,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "초보자 안내 시작",
             "일반 모드로 계속",
             "초보자 안내 모드",
-            "빨간 테두리",
+            "초록색 테두리",
             "화살표",
             "안내 건너뛰기",
             "처음부터 다시 보기",
@@ -128,6 +132,18 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, readme[beginner_start:connection_details])
+
+    def test_beginner_entrypoint_explains_environment_and_preprocessing_blockers(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        beginner_doc = (REPO_ROOT / "docs" / "beginner_first_success_ko.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("현재 실행판은 일반 모드로 시작하므로", readme)
+        self.assertIn("개발자용 실행과 검증", readme)
+        self.assertIn("Kordoc 사용 가능", readme)
+        self.assertIn("py -3.11 -m venv .venv", beginner_doc)
+        self.assertIn("pip install -e .", beginner_doc)
 
     def test_operator_quickstart_matches_safe_beginner_guide(self) -> None:
         quickstart = (REPO_ROOT / "docs" / "operator_quickstart_ko.md").read_text(

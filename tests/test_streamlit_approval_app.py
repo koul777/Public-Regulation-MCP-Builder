@@ -648,7 +648,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             self.assertFalse(approve.disabled)
             self.assertNotIn(
                 "approval:doc_streamlit_approval:chunk-streamlit:human_confirmed",
-                app.session_state.filtered_state,
+                app.session_state,
             )
             _confirm_rendered_approval_rows(app)
             approve = next(button for button in app.button if button.label == "\uc774 \uaddc\uc815 \ucd5c\uc885 \ud655\uc815 \u00b7 \uc2b9\uc778\ud558\uace0 \uc0c9\uc778")
@@ -879,7 +879,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             )
             self.assertNotIn(
                 "approval:doc_streamlit_many:chunk-many-26:human_confirmed",
-                app.session_state.filtered_state,
+                app.session_state,
             )
             first_page_confirmations = [
                 checkbox
@@ -967,7 +967,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             next(button for button in app.button if button.label == "④ Qwen 규정 챗봇·AI 연결로 이동").click().run()
 
         self.assertEqual("④ Qwen 규정 챗봇·AI 연결", app.session_state["nav_page"])
-        self.assertNotIn("workflow_transition_state", app.session_state.filtered_state)
+        self.assertNotIn("workflow_transition_state", app.session_state)
         self.assertFalse(app.exception)
 
     def test_beginner_results_checkboxes_do_not_block_approval_navigation(self) -> None:
@@ -1441,11 +1441,11 @@ class StreamlitApprovalAppTests(unittest.TestCase):
 
             self.assertNotIn(
                 "approval:doc_streamlit_approval:chunk-streamlit:ai_decisions",
-                app.session_state.filtered_state,
+                app.session_state,
             )
             self.assertNotIn(
                 "approval:doc_streamlit_approval:chunk-streamlit:human_confirmed",
-                app.session_state.filtered_state,
+                app.session_state,
             )
             _confirm_rendered_approval_rows(app)
             decisions = app.session_state[

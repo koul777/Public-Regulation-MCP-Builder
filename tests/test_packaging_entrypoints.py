@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -604,16 +605,69 @@ class PackagingEntrypointTests(unittest.TestCase):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
         self.assertIn("Get-Command npm", installer)
-        self.assertIn('$KordocPackage = "kordoc@4.12.0"', installer)
+        self.assertIn('$KordocPackage = "kordoc@4.16.0"', installer)
         self.assertIn("install -g $KordocPackage", installer)
         self.assertIn("npm prefix -g", installer)
-        self.assertIn("where.exe kordoc", installer)
-        self.assertIn("kordoc --version", installer)
+        self.assertIn('Join-Path $npmGlobal "kordoc.cmd"', installer)
+        self.assertIn("Get-Command kordoc -CommandType Application", installer)
+        self.assertIn("& $kordocShim --version", installer)
+        self.assertIn("$Matches[1] -ne '4.16.0'", installer)
         self.assertIn("재처리 -> 사람 승인 -> 승인하고 색인", installer)
         self.assertIn("recursive-include packaging *.py *.spec *.txt *.ps1", manifest)
         self.assertEqual(
             pyproject["tool"]["setuptools"]["data-files"]["."],
             ["packaging/INSTALL_KORDOC_KO.ps1"],
+        )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows installer contract")
+    def test_kordoc_installer_verifies_pinned_prefix_shim_without_installing(self) -> None:
+        installer = ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1"
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory)
+            (prefix / "npm.cmd").write_text(
+                f'@echo off\r\nif "%~1"=="prefix" if "%~2"=="-g" echo {prefix}\r\n',
+                encoding="ascii",
+            )
+            shim = prefix / "kordoc.cmd"
+            env = {**os.environ, "PATH": f"{prefix}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+            def verify() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                     "-File", str(installer), "-SkipInstall"],
+                    env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=15, creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+
+            shim.write_text('@echo off\r\necho 4.16.0\r\n', encoding="ascii")
+            first = verify()
+            self.assertEqual(0, first.returncode, first.stderr)
+            self.assertIn("Kordoc 준비 완료", first.stdout)
+            shim.write_text('@echo off\r\necho 4.15.0\r\n', encoding="ascii")
+            self.assertEqual(11, verify().returncode)
+            shim.unlink()
+            self.assertEqual(10, verify().returncode)
+
+    def test_shipped_kordoc_version_notes_match_the_installer_pin(self) -> None:
+        """Operator docs and the sample env must name the version the installer actually pins."""
+
+        installer = (ROOT / "packaging" / "INSTALL_KORDOC_KO.ps1").read_text(encoding="utf-8")
+        pinned = re.search(r'\$KordocPackage = "kordoc@([0-9]+\.[0-9]+\.[0-9]+)"', installer)
+        self.assertIsNotNone(pinned)
+        version = pinned.group(1)
+
+        self.assertIn(f"검증된 Kordoc {version} 고정 버전을", installer)
+
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertEqual(
+            [version],
+            re.findall(r"npm install -g kordoc@([0-9]+\.[0-9]+\.[0-9]+)", env_example),
+        )
+
+        quickstart = (ROOT / "docs" / "operator_quickstart_ko.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            [version],
+            re.findall(r"Kordoc `([0-9]+\.[0-9]+\.[0-9]+)`", quickstart),
         )
 
     def test_readme_discloses_kordoc_source_and_bundle_scope(self) -> None:
