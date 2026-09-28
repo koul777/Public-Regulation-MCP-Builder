@@ -93,7 +93,34 @@ const css = fs.readFileSync(path.join(root, 'frontend/assets/beginner_tour.css')
     assert(await page.evaluate(()=>document.querySelector('#rr-tour-root').contains(document.activeElement)||document.querySelector('#approve').contains(document.activeElement)));
     await page.emulateMedia({reducedMotion:'reduce'});
     assert.equal(await page.locator('.rr-tour-card').evaluate(el=>getComputedStyle(el).animationName),'none');
+    // The closed guide must leave Streamlit's fixed chat composer clickable.
+    await page.keyboard.press('Escape');
+    await page.setViewportSize({width:1280,height:900});
+    await page.evaluate(()=>{
+      const composer=document.createElement('div');
+      composer.dataset.testid='stChatInput';
+      composer.style.cssText='position:fixed;bottom:20px;left:80px;right:80px;height:60px;background:white';
+      composer.innerHTML='<textarea aria-label="다음 질문"></textarea><button style="position:absolute;right:0;bottom:0" aria-label="질문 보내기">전송</button>';
+      window.sentQuestions=0;
+      composer.querySelector('button').onclick=()=>window.sentQuestions++;
+      document.body.append(composer);
+    });
+    const dockAboveComposer=()=>page.waitForFunction(()=>{
+      const dock=document.querySelector('.rr-tour-dock').getBoundingClientRect();
+      const input=document.querySelector('[data-testid="stChatInput"]').getBoundingClientRect();
+      return dock.bottom<=input.top-8;
+    },null,{timeout:3000});
+    await dockAboveComposer();
+    await page.getByRole('button',{name:'질문 보내기',exact:true}).click();
+    await page.locator('[data-testid="stChatInput"]').evaluate(el=>el.style.height='150px');
+    await dockAboveComposer();
+    await page.setViewportSize({width:390,height:844});
+    await dockAboveComposer();
+    await page.getByRole('button',{name:'질문 보내기',exact:true}).click();
+    assert.equal(await page.evaluate(()=>window.sentQuestions),2,'desktop and mobile sends must remain clickable');
+    await page.locator('[data-testid="stChatInput"]').evaluate(el=>el.remove());
+    await page.waitForFunction(()=>document.querySelector('.rr-tour-dock').style.bottom==='');
     assert.deepEqual(errors,[]);
-    console.log('PASS: click progression, reruns, priority, collapsed controls, dialogs, pause/resume, opt-out, no auto-approval, mobile and keyboard');
+    console.log('PASS: click progression, reruns, priority, collapsed controls, dialogs, pause/resume, opt-out, no auto-approval, mobile, keyboard and unobscured chat send');
   } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});
