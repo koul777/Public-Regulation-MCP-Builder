@@ -39,8 +39,8 @@ def render_journey(
     stages = [(1, "파일 올리기", "규정 파일을 읽고 정리"),
               (2, "결과 살펴보기", "AI 검수 결과 확인"),
               (3, "확인하고 승인", "원문 비교 후 검색에 등록"),
-              (4, "AI에 연결하기" if mcp else "규정에 질문하기",
-               "사용할 AI 앱에 연결" if mcp else "답변과 근거 함께 확인")]
+              (4, "AI에 연결하기" if mcp else "Qwen 앱으로 이어가기",
+               "사용할 AI 앱에 연결" if mcp else "규정 선택·질문·근거 확인은 Qwen 창에서")]
     if not uses_results:
         stages = [stage for stage in stages if stage[0] != 2]
     cards = []
@@ -56,10 +56,15 @@ def render_journey(
             f'<p>{description}</p></li>'
         )
     done_count = sum(step <= len(completed) and completed[step - 1] for step, _, _ in stages)
+    completion_title = "모든 준비를 마쳤어요" if mcp else "빌더의 Qwen 인계 준비를 마쳤어요"
+    completion_description = (
+        "승인한 규정을 AI에서 활용할 수 있어요. 새 문서도 같은 순서로 진행하세요."
+        if mcp else "기관·규정 선택, 질문, 답변의 근거 인용 확인은 Qwen 창에서 계속하세요."
+    )
     ribbon = (
         '<div class="rr-journey-complete" role="status">'
-        '<span aria-hidden="true">✓</span><div><strong>모든 준비를 마쳤어요</strong>'
-        '<p>승인한 규정을 AI에서 활용할 수 있어요. 새 문서도 같은 순서로 진행하세요.</p>'
+        f'<span aria-hidden="true">✓</span><div><strong>{completion_title}</strong>'
+        f'<p>{completion_description}</p>'
         '</div></div>'
         if done_count == len(stages) else ""
     )

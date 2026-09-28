@@ -1113,7 +1113,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "AI_USAGE_PATH_QWEN": "qwen",
             "_ai_usage_path": lambda: usage_path["value"],
             "_qwen_beginner_procedure_states": lambda ctx: tuple(
-                (ctx or {}).get("qwen_states", (False,) * 5)
+                (ctx or {}).get("qwen_states", (False,) * 2)
             ),
         }
         exec(compile(ast.Module(body=[helper], type_ignores=[]), "<guide-completion>", "exec"), namespace)
@@ -1190,7 +1190,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertEqual(
             (True, True, True, True),
             completed_steps(
-                {**approved_context, "qwen_states": (True,) * 5},
+                {**approved_context, "qwen_states": (True,) * 2},
                 results_confirmed=False,
             ),
         )
@@ -1640,7 +1640,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "AI_USAGE_PATH_QWEN": "qwen",
             "_ai_usage_path": lambda: usage_path["value"],
             "_qwen_beginner_procedure_states": lambda ctx: tuple(
-                ctx.get("qwen_states", (False,) * 5)
+                ctx.get("qwen_states", (False,) * 2)
             ),
             "st": SimpleNamespace(session_state={}),
         }
@@ -1736,7 +1736,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         )
         self.assertEqual(
             [True, True, True, True],
-            workflow_states({**actual_bundle_ready, "qwen_states": (True,) * 5}),
+            workflow_states({**actual_bundle_ready, "qwen_states": (True,) * 2}),
         )
 
         # AI 추가 검수를 쓰지 않아 ②를 건너뛰는 규정은, 누를 화면이 없으므로

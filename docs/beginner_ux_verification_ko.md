@@ -1,5 +1,67 @@
 # 초보자 화면 안내 실행 검증
 
+## 2026-09-29 Orca 토론 후 보완
+
+[역할 분담과 토론 결정](beginner_overnight_plan_ko.md)에 따라 Kordoc 준비 확인,
+Qwen 복구·근거 안내와 실제 브라우저 검증을 보완했다.
+
+### 실제 두 조항의 안내 이동
+
+```powershell
+node tests/browser/real_beginner_journey.cjs
+```
+
+Playwright와 Chromium이 설치된 환경에서 실행한다. 이 검사는 빈 루프백 포트와
+매번 새로운 `tmp/real-beginner-*` 저장소를 선택하고 서버를 종료 시 정리한다.
+기존 운영 데이터나 실제 기관 문서를 읽지 않는다.
+
+- 공개 합성 DOCX의 전처리 결과에서 제1조·제2조의 서로 다른 청크 ID를 확보한다.
+- 첫 검수 항목의 판단·확인 후 제1조, 제1조 확인 후 제2조 위젯으로 안내가 이동하는지
+  실제 DOM 선택자와 청크 ID를 비교한다. 같은 안내 제목만으로 진행을 판정하지 않는다.
+- 안내 일시정지 중 실제 위젯 조작으로 화면이 다시 실행돼도 정지 상태를 유지하고,
+  이어 보기 후 현재 미완료 항목을 안내하는지 확인한다.
+- 별도 Python 프로세스에서 저장소를 읽어 모든 청크가 미승인이고 승인 저널 0건,
+  색인 작업 없음, 승인 벡터 파일 없음임을 확인한다. 앱·브라우저 예외도 없어야 한다.
+
+이 검사는 최종 승인·반려 버튼, 파일 선택 취소, 실제 모델 응답 품질을 검사하지 않는다.
+기존 65초 영상은 첫 조항의 검수 조작까지만 담으며, 위 회귀 결과와 별개다.
+
+### Kordoc 및 Qwen 확인 범위
+
+Kordoc 집중 검사는 실제 임시 명령과 Windows 가짜 npm/Kordoc 실행 파일을 사용한다.
+정상 전체 명령·누락된 CLI·설치 버전 불일치·실행 파일 누락을 구분하며 실제 전역 설치는
+수행하지 않는다. 별도 설치된 Kordoc 4.15.7로 합성 DOCX의 2×2 표 1개와 한글 내용을
+추출하는 실행도 통과했다. 이는 모든 HWP/HWPX/PDF의 품질 보증이 아니다.
+
+Qwen의 준비 실패·인용 없음·잘못된 인용 형식·연속 질문은 합성 응답으로 검사한다.
+기관·규정 승인 게이트를 유지하며, 근거 없는 답변에는 사용 주의와 다음 행동을 표시한다.
+빌더는 정상 앱 실행까지만 인계 준비 완료로 세고 질문·근거 확인 결과를 추측하지 않는다.
+
+### 최종 통합 및 최신 Kordoc 확인
+
+전체 Python 회귀는 **3,765개 실행, 실패 없음, 16개 건너뜀, 672.137초**로 완료했다.
+건너뛴 항목에는 공개 저장소에 없는 실제 문서 픽스처, 운영체제 조건과 별도 설치 검사가
+포함된다. 모든 문서 형식의 실물 검증을 마쳤다는 뜻은 아니다.
+
+게시 직전 npm에서 `4.16.0`을 확인해 설치 기준·오류 안내·MCP 복구 명령을 갱신했다.
+위 전체 회귀 후 변경한 버전 및 Windows PowerShell 한글 출력은 관련 **76개 검사로
+추가 검증했으며 실패 없이 1개를 건너뛰었다**. 다음 명령을 사용했다.
+
+```powershell
+python -X utf8 -m unittest tests.test_pipeline tests.test_operator_setup_service tests.test_packaging_entrypoints tests.test_streamlit_setup tests.test_beginner_quickstart_docs tests.test_kordoc_table_parser tests.test_generate_mcp_client_config.GenerateMcpClientConfigTests.test_kordoc_remediation_hint_matches_pinned_installer_version -q
+```
+
+설치된 실제 Kordoc `4.16.0`의 버전 응답, 합성 DOCX 2×2 표 추출과 한글 유지,
+설치 도구의 `-SkipInstall` 검증도 통과했다. PowerShell 5.1에서 한글 문자열을 읽을 수
+있도록 설치 스크립트를 UTF-8 BOM으로 저장하고, 리디렉션된 출력은 UTF-8로 고정했다.
+실제 npm 설치 없이 가짜 실행 파일로 성공·구버전·누락과 한글 출력을 검사한다.
+
+`python -m build --sdist --wheel` 및 공개 소스 위생 감사를 실행했다. 빌드한 패키지에
+안내 JavaScript/CSS가 들어 있고 wheel에서 리소스로 읽히며, 시연 영상은 패키지에서
+제외되는 것을 확인했다. README의 공개 GIF·MP4 주소도 GitHub에서 확인했다.
+`python -m scripts.run_beginner_first_success`는 실제 MCP STDIO 초기화,
+목록·검색·원문 조회와 tenant 격리 검사를 모두 통과했다. 실제 Qwen 모델은 이 검사에 포함하지 않았다.
+
 ## 2026-09-28 추가 검증 — 실제 클릭으로 이어지는 안내
 
 이번 보완은 밝게 표시된 실제 항목을 직접 누르면 다음 미완료 항목으로 안내가 이어지는

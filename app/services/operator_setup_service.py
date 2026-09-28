@@ -15,6 +15,8 @@ _INSTALLER_GUIDANCE = {
     "installer_timeout": ("정해진 시간 안에 설치가 끝나지 않았습니다.", "인터넷 연결과 npm 접근 상태를 확인한 뒤 설치를 다시 실행하세요."),
     "installer_unavailable": ("Windows 설치 도구를 실행하지 못했습니다.", "PowerShell 사용 권한을 확인하고 앱을 다시 연 뒤 설치를 다시 실행하세요."),
     "installer_failed": ("Kordoc 설치 또는 실행 확인에 실패했습니다.", "Node.js LTS와 npm이 설치되어 있는지, 인터넷 연결이 가능한지 확인한 뒤 설치를 다시 실행하세요."),
+    "installer_command_mismatch": ("설치된 Kordoc 명령을 확인하지 못했습니다.", "npm 전역 설치 경로와 PATH를 확인한 뒤 설치를 다시 실행하세요."),
+    "installer_version_mismatch": ("Kordoc 4.16.0 버전 확인에 실패했습니다.", "검증된 버전으로 다시 설치한 뒤 앱을 재시작하고 준비 상태를 확인하세요."),
 }
 
 
@@ -82,5 +84,7 @@ def run_kordoc_installer(
         return {"ok": False, "error": "installer_timeout", "output": ""}
     except OSError:
         return {"ok": False, "error": "installer_unavailable", "output": ""}
+    failure_codes = {10: "installer_command_mismatch", 11: "installer_version_mismatch"}
     return {"ok": result.returncode == 0,
-            "error": "" if result.returncode == 0 else "installer_failed", "output": ""}
+            "error": "" if result.returncode == 0 else failure_codes.get(result.returncode, "installer_failed"),
+            "output": ""}

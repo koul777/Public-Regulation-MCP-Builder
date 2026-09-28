@@ -405,9 +405,6 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
 BEGINNER_QWEN_PROCEDURES: tuple[str, ...] = (
     "승인·색인된 규정 준비 상태 확인",
     "독립 Qwen 챗봇 실행",
-    "대화할 규정 선택",
-    "Qwen 연결 확인 후 질문 입력",
-    "답변과 근거 조문 함께 확인",
 )
 # The six external connection confirmations start at procedure 4-6 in the list above.
 BEGINNER_CONNECTION_FIRST_SUBSTEP = 6
@@ -451,8 +448,8 @@ def _beginner_guide_step_details(step: int) -> tuple[str, str, str]:
     if int(step) == 4:
         return (
             page,
-            "로컬 Qwen 챗봇으로 질문하기",
-            "독립 Qwen 앱을 열고 규정을 선택한 뒤 답변과 근거 조문을 함께 확인합니다.",
+            "로컬 Qwen 챗봇으로 이어가기",
+            "승인·색인된 규정을 준비하고 독립 Qwen 앱을 엽니다. 규정 선택·질문·근거 확인은 Qwen 창에서 이어집니다.",
         )
     return page, title, description
 
@@ -2029,9 +2026,9 @@ def _qwen_beginner_procedure_states(ctx: dict | None) -> tuple[bool, ...]:
         and process.poll() is None
         and _standalone_qwen_chat_is_healthy(app_url)
     )
-    # 기관·규정 선택, 질문, 근거 확인은 별도 Streamlit 세션에서 이루어진다. 빌더가
-    # 그 세션을 추측해 완료 처리하지 않고, 독립 앱 자체의 번호 안내가 이어서 담당한다.
-    return approval_ready, standalone_running, False, False, False
+    # 빌더가 확인할 수 있는 준비·앱 실행만 완료로 센다. 기관·규정 선택, 질문과
+    # 근거 확인은 별도 Qwen 세션에서 안내하며, 앱 상태를 답변 검증으로 해석하지 않는다.
+    return approval_ready, standalone_running
 
 
 def _beginner_guide_completed_steps(
@@ -7565,10 +7562,15 @@ def _render_kordoc_preprocess_preflight() -> bool:
         version = str(command_status.get("version") or "unknown")
         st.caption(
             "공식 MCP 품질 준비 확인: PDF·HWP·HWPX·DOCX 문서에 필요한 "
-            f"Kordoc 사용 가능 ({command_label}, {version})"
+            f"Kordoc 사용 가능 — 설정한 명령 실행 확인 ({command_label}, {version}). "
+            "문서별 표 파싱 결과와 사람 승인·색인은 별도로 확인합니다."
         )
+        if command_status.get("reason") == "version_unrecognized":
+            st.info("명령은 실행됐지만 버전 표기를 확인하지 못했습니다. 관리자 설정의 Kordoc 명령과 설치 버전을 확인하세요.")
         return True
 
+    if command_status.get("reason") == "version_probe_failed":
+        st.info("설정된 Kordoc 전체 명령 실행에 실패했습니다. 관리자 설정에서 명령과 스크립트 위치를 확인한 뒤 ‘Kordoc 준비 상태 다시 확인’을 누르세요.")
     npm_available = shutil.which("npm") is not None
     if npm_available:
         _render_beginner_action_marker(
@@ -12847,7 +12849,7 @@ def _page_connect(
             else "승인된 규정을 ChatGPT·Claude·Codex에서 사용하도록 MCP 연결 묶음을 만들고 확인합니다."
         ),
         finish=(
-            "독립 Qwen 앱에서 답변과 근거 조문을 확인하면 준비가 끝납니다."
+            "승인·색인한 규정과 독립 Qwen 앱 실행을 확인하면 빌더 준비가 끝납니다. 규정 선택·질문·근거 확인은 Qwen 창에서 계속하세요."
             if qwen_path
             else "외부 AI에서 list_regulations·search·fetch가 확인되면 MCP 연결이 끝납니다."
         ),
@@ -15367,7 +15369,7 @@ with st.sidebar:
         st.caption(f"AI 사용 준비: {'완료' if ctx['mcp_connection_gate'].get('ready') else '아직'}")
         if _ai_usage_path() == AI_USAGE_PATH_QWEN:
             st.caption(
-                "Qwen 질문·근거 확인: "
+                "Qwen 앱으로 이어갈 준비: "
                 + ("완료" if all(_qwen_beginner_procedure_states(ctx)) else "아직")
             )
         else:

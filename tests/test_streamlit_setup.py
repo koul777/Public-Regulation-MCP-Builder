@@ -22,7 +22,7 @@ from app.services.operator_setup_service import kordoc_installer_guidance
 settings = SimpleNamespace(kordoc_table_command="kordoc")
 shutil = SimpleNamespace(which=lambda name: "npm" if st.session_state.get("npm", True) else None)
 def kordoc_table_command_status(command):
-    return {"available": st.session_state.get("available", False), "label": "kordoc", "version": "synthetic"}
+    return {"available": st.session_state.get("available", False), "label": "kordoc", "version": "synthetic", "reason": st.session_state.get("reason", "")}
 def clear():
     st.session_state["checks"] = st.session_state.get("checks", 0) + 1
 kordoc_table_command_status.cache_clear = clear
@@ -40,6 +40,22 @@ st.checkbox("다른 작업")
 
 
 class StreamlitSetupTests(unittest.TestCase):
+    def test_custom_command_failure_and_unknown_version_have_distinct_recovery(self) -> None:
+        app = AppTest.from_string(setup_app_source())
+        app.session_state["reason"] = "version_probe_failed"
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any("전체 명령 실행에 실패" in item.value for item in app.info))
+        self.assertFalse(any("Kordoc 사용 가능" in item.value for item in app.caption))
+        self.assertNotIn("installs", app.session_state)
+        app.session_state["available"] = True
+        app.session_state["reason"] = "version_unrecognized"
+        app.button(key="preprocess-kordoc-recheck").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any("버전 표기를 확인하지 못했습니다" in item.value for item in app.info))
+        self.assertTrue(any("문서별 표 파싱 결과" in item.value for item in app.caption))
+        self.assertNotIn("installs", app.session_state)
+
     def test_failure_survives_rerun_and_retry_uses_safe_action_copy(self) -> None:
         app = AppTest.from_string(setup_app_source()).run()
         self.assertFalse(app.exception)

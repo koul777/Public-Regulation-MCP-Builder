@@ -77,7 +77,8 @@ class BeginnerTourTests(unittest.TestCase):
                 )
                 self.assertIn("1 / 3 완료", markup)
                 self.assertNotIn("결과 살펴보기", markup)
-                self.assertIn("규정에 질문하기", markup)
+                self.assertIn("Qwen 앱으로 이어가기", markup)
+                self.assertIn("규정 선택·질문·근거 확인은 Qwen 창에서", markup)
                 self.assertNotIn("AI에 연결하기", markup)
                 self.assertEqual(3, len(cards))
                 self.assertEqual("step", cards[1]["aria-current"])
@@ -95,6 +96,16 @@ class BeginnerTourTests(unittest.TestCase):
                 )
                 self.assertIn(f"{total} / {total} 완료", markup)
                 self.assertTrue(all("done" in card["class"].split() for card in cards))
+
+    def test_completed_qwen_journey_describes_handoff_without_claiming_answer_review(self) -> None:
+        markup, cards = self._journey(
+            active_step=4, completed=(True,) * 4,
+            uses_results=True, mcp=False,
+        )
+        self.assertTrue(all("done" in card["class"].split() for card in cards))
+        self.assertIn("빌더의 Qwen 인계 준비를 마쳤어요", markup)
+        self.assertIn("기관·규정 선택, 질문, 답변의 근거 인용 확인은 Qwen 창에서 계속하세요", markup)
+        self.assertNotIn("답변과 근거 함께 확인", markup)
 
     def test_tour_render_is_read_only_and_script_config_cannot_escape(self) -> None:
         page = '</script><img src=x onerror="alert(1)"> 한글'

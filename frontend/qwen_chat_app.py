@@ -448,7 +448,7 @@ def run_rag_chat_with_visible_progress(
 
         progress_bar.progress(100, text=_STAGE_LABELS["completed"])
         detail.caption(f"완료 · 총 {time.monotonic() - started_at:.1f}초")
-        status.update(label="Qwen 답변과 근거 확인 완료", state="complete", expanded=False)
+        status.update(label="답변 생성 완료 · 근거 인용을 아래에서 확인하세요", state="complete", expanded=False)
 
     if not isinstance(outcome_value, dict):
         raise RuntimeError("Qwen chat returned an invalid response")
@@ -461,26 +461,40 @@ def safe_citation_rows(citations: Any) -> list[dict[str, Any]]:
     if not isinstance(citations, list):
         return []
     rows: list[dict[str, Any]] = []
+
+    def readable(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())[:4000]
+
+    def page_number(value: Any) -> str:
+        if isinstance(value, bool):
+            return ""
+        text = str(value) if isinstance(value, int) else readable(value)
+        return text if text.isascii() and text.isdigit() and 0 < len(text) <= 7 else ""
+
     for citation in citations:
         if not isinstance(citation, dict):
             continue
-        page_start = citation.get("source_page_start")
-        page_end = citation.get("source_page_end")
+        page_start = page_number(citation.get("source_page_start"))
+        page_end = page_number(citation.get("source_page_end"))
         page_label = ""
         if page_start not in (None, ""):
             page_label = str(page_start)
             if page_end not in (None, "", page_start):
                 page_label = f"{page_label}–{page_end}"
         row = {
-            "규정명": citation.get("regulation_title") or citation.get("document_title"),
-            "조문": citation.get("article_no"),
-            "조문 제목": citation.get("article_title"),
-            "항": citation.get("paragraph_no"),
+            "규정명": readable(citation.get("regulation_title")) or readable(citation.get("document_title")),
+            "조문": readable(citation.get("article_no")),
+            "조문 제목": readable(citation.get("article_title")),
+            "항": readable(citation.get("paragraph_no")),
             "원문 쪽": page_label,
-            "근거 인용문": citation.get("support_quote"),
+            "근거 인용문": readable(citation.get("support_quote")),
         }
         row = {key: value for key, value in row.items() if value not in (None, "")}
-        if row:
+        # A page number or heading alone is not enough for a reader to check
+        # what text supports the answer, even inside the selected document.
+        if "조문" in row or "근거 인용문" in row:
             rows.append(row)
     return rows
 
@@ -553,6 +567,11 @@ def _render_assistant_message(message: dict[str, Any]) -> None:
     if citation_rows:
         with st.expander(f"근거 인용 {len(citation_rows)}건", expanded=True):
             st.dataframe(citation_rows, hide_index=True, width="stretch")
+    else:
+        st.warning(
+            "확인할 수 있는 근거 인용이 없습니다. 이 답변을 규정 근거로 사용하지 마세요. "
+            "질문을 더 구체적으로 바꾸거나 빌더에서 이 규정의 승인·색인 상태를 확인하세요."
+        )
 
 
 def _friendly_chat_error(exc: Exception) -> str:
@@ -600,10 +619,15 @@ def _qwen_tour_step(probe_ok: bool, messages: list[dict[str, Any]]) -> tuple[int
                 "Ollama와 qwen3:8b가 준비됐는지 확인합니다. 실패하면 화면의 복구 안내를 따라 다시 누르세요.",
                 "div.st-key-qwen-probe")
     last = messages[-1] if messages else {}
-    if last.get("role") == "assistant" and not last.get("error") and last.get("citations"):
-        return (5, "답변 아래 근거 인용을 확인하세요",
-                "답변과 함께 규정명·조문·원문 쪽을 확인하세요. 새 질문은 아래 입력창에 적을 수 있습니다.",
-                f"div.st-key-qwen-answer-{len(messages)-1}")
+    if last.get("role") == "assistant" and not last.get("error"):
+        answer_target = f"div.st-key-qwen-answer-{len(messages)-1}"
+        if safe_citation_rows(last.get("citations")):
+            return (5, "답변 아래 근거 인용을 확인하세요",
+                    "답변과 함께 규정명·조문·원문 쪽을 직접 확인하세요. 새 질문은 아래 입력창에 적을 수 있습니다.",
+                    answer_target)
+        return (5, "근거 인용이 없는 답변을 확인하세요",
+                "이 답변을 규정 근거로 사용하지 마세요. 질문을 바꾸거나 빌더에서 승인·색인 상태를 확인하세요.",
+                answer_target)
     return (4, "아래 입력창에 규정 질문을 적으세요",
             "질문을 입력한 뒤 전송 버튼을 누르세요. 답변이 끝나면 근거 인용을 확인합니다.",
             "div.st-key-qwen-question")
@@ -616,6 +640,20 @@ def _render_qwen_tour(enabled: bool, action: tuple[int, str, str, str]) -> None:
         attributes = marker_attributes(title, description, selectors=[selector], step=4, substep=substep)
         st.markdown(f'<span {attributes} data-rr-tour-current="true"></span>', unsafe_allow_html=True)
     render_tour(enabled=enabled, page="qwen-chat")
+
+
+def _render_qwen_blocked_state(
+    guided: bool, *, title: str, reason: str, next_action: str,
+) -> None:
+    """Keep a visible recovery step when no safe chat selection exists."""
+    with st.container(key="qwen-recovery"):
+        st.warning(reason)
+        st.info(next_action)
+        st.button("빌더에서 조치한 뒤 다시 확인", key="qwen-recovery-recheck")
+    _render_qwen_tour(
+        guided,
+        (1, title, next_action, "div.st-key-qwen-recovery-recheck"),
+    )
 
 
 def main() -> None:
@@ -641,22 +679,37 @@ def main() -> None:
         )
         st.stop()
 
+    guided = st.toggle("한 단계씩 클릭 안내", value=True, key="qwen-guided-mode")
     try:
         tenant_id = local_tenant_id(settings)
         registry = load_local_institution_registry(settings)
     except FileNotFoundError:
-        st.error("기관 프로필 파일을 찾지 못했습니다. 먼저 빌더에서 기관을 등록해 주세요.")
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 기관을 먼저 등록하세요",
+            reason="기관 프로필 파일을 찾지 못해 질문할 기관을 선택할 수 없습니다.",
+            next_action="빌더 창으로 돌아가 기관을 등록한 뒤 이 Qwen 화면을 새로고침하세요.",
+        )
         st.stop()
     except (OSError, ValueError):
-        st.error("기관 프로필 파일을 안전하게 읽지 못했습니다. 빌더에서 기관 설정을 확인해 주세요.")
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 기관 설정을 확인하세요",
+            reason="기관 프로필을 안전하게 읽지 못해 질문을 시작할 수 없습니다.",
+            next_action="빌더 창에서 기관 설정을 확인한 뒤 이 Qwen 화면을 새로고침하세요.",
+        )
         st.stop()
 
     profiles = local_profiles(registry, tenant_id)
     if not profiles:
-        st.warning("현재 로컬 테넌트에서 사용할 수 있는 기관 프로필이 없습니다.")
+        _render_qwen_blocked_state(
+            guided,
+            title="현재 기관을 먼저 등록하세요",
+            reason="현재 로컬 테넌트에서 선택할 수 있는 기관 프로필이 없습니다.",
+            next_action="빌더 창에서 현재 기관을 등록한 뒤 이 Qwen 화면을 새로고침하세요.",
+        )
         st.stop()
 
-    guided = st.toggle("한 단계씩 클릭 안내", value=True, key="qwen-guided-mode")
     selected_profile_id = st.selectbox(
         "1. 질문할 기관을 선택하세요",
         options=list(profiles),
@@ -682,7 +735,12 @@ def main() -> None:
         st.stop()
 
     if not documents:
-        st.info("이 기관에는 전처리가 완료된 규정이 없습니다. 먼저 빌더에서 전처리를 완료해 주세요.")
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 규정 전처리를 완료하세요",
+            reason="선택한 기관에 전처리가 완료된 규정이 없습니다.",
+            next_action="빌더 창에서 이 기관의 규정 파일을 선택해 전처리를 완료한 뒤 이 Qwen 화면을 새로고침하세요. 전처리 후에도 사람 검토와 승인·색인이 필요합니다.",
+        )
         st.stop()
 
     auth = AuthContext(
@@ -715,10 +773,11 @@ def main() -> None:
         if item.ready
     }
     if not ready_by_id:
-        st.warning(
-            "아직 질문 가능한 규정이 없습니다. 빌더의 ‘③ 승인·색인’에서 남은 조항을 모두 승인 또는 "
-            "반려한 뒤 ‘승인된 내용 색인’을 완료해 주세요. "
-            "승인 조항 수와 색인 조항 수가 정확히 같아야 합니다."
+        _render_qwen_blocked_state(
+            guided,
+            title="빌더에서 남은 검토와 색인을 완료하세요",
+            reason="이 기관에 아직 질문 가능한 규정이 없습니다. 검토 대기나 승인·색인 불일치가 있는 규정은 질문에서 제외됩니다.",
+            next_action="빌더 창의 ‘③ 검수하고 승인’에서 원문을 확인하고 남은 조항을 직접 승인 또는 반려하세요. 승인된 조항을 색인한 뒤 이 화면을 새로고침하세요. 승인 수와 색인 수가 같아야 합니다.",
         )
         st.stop()
 

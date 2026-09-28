@@ -16,6 +16,8 @@ class OperatorSetupServiceTests(unittest.TestCase):
             (subprocess.TimeoutExpired("installer", 300), "installer_timeout"),
             (OSError("synthetic-secret"), "installer_unavailable"),
             (SimpleNamespace(returncode=1, stdout="synthetic-secret", stderr="synthetic-secret"), "installer_failed"),
+            (SimpleNamespace(returncode=10, stdout="synthetic-secret", stderr="synthetic-secret"), "installer_command_mismatch"),
+            (SimpleNamespace(returncode=11, stdout="synthetic-secret", stderr="synthetic-secret"), "installer_version_mismatch"),
             (SimpleNamespace(returncode=0, stdout="synthetic-secret", stderr="synthetic-secret"), ""),
         ):
             with self.subTest(expected=expected):
@@ -43,3 +45,5 @@ class OperatorSetupServiceTests(unittest.TestCase):
         self.assertIn("배포본", missing[1])
         self.assertNotEqual(timeout, missing)
         self.assertNotIn("synthetic-secret", str(kordoc_installer_guidance("synthetic-secret")))
+        self.assertIn("PATH", kordoc_installer_guidance("installer_command_mismatch")[1])
+        self.assertIn("4.16.0", kordoc_installer_guidance("installer_version_mismatch")[0])

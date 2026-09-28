@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -202,6 +203,45 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(payload["kordoc_table_command_available"])
         self.assertEqual(payload["kordoc_table_command_resolved_name"], "kordoc.cmd")
         self.assertNotIn("kordoc_table_command_version", payload)
+        kordoc_table_command_status.cache_clear()
+
+    def test_kordoc_status_probes_entire_custom_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cli = Path(directory) / "synthetic_kordoc.py"
+            cli.write_text(
+                "import sys\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    print('kordoc 4.15.7')\n"
+                "else:\n"
+                "    raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            command = f'"{sys.executable}" "{cli}"'
+            kordoc_table_command_status.cache_clear()
+            ready = kordoc_table_command_status(command)
+            missing = kordoc_table_command_status(f'"{sys.executable}" "{cli.with_name("missing.py")}"')
+
+        self.assertTrue(ready["available"])
+        self.assertEqual("4.15.7", ready["version"])
+        self.assertEqual("", ready["reason"])
+        self.assertFalse(missing["available"])
+        self.assertEqual("version_probe_failed", missing["reason"])
+        self.assertEqual("", missing["version"])
+        kordoc_table_command_status.cache_clear()
+
+    def test_kordoc_status_never_exposes_raw_version_output(self) -> None:
+        kordoc_table_command_status.cache_clear()
+        with patch("app.core.pipeline.resolve_kordoc_command", return_value="node"):
+            with patch("app.core.pipeline.subprocess.run") as runner:
+                runner.return_value.returncode = 0
+                runner.return_value.stdout = "local/private/path secret-token"
+                runner.return_value.stderr = ""
+                status = kordoc_table_command_status("node synthetic-cli.js")
+        self.assertEqual("unverified", status["version"])
+        self.assertEqual("version_unrecognized", status["reason"])
+        self.assertTrue(status["available"])
+        self.assertEqual(["node", "synthetic-cli.js", "--version"], runner.call_args.args[0])
+        self.assertNotIn("secret-token", str(status))
         kordoc_table_command_status.cache_clear()
 
     def test_processing_options_payload_keeps_agent_review_scope_when_provider_execution_disabled(self) -> None:
