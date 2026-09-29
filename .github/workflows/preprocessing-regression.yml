@@ -36,12 +36,14 @@ jobs:
           python -m unittest -v \
             tests.test_readiness_adapter \
             tests.test_local_llm_readiness_service \
+            tests.test_indexing_readiness_service \
             tests.test_operator_setup_service \
             tests.test_local_app_service \
             tests.test_authoring_service \
             tests.test_authoring_official_isolation \
             tests.test_streamlit_setup \
-            tests.test_streamlit_authoring
+            tests.test_streamlit_authoring \
+            tests.test_streamlit_approval_app
 
       - name: Run parsing and preprocessing regression suite
         run: |
