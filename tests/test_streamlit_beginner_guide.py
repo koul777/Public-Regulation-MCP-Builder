@@ -2566,12 +2566,12 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             page_source,
         )
         advisory_start = page_source.index(
-            "if beginner_mode_active and _results_step_is_used(ctx) and not beginner_current_results_confirmed:"
+            "if beginner_mode_active and not _beginner_focus_review() and _results_step_is_used(ctx) and not beginner_current_results_confirmed:"
         )
         advisory_end = page_source.index("if not chunks:", advisory_start)
         self.assertNotIn("return", page_source[advisory_start:advisory_end])
         self.assertIn('st.session_state["document_id"] = next_document_id', page_source)
-        self.assertIn("_queue_workflow_navigation(\n                    NAV_RESULTS", page_source)
+        self.assertIn("NAV_APPROVAL if _beginner_focus_review() else NAV_RESULTS", page_source)
 
     def test_beginner_mcp_explains_and_gates_principle_before_configuration(self) -> None:
         source, module = _source_and_module()
@@ -3187,7 +3187,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         self._run()
         self.app.button(key="pending-upload-select-all").click().run()
         self.assertFalse(self.app.exception)
-        self.assertTrue(self.app.button(key="preprocess-start").disabled)
+        self.assertFalse(any(button.key == "preprocess-start" for button in self.app.button))
 
         next(
             item for item in self.app.checkbox
@@ -3225,13 +3225,9 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         next(item for item in self.app.button if item.label == "해당 없음").click().run()
         self.assertFalse(self.app.exception)
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
-        self.assertIn("이 조항의 검수 항목 확인을 마치세요", markers)
+        self.assertIn("원문과 최종본을 확인하고 다음으로 가세요", markers)
         self.assertNotIn("검수 항목을 읽고 판단하세요", markers)
-        next(item for item in self.app.checkbox if item.label == "표시된 검수 항목에 대한 판단을 모두 확인했습니다.").check().run()
-        self.assertFalse(self.app.exception)
-        markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
-        self.assertIn("원문과 최종본을 직접 대조하세요", markers)
-        next(item for item in self.app.checkbox if item.label.startswith("원본과 최종본을 직접 대조")).check().run()
+        next(item for item in self.app.button if item.label == "원문·최종본 확인 완료 · 다음").click().run()
         self.assertFalse(self.app.exception)
         self.assertEqual([], repository.list_approval_journal_records(document_id))
         self.assertIn("1 / 3 완료", journey)
@@ -3268,6 +3264,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
 
     def test_completed_current_document_opens_next_pending_document_before_ai_handoff(self) -> None:
         from tests.test_streamlit_approval_app import (
+            _confirm_rendered_approval_rows,
             _seed_app_institution_context,
             _seed_streamlit_multi_approval_documents,
         )
@@ -3288,6 +3285,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         # A narrower future export choice must not hide pending selected work.
         self.app.session_state[f"mcp-data-scope-{first_id}"] = "current_document"
         self._run()
+        _confirm_rendered_approval_rows(self.app)
         fake_embedding = SimpleNamespace(
             encode_documents=lambda texts: [[0.0] * 384 for _ in texts]
         )
@@ -3311,7 +3309,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
 
         next_document = self.app.button(key=f"approval-next-regulation-{first_id}-{second_id}")
         self.assertFalse(next_document.disabled)
-        self.assertTrue(self.app.button(key="approval-goto-connect-simple").disabled)
+        self.assertFalse(any(button.key == "approval-goto-connect-simple" for button in self.app.button))
         self.assertTrue(self.app.button(key="beginner-guide-next").disabled)
         self.assertIn(
             "다음 미완료 규정을 하나씩 계속 확인하세요",
@@ -3324,7 +3322,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
             self._run()
         self.assertEqual(second_id, self.app.session_state["document_id"])
         self.assertEqual(second_id, self.app.session_state["workflow_opened_document_id"])
-        self.assertEqual("② 결과 확인", self.app.session_state["nav_page"])
+        self.assertEqual("③ 검수하고 승인", self.app.session_state["nav_page"])
         self.assertEqual(before, self._file_snapshot())
         self.assertEqual([], repository.list_approval_journal_records(second_id))
 

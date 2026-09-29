@@ -99,10 +99,14 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
             "test_authoring_service", "test_authoring_official_isolation",
             "test_streamlit_setup", "test_streamlit_authoring",
             "test_streamlit_approval_app",
+            "test_ai_review_display",
         ):
             self.assertIn(f"tests.{module}", fast_step)
             self.assertTrue((REPO_ROOT / "tests" / f"{module}.py").is_file())
         self.assertNotIn("continue-on-error", fast_step)
+        modules = [line for line in fast_step.splitlines() if line.strip().startswith("tests.")]
+        for line in modules[:-1]:
+            self.assertTrue(line.rstrip().endswith("\\"), f"Shell would execute module as a command: {line.strip()}")
 
     def test_ci_template_exercises_mcp_connection_paths(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "ci.yml"

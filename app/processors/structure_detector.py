@@ -117,7 +117,7 @@ REVISION_REGULATION_KIND_PATTERN = re.compile(
     r"(?:규정|내규|정관|세칙|규칙|기준|요령|지침|편람|훈령|예규|고시)\s*$"
 )
 INLINE_ARTICLE_MARKER_PATTERN = re.compile(
-    rf"(?<!\S)제\s*\d+\s*조(?:의\s*\d+)?(?=\s*{ARTICLE_TITLE_DELIMITER_PATTERN})"
+    rf"(?:(?<!\S)|(?<=[.。]))제\s*\d+\s*조(?:의\s*\d+)?(?=\s*{ARTICLE_TITLE_DELIMITER_PATTERN})"
 )
 
 FOOTNOTE_CAPTION_MARKER_PATTERN = re.compile(

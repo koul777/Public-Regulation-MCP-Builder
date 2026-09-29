@@ -823,6 +823,10 @@ class StreamlitResultsStepVisibilityTests(unittest.TestCase):
         # 문서가 없을 때 메뉴가 나타났다 사라지면 더 헷갈린다.
         self.assertTrue(streamlit_app._results_step_is_used(None))
 
+    def test_focused_comparison_includes_ai_review_without_an_extra_results_stage(self) -> None:
+        with patch.object(streamlit_app, "_beginner_focus_review", return_value=True):
+            self.assertFalse(streamlit_app._results_step_is_used(self._ctx({"request_enabled": True})))
+
     def test_nav_drops_the_results_page_for_a_parser_only_document(self) -> None:
         pages = streamlit_app._primary_nav_pages(
             self._ctx({"status": "skipped", "skip_reason": "agent_review_not_requested"})
@@ -859,7 +863,7 @@ class StreamlitResultsStepVisibilityTests(unittest.TestCase):
         source = Path(streamlit_app.__file__).read_text(encoding="utf-8")
 
         advisory = (
-            "if beginner_mode_active and _results_step_is_used(ctx) "
+            "if beginner_mode_active and not _beginner_focus_review() and _results_step_is_used(ctx) "
             "and not beginner_current_results_confirmed:"
         )
         self.assertIn(advisory, source)

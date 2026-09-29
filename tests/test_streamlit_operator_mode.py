@@ -1127,7 +1127,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('header_cols[1].markdown("**전처리본 · ✅ 최종본**")', source)
         self.assertIn('header_cols[2].markdown("**AI 검수 의견**")', source)
         self.assertIn("_render_agent_review_findings(", source)
-        self.assertIn("AI는 어디를 봐야 하는지 짚어 줄 뿐 본문을 고치지 않습니다.", source)
+        self.assertIn("AI 의견과 저장된 수정 제안은 자동으로 최종본에 반영되지 않습니다.", source)
         self.assertIn("✅ 최종본 칸의 내용이 승인·색인되어 MCP에 들어갑니다.", source)
         self.assertNotIn("_approval_auto_confirm_pending_chunks", source)
         self.assertIn("_render_approval_chunk_confirmation_controls(", source)
@@ -2224,7 +2224,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('if safe_step > 1 and ctx is None:', source)
         self.assertIn('action = "① 문서 올려서 전처리로 이동"', source)
         self.assertIn("        ctx=ctx,\n        purpose=\"여기서는 프로그램이 글자를 제대로 읽었는지", source)
-        self.assertIn("        ctx=ctx,\n        purpose=\"왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고", source)
+        self.assertIn('purpose="왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고', source)
         self.assertIn("승인된 규정을 독립 로컬 Qwen 챗봇에서 선택해 질문합니다", source)
         self.assertIn('class="rr-beginner-compass"', source)
         for purpose in (

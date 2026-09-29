@@ -43,7 +43,8 @@ jobs:
             tests.test_authoring_official_isolation \
             tests.test_streamlit_setup \
             tests.test_streamlit_authoring \
-            tests.test_streamlit_approval_app
+            tests.test_streamlit_approval_app \
+            tests.test_ai_review_display
 
       - name: Run parsing and preprocessing regression suite
         run: |

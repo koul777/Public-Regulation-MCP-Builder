@@ -90,6 +90,52 @@ class DocxParserTests(unittest.TestCase):
             with self.assertRaisesRegex(ParserError, "Failed to parse DOCX file"):
                 DocxParser().parse(path, "doc_invalid_docx")
 
+    @unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
+    def test_nested_table_text_and_merged_cell_coordinates_are_preserved(self) -> None:
+        from docx import Document
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested.docx"
+            doc = Document()
+            table = doc.add_table(rows=3, cols=3)
+            table.cell(0, 0).merge(table.cell(0, 2)).text = "공통 기준"
+            table.cell(1, 0).merge(table.cell(2, 0)).text = "세로 기준"
+            table.cell(1, 1).text = "내부 표 앞"
+            nested = table.cell(1, 1).add_table(rows=1, cols=2)
+            nested.cell(0, 0).text = "신청 기한"
+            nested.cell(0, 1).text = "3근무일"
+            table.cell(1, 1).add_paragraph("내부 표 뒤")
+            doc.save(path)
+            parsed = DocxParser().parse(path, "doc_nested")
+            block = parsed.pages[0].blocks[0]
+        for text in ("공통 기준", "세로 기준", "내부 표 앞", "신청 기한", "3근무일", "내부 표 뒤"):
+            self.assertEqual(1, block.text.count(text))
+        cells = block.metadata["docx_table_cells"]
+        self.assertEqual(3, cells[0]["column_span"])
+        self.assertEqual("continue", next(c["vertical_merge"] for c in cells if c["row"] == 2 and c["column"] == 0))
+        self.assertEqual(1, block.metadata["docx_nested_table_count"])
+        self.assertIn("docx_complex_table_layout", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertLess(block.text.index("신청 기한"), block.text.index("내부 표 뒤"))
+
+    @unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
+    def test_content_controls_preserve_article_order_without_duplicate_table_text(self) -> None:
+        from docx import Document
+        from docx.oxml import OxmlElement
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "controlled.docx"
+            doc = Document()
+            doc.add_paragraph("제1조(목적) 원문")
+            paragraph = doc.add_paragraph("제2조(신청) 3일 전 신청한다.")
+            control, content = OxmlElement("w:sdt"), OxmlElement("w:sdtContent")
+            paragraph._p.addprevious(control)
+            content.append(paragraph._p)
+            control.append(content)
+            doc.add_paragraph("제3조(반납) 다음 날 반납한다.")
+            doc.save(path)
+            parsed = DocxParser().parse(path, "doc_controlled")
+        self.assertEqual(["제1조(목적) 원문", "제2조(신청) 3일 전 신청한다.", "제3조(반납) 다음 날 반납한다."],
+                         [block.text for block in parsed.pages[0].blocks])
+
 
 if __name__ == "__main__":
     unittest.main()
