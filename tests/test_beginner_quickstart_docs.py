@@ -116,7 +116,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "Kordoc 사용 가능",
             "안전 재전처리",
             "화면 진입만으로 시작되지 않으며",
-            "원문·최종본 확인 완료 · 다음",
+            "내용이 맞아요 · 다음",
             "이슈",
             "생성할 MCP 이름 (필수 입력)",
             "MCP로 쓸 파일 묶음 만들기",
