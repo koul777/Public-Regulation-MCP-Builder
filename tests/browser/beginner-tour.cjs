@@ -70,6 +70,18 @@ const css = fs.readFileSync(path.join(root, 'frontend/assets/beginner_tour.css')
     await page.locator('.rr-tour-primary').click();
     await page.getByRole('button',{name:'직접 승인',exact:true}).click();
     assert.equal(await page.evaluate(()=>window.approvals),1);
+    // An unavailable control must never be presented as the next click.
+    await clear();
+    await page.locator('#approve button').evaluate(el=>el.disabled=true);
+    await marker('approve','비활성 승인 버튼',4,{current:true,priority:100});
+    await marker('upload','사용 가능한 파일 선택',5);
+    await mount();
+    await title('사용 가능한 파일 선택');
+    assert.equal(await page.evaluate(()=>window.approvals),1);
+    await clear(); await marker('approve','비활성 항목만 남음',6);
+    await mount();
+    assert.equal(await page.locator('.rr-tour-card').isVisible(),false);
+    await page.locator('#approve button').evaluate(el=>el.disabled=false);
     // Missing targets never produce a floating, blocking ghost prompt.
     await clear(); await marker('missing','없는 버튼');
     await mount();

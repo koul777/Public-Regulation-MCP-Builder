@@ -14,7 +14,7 @@ from app.processors.kordoc_table_parser import resolve_kordoc_command, split_com
 from app.schemas.chunk import ChunkOptions
 
 
-PREPROCESSOR_PIPELINE_VERSION = "2026.08.03-canonical-regulation-parity-2"
+PREPROCESSOR_PIPELINE_VERSION = "2026.09.29-docx-cell-and-article-boundaries-3"
 _SAFE_VERSION = re.compile(r"(?<![A-Za-z0-9])v?(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?![A-Za-z0-9])")
 
 

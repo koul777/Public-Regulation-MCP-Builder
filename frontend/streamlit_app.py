@@ -25,6 +25,7 @@ from urllib.request import urlopen
 import pandas as pd
 import streamlit as st
 
+from frontend.ai_review_display import review_display
 from frontend.beginner_tour import (
     TOUR_REQUEST_KEY,
     marker_attributes,
@@ -970,6 +971,7 @@ def _render_ai_review_sidebar(ctx: dict | None) -> None:
 
 
 AI_REVIEW_REASON_LABELS = {
+    "table_review_required": ("표 원문 대조", "중간", "표의 제목·행·열·숫자가 원문과 같은지 확인하세요."),
     "chunk_warnings": ("청크 경고 확인", "중간", "청크 경고가 실제 원문 오류인지 확인하고 필요한 경우 전처리 결과를 보정합니다."),
     "replacement_character": ("문자 깨짐 가능성", "높음", "깨진 문자나 인코딩 오류가 있으면 원문과 대조해 수정합니다."),
     "table_extraction_failed": ("표 추출 실패 가능성", "높음", "원본 표와 전처리 표를 대조하고 Kordoc 표 결과를 우선 적용합니다."),
@@ -2288,19 +2290,20 @@ def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
     st.markdown("## 내 규정으로 AI에 질문하기")
     st.caption("파일 올리기 → 원문 확인·승인 → AI에 연결. 화면 안내를 따라 하나씩 진행하세요.")
     st.session_state.setdefault(AI_USAGE_PATH_KEY, AI_USAGE_PATH_QWEN)
-    st.session_state[AI_USAGE_PATH_FIRST_WIDGET_KEY] = _ai_usage_path()
-    selected_usage_path = st.radio(
-        "최종 사용 방법",
-        AI_USAGE_PATH_OPTIONS,
-        key=AI_USAGE_PATH_FIRST_WIDGET_KEY,
-        format_func=_ai_usage_path_label,
-        on_change=_ai_usage_path_changed,
-        args=(AI_USAGE_PATH_FIRST_WIDGET_KEY,),
-    )
-    if selected_usage_path == AI_USAGE_PATH_QWEN:
-        st.caption("Qwen은 이 PC의 별도 챗봇에서 질문합니다. 규정과 대화는 외부 API로 보내지 않습니다.")
-    else:
-        st.caption("MCP는 승인한 규정을 ChatGPT·Claude·Codex에 연결합니다. 사용할 AI는 나중에도 바꿀 수 있습니다.")
+    with st.expander("사용할 AI 바꾸기 (기본: 로컬 Qwen)", expanded=False):
+        st.session_state[AI_USAGE_PATH_FIRST_WIDGET_KEY] = _ai_usage_path()
+        selected_usage_path = st.radio(
+            "최종 사용 방법",
+            AI_USAGE_PATH_OPTIONS,
+            key=AI_USAGE_PATH_FIRST_WIDGET_KEY,
+            format_func=_ai_usage_path_label,
+            on_change=_ai_usage_path_changed,
+            args=(AI_USAGE_PATH_FIRST_WIDGET_KEY,),
+        )
+        if selected_usage_path == AI_USAGE_PATH_QWEN:
+            st.caption("Qwen은 이 PC의 별도 챗봇에서 질문합니다. 규정과 대화는 외부 API로 보내지 않습니다.")
+        else:
+            st.caption("MCP는 승인한 규정을 ChatGPT·Claude·Codex에 연결합니다. 사용할 AI는 나중에도 바꿀 수 있습니다.")
     st.caption("초보자 안내는 지금 누를 곳을 초록색으로 짚어 줍니다. 실제 승인·색인은 직접 실행합니다.")
     guide_col, general_col = st.columns(2)
     with guide_col:
@@ -2806,7 +2809,7 @@ def _render_beginner_action_marker(
         tour_selectors.append(f'div[class*="st-key-{safe_prefix}"]')
     tour_attributes = marker_attributes(
         title, description, selectors=tour_selectors, step=int(step), substep=int(substep),
-        presentation="inline" if int(step) == 3 and int(substep) == 2 else "spotlight",
+        presentation="inline" if int(step) == 3 else "spotlight",
     )
     # Optional tooling stays discoverable in its own expander, while the tour
     # leads fast preprocessing directly to the upload action.
@@ -3196,6 +3199,11 @@ def _render_operator_project_dialog(page: str) -> None:
 
 def _render_operator_project_controls(page: str) -> None:
     """Keep one save action at the upper-right of every main workflow screen."""
+    with st.expander("작업 저장·불러오기", expanded=False) if _beginner_focus_review() else nullcontext():
+        _render_operator_project_control_buttons(page)
+
+
+def _render_operator_project_control_buttons(page: str) -> None:
     control_key = hashlib.sha256(page.encode("utf-8")).hexdigest()[:10]
     if OPERATOR_PROJECT_NAME_PENDING_KEY in st.session_state:
         st.session_state[OPERATOR_PROJECT_NAME_KEY] = st.session_state.pop(OPERATOR_PROJECT_NAME_PENDING_KEY)
@@ -7949,6 +7957,9 @@ def _results_step_is_used(ctx: dict | None) -> bool:
     if not ctx:
         # 아직 문서가 없으면 기본 순서를 유지한다(감췄다 나타났다 하면 더 헷갈린다).
         return True
+    if _beginner_focus_review():
+        # The focused comparison shows AI findings alongside the original.
+        return False
     return _agent_review_requested(ctx.get("agent_review_summary"))
 
 
@@ -8601,6 +8612,21 @@ def _page_preprocess() -> None:
     beginner_mode = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
     st.markdown("## ① 문서 올려서 전처리")
     _render_operator_project_controls(NAV_PREPROCESS)
+    completed_id = str(st.session_state.get("beginner_preprocess_finished_document_id") or "")
+    if beginner_mode and completed_id and completed_id == str(st.session_state.get("document_id") or ""):
+        completed_ctx = _load_document_context(completed_id)
+        if completed_ctx and _beginner_guide_completed_steps(completed_ctx)[0]:
+            st.success("파일 읽기가 끝났습니다. 이제 원문과 정리된 내용을 한 조항씩 확인하세요.")
+            _render_beginner_action_marker(
+                1, "전처리 결과를 확인하세요", "아래 버튼을 눌러 첫 조항부터 확인하세요.",
+                control_key_prefix="preprocess-goto-results", substep=5,
+            )
+            _render_workflow_next_button("③ 검수하고 승인으로 이동", NAV_APPROVAL, key="preprocess-goto-results")
+            with st.expander("다른 파일 또는 전처리 설정", expanded=False):
+                if st.button("파일 선택 화면 다시 열기", key="beginner-reopen-upload"):
+                    st.session_state.pop("beginner_preprocess_finished_document_id", None)
+                    st.rerun()
+            return
     if not beginner_mode:
         _render_pipeline_stages(PIPELINE_STAGE_PARSER)
     _render_beginner_page_compass(
@@ -8978,34 +9004,35 @@ def _page_preprocess() -> None:
             "같은 규정의 승인된 이전 버전이 있으면 자동으로 개정 관계를 연결합니다."
         )
 
-        # 지금까지는 본문에서 찾은 제목이 항상 이겨서, 사용자가 저장한 파일 이름이 목록에서 사라졌다.
-        document_name_mode = st.radio(
-            "규정 이름 (목록·디렉터리에 표시될 이름)",
-            ["filename", "content"],
-            format_func=lambda value: {
-                "filename": "올린 파일 이름 그대로 사용",
-                "content": "문서 본문에서 찾은 제목 사용",
-            }[value],
-            horizontal=True,
-            key=PREPROCESS_DOCUMENT_NAME_MODE_KEY,
-        )
-        if document_name_mode == "filename":
-            st.caption(
-                "파일을 저장할 때 쓴 이름이 그대로 규정 이름이 됩니다(확장자는 뺍니다). "
-                "규정 안의 조항 제목은 본문에서 찾은 값을 그대로 씁니다."
+        with st.expander("규정 이름 바꾸기 (선택)", expanded=False) if beginner_mode else nullcontext():
+            # 지금까지는 본문에서 찾은 제목이 항상 이겨서, 사용자가 저장한 파일 이름이 목록에서 사라졌다.
+            document_name_mode = st.radio(
+                "규정 이름 (목록·디렉터리에 표시될 이름)",
+                ["filename", "content"],
+                format_func=lambda value: {
+                    "filename": "올린 파일 이름 그대로 사용",
+                    "content": "문서 본문에서 찾은 제목 사용",
+                }[value],
+                horizontal=True,
+                key=PREPROCESS_DOCUMENT_NAME_MODE_KEY,
             )
-            if len(upload_sources) == 1:
-                document_name = st.text_input(
-                    "규정 이름 직접 수정 (선택)",
-                    value=Path(str(upload_sources[0]["filename"])).stem,
-                    key="preprocess-document-name-override",
-                    help="비워 두면 파일 이름을 그대로 씁니다.",
+            if document_name_mode == "filename":
+                st.caption(
+                    "파일을 저장할 때 쓴 이름이 그대로 규정 이름이 됩니다(확장자는 뺍니다). "
+                    "규정 안의 조항 제목은 본문에서 찾은 값을 그대로 씁니다."
                 )
-        else:
-            st.caption(
-                "본문 첫 부분에서 찾은 규정 제목을 씁니다. 통합본처럼 제목이 여러 개인 파일에서는 "
-                "파일 이름을 쓰는 편이 목록에서 찾기 쉽습니다."
-            )
+                if len(upload_sources) == 1:
+                    document_name = st.text_input(
+                        "규정 이름 직접 수정 (선택)",
+                        value=Path(str(upload_sources[0]["filename"])).stem,
+                        key="preprocess-document-name-override",
+                        help="비워 두면 파일 이름을 그대로 씁니다.",
+                    )
+            else:
+                st.caption(
+                    "본문 첫 부분에서 찾은 규정 제목을 씁니다. 통합본처럼 제목이 여러 개인 파일에서는 "
+                    "파일 이름을 쓰는 편이 목록에서 찾기 쉽습니다."
+                )
 
     regulation_id = ""
     regulation_version = ""
@@ -9154,7 +9181,7 @@ def _page_preprocess() -> None:
         chunk_mode = "article"
         st.caption("청크 방식: 규정의 조문·항목 구조에 맞춰 자동 적용")
         include_context_header = st.checkbox("위치/본문 헤더 포함", value=True)
-        enable_table_extraction = st.checkbox("표/별표 추출 활성화", value=False)
+        enable_table_extraction = st.checkbox("표/별표 추출 활성화", value=beginner_mode)
         st.caption(
             "AI 추가 검수는 왼쪽 사이드바에서 켜고 연결 설정을 저장했을 때 실행됩니다. "
             "선택해도 실제 API 실행은 운영 설정과 예산 한도를 만족할 때만 진행되며, 사람 승인과 보안 게이트를 대신하지 않습니다."
@@ -9221,7 +9248,7 @@ def _page_preprocess() -> None:
             control_key_prefix="preprocess-start",
             substep=5,
         )
-    if upload_sources and st.button(
+    if upload_sources and (not beginner_mode or beginner_preprocess_confirmations_complete) and st.button(
         "전처리 시작",
         type="primary",
         key="preprocess-start",
@@ -9648,6 +9675,9 @@ def _page_preprocess() -> None:
             st.session_state[f"workflow-document-selected-{completed_document_id}"] = True
         st.session_state["document_id"] = document.document_id
         st.session_state["unreviewed_preview_requested"] = not official_review_required
+        if beginner_mode:
+            st.session_state["beginner_preprocess_finished_document_id"] = document.document_id
+            st.rerun()
         next_step_label = "② 결과 확인" if ai_review_requested else "③ 검수하고 승인"
         st.success(
             f"{len(completed_documents)}개 문서 전처리가 끝났습니다. "
@@ -10430,7 +10460,8 @@ def _agent_review_findings(chunk) -> dict[str, object]:
     return findings if isinstance(findings, dict) else {}
 
 
-def _render_agent_review_findings(chunk, *, selected_for_review: bool, reviewed: bool = False) -> None:
+def _render_agent_review_findings(chunk, *, selected_for_review: bool, reviewed: bool = False,
+                                  agent_review_summary: dict | None = None) -> None:
     """AI 검수 의견 칸. AI는 본문을 고치지 않고 볼 곳만 짚어 준다.
 
     본문 재작성을 시켜 봤더니 되돌아온 교정본의 77%가 원문과 완전히 같았고,
@@ -10441,11 +10472,24 @@ def _render_agent_review_findings(chunk, *, selected_for_review: bool, reviewed:
     실행이 끝나지 못한 것, 애초에 대상이 아니었던 것. 셋을 같은 문구로 묶으면
     검수를 켠 운영자가 화면만 보고는 AI가 돌았는지조차 알 수 없다.
     """
-    findings = _agent_review_findings(chunk)
-    issues = [str(issue) for issue in (findings.get("issues") or []) if str(issue).strip()]
-    recommended = str(findings.get("recommended_human_check") or "").strip()
+    display = review_display(chunk, agent_review_summary)
+    issues = display.issues
+    recommended = display.recommendation
+    if display.proposal:
+        st.markdown("**저장된 AI 정리 제안**")
+        st.code(display.proposal, language="text", wrap_lines=True)
+        if display.changed:
+            st.caption("취소선은 삭제 제안, 밑줄은 추가 제안입니다. 제안은 최종본과 별도로 표시합니다.")
+            st.markdown(
+                '<div class="rr-ai-proposal-diff" style="white-space:pre-wrap;overflow-wrap:anywhere">'
+                + display.diff_html + '</div>', unsafe_allow_html=True,
+            )
+        else:
+            st.caption("저장된 AI 제안이 전처리본과 같습니다. 변경된 문장은 없습니다.")
     if not issues and not recommended:
-        if reviewed:
+        if display.proposal:
+            st.caption("별도로 저장된 AI 지적사항은 없습니다.")
+        elif reviewed:
             st.caption("✅ AI 검수 완료 · 지적 없음")
         elif selected_for_review:
             st.caption(
@@ -10455,12 +10499,39 @@ def _render_agent_review_findings(chunk, *, selected_for_review: bool, reviewed:
         else:
             st.caption("AI 검수 대상 아님")
         return
-    risk = str(findings.get("risk_level") or "medium").strip().lower()
+    risk = display.risk_level
     st.caption(f"위험도 {AGENT_REVIEW_RISK_MARKS.get(risk, '🟡 중간')}")
     for issue in issues:
         st.markdown(f"- {issue}")
     if recommended:
         st.caption(f"사람이 확인할 것: {recommended}")
+
+
+def _approval_apply_ai_proposal(document_id: str, chunk_id: str, proposal: str) -> None:
+    """An explicit operator click stages a proposal; approval remains separate."""
+    st.session_state[_approval_edited_text_key(document_id, chunk_id)] = proposal
+    st.session_state[_approval_edited_text_widget_key(document_id, chunk_id)] = proposal
+    for name in ("human_confirmed", "human_confirmed_widget", "ai_result_confirmed_widget"):
+        st.session_state[_approval_chunk_state_key(document_id, chunk_id, name)] = False
+    st.session_state[_approval_chunk_state_key(document_id, chunk_id, "ai_result_confirmed")] = ""
+
+
+def _beginner_focus_review() -> bool:
+    return bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+
+
+def _reopen_focused_review(document_id: str, chunk_id: str) -> None:
+    """Revisit a reviewed row without losing its draft or review decisions."""
+    for name in ("human_confirmed", "human_confirmed_widget", "ai_result_confirmed_widget"):
+        st.session_state[_approval_chunk_state_key(document_id, chunk_id, name)] = False
+    st.session_state[_approval_chunk_state_key(document_id, chunk_id, "ai_result_confirmed")] = ""
+
+
+def _confirm_focused_review(document_id: str, chunk_id: str, signature: str) -> None:
+    """One explicit click confirms the visible decisions and source comparison."""
+    st.session_state[_approval_chunk_state_key(document_id, chunk_id, "ai_result_confirmed")] = signature
+    for name in ("human_confirmed", "human_confirmed_widget", "ai_result_confirmed_widget"):
+        st.session_state[_approval_chunk_state_key(document_id, chunk_id, name)] = True
 
 
 def _approval_sheet_ai_review_note(agent_review_summary: dict | None) -> str:
@@ -10646,6 +10717,21 @@ def _render_approval_chunk_confirmation_controls(
         ),
     )
     ai_result_confirmed = bool(ai_state["ai_confirmed"])
+    if _beginner_focus_review():
+        if ai_result_confirmed and bool(action_resolution["action_required_resolved"]):
+            confirm_key = _approval_chunk_state_key(document_id, chunk_id, "confirm-and-next")
+            _render_beginner_action_marker(
+                3, "원문과 최종본을 확인하고 다음으로 가세요",
+                "위 원문·최종본·AI 의견을 읽으세요. 내용이 맞을 때만 아래 버튼을 누릅니다. "
+                "조항 확인 뒤 마지막에 별도로 승인합니다.",
+                control_keys=(confirm_key,), substep=2,
+            )
+            st.button(
+                "원문·최종본 확인 완료 · 다음", key=confirm_key, type="primary", width="stretch",
+                on_click=_confirm_focused_review,
+                args=(document_id, chunk_id, _approval_ai_result_signature(item_ids, ai_decisions)),
+            )
+        return
     if bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)):
         signature = _approval_ai_result_signature(item_ids, ai_decisions)
         ai_result_confirmed_key = _approval_chunk_state_key(
@@ -10756,6 +10842,35 @@ def _render_approval_compare_sheet(
     """
     if not rows:
         return
+    focused = _beginner_focus_review() and not read_only and not show_document_label
+    if focused:
+        incomplete = [row for row in rows if not _approval_chunk_review_state_from_session(
+            document_id=str(row["document_id"]), chunk=row["chunk"],
+            review_attention={str(getattr(row["chunk"], "chunk_id", "")): row.get("review_reasons", [])},
+            agent_review_summary=dict(row.get("agent_review_summary") or {}),
+        )["state"]["approve_enabled"]]
+        complete_count = len(rows) - len(incomplete)
+        st.progress(complete_count / len(rows), text=f"조항 확인 {complete_count} / {len(rows)}")
+        incomplete_ids = {(str(row["document_id"]), row["chunk"].chunk_id) for row in incomplete}
+        completed = [row for row in rows if (str(row["document_id"]), row["chunk"].chunk_id) not in incomplete_ids]
+        if completed:
+            with st.expander("확인한 조항 다시 검토하기", expanded=False):
+                selected = st.selectbox(
+                    "다시 볼 조항", range(len(completed)),
+                    format_func=lambda index: f"{index + 1}. {completed[index]['chunk'].text[:70]}",
+                    key=f"{page_state_key}-revisit",
+                )
+                selected_row = completed[selected]
+                st.button(
+                    "이 조항 다시 확인", key=f"{page_state_key}-reopen",
+                    on_click=_reopen_focused_review,
+                    args=(str(selected_row["document_id"]), str(selected_row["chunk"].chunk_id)),
+                )
+        if not incomplete:
+            st.success("모든 조항을 확인했습니다. 아래에서 최종 승인하세요.")
+            return
+        rows = incomplete[:1]
+        st.caption("한 번에 한 조항만 확인합니다. 확인 완료를 누르면 다음 조항이 나타납니다.")
     ai_selected_chunk_ids = ai_selected_chunk_ids or set()
     ai_reviewed_chunk_ids = ai_reviewed_chunk_ids or set()
     sheet_page_count = max(
@@ -10796,6 +10911,8 @@ def _render_approval_compare_sheet(
             "검색 등록 상태는 아래 최종 확정 영역에서 확인하세요. "
             "내용을 고쳐야 하면 같은 원본을 새 버전으로 다시 전처리해 승인하세요."
         )
+    elif focused:
+        st.caption("가운데 최종본이 승인됩니다. AI 의견과 수정 제안은 오른쪽에서 확인하세요.")
     else:
         # 마무리 문장('고칠 곳은 …')은 아래 안내가 이미 달고 있다. 여기서 한 번 더 쓰면
         # 같은 문장이 한 줄 안에 두 번 나온다.
@@ -10807,7 +10924,7 @@ def _render_approval_compare_sheet(
         )
         st.caption(
             "✅ 최종본 칸의 내용이 승인·색인되어 MCP에 들어갑니다. "
-            "AI는 어디를 봐야 하는지 짚어 줄 뿐 본문을 고치지 않습니다. "
+            "AI 의견과 저장된 수정 제안은 자동으로 최종본에 반영되지 않습니다. "
             + ai_review_note
         )
     st.divider()
@@ -10878,7 +10995,19 @@ def _render_approval_compare_sheet(
                 chunk,
                 selected_for_review=cid in row_ai_selected_chunk_ids,
                 reviewed=cid in row_ai_reviewed_chunk_ids,
+                agent_review_summary=row_agent_review_summary,
             )
+            proposal = review_display(chunk, row_agent_review_summary)
+            if proposal.changed and not read_only:
+                if _approval_edited_text_from_session(row_document_id, chunk) == proposal.proposal:
+                    st.caption("AI 제안을 최종본 편집 칸에 반영했습니다. 원문 대조 후 확인하세요.")
+                else:
+                    st.button(
+                        "AI 제안을 최종본에 반영", key=f"apply-ai-proposal-{row_document_id}-{cid}",
+                        on_click=_approval_apply_ai_proposal,
+                        args=(row_document_id, cid, proposal.proposal),
+                        help="현재 편집 내용을 이 제안으로 바꿉니다. 자동 승인하지 않으며 다시 확인해야 합니다.",
+                    )
         with edit_col:
             if read_only:
                 st.code(str(getattr(chunk, "text", "") or ""), language="text", wrap_lines=True)
@@ -10986,18 +11115,21 @@ def _page_approval(ctx: dict | None) -> None:
     _render_operator_project_controls(NAV_APPROVAL)
     if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
         _render_pipeline_stages(PIPELINE_STAGE_HUMAN_APPROVAL)
-    _render_beginner_page_compass(
-        3,
-        ctx=ctx,
-        purpose="왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고, 맞는 내용만 최종 승인합니다.",
-        finish="선택한 규정의 승인·색인이 끝나면 ④ Qwen 규정 챗봇·AI 연결로 넘어갑니다.",
-    )
+    if not _beginner_focus_review():
+        _render_beginner_page_compass(
+            3,
+            ctx=ctx,
+            purpose="왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고, 맞는 내용만 최종 승인합니다.",
+            finish="선택한 규정의 승인·색인이 끝나면 ④ Qwen 규정 챗봇·AI 연결로 넘어갑니다.",
+        )
     if not _require_document_context(ctx):
         return
     if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
         _render_approval_screen_guide()
-    st.caption("Secure RAG review gate — 승인·색인된 내용만 AI가 답변 근거로 사용합니다.")
-    selected_document_ids = _render_workflow_document_directory(page_key="approval")
+    if not _beginner_focus_review():
+        st.caption("Secure RAG review gate — 승인·색인된 내용만 AI가 답변 근거로 사용합니다.")
+    with st.expander("규정 목록·다른 규정 선택", expanded=False) if _beginner_focus_review() else nullcontext():
+        selected_document_ids = _render_workflow_document_directory(page_key="approval")
     document_id = ctx["document_id"]
     if not _workflow_document_opened(document_id):
         _render_beginner_action_marker(
@@ -11021,6 +11153,8 @@ def _page_approval(ctx: dict | None) -> None:
     # AI 추가 검수를 쓰지 않은 규정은 '② 결과 확인'을 건너뛰므로, 품질 경고를
     # 여기서 보여 주지 않으면 깨진 글자를 아무도 못 보고 승인하게 된다.
     if not _results_step_is_used(ctx):
+        _render_quality_banner(ctx.get("quality_report"))
+    elif _beginner_focus_review():
         _render_quality_banner(ctx.get("quality_report"))
 
     # 선택한 규정 전부의 청크를 미리 읽으면 규정 수에 비례해 화면이 느려진다.
@@ -11057,7 +11191,7 @@ def _page_approval(ctx: dict | None) -> None:
         st.session_state.get(_beginner_guide_results_confirmed_key(document_id))
     )
     # 결과 확인은 초보자에게 권고하되 최종 승인·색인 화면을 막는 관문으로 사용하지 않는다.
-    if beginner_mode_active and _results_step_is_used(ctx) and not beginner_current_results_confirmed:
+    if beginner_mode_active and not _beginner_focus_review() and _results_step_is_used(ctx) and not beginner_current_results_confirmed:
         _render_beginner_action_marker(
             3,
             "현재 규정의 결과 두 곳 확인을 권고합니다",
@@ -11198,11 +11332,14 @@ def _page_approval(ctx: dict | None) -> None:
         opened_regulation_label = _regulation_unit_label(opened_unit)
         scoped_chunk_ids = {str(chunk_id) for chunk_id in list(opened_unit.get("chunk_ids") or [])}
 
-    st.markdown(f"### 2단계 · '{opened_regulation_label}' 원본 · 전처리본 · AI 검수 의견 비교")
-    st.caption(
-        "아래로 스크롤하며 조항마다 세 칸을 비교하고, ✅ 최종본 칸에서 직접 고치세요. "
-        "각 조항 아래의 검수 확인을 마치면 고친 내용이 3단계 확정 때 함께 저장됩니다."
-    )
+    if _beginner_focus_review():
+        st.markdown(f"### {opened_regulation_label}")
+    else:
+        st.markdown(f"### 2단계 · '{opened_regulation_label}' 원본 · 전처리본 · AI 검수 의견 비교")
+        st.caption(
+            "아래로 스크롤하며 조항마다 세 칸을 비교하고, ✅ 최종본 칸에서 직접 고치세요. "
+            "각 조항 아래의 검수 확인을 마치면 고친 내용이 3단계 확정 때 함께 저장됩니다."
+        )
     chunk_by_id = {str(chunk.chunk_id): chunk for chunk in chunks}
     attention_ids = {str(chunk_id) for chunk_id in review_attention}
     ai_selected_chunk_ids = _agent_review_selected_chunk_ids(agent_review_summary)
@@ -11231,7 +11368,7 @@ def _page_approval(ctx: dict | None) -> None:
         pending_compare_ids = [cid for cid in pending_compare_ids if cid in scoped_chunk_ids]
         approved_compare_ids = [cid for cid in approved_compare_ids if cid in scoped_chunk_ids]
 
-    if pending_compare_ids:
+    if pending_compare_ids and not _beginner_focus_review():
         _render_beginner_action_marker(
             3,
             "세 칸을 위에서 아래로 훑어보세요",
@@ -11269,7 +11406,8 @@ def _page_approval(ctx: dict | None) -> None:
         )
     else:
         sheet_compare_ids = pending_compare_ids or approved_compare_ids
-        _render_approval_compare_sheet(
+        with st.expander("승인한 내용 다시 보기", expanded=False) if _beginner_focus_review() and not pending_compare_ids else nullcontext():
+            _render_approval_compare_sheet(
             rows=[
                 _approval_compare_row(
                     document,
@@ -11292,7 +11430,15 @@ def _page_approval(ctx: dict | None) -> None:
             agent_review_summary=agent_review_summary,
         )
 
-    if pending_compare_ids:
+    if _beginner_focus_review() and pending_compare_ids:
+        incomplete = [cid for cid in pending_compare_ids if not _approval_chunk_review_state_from_session(
+            document_id=document_id, chunk=chunk_by_id[cid], review_attention=review_attention,
+            agent_review_summary=agent_review_summary,
+        )["state"]["approve_enabled"]]
+        if incomplete:
+            return
+
+    if pending_compare_ids and not _beginner_focus_review():
         with st.expander("조항을 MCP에서 제외해야 하는 경우 (선택)", expanded=False):
             st.caption(
                 "반려는 승인이나 색인이 아닙니다. 선택한 조항만 더 이상 승인 대기로 남지 않는 "
@@ -11453,6 +11599,8 @@ def _page_approval(ctx: dict | None) -> None:
             guide_substep=4 if approved_count >= total_chunks else 3 if approve_enabled else 0,
             recovering=bool(operation_error),
         )
+    if _beginner_focus_review() and not indexing_packages_ready:
+        return
     if indexing_packages_ready and approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
         _render_beginner_action_marker(
             3,
@@ -11472,7 +11620,7 @@ def _page_approval(ctx: dict | None) -> None:
 
     # 통합본은 규정이 수백 개라 한 규정씩 확정하면 끝나지 않는다. 규정이 둘 이상일 때만
     # '이 규정' 버튼 옆에 파일 전체를 한 번에 확정하는 버튼을 같이 둔다.
-    show_approve_all = len(regulation_units) > 1
+    show_approve_all = len(regulation_units) > 1 and not _beginner_focus_review()
     if show_approve_all:
         approve_col, approve_all_col, index_col = st.columns([2, 2, 2])
     else:
@@ -11639,7 +11787,7 @@ def _page_approval(ctx: dict | None) -> None:
         st.caption(f"자동 생성된 증빙: {evidence.get('artifacts', {}).get('review_batches_json', '')}")
         st.rerun()
 
-    if approve_col.button(
+    if (not _beginner_focus_review() or (can_approve and approved_count < total_chunks)) and approve_col.button(
         "이 규정 최종 확정 · 승인하고 색인",
         type="primary",
         key=approve_index_button_key,
@@ -11681,7 +11829,7 @@ def _page_approval(ctx: dict | None) -> None:
         except Exception as exc:
             _refresh_after_approval_failure(document_id, exc)
 
-    if index_col.button(
+    if (not _beginner_focus_review() or (not can_approve and approved_count > 0 and not mcp_connection_gate.get("ready"))) and index_col.button(
         "이미 승인된 내용 AI에 등록만 실행",
         key=f"quick-index-only-{document_id}",
         disabled=approved_count <= 0,
@@ -11720,9 +11868,12 @@ def _page_approval(ctx: dict | None) -> None:
         except Exception as exc:
             _refresh_after_approval_failure(document_id, exc)
 
+    if _beginner_focus_review() and not mcp_connection_gate.get("ready"):
+        return
+
     # 규정을 하나씩 열지 않고 선택한 규정 전체를 한 화면에서 확인·확정하고 싶을 때만 연다.
     bulk_review_requested = False
-    if multi_selected:
+    if multi_selected and not _beginner_focus_review():
         st.divider()
         st.markdown(f"### 전체 규정 확인 (선택 {len(selected_document_ids):,}개)")
         st.caption(
@@ -12105,7 +12256,7 @@ def _page_approval(ctx: dict | None) -> None:
                 for event in audit_preview[-10:]:
                     st.caption(f"{event.get('timestamp')} · {event.get('message')}")
 
-    show_advanced_approval = st.checkbox(
+    show_advanced_approval = False if _beginner_focus_review() else st.checkbox(
         "전산 담당자용 고급 승인 절차 보기",
         value=False,
         key=f"show-advanced-approval-{document_id}",
@@ -12177,7 +12328,7 @@ def _page_approval(ctx: dict | None) -> None:
                 st.session_state[WORKFLOW_OPENED_DOCUMENT_KEY] = next_document_id
                 _invalidate_document_context_cache()
                 _queue_workflow_navigation(
-                    NAV_RESULTS,
+                    NAV_APPROVAL if _beginner_focus_review() else NAV_RESULTS,
                     label=f"{next_document_label} 결과 확인",
                 )
                 st.rerun()
@@ -12196,6 +12347,7 @@ def _page_approval(ctx: dict | None) -> None:
             )
         if (
             _ai_usage_path() == AI_USAGE_PATH_QWEN
+            and not _beginner_focus_review()
             and bool(mcp_connection_gate.get("ready"))
             and not mcp_profile_scope_mismatch
         ):
@@ -12206,12 +12358,13 @@ def _page_approval(ctx: dict | None) -> None:
             st.caption(
                 "빌더와 별도인 로컬 챗봇이 열립니다. 챗봇에서 승인·색인 완료 규정을 선택하세요."
             )
-        _render_workflow_next_button(
-            "④ Qwen 규정 챗봇·AI 연결로 이동",
-            NAV_MCP,
-            key="approval-goto-connect-simple",
-            disabled=beginner_approval_incomplete,
-        )
+        if not _beginner_focus_review() or not beginner_approval_incomplete:
+            _render_workflow_next_button(
+                "④ Qwen 규정 챗봇·AI 연결로 이동",
+                NAV_MCP,
+                key="approval-goto-connect-simple",
+                disabled=beginner_approval_incomplete,
+            )
         return
 
     st.markdown("### 고급 옵션 A. 검수 증빙 직접 관리")
@@ -12939,36 +13092,38 @@ def _page_connect(
     heading = _connect_nav_display_label()
     st.markdown(f"## {heading}")
     _render_operator_project_controls(NAV_MCP)
-    _render_beginner_page_compass(
-        4,
-        ctx=ctx,
-        purpose=(
-            "승인된 규정을 독립 로컬 Qwen 챗봇에서 선택해 질문합니다."
-            if qwen_path
-            else "승인된 규정을 ChatGPT·Claude·Codex에서 사용하도록 MCP 연결 묶음을 만들고 확인합니다."
-        ),
-        finish=(
-            "승인·색인한 규정과 독립 Qwen 앱 실행을 확인하면 빌더 준비가 끝납니다. 규정 선택·질문·근거 확인은 Qwen 창에서 계속하세요."
-            if qwen_path
-            else "외부 AI에서 list_regulations·search·fetch가 확인되면 MCP 연결이 끝납니다."
-        ),
-    )
-    st.markdown(
-        '<div class="rr-help">AI 연결 정보(API 키·모델·주소)는 <b>⚙️ 관리자 설정 → AI 연결</b>에서 한 번만 입력하면 됩니다. '
-        + (
-            "빌더는 데이터 구축만 담당합니다. <b>독립 Qwen 앱</b>을 새 창으로 열어 대화하세요.</div>"
-            if qwen_path
-            else "이 화면은 승인된 규정을 <b>외부 AI에 MCP로 연결</b>하는 곳입니다. 독립 로컬 Qwen 앱은 별도로 실행할 수 있습니다.</div>"
-        ),
-        unsafe_allow_html=True,
-    )
-    # 입력은 관리자 설정에서 하고, 여기서는 연결 상태만 확인한다.
-    _render_ai_connection_status_banner(settings, context="connect")
-    st.divider()
+    with st.expander("AI 연결 설정·도움말", expanded=False) if _beginner_focus_review() and qwen_path else nullcontext():
+        _render_beginner_page_compass(
+            4,
+            ctx=ctx,
+            purpose=(
+                "승인된 규정을 독립 로컬 Qwen 챗봇에서 선택해 질문합니다."
+                if qwen_path
+                else "승인된 규정을 ChatGPT·Claude·Codex에서 사용하도록 MCP 연결 묶음을 만들고 확인합니다."
+            ),
+            finish=(
+                "승인·색인한 규정과 독립 Qwen 앱 실행을 확인하면 빌더 준비가 끝납니다. 규정 선택·질문·근거 확인은 Qwen 창에서 계속하세요."
+                if qwen_path
+                else "외부 AI에서 list_regulations·search·fetch가 확인되면 MCP 연결이 끝납니다."
+            ),
+        )
+        st.markdown(
+            '<div class="rr-help">AI 연결 정보(API 키·모델·주소)는 <b>⚙️ 관리자 설정 → AI 연결</b>에서 한 번만 입력하면 됩니다. '
+            + (
+                "빌더는 데이터 구축만 담당합니다. <b>독립 Qwen 앱</b>을 새 창으로 열어 대화하세요.</div>"
+                if qwen_path
+                else "이 화면은 승인된 규정을 <b>외부 AI에 MCP로 연결</b>하는 곳입니다. 독립 로컬 Qwen 앱은 별도로 실행할 수 있습니다.</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        # 입력은 관리자 설정에서 하고, 여기서는 연결 상태만 확인한다.
+        _render_ai_connection_status_banner(settings, context="connect")
+        st.divider()
     if not _require_document_context(ctx):
         st.info("Qwen 규정 챗봇과 MCP 연결은 '① 문서 올려서 전처리'를 마친 뒤 이 화면에서 이어집니다.")
         return
-    selected_document_ids = _render_workflow_document_directory(page_key="mcp")
+    with st.expander("연결할 규정 목록", expanded=False) if _beginner_focus_review() and qwen_path else nullcontext():
+        selected_document_ids = _render_workflow_document_directory(page_key="mcp")
     document_id = ctx["document_id"]
     document = ctx["document"]
     document_tenant_id = ctx["document_tenant_id"]
@@ -15365,118 +15520,119 @@ with st.sidebar:
         current_profile = institution_registry.profiles[current_profile_id]
         st.caption(current_profile.institution_name or current_profile.display_name or current_profile_id)
         st.divider()
-    st.markdown("### 공공기관 규정 MCP 빌더")
-    beginner_sidebar = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
-    if current_nav_page == NAV_AUTHORING:
-        st.caption("지금은 로컬 1인 규정 초안 연습 화면입니다. 본문의 1~6단계를 따라가세요.")
-    elif not beginner_sidebar:
-        st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
-    if authoring_enabled(settings) and not beginner_sidebar:
-        if st.button(
-            NAV_AUTHORING,
-            type="primary" if current_nav_page == NAV_AUTHORING else "secondary",
-            key="sidebar-open-authoring",
-            width="stretch",
-        ):
-            st.session_state["nav_page"] = NAV_AUTHORING
-            st.rerun()
-        st.caption("원문이 없을 때 초안부터 작성합니다. 공식 승인 아님.")
+    with st.expander("설정·다른 단계 보기", expanded=False) if _beginner_focus_review() else nullcontext():
+        st.markdown("### 공공기관 규정 MCP 빌더")
+        beginner_sidebar = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
+        if current_nav_page == NAV_AUTHORING:
+            st.caption("지금은 로컬 1인 규정 초안 연습 화면입니다. 본문의 1~6단계를 따라가세요.")
+        elif not beginner_sidebar:
+            st.caption("아래 ①~④ 순서대로 진행하세요. 보조 기능은 고급 메뉴에 있습니다.")
+        if authoring_enabled(settings) and not beginner_sidebar:
+            if st.button(
+                NAV_AUTHORING,
+                type="primary" if current_nav_page == NAV_AUTHORING else "secondary",
+                key="sidebar-open-authoring",
+                width="stretch",
+            ):
+                st.session_state["nav_page"] = NAV_AUTHORING
+                st.rerun()
+            st.caption("원문이 없을 때 초안부터 작성합니다. 공식 승인 아님.")
+            st.divider()
+        if current_nav_page != NAV_AUTHORING:
+            _render_beginner_guide_sidebar(ctx, current_nav_page)
         st.divider()
-    if current_nav_page != NAV_AUTHORING:
-        _render_beginner_guide_sidebar(ctx, current_nav_page)
-    st.divider()
-    # AI 추가 검수를 쓰지 않은 문서에서는 ②를 빼고 ①→③ 2단계로 보여 준다.
-    primary_nav_pages = _primary_nav_pages(ctx, current_nav_page)
-    stored_primary_page = str(st.session_state.get("primary_nav_page") or "")
-    desired_primary_page = (
-        current_nav_page
-        if current_nav_page in primary_nav_pages
-        else stored_primary_page if stored_primary_page in primary_nav_pages else NAV_HOME
-    )
-    if stored_primary_page != desired_primary_page:
-        st.session_state["primary_nav_page"] = desired_primary_page
-    if current_nav_page == NAV_AUTHORING:
-        st.markdown("**규정 초안 연습 순서**")
-        st.caption(
-            "새 초안 만들기 → 기본정보 → 조문 → 작성 검사 → "
-            "내용 확인 → 연습용 내보내기"
+        # AI 추가 검수를 쓰지 않은 문서에서는 ②를 빼고 ①→③ 2단계로 보여 준다.
+        primary_nav_pages = _primary_nav_pages(ctx, current_nav_page)
+        stored_primary_page = str(st.session_state.get("primary_nav_page") or "")
+        desired_primary_page = (
+            current_nav_page
+            if current_nav_page in primary_nav_pages
+            else stored_primary_page if stored_primary_page in primary_nav_pages else NAV_HOME
         )
-    else:
-        st.radio(
-            "기본 작업 순서",
-            primary_nav_pages,
-            key="primary_nav_page",
-            on_change=_go_primary_nav,
-            format_func=_primary_nav_display_label,
-        )
-        if NAV_RESULTS not in primary_nav_pages and not beginner_sidebar:
+        if stored_primary_page != desired_primary_page:
+            st.session_state["primary_nav_page"] = desired_primary_page
+        if current_nav_page == NAV_AUTHORING:
+            st.markdown("**규정 초안 연습 순서**")
             st.caption(
-                "이 규정은 AI 추가 검수를 쓰지 않아 '② 결과 확인'을 건너뜁니다. "
-                "품질 경고와 상세 정보는 '③ 검수하고 승인' 화면에서 볼 수 있습니다."
+                "새 초안 만들기 → 기본정보 → 조문 → 작성 검사 → "
+                "내용 확인 → 연습용 내보내기"
             )
-    if current_nav_page != NAV_AUTHORING:
-        with st.expander("사용할 AI 변경", expanded=not beginner_sidebar):
-            st.session_state[AI_USAGE_PATH_SIDEBAR_WIDGET_KEY] = _ai_usage_path()
+        else:
             st.radio(
-                "Qwen 또는 MCP 선택",
-                AI_USAGE_PATH_OPTIONS,
-                key=AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,
-                format_func=_ai_usage_path_label,
-                on_change=_ai_usage_path_changed,
-                args=(AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,),
-                label_visibility="collapsed",
+                "기본 작업 순서",
+                primary_nav_pages,
+                key="primary_nav_page",
+                on_change=_go_primary_nav,
+                format_func=_primary_nav_display_label,
             )
-            st.caption("두 방법 모두 승인·색인한 규정만 사용합니다.")
-            if _ai_usage_path() == AI_USAGE_PATH_QWEN and not beginner_sidebar:
-                _render_standalone_qwen_chat_launcher(
-                    key="sidebar-launch-standalone-qwen-chat",
-                    primary=True,
+            if NAV_RESULTS not in primary_nav_pages and not beginner_sidebar:
+                st.caption(
+                    "이 규정은 AI 추가 검수를 쓰지 않아 '② 결과 확인'을 건너뜁니다. "
+                    "품질 경고와 상세 정보는 '③ 검수하고 승인' 화면에서 볼 수 있습니다."
                 )
-        _render_ai_review_sidebar(ctx)
-        _render_beginner_orchestration_explanation(nav_page=current_nav_page)
-    if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) or current_nav_page in ADVANCED_NAV_PAGES:
-        with st.expander("고급 기능·관리자 메뉴", expanded=current_nav_page in ADVANCED_NAV_PAGES):
-            st.caption("일반 작업에서는 열 필요가 없습니다.")
-            for advanced_page in ADVANCED_NAV_PAGES:
-                if st.button(advanced_page, key=f"advanced-nav-{advanced_page}", width="stretch"):
-                    _queue_workflow_navigation(advanced_page)
-                    st.rerun()
-    nav_page = current_nav_page
-    st.divider()
-    if ctx and not beginner_sidebar:
-        workflow_states = _workflow_states(ctx)
-        workflow_readiness = safe_summarize_workflow_readiness(workflow_states)
-        if workflow_readiness.is_complete:
-            st.caption("진행 상태: 전체 4단계 완료")
-        else:
-            next_stage = workflow_readiness.current_stage or WorkflowStage.USE
-            next_message, next_target = _next_action(ctx)
-            st.caption(
-                f"진행 상태: {workflow_readiness.completed_steps}/"
-                f"{workflow_readiness.total_steps}단계 완료 · "
-                f"현재 단계: {next_stage.display_name}"
-            )
-            st.info(
-                f"지금 할 일: {next_message}\n\n"
-                f"이동 위치: {next_target}"
-            )
-        quality_report = ctx["quality_report"]
-        st.markdown("**현재 작업 중인 문서**")
-        st.caption(f"문서 ID: {ctx['document_id'][:12]}")
-        st.caption(f"품질: {'통과' if quality_report and quality_report.passed else '검토 필요'}")
-        st.caption(f"승인된 청크: {ctx['approved_count']:,} / {len(ctx['chunks']):,}")
-        st.caption(f"AI 사용 준비: {'완료' if ctx['mcp_connection_gate'].get('ready') else '아직'}")
-        if _ai_usage_path() == AI_USAGE_PATH_QWEN:
-            st.caption(
-                "Qwen 앱으로 이어갈 준비: "
-                + ("완료" if all(_qwen_beginner_procedure_states(ctx)) else "아직")
-            )
-        else:
-            st.caption(f"MCP 생성: {'완료' if _mcp_bundle_created(ctx) else '아직'}")
-    elif not ctx and not beginner_sidebar:
-        st.caption("아직 전처리한 문서가 없습니다.")
-    st.divider()
-    st.caption("이 화면은 로컬 운영자 전용입니다.")
+        if current_nav_page != NAV_AUTHORING:
+            with st.expander("사용할 AI 변경", expanded=not beginner_sidebar):
+                st.session_state[AI_USAGE_PATH_SIDEBAR_WIDGET_KEY] = _ai_usage_path()
+                st.radio(
+                    "Qwen 또는 MCP 선택",
+                    AI_USAGE_PATH_OPTIONS,
+                    key=AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,
+                    format_func=_ai_usage_path_label,
+                    on_change=_ai_usage_path_changed,
+                    args=(AI_USAGE_PATH_SIDEBAR_WIDGET_KEY,),
+                    label_visibility="collapsed",
+                )
+                st.caption("두 방법 모두 승인·색인한 규정만 사용합니다.")
+                if _ai_usage_path() == AI_USAGE_PATH_QWEN and not beginner_sidebar:
+                    _render_standalone_qwen_chat_launcher(
+                        key="sidebar-launch-standalone-qwen-chat",
+                        primary=True,
+                    )
+            _render_ai_review_sidebar(ctx)
+            _render_beginner_orchestration_explanation(nav_page=current_nav_page)
+        if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) or current_nav_page in ADVANCED_NAV_PAGES:
+            with st.expander("고급 기능·관리자 메뉴", expanded=current_nav_page in ADVANCED_NAV_PAGES):
+                st.caption("일반 작업에서는 열 필요가 없습니다.")
+                for advanced_page in ADVANCED_NAV_PAGES:
+                    if st.button(advanced_page, key=f"advanced-nav-{advanced_page}", width="stretch"):
+                        _queue_workflow_navigation(advanced_page)
+                        st.rerun()
+        nav_page = current_nav_page
+        st.divider()
+        if ctx and not beginner_sidebar:
+            workflow_states = _workflow_states(ctx)
+            workflow_readiness = safe_summarize_workflow_readiness(workflow_states)
+            if workflow_readiness.is_complete:
+                st.caption("진행 상태: 전체 4단계 완료")
+            else:
+                next_stage = workflow_readiness.current_stage or WorkflowStage.USE
+                next_message, next_target = _next_action(ctx)
+                st.caption(
+                    f"진행 상태: {workflow_readiness.completed_steps}/"
+                    f"{workflow_readiness.total_steps}단계 완료 · "
+                    f"현재 단계: {next_stage.display_name}"
+                )
+                st.info(
+                    f"지금 할 일: {next_message}\n\n"
+                    f"이동 위치: {next_target}"
+                )
+            quality_report = ctx["quality_report"]
+            st.markdown("**현재 작업 중인 문서**")
+            st.caption(f"문서 ID: {ctx['document_id'][:12]}")
+            st.caption(f"품질: {'통과' if quality_report and quality_report.passed else '검토 필요'}")
+            st.caption(f"승인된 청크: {ctx['approved_count']:,} / {len(ctx['chunks']):,}")
+            st.caption(f"AI 사용 준비: {'완료' if ctx['mcp_connection_gate'].get('ready') else '아직'}")
+            if _ai_usage_path() == AI_USAGE_PATH_QWEN:
+                st.caption(
+                    "Qwen 앱으로 이어갈 준비: "
+                    + ("완료" if all(_qwen_beginner_procedure_states(ctx)) else "아직")
+                )
+            else:
+                st.caption(f"MCP 생성: {'완료' if _mcp_bundle_created(ctx) else '아직'}")
+        elif not ctx and not beginner_sidebar:
+            st.caption("아직 전처리한 문서가 없습니다.")
+        st.divider()
+        st.caption("이 화면은 로컬 운영자 전용입니다.")
 
 if st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY) and nav_page in PRIMARY_NAV_PAGES:
     render_journey(

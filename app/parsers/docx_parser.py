@@ -50,7 +50,7 @@ class DocxParser(BaseParser):
         blocks: list[ParsedBlock] = []
         raw_parts: list[str] = []
 
-        for child in doc.element.body.iterchildren():
+        for child in self._body_items(doc.element.body):
             if isinstance(child, CT_P):
                 paragraph = Paragraph(child, doc)
                 text = paragraph.text.strip()
@@ -61,7 +61,7 @@ class DocxParser(BaseParser):
                 table = Table(child, doc)
                 table_text = self._table_text(table)
                 if table_text:
-                    blocks.append(ParsedBlock(type="table", text=table_text))
+                    blocks.append(ParsedBlock(type="table", text=table_text, metadata=self._table_layout(table)))
                     raw_parts.append(table_text)
 
         if not blocks:
@@ -70,18 +70,29 @@ class DocxParser(BaseParser):
         metadata: dict[str, Any] = {
             "docx_unparsed_parts": unparsed_parts,
         }
-        if unparsed_parts:
+        complex_tables = [block for block in blocks if block.type == "table" and (
+            block.metadata.get("docx_nested_table_count") or any(
+                cell["column_span"] > 1 or cell["vertical_merge"]
+                for cell in block.metadata.get("docx_table_cells", [])
+            )
+        )]
+        metadata["docx_complex_table_count"] = len(complex_tables)
+        if unparsed_parts or complex_tables:
+            flags = (["docx_unparsed_parts"] if unparsed_parts else []) + (
+                ["docx_complex_table_layout"] if complex_tables else []
+            )
             metadata.update(
                 parser_uncertainty_metadata(
                     source="docx",
                     risk_level="medium",
-                    flags=["docx_unparsed_parts"],
+                    flags=flags,
                     confidence=0.72,
-                    recommendation="review_missing_docx_parts",
+                    recommendation="review_missing_docx_parts" if unparsed_parts else "review_docx_table_layout",
                     remediation_hint=(
-                        "Review DOCX parts not included in body order extraction before approval: "
-                        + ", ".join(unparsed_parts)
-                        + "."
+                        ("Review DOCX parts not included in body order extraction before approval: "
+                         + ", ".join(unparsed_parts) + ". " if unparsed_parts else "")
+                        + ("Compare merged and nested table cell relationships with the original document."
+                           if complex_tables else "")
                     ),
                 )
             )
@@ -140,18 +151,55 @@ class DocxParser(BaseParser):
                 detected.append("word/document.xml#w:altChunk")
         return sorted(set(detected), key=str.casefold)
 
+    def _body_items(self, parent: Any):
+        """Unwrap content controls without walking a table's paragraphs twice."""
+        for child in parent.iterchildren():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag in {"p", "tbl"}:
+                yield child
+            elif tag in {"sdt", "sdtContent", "customXml", "ins", "moveTo"}:
+                yield from self._body_items(child)
+
+    def _table_layout(self, table: Any) -> dict[str, Any]:
+        from docx.table import _Cell
+        cells = []
+        for row_index, row in enumerate(table.rows):
+            column = int(getattr(row, "grid_cols_before", 0) or 0)
+            for tc in row._tr.tc_lst:
+                span = int(tc.grid_span or 1)
+                merge = tc.vMerge
+                cell = _Cell(tc, table)
+                cells.append({"row": row_index, "column": column, "column_span": span,
+                              "vertical_merge": str(merge or ""),
+                              "text": self._cell_content(cell), "nested_table_count": len(cell.tables)})
+                column += span
+        return {"docx_table_cells": cells, "docx_table_row_count": len(table.rows),
+                "docx_table_column_count": len(table.columns),
+                "docx_nested_table_count": sum(c["nested_table_count"] for c in cells)}
+
+    def _cell_content(self, cell: Any) -> str:
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+        parts = []
+        for child in self._body_items(cell._tc):
+            if child.tag.rsplit("}", 1)[-1] == "tbl":
+                text = self._table_text(Table(child, cell))
+            else:
+                text = Paragraph(child, cell).text
+            if text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts)
+
     def _table_text(self, table: Any) -> str:
+        from docx.table import _Cell
         rows: list[str] = []
         for row in table.rows:
             cells: list[str] = []
-            previous_tc = None
-            for cell in row.cells:
-                # A cell merged across grid columns is yielded once per column
-                # by python-docx, all sharing the same underlying <w:tc>.
-                if cell._tc is previous_tc:
-                    continue
-                previous_tc = cell._tc
-                cells.append(self._cell_text(cell.text))
+            # Physical cells preserve vertical continuation and omitted grid
+            # positions; row.cells repeats merged origin text in later rows.
+            for tc in row._tr.tc_lst:
+                cell = _Cell(tc, table)
+                cells.append(self._cell_text(self._cell_content(cell)))
             row_text = " | ".join(cells).strip()
             if row_text:
                 rows.append(row_text)

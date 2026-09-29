@@ -11,6 +11,20 @@ FIXTURE = Path(__file__).parent / "fixtures" / "sample_regulation.md"
 
 
 class StructureDetectorTests(unittest.TestCase):
+    def test_article_headings_joined_after_sentence_end_are_separated(self) -> None:
+        text = "제1조(목적) 장비를 관리한다.제2조(신청) 3일 전에 신청한다.제2조의2(승인) 담당자가 승인한다."
+        nodes = StructureDetector().detect_from_text(text)
+        articles = [node for node in nodes if node.node_type == "article"]
+        self.assertEqual(["제1조", "제2조", "제2조의2"], [node.number for node in articles])
+        self.assertIn("3일 전에 신청한다.", articles[1].text)
+        self.assertNotIn("제2조의2", articles[1].text)
+
+    def test_joined_article_reference_keeps_its_host_clause(self) -> None:
+        text = "제1조(신청) 기한을 정한다.제2조(승인)에 따라 처리한다."
+        nodes = StructureDetector().detect_from_text(text)
+        self.assertEqual(["제1조"], [node.number for node in nodes if node.node_type == "article"])
+        self.assertIn("제2조(승인)에 따라", nodes[0].text)
+
     def test_detects_korean_regulation_hierarchy(self) -> None:
         text = FIXTURE.read_text(encoding="utf-8")
         nodes = StructureDetector().detect_from_text(text)

@@ -23,6 +23,7 @@ include docs/authoring_security_model_ko.md
 include docs/authoring_workspace_rollout_plan_ko.md
 include docs/beginner_first_success_ko.md
 include docs/beginner_guided_fix_verification_ko.md
+include docs/focused_beginner_verification_ko.md
 include docs/beginner_live_verification_ko.md
 include docs/beginner_maintenance_orchestration_plan_ko.md
 include docs/beginner_overnight_plan_ko.md

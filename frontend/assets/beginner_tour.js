@@ -46,6 +46,11 @@
       let elements = [];
       try {elements = [...doc.querySelectorAll(selector)];} catch (_) {continue;}
       for (const element of elements) {
+        // A marker must never send a beginner to an unusable control. This
+        // also covers Streamlit's wrapper around a disabled button/input.
+        const controls = [...element.querySelectorAll('button,input,textarea,select,a[href]')];
+        if (element.matches('[disabled],[aria-disabled="true"]') ||
+            (controls.length && controls.every(control => control.disabled || control.getAttribute('aria-disabled') === 'true'))) continue;
         // Let the user open collapsed sections before pointing at their contents.
         const closed = [];
         for (let parent=element.parentElement; parent; parent=parent.parentElement) {
