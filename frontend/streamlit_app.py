@@ -9243,8 +9243,8 @@ def _page_preprocess() -> None:
     if upload_sources and beginner_preprocess_confirmations_complete:
         _render_beginner_action_marker(
             1,
-            "선택한 파일의 전처리를 시작하세요",
-            "문서 정보가 맞는지 확인한 뒤 바로 아래 전처리 시작 버튼을 누르세요.",
+            "파일 내용을 정리해 볼까요?",
+            "아래 '전처리 시작'을 누르세요. 전처리는 파일을 읽고, 확인하기 좋게 나누는 일이에요. 끝나면 내용을 확인하는 화면으로 갈 수 있어요.",
             control_key_prefix="preprocess-start",
             substep=5,
         )
@@ -9756,7 +9756,7 @@ def _quality_mojibake_counts(quality_report) -> tuple[int, int, int]:
     )
 
 
-def _render_quality_banner(quality_report) -> None:
+def _render_quality_banner(quality_report, *, at_review: bool = False) -> None:
     mojibake_chunks, mojibake_metadata, mojibake_removed = _quality_mojibake_counts(quality_report)
     if mojibake_chunks or mojibake_metadata:
         # 글자가 깨진 문서에 "통과했으니 넘어가도 된다"고 말하면 안 된다.
@@ -9783,9 +9783,9 @@ def _render_quality_banner(quality_report) -> None:
         )
         return
     if quality_report and quality_report.passed:
-        st.success("품질 검사를 통과했습니다. '③ 검수하고 승인' 단계로 넘어가셔도 됩니다.")
+        st.success("파일 정리가 끝났어요. 이제 원래 문서와 내용이 같은지 확인해 주세요." if at_review else "품질 검사를 통과했습니다. '③ 검수하고 승인' 단계로 넘어가셔도 됩니다.")
     elif quality_report:
-        st.warning("품질 검사에서 확인이 필요한 항목이 있습니다. 아래 '이슈' 탭에서 내용을 확인해 주세요.")
+        st.warning("파일을 읽으며 주의할 점이 발견됐어요. 아래 내용을 원래 문서와 비교하고, 자세한 결과는 '이 규정의 상태 자세히 보기'에서 확인하세요." if at_review else "품질 검사에서 확인이 필요한 항목이 있습니다. 아래 '이슈' 탭에서 내용을 확인해 주세요.")
     else:
         st.info("아직 이 문서의 품질 검사 결과가 없습니다.")
 
@@ -10611,9 +10611,20 @@ def _render_approval_chunk_confirmation_controls(
         if str(decision) in {"reflect", "skip"}
     }
 
-    st.markdown("**이 조항 검수 확인**")
+    focused = _beginner_focus_review()
+    st.markdown("**내용이 맞는지 확인해요**" if focused else "**이 조항 검수 확인**")
+    if focused:
+        with st.expander("잘 모르겠어요 · 확인 방법 보기", expanded=False):
+            st.markdown(
+                "1. **원래 문서**와 **저장할 내용**을 한 줄씩 읽어 보세요.\n"
+                "2. 날짜, 금액, 사람 이름, 해야 할 일이 같은지 보세요. 표는 칸이 빠지거나 순서가 바뀌지 않았는지 보세요.\n"
+                "3. 아래에 주의할 점이 있으면, 실제로 그 문제가 있는지 원래 문서에서 찾아보세요.\n"
+                "4. 문제가 있으면 **고칠 곳이 있어요**, 그 문제가 없으면 **이 문제는 없어요**를 누르세요."
+            )
+            st.info("아직 모르겠으면 여기서 멈추고 문서를 잘 아는 사람에게 물어보세요. 이 도움말을 열어도 확인이나 승인이 되지 않습니다.")
+            st.caption("[위치]는 문서에서 이 내용이 있는 곳이고, [본문] 다음부터가 실제 내용이에요. 표의 | 기호는 칸을 나누는 표시예요.")
     if review_items:
-        st.caption("표시된 검수 항목마다 판단한 뒤, 원문과 최종본을 직접 대조해 주세요.")
+        st.caption("아래 주의할 점을 원래 문서에서 찾아보고, 맞는 버튼을 골라 주세요." if focused else "표시된 검수 항목마다 판단한 뒤, 원문과 최종본을 직접 대조해 주세요.")
         for item in review_items:
             item_id = str(item["item_id"])
             decision = ai_decisions.get(item_id, "")
@@ -10624,9 +10635,9 @@ def _render_approval_chunk_confirmation_controls(
             decision_group_key = _approval_chunk_state_key(document_id, chunk_id, f"decision-{item_id}")
             decision_guide = st.empty()
             with st.container(key=decision_group_key):
-                reflect_col, skip_col, status_col = st.columns([1, 1, 3])
+                reflect_col, skip_col, status_col = st.columns([2, 2, 3] if focused else [1, 1, 3])
             if reflect_col.button(
-                "수정 필요로 판단",
+                "고칠 곳이 있어요" if focused else "수정 필요로 판단",
                 key=reflect_button_key,
                 type="primary" if decision == "reflect" else "secondary",
             ):
@@ -10637,7 +10648,7 @@ def _render_approval_chunk_confirmation_controls(
                     decision="reflect",
                 )
             if skip_col.button(
-                "해당 없음",
+                "이 문제는 없어요" if focused else "해당 없음",
                 key=skip_button_key,
                 type="primary" if decision == "skip" else "secondary",
             ):
@@ -10651,8 +10662,8 @@ def _render_approval_chunk_confirmation_controls(
             if current_decision not in {"reflect", "skip"}:
                 with decision_guide.container():
                     _render_beginner_action_marker(
-                        3, "검수 항목을 읽고 판단하세요",
-                        "위 검수 의견을 원문과 비교하세요. 수정이 필요하면 '수정 필요로 판단', 해당하지 않으면 '해당 없음'을 직접 선택하세요.",
+                        3, "주의할 점을 보고 버튼을 골라 주세요",
+                        "원래 문서와 비교해 고칠 곳이 있는지 골라 주세요. 어렵다면 위의 '잘 모르겠어요'를 펼쳐 보세요.",
                         control_keys=(decision_group_key,), substep=2,
                     )
             status_col.caption(
@@ -10686,7 +10697,7 @@ def _render_approval_chunk_confirmation_controls(
             "수정 필요 항목 처리 메모",
             key=str(action_resolution["action_resolution_note_key"]),
             placeholder="본문을 직접 고치지 않았다면 어떻게 해결·확인했는지 적어 주세요.",
-            help="최종본을 수정했거나 확인 방법을 메모해 두는 것을 권고합니다. 비워 두어도 최종 승인 버튼은 사용할 수 있습니다.",
+            help=("저장할 내용을 고치거나, 문제를 어떻게 해결했는지 적어야 다음으로 갈 수 있어요." if focused else "최종본을 수정했거나 확인 방법을 메모해 두는 것을 권고합니다. 비워 두어도 최종 승인 버튼은 사용할 수 있습니다."),
             on_change=_approval_sync_action_resolution_note,
             kwargs={
                 "human_confirmed_key": human_confirmed_key,
@@ -10701,7 +10712,7 @@ def _render_approval_chunk_confirmation_controls(
         if not bool(action_resolution["action_required_resolved"]):
             _render_beginner_action_marker(
                 3, "수정하거나 처리 방법을 기록하세요",
-                "위의 가운데 최종본을 수정하거나, 이 입력란에 확인·해결한 방법을 적으세요. 입력 후 Tab을 눌러 저장합니다.",
+                "위의 저장할 내용을 고치거나, 여기에 문제를 해결한 방법을 적으세요. 입력을 마치면 칸 밖을 누르거나 Tab 키를 누르세요.",
                 control_keys=(str(action_resolution["action_resolution_note_key"]),), substep=2,
             )
             st.warning(
@@ -10721,13 +10732,13 @@ def _render_approval_chunk_confirmation_controls(
         if ai_result_confirmed and bool(action_resolution["action_required_resolved"]):
             confirm_key = _approval_chunk_state_key(document_id, chunk_id, "confirm-and-next")
             _render_beginner_action_marker(
-                3, "원문과 최종본을 확인하고 다음으로 가세요",
-                "위 원문·최종본·AI 의견을 읽으세요. 내용이 맞을 때만 아래 버튼을 누릅니다. "
-                "조항 확인 뒤 마지막에 별도로 승인합니다.",
+                3, "내용이 맞으면 다음으로 가요",
+                "원래 문서와 저장할 내용을 비교했나요? AI 의견도 있으면 읽어 보세요. "
+                "내용이 맞을 때 아래 버튼을 누르세요. 모든 내용을 확인한 뒤 마지막에 승인합니다.",
                 control_keys=(confirm_key,), substep=2,
             )
             st.button(
-                "원문·최종본 확인 완료 · 다음", key=confirm_key, type="primary", width="stretch",
+                "내용이 맞아요 · 다음", key=confirm_key, type="primary", width="stretch",
                 on_click=_confirm_focused_review,
                 args=(document_id, chunk_id, _approval_ai_result_signature(item_ids, ai_decisions)),
             )
@@ -10901,10 +10912,11 @@ def _render_approval_compare_sheet(
             f"{sheet_start + 1:,}~{sheet_start + len(visible_rows):,}번째 조항을 표시하고 있습니다."
         )
 
-    header_cols = st.columns(3)
-    header_cols[0].markdown("**원본**")
-    header_cols[1].markdown("**전처리본 · ✅ 최종본**")
-    header_cols[2].markdown("**AI 검수 의견**")
+    if not focused:
+        header_cols = st.columns(3)
+        header_cols[0].markdown("**원본**")
+        header_cols[1].markdown("**전처리본 · ✅ 최종본**")
+        header_cols[2].markdown("**AI 검수 의견**")
     if read_only:
         st.caption(
             "이미 승인된 조항입니다. ✅ 최종본 칸에는 승인한 본문이 표시되며 여기서는 편집할 수 없습니다. "
@@ -10912,7 +10924,7 @@ def _render_approval_compare_sheet(
             "내용을 고쳐야 하면 같은 원본을 새 버전으로 다시 전처리해 승인하세요."
         )
     elif focused:
-        st.caption("가운데 최종본이 승인됩니다. AI 의견과 수정 제안은 오른쪽에서 확인하세요.")
+        st.caption("원래 문서와 저장할 내용을 비교하세요. 고친 뒤 칸 밖을 누르면 수정 내용이 유지됩니다. AI가 제안한 내용은 아래에서 볼 수 있어요.")
     else:
         # 마무리 문장('고칠 곳은 …')은 아래 안내가 이미 달고 있다. 여기서 한 번 더 쓰면
         # 같은 문장이 한 줄 안에 두 번 나온다.
@@ -10978,19 +10990,24 @@ def _render_approval_compare_sheet(
             if edited_text_widget_key not in st.session_state:
                 st.session_state[edited_text_widget_key] = st.session_state[edited_text_key]
 
-        location = chunk.metadata.get("hierarchy_path") or chunk.chunk_type
-        attention_mark = " · ⚠️ 검수 주의" if bool(row.get("attention")) else ""
+        location = f"지금 확인할 내용 {complete_count + 1}" if focused else chunk.metadata.get("hierarchy_path") or chunk.chunk_type
+        attention_mark = (" · ⚠️ 아래 주의할 점을 읽어 주세요" if focused else " · ⚠️ 검수 주의") if bool(row.get("attention")) else ""
         regulation_mark = (
             f"{row['document_label']} · " if show_document_label and row.get("document_label") else ""
         )
         st.markdown(f"**{regulation_mark}{location}**{attention_mark}")
-        row_cols = st.columns(3)
+        row_cols = st.columns(2 if focused else 3)
         with row_cols[0]:
+            if focused:
+                st.markdown("**원래 문서**")
             _render_original_source_preview(row_document, chunk)
         # 편집 칸은 언제나 가운데다. AI 결과에 따라 칸이 좌우로 옮겨 다니면
         # 조항마다 어디를 고쳐야 하는지 알 수 없다.
         edit_col = row_cols[1]
-        with row_cols[2]:
+        ai_area = st.container() if focused else row_cols[2]
+        with ai_area:
+            if focused:
+                st.markdown("**AI가 확인하거나 제안한 내용**")
             _render_agent_review_findings(
                 chunk,
                 selected_for_review=cid in row_ai_selected_chunk_ids,
@@ -11009,6 +11026,8 @@ def _render_approval_compare_sheet(
                         help="현재 편집 내용을 이 제안으로 바꿉니다. 자동 승인하지 않으며 다시 확인해야 합니다.",
                     )
         with edit_col:
+            if focused:
+                st.markdown("**저장할 내용 · 여기서 고칠 수 있어요**")
             if read_only:
                 st.code(str(getattr(chunk, "text", "") or ""), language="text", wrap_lines=True)
             else:
@@ -11153,9 +11172,9 @@ def _page_approval(ctx: dict | None) -> None:
     # AI 추가 검수를 쓰지 않은 규정은 '② 결과 확인'을 건너뛰므로, 품질 경고를
     # 여기서 보여 주지 않으면 깨진 글자를 아무도 못 보고 승인하게 된다.
     if not _results_step_is_used(ctx):
-        _render_quality_banner(ctx.get("quality_report"))
+        _render_quality_banner(ctx.get("quality_report"), at_review=True)
     elif _beginner_focus_review():
-        _render_quality_banner(ctx.get("quality_report"))
+        _render_quality_banner(ctx.get("quality_report"), at_review=True)
 
     # 선택한 규정 전부의 청크를 미리 읽으면 규정 수에 비례해 화면이 느려진다.
     # 전체 규정 승인을 실제로 쓸 때만 나머지 규정을 불러온다(미로딩 규정은 fail-closed로 '미완료' 취급).
@@ -11278,8 +11297,14 @@ def _page_approval(ctx: dict | None) -> None:
             beginner_mode_active=beginner_mode_active,
         )
 
-    if review_attention:
+    pending_attention_count = sum(
+        chunk.chunk_id in review_attention and chunk.approval_status != "approved"
+        for chunk in chunks
+    )
+    if review_attention and (not _beginner_focus_review() or pending_attention_count):
         st.warning(
+            f"주의해서 볼 내용이 {pending_attention_count:,}개 있어요. 아래에서 하나씩 확인해 주세요."
+            if _beginner_focus_review() else
             f"검수 주의 청크가 {len(review_attention):,}개 있습니다. "
             "아래 비교 화면에서 ⚠️ 표시가 붙은 조항을 특히 주의해서 확인해 주세요."
         )
@@ -11391,6 +11416,8 @@ def _page_approval(ctx: dict | None) -> None:
     if not pending_compare_ids:
         if approved_compare_ids:
             st.success(
+                f"내용 {len(approved_compare_ids):,}개의 승인이 끝났어요. 다시 읽으려면 아래 '승인한 내용 다시 보기'를 펼치세요."
+                if _beginner_focus_review() else
                 f"이 규정의 조항 {len(approved_compare_ids):,}개는 모두 승인이 끝나 새로 검수할 조항이 없습니다. "
                 "아래에 승인된 최종본을 원본과 나란히 펼쳐 두었으니 그대로 확인하세요."
             )
@@ -11516,8 +11543,10 @@ def _page_approval(ctx: dict | None) -> None:
         for chunk in document_pending_chunks
     ]
 
-    st.markdown(f"### 3단계 · '{opened_regulation_label}' 최종 확정")
+    st.markdown("### 마지막 확인" if _beginner_focus_review() else f"### 3단계 · '{opened_regulation_label}' 최종 확정")
     st.caption(
+        f"전체 {total_chunks:,}개 중 {approved_count:,}개를 승인했어요. 남은 내용은 {len(pending_compare_ids):,}개예요."
+        if _beginner_focus_review() else
         f"이 규정 조항 {total_chunks:,}개 중 승인 {approved_count:,}개 · 남은 미승인 "
         f"{len(pending_compare_ids):,}개. 최종 확정을 누르면 고친 내용 저장 → 승인 → AI 등록(색인)이 "
         "한 번에 실행됩니다."
@@ -11533,7 +11562,7 @@ def _page_approval(ctx: dict | None) -> None:
             )
         else:
             st.info("아직 승인된 조항은 없습니다. 입력한 수정 내용을 확인하고 원인을 해결한 뒤 다시 실행하세요.")
-    if len(regulation_units) > 1:
+    if len(regulation_units) > 1 and not _beginner_focus_review():
         st.caption(
             f"규정을 하나씩 열기 어려우면 옆의 **'이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정'** "
             f"버튼으로 이 파일의 미승인 조항 {len(document_pending_compare_ids):,}개를 한 번에 승인·색인할 수 있습니다."
@@ -11547,13 +11576,15 @@ def _page_approval(ctx: dict | None) -> None:
             )
         elif not mcp_connection_gate.get("ready"):
             st.warning(
+                "확인한 내용을 승인하면 AI가 답을 찾을 수 있도록 준비합니다. 아래 버튼을 누른 뒤 완료될 때까지 기다려 주세요."
+                if _beginner_focus_review() else
                 "AI는 '승인 후 색인된' 내용만 볼 수 있습니다. 승인과 색인을 마친 뒤에도 숫자가 맞지 않으면 아래 '다시 색인하기'를 눌러 주세요.\n\n"
                 "Claude/MCP can answer only from approved chunks that are currently indexed. "
                 "If Claude sees smoke-test documents or fewer records than expected, approve the intended chunks "
                 "and run Reindex approved chunks with the same data directory and tenant."
             )
         else:
-            st.success("승인된 모든 청크가 색인되어 AI에서 사용할 수 있습니다.")
+            st.success("질문할 준비가 끝났어요. 아래 안내에 따라 AI 질문 화면으로 이동하세요." if _beginner_focus_review() else "승인된 모든 청크가 색인되어 AI에서 사용할 수 있습니다.")
     if reviewed_approval_entries:
         st.info(
             f"위에서 확인한 미승인 조항 {len(reviewed_approval_entries):,}/{len(pending_review_entries):,}개가 "
@@ -11612,8 +11643,8 @@ def _page_approval(ctx: dict | None) -> None:
     elif indexing_packages_ready and approved_count < total_chunks and approve_enabled:
         _render_beginner_action_marker(
             3,
-            "확인한 내용을 최종 확정하세요",
-            "위에서 비교한 내용을 바로 아래 '이 규정 최종 확정' 버튼으로 저장·승인·색인하세요.",
+            "마지막으로 승인해 주세요",
+            "아래 버튼을 누르면 확인한 내용을 저장하고 승인합니다. 이어서 AI가 이 내용에서 답을 찾도록 준비해요.",
             control_keys=(approve_index_button_key,),
             substep=3,
         )
@@ -11788,7 +11819,7 @@ def _page_approval(ctx: dict | None) -> None:
         st.rerun()
 
     if (not _beginner_focus_review() or (can_approve and approved_count < total_chunks)) and approve_col.button(
-        "이 규정 최종 확정 · 승인하고 색인",
+        "승인하고 AI 질문 준비하기" if _beginner_focus_review() else "이 규정 최종 확정 · 승인하고 색인",
         type="primary",
         key=approve_index_button_key,
         disabled=not can_approve or approved_count >= total_chunks,
@@ -13193,7 +13224,7 @@ def _page_connect(
                 "1. 질문할 기관을 선택합니다.  "
                 "\n2. 규정별 승인·색인 준비 상태에서 `질문 가능`을 확인합니다.  "
                 "\n3. 대화할 규정 하나를 선택합니다.  "
-                "\n4. `Ollama · qwen3:8b 연결 확인`을 누른 뒤 질문합니다.  "
+                "\n4. `AI 연결 확인`을 누른 뒤 질문합니다.  "
                 "\n5. 진행 게이지가 끝나면 답변과 펼쳐진 근거 인용을 함께 확인합니다."
             )
             st.info(

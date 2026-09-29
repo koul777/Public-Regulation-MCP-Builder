@@ -855,7 +855,7 @@ class StreamlitResultsStepVisibilityTests(unittest.TestCase):
 
         # ②를 건너뛰면 깨진 글자 경고를 볼 곳이 ③밖에 없다.
         self.assertIn(
-            "if not _results_step_is_used(ctx):\n        _render_quality_banner(ctx.get(\"quality_report\"))",
+            "if not _results_step_is_used(ctx):\n        _render_quality_banner(ctx.get(\"quality_report\"), at_review=True)",
             source,
         )
 

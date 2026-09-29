@@ -641,8 +641,8 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 and isinstance(call.func, ast.Attribute)
                 and call.func.attr == "button"
                 and call.args
-                and isinstance(call.args[0], ast.Constant)
-                and call.args[0].value == "이 규정 최종 확정 · 승인하고 색인"
+                and any(isinstance(value, ast.Constant) and value.value == "승인하고 AI 질문 준비하기"
+                        for value in ast.walk(call.args[0]))
                 for call in ast.walk(node.test)
             )
         )
@@ -3219,15 +3219,15 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         self.assertEqual(document_id, self.app.session_state["document_id"])
         journey = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-journey" in str(item.value))
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
-        self.assertIn("검수 항목을 읽고 판단하세요", markers)
+        self.assertIn("주의할 점을 보고 버튼을 골라 주세요", markers)
         # Both choices must be reachable inside one spotlight; guidance must
         # not silently pick a review decision or sign an approval.
-        next(item for item in self.app.button if item.label == "해당 없음").click().run()
+        next(item for item in self.app.button if item.label in {"해당 없음", "이 문제는 없어요"}).click().run()
         self.assertFalse(self.app.exception)
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
-        self.assertIn("원문과 최종본을 확인하고 다음으로 가세요", markers)
-        self.assertNotIn("검수 항목을 읽고 판단하세요", markers)
-        next(item for item in self.app.button if item.label == "원문·최종본 확인 완료 · 다음").click().run()
+        self.assertIn("내용이 맞으면 다음으로 가요", markers)
+        self.assertNotIn("주의할 점을 보고 버튼을 골라 주세요", markers)
+        next(item for item in self.app.button if item.label == "내용이 맞아요 · 다음").click().run()
         self.assertFalse(self.app.exception)
         self.assertEqual([], repository.list_approval_journal_records(document_id))
         self.assertIn("1 / 3 완료", journey)
@@ -3295,7 +3295,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         ):
             next(
                 button for button in self.app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             ).click().run()
         self.assertFalse(self.app.exception)
 

@@ -55,10 +55,10 @@ def _confirm_rendered_approval_rows(app) -> None:
 
     if "beginner_guide_enabled" in app.session_state and app.session_state["beginner_guide_enabled"]:
         for _ in range(100):
-            choices = [button.key for button in app.button if button.label == "해당 없음"]
+            choices = [button.key for button in app.button if button.label in {"해당 없음", "이 문제는 없어요"}]
             for key in choices:
                 app.button(key=key).click().run()
-            confirm = [button for button in app.button if button.label == "원문·최종본 확인 완료 · 다음"]
+            confirm = [button for button in app.button if button.label == "내용이 맞아요 · 다음"]
             if not confirm:
                 return
             confirm[0].click().run()
@@ -142,7 +142,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             app, settings = self._recovery_app(Path(tmp))
             app.run()
             with patch("app.api.routes_documents.index_document", side_effect=RuntimeError("synthetic indexing failure")):
-                next(b for b in app.button if b.label == "이 규정 최종 확정 · 승인하고 색인").click().run()
+                next(b for b in app.button if b.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}).click().run()
             self.assertFalse(app.exception)
             self.assertEqual("1", next(m.value for m in app.metric if m.label == "승인된 청크 (Approved chunks)"))
             self.assertTrue(any("저장된 승인 1개는 유지됩니다" in i.value for i in app.info))
@@ -172,12 +172,12 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             app.run()
             self.assertFalse(app.exception)
             self.assertEqual(1, len([t for t in app.text_area if t.label == "제안 내용 수정"]))
-            self.assertFalse(any(b.label == "이 규정 최종 확정 · 승인하고 색인" for b in app.button))
+            self.assertFalse(any(b.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"} for b in app.button))
             for _ in range(2):
                 for b in list(app.button):
-                    if b.label == "해당 없음":
+                    if b.label in {"해당 없음", "이 문제는 없어요"}:
                         next(x for x in app.button if x.key == b.key).click().run()
-                confirm = next(b for b in app.button if b.label == "원문·최종본 확인 완료 · 다음")
+                confirm = next(b for b in app.button if b.label == "내용이 맞아요 · 다음")
                 self.assertFalse(confirm.disabled)
                 confirm.click().run()
                 self.assertFalse(app.exception)
@@ -186,16 +186,63 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             next(b for b in app.button if b.label == "이 조항 다시 확인").click().run()
             self.assertFalse(app.exception)
             self.assertEqual(1, len([t for t in app.text_area if t.label == "제안 내용 수정"]))
-            self.assertFalse(any(b.label == "이 규정 최종 확정 · 승인하고 색인" for b in app.button))
+            self.assertFalse(any(b.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"} for b in app.button))
             next(t for t in app.text_area if t.label == "제안 내용 수정").set_value("원문 대조 후 수정한 최종본").run()
             _confirm_rendered_approval_rows(app)
-            approve = next(b for b in app.button if b.label == "이 규정 최종 확정 · 승인하고 색인")
+            approve = next(b for b in app.button if b.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"})
             self.assertFalse(approve.disabled)
             approve.click().run()
             self.assertFalse(app.exception)
             self.assertEqual(1, len(repository.list_approval_records("doc_streamlit_approval")))
             self.assertEqual("원문 대조 후 수정한 최종본", repository.get_chunks("doc_streamlit_approval")[1].text)
             self.assertFalse(next(b.disabled for b in app.button if b.label == "④ Qwen 규정 챗봇·AI 연결로 이동"))
+
+    def test_beginner_help_and_fix_choice_do_not_confirm_or_approve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, settings = self._recovery_app(Path(tmp))
+            repository = JsonRepository(settings)
+            app.session_state["beginner_guide_enabled"] = True
+            app.session_state["beginner_guide_choice_made"] = True
+            app.run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any(e.label == "잘 모르겠어요 · 확인 방법 보기" for e in app.expander))
+            self.assertTrue(any("문서를 잘 아는 사람" in i.value for i in app.info))
+            self.assertFalse(any(b.label == "내용이 맞아요 · 다음" for b in app.button))
+            self.assertFalse(repository.list_approval_records("doc_streamlit_approval"))
+            choices = [b.key for b in app.button if b.label == "고칠 곳이 있어요"]
+            self.assertTrue(choices)
+            for key in choices:
+                app.button(key=key).click().run()
+            self.assertFalse(app.exception)
+            self.assertFalse(any(b.label == "내용이 맞아요 · 다음" for b in app.button))
+            self.assertFalse(any(b.label == "승인하고 AI 질문 준비하기" for b in app.button))
+            next(t for t in app.text_area if t.label == "수정 필요 항목 처리 메모").set_value(
+                "합성 문서의 표를 원본과 비교해 칸이 빠지지 않았음을 확인했습니다."
+            ).run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any(b.label == "내용이 맞아요 · 다음" for b in app.button))
+            self.assertFalse(repository.list_approval_records("doc_streamlit_approval"))
+
+    def test_beginner_ai_proposal_stays_visible_below_comparison_and_requires_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, settings = self._recovery_app(Path(tmp))
+            repository = JsonRepository(settings)
+            chunks = repository.get_chunks("doc_streamlit_approval")
+            original = chunks[0].text
+            proposal = original + " 합성 AI 제안 문장"
+            chunks[0].ai_preprocessed_text = proposal
+            repository.save_chunks("doc_streamlit_approval", chunks)
+            app.session_state["beginner_guide_enabled"] = True
+            app.session_state["beginner_guide_choice_made"] = True
+            app.run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any(c.value == proposal for c in app.code))
+            self.assertEqual(original, next(t.value for t in app.text_area if t.label == "제안 내용 수정"))
+            next(b for b in app.button if b.label == "AI 제안을 최종본에 반영").click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(proposal, next(t.value for t in app.text_area if t.label == "제안 내용 수정"))
+            self.assertEqual(original, repository.get_chunks("doc_streamlit_approval")[0].text)
+            self.assertFalse(repository.list_approval_records("doc_streamlit_approval"))
 
     def test_stored_ai_proposal_is_visible_and_only_explicit_apply_changes_editor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,7 +273,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             edited = "승인 전 오류가 나도 남겨야 하는 수정 내용"
             next(t for t in app.text_area if t.label == "제안 내용 수정").set_value(edited).run()
             with patch("app.api.routes_documents.approve_review_chunks", side_effect=RuntimeError("synthetic approval failure")):
-                next(b for b in app.button if b.label == "이 규정 최종 확정 · 승인하고 색인").click().run()
+                next(b for b in app.button if b.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}).click().run()
             self.assertFalse(app.exception)
             self.assertTrue(any("아직 승인된 조항은 없습니다" in i.value for i in app.info))
             self.assertEqual(edited, next(t.value for t in app.text_area if t.label == "제안 내용 수정"))
@@ -870,7 +917,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
                     if area.label == "수정 필요 항목 처리 메모"
                 )
             )
-            next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인").click().run()
+            next(button for button in app.button if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}).click().run()
 
             saved = JsonRepository(settings).get_chunks("doc_streamlit_approval")[0]
 
@@ -924,7 +971,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             one_click_approve = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
             self.assertTrue(all(checkbox.disabled for checkbox in human_checks))
             self.assertFalse(one_click_approve.disabled)
@@ -951,7 +998,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             resolved_approve = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
 
         self.assertFalse(app.exception)
@@ -988,7 +1035,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             ready_button = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
             self.assertFalse(ready_button.disabled)
 
@@ -998,7 +1045,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             override_button = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
 
         self.assertFalse(override_button.disabled)
@@ -1062,7 +1109,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             first_page_button = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
             self.assertFalse(first_page_button.disabled)
 
@@ -1086,7 +1133,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             all_pages_button = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
             next(
                 control
@@ -1203,7 +1250,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            self.assertFalse(any(button.label == "이 규정 최종 확정 · 승인하고 색인" for button in app.button))
+            self.assertFalse(any(button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"} for button in app.button))
             next(
                 radio for radio in app.radio if radio.label == "기본 작업 순서"
             ).set_value("④ Qwen 규정 챗봇·AI 연결").run()
@@ -1347,7 +1394,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             approve = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
             self.assertFalse(approve.disabled)
             fake_embedding = SimpleNamespace(
@@ -1413,7 +1460,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
 
         self.assertFalse(app.exception)
         self.assertEqual([], override_areas)
-        self.assertFalse(any(button.label == "이 규정 최종 확정 · 승인하고 색인" for button in app.button))
+        self.assertFalse(any(button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"} for button in app.button))
 
     def test_general_mode_records_explicit_unreviewed_approval_override(self) -> None:
         if AppTest is None:
@@ -1453,7 +1500,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             approve = next(
                 button
                 for button in app.button
-                if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             )
             self.assertFalse(approve.disabled)
             fake_embedding = SimpleNamespace(
@@ -1529,7 +1576,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             self.assertIn("second draft content", values)
 
             self.assertFalse(app.exception)
-            approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
+            approve = next(button for button in app.button if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"})
             self.assertFalse(approve.disabled)
             _confirm_rendered_approval_rows(app)
             self.assertTrue(
@@ -1538,7 +1585,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             self.assertTrue(
                 app.session_state["approval:doc_streamlit_approval:chunk-streamlit-second:human_confirmed"]
             )
-            approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
+            approve = next(button for button in app.button if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"})
             self.assertFalse(approve.disabled)
 
     def test_remaining_review_buttons_preserve_completed_work_and_fill_only_missing_items(self) -> None:
@@ -1638,10 +1685,10 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
+            approve = next(button for button in app.button if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"})
             self.assertFalse(approve.disabled)
             _confirm_rendered_approval_rows(app)
-            approve = next(button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인")
+            approve = next(button for button in app.button if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"})
             approve.click().run()
 
             chunks = {chunk.chunk_id: chunk for chunk in JsonRepository(settings).get_chunks("doc_streamlit_approval")}
@@ -1798,7 +1845,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
 
             _confirm_rendered_approval_rows(app)
             next(
-                button for button in app.button if button.label == "이 규정 최종 확정 · 승인하고 색인"
+                button for button in app.button if button.label in {"이 규정 최종 확정 · 승인하고 색인", "승인하고 AI 질문 준비하기"}
             ).click().run()
 
             chunks = {chunk.chunk_id: chunk for chunk in JsonRepository(settings).get_chunks("doc_streamlit_bundle")}

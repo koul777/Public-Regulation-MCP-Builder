@@ -626,8 +626,8 @@ def _qwen_probe_readiness(
 def _qwen_tour_step(probe_ok: bool, messages: list[dict[str, Any]]) -> tuple[int, str, str, str]:
     """Choose guidance from real connection/answer state, without changing it."""
     if not probe_ok:
-        return (3, "Qwen 연결 확인 버튼을 누르세요",
-                "Ollama와 qwen3:8b가 준비됐는지 확인합니다. 실패하면 화면의 복구 안내를 따라 다시 누르세요.",
+        return (3, "AI 연결 확인을 눌러 주세요",
+                "이 컴퓨터의 AI가 답할 준비가 됐는지 확인해요. 처음에는 시간이 걸릴 수 있어요. 실패하면 화면의 안내에 따라 다시 시도하세요.",
                 "div.st-key-qwen-probe")
     last = messages[-1] if messages else {}
     if last.get("role") == "assistant" and not last.get("error"):
@@ -669,10 +669,9 @@ def _render_qwen_blocked_state(
 
 def main() -> None:
     st.set_page_config(page_title="로컬 Qwen 규정 챗봇", page_icon="💬", layout="wide")
-    st.title("로컬 Qwen 규정 챗봇")
+    st.title("규정에 질문하기")
     st.caption(
-        "빌더와 별도로 실행되는 localhost 전용 화면입니다. 선택한 규정의 승인·색인된 조항만 "
-        "qwen3:8b에 전달하며 외부 AI 서비스에는 보내지 않습니다."
+        "확인을 마친 규정으로 AI에게 물어보세요. 이 컴퓨터의 Qwen AI가 답하며, 문서를 외부 AI 서비스에 보내지 않습니다."
     )
 
     settings = get_settings()
@@ -761,22 +760,22 @@ def main() -> None:
         role=API_ROLE_ADMIN,
     )
     readiness_items = [document_readiness(repository, document, auth) for document in documents]
-    st.markdown("### 2. 규정 준비 상태를 확인하세요")
-    st.caption("목록에는 전처리가 끝난 규정만 보입니다. ‘질문 가능’인 규정만 채팅 선택란에 나타납니다.")
-    st.dataframe(
-        [
-            {
-                "규정": _document_label(item.document),
-                "승인 조항": f"{item.approved_chunk_count}/{item.active_chunk_count}",
-                "검토 대기": item.pending_review_count,
-                "색인 상태": str(item.gate.get("indexing_status") or "확인 필요"),
-                "판정": readiness_message(item),
-            }
-            for item in readiness_items
-        ],
-        hide_index=True,
-        width="stretch",
-    )
+    with st.expander("규정 준비 상태 자세히 보기", expanded=not guided):
+        st.caption("확인과 승인을 마쳐 질문할 준비가 된 규정만 선택할 수 있어요.")
+        st.dataframe(
+            [
+                {
+                    "규정": _document_label(item.document),
+                    "승인 조항": f"{item.approved_chunk_count}/{item.active_chunk_count}",
+                    "검토 대기": item.pending_review_count,
+                    "색인 상태": str(item.gate.get("indexing_status") or "확인 필요"),
+                    "판정": readiness_message(item),
+                }
+                for item in readiness_items
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
     ready_by_id = {
         str(getattr(item.document, "document_id", "") or ""): item
@@ -793,7 +792,7 @@ def main() -> None:
         st.stop()
 
     selected_document_id = st.selectbox(
-        "3. 질문할 규정 하나를 선택하세요",
+        "2. 질문할 규정 하나를 선택하세요",
         options=list(ready_by_id),
         format_func=lambda document_id: _document_label(ready_by_id[document_id].document),
         index=None if guided else 0,
@@ -806,15 +805,16 @@ def main() -> None:
         return
     selected = ready_by_id[selected_document_id]
     st.success(
-        f"질문 범위가 ‘{_document_label(selected.document)}’ 한 건으로 고정되었습니다. "
-        f"승인·색인 조항 {selected.approved_chunk_count}개만 검색합니다."
+        f"‘{_document_label(selected.document)}’에 대해 질문할 수 있어요. "
+        f"확인과 승인을 마친 내용 {selected.approved_chunk_count}개에서 답을 찾아요."
     )
 
-    st.markdown("### 4. Ollama와 Qwen3 8B 연결을 확인하세요")
+    st.markdown("### 3. AI가 준비됐는지 확인해요")
     probe_signature = _probe_signature(settings)
     probe_state = st.session_state.get(PROBE_SESSION_KEY)
     probe_readiness = _qwen_probe_readiness(probe_state, signature=probe_signature)
-    if st.button("Ollama · qwen3:8b 연결 확인", width="stretch", key="qwen-probe"):
+    if st.button("AI 연결 확인", width="stretch", key="qwen-probe",
+                 type="secondary" if probe_readiness.state == OperatorReadinessState.READY else "primary"):
         with st.spinner("이 PC의 Ollama에 짧은 확인 질문을 보내고 있습니다."):
             card = check_local_llm_readiness(settings, probe_runner=probe_local_llm)
         probe_ok = card.state == OperatorReadinessState.READY
@@ -838,18 +838,20 @@ def main() -> None:
             "`ollama pull qwen3:8b`가 완료되었는지 확인하세요."
         )
 
-    st.markdown("### 5. 질문하고 답변과 근거 인용을 확인하세요")
+    if guided and not probe_ok:
+        _render_qwen_tour(guided, _qwen_tour_step(False, []))
+        return
+
+    st.markdown("### 4. 궁금한 것을 적어 주세요")
     st.caption(
-        "질문을 보내면 실제 규정 검색·Qwen 답변·인용 검증 단계와 진행 게이지, 현재 단계, "
-        "경과 시간이 실시간으로 표시됩니다. 답변 아래의 ‘근거 인용’을 함께 확인하세요."
+        "예: ‘신청하려면 무엇을 해야 하나요?’ 질문을 적고 오른쪽 화살표를 누르세요. "
+        "답변 아래 ‘근거 인용’은 AI가 참고한 문서 내용이에요. 답이 맞는지 함께 확인해 주세요."
     )
     messages = _document_history(selected_profile_id, selected_document_id)
-    clear_column, scope_column = st.columns([1, 4])
-    with clear_column:
-        if st.button("이 규정 대화 지우기", disabled=not messages):
+    with st.expander("답변 설정·대화 지우기", expanded=not guided):
+        if (messages or not guided) and st.button("이 규정 대화 지우기", disabled=not messages):
             messages.clear()
             st.rerun()
-    with scope_column:
         top_k = st.slider("답변에 참고할 승인 조항 수", min_value=1, max_value=10, value=5)
         precise_claim_audit = st.toggle(
             "Qwen3 4B 정밀 근거 감사",

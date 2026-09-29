@@ -133,7 +133,7 @@ async function main() {
     await page.locator('input[type=file]').setInputFiles(path.join(runtime,'synthetic_beginner_regulation.docx'));
     await waitTitle(page,'자동 인식한 규정 정보를 확인하세요');
     await page.locator('div[class*="st-key-beginner_guide_preprocess_info_confirmed"] label').click();
-    await waitTitle(page,'선택한 파일의 전처리를 시작하세요');
+    await waitTitle(page,'파일 내용을 정리해 볼까요?');
     await page.getByRole('button',{name:'전처리 시작',exact:true}).click();
     await waitTitle(page,'전처리 결과를 확인하세요');
     await page.getByRole('button',{name:'③ 검수하고 승인으로 이동',exact:true}).click();
