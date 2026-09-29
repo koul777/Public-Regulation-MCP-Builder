@@ -26,6 +26,7 @@ from app.schemas.document import Document
 from app.schemas.run import ProcessingRun
 from app.services.document_service import DocumentService
 from app.services.institution_purge_service import InstitutionPurgeService
+from app.services.indexing_readiness_service import IndexingPackageStatus, IndexingPreparationResult
 from app.storage.repository import JsonRepository
 
 
@@ -92,6 +93,92 @@ def _confirm_rendered_approval_rows(app) -> None:
 
 
 class StreamlitApprovalAppTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise real approval, journals and indexing. Model
+        # download/inference belongs to the separate live verification path.
+        self.embedding_inputs: list[str] = []
+
+        def encode_documents(texts):
+            self.embedding_inputs.extend(texts)
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
+        for target, value in (
+            ("app.ingestion.embedding_adapter._qwen_embedding_adapter", SimpleNamespace(encode_documents=encode_documents)),
+            ("app.services.indexing_readiness_service.check_indexing_packages", IndexingPackageStatus()),
+        ):
+            patcher = patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _recovery_app(self, root: Path):
+        if AppTest is None:
+            self.skipTest("streamlit.testing.v1.AppTest is not available")
+        settings = Settings(data_dir=root / "data", artifact_root=root)
+        _seed_streamlit_approval_document(settings)
+        set_runtime_settings_overrides(data_dir=settings.data_dir, artifact_root=settings.artifact_root)
+        self.addCleanup(clear_runtime_settings_overrides)
+        app = AppTest.from_file(str(REPO_ROOT / "frontend" / "streamlit_app.py"), default_timeout=20)
+        _seed_app_institution_context(app)
+        app.session_state["document_id"] = "doc_streamlit_approval"
+        app.session_state["nav_page"] = "③ 검수하고 승인"
+        app.session_state["ai_connection_overrides"] = {"data_dir": settings.data_dir, "artifact_root": settings.artifact_root}
+        return app, settings
+
+    def test_index_failure_refreshes_saved_approval_and_retry_does_not_approve_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, settings = self._recovery_app(Path(tmp))
+            app.run()
+            with patch("app.api.routes_documents.index_document", side_effect=RuntimeError("synthetic indexing failure")):
+                next(b for b in app.button if b.label == "이 규정 최종 확정 · 승인하고 색인").click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual("1", next(m.value for m in app.metric if m.label == "승인된 청크 (Approved chunks)"))
+            self.assertTrue(any("저장된 승인 1개는 유지됩니다" in i.value for i in app.info))
+            self.assertTrue(any("검색 등록 상태는 아래 최종 확정 영역에서 확인하세요" in c.value for c in app.caption))
+            self.assertFalse(any("이미 승인·색인이 끝난" in c.value for c in app.caption))
+            retry = next(b for b in app.button if b.label == "이미 승인된 내용 AI에 등록만 실행")
+            self.assertFalse(retry.disabled)
+            repository = JsonRepository(settings)
+            self.assertEqual(1, len(repository.list_approval_records("doc_streamlit_approval")))
+            retry.click().run()
+            self.assertFalse(app.exception)
+            self.assertFalse(app.error)
+            self.assertEqual(1, len(repository.list_approval_records("doc_streamlit_approval")))
+            self.assertEqual("indexed", repository.list_indexing_jobs("doc_streamlit_approval")[-1]["status"])
+
+    def test_failed_approval_keeps_edits_and_does_not_claim_saved_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, settings = self._recovery_app(Path(tmp))
+            app.run()
+            edited = "승인 전 오류가 나도 남겨야 하는 수정 내용"
+            next(t for t in app.text_area if t.label == "제안 내용 수정").set_value(edited).run()
+            with patch("app.api.routes_documents.approve_review_chunks", side_effect=RuntimeError("synthetic approval failure")):
+                next(b for b in app.button if b.label == "이 규정 최종 확정 · 승인하고 색인").click().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any("아직 승인된 조항은 없습니다" in i.value for i in app.info))
+            self.assertEqual(edited, next(t.value for t in app.text_area if t.label == "제안 내용 수정"))
+            self.assertTrue(next(b.disabled for b in app.button if b.label == "이미 승인된 내용 AI에 등록만 실행"))
+            self.assertFalse(JsonRepository(settings).list_approval_records("doc_streamlit_approval"))
+
+    def test_missing_packages_offer_setup_without_running_it_on_render(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, settings = self._recovery_app(Path(tmp))
+            status = IndexingPackageStatus(missing_packages=("torch",))
+
+            def prepare():
+                status.missing_packages = ()
+                return IndexingPreparationResult(ready=True, reason="ready")
+
+            with patch("app.services.indexing_readiness_service.check_indexing_packages", side_effect=lambda: status), \
+                 patch("app.services.indexing_readiness_service.prepare_indexing_runtime", side_effect=prepare) as setup:
+                app.run()
+                setup.assert_not_called()
+                self.assertTrue(any("torch" in w.value for w in app.warning))
+                next(b for b in app.button if b.label == "검색 기능 설치·준비").click().run()
+                setup.assert_called_once()
+            self.assertFalse(app.exception)
+            self.assertTrue(any("검색 모델의 실제 실행을 확인했습니다" in s.value for s in app.success))
+            self.assertFalse(JsonRepository(settings).list_approval_records("doc_streamlit_approval"))
+
     def test_home_document_delete_requires_explicit_confirmation(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
@@ -718,6 +805,7 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertEqual(edited, saved.retrieval_text)
         self.assertTrue(saved.metadata["human_review_edited"])
         self.assertEqual(64, len(saved.metadata["human_review_original_sha256"]))
+        self.assertTrue(any(edited in text for text in self.embedding_inputs), "indexing must receive the saved edit")
 
     def test_action_required_recommends_resolution_but_keeps_one_click_approval(self) -> None:
         if AppTest is None:

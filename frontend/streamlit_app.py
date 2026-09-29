@@ -147,6 +147,11 @@ from scripts.analyze_regulation_corpus import (
 )
 from app.services.local_app_service import start_local_qwen_chat
 from app.services.local_llm_readiness_service import check_local_llm_readiness
+from app.services.indexing_readiness_service import (
+    check_indexing_packages,
+    indexing_preparation_guidance,
+    prepare_indexing_runtime,
+)
 from app.services.operator_setup_service import (
     kordoc_installer_candidates,
     kordoc_installer_guidance,
@@ -10745,7 +10750,7 @@ def _render_approval_compare_sheet(
     승인·색인되는 본문은 언제나 가운데 전처리본 칸이다. AI는 오른쪽에서 볼 곳을
     짚어 줄 뿐 본문을 쓰지 않는다.
 
-    ``read_only``는 이미 승인·색인이 끝난 규정을 다시 펼쳐 볼 때 쓴다. 승인된 조항을
+    ``read_only``는 이미 승인된 규정을 다시 펼쳐 볼 때 쓴다. 승인된 조항을
     편집 칸으로 내주면 화면의 글자와 실제로 색인된 근거가 조용히 갈라지므로,
     이때는 승인된 최종본을 읽기 전용으로만 보여 준다.
     """
@@ -10787,8 +10792,9 @@ def _render_approval_compare_sheet(
     header_cols[2].markdown("**AI 검수 의견**")
     if read_only:
         st.caption(
-            "이미 승인·색인이 끝난 조항입니다. ✅ 최종본 칸의 내용이 지금 MCP가 근거로 쓰는 본문이며, "
-            "여기서는 편집할 수 없습니다. 내용을 고쳐야 하면 같은 원본을 새 버전으로 다시 전처리해 승인하세요."
+            "이미 승인된 조항입니다. ✅ 최종본 칸에는 승인한 본문이 표시되며 여기서는 편집할 수 없습니다. "
+            "검색 등록 상태는 아래 최종 확정 영역에서 확인하세요. "
+            "내용을 고쳐야 하면 같은 원본을 새 버전으로 다시 전처리해 승인하세요."
         )
     else:
         # 마무리 문장('고칠 곳은 …')은 아래 안내가 이미 달고 있다. 여기서 한 번 더 쓰면
@@ -10904,6 +10910,61 @@ def _render_approval_compare_sheet(
                 ),
             )
         st.divider()
+
+
+def _refresh_after_approval_failure(document_id: str, error: Exception) -> None:
+    """Reload durable approval/index state while preserving the operator's inputs."""
+    st.session_state[f"approval-operation-error-{document_id}"] = _brief_long_operation_error(error)
+    st.session_state.pop("indexing-runtime-preparation", None)
+    _invalidate_document_context_cache(document_id)
+    st.rerun()
+
+
+def _render_indexing_preparation(document_id: str, *, guide_substep: int, recovering: bool) -> bool:
+    """Show setup before indexing; package presence never proves document readiness."""
+    packages = check_indexing_packages()
+    with st.expander("AI 검색 등록 준비", expanded=not packages.available or recovering):
+        if packages.available:
+            st.caption("필요한 검색 패키지가 있습니다. 첫 등록에는 모델을 읽는 시간이 걸립니다.")
+        else:
+            st.warning("검색 등록에 필요한 패키지가 없습니다: " + ", ".join(packages.missing_packages))
+        st.caption(
+            "아래 준비 버튼은 인터넷에서 필요한 검색 패키지와 모델을 받아 현재 앱 환경에 설치·점검합니다. "
+            "처음에는 수 분 걸릴 수 있습니다. 기관 문서는 전송하지 않으며 승인·색인은 별도로 실행합니다."
+        )
+        previous = st.session_state.get("indexing-runtime-preparation")
+        if isinstance(previous, dict):
+            message = indexing_preparation_guidance(str(previous.get("reason") or ""))
+            if previous.get("ready") and packages.available:
+                st.success(message)
+            elif not previous.get("ready"):
+                st.error(message)
+        setup_key = f"indexing-runtime-prepare-{document_id}"
+        if not packages.can_prepare:
+            st.info(indexing_preparation_guidance("managed_runtime_required"))
+        elif not packages.available and guide_substep:
+            _render_beginner_action_marker(
+                3, "AI 검색 등록을 먼저 준비하세요",
+                "아래 준비 버튼을 누르세요. 필요한 패키지와 모델을 인터넷에서 받아 점검합니다. "
+                "기관 문서는 보내지 않으며, 준비 후 승인·검색 등록 안내로 이어집니다.",
+                control_keys=(setup_key,), substep=guide_substep,
+            )
+        if st.button(
+            "검색 모델 준비·점검" if packages.available else "검색 기능 설치·준비",
+            key=setup_key, disabled=not packages.can_prepare,
+        ):
+            with _long_operation_status("AI 검색 준비 중…") as setup_status:
+                progress = st.progress(0, text="검색 패키지·모델 준비 중")
+                detail = st.empty()
+                result = _run_background_operation_with_progress(
+                    lambda _report: prepare_indexing_runtime(),
+                    progress_bar=progress, detail_box=detail, status_box=setup_status,
+                    start_percent=0, end_percent=100, label="검색 패키지·모델 준비", estimated_seconds=90,
+                )
+                st.session_state["indexing-runtime-preparation"] = result.model_dump()
+                setup_status.update(state="complete" if result.ready else "error")
+            st.rerun()
+    return packages.available
 
 
 def _render_approval_screen_guide() -> None:
@@ -11315,6 +11376,17 @@ def _page_approval(ctx: dict | None) -> None:
         f"{len(pending_compare_ids):,}개. 최종 확정을 누르면 고친 내용 저장 → 승인 → AI 등록(색인)이 "
         "한 번에 실행됩니다."
     )
+    operation_error_key = f"approval-operation-error-{document_id}"
+    operation_error = st.session_state.get(operation_error_key)
+    if operation_error:
+        st.error(f"승인·검색 등록을 끝내지 못했습니다. {operation_error}")
+        if approved_count:
+            st.info(
+                f"저장된 승인 {approved_count:,}개는 유지됩니다. 아래에서 검색 준비를 확인한 뒤 "
+                "'이미 승인된 내용 AI에 등록만 실행'을 누르세요. 남은 미승인 조항은 따로 확인할 수 있습니다."
+            )
+        else:
+            st.info("아직 승인된 조항은 없습니다. 입력한 수정 내용을 확인하고 원인을 해결한 뒤 다시 실행하세요.")
     if len(regulation_units) > 1:
         st.caption(
             f"규정을 하나씩 열기 어려우면 옆의 **'이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정'** "
@@ -11374,7 +11446,14 @@ def _page_approval(ctx: dict | None) -> None:
 
     approve_index_button_key = f"approval-approve-index-{document_id}"
     approve_all_index_button_key = f"approval-approve-index-all-{document_id}"
-    if approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
+    indexing_packages_ready = True
+    if not mcp_connection_gate.get("ready"):
+        indexing_packages_ready = _render_indexing_preparation(
+            document_id,
+            guide_substep=4 if approved_count >= total_chunks else 3 if approve_enabled else 0,
+            recovering=bool(operation_error),
+        )
+    if indexing_packages_ready and approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
         _render_beginner_action_marker(
             3,
             "승인된 내용을 AI 검색에 등록하세요",
@@ -11382,7 +11461,7 @@ def _page_approval(ctx: dict | None) -> None:
             control_key_prefix="quick-index-only-",
             substep=4,
         )
-    elif approved_count < total_chunks and approve_enabled:
+    elif indexing_packages_ready and approved_count < total_chunks and approve_enabled:
         _render_beginner_action_marker(
             3,
             "확인한 내용을 최종 확정하세요",
@@ -11422,6 +11501,7 @@ def _page_approval(ctx: dict | None) -> None:
         버튼은 화면에서 입력한 값(기본 빈 값)을 그대로 쓰고, '전체 규정' 버튼은 문서 전체가
         검수 완료가 아닐 때 기본 사유를 넣어 호출한다.
         """
+        st.session_state.pop(operation_error_key, None)
         selected_security_level = str(st.session_state.get(security_level_key) or "internal")
         edited_chunk_total = _approval_save_text_edits(
             document_id=document_id,
@@ -11572,7 +11652,7 @@ def _page_approval(ctx: dict | None) -> None:
         try:
             _execute_final_approval(approval_target_entries)
         except Exception as exc:
-            st.error(_safe_ui_error(exc))
+            _refresh_after_approval_failure(document_id, exc)
 
     # 파일 전체 확정은 규정을 하나씩 열지 않고 눌러야 쓸모가 있으므로, 문서 전체가
     # 검수 완료가 아니면 기본 사유를 자동으로 적용해 사유 입력 없이도 눌리게 한다.
@@ -11599,7 +11679,7 @@ def _page_approval(ctx: dict | None) -> None:
                 override_reason_text=document_bulk_override_reason_text,
             )
         except Exception as exc:
-            st.error(_safe_ui_error(exc))
+            _refresh_after_approval_failure(document_id, exc)
 
     if index_col.button(
         "이미 승인된 내용 AI에 등록만 실행",
@@ -11607,6 +11687,7 @@ def _page_approval(ctx: dict | None) -> None:
         disabled=approved_count <= 0,
     ):
         try:
+            st.session_state.pop(operation_error_key, None)
             with _long_operation_status(
                 "승인된 내용 검색 색인 중…",
                 failure_stage="승인 내용 검색 인덱스 생성",
@@ -11637,7 +11718,7 @@ def _page_approval(ctx: dict | None) -> None:
             st.success(f"승인된 청크 {result.get('record_count', 0):,}개를 AI에 등록했습니다.")
             st.rerun()
         except Exception as exc:
-            st.error(_safe_ui_error(exc))
+            _refresh_after_approval_failure(document_id, exc)
 
     # 규정을 하나씩 열지 않고 선택한 규정 전체를 한 화면에서 확인·확정하고 싶을 때만 연다.
     bulk_review_requested = False
