@@ -3227,7 +3227,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
         self.assertIn("이 조항의 검수 항목 확인을 마치세요", markers)
         self.assertNotIn("검수 항목을 읽고 판단하세요", markers)
-        next(item for item in self.app.checkbox if item.label == "AI 검수 항목에 대한 판단을 모두 확인했습니다.").check().run()
+        next(item for item in self.app.checkbox if item.label == "표시된 검수 항목에 대한 판단을 모두 확인했습니다.").check().run()
         self.assertFalse(self.app.exception)
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
         self.assertIn("원문과 최종본을 직접 대조하세요", markers)

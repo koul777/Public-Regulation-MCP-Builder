@@ -74,8 +74,8 @@ def _confirm_rendered_approval_rows(app) -> None:
         checkbox.key
         for checkbox in app.checkbox
         if checkbox.label in {
-            "AI 검수 항목에 대한 판단을 모두 확인했습니다.",
-            "AI 검수 항목이 없음을 확인했습니다.",
+            "표시된 검수 항목에 대한 판단을 모두 확인했습니다.",
+            "별도로 표시된 검수 항목이 없음을 확인했습니다.",
         }
     ]
     for key in ai_confirmation_keys:

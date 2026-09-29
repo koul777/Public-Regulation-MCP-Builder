@@ -24,6 +24,8 @@
 .rr-tour-shade {position:fixed;background:rgba(14,32,27,.57);z-index:1000000;pointer-events:auto;backdrop-filter:blur(1px)}
 .rr-tour-ring {position:fixed;z-index:1000001;pointer-events:none;border:2px solid #fff;border-radius:10px;box-shadow:0 0 0 3px #17ad7b}
 .rr-tour-card {position:fixed;z-index:1000002;width:370px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto;background:white;border:1px solid #deebe4;border-radius:14px;box-shadow:0 20px 80px #061b2940;padding:23px;animation:rr-tour-enter .18s ease-out}
+#rr-tour-root.rr-tour-inline .rr-tour-card {position:relative;z-index:auto;width:100%;max-width:none;max-height:none;box-shadow:none;border:2px solid #169b70;scroll-margin-top:70px}
+#rr-tour-root.rr-tour-inline + .rr-beginner-marker {display:none}
 .rr-tour-top {display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
 .rr-tour-tag {font-size:10px;letter-spacing:1px;color:#13865e;background:#e8f8ef;border:1px solid #c7e9d7;border-radius:20px;padding:3px 9px;font-weight:700}
 .rr-tour-card h2 {font-size:21px!important;line-height:1.45!important;color:#17372b!important;margin:0 0 12px!important;font-weight:750!important;letter-spacing:-.6px!important}
