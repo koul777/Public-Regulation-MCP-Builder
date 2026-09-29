@@ -46,7 +46,7 @@ AI 질문 화면을 다시 검토했다. 어린이 대상 사용성 시험을 �
 
 ## 시연
 
-[실제 화면 24초 MP4](assets/easier-beginner-demo.mp4) · [GIF](assets/easier-beginner-demo.gif)
+[실제 화면 24초 MP4](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/d44fb1007bbb25611e5a7b693125a6628bc25f44/docs/assets/easier-beginner-demo.mp4) · [GIF](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/d44fb1007bbb25611e5a7b693125a6628bc25f44/docs/assets/easier-beginner-demo.gif)
 
 브라우저 녹화의 도움말·조항 확인·최종 승인·AI 답변 장면을 원래 속도로 발췌했다.
 기다리는 시간과 일부 조항 확인은 생략했다. Windows 파일 선택창과 모든 종류의 문서,
