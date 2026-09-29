@@ -1084,7 +1084,7 @@ def _approval_ai_review_items(chunk, review_reasons: list[str], agent_review_sum
     for index, reason in enumerate(dict.fromkeys(candidate_reasons), start=1):
         title, severity, suggestion = AI_REVIEW_REASON_LABELS.get(
             reason,
-            ("AI 검수 항목 확인", "중간", f"{reason} 항목을 원문과 비교해 반영 여부를 결정합니다."),
+            ("검수 항목 확인", "중간", f"{reason} 항목을 원문과 비교해 반영 여부를 결정합니다."),
         )
         items.append(
             {
@@ -1438,7 +1438,7 @@ def _render_pdf_source_preview(source_context: dict[str, object]) -> None:
                 f"PDF 페이지 이미지를 만들 수 없어 추출 원문으로 대체합니다: {_safe_ui_error(exc)}"
             )
     raw_text = str(source_context.get("raw_text") or "")
-    st.code(raw_text or "저장된 PDF 원문 텍스트가 없습니다.", language="text")
+    st.code(raw_text or "저장된 PDF 원문 텍스트가 없습니다.", language="text", wrap_lines=True)
 
 
 def _render_original_source_preview(document, chunk) -> None:
@@ -1452,10 +1452,10 @@ def _render_original_source_preview(document, chunk) -> None:
     if metadata.get("table_source") == "kordoc" or metadata.get("kordoc_table_promoted"):
         st.markdown("**원본 규정 (Kordoc 표 원문 셀)**")
         raw_rows = _approval_kordoc_raw_rows(chunk)
-        st.code("\n".join(raw_rows) or str(source_context.get("raw_text") or ""), language="text")
+        st.code("\n".join(raw_rows) or str(source_context.get("raw_text") or ""), language="text", wrap_lines=True)
         return
     st.markdown(f"**원본 규정 ({file_type.upper()} 추출 원문)**")
-    st.code(str(source_context.get("raw_text") or "저장된 원문 텍스트가 없습니다."), language="text")
+    st.code(str(source_context.get("raw_text") or "저장된 원문 텍스트가 없습니다."), language="text", wrap_lines=True)
 
 
 def _render_processed_result_preview(chunk, processed_text: str) -> None:
@@ -1471,7 +1471,7 @@ def _render_processed_result_preview(chunk, processed_text: str) -> None:
                 preview_rows.append({"행": row.get("row_index"), "셀": " | ".join(str(cell) for cell in row.get("cells") or [])})
         if preview_rows:
             st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
-    st.code(processed_text or "전처리 결과 본문이 없습니다.", language="text")
+    st.code(processed_text or "전처리 결과 본문이 없습니다.", language="text", wrap_lines=True)
 
 
 def _approval_audit_preview_entry(message: str) -> dict[str, str]:
@@ -2801,6 +2801,7 @@ def _render_beginner_action_marker(
         tour_selectors.append(f'div[class*="st-key-{safe_prefix}"]')
     tour_attributes = marker_attributes(
         title, description, selectors=tour_selectors, step=int(step), substep=int(substep),
+        presentation="inline" if int(step) == 3 and int(substep) == 2 else "spotlight",
     )
     # Optional tooling stays discoverable in its own expander, while the tour
     # leads fast preprocessing directly to the upload action.
@@ -3878,6 +3879,7 @@ def _render_standalone_qwen_chat_launcher(
 ) -> None:
     """Render the one-click launcher and a reusable link to the separate app."""
 
+    launch_guide = st.empty()
     if st.button(
         "💬 독립 Qwen 챗봇 실행",
         key=key,
@@ -3899,7 +3901,9 @@ def _render_standalone_qwen_chat_launcher(
                         )
                         st.success("새 브라우저 창에서 Qwen 챗봇을 사용할 수 있습니다.")
                         st.caption(f"로컬 주소: {app_url}")
-                        break
+                        # The journey/sidebar were rendered before this click.
+                        # Rerender them only after the app health check succeeds.
+                        st.rerun()
                     if (
                         process is not None
                         and callable(getattr(process, "poll", None))
@@ -3928,6 +3932,7 @@ def _render_standalone_qwen_chat_launcher(
         except (OSError, RuntimeError, ValueError) as exc:
             st.error(f"독립 Qwen 챗봇을 시작하지 못했습니다: {_safe_ui_error(exc)}")
 
+    ready = False
     state = st.session_state.get(QWEN_CHAT_APP_LAUNCH_STATE_KEY)
     if isinstance(state, dict):
         app_url = str(state.get("url") or "")
@@ -3938,11 +3943,17 @@ def _render_standalone_qwen_chat_launcher(
             and process.poll() is None
         )
         if process_running and _standalone_qwen_chat_is_healthy(app_url):
-            st.link_button(
-                "열려 있는 Qwen 챗봇으로 이동",
-                app_url,
-                width=width,
+            ready = True
+            link_key = f"{key}-open"
+            _render_beginner_action_marker(
+                4, "준비된 Qwen 챗봇으로 이동하세요",
+                "아래 이동 버튼을 누르세요. 새 창에서 기관과 규정을 선택하고 질문·근거 확인 안내를 이어갑니다.",
+                control_keys=(link_key,), substep=2,
             )
+            # The container supplies a stable target on Streamlit versions
+            # where link_button itself has no key argument.
+            with st.container(key=link_key):
+                st.link_button("열려 있는 Qwen 챗봇으로 이동", app_url, width=width)
         elif process is not None and not process_running:
             return_code = process.poll() if callable(getattr(process, "poll", None)) else "unknown"
             st.error(
@@ -3950,6 +3961,13 @@ def _render_standalone_qwen_chat_launcher(
             )
         elif app_url:
             st.caption("독립 Qwen 챗봇을 시작하는 중입니다. 잠시 뒤 새 창이 열립니다.")
+    if not ready:
+        with launch_guide.container():
+            _render_beginner_action_marker(
+                4, "독립 Qwen 챗봇을 실행하세요",
+                "아래 실행 버튼을 누르고 준비가 끝날 때까지 기다리세요. 준비되면 새 창으로 이동할 버튼을 안내합니다.",
+                control_keys=(key,), substep=2,
+            )
 
 
 def _apply_ai_connection_overrides() -> None:
@@ -10519,7 +10537,7 @@ def _render_approval_chunk_confirmation_controls(
 
     st.markdown("**이 조항 검수 확인**")
     if review_items:
-        st.caption("AI가 표시한 항목마다 판단한 뒤, 원문과 최종본을 직접 대조해 주세요.")
+        st.caption("표시된 검수 항목마다 판단한 뒤, 원문과 최종본을 직접 대조해 주세요.")
         for item in review_items:
             item_id = str(item["item_id"])
             decision = ai_decisions.get(item_id, "")
@@ -10569,7 +10587,7 @@ def _render_approval_chunk_confirmation_controls(
                 else "아직 판단하지 않음"
             )
     else:
-        st.caption("이 조항에는 AI가 별도로 표시한 검수 항목이 없습니다.")
+        st.caption("이 조항에는 별도로 표시된 검수 항목이 없습니다. 원문 대조는 직접 진행해 주세요.")
 
     ai_decisions = {
         str(item_id): str(decision)
@@ -10647,9 +10665,9 @@ def _render_approval_chunk_confirmation_controls(
             )
         st.checkbox(
             (
-                "AI 검수 항목에 대한 판단을 모두 확인했습니다."
+                "표시된 검수 항목에 대한 판단을 모두 확인했습니다."
                 if item_ids
-                else "AI 검수 항목이 없음을 확인했습니다."
+                else "별도로 표시된 검수 항목이 없음을 확인했습니다."
             ),
             key=ai_result_confirmed_widget_key,
             disabled=not bool(ai_state["ai_confirmed"]),
@@ -10705,7 +10723,7 @@ def _render_approval_chunk_confirmation_controls(
         st.success("이 조항의 명시적 검수가 완료되었습니다.")
     else:
         st.caption(
-            "AI 항목 판단, 수정 필요 항목의 해결, 사람 확인을 마치면 명시적 검수 완료로 기록됩니다. "
+            "검수 항목 판단, 수정 필요 항목의 해결, 사람 확인을 마치면 명시적 검수 완료로 기록됩니다. "
             "완료하지 않아도 최종 확정은 가능하며 미검수 승인으로 감사 기록에 남습니다."
         )
 
@@ -10857,7 +10875,7 @@ def _render_approval_compare_sheet(
             )
         with edit_col:
             if read_only:
-                st.code(str(getattr(chunk, "text", "") or ""), language="text")
+                st.code(str(getattr(chunk, "text", "") or ""), language="text", wrap_lines=True)
             else:
                 st.text_area(
                     "제안 내용 수정",

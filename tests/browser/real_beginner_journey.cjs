@@ -155,7 +155,7 @@ async function main() {
     assert.equal(first?.title,'검수 항목을 읽고 판단하세요');
     await page.getByRole('button',{name:'해당 없음',exact:true}).first().click();
     await waitTitle(page,'이 조항의 검수 항목 확인을 마치세요');
-    await page.getByText('AI 검수 항목에 대한 판단을 모두 확인했습니다.',{exact:true}).first().click();
+    await page.getByText('표시된 검수 항목에 대한 판단을 모두 확인했습니다.',{exact:true}).first().click();
     await waitTitle(page,'원문과 최종본을 직접 대조하세요');
     await page.getByText('원본과 최종본을 직접 대조했고, 이 내용으로 승인·색인하는 데 동의합니다.',{exact:true}).first().click();
     await waitTitle(page,'이 조항의 검수 항목 확인을 마치세요');

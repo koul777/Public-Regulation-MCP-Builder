@@ -25,7 +25,7 @@ const css = fs.readFileSync(path.join(root, 'frontend/assets/beginner_tour.css')
     await page.goto('http://guide.test/');
     const marker = async (id, title, substep=1, extra={}) => page.evaluate(({id,title,substep,extra}) => {
       const node=document.createElement('div');
-      node.dataset.rrTour=JSON.stringify({title,description:'밝은 항목을 직접 눌러 진행하세요.',step:1,substep,selectors:['#'+id]});
+      node.dataset.rrTour=JSON.stringify({title,description:'밝은 항목을 직접 눌러 진행하세요.',step:1,substep,selectors:['#'+id],presentation:extra.presentation});
       node.dataset.rrTourCurrent=extra.current ? 'true' : 'false';
       node.dataset.rrTourPriority=String(extra.priority || 0);
       document.querySelector('#markers').append(node);
@@ -120,6 +120,28 @@ const css = fs.readFileSync(path.join(root, 'frontend/assets/beginner_tour.css')
     assert.equal(await page.evaluate(()=>window.sentQuestions),2,'desktop and mobile sends must remain clickable');
     await page.locator('[data-testid="stChatInput"]').evaluate(el=>el.remove());
     await page.waitForFunction(()=>document.querySelector('.rr-tour-dock').style.bottom==='');
+    // Comparing a source and its editor must never require pausing the guide.
+    await page.evaluate(()=>{
+      const source=document.createElement('textarea');
+      source.setAttribute('aria-label','비교할 원문');source.value='원문 문장 끝까지 읽고 대조합니다.';
+      document.querySelector('#approve').before(source);
+    });
+    await clear(); await marker('approve','원문과 최종본을 대조하세요',7,{presentation:'inline'});
+    await mount();
+    await page.locator('.rr-tour-dock button').click();
+    await title('원문과 최종본을 대조하세요');
+    assert.equal(await page.locator('.rr-tour-card').evaluate(e=>getComputedStyle(e).position),'relative');
+    assert.equal(await page.locator('.rr-tour-shade:visible').count(),0,'review must not dim or block surrounding text');
+    await page.getByRole('textbox',{name:'비교할 원문'}).click();
+    assert.equal(await page.locator('.rr-tour-card').isVisible(),true,'source can be read with guide still open');
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(()=>document.activeElement===document.querySelector('#approve button')),true,'inline review must not trap normal reading navigation');
+    assert.equal(await page.evaluate(()=>window.approvals),1,'review guidance cannot approve');
+    await page.getByRole('button',{name:'직접 승인',exact:true}).click();
+    assert.equal(await page.evaluate(()=>window.approvals),2);
+    await clear(); await marker('upload','검수 다음 단계',8); await mount();
+    await title('검수 다음 단계');
+    assert.equal(await page.locator('#rr-tour-root').evaluate(e=>e.parentElement===document.body),true);
     assert.deepEqual(errors,[]);
     console.log('PASS: click progression, reruns, priority, collapsed controls, dialogs, pause/resume, opt-out, no auto-approval, mobile, keyboard and unobscured chat send');
   } finally {await browser.close();}

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from app.agents.claim_auditor import ClaimAuditAgent
 from app.agents.grounded_qa import AnswerClaim, GroundedAnswerDraft, GroundedQwenAnswerAgent
 from app.rag.context_builder import ContextBuilder
+from app.rag.extractive_answer import NO_EVIDENCE_ANSWER
 
 
 class _Runtime:
@@ -48,6 +49,40 @@ def _context():
 
 
 class GroundedQATests(unittest.TestCase):
+    def test_missing_information_is_abstention_even_with_valid_citation_id(self) -> None:
+        for answer in (
+            "이 규정에서는 보증금 금액을 명시하고 있지 않습니다. [E1]",
+            "지급 기한이 명시되어 있지 않습니다. [E1]",
+            "제공된 근거가 부족합니다. [E1]",
+            "금액을 확인할 수 없습니다. [E1]",
+            "The amount is not specified. [E1]",
+        ):
+            for fast in (False, True):
+                with self.subTest(answer=answer, fast=fast):
+                    payload = {"answer": answer, "abstained": False}
+                    if fast:
+                        payload["evidence_context_ids"] = ["E1"]
+                    else:
+                        payload["claims"] = [{"claim_id": "C1", "text": answer, "evidence_context_ids": ["E1"]}]
+                    agent = GroundedQwenAnswerAgent(runtime=_Runtime(payload))
+                    result = (agent.answer_fast if fast else agent.answer)(query="보증금은 얼마인가요?", context=_context())
+                    self.assertTrue(result.abstained)
+                    self.assertEqual(NO_EVIDENCE_ANSWER, result.answer)
+                    self.assertEqual((), result.claims)
+                    self.assertEqual("abstained", result.answer_mode)
+
+    def test_substantive_negative_rule_is_not_missing_information(self) -> None:
+        context = _context()
+        item = context.items[0].model_copy(update={"text": "보증금을 징수하지 않는다."})
+        context = context.model_copy(update={"items": (item,)})
+        agent = GroundedQwenAnswerAgent(runtime=_Runtime({
+            "answer": "보증금을 징수하지 않습니다. [E1]",
+            "evidence_context_ids": ["E1"], "abstained": False,
+        }))
+        result = agent.answer_fast(query="보증금을 내나요?", context=context)
+        self.assertFalse(result.abstained)
+        self.assertEqual(("E1",), result.claims[0].evidence_context_ids)
+
     def test_extractively_answers_with_context_marker_when_model_not_requested(self) -> None:
         result = GroundedQwenAnswerAgent(runtime=_Runtime({})).answer(
             query="접근권한은 언제 검토하나요?",

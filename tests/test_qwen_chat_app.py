@@ -43,6 +43,17 @@ def _synthetic_visible_progress() -> None:
 
 
 class QwenChatSecurityAndGateTests(unittest.TestCase):
+    def test_duplicate_public_citations_preserve_distinct_scope_pages_and_quotes(self) -> None:
+        citation = {"document_id": "doc-a", "regulation_version": "1", "article_no": "제5조",
+                    "article_title": "기록 보관", "source_page_start": 1}
+        variants = [dict(citation, chunk_id="article"), dict(citation, chunk_id="table"),
+                    dict(citation, document_id="doc-b"), dict(citation, regulation_version="2"),
+                    dict(citation, source_page_start=2), dict(citation, support_quote="2년간 보관한다.")]
+        rows = safe_citation_rows(variants)
+        self.assertEqual(5, len(rows))
+        self.assertEqual("2", rows[-2]["원문 쪽"])
+        self.assertEqual("2년간 보관한다.", rows[-1]["근거 인용문"])
+
     def setUp(self) -> None:
         import sys
 

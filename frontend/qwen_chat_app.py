@@ -461,6 +461,7 @@ def safe_citation_rows(citations: Any) -> list[dict[str, Any]]:
     if not isinstance(citations, list):
         return []
     rows: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
 
     def readable(value: Any) -> str:
         if not isinstance(value, str):
@@ -495,7 +496,17 @@ def safe_citation_rows(citations: Any) -> list[dict[str, Any]]:
         # A page number or heading alone is not enough for a reader to check
         # what text supports the answer, even inside the selected document.
         if "조문" in row or "근거 인용문" in row:
-            rows.append(row)
+            # Several approved chunks (e.g. an article and its table) may
+            # resolve to the same public locator. Keep the internal evidence
+            # intact, but show that locator once within its document/version.
+            identity = (
+                readable(citation.get("document_id")),
+                readable(citation.get("regulation_version")),
+                tuple(row.items()),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                rows.append(row)
     return rows
 
 

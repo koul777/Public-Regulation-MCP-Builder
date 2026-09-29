@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/assets/pr-mcp-builder-brand-trailer.gif" alt="Kordoc 4.16.0 연동, 초보자 클릭 안내, 문서와 표 구조화, 사람 승인, 로컬 Qwen과 MCP를 소개하는 20초 홍보 영상" width="960">
+  <img src="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.gif" alt="Kordoc 4.16.0 연동, 초보자 클릭 안내, 문서와 표 구조화, 사람 승인, 로컬 Qwen과 MCP를 소개하는 20초 홍보 영상" width="960">
 </p>
 
 <p align="center"><strong>Kordoc 4.16.0 연동 · 초보자 클릭 안내 · 승인된 규정 기반 로컬 RAG</strong></p>
 
 <p align="center">
-  <a href="docs/assets/pr-mcp-builder-brand-trailer.mp4">20초 홍보 영상 MP4</a> ·
-  <a href="docs/assets/pr-mcp-builder-brand-trailer.png">정지 화면 보기</a> ·
+  <a href="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.mp4">20초 홍보 영상 MP4</a> ·
+  <a href="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.png">정지 화면 보기</a> ·
   <a href="#초보자-클릭-안내-시연">실제 사용 시연 바로 보기</a>
 </p>
 
@@ -17,21 +17,23 @@
 
 ## 초보자 클릭 안내 시연
 
-**초보자 안내 시작**을 누르면 지금 눌러야 할 실제 항목만 밝게 표시됩니다.
-직접 입력하거나 클릭해 작업을 마치면 다음 안내가 이어집니다.
+**초보자 안내 시작**을 누르면 지금 눌러야 할 항목을 안내합니다.
+검수 중에는 원문과 최종본을 가리지 않는 본문 안내를 사용하고, 직접 확인을 마치면
+다음 조항으로 이어집니다. 챗봇 실행과 새 창 이동까지 안내가 연결됩니다.
 
-![실제 앱에서 기관 등록, 파일 업로드, 전처리와 조항별 검수를 따라가는 초보자 클릭 안내 시연](docs/assets/beginner-click-guide.gif)
+![수정 후 실제 앱에서 원문 대조, 조항별 확인, 챗봇 이동과 근거 부족 답변까지 진행한 클릭 검증](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/9283434c6fedb20fd2b05421e838f600a5784193/docs/assets/guided-fix-live-demo.gif)
 
-[65초 MP4 시연 파일](docs/assets/beginner-click-guide.mp4) ·
-[실행 검증과 시연 재현 방법](docs/beginner_ux_verification_ko.md) ·
-[가상 규정으로 승인·색인·Qwen 답변까지 직접 클릭한 결과](docs/beginner_live_verification_ko.md)
+[수정 후 85초 실제 클릭 검증 MP4](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/9283434c6fedb20fd2b05421e838f600a5784193/docs/assets/guided-fix-live-demo.mp4) ·
+[수정 내용·세 질문의 답변·검증 화면](docs/beginner_guided_fix_verification_ko.md)
 
-영상 순서: **안내 시작 → 기관명 입력·생성 → 파일 업로드 → 인식 정보 확인 →
-전처리 → 검수 항목 판단 → 검수 확인·원문 대조 체크 → 안내 멈춤·이어 보기**.
-공개 합성 문서로 현재 소스 화면을 녹화했습니다. 파일은 업로드 입력에 직접 전달하며,
-Windows 파일 선택창은 영상에 포함하지 않습니다. 시연은 첫 조항의 검수 조작까지이며,
-다음 조항 이동·최종 승인·색인과 Qwen 답변은 포함하지 않습니다.
-안내창의 다음 버튼은 설명만 넘기고 실제 승인을 대신하지 않습니다.
+새 가상 장비 규정을 넣고 **기관 생성 → 업로드 → 8개 조항·표 대조 → 승인·색인 →
+Qwen 실행 → 세 질문과 근거 확인**을 실제 화면으로 완료했습니다. 위 영상은 이 실행에서
+주요 화면을 발췌하고 대기 구간을 줄인 편집본입니다. 일부 구간은 1.25–2배속이며,
+모든 조항 확인 장면과 Windows 파일 선택창은 포함하지 않습니다. 안내는 실제 승인을 대신하지 않습니다.
+
+[이전 65초 시작 안내 시연](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/beginner-click-guide.mp4) ·
+[시작 안내 시연 재현 방법](docs/beginner_ux_verification_ko.md) ·
+[이전 실행의 실패·복구 기록](docs/beginner_live_verification_ko.md)
 
 **사람이 승인·색인한 공공기관 규정을 독립 로컬 Qwen 챗봇에서 고르고 바로 대화하거나,
 같은 승인 데이터를 MCP로 연결하는 Windows용 규정 전처리·RAG 빌더입니다.**
@@ -2090,6 +2092,12 @@ Kordoc 소스나 실행 파일이 포함되지 않음에 유의하세요. 라이
 현재 Windows 실행판에 모두 포함되었다는 뜻은 아니며, 배포 여부는 Releases에서 확인하세요.
 
 ## 2026년 9월 29일 — 실제 조항 안내 검증과 Kordoc·Qwen 복구 보완
+
+- **초보 안내에서 발견한 문제 수정:** 검수 안내가 원문을 가리지 않도록 본문에 배치하고,
+  긴 원문은 줄바꿈합니다. 챗봇 실행·이동 안내를 연결하고 준비 직후 `3 / 3 완료`를 갱신합니다.
+  AI 사용 여부와 무관한 검수 확인 문구, 중복 인용 정리, 근거 부족 답변의 인용 제거를 반영했습니다.
+  새 가상 규정 8개 청크의 승인·실제 색인과 Qwen 세 질문을 다시 완료했습니다.
+  [수정 후 실제 화면·검증 결과](docs/beginner_guided_fix_verification_ko.md)를 참고하세요.
 
 - 합성 DOCX의 8개 항목을 초보 안내에 따라 검수·승인·색인하고 실제 Qwen3 8B에
   연속 질문했습니다. 신청 기한·보관 기간과 근거 조문, 규정에 없는 내용의 답변

@@ -38,6 +38,7 @@
   let active = null, target = null, slide = 0, opened = false, disposed = false;
   let frame = 0, scanTimer = 0, lastFocus = null, suspended = false;
   let chatInput = null;
+  const inline = () => slide === 2 && active?.presentation === "inline";
   const visible = element => !!element && element.getClientRects().length > 0
     && win.getComputedStyle(element).visibility !== "hidden";
   const resolve = marker => {
@@ -58,7 +59,7 @@
     return null;
   };
   const identity = marker => marker ? JSON.stringify([
-    config.page, marker.step, marker.substep, marker.title, marker.selectors,
+    config.page, marker.step, marker.substep, marker.title, marker.selectors, marker.presentation,
     marker.resolved.reveal,
   ]) : "";
   const box = (element, left, top, width, height) => Object.assign(element.style, {
@@ -81,6 +82,10 @@
     if (disposed) return;
     placeDock();
     if (!opened) return;
+    if (inline()) {
+      shades.forEach(element => {element.hidden = true;}); ring.hidden = true;
+      return;
+    }
     const w = win.innerWidth, h = win.innerHeight;
     const rect = visible(target) ? target.getBoundingClientRect() : null;
     const gap = 8;
@@ -113,6 +118,7 @@
   };
   const close = ({pause=false, dismiss=true, restoreFocus=true} = {}) => {
     opened=false; card.hidden=true; ring.hidden=true; shades.forEach(e=>{e.hidden=true;}); dock.hidden=false;
+    root.classList.remove("rr-tour-inline");
     placeDock();
     saved.seen=true; saved.hidden=!!find("input").checked;
     if (pause) saved.paused=true;
@@ -141,9 +147,17 @@
     find(".rr-tour-primary").textContent=slide===2 ? "안내 접고 직접 하기" : slide===1 ? "한 단계씩 시작 →" : "다음 →";
     find(".rr-tour-dots").innerHTML=slide===2 ? "" : [0,1].map(i=>`<span class="rr-tour-dot ${i===slide?'active':''}"></span>`).join("");
     find(".rr-tour-dots").setAttribute("aria-label",slide===2 ? "실제 작업 따라하기" : `${slide+1} / 2 시작 안내`);
+    root.classList.toggle("rr-tour-inline", inline());
+    card.setAttribute("role", inline() ? "region" : "dialog");
+    if (inline()) {
+      // Review needs the surrounding original, editor and findings readable.
+      // Keep guidance in document flow; no dimmer, focus trap or floating card.
+      active.element.before(root);
+      card.style.left = ""; card.style.top = "";
+    } else if (root.parentElement !== doc.body) doc.body.append(root);
     card.hidden=false; dock.hidden=true; opened=true;
     if (slide===2) {saved.seen=true; saved.openKey=identity(active); saved.dismissedKey=""; persist();}
-    if (target && focus) target.scrollIntoView({block:win.innerWidth<800 ? "start" : "center",behavior:"instant"});
+    if (focus) (inline() ? card : target)?.scrollIntoView({block:inline() || win.innerWidth<800 ? "start" : "center",behavior:"instant"});
     place(); if (focus) card.focus({preventScroll:true});
   };
   const open = index => {lastFocus=doc.activeElement; show(index);};
@@ -183,7 +197,7 @@
   const onKey = event => {
     if (!opened) return;
     if (event.key==="Escape") {event.preventDefault();event.stopPropagation();close({pause:true});}
-    if (event.key==="Tab") {
+    if (event.key==="Tab" && !inline()) {
       const selector='button,input:not([type="hidden"]),select,textarea,a[href],summary,[tabindex="0"]';
       const candidates=[...(target?.matches(selector) ? [target] : []),
         ...(target ? target.querySelectorAll(selector) : []),

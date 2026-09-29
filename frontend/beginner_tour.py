@@ -22,13 +22,14 @@ def marker_attributes(
     selectors: list[str],
     step: int,
     substep: int,
+    presentation: str = "spotlight",
 ) -> str:
     """Serialize trusted widget selectors and escaped copy into a DOM marker."""
-    payload = json.dumps(
-        {"title": title, "description": description, "selectors": selectors,
-         "step": step, "substep": substep},
-        ensure_ascii=False,
-    )
+    data = {"title": title, "description": description, "selectors": selectors,
+            "step": step, "substep": substep}
+    if presentation == "inline":
+        data["presentation"] = "inline"
+    payload = json.dumps(data, ensure_ascii=False)
     return f'data-rr-tour="{html.escape(payload, quote=True)}"'
 
 
