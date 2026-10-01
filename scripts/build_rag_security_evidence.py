@@ -583,6 +583,7 @@ def _component_manifest(settings: Settings) -> dict[str, Any]:
     source_paths = [
         "app/api/routes_documents.py",
         "app/api/routes_rag.py",
+        "app/core/local_http.py",
         "app/core/security.py",
         "app/ingestion/vector_adapter.py",
         "app/ingestion/vector_integrity.py",

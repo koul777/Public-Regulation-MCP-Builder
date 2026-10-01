@@ -43,6 +43,8 @@ class BuildRagSecurityEvidenceTests(unittest.TestCase):
         self.assertEqual(len(report["component_manifest_hash"]), 64)
         self.assertEqual(report["component_manifest"]["vector_store_target"], "local-jsonl")
         self.assertIn("app/api/routes_rag.py", {item["path"] for item in report["component_manifest"]["source_files"]})
+        # The loopback-only HTTP helper is the egress boundary for local model calls.
+        self.assertIn("app/core/local_http.py", {item["path"] for item in report["component_manifest"]["source_files"]})
         self.assertTrue(all(len(item["sha256"]) == 64 for item in report["component_manifest"]["source_files"]))
 
     def test_report_fails_when_approval_vector_sync_outcome_is_missing(self) -> None:
