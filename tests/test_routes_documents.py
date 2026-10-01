@@ -2475,6 +2475,126 @@ class RoutesDocumentsTests(unittest.TestCase):
         ])
         self.assertEqual(1, approvals[0]["review_attention_chunk_count"])
 
+    def _flagged_document_for_override(self, root: Path, document_id: str) -> tuple[Settings, dict]:
+        settings = Settings(data_dir=root / "data", artifact_root=root)
+        repository = JsonRepository(settings)
+        repository.upsert_document(
+            Document(
+                document_id=document_id,
+                filename=f"{document_id}.pdf",
+                document_name=document_id,
+                file_type="pdf",
+                file_hash="hash",
+                tenant_id="tenant-a",
+                status="completed",
+            )
+        )
+        repository.save_processing_result(
+            document_id,
+            [],
+            [
+                Chunk(
+                    chunk_id="chunk-flagged",
+                    document_id=document_id,
+                    chunk_type="table",
+                    text="table text",
+                    retrieval_text="table text",
+                    metadata={
+                        "table_review_required": True,
+                        "table_review_flags": ["row_review_required"],
+                    },
+                )
+            ],
+            [],
+        )
+        evidence = _write_approval_evidence(
+            root,
+            settings=settings,
+            document_id=document_id,
+            chunks=repository.get_chunks(document_id),
+        )
+        return settings, evidence
+
+    def test_approve_review_chunks_override_reason_requires_admin_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, evidence = self._flagged_document_for_override(root, "doc_override_role")
+            operator = AuthContext(
+                actor="operator", tenant_id="tenant-a", auth_mode="api_token", role="operator"
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                with self.assertRaises(HTTPException) as raised:
+                    routes_documents.approve_review_chunks(
+                        "doc_override_role",
+                        routes_documents.ApprovalRequest(
+                            chunk_ids=["chunk-flagged"],
+                            approval_id="approval-operator-override",
+                            security_level="internal",
+                            review_flags_acknowledged=False,
+                            approval_override_reason="operator waiver",
+                            **evidence,
+                        ),
+                        operator,
+                    )
+            approvals = JsonRepository(settings).list_approval_records("doc_override_role")
+            statuses = [chunk.approval_status for chunk in JsonRepository(settings).get_chunks("doc_override_role")]
+
+        self.assertEqual(403, raised.exception.status_code)
+        self.assertEqual([], approvals)
+        self.assertNotIn("approved", statuses)
+
+    def test_approve_review_chunks_operator_without_override_reason_is_not_blocked_by_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, evidence = self._flagged_document_for_override(root, "doc_override_role_ack")
+            operator = AuthContext(
+                actor="operator", tenant_id="tenant-a", auth_mode="api_token", role="operator"
+            )
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                response = routes_documents.approve_review_chunks(
+                    "doc_override_role_ack",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-flagged"],
+                        approval_id="approval-operator-ack",
+                        security_level="internal",
+                        review_flags_acknowledged=True,
+                        **evidence,
+                    ),
+                    operator,
+                )
+
+        self.assertEqual("approval-operator-ack", response["approval_id"])
+
+    def test_approve_review_chunks_journals_override_reason_even_when_every_chunk_is_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, evidence = self._flagged_document_for_override(root, "doc_override_confirmed")
+
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                response = routes_documents.approve_review_chunks(
+                    "doc_override_confirmed",
+                    routes_documents.ApprovalRequest(
+                        chunk_ids=["chunk-flagged"],
+                        approval_id="approval-confirmed-override",
+                        security_level="internal",
+                        review_flags_acknowledged=False,
+                        approval_override_reason="director waiver",
+                        review_decision_events=[
+                            {"event": "human_review_confirmed", "chunk_id": "chunk-flagged"}
+                        ],
+                        **evidence,
+                    ),
+                    _auth_context(),
+                )
+            approvals = JsonRepository(settings).list_approval_records("doc_override_confirmed")
+
+        self.assertEqual("approval-confirmed-override", response["approval_id"])
+        self.assertFalse(approvals[0]["review_flags_acknowledged"])
+        self.assertEqual("complete", approvals[0]["human_review_coverage"]["status"])
+        self.assertEqual("director waiver", approvals[0]["approval_override_reason"])
+
     def test_approve_review_chunks_requires_ack_for_damaged_text_and_missing_source_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
