@@ -395,6 +395,141 @@ class StreamlitApprovalHelperTests(unittest.TestCase):
         self.assertNotIn(streamlit_app.DOCUMENT_CONTEXT_CACHE_KEY, state)
 
 
+class StreamlitOpenLocalArtifactTests(unittest.TestCase):
+    """로컬 파일 열기는 PowerShell 콘솔을 띄우지 않고 셸 연결 프로그램으로 연다."""
+
+    def test_windows_opens_with_startfile_without_spawning_a_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "labels.csv"
+            artifact.write_text("document_id\n", encoding="utf-8")
+            with patch.object(streamlit_app.sys, "platform", "win32"), patch.object(
+                streamlit_app.os, "startfile", create=True
+            ) as startfile, patch.object(streamlit_app.subprocess, "Popen") as popen:
+                streamlit_app._open_local_artifact(artifact)
+
+        startfile.assert_called_once_with(str(artifact))
+        popen.assert_not_called()
+
+    def test_missing_artifact_still_raises_file_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            streamlit_app.os, "startfile", create=True
+        ) as startfile:
+            with self.assertRaises(FileNotFoundError):
+                streamlit_app._open_local_artifact(Path(tmp) / "missing.csv")
+
+        startfile.assert_not_called()
+
+    def test_non_windows_raises_clear_os_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "labels.csv"
+            artifact.write_text("document_id\n", encoding="utf-8")
+            with patch.object(streamlit_app.sys, "platform", "linux"), patch.object(
+                streamlit_app.os, "startfile", create=True
+            ) as startfile:
+                with self.assertRaises(OSError) as raised:
+                    streamlit_app._open_local_artifact(artifact)
+
+        self.assertNotIsInstance(raised.exception, FileNotFoundError)
+        self.assertIn("Windows", str(raised.exception))
+        startfile.assert_not_called()
+
+    def test_runnable_file_types_are_refused_without_opening(self) -> None:
+        for name in ("run.exe", "run.BAT", "run.cmd", "run.ps1", "run.lnk", "run.js", "noext"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                artifact = Path(tmp) / name
+                artifact.write_text("x", encoding="utf-8")
+                with patch.object(streamlit_app.sys, "platform", "win32"), patch.object(
+                    streamlit_app.os, "startfile", create=True
+                ) as startfile:
+                    with self.assertRaises(OSError) as raised:
+                        streamlit_app._open_local_artifact(artifact)
+
+                self.assertNotIsInstance(raised.exception, FileNotFoundError)
+                startfile.assert_not_called()
+
+    def test_regulation_documents_and_review_files_are_allowed(self) -> None:
+        for name in ("rule.pdf", "rule.DOCX", "rule.hwpx", "rule.hwp", "packet.md", "labels.csv"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                artifact = Path(tmp) / name
+                artifact.write_text("x", encoding="utf-8")
+                with patch.object(streamlit_app.sys, "platform", "win32"), patch.object(
+                    streamlit_app.os, "startfile", create=True
+                ) as startfile:
+                    streamlit_app._open_local_artifact(artifact)
+
+                startfile.assert_called_once_with(str(artifact))
+
+    def test_network_paths_are_refused(self) -> None:
+        class _FakeNetworkPath:
+            suffix = ".csv"
+
+            def exists(self) -> bool:
+                return True
+
+            def __str__(self) -> str:
+                return "\\\\server\\share\\labels.csv"
+
+        with patch.object(streamlit_app.sys, "platform", "win32"), patch.object(
+            streamlit_app.os, "startfile", create=True
+        ) as startfile:
+            with self.assertRaises(OSError):
+                streamlit_app._open_local_artifact(_FakeNetworkPath())  # type: ignore[arg-type]
+
+        startfile.assert_not_called()
+
+
+class StreamlitLinkButtonCompatTests(unittest.TestCase):
+    """link_button에 key 인자가 없는 Streamlit에서도 안내 화면이 깨지지 않아야 한다."""
+
+    def test_key_is_passed_through_when_the_installed_streamlit_supports_it(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class _St:
+            @staticmethod
+            def link_button(label, url, key=None, width="content"):
+                calls.append({"label": label, "url": url, "key": key, "width": width})
+
+        with patch.object(streamlit_app, "st", _St):
+            streamlit_app._link_button("안내", "https://example.invalid", key="k1", width="stretch")
+
+        self.assertEqual(
+            [{"label": "안내", "url": "https://example.invalid", "key": "k1", "width": "stretch"}],
+            calls,
+        )
+
+    def test_keyed_container_wraps_the_button_when_key_is_unsupported(self) -> None:
+        events: list[tuple[object, ...]] = []
+
+        class _Container:
+            def __init__(self, key):
+                self.key = key
+
+            def __enter__(self):
+                events.append(("enter", self.key))
+                return self
+
+            def __exit__(self, *exc_info):
+                events.append(("exit", self.key))
+                return False
+
+        class _St:
+            @staticmethod
+            def link_button(label, url):
+                events.append(("link", label, url))
+
+            @staticmethod
+            def container(key=None):
+                return _Container(key)
+
+        with patch.object(streamlit_app, "st", _St):
+            streamlit_app._link_button("안내", "https://example.invalid", key="k2")
+
+        self.assertEqual(
+            [("enter", "k2"), ("link", "안내", "https://example.invalid"), ("exit", "k2")],
+            events,
+        )
+
+
 class StreamlitRegulationDirectoryTests(unittest.TestCase):
     """규정집 통합본 한 파일이든 규정별 개별 파일이든 같은 '규정 단위'로 나뉘어야 한다."""
 

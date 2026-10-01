@@ -513,6 +513,74 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(captured["argv"][5], shim)
         self.assertEqual(captured["argv"][-3:], ["--format", "json", "--silent"])
 
+    def test_parse_file_hides_console_window_only_on_windows(self) -> None:
+        # Kordoc runs once per document. Without CREATE_NO_WINDOW a windowless
+        # parent (service or desktop launcher) flashes a console for each run.
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=10,
+        )
+        windows_shim = "\\".join(["C:", "Users", "op", "AppData", "Roaming", "npm", "kordoc.cmd"])
+        for windows, resolved in ((True, windows_shim), (False, "/usr/local/bin/kordoc")):
+            with self.subTest(windows=windows):
+                captured: dict[str, object] = {}
+
+                def fake_run(argv, **kwargs):
+                    captured["kwargs"] = kwargs
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"blocks": []}), stderr="")
+
+                with patch("app.processors.kordoc_table_parser.shutil.which", return_value=resolved), patch(
+                    "app.processors.kordoc_table_parser._is_windows", return_value=windows
+                ), patch("app.core.hidden_process._is_windows", return_value=windows), patch(
+                    "app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run
+                ):
+                    result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+                self.assertEqual(result["status"], "parsed")
+                self.assertEqual(10, captured["kwargs"]["timeout"])
+                if windows:
+                    self.assertEqual(0x08000000, captured["kwargs"]["creationflags"])
+                else:
+                    self.assertNotIn("creationflags", captured["kwargs"])
+
+    def test_npm_global_prefix_probe_hides_console_window_only_on_windows(self) -> None:
+        from types import SimpleNamespace
+
+        from app.processors import kordoc_table_parser
+
+        for windows in (True, False):
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as tmp:
+                prefix = Path(tmp)
+                captured: dict[str, object] = {}
+
+                def fake_run(argv, **kwargs):
+                    captured["argv"] = argv
+                    captured["kwargs"] = kwargs
+                    return SimpleNamespace(returncode=0, stdout=f"{prefix}\n", stderr="")
+
+                # The probe is cached per executable string; clear it so this
+                # test neither reuses nor leaves a stale entry.
+                kordoc_table_parser._npm_global_prefix.cache_clear()
+                try:
+                    with patch("app.processors.kordoc_table_parser._is_windows", return_value=windows), patch(
+                        "app.core.hidden_process._is_windows", return_value=windows
+                    ), patch("app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run):
+                        resolved = kordoc_table_parser._npm_global_prefix("synthetic-npm.cmd")
+                finally:
+                    kordoc_table_parser._npm_global_prefix.cache_clear()
+
+                self.assertEqual(prefix, resolved)
+                self.assertEqual(["prefix", "-g"], captured["argv"][-2:])
+                self.assertEqual(3, captured["kwargs"]["timeout"])
+                if windows:
+                    self.assertEqual(0x08000000, captured["kwargs"]["creationflags"])
+                else:
+                    self.assertNotIn("creationflags", captured["kwargs"])
+
     def test_parse_file_finds_windows_npm_shim_when_path_is_stale(self) -> None:
         # A long-running Streamlit/API process can have a stale PATH after npm
         # installs Kordoc. Fall back to the standard Windows npm global shim dir.

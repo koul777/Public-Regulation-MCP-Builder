@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from statistics import median
 
+from app.core.hidden_process import hidden_window_options
 from app.parsers.base import (
     BaseParser,
     OCRRequiredError,
@@ -1117,6 +1118,7 @@ foreach ($imagePath in $imagePaths) {
                 encoding="utf-8",
                 timeout=self.ocr_timeout_seconds,
                 check=False,
+                **hidden_window_options(),
             )
             if completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()

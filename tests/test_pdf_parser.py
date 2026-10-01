@@ -431,6 +431,29 @@ class PDFParserTests(unittest.TestCase):
         self.assertIn("ocr_text_extracted", parsed.metadata["parser_uncertainty_flags"])
         self.assertEqual(parsed.pages[0].blocks[0].metadata["ocr_backend"], "windows")
 
+    def test_windows_ocr_powershell_hides_console_window_only_on_windows(self) -> None:
+        for windows in (True, False):
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as tmp:
+                image = Path(tmp) / "page-1.png"
+                image.write_bytes(b"synthetic")
+                completed = SimpleNamespace(
+                    returncode=0,
+                    stdout='{"pages": [{"path": "page-1.png", "text": "제1조(목적)"}]}',
+                    stderr="",
+                )
+
+                with patch("app.parsers.pdf_parser.shutil.which", return_value="powershell"), patch(
+                    "app.core.hidden_process._is_windows", return_value=windows
+                ), patch("app.parsers.pdf_parser.subprocess.run", return_value=completed) as run:
+                    pages = PDFParser(ocr_backend="windows", ocr_timeout_seconds=5)._extract_windows_ocr_pages([image])
+
+                self.assertEqual(["제1조(목적)"], pages)
+                self.assertEqual(5, run.call_args.kwargs["timeout"])
+                if windows:
+                    self.assertEqual(0x08000000, run.call_args.kwargs["creationflags"])
+                else:
+                    self.assertNotIn("creationflags", run.call_args.kwargs)
+
 
 class _FakeRect:
     def __init__(self, width: float, height: float) -> None:

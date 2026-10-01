@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import Settings
+from app.core.hidden_process import hidden_window_options
 
 
 WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py")
@@ -94,6 +95,7 @@ class KordocTableParser:
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_seconds,
+                **hidden_window_options(),
             )
         except subprocess.TimeoutExpired:
             if temp_dir is not None:
@@ -306,6 +308,7 @@ def _npm_global_prefix(npm_executable: str) -> Path | None:
             encoding="utf-8",
             errors="replace",
             timeout=3,
+            **hidden_window_options(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

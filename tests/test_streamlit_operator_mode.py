@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterator
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.core.hidden_process import hidden_window_options
 from scripts.mcp_connection_diagnostic import diagnostic_from_bundle_status
 from scripts.mcp_client_status import begin_attempt, commit_success, create_bundle_status
 
@@ -944,7 +945,12 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "_select_windows_output_directory_via_powershell"
         )
-        namespace = {"Path": Path, "os": os, "subprocess": subprocess}
+        namespace = {
+            "Path": Path,
+            "os": os,
+            "subprocess": subprocess,
+            "hidden_window_options": hidden_window_options,
+        }
         exec(
             compile(ast.Module(body=[helper_node], type_ignores=[]), "<folder-picker>", "exec"),
             namespace,
@@ -957,7 +963,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp, patch(
             "subprocess.run", return_value=completed
-        ) as run_process:
+        ) as run_process, patch("app.core.hidden_process._is_windows", return_value=True):
             selected = namespace["_select_windows_output_directory_via_powershell"](
                 Path(tmp)
             )
@@ -970,6 +976,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             str(Path(tmp).resolve()),
             kwargs["env"]["PR_MCP_FOLDER_PICKER_INITIAL"],
         )
+        # Only the console host is hidden; the dialog is still shown by PowerShell.
+        self.assertEqual(0x08000000, kwargs["creationflags"])
 
     def test_portable_mcp_config_uses_executable_server_mode(self) -> None:
         source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
