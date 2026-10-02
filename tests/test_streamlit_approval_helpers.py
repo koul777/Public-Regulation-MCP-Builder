@@ -1243,5 +1243,126 @@ class InstitutionStorageDirAgreementTests(unittest.TestCase):
                 self.assertEqual([], streamlit_app._pending_upload_paths(profile_id))
 
 
+class ApprovalReviewReasonLabelTests(unittest.TestCase):
+    """초보자 검수 화면에 내부 코드(table_review_flags:... 등)를 그대로 보여주지 않는다."""
+
+    def _items(self, reasons: list[str]) -> list[dict]:
+        chunk = SimpleNamespace(chunk_id="c1", warnings=[], metadata={"hierarchy_path": "제1조"}, chunk_type="article")
+        return streamlit_app._approval_ai_review_items(chunk, reasons, None)
+
+    def test_prefixed_table_flags_get_plain_wording(self) -> None:
+        items = self._items(
+            [
+                "table_review_flags:possible_truncated_cell",
+                "table_review_flags:row_review_required",
+                "table_review_flags:wrapped_cell_merge",
+            ]
+        )
+
+        self.assertEqual(["표 칸 잘림 가능성", "표 줄 확인", "표 줄 합침 확인"], [item["title"] for item in items])
+        for item in items:
+            self.assertNotIn("table_review_flags", str(item["suggestion"]))
+            self.assertNotIn("_", str(item["suggestion"]))
+
+    def test_unknown_flags_fall_back_to_their_family_without_the_code(self) -> None:
+        reasons = [
+            "table_review_flags:brand_new_flag",
+            "parser_uncertainty_flags:some_flag",
+            "warning:table_caption_split",
+            "mystery_reason_code",
+        ]
+        items = self._items(reasons)
+
+        self.assertEqual(
+            ["표 내용 확인", "자동 변환이 불확실한 부분", "변환 경고 확인", "검수 항목 확인"],
+            [item["title"] for item in items],
+        )
+        for item, reason in zip(items, reasons):
+            self.assertNotIn(reason, str(item["suggestion"]))
+            self.assertEqual(reason, item["reason"])
+
+    def test_existing_reason_labels_are_unchanged(self) -> None:
+        item = self._items(["table_review_required"])[0]
+
+        self.assertEqual(streamlit_app.AI_REVIEW_REASON_LABELS["table_review_required"][0], item["title"])
+
+    def test_every_reason_family_from_review_workflow_has_plain_wording(self) -> None:
+        from app.services import review_workflow_service as workflow
+
+        # Bool keys and the page-location key are emitted bare; list keys and
+        # parser-uncertainty details are emitted as "<family>:<value>".
+        codes = [
+            *workflow.REVIEW_ATTENTION_BOOL_METADATA_KEYS,
+            "source_page_unavailable_reason",
+            *(f"{family}:x" for family in workflow.REVIEW_ATTENTION_LIST_METADATA_KEYS),
+            "parser_uncertainty_risk_level:high",
+            "parser_uncertainty_flags:x",
+            "parser_uncertainty_recommendation:x",
+            "warning:x",
+        ]
+        for code in codes:
+            title, _severity, suggestion = streamlit_app._approval_review_reason_label(code)
+            self.assertNotEqual(streamlit_app.AI_REVIEW_DEFAULT_LABEL[0], title, code)
+            self.assertNotIn(code.partition(":")[0], suggestion)
+
+
+class ApprovalReviewGuideBannerTests(unittest.TestCase):
+    """초보자 안내 배너는 판단하지 않은 첫 항목 위에 한 번만 나온다."""
+
+    REASONS = [
+        "table_review_flags:possible_truncated_cell",
+        "table_review_flags:row_review_required",
+        "table_review_required",
+    ]
+
+    def _app(self):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_string(
+            "import streamlit as st\n"
+            "from frontend.streamlit_app import _render_approval_chunk_confirmation_controls\n"
+            "_render_approval_chunk_confirmation_controls(document_id='doc', chunk=st.session_state['chunk'],"
+            " agent_review_summary=None, review_reasons=st.session_state['reasons'])\n"
+        )
+        app.session_state["chunk"] = Chunk(
+            chunk_id="c1", document_id="doc", chunk_type="table", text="구분 | 내용", metadata={}
+        )
+        app.session_state["reasons"] = list(self.REASONS)
+        app.session_state[streamlit_app.BEGINNER_GUIDE_ENABLED_KEY] = True
+        app.session_state[streamlit_app.BEGINNER_GUIDE_STEP_KEY] = 3
+        return app
+
+    @staticmethod
+    def _guide_markers(app) -> list[str]:
+        return [
+            str(item.value)
+            for item in app.markdown
+            if "data-rr-tour=" in str(item.value) and "주의할 점을 보고 버튼을 골라 주세요" in str(item.value)
+        ]
+
+    def test_one_banner_moves_to_the_next_undecided_item(self) -> None:
+        app = self._app()
+        app.run(timeout=60)
+        self.assertFalse(app.exception)
+        captions = " ".join(str(item.value) for item in app.caption)
+        self.assertNotIn("table_review_flags", captions)
+        markers = self._guide_markers(app)
+        self.assertEqual(1, len(markers))
+        self.assertIn("possible_truncated_cell", markers[0])
+
+        skip_keys = [item.key for item in app.button if item.label == "이 문제는 없어요"]
+        self.assertEqual(3, len(skip_keys))
+        app.button(key=skip_keys[0]).click().run(timeout=60)
+        self.assertFalse(app.exception)
+        markers = self._guide_markers(app)
+        self.assertEqual(1, len(markers))
+        self.assertIn("row_review_required", markers[0])
+
+        for key in skip_keys[1:]:
+            app.button(key=key).click().run(timeout=60)
+            self.assertFalse(app.exception)
+        self.assertEqual([], self._guide_markers(app))
+
+
 if __name__ == "__main__":
     unittest.main()
