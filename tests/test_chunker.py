@@ -3026,5 +3026,66 @@ class ChunkerTablePromotionKeepsProseTests(unittest.TestCase):
         self.assertIn(markdown, result)
 
 
+class ChunkerExplicitTableRowsTests(unittest.TestCase):
+    """DOCX/HWPX 표는 한 줄이 곧 한 행이므로 줄 이어붙이기(wrapped cell) 병합을 하지 않는다."""
+
+    TABLE = (
+        "구분 | 합성 처리 기준\n"
+        "일반 휴가 | 신청서 제출 후 담당자 확인\n"
+        "긴급 휴가 | 담당자에게 먼저 알린 뒤 신청서 보완"
+    )
+
+    def _table_chunk(self, file_type: str) -> Chunk:
+        text = "제1조(휴가) 휴가 처리 기준은 다음 표와 같다.\n" + self.TABLE
+        parsed = ParsedDocument(
+            document_id="doc_rows",
+            source_file=f"rows.{file_type}",
+            file_type=file_type,
+            pages=[
+                ParsedPage(
+                    page_no=1,
+                    blocks=[
+                        ParsedBlock(type="text", text="제1조(휴가) 휴가 처리 기준은 다음 표와 같다."),
+                        ParsedBlock(type="table", text=self.TABLE),
+                    ],
+                )
+            ],
+            raw_text=text,
+        )
+        nodes = StructureDetector().detect(parsed)
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+        return next(chunk for chunk in chunks if chunk.chunk_type == "table")
+
+    def test_docx_table_rows_are_not_merged_as_wrapped_cells(self) -> None:
+        chunk = self._table_chunk("docx")
+        rows = [row["cells"] for row in chunk.metadata["table_cell_rows"]]
+
+        self.assertEqual(3, len(rows))
+        self.assertIn(["일반 휴가", "신청서 제출 후 담당자 확인"], rows)
+        self.assertIn(["긴급 휴가", "담당자에게 먼저 알린 뒤 신청서 보완"], rows)
+        self.assertNotIn("wrapped_cell_merge", chunk.metadata.get("table_review_flags") or [])
+
+    def test_hwpx_table_rows_are_not_merged_as_wrapped_cells(self) -> None:
+        chunk = self._table_chunk("hwpx")
+
+        self.assertNotIn("wrapped_cell_merge", chunk.metadata.get("table_review_flags") or [])
+
+    def test_text_extracted_pdf_table_still_merges_wrapped_cells(self) -> None:
+        chunk = self._table_chunk("pdf")
+
+        self.assertIn("wrapped_cell_merge", chunk.metadata.get("table_review_flags") or [])
+
+    def test_row_boundary_mode_is_reset_after_building(self) -> None:
+        chunker = Chunker()
+        parsed = ParsedDocument(
+            document_id="doc_reset", source_file="reset.docx", file_type="docx",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(type="table", text=self.TABLE)])],
+            raw_text=self.TABLE,
+        )
+        chunker.build_chunks(StructureDetector().detect(parsed), parsed)
+
+        self.assertFalse(chunker.table_extractor.explicit_row_boundaries)
+
+
 if __name__ == "__main__":
     unittest.main()

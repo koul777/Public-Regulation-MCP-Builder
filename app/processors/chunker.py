@@ -118,6 +118,30 @@ class Chunker:
         options: ChunkOptions | None = None,
         regulation_progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> list[Chunk]:
+        extractor = self.table_extractor
+        if not hasattr(extractor, "explicit_row_boundaries"):
+            return self._build_chunks(nodes, parsed, options, regulation_progress_callback)
+        previous = extractor.explicit_row_boundaries
+        extractor.explicit_row_boundaries = self._parser_writes_one_table_row_per_line(parsed)
+        try:
+            return self._build_chunks(nodes, parsed, options, regulation_progress_callback)
+        finally:
+            extractor.explicit_row_boundaries = previous
+
+    @staticmethod
+    def _parser_writes_one_table_row_per_line(parsed: ParsedDocument) -> bool:
+        file_type = str(parsed.file_type or "").strip().lower().lstrip(".")
+        if not file_type:
+            file_type = Path(str(parsed.source_file or "")).suffix.lower().lstrip(".")
+        return file_type in {"docx", "hwpx"}
+
+    def _build_chunks(
+        self,
+        nodes: list[StructureNode],
+        parsed: ParsedDocument,
+        options: ChunkOptions | None = None,
+        regulation_progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> list[Chunk]:
         options = options or ChunkOptions()
         lookup = {node.node_id: node for node in nodes}
         children_by_parent = self._children_by_parent(nodes)

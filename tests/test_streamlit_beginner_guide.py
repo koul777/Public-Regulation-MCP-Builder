@@ -3221,9 +3221,16 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
         self.assertIn("주의할 점을 보고 버튼을 골라 주세요", markers)
         # Both choices must be reachable inside one spotlight; guidance must
-        # not silently pick a review decision or sign an approval.
-        next(item for item in self.app.button if item.label in {"해당 없음", "이 문제는 없어요"}).click().run()
-        self.assertFalse(self.app.exception)
+        # not silently pick a review decision or sign an approval. The sample
+        # table keeps its rows, so it can carry several table review flags;
+        # the beginner decides each one explicitly.
+        skip_keys = [
+            item.key for item in self.app.button if item.label in {"해당 없음", "이 문제는 없어요"}
+        ]
+        self.assertTrue(skip_keys)
+        for skip_key in skip_keys:
+            self.app.button(key=skip_key).click().run()
+            self.assertFalse(self.app.exception)
         markers = "\n".join(str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value))
         self.assertIn("내용이 맞으면 다음으로 가요", markers)
         self.assertNotIn("주의할 점을 보고 버튼을 골라 주세요", markers)

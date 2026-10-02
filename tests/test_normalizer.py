@@ -115,6 +115,58 @@ class TextNormalizerTests(unittest.TestCase):
 
         self.assertNotIn("- 12 -", normalized.raw_text)
 
+    def test_keeps_table_rows_on_separate_lines(self) -> None:
+        table = "구분 | 대상 | 금액\n가족수당 | 배우자 | 40,000원\n가족수당 | 자녀 | 20,000원"
+        prose = "제1조(목적) 이 규정은\n직원의 복무에 관한 사항을 정한다."
+        parsed = ParsedDocument(
+            document_id="doc-table",
+            source_file="x.docx",
+            file_type="docx",
+            pages=[
+                ParsedPage(
+                    page_no=1,
+                    blocks=[ParsedBlock(type="text", text=prose), ParsedBlock(type="table", text=table)],
+                )
+            ],
+            raw_text=f"{prose}\n{table}",
+        )
+
+        normalized = TextNormalizer().normalize_document(parsed)
+        prose_block, table_block = normalized.pages[0].blocks
+
+        self.assertEqual(table, table_block.text)
+        self.assertEqual("제1조(목적) 이 규정은 직원의 복무에 관한 사항을 정한다.", prose_block.text)
+
+    def test_docx_table_rows_survive_parse_and_normalize(self) -> None:
+        try:
+            from docx import Document
+        except ImportError:  # pragma: no cover - python-docx is a core dependency
+            self.skipTest("python-docx is not installed")
+        import tempfile
+        from pathlib import Path
+
+        from app.parsers.docx_parser import DocxParser
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allowance.docx"
+            doc = Document()
+            doc.add_paragraph("제5조(가족수당) 가족수당은 다음 표와 같다.")
+            rows = [("구분", "대상", "금액"), ("가족수당", "배우자", "40,000원"), ("가족수당", "자녀", "20,000원")]
+            table = doc.add_table(rows=len(rows), cols=3)
+            for row_index, row in enumerate(rows):
+                for col_index, value in enumerate(row):
+                    table.cell(row_index, col_index).text = value
+            doc.save(path)
+
+            parsed = DocxParser().parse(path, "doc_allowance")
+
+        normalized = TextNormalizer().normalize_document(parsed)
+        table_block = next(block for block in normalized.pages[0].blocks if block.type == "table")
+
+        self.assertEqual(
+            ["구분 | 대상 | 금액", "가족수당 | 배우자 | 40,000원", "가족수당 | 자녀 | 20,000원"],
+            table_block.text.splitlines(),
+        )
 
 class NormalizerMojibakeCleanupTests(unittest.TestCase):
     """깨진 글자를 지우되, 지웠다는 사실과 정상 한자는 남기는지 확인한다."""
