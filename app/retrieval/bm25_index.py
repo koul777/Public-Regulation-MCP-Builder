@@ -13,6 +13,8 @@ import unicodedata
 
 from app.retrieval.tokenizer import (
     FALLBACK_TOKENIZER_MODEL,
+    preloaded_kiwi_tokens,
+    recording_kiwi_inputs,
     tokenize,
     tokenizer_name,
 )
@@ -85,26 +87,33 @@ class Bm25Index:
         document_frequencies: Counter[str] = Counter()
         total_length = 0
         normalized_records = list(records)
-        for record in normalized_records:
-            term_frequencies = _weighted_term_frequencies(record, title_weight=title_weight)
-            if not term_frequencies:
-                continue
-            document_terms = dict(sorted(term_frequencies.items()))
-            for token in document_terms:
-                document_frequencies[token] += 1
-            document_length = sum(int(value) for value in document_terms.values())
-            total_length += document_length
-            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-            documents.append(
-                {
-                    "id": str(record.get("id") or ""),
-                    "document_id": str(record.get("document_id") or metadata.get("document_id") or ""),
-                    "chunk_id": str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
-                    "content_hash": str(record.get("content_hash") or ""),
-                    "document_length": document_length,
-                    "term_frequencies": document_terms,
-                }
-            )
+        # Record every text the build will tokenize, analyze the unique ones in
+        # one batched Kiwi call, then run the unchanged build against that table.
+        # About two thirds of these texts repeat across fields and records.
+        with recording_kiwi_inputs() as kiwi_inputs:
+            for record in normalized_records:
+                _weighted_term_frequencies(record, title_weight=title_weight)
+        with preloaded_kiwi_tokens(kiwi_inputs):
+            for record in normalized_records:
+                term_frequencies = _weighted_term_frequencies(record, title_weight=title_weight)
+                if not term_frequencies:
+                    continue
+                document_terms = dict(sorted(term_frequencies.items()))
+                for token in document_terms:
+                    document_frequencies[token] += 1
+                document_length = sum(int(value) for value in document_terms.values())
+                total_length += document_length
+                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                documents.append(
+                    {
+                        "id": str(record.get("id") or ""),
+                        "document_id": str(record.get("document_id") or metadata.get("document_id") or ""),
+                        "chunk_id": str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
+                        "content_hash": str(record.get("content_hash") or ""),
+                        "document_length": document_length,
+                        "term_frequencies": document_terms,
+                    }
+                )
         average_length = total_length / len(documents) if documents else 0.0
         return cls(
             index_version=BM25_INDEX_VERSION,

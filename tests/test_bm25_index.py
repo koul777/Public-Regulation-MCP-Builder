@@ -1132,6 +1132,27 @@ class Bm25IndexTests(unittest.TestCase):
         self.assertLess(top_ids.index("doc:governing-article"), top_ids.index("doc:gift-form"))
 
 
+    def test_batched_kiwi_build_matches_unbatched_build(self) -> None:
+        from contextlib import nullcontext
+
+        from app.retrieval import bm25_index as bm25_module
+
+        records = [
+            _record("tenant-a:doc:c1", "제1조(목적) 이 규정은 직원의 복무에 관한 사항을 정한다.", article_title="목적"),
+            _record("tenant-a:doc:c2", "제12조(휴직) ① 직원이 질병으로 휴직을 신청하면 승인한다.", article_title="휴직"),
+            _record("tenant-a:doc:c3", "제12조(휴직) ② 육아휴직 수당은 별표 1에 따른다.", article_title="휴직"),
+        ]
+
+        batched = Bm25Index.build(records).to_dict()
+        with patch.object(bm25_module, "preloaded_kiwi_tokens", lambda texts: nullcontext()):
+            unbatched = Bm25Index.build(records).to_dict()
+
+        batched.pop("generated_at", None)
+        unbatched.pop("generated_at", None)
+        self.assertEqual(unbatched, batched)
+        self.assertTrue(batched["documents"])
+
+
 def _record(
     record_id: str,
     text: str,
