@@ -1604,6 +1604,52 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertEqual([node.number for node in articles], ["제1조"])
         self.assertIn("제5조(정의)에 따라", articles[0].text)
 
+    def test_titled_article_reference_wrapped_to_line_start_is_not_a_heading(self) -> None:
+        text = "\n".join(
+            [
+                "제10조(징계) ① 징계의 절차는",
+                "제11조(징계위원회)의 의결을 거쳐야 한다.",
+                "② 징계 결과는 본인에게 통보한다.",
+                "제11조(징계위원회) 위원회는 5명으로 구성한다.",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        articles = [node for node in nodes if node.node_type == "article"]
+        by_number = {node.number: node for node in nodes if node.number}
+
+        self.assertEqual(["제10조", "제11조"], [node.number for node in articles])
+        self.assertIn("제11조(징계위원회)의 의결을 거쳐야 한다.", by_number["①"].text)
+        self.assertEqual(articles[0].node_id, by_number["②"].parent_id)
+
+    def test_titled_article_reference_tails_for_common_particles(self) -> None:
+        for tail in ("에 따른다.", "에서 정한다.", "으로 정한다.", "를 준용한다.", "및 제12조를 준용한다.", "중 해당 사항"):
+            with self.subTest(tail=tail):
+                nodes = StructureDetector().detect_from_text(
+                    "\n".join(["제1조(목적) ① 세부 사항은", f"제5조(정의){tail}"])
+                )
+                self.assertEqual(["제1조"], [node.number for node in nodes if node.node_type == "article"])
+
+        nodes = StructureDetector().detect_from_text("제1조(목적) ① 징계는\n제11조(징계위원회)의\n의결을 거친다.")
+        self.assertEqual(["제1조"], [node.number for node in nodes if node.node_type == "article"])
+
+    def test_titled_article_heading_followed_by_body_is_still_a_heading(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(
+                [
+                    "제1조(목적)이 규정은 복무에 관한 사항을 정한다.",
+                    "제2조(정의) 이 규정에서 사용하는 용어는 다음과 같다.",
+                    "제3조(적용범위) 중앙행정기관에 적용한다.",
+                    "제4조(위원회) 위원회는 5명으로 구성한다.",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            ["제1조", "제2조", "제3조", "제4조"],
+            [node.number for node in nodes if node.node_type == "article"],
+        )
+
     def test_explicit_caption_markers_add_caption_metadata(self) -> None:
         text = "\n".join(
             [
