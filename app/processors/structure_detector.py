@@ -362,6 +362,10 @@ class StructureDetector:
                 None,
             )
             trailing = (match.group("article_trailing") or "").strip()
+            if title and self._looks_like_titled_article_reference_tail(trailing):
+                # "제11조(징계위원회)의 의결을 거쳐야 한다." is a cross-reference
+                # that a line wrap pushed to the start of a line, not a heading.
+                return None
             if not title:
                 title = self._article_lifecycle_title(trailing)
             if not title and self._looks_like_article_reference_tail(trailing):
@@ -412,6 +416,16 @@ class StructureDetector:
 
     def _looks_like_article_reference_tail(self, trailing: str) -> bool:
         return bool(re.match(r"^(제\s*\d+\s*(항|호)|및|내지|부터|까지|관련|중\b)", trailing.strip()))
+
+    def _looks_like_titled_article_reference_tail(self, trailing: str) -> bool:
+        """Return True when text right after ``제N조(제목)`` continues a sentence.
+
+        A heading's body never starts with a case particle or conjunction
+        followed by a space. ``이`` is excluded on purpose: the compact form
+        ``제1조(목적)이 규정은 ...`` is a real heading followed by its body.
+        """
+
+        return bool(re.match(r"^(?:의|에|에서|으로|로|을|를|은|는|과|와|및|중)(?=\s|$)", trailing))
 
     def _article_lifecycle_title(self, trailing: str) -> str | None:
         compact = re.sub(r"\s+", "", trailing or "").lstrip("<")
