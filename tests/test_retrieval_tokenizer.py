@@ -4,7 +4,13 @@ import unicodedata
 import unittest
 from unittest.mock import patch
 
-from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL, TOKENIZER_MODEL, tokenize
+from app.retrieval.tokenizer import (
+    FALLBACK_TOKENIZER_MODEL,
+    TOKENIZER_MODEL,
+    preloaded_kiwi_tokens,
+    recording_kiwi_inputs,
+    tokenize,
+)
 
 
 class RetrievalTokenizerTests(unittest.TestCase):
@@ -78,6 +84,50 @@ class RetrievalTokenizerTests(unittest.TestCase):
             tokens = tokenize("육아휴직 신청", tokenizer_model=FALLBACK_TOKENIZER_MODEL)
 
         self.assertIn("육아휴직", tokens)
+
+
+    def test_preloaded_batch_tokens_match_per_call_tokens(self) -> None:
+        texts = [
+            "제12조(휴직) ① 직원이 질병으로 휴직을 신청하면",
+            "육아휴직 신청 절차와 수당 지급",
+            unicodedata.normalize("NFD", "병가를 사용한 직원"),
+            "제１２조의２ 별표 1",
+            "",
+            "육아휴직 신청 절차와 수당 지급",
+        ]
+        expected = [
+            (tokenize(text, tokenizer_model=TOKENIZER_MODEL), tokenize(text, dedupe=False, tokenizer_model=TOKENIZER_MODEL))
+            for text in texts
+        ]
+
+        with preloaded_kiwi_tokens(texts):
+            actual = [
+                (tokenize(text, tokenizer_model=TOKENIZER_MODEL), tokenize(text, dedupe=False, tokenizer_model=TOKENIZER_MODEL))
+                for text in texts
+            ]
+            unlisted = tokenize("목록에 없는 문장도 평소처럼 분석", tokenizer_model=TOKENIZER_MODEL)
+
+        self.assertEqual(expected, actual)
+        self.assertEqual(tokenize("목록에 없는 문장도 평소처럼 분석", tokenizer_model=TOKENIZER_MODEL), unlisted)
+
+    def test_recording_collects_unique_kiwi_inputs_without_analyzing(self) -> None:
+        with recording_kiwi_inputs() as recorded:
+            first = tokenize("휴직 신청", tokenizer_model=TOKENIZER_MODEL)
+            tokenize("휴직 신청", tokenizer_model=TOKENIZER_MODEL)
+            tokenize(unicodedata.normalize("NFD", "육아휴직"), tokenizer_model=TOKENIZER_MODEL)
+            regex_tokens = tokenize("병가 사용", tokenizer_model=FALLBACK_TOKENIZER_MODEL)
+
+        self.assertEqual([], first)
+        self.assertEqual(["휴직 신청", "육아휴직"], list(recorded))
+        self.assertIn("병가", regex_tokens)
+        self.assertIn("휴직", tokenize("휴직 신청", tokenizer_model=TOKENIZER_MODEL))
+
+    def test_preloading_never_replaces_explicit_regex_tokenizer(self) -> None:
+        text = "병가를 사용한 직원"
+        expected = tokenize(text, tokenizer_model=FALLBACK_TOKENIZER_MODEL)
+
+        with preloaded_kiwi_tokens([text]):
+            self.assertEqual(expected, tokenize(text, tokenizer_model=FALLBACK_TOKENIZER_MODEL))
 
 
 if __name__ == "__main__":

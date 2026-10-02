@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any
 
@@ -10,6 +13,15 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 TOKENIZER_MODEL = "kiwi-tokenizer-v1"
 FALLBACK_TOKENIZER_MODEL = "regex-ko-tokenizer-v1"
+
+# Bulk index builds call tokenize() tens of times per record and most of those
+# texts repeat. These two context-local switches let a builder first record the
+# texts Kiwi would analyze, then analyze the unique ones in one batched call.
+# Outside those blocks tokenize() behaves exactly as before.
+_RECORDED_KIWI_INPUTS: ContextVar[dict[str, None] | None] = ContextVar("_RECORDED_KIWI_INPUTS", default=None)
+_PRELOADED_KIWI_TOKENS: ContextVar[dict[str, list[str]] | None] = ContextVar(
+    "_PRELOADED_KIWI_TOKENS", default=None
+)
 
 _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
 _ARTICLE_NO_RE = re.compile(r"제\s*\d+\s*조(?:\s*의\s*\d+)?", re.IGNORECASE)
@@ -96,11 +108,63 @@ def tokenize(
     if kiwi is None:
         tokens = _regex_tokens(raw_text)
     else:
-        tokens = _kiwi_tokens(kiwi, raw_text)
+        recorded = _RECORDED_KIWI_INPUTS.get()
+        if recorded is not None:
+            recorded[raw_text] = None
+            return []
+        preloaded = _PRELOADED_KIWI_TOKENS.get()
+        cached = preloaded.get(raw_text) if preloaded is not None else None
+        tokens = list(cached) if cached is not None else _kiwi_tokens(kiwi, raw_text)
     combined = [*article_tokens, *tokens]
     if dedupe:
         return _dedupe_preserve_order(combined)
     return [token for token in combined if token]
+
+
+@contextmanager
+def recording_kiwi_inputs() -> Iterator[dict[str, None]]:
+    """Collect the texts tokenize() would send to Kiwi, without analyzing them.
+
+    Inside the block, every tokenize() call that would use Kiwi records its
+    NFKC-normalized text in the yielded dict (insertion-ordered, unique) and
+    returns ``[]``. Use it only for a dry pass whose results are discarded.
+    """
+
+    recorded: dict[str, None] = {}
+    reset_token = _RECORDED_KIWI_INPUTS.set(recorded)
+    try:
+        yield recorded
+    finally:
+        _RECORDED_KIWI_INPUTS.reset(reset_token)
+
+
+@contextmanager
+def preloaded_kiwi_tokens(texts: Iterable[str]) -> Iterator[None]:
+    """Analyze many texts in one batched Kiwi call and reuse the result.
+
+    Inside the block, tokenize() answers Kiwi-path calls for these texts from
+    the batch; any other text is analyzed as usual. Token output is identical
+    to per-call analysis. Without Kiwi, or if the batch call fails, the block
+    simply runs without preloading.
+    """
+
+    table: dict[str, list[str]] | None = None
+    kiwi = _kiwi()
+    if kiwi is not None:
+        unique = list(dict.fromkeys(unicodedata.normalize("NFKC", str(text or "")) for text in texts))
+        if unique:
+            try:
+                table = {
+                    text: _kiwi_items_to_tokens(items) for text, items in zip(unique, kiwi.tokenize(unique))
+                }
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                LOGGER.warning("kiwipiepy batch tokenization failed; analyzing texts one by one: %s", exc)
+                table = None
+    reset_token = _PRELOADED_KIWI_TOKENS.set(table)
+    try:
+        yield
+    finally:
+        _PRELOADED_KIWI_TOKENS.reset(reset_token)
 
 
 def tokenizer_name() -> str:
@@ -126,12 +190,16 @@ def _kiwi() -> Any | None:
 
 
 def _kiwi_tokens(kiwi: Any, text: str) -> list[str]:
-    tokens: list[str] = []
     try:
         analyzed = kiwi.tokenize(text)
     except Exception as exc:  # pragma: no cover - defensive fallback
         LOGGER.warning("kiwipiepy tokenization failed; falling back to regex Korean tokenizer: %s", exc)
         return _regex_tokens(text)
+    return _kiwi_items_to_tokens(analyzed)
+
+
+def _kiwi_items_to_tokens(analyzed: Iterable[Any]) -> list[str]:
+    tokens: list[str] = []
     for item in analyzed:
         form = str(getattr(item, "form", "") or "").strip().lower()
         tag = str(getattr(item, "tag", "") or "")
