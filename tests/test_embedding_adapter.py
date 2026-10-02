@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import unittest
 from unittest.mock import patch
 
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL
+from app.ingestion import embedding_adapter
 from app.ingestion.embedding_adapter import (
     EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION,
     LOCAL_HASH_EMBEDDING_MODEL,
     embed_vector_record,
     embed_vector_records,
     local_hash_embedding,
+    stable_embedding_hash,
 )
 from app.ingestion.vector_adapter import VECTOR_RECORD_SCHEMA_VERSION, stable_content_hash
+from app.ingestion.vector_integrity import embedded_vector_integrity_reason
 
 
 class EmbeddingAdapterTests(unittest.TestCase):
@@ -103,6 +108,86 @@ class EmbeddingAdapterTests(unittest.TestCase):
         adapter_factory.assert_not_called()
         self.assertEqual([], embedded)
         self.assertEqual(0, summary["record_count"])
+
+
+class LocalHashEmbeddingTokenCacheTests(unittest.TestCase):
+    REPEATED_TEXT = "제1조(목적) 이 규정은 예산 집행 기준을 정한다. 제2조(적용) 이 규정은 예산 집행에 적용한다. 예산 예산 예산"
+
+    def setUp(self) -> None:
+        embedding_adapter._cached_token_bucket.cache_clear()
+
+    def tearDown(self) -> None:
+        embedding_adapter._cached_token_bucket.cache_clear()
+
+    def test_repeated_tokens_match_cache_cleared_and_uncached_computation(self) -> None:
+        for dimensions in (1, 8, 384, 4096):
+            with self.subTest(dimensions=dimensions):
+                embedding_adapter._cached_token_bucket.cache_clear()
+                cold = local_hash_embedding(self.REPEATED_TEXT, dimensions=dimensions)
+                warm = local_hash_embedding(self.REPEATED_TEXT, dimensions=dimensions)
+                embedding_adapter._cached_token_bucket.cache_clear()
+                recleared = local_hash_embedding(self.REPEATED_TEXT, dimensions=dimensions)
+
+                self.assertEqual(_uncached_reference_embedding(self.REPEATED_TEXT, dimensions), cold)
+                self.assertEqual(cold, warm)
+                self.assertEqual(cold, recleared)
+
+        info = embedding_adapter._cached_token_bucket.cache_info()
+        self.assertGreater(info.hits, 0)
+
+    def test_different_dimensions_do_not_share_cache_entries(self) -> None:
+        local_hash_embedding("예산", dimensions=8)
+        after_first = embedding_adapter._cached_token_bucket.cache_info()
+        local_hash_embedding("예산", dimensions=16)
+        after_second = embedding_adapter._cached_token_bucket.cache_info()
+
+        self.assertEqual(1, after_first.currsize)
+        self.assertEqual(2, after_second.currsize)
+        self.assertEqual(0, after_second.hits)
+        self.assertEqual(_uncached_reference_embedding("예산", 16), local_hash_embedding("예산", dimensions=16))
+        self.assertEqual(_uncached_reference_embedding("예산", 8), local_hash_embedding("예산", dimensions=8))
+
+    def test_token_cache_is_bounded_and_skips_long_tokens(self) -> None:
+        self.assertEqual(65_536, embedding_adapter._cached_token_bucket.cache_info().maxsize)
+        long_token = "가" * (embedding_adapter._TOKEN_BUCKET_CACHE_MAX_CHARS + 1)
+        punctuation_only = "!!! ... ---"
+
+        self.assertEqual(_uncached_reference_embedding(long_token, 8), local_hash_embedding(long_token, dimensions=8))
+        self.assertEqual(
+            _uncached_reference_embedding(punctuation_only, 8),
+            local_hash_embedding(punctuation_only, dimensions=8),
+        )
+        self.assertEqual(1, embedding_adapter._cached_token_bucket.cache_info().currsize)
+
+    def test_tampered_rows_are_still_rejected_with_a_warm_token_cache(self) -> None:
+        clean = embed_vector_record(_record("doc:chunk-1", self.REPEATED_TEXT), dimensions=8)
+        self.assertEqual("", embedded_vector_integrity_reason(clean))
+        self.assertGreater(embedding_adapter._cached_token_bucket.cache_info().currsize, 0)
+
+        text_changed = dict(clean)
+        text_changed["text"] = self.REPEATED_TEXT.replace("집행 기준", "집행 예외")
+        swapped_cached_vocabulary = dict(clean)
+        swapped_cached_vocabulary["text"] = "예산 예산 예산 제1조 목적 규정"
+        embedding_replaced = dict(clean)
+        embedding_replaced["embedding"] = local_hash_embedding("예산 예산", dimensions=8)
+        embedding_replaced["embedding_hash"] = stable_embedding_hash(embedding_replaced["embedding"])
+
+        self.assertEqual("embedding_vector_mismatch", embedded_vector_integrity_reason(text_changed))
+        self.assertEqual("embedding_vector_mismatch", embedded_vector_integrity_reason(swapped_cached_vocabulary))
+        self.assertEqual("embedding_vector_mismatch", embedded_vector_integrity_reason(embedding_replaced))
+        self.assertEqual("", embedded_vector_integrity_reason(clean))
+
+
+def _uncached_reference_embedding(text: str, dimensions: int) -> list[float]:
+    vector = [0.0] * dimensions
+    tokens = embedding_adapter._tokens(text) or [text]
+    for token in tokens:
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        vector[int.from_bytes(digest[:4], "big") % dimensions] += -1.0 if digest[4] & 1 else 1.0
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm:
+        vector = [round(value / norm, 8) for value in vector]
+    return vector
 
 
 class _RecordingEmbeddingAdapter:
