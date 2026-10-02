@@ -82,7 +82,34 @@ jobs:
             tests.test_local_llm_doctor \
             tests.test_qwen_chat_app \
             tests.test_streamlit_ai_usage_path \
-            tests.test_streamlit_operator_mode
+            tests.test_streamlit_operator_mode \
+            tests.test_streamlit_approval_helpers \
+            tests.test_hidden_process \
+            tests.test_local_http \
+            tests.test_ollama_runtime
+
+      - name: Run tenant isolation, API security, approval and repository contracts
+        run: |
+          python -m unittest -v \
+            tests.test_api_security \
+            tests.test_api_tenant_isolation \
+            tests.test_tenant_access \
+            tests.test_repository \
+            tests.test_repository_journal_integrity \
+            tests.test_approval_governance \
+            tests.test_approval_governance_invariants \
+            tests.test_retrieval_security \
+            tests.test_official_rag_approval_gate_policy
+
+      # Largest API route and MCP tool suites. This step is separate so it can be
+      # dropped on its own if pull request runtime becomes a concern; the same
+      # modules still run after merge in the auto-release verify job.
+      - name: Run large API route and MCP tool suites
+        run: |
+          python -m unittest -v \
+            tests.test_routes_rag \
+            tests.test_routes_documents \
+            tests.test_regulation_mcp_tools
 
       - name: Build source and wheel distributions
         run: python -m build --sdist --wheel

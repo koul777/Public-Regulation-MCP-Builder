@@ -2711,6 +2711,10 @@ def approve_review_chunks(
     approval_state_committed = False
     try:
         require_api_role(auth, API_WRITE_ROLES)
+        # The override reason lets an approval skip the review-flag acknowledgement,
+        # so it needs the same admin role the merge endpoint already demands for it.
+        if str(request.approval_override_reason or "").strip():
+            require_api_role(auth, {API_ROLE_ADMIN})
         _require_document_access(repository, document_id, auth)
         chunks = _load_review_chunks(repository, document_id)
         requested_ids = _require_chunk_ids(chunks, request.chunk_ids)
@@ -2992,6 +2996,10 @@ def approve_review_chunks(
                 str(request.approval_override_reason or "").strip()
                 or (event_override_reasons[0] if event_override_reasons else default_unreviewed_reason)
             )
+        elif str(request.approval_override_reason or "").strip():
+            # The reason may have waived the review-flag acknowledgement even though every
+            # chunk carries a human-review event; the journal must still show why.
+            approval_record["approval_override_reason"] = str(request.approval_override_reason).strip()
         approval_record["approval_state_transition"] = _approval_state_transition(
             [
                 chunk.approval_status

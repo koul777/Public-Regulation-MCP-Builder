@@ -9,12 +9,13 @@ from streamlit.testing.v1 import AppTest
 
 def setup_app_source() -> str:
     source = (Path(__file__).resolve().parents[1] / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
-    names = {"_render_kordoc_install_feedback", "_render_kordoc_preprocess_preflight"}
+    names = {"_link_button", "_render_kordoc_install_feedback", "_render_kordoc_preprocess_preflight"}
     functions = "\n\n".join(
         ast.get_source_segment(source, node) for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name in names
     )
     return '''
+import inspect
 from typing import Any
 from types import SimpleNamespace
 import streamlit as st

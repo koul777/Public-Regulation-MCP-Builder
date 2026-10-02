@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+from app.agents import review_executor
 from app.agents.review_executor import AgentReviewExecutor
 from app.core.config import Settings
 from app.schemas.chunk import Chunk
+from tests.test_local_http import LOOPBACK_HOST, PROXY_ENV, _FakeResponse, _fake_http, _redirect
 
 
 def review_chunk() -> Chunk:
@@ -923,6 +927,35 @@ class AgentReviewExecutorTests(unittest.TestCase):
         self.assertEqual(context["kordoc_table_inventory"]["table_samples"][0]["column_count"], 2)
         self.assertNotIn("source_path", context)
         self.assertNotIn("secret", encoded)
+
+
+class ProviderTransportTests(unittest.TestCase):
+    """제공자 호출은 리다이렉트를 따라가지 않고, 로컬 서버는 프록시를 거치지 않는다."""
+
+    def test_remote_provider_redirect_fails_without_contacting_the_target(self) -> None:
+        with _fake_http(_redirect(302)) as seen:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 302"):
+                review_executor._post_json(
+                    "http://provider.invalid/v1/chat/completions",
+                    {"Authorization": "Bearer synthetic"},
+                    {"model": "synthetic"},
+                    5,
+                )
+
+        # Only the original request left; the redirect target (and the credentials) did not.
+        self.assertEqual(1, len(seen))
+
+    def test_loopback_provider_bypasses_the_proxy(self) -> None:
+        with patch.dict(os.environ, PROXY_ENV), _fake_http(lambda req: _FakeResponse(b'{"ok": true}')) as seen:
+            result = review_executor._post_json(
+                f"http://{LOOPBACK_HOST}/v1/chat/completions",
+                {},
+                {"model": "synthetic"},
+                5,
+            )
+
+        self.assertEqual({"ok": True}, result)
+        self.assertEqual([LOOPBACK_HOST], [item["host"] for item in seen])
 
 
 if __name__ == "__main__":

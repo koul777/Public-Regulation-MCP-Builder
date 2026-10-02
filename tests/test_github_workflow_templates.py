@@ -46,6 +46,80 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
             self.assertLess(hygiene_index, release_step_index)
             self.assertLess(public_gate_index, release_step_index)
 
+    def test_auto_release_grants_write_only_to_the_release_job_after_verification(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
+        text = path.read_text(encoding="utf-8")
+
+        verify_start = text.index("\n  verify:\n")
+        release_start = text.index("\n  release:\n")
+        self.assertLess(verify_start, release_start)
+        workflow_header = text[:verify_start]
+        verify_job = text[verify_start:release_start]
+        release_job = text[release_start:]
+
+        # Workflow default is read-only; the single write grant sits on the release job.
+        self.assertIn("\npermissions:\n  contents: read\n", workflow_header)
+        self.assertNotIn("contents: write", workflow_header)
+        self.assertNotIn("contents: write", verify_job)
+        self.assertEqual(1, text.count("contents: write"))
+        self.assertIn("    permissions:\n      contents: write\n", release_job)
+        self.assertIn("    needs: verify\n", release_job)
+
+        skip_condition = (
+            "if: github.event_name != 'push' || "
+            "!contains(github.event.head_commit.message, '[skip auto-release]')"
+        )
+        self.assertIn(skip_condition, verify_job)
+        self.assertIn(skip_condition, release_job)
+
+        # verify holds every test and public gate and none of the publishing operations.
+        for command in (
+            'python -m pip install ".[dev]"',
+            "python -m unittest discover -s tests -v",
+            (
+                "python scripts/audit_release_hygiene.py --workflow-scope available "
+                "--include-untracked --include-source-path-scan"
+            ),
+            (
+                "python scripts/run_public_release_gate.py --root . "
+                "--include-untracked --fail-on-blocked"
+            ),
+        ):
+            self.assertIn(command, verify_job)
+        self.assertIn("persist-credentials: false", verify_job)
+        self.assertIn("sha: ${{ steps.verified.outputs.sha }}", verify_job)
+        for publishing_operation in (
+            "git push",
+            "git tag -a",
+            "gh release",
+            "python -m build",
+            "build_windows_portable.ps1",
+        ):
+            self.assertNotIn(publishing_operation, verify_job)
+
+        # release rebuilds the exact verified commit and keeps the ordered release steps.
+        self.assertIn("ref: ${{ needs.verify.outputs.sha }}", release_job)
+        self.assertNotIn("ref: main", release_job)
+        # If main moved after verification, fail closed instead of rebasing onto
+        # commits that no gate verified, and compare before anything is pushed.
+        self.assertIn("VERIFIED_SHA: ${{ needs.verify.outputs.sha }}", release_job)
+        self.assertNotIn("git rebase", release_job)
+        compare_index = release_job.index("git ls-remote origin refs/heads/main")
+        self.assertLess(compare_index, release_job.index("git push origin HEAD:main"))
+        self.assertLess(compare_index, release_job.index("git tag -a"))
+        release_steps = (
+            'python -m pip install ".[dev]"',
+            "Determine and write the release version",
+            "Build release artifacts",
+            "Build Windows portable ZIP",
+            "Commit the release version and tag it",
+            "Publish GitHub Release",
+        )
+        positions = [release_job.index(step) for step in release_steps]
+        self.assertEqual(sorted(positions), positions)
+        self.assertLess(release_job.index("actions/checkout@v4"), positions[0])
+        self.assertLess(release_job.index("actions/setup-python@v5"), positions[0])
+
     def test_preprocessing_policy_never_executes_pull_request_code(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "preprocessing-change-policy.yml"
         text = path.read_text(encoding="utf-8")
@@ -82,6 +156,10 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertIn("tests.test_local_llm_doctor", text)
         self.assertIn("tests.test_qwen_chat_app", text)
         self.assertIn("tests.test_streamlit_ai_usage_path", text)
+        self.assertIn("tests.test_streamlit_approval_helpers", text)
+        self.assertIn("tests.test_hidden_process", text)
+        self.assertIn("tests.test_local_http", text)
+        self.assertIn("tests.test_ollama_runtime", text)
         self.assertIn("python -m build --sdist --wheel", text)
         self.assertIn("--include-source-path-scan", text)
 
@@ -107,6 +185,46 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         modules = [line for line in fast_step.splitlines() if line.strip().startswith("tests.")]
         for line in modules[:-1]:
             self.assertTrue(line.rstrip().endswith("\\"), f"Shell would execute module as a command: {line.strip()}")
+
+    def test_preprocessing_regression_runs_tenant_security_and_approval_modules(self) -> None:
+        path = REPO_ROOT / ".github" / "workflows" / "preprocessing-regression.yml"
+        text = path.read_text(encoding="utf-8")
+
+        suite_name = "- name: Run parsing and preprocessing regression suite"
+        security_name = "- name: Run tenant isolation, API security, approval and repository contracts"
+        large_name = "- name: Run large API route and MCP tool suites"
+        build_name = "- name: Build source and wheel distributions"
+        self.assertLess(text.index(suite_name), text.index(security_name))
+        self.assertLess(text.index(security_name), text.index(large_name))
+        self.assertLess(text.index(large_name), text.index(build_name))
+
+        steps = (
+            (
+                text[text.index(security_name):text.index(large_name)],
+                (
+                    "test_api_security", "test_api_tenant_isolation", "test_tenant_access",
+                    "test_repository", "test_repository_journal_integrity",
+                    "test_approval_governance", "test_approval_governance_invariants",
+                    "test_retrieval_security", "test_official_rag_approval_gate_policy",
+                ),
+            ),
+            (
+                text[text.index(large_name):text.index(build_name)],
+                ("test_routes_rag", "test_routes_documents", "test_regulation_mcp_tools"),
+            ),
+        )
+        for step, modules in steps:
+            self.assertNotIn("continue-on-error", step)
+            module_lines = [line for line in step.splitlines() if line.strip().startswith("tests.")]
+            listed = [line.strip().rstrip("\\").strip() for line in module_lines]
+            for module in modules:
+                self.assertIn(f"tests.{module}", listed)
+                self.assertTrue((REPO_ROOT / "tests" / f"{module}.py").is_file())
+            for line in module_lines[:-1]:
+                self.assertTrue(
+                    line.rstrip().endswith("\\"),
+                    f"Shell would execute module as a command: {line.strip()}",
+                )
 
     def test_ci_template_exercises_mcp_connection_paths(self) -> None:
         path = REPO_ROOT / ".github" / "workflows" / "ci.yml"

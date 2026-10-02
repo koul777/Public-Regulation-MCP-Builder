@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from app.agents.execution_audit import append_provider_execution_record
 from app.agents.execution_guard import payload_hash
@@ -18,10 +18,11 @@ from app.agents.provider_config import (
 )
 from app.agents.review_context import review_context_for_metadata
 from app.core.config import Settings
+from app.core.local_http import provider_urlopen as urlopen
 from app.schemas.chunk import Chunk
 
 
-HTTP_POST = Callable[[str, dict[str, str], dict[str, Any], int], dict[str, Any]]
+HTTP_POST =Callable[[str, dict[str, str], dict[str, Any], int], dict[str, Any]]
 
 SYSTEM_PROMPT = """You review Korean public-institution regulation parser output.
 Return compact JSON only. Do not approve the document.

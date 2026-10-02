@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import html
+import inspect
 import json
 import os
 import queue
@@ -58,6 +59,7 @@ from app.api.routes_documents import (
 )
 from app.core.api_audit import redact_sensitive_paths
 from app.core.config import Settings, get_settings, set_runtime_settings_overrides
+from app.core.hidden_process import hidden_window_options
 from app.core.pipeline import kordoc_table_command_status, processing_options_payload
 from app.agents.role_registry import workflow_roles
 from app.agents.provider_config import (
@@ -5938,6 +5940,8 @@ def _select_windows_output_directory_via_powershell(initial_directory: Path) -> 
             errors="replace",
             timeout=120,
             check=False,
+            # Hides only the console host; the folder dialog itself still shows.
+            **hidden_window_options(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OSError("PowerShell folder picker is unavailable.") from exc
@@ -6121,15 +6125,37 @@ def _find_goldset_packet_path(document_id: str) -> Path | None:
     return None
 
 
+def _link_button(label: str, url: str, *, key: str, **kwargs: Any) -> None:
+    """``st.link_button(key=...)``를 지원하는 Streamlit에서는 그대로, 아니면 키 컨테이너로 감싼다.
+
+    오래된 Streamlit은 ``key`` 인자를 거부해 Kordoc 설치 안내와 ChatGPT MCP 안내 화면이
+    TypeError로 깨졌다. 컨테이너가 같은 키를 안정적인 대상으로 남긴다.
+    """
+    if "key" in inspect.signature(st.link_button).parameters:
+        st.link_button(label, url, key=key, **kwargs)
+        return
+    with st.container(key=key):
+        st.link_button(label, url, **kwargs)
+
+
+# 이 기능이 여는 파일: 원본 규정 문서, 검수 안내문, 검수 기록. 셸 연결 프로그램으로
+# 열기 때문에 실행 파일 형식이 들어오면 그대로 실행된다. 목록에 없는 확장자는 거부한다.
+_OPENABLE_ARTIFACT_SUFFIXES = frozenset(
+    {".pdf", ".docx", ".hwpx", ".hwp", ".md", ".csv", ".json", ".txt"}
+)
+
+
 def _open_local_artifact(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(str(path))
-    escaped = str(path).replace("'", "''")
-    subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-Command", f"Invoke-Item -LiteralPath '{escaped}'"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    if sys.platform != "win32":
+        raise OSError("로컬 파일 열기는 Windows 로컬 실행에서만 지원합니다.")
+    if str(path).startswith(("\\\\", "//")):
+        raise OSError("네트워크 경로의 파일은 이 화면에서 열 수 없습니다.")
+    if path.suffix.lower() not in _OPENABLE_ARTIFACT_SUFFIXES:
+        raise OSError("이 형식의 파일은 이 화면에서 열 수 없습니다.")
+    # Shell-open with the default app without spawning a PowerShell console.
+    os.startfile(str(path))
 
 
 def _load_approval_template_from_manifest(
@@ -7641,7 +7667,7 @@ def _render_kordoc_preprocess_preflight() -> bool:
             "먼저 Node.js LTS를 https://nodejs.org 에서 설치하세요. 설치가 끝나면 "
             f"{_application_restart_instruction()} 다시 이 화면에서 Kordoc 설치·검증을 시작하세요."
         )
-        st.link_button(
+        _link_button(
             "Node.js LTS 설치 페이지 열기",
             "https://nodejs.org",
             key="preprocess-nodejs-link",
@@ -13830,12 +13856,12 @@ def _page_connect(
                     "권한 설정에 따라 메뉴가 보이지 않을 수 있습니다. ChatGPT는 로컬 MCP에 "
                     "직접 연결하지 않으며, 사설망 서버에는 Secure MCP Tunnel이 필요합니다."
                 )
-                st.link_button(
+                _link_button(
                     "OpenAI 공식 ChatGPT MCP 지원 범위",
                     "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
                     key=f"openai-chatgpt-mcp-help-{document_id}",
                 )
-                st.link_button(
+                _link_button(
                     "OpenAI Secure MCP Tunnel 안내",
                     "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
                     key=f"openai-secure-mcp-tunnel-{document_id}",

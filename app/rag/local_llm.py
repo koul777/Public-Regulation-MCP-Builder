@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from app.core.config import Settings
+# Keep the ``urlopen`` name (existing patch point) but bind it to the proxy-free,
+# redirect-refusing opener so question and evidence text never leave loopback.
+from app.core.local_http import local_urlopen as urlopen
 
 
 ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}

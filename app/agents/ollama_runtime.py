@@ -6,11 +6,14 @@ import json
 import time
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agents.model_router import require_loopback_endpoint
+# Keep the ``urlopen`` name (existing patch point) but bind it to the proxy-free,
+# redirect-refusing opener so prompts never leave loopback.
+from app.core.local_http import local_urlopen as urlopen
 
 
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
