@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import html
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -992,6 +994,48 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertEqual("3-2", label(3, 2))
         self.assertEqual("4-11", label(4, 11))
         self.assertEqual("1", label(1, 0))
+
+    def test_detected_value_label_marks_only_values_not_read_from_the_document(self) -> None:
+        _source, module = _source_and_module()
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=[_function(module, "_detected_value_label")], type_ignores=[]),
+                "<detected-value-label>",
+                "exec",
+            ),
+            namespace,
+        )
+        label = namespace["_detected_value_label"]
+
+        # Fallbacks: the upload day, the effective date that copies it, a sequence version.
+        self.assertEqual("2026-10-02 · 임시 입력", label("2026-10-02", "upload_date"))
+        self.assertEqual(
+            "2026-10-02 · 임시 입력",
+            label("2026-10-02", "revision_date", revision_source="upload_date"),
+        )
+        self.assertEqual("v1 · 임시 입력", label("v1", "sequence"))
+        # Values that really come from the file name or the text stay unmarked.
+        self.assertEqual("2019-03-01", label("2019-03-01", "filename"))
+        self.assertEqual("2019-03-01", label("2019-03-01", "content"))
+        self.assertEqual("2019-03-01", label("2019-03-01", "revision_date", revision_source="filename"))
+        self.assertEqual("v3", label("v3", ""))
+        self.assertEqual("문서에서 찾지 못함", label("", "upload_date"))
+
+    def test_confirmation_marker_lights_the_detected_info_table_it_asks_to_verify(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_preprocess")) or ""
+
+        # The table is the thing being confirmed, so it must sit in a keyed block that
+        # the 1-4 marker names as read-only context next to the confirmation checkbox.
+        container_at = page_source.index("with st.container(key=PREPROCESS_DETECTED_INFO_KEY):")
+        table_at = page_source.index("st.dataframe(detected_rows", container_at)
+        marker_at = page_source.index("자동 인식한 규정 정보를 확인하세요")
+        marker_call = page_source[marker_at : page_source.index("substep=4", marker_at)]
+        self.assertLess(container_at, table_at)
+        self.assertIn("context_keys=(PREPROCESS_DETECTED_INFO_KEY,)", marker_call)
+        self.assertIn("control_key_prefix=BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY", marker_call)
+        self.assertNotIn("control_keys=", marker_call)
 
     def test_beginner_preprocess_requires_sequential_manual_confirmations(self) -> None:
         source, module = _source_and_module()
@@ -3177,6 +3221,62 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         self.assertGreater(self.app.session_state[TOUR_REQUEST_KEY], first_request)
         self.assertEqual(initial_files, self._file_snapshot())
         self.assertNotIn("document_id", self.app.session_state)
+
+    def test_upload_step_guide_names_the_buttons_actually_on_screen(self) -> None:
+        self._create_institution()
+        markers = "\n".join(
+            str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value)
+        )
+        captions = "\n".join(str(item.value) for item in self.app.caption)
+        uploader_help = " ".join(
+            str(getattr(element.proto, "help", "")) for element in self.app.get("file_uploader")
+        )
+
+        self.assertIn("먼저 규정 파일을 선택하세요", markers)
+        for text in (markers, captions, uploader_help):
+            # Streamlit draws an English button; the Korean guide must not name a
+            # control that does not exist ("파일 찾기"), only the real labels.
+            self.assertNotIn("파일 찾기", text)
+            self.assertIn("Upload", text)
+            self.assertIn("Browse files", text)
+        self.assertIn("영어 버튼", markers)
+        self.assertIn("PDF·HWP·HWPX·DOCX를 여러 개 함께 선택할 수 있습니다.", captions)
+        self.assertIn("per file", captions)
+
+    def test_detected_info_table_marks_fallback_dates_and_tour_lights_the_table(self) -> None:
+        profile_id = self._create_institution()
+        pending_dir = institution_storage_dir(
+            self.settings.data_dir / "pending_uploads", profile_id, create=True,
+        )
+        # The synthetic file name carries no date or version, so every date is a fallback.
+        (pending_dir / SYNTHETIC_SAMPLE_FILENAME).write_bytes(build_synthetic_regulation_docx())
+        self._run()
+        self.app.button(key="pending-upload-select-all").click().run()
+        self.assertFalse(self.app.exception)
+
+        row = self.app.dataframe[0].value.iloc[0]
+        for column in ("개정일", "시행일"):
+            self.assertRegex(row[column], r"^\d{4}-\d{2}-\d{2} · 임시 입력$", column)
+        self.assertEqual("v1 · 임시 입력", row["버전"])
+        notices = [str(item.value) for item in self.app.info]
+        self.assertTrue(
+            any("임시 입력" in text and "문서에서 찾지 못해" in text for text in notices), notices,
+        )
+
+        markers = [
+            str(item.value) for item in self.app.markdown if "data-rr-tour=" in str(item.value)
+        ]
+        marker = next(text for text in markers if "자동 인식한 규정 정보를 확인하세요" in text)
+        payload = json.loads(
+            html.unescape(re.search(r'data-rr-tour="([^"]*)"', marker).group(1))
+        )
+        self.assertEqual(
+            ['div[class~="st-key-preprocess-detected-regulation-info"]'], payload["context"],
+        )
+        # The confirmation checkbox stays the only action target.
+        self.assertEqual(4, payload["substep"])
+        self.assertEqual(1, len(payload["selectors"]))
+        self.assertIn("beginner_guide_preprocess_info_confirmed", payload["selectors"][0])
 
     def test_synthetic_docx_processing_moves_to_review_without_automatic_approval(self) -> None:
         profile_id = self._create_institution()

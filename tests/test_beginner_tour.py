@@ -46,6 +46,34 @@ class BeginnerTourTests(unittest.TestCase):
         self.assertEqual({"data-rr-tour"}, set(attrs))
         self.assertEqual(payload, json.loads(attrs["data-rr-tour"]))
 
+    def test_marker_context_selectors_are_optional_and_round_trip(self) -> None:
+        base = {"title": "확인", "description": "표를 보세요", "selectors": ["div.a"],
+                "step": 1, "substep": 4}
+        plain = _HTMLCapture()
+        plain.feed(f"<div {beginner_tour.marker_attributes(**base)}></div>")
+        # Existing markers keep their exact payload: no empty "context" key.
+        self.assertEqual(base, json.loads(plain.tags[0][1]["data-rr-tour"]))
+
+        for empty in (None, []):
+            self.assertNotIn("context", beginner_tour.marker_attributes(**base, context_selectors=empty))
+        context = ['div[class~="st-key-detected"]', '[data-label="a & b"]']
+        lit = _HTMLCapture()
+        lit.feed(f"<div {beginner_tour.marker_attributes(**base, context_selectors=context)}></div>")
+        self.assertEqual({**base, "context": context}, json.loads(lit.tags[0][1]["data-rr-tour"]))
+
+    def test_controller_lights_context_regions_but_keeps_one_action_target(self) -> None:
+        script = (beginner_tour.ASSETS / "beginner_tour.js").read_text(encoding="utf-8")
+
+        # Context regions come from the marker, are skipped when hidden, and take part
+        # in the dimming cut-outs, but never replace the click target.
+        self.assertIn("marker.context", script)
+        self.assertIn("const contextElements = marker =>", script)
+        self.assertIn("elements.find(visible)", script)
+        self.assertIn("const lit = r && usable(r) ? [r, ...extra] : [];", script)
+        self.assertIn("target?.contains(event.target)", script)
+        self.assertNotIn("companions.some", script)
+        self.assertNotIn("companions.includes", script)
+
     def _journey(self, **kwargs: object) -> tuple[str, list[dict[str, str | None]]]:
         with patch.object(beginner_tour.st, "markdown") as markdown:
             beginner_tour.render_journey(**kwargs)
