@@ -164,6 +164,110 @@ class HwpxParserTests(unittest.TestCase):
         self.assertEqual(blocks[5].metadata["caption_count"], 1)
         self.assertIn("그림 1. 처리 흐름", parsed.raw_text)
 
+    IMAGE_DESCRIPTION_BOILERPLATE = (
+        "그림입니다.\n원본 그림의 이름: sample_flow.png\n원본 그림의 크기: 가로 640pixel, 세로 480pixel"
+    )
+
+    def test_drops_auto_generated_image_description_from_body_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "image-boilerplate.hwpx"
+            self._write_hwpx(
+                path,
+                f"""
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:p><hp:run><hp:t>제1조(목적) 가상의 목적을 정한다.</hp:t></hp:run></hp:p>
+                  <hp:p><hp:run><hp:pic>
+                    <hp:img binaryItemIDRef="image1"/>
+                    <hp:shapeComment>{self.IMAGE_DESCRIPTION_BOILERPLATE}</hp:shapeComment>
+                  </hp:pic></hp:run></hp:p>
+                  <hp:p><hp:run><hp:t>제2조(정의) 가상의 용어를 정의한다.</hp:t></hp:run></hp:p>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        blocks = parsed.pages[0].blocks
+        self.assertEqual(
+            [block.text for block in blocks],
+            ["제1조(목적) 가상의 목적을 정한다.", "제2조(정의) 가상의 용어를 정의한다."],
+        )
+        self.assertNotIn("그림입니다", parsed.raw_text)
+        self.assertNotIn("sample_flow.png", parsed.raw_text)
+
+    def test_keeps_image_caption_but_drops_auto_generated_description(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "image-caption.hwpx"
+            self._write_hwpx(
+                path,
+                f"""
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:p><hp:run><hp:pic>
+                    <hp:shapeComment>{self.IMAGE_DESCRIPTION_BOILERPLATE}</hp:shapeComment>
+                    <hp:caption><hp:subList><hp:p><hp:run><hp:t>그림 1. 가상 결재 흐름</hp:t></hp:run></hp:p></hp:subList></hp:caption>
+                  </hp:pic></hp:run></hp:p>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        blocks = parsed.pages[0].blocks
+        self.assertEqual([block.type for block in blocks], ["image"])
+        self.assertEqual(blocks[0].text, "그림 1. 가상 결재 흐름")
+        self.assertEqual(blocks[0].metadata["caption_count"], 1)
+        self.assertNotIn("원본 그림의", parsed.raw_text)
+
+    def test_drops_auto_generated_image_description_inside_table_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "table-image-boilerplate.hwpx"
+            self._write_hwpx(
+                path,
+                f"""
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:tbl>
+                    <hp:tr>
+                      <hp:tc><hp:subList><hp:p><hp:run><hp:t>구분</hp:t></hp:run></hp:p></hp:subList></hp:tc>
+                      <hp:tc><hp:subList><hp:p><hp:run>
+                        <hp:t>서식 예시</hp:t>
+                        <hp:pic><hp:shapeComment>{self.IMAGE_DESCRIPTION_BOILERPLATE}</hp:shapeComment></hp:pic>
+                      </hp:run></hp:p></hp:subList></hp:tc>
+                    </hp:tr>
+                  </hp:tbl>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        table = parsed.pages[0].blocks[0]
+        self.assertEqual(table.type, "table")
+        self.assertEqual(table.text, "구분 | 서식 예시")
+        self.assertEqual(table.metadata["hwpx_table_image_count"], 1)
+        self.assertIn("table_image", table.metadata["hwpx_parser_review_flags"])
+
+    def test_keeps_author_written_image_description_and_body_text_mentioning_boilerplate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "image-custom-description.hwpx"
+            self._write_hwpx(
+                path,
+                """
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:p><hp:run><hp:t>그림입니다. 원본 그림의 이름: 서식.png 문구는 본문이므로 남긴다.</hp:t></hp:run></hp:p>
+                  <hp:p><hp:run><hp:pic>
+                    <hp:shapeComment>그림입니다. 가상 기관의 조직도: 원장 아래 3개 본부</hp:shapeComment>
+                  </hp:pic></hp:run></hp:p>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        blocks = parsed.pages[0].blocks
+        self.assertEqual([block.type for block in blocks], ["text", "image"])
+        self.assertEqual(blocks[0].text, "그림입니다. 원본 그림의 이름: 서식.png 문구는 본문이므로 남긴다.")
+        self.assertEqual(blocks[1].text, "그림입니다. 가상 기관의 조직도: 원장 아래 3개 본부")
+
     def test_marks_complex_table_structures_for_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "complex-table.hwpx"

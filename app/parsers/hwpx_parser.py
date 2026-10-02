@@ -16,6 +16,22 @@ from app.parsers.xml_safety import elementtree_xml_input, reject_unsafe_xml_decl
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 
+# 한컴은 그림 개체(hp:pic)의 hp:shapeComment에 "그림입니다. 원본 그림의 이름: …
+# 원본 그림의 크기: 가로 …pixel, 세로 …pixel" 같은 설명을 자동으로 넣는다. 본문이
+# 아니므로 이 형식으로만 이루어진 설명은 뺀다. 사용자가 고쳐 쓴 설명이나 hp:caption은
+# 그대로 둔다.
+HWPX_IMAGE_DESCRIPTION_LEAD_PATTERN = re.compile(r"그림입니다\.?")
+HWPX_IMAGE_DESCRIPTION_FIELD_SPLIT_PATTERN = re.compile(
+    r"\s*(?=(?:원본\s*그림의\s*(?:이름|크기)|사진\s*찍은\s*날짜|프로그램\s*이름)\s*:)"
+)
+HWPX_IMAGE_DESCRIPTION_FIELD_PATTERNS = (
+    re.compile(r"원본\s*그림의\s*이름\s*:\s*(?:.{0,240}\.[A-Za-z0-9]{2,5}|\S{1,240})"),
+    re.compile(r"원본\s*그림의\s*크기\s*:\s*가로\s*\d+\s*(?:pixel|픽셀)\s*,\s*세로\s*\d+\s*(?:pixel|픽셀)"),
+    re.compile(r"사진\s*찍은\s*날짜\s*:\s*[0-9년월일시분초오전후AaPpMm:./\-\s]{1,60}"),
+    re.compile(r"프로그램\s*이름\s*:\s*.{1,160}"),
+)
+
+
 class HwpxParser(BaseParser):
     supported_extensions = {".hwpx"}
     NOTE_TAGS = {"footnote", "endnote", "footnotes", "endnotes"}
@@ -266,14 +282,14 @@ class HwpxParser(BaseParser):
             for cell in list(row):
                 if self._local_name(cell) not in self.CELL_TAGS:
                     continue
-                cell_text = self._clean_text(" ".join(part.strip() for part in cell.itertext() if part.strip()))
+                cell_text = self._clean_text(" ".join(part.strip() for part in self._text_parts(cell) if part.strip()))
                 if cell_text:
                     cells.append(cell_text)
             if cells:
                 rows.append(" | ".join(cells))
         if rows:
             return "\n".join(rows)
-        return "".join(table.itertext())
+        return "".join(self._text_parts(table))
 
     def _table_metadata(self, table: ElementTree.Element) -> dict:
         rows = list(self._outer_table_rows(table))
@@ -400,7 +416,7 @@ class HwpxParser(BaseParser):
         for descendant in table.iter():
             if descendant is table or self._local_name(descendant) not in self.TABLE_TAGS:
                 continue
-            snippet = self._clean_text(" ".join(part.strip() for part in descendant.itertext() if part.strip()))
+            snippet = self._clean_text(" ".join(part.strip() for part in self._text_parts(descendant) if part.strip()))
             if snippet and snippet not in snippets:
                 snippets.append(snippet[:160])
             if len(snippets) >= limit:
@@ -408,7 +424,48 @@ class HwpxParser(BaseParser):
         return snippets
 
     def _element_text(self, element: ElementTree.Element) -> str:
-        return self._clean_text(" ".join(part.strip() for part in element.itertext() if part.strip()))
+        return self._clean_text(" ".join(part.strip() for part in self._text_parts(element) if part.strip()))
+
+    def _text_parts(self, element: ElementTree.Element) -> list[str]:
+        """``itertext()`` without Hancom's auto-generated image descriptions."""
+
+        parts: list[str] = []
+        stack: list[tuple[ElementTree.Element, bool]] = [(element, False)]
+        while stack:
+            current, emit_tail = stack.pop()
+            if emit_tail:
+                if current.tail:
+                    parts.append(current.tail)
+                continue
+            if not isinstance(current.tag, str):
+                # itertext()와 같이 주석·처리 지시문의 내용은 건너뛰고 tail만 남긴다.
+                continue
+            if current is not element and self._is_image_description_boilerplate(current):
+                continue
+            if current.text:
+                parts.append(current.text)
+            for child in reversed(list(current)):
+                if child.tail:
+                    stack.append((child, True))
+                stack.append((child, False))
+        return parts
+
+    def _is_image_description_boilerplate(self, element: ElementTree.Element) -> bool:
+        if self._local_name(element) != "shapecomment":
+            return False
+        text = self._clean_text("".join(element.itertext()))
+        lead = HWPX_IMAGE_DESCRIPTION_LEAD_PATTERN.match(text)
+        if lead is None:
+            return False
+        fields = [
+            field.strip()
+            for field in HWPX_IMAGE_DESCRIPTION_FIELD_SPLIT_PATTERN.split(text[lead.end() :])
+            if field.strip()
+        ]
+        return all(
+            any(pattern.fullmatch(field) for pattern in HWPX_IMAGE_DESCRIPTION_FIELD_PATTERNS)
+            for field in fields
+        )
 
     def _has_structural_inline_child(self, element: ElementTree.Element) -> bool:
         for descendant in element.iter():
