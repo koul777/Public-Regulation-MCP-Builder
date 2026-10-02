@@ -989,6 +989,52 @@ AI_REVIEW_REASON_LABELS = {
     "full_document_review": ("전체 조항 검수", "낮음", "위험 신호가 붙지는 않았지만 문서 전체 검수 대상이라 원문과 대조합니다."),
 }
 
+# Review reasons often arrive as "<field>:<flag>" (for example
+# "table_review_flags:possible_truncated_cell"). The raw code means nothing to
+# a beginner, so each known flag and each field family gets plain wording.
+AI_REVIEW_FLAG_LABELS = {
+    "possible_truncated_cell": ("표 칸 잘림 가능성", "중간", "표의 칸 내용이 중간에 잘리지 않았는지 원래 문서와 비교해 보세요."),
+    "row_review_required": ("표 줄 확인", "중간", "표의 각 줄이 원래 문서와 같은 순서·내용인지 확인하세요."),
+    "wrapped_cell_merge": ("표 줄 합침 확인", "중간", "넘어간 줄을 한 칸으로 합쳤어요. 서로 다른 줄이 잘못 합쳐지지 않았는지 확인하세요."),
+    "unstable_column_count": ("표 칸 수 확인", "중간", "줄마다 칸 수가 달라요. 빠지거나 옆으로 밀린 칸이 없는지 확인하세요."),
+    "probable_extraction_failed": ("표 추출 실패 가능성", "높음", "표가 제대로 읽히지 않았을 수 있어요. 원래 문서의 표와 한 줄씩 비교하세요."),
+    "probable_table_extraction_failed": ("표 추출 실패 가능성", "높음", "표가 제대로 읽히지 않았을 수 있어요. 원래 문서의 표와 한 줄씩 비교하세요."),
+    "appendix_table_low_structured_row_count": ("별표 표 일부만 정리됨", "중간", "별표의 표가 일부만 표로 정리됐어요. 빠진 줄이 없는지 확인하세요."),
+    "raw_table_like_rows_without_cell_rows": ("표 칸 나눔 확인", "중간", "표처럼 보이는 줄이 칸으로 나뉘지 않았어요. 칸 내용이 섞이지 않았는지 확인하세요."),
+    "compact_table_signals_without_cell_rows": ("표 칸 나눔 확인", "중간", "표처럼 보이는 줄이 칸으로 나뉘지 않았어요. 칸 내용이 섞이지 않았는지 확인하세요."),
+    "dense_numeric_row_reconstruction": ("숫자 표 재구성 확인", "중간", "숫자가 많은 표를 다시 맞췄어요. 숫자가 올바른 칸에 있는지 확인하세요."),
+}
+AI_REVIEW_FAMILY_LABELS = {
+    "table_review_flags": ("표 내용 확인", "중간", "표의 칸과 줄이 원래 문서와 같은지 확인하세요."),
+    "row_quality_flags": ("표 내용 확인", "중간", "표의 칸과 줄이 원래 문서와 같은지 확인하세요."),
+    "review_flags": ("변환 결과 확인", "중간", "원래 문서와 비교해 빠지거나 바뀐 내용이 없는지 확인하세요."),
+    "quality_flags": ("변환 결과 확인", "중간", "원래 문서와 비교해 빠지거나 바뀐 내용이 없는지 확인하세요."),
+    "parser_uncertainty_risk_level": ("자동 변환이 불확실한 부분", "높음", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
+    "parser_uncertainty_flags": ("자동 변환이 불확실한 부분", "높음", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
+    "parser_uncertainty_recommendation": ("자동 변환이 불확실한 부분", "높음", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
+    "warning": ("변환 경고 확인", "중간", "변환 중 경고가 있었어요. 원래 문서와 비교해 내용이 맞는지 확인하세요."),
+    "source_page_unavailable_reason": ("원래 위치 확인", "중간", "이 내용이 원래 문서의 어디에 있는지 직접 찾아 확인하세요."),
+    "review_required": ("사람 확인 필요", "중간", "자동 변환만으로는 확신할 수 없어요. 원래 문서와 비교해 확인하세요."),
+    "manual_review_required": ("사람 확인 필요", "중간", "자동 변환만으로는 확신할 수 없어요. 원래 문서와 비교해 확인하세요."),
+    "requires_manual_review": ("사람 확인 필요", "중간", "자동 변환만으로는 확신할 수 없어요. 원래 문서와 비교해 확인하세요."),
+}
+AI_REVIEW_DEFAULT_LABEL = ("검수 항목 확인", "중간", "원래 문서와 비교해 이 내용이 맞는지 확인하세요.")
+
+
+def _approval_review_reason_label(reason: str) -> tuple[str, str, str]:
+    """Return plain (title, severity, suggestion) wording for one review reason code."""
+
+    code = str(reason or "").strip()
+    if code in AI_REVIEW_REASON_LABELS:
+        return AI_REVIEW_REASON_LABELS[code]
+    family, _, flag = code.partition(":")
+    flag = flag.strip()
+    if flag in AI_REVIEW_FLAG_LABELS:
+        return AI_REVIEW_FLAG_LABELS[flag]
+    if flag in AI_REVIEW_REASON_LABELS:
+        return AI_REVIEW_REASON_LABELS[flag]
+    return AI_REVIEW_FAMILY_LABELS.get(family.strip(), AI_REVIEW_DEFAULT_LABEL)
+
 
 def _approval_tab_badge(confirmed: bool) -> str:
     return "✅ 확인함" if confirmed else "⬜ 미확인"
@@ -1091,10 +1137,7 @@ def _approval_ai_review_items(chunk, review_reasons: list[str], agent_review_sum
 
     items: list[dict[str, object]] = []
     for index, reason in enumerate(dict.fromkeys(candidate_reasons), start=1):
-        title, severity, suggestion = AI_REVIEW_REASON_LABELS.get(
-            reason,
-            ("검수 항목 확인", "중간", f"{reason} 항목을 원문과 비교해 반영 여부를 결정합니다."),
-        )
+        title, severity, suggestion = _approval_review_reason_label(reason)
         items.append(
             {
                 "item_id": f"{chunk.chunk_id}:{reason}:{index}",
@@ -10651,11 +10694,15 @@ def _render_approval_chunk_confirmation_controls(
             st.caption("[위치]는 문서에서 이 내용이 있는 곳이고, [본문] 다음부터가 실제 내용이에요. 표의 | 기호는 칸을 나누는 표시예요.")
     if review_items:
         st.caption("아래 주의할 점을 원래 문서에서 찾아보고, 맞는 버튼을 골라 주세요." if focused else "표시된 검수 항목마다 판단한 뒤, 원문과 최종본을 직접 대조해 주세요.")
+        guided_item_shown = False
         for item in review_items:
             item_id = str(item["item_id"])
             decision = ai_decisions.get(item_id, "")
+            # Beginners see plain wording only; the code stays visible to experts.
             st.caption(
                 f"{item['severity']} · {item['title']} — {item['suggestion']}"
+                if focused
+                else f"{item['severity']} · {item['title']} — {item['suggestion']} (코드: {item['reason']})"
             )
             reflect_button_key, skip_button_key = _approval_ai_decision_control_keys(item_id)
             decision_group_key = _approval_chunk_state_key(document_id, chunk_id, f"decision-{item_id}")
@@ -10685,7 +10732,10 @@ def _render_approval_chunk_confirmation_controls(
                     decision="skip",
                 )
             current_decision = dict(st.session_state.get(ai_decisions_key) or {}).get(item_id)
-            if current_decision not in {"reflect", "skip"}:
+            if current_decision not in {"reflect", "skip"} and not guided_item_shown:
+                # One guide banner at a time: point at the first undecided item
+                # instead of repeating the same banner above every item.
+                guided_item_shown = True
                 with decision_guide.container():
                     _render_beginner_action_marker(
                         3, "주의할 점을 보고 버튼을 골라 주세요",
