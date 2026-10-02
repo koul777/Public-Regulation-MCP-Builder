@@ -10,6 +10,7 @@ from app.processors.structure_detector import StructureDetector
 from app.schemas.chunk import ChunkOptions
 from app.parsers.base import ParserError
 from app.parsers.factory import get_parser
+from app.parsers.extraction_quality import build_extraction_quality_report
 from app.parsers.hwpx_parser import HwpxParser
 
 
@@ -168,7 +169,7 @@ class HwpxParserTests(unittest.TestCase):
         "그림입니다.\n원본 그림의 이름: sample_flow.png\n원본 그림의 크기: 가로 640pixel, 세로 480pixel"
     )
 
-    def test_drops_auto_generated_image_description_from_body_text(self) -> None:
+    def test_replaces_auto_generated_image_description_with_placeholder_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "image-boilerplate.hwpx"
             self._write_hwpx(
@@ -189,11 +190,141 @@ class HwpxParserTests(unittest.TestCase):
 
         blocks = parsed.pages[0].blocks
         self.assertEqual(
-            [block.text for block in blocks],
-            ["제1조(목적) 가상의 목적을 정한다.", "제2조(정의) 가상의 용어를 정의한다."],
+            [(block.type, block.text) for block in blocks],
+            [
+                ("text", "제1조(목적) 가상의 목적을 정한다."),
+                ("image", "[그림]"),
+                ("text", "제2조(정의) 가상의 용어를 정의한다."),
+            ],
         )
+        image_metadata = blocks[1].metadata
+        self.assertTrue(image_metadata["hwpx_image_description_omitted"])
+        self.assertEqual(image_metadata["hwpx_image_original_name"], "sample_flow.png")
+        self.assertEqual(image_metadata["hwpx_image_caption_count"], 0)
         self.assertNotIn("그림입니다", parsed.raw_text)
+        self.assertNotIn("원본 그림의", parsed.raw_text)
         self.assertNotIn("sample_flow.png", parsed.raw_text)
+
+    def test_image_only_hwpx_still_parses_and_is_flagged_for_review(self) -> None:
+        # 스캔한 별표를 그림으로만 붙인 문서. 자동 설명을 빼도 그림 블록이 남아야
+        # "No text blocks"로 실패하지 않고 image_blocks_detected 검수 사유가 잡힌다.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "image-only.hwpx"
+            self._write_hwpx(
+                path,
+                f"""
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:p><hp:run><hp:pic>
+                    <hp:shapeComment>{self.IMAGE_DESCRIPTION_BOILERPLATE}</hp:shapeComment>
+                  </hp:pic></hp:run></hp:p>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        self.assertEqual([(block.type, block.text) for block in parsed.pages[0].blocks], [("image", "[그림]")])
+        self.assertEqual(parsed.raw_text, "[그림]")
+        report = build_extraction_quality_report(parsed)
+        self.assertEqual(report["status"], "review_required")
+        self.assertTrue(report["ready_for_normalization"])
+        self.assertEqual(report["image_block_count"], 1)
+        self.assertEqual(report["image_page_numbers"], [1])
+        self.assertIn("image_blocks_detected", report["review_reasons"])
+
+    def test_picture_only_table_keeps_a_table_block_and_review_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "picture-table.hwpx"
+            self._write_hwpx(
+                path,
+                f"""
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:tbl>
+                    <hp:tr>
+                      <hp:tc><hp:subList><hp:p><hp:run>
+                        <hp:pic><hp:shapeComment>{self.IMAGE_DESCRIPTION_BOILERPLATE}</hp:shapeComment></hp:pic>
+                      </hp:run></hp:p></hp:subList></hp:tc>
+                    </hp:tr>
+                  </hp:tbl>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        table = parsed.pages[0].blocks[0]
+        self.assertEqual((table.type, table.text), ("table", "[그림]"))
+        self.assertEqual(table.metadata["hwpx_table_image_count"], 1)
+        self.assertIn("table_image", table.metadata["hwpx_parser_review_flags"])
+        self.assertEqual(build_extraction_quality_report(parsed)["status"], "review_required")
+        self.assertNotIn("원본 그림의", parsed.raw_text)
+
+    def test_original_image_name_is_metadata_only_and_never_a_path(self) -> None:
+        cases = {
+            "scan_appendix.png": "scan_appendix.png",
+            "D:\\가상폴더\\하위\\scan.png": None,
+            "/srv/virtual/scan.png": None,
+            "~/scan.png": None,
+        }
+        for original_name, expected in cases.items():
+            with self.subTest(original_name=original_name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "image-name.hwpx"
+                description = (
+                    f"그림입니다.\n원본 그림의 이름: {original_name}\n"
+                    "원본 그림의 크기: 가로 10pixel, 세로 10pixel"
+                )
+                self._write_hwpx(
+                    path,
+                    f"""
+                    <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                      <hp:p><hp:run><hp:pic><hp:shapeComment>{description}</hp:shapeComment></hp:pic></hp:run></hp:p>
+                    </root>
+                    """,
+                )
+
+                parsed = HwpxParser().parse(path, "doc_hwpx")
+
+                block = parsed.pages[0].blocks[0]
+                self.assertEqual(block.text, "[그림]")
+                self.assertTrue(block.metadata["hwpx_image_description_omitted"])
+                self.assertEqual(block.metadata.get("hwpx_image_original_name"), expected)
+                self.assertNotIn(original_name, parsed.raw_text)
+                if expected is None:
+                    self.assertNotIn(original_name, str(block.metadata))
+
+    def test_program_name_field_is_dropped_only_for_product_name_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "program-name.hwpx"
+            self._write_hwpx(
+                path,
+                """
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:p><hp:run><hp:pic><hp:shapeComment>그림입니다.
+                    원본 그림의 이름: photo.jpg 원본 그림의 크기: 가로 10pixel, 세로 10pixel
+                    사진 찍은 날짜: 2019년 3월 5일 오후 2:10 프로그램 이름 : Adobe Photoshop CS6 (Windows)
+                  </hp:shapeComment></hp:pic></hp:run></hp:p>
+                  <hp:p><hp:run><hp:pic><hp:shapeComment>그림입니다. 원본 그림의 크기: 가로 10pixel, 세로 10pixel 프로그램 이름: 가상 결재 시스템 화면 캡처본</hp:shapeComment></hp:pic></hp:run></hp:p>
+                  <hp:p><hp:run><hp:pic><hp:shapeComment>그림입니다. 프로그램 이름: Adobe Photoshop 이후 담당 부서가 별도로 검토한 내용: 부록 참조</hp:shapeComment></hp:pic></hp:run></hp:p>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_hwpx")
+
+        blocks = parsed.pages[0].blocks
+        self.assertEqual([block.type for block in blocks], ["image", "image", "image"])
+        self.assertEqual(blocks[0].text, "[그림]")
+        self.assertTrue(blocks[0].metadata["hwpx_image_description_omitted"])
+        self.assertEqual(
+            blocks[1].text,
+            "그림입니다. 원본 그림의 크기: 가로 10pixel, 세로 10pixel 프로그램 이름: 가상 결재 시스템 화면 캡처본",
+        )
+        self.assertEqual(
+            blocks[2].text,
+            "그림입니다. 프로그램 이름: Adobe Photoshop 이후 담당 부서가 별도로 검토한 내용: 부록 참조",
+        )
+        for kept in blocks[1:]:
+            self.assertNotIn("hwpx_image_description_omitted", kept.metadata)
 
     def test_keeps_image_caption_but_drops_auto_generated_description(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

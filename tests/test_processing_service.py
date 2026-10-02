@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -165,6 +166,56 @@ class ProcessingServiceTests(unittest.TestCase):
             service = ProcessingService(settings=settings, repository=JsonRepository(settings))
 
         self.assertTrue(service.quality_gate.strict_profile_ids)
+
+    def test_process_image_only_hwpx_still_marks_ocr_candidate_for_review(self) -> None:
+        description = (
+            "그림입니다.\n원본 그림의 이름: scan_appendix.png\n"
+            "원본 그림의 크기: 가로 640pixel, 세로 480pixel"
+        )
+        section_xml = (
+            '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+            f"<hp:p><hp:run><hp:pic><hp:shapeComment>{description}</hp:shapeComment></hp:pic></hp:run></hp:p>"
+            "</root>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "scan-appendix.hwpx"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("Contents/section0.xml", section_xml)
+            settings = Settings(data_dir=Path(tmp) / "data")
+            repo = JsonRepository(settings)
+            document = Document(
+                document_id="doc_image_only_hwpx",
+                filename="scan-appendix.hwpx",
+                document_name="가상 스캔 별표",
+                file_type="hwpx",
+                file_hash="image-only-hwpx-hash",
+                tenant_id="tenant-a",
+                status="uploaded",
+            )
+            repo.upsert_document(document)
+            service = ProcessingService(settings=settings, repository=repo)
+
+            with patch.object(service.documents, "path_for", return_value=source), patch.object(
+                service.kordoc_table_parser,
+                "parse_file",
+                return_value={"status": "disabled", "table_count": 0, "tables": []},
+            ):
+                job = service.process(document.document_id, ChunkOptions(enable_agent_review=False))
+
+            completed_run = repo.latest_completed_run(document.document_id)
+
+        self.assertEqual("completed", job.status)
+        self.assertIsNotNone(completed_run)
+        extraction = completed_run.stats["extraction_metrics"]
+        self.assertEqual("review_required", extraction["status"])
+        self.assertEqual(1, extraction["image_block_count"])
+        self.assertIn("image_blocks_detected", extraction["review_reasons"])
+        parse_stage = next(
+            stage for stage in completed_run.stats["pipeline_trace"]["stages"] if stage["stage_id"] == "parse_extract"
+        )
+        roles = {role["role_id"]: role for role in parse_stage["agent_role_statuses"]}
+        self.assertEqual("review_required", roles["ocr_extractor"]["status"])
+        self.assertEqual("ocr_candidate_detected", roles["ocr_extractor"]["reason_code"])
 
     def test_process_agent_review_request_false_skips_provider_and_records_reason(self) -> None:
         class Parser:

@@ -18,18 +18,26 @@ from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 # 한컴은 그림 개체(hp:pic)의 hp:shapeComment에 "그림입니다. 원본 그림의 이름: …
 # 원본 그림의 크기: 가로 …pixel, 세로 …pixel" 같은 설명을 자동으로 넣는다. 본문이
-# 아니므로 이 형식으로만 이루어진 설명은 뺀다. 사용자가 고쳐 쓴 설명이나 hp:caption은
-# 그대로 둔다.
+# 아니므로 이 형식으로만 이루어진 설명의 "텍스트"는 뺀다. 그림 자체는 남겨서 호출부가
+# 짧은 자리표시자(HWPX_IMAGE_PLACEHOLDER_TEXT)로 image 블록을 계속 만든다. 그래야 캡션 없는
+# 스캔 그림(별표 등)도 image_blocks_detected 검수 사유와 OCR 후보 판정에 그대로 잡힌다.
+# 사용자가 고쳐 쓴 설명이나 hp:caption은 그대로 둔다.
+HWPX_IMAGE_PLACEHOLDER_TEXT = "[그림]"
 HWPX_IMAGE_DESCRIPTION_LEAD_PATTERN = re.compile(r"그림입니다\.?")
 HWPX_IMAGE_DESCRIPTION_FIELD_SPLIT_PATTERN = re.compile(
     r"\s*(?=(?:원본\s*그림의\s*(?:이름|크기)|사진\s*찍은\s*날짜|프로그램\s*이름)\s*:)"
 )
+HWPX_IMAGE_ORIGINAL_NAME_FIELD_PATTERN = re.compile(r"원본\s*그림의\s*이름\s*:\s*(?P<name>.+)")
+# 프로그램 이름은 "Adobe Photoshop CS6", "Microsoft Office PowerPoint"처럼 짧은 영문 제품명
+# 모양일 때만 자동 설명으로 본다. 한글·콜론·문장부호가 섞인 뒤따르는 글은 작성자가 덧붙인
+# 내용일 수 있으므로 매칭하지 않고(= 설명 전체를 본문으로 남기고) 안전한 쪽으로 처리한다.
 HWPX_IMAGE_DESCRIPTION_FIELD_PATTERNS = (
     re.compile(r"원본\s*그림의\s*이름\s*:\s*(?:.{0,240}\.[A-Za-z0-9]{2,5}|\S{1,240})"),
     re.compile(r"원본\s*그림의\s*크기\s*:\s*가로\s*\d+\s*(?:pixel|픽셀)\s*,\s*세로\s*\d+\s*(?:pixel|픽셀)"),
     re.compile(r"사진\s*찍은\s*날짜\s*:\s*[0-9년월일시분초오전후AaPpMm:./\-\s]{1,60}"),
-    re.compile(r"프로그램\s*이름\s*:\s*.{1,160}"),
+    re.compile(r"프로그램\s*이름\s*:\s*[A-Za-z0-9][A-Za-z0-9 .,+\-_()/&®™©]{0,79}"),
 )
+HWPX_IMAGE_NAME_METADATA_LIMIT = 120
 
 
 class HwpxParser(BaseParser):
@@ -229,12 +237,19 @@ class HwpxParser(BaseParser):
                     )
                 )
             table_text = self._table_text(element)
+            if not table_text.strip() and self._omitted_image_descriptions(element):
+                # 그림만 든 표(스캔한 별표를 표 안에 붙인 경우 등)도 표 블록과 검수 신호를 유지한다.
+                table_text = HWPX_IMAGE_PLACEHOLDER_TEXT
             if table_text.strip():
                 blocks.append(("table", table_text, self._table_metadata(element)))
             return
         if tag in self.IMAGE_TAGS:
             captions = self._caption_texts(element)
             image_text = "\n".join(captions) or self._element_text(element)
+            omitted = self._omitted_image_descriptions(element)
+            if omitted and not image_text.strip():
+                # 자동 설명만 있던 그림. 설명 텍스트는 버리되 그림 자리는 남긴다.
+                image_text = HWPX_IMAGE_PLACEHOLDER_TEXT
             if image_text.strip():
                 metadata = {
                     "hwpx_block_type": "image",
@@ -243,6 +258,11 @@ class HwpxParser(BaseParser):
                 }
                 if captions:
                     metadata["hwpx_parser_review_flags"] = ["image_caption"]
+                if omitted:
+                    metadata["hwpx_image_description_omitted"] = True
+                    original_name = self._image_original_name(omitted)
+                    if original_name:
+                        metadata["hwpx_image_original_name"] = original_name
                 blocks.append(
                     (
                         "image",
@@ -451,21 +471,57 @@ class HwpxParser(BaseParser):
         return parts
 
     def _is_image_description_boilerplate(self, element: ElementTree.Element) -> bool:
+        return self._image_description_fields(element) is not None
+
+    def _image_description_fields(self, element: ElementTree.Element) -> list[str] | None:
+        """Return the fields of an auto-generated image description, else ``None``."""
+
         if self._local_name(element) != "shapecomment":
-            return False
+            return None
         text = self._clean_text("".join(element.itertext()))
         lead = HWPX_IMAGE_DESCRIPTION_LEAD_PATTERN.match(text)
         if lead is None:
-            return False
+            return None
         fields = [
             field.strip()
             for field in HWPX_IMAGE_DESCRIPTION_FIELD_SPLIT_PATTERN.split(text[lead.end() :])
             if field.strip()
         ]
-        return all(
+        if all(
             any(pattern.fullmatch(field) for pattern in HWPX_IMAGE_DESCRIPTION_FIELD_PATTERNS)
             for field in fields
-        )
+        ):
+            return fields
+        return None
+
+    def _omitted_image_descriptions(self, element: ElementTree.Element) -> list[list[str]]:
+        """Auto-generated descriptions below ``element`` that ``_text_parts`` leaves out."""
+
+        omitted: list[list[str]] = []
+        for descendant in element.iter():
+            if descendant is element or not isinstance(descendant.tag, str):
+                continue
+            fields = self._image_description_fields(descendant)
+            if fields is not None:
+                omitted.append(fields)
+        return omitted
+
+    def _image_original_name(self, omitted: list[list[str]]) -> str | None:
+        """Original picture file name for metadata only; never a local path."""
+
+        for fields in omitted:
+            for field in fields:
+                match = HWPX_IMAGE_ORIGINAL_NAME_FIELD_PATTERN.fullmatch(field)
+                if match is None:
+                    continue
+                name = self._clean_text(match.group("name"))
+                if (
+                    name
+                    and len(name) <= HWPX_IMAGE_NAME_METADATA_LIMIT
+                    and not re.search(r"[\\/]|^[A-Za-z]:|^~|\.\.", name)
+                ):
+                    return name
+        return None
 
     def _has_structural_inline_child(self, element: ElementTree.Element) -> bool:
         for descendant in element.iter():

@@ -60,6 +60,34 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("제9조", gaps[0].message)
 
+    def test_unexpanded_range_deletion_does_not_hide_gap_it_cannot_prove(self) -> None:
+        # 100조 이상이거나 가지번호가 섞인 범위는 구조 탐지기가 풀지 못한다. 그런 범위의 끝
+        # 번호를 그대로 믿으면 그 사이의 누락 경고가 사라지므로, 풀린 범위만 순서를 전진시킨다.
+        cases = {
+            "over_expansion_limit": "제4조(목적) 내용\n제5조 ~ 제200조 삭제\n제8조(시행) 내용",
+            "mixed_branch_numbers": "제4조(목적) 내용\n제5조 ~ 제9조의2 삭제\n제8조(시행) 내용",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                parsed = ParsedDocument(
+                    document_id=f"doc_unexpanded_{name}",
+                    source_file="range-unexpanded.md",
+                    document_name="가상규정",
+                    file_type="text",
+                    pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+                    raw_text=text,
+                )
+                nodes = StructureDetector().detect(parsed)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+                issues = Validator().validate(nodes, chunks, parsed.document_id)
+
+                range_node = next(node for node in nodes if node.metadata.get("deleted_article_range"))
+                self.assertNotIn("deleted_article_numbers", range_node.metadata)
+                self.assertIn("deleted_article_range_unexpanded", range_node.warnings)
+                gaps = [issue for issue in issues if issue.issue_type == "article_sequence_gap"]
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("제5조 다음에 제8조", gaps[0].message)
+
     def test_suppresses_expected_amendment_sequence_gap(self) -> None:
         text = "\n".join(
             [
