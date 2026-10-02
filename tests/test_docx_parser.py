@@ -387,8 +387,13 @@ class DocxAutomaticNumberingTests(unittest.TestCase):
             self._texts(parsed),
         )
         self.assertEqual(3, parsed.metadata["docx_auto_numbered_paragraph_count"])
+        self.assertEqual(3, parsed.metadata["docx_auto_numbered_article_label_count"])
         self.assertIn("docx_auto_numbering_rendered", parsed.metadata["parser_uncertainty_flags"])
-        self.assertEqual("low", parsed.metadata["parser_uncertainty_risk_level"])
+        # Rendered 제N조 labels become chunk ids and citation keys: reviewer must verify them.
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertEqual("review_docx_list_numbering", parsed.metadata["parser_uncertainty_recommendation"])
+        self.assertIn("Verify the numbering against Word", parsed.metadata["parser_uncertainty_remediation_hint"])
+        self.assertNotIn("docx_auto_numbering_default_start", parsed.metadata["parser_uncertainty_flags"])
 
     def test_paragraph_and_item_levels_restart_when_the_article_advances(self) -> None:
         parsed = self._build(
@@ -487,6 +492,143 @@ class DocxAutomaticNumberingTests(unittest.TestCase):
         self.assertIn("docx_auto_numbering_format_fallback", parsed.metadata["parser_uncertainty_flags"])
         self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
         self.assertEqual("review_docx_list_numbering", parsed.metadata["parser_uncertainty_recommendation"])
+
+    def test_circled_number_labels_alone_raise_risk_to_medium(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="50"><w:lvl w:ilvl="0"><w:start w:val="1"/>'
+            '<w:numFmt w:val="decimalEnclosedCircle"/><w:lvlText w:val="%1"/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("연차는 15일로 한다.", num_id=7, ilvl=0), self._p("특별휴가는 별도로 정한다.", num_id=7, ilvl=0)],
+            abstract,
+            '<w:num w:numId="7"><w:abstractNumId w:val="50"/></w:num>',
+        )
+
+        self.assertEqual(["① 연차는 15일로 한다.", "② 특별휴가는 별도로 정한다."], self._texts(parsed))
+        self.assertEqual(2, parsed.metadata["docx_auto_numbered_article_label_count"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertIn("docx_auto_numbering_rendered", parsed.metadata["parser_uncertainty_flags"])
+
+    def test_item_level_labels_alone_keep_low_risk(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="51"><w:lvl w:ilvl="0"><w:start w:val="1"/>'
+            '<w:numFmt w:val="ganada"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("경조휴가", num_id=8, ilvl=0), self._p("포상휴가", num_id=8, ilvl=0)],
+            abstract,
+            '<w:num w:numId="8"><w:abstractNumId w:val="51"/></w:num>',
+        )
+
+        self.assertEqual(["가. 경조휴가", "나. 포상휴가"], self._texts(parsed))
+        self.assertEqual("low", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertIn("docx_auto_numbering_rendered", parsed.metadata["parser_uncertainty_flags"])
+        self.assertNotIn("docx_auto_numbered_article_label_count", parsed.metadata)
+
+    def test_huge_start_value_falls_back_to_decimal_without_building_huge_labels(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="52"><w:lvl w:ilvl="0"><w:start w:val="2147483647"/>'
+            '<w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("첫째", num_id=9, ilvl=0), self._p("둘째", num_id=9, ilvl=0)],
+            abstract,
+            '<w:num w:numId="9"><w:abstractNumId w:val="52"/></w:num>',
+        )
+
+        self.assertEqual(["2147483647. 첫째", "2147483648. 둘째"], self._texts(parsed))
+        self.assertEqual(["lowerLetter"], parsed.metadata["docx_auto_numbering_fallback_formats"])
+        self.assertIn("docx_auto_numbering_format_fallback", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+
+    def test_start_values_beyond_32_bits_or_with_thousands_of_digits_stay_bounded(self) -> None:
+        for start in ("9" * 40, "9" * 5000):
+            with self.subTest(digits=len(start)):
+                abstract = (
+                    '<w:abstractNum w:abstractNumId="53"><w:lvl w:ilvl="0">'
+                    f'<w:start w:val="{start}"/><w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/></w:lvl>'
+                    "</w:abstractNum>"
+                )
+                parsed = self._build(
+                    [self._p("첫째", num_id=9, ilvl=0), self._p("둘째", num_id=9, ilvl=0)],
+                    abstract,
+                    '<w:num w:numId="9"><w:abstractNumId w:val="53"/></w:num>',
+                )
+
+                self.assertTrue(all(len(text) < 40 for text in self._texts(parsed)), self._texts(parsed))
+                self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+
+    def test_value_cap_applies_to_letters_but_not_to_plain_decimals(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="54">'
+            '<w:lvl w:ilvl="0"><w:start w:val="10000"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1."/></w:lvl>'
+            '<w:lvl w:ilvl="1"><w:start w:val="10001"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2."/></w:lvl>'
+            '<w:lvl w:ilvl="2"><w:start w:val="20000"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%3)"/></w:lvl>'
+            "</w:abstractNum>"
+        )
+        parsed = self._build(
+            [self._p("a", num_id=9, ilvl=0), self._p("b", num_id=9, ilvl=1), self._p("c", num_id=9, ilvl=2)],
+            abstract,
+            '<w:num w:numId="9"><w:abstractNumId w:val="54"/></w:num>',
+        )
+
+        texts = self._texts(parsed)
+        # 10,000 is still rendered as letters (385 characters, under the label limit
+        # is not met so it is left out), 10,001 and above fall back to decimal.
+        self.assertEqual("10001. b", texts[1])
+        self.assertEqual("20000) c", texts[2])
+        self.assertEqual(["lowerLetter"], parsed.metadata["docx_auto_numbering_fallback_formats"])
+
+    def test_label_template_over_the_length_limit_is_not_rendered(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="55"><w:lvl w:ilvl="0"><w:start w:val="1"/>'
+            f'<w:numFmt w:val="decimal"/><w:lvlText w:val="{"가" * 400}%1"/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("본문", num_id=9, ilvl=0)],
+            abstract,
+            '<w:num w:numId="9"><w:abstractNumId w:val="55"/></w:num>',
+        )
+
+        self.assertEqual(["본문"], self._texts(parsed))
+        self.assertEqual(["label_length"], parsed.metadata["docx_auto_numbering_fallback_formats"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+
+    def test_omitted_start_uses_the_ooxml_default_of_zero_and_is_flagged(self) -> None:
+        # ECMA-376 17.9.25: "If this element is omitted, then the starting value
+        # shall be zero (0)". LibreOffice renders the same ("제0조", "제1조", ...),
+        # so the parser follows the specification and asks for review.
+        abstract = (
+            '<w:abstractNum w:abstractNumId="56"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/>'
+            '<w:lvlText w:val="제%1조"/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("(목적) 목적을 정한다.", num_id=9, ilvl=0), self._p("(정의) 용어를 정한다.", num_id=9, ilvl=0)],
+            abstract,
+            '<w:num w:numId="9"><w:abstractNumId w:val="56"/></w:num>',
+        )
+
+        self.assertEqual(["제0조 (목적) 목적을 정한다.", "제1조 (정의) 용어를 정한다."], self._texts(parsed))
+        self.assertTrue(parsed.metadata["docx_auto_numbering_default_start"])
+        self.assertIn("docx_auto_numbering_default_start", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertIn("w:start", parsed.metadata["parser_uncertainty_remediation_hint"])
+
+    def test_omitted_start_with_start_override_is_explicit_and_not_flagged(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="57"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/>'
+            '<w:lvlText w:val="제%1조"/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("(목적) 목적을 정한다.", num_id=9, ilvl=0)],
+            abstract,
+            '<w:num w:numId="9"><w:abstractNumId w:val="57"/>'
+            '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>',
+        )
+
+        self.assertEqual(["제1조 (목적) 목적을 정한다."], self._texts(parsed))
+        self.assertNotIn("docx_auto_numbering_default_start", parsed.metadata)
+        self.assertNotIn("docx_auto_numbering_default_start", parsed.metadata["parser_uncertainty_flags"])
 
     def test_numbered_paragraph_inside_table_cell_gets_its_label(self) -> None:
         parsed = self._build(

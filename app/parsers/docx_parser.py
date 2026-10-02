@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import re
 import zipfile
 
 from app.parsers.archive_safety import (
@@ -118,6 +119,23 @@ class DocxParser(BaseParser):
         if labels:
             metadata["docx_auto_numbered_paragraph_count"] = len(labels)
             numbering_flags.append("docx_auto_numbering_rendered")
+        if numbering.article_label_count:
+            metadata["docx_auto_numbered_article_label_count"] = numbering.article_label_count
+            reasons.append((
+                "docx_auto_numbering_rendered",
+                "review_docx_list_numbering",
+                "Article (제N조) or circled-number (①) labels were rendered from the DOCX automatic list "
+                "numbering; they become article identities and citation keys. Verify the numbering against "
+                "Word before approval.",
+            ))
+        if numbering.default_start_used:
+            metadata["docx_auto_numbering_default_start"] = True
+            reasons.append((
+                "docx_auto_numbering_default_start",
+                "review_docx_list_numbering",
+                "Some list levels omit w:start, so the OOXML default start value (0) was used; check that "
+                "the first numbers match what Word shows.",
+            ))
         if numbering.fallback_formats:
             metadata["docx_auto_numbering_fallback_formats"] = numbering.fallback_formats
             numbering_flags.append("docx_auto_numbering_format_fallback")
@@ -133,7 +151,7 @@ class DocxParser(BaseParser):
                 parser_uncertainty_metadata(
                     source="docx",
                     risk_level="medium",
-                    flags=[reason[0] for reason in reasons] + numbering_flags,
+                    flags=list(dict.fromkeys([reason[0] for reason in reasons] + numbering_flags)),
                     confidence=0.72,
                     recommendation=reasons[0][1],
                     remediation_hint=" ".join(reason[2] for reason in reasons),
@@ -306,9 +324,23 @@ _ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "X
           (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"))
 
 
+# ECMA-376 17.9.25: an omitted w:start means 0. Values outside a signed 32-bit
+# integer are treated as invalid rather than parsed into huge Python ints.
+_MAX_START_VALUE = 2**31 - 1
+# Letter, Roman and other non-decimal formats are rendered only up to this
+# value; larger values fall back to decimal (a lowerLetter value of 10,000 is
+# already a 385-character label).
+_MAX_FORMATTED_VALUE = 10_000
+# Labels longer than this are never rendered (a hostile lvlText could be huge).
+_MAX_LABEL_CHARS = 400
+_ARTICLE_LABEL_RE = re.compile(r"^\s*(?:제\s*\d+\s*조|[\u2460-\u2473])")
+
+
 @dataclass
 class _ListLevel:
-    start: int = 1
+    start: int = 0
+    start_explicit: bool = False
+    start_invalid: bool = False
     num_format: str = "decimal"
     text: str | None = None
     restart: int | None = None
@@ -321,6 +353,8 @@ class _ListLevel:
 class _ListLabels:
     labels: dict[Any, str] = field(default_factory=dict)
     fallback_formats: list[str] = field(default_factory=list)
+    article_label_count: int = 0
+    default_start_used: bool = False
 
 
 def _w_val(element: Any, path: str) -> str | None:
@@ -334,19 +368,29 @@ def _w_val(element: Any, path: str) -> str | None:
 
 def _w_int(element: Any, path: str) -> int | None:
     value = _w_val(element, path)
-    try:
-        return int(value) if value is not None else None
-    except ValueError:
+    if value is None:
         return None
+    value = value.strip()
+    # Bound the digits before int() so a hostile file cannot make us build or
+    # print enormous integers.
+    if not re.fullmatch(r"-?\d{1,10}", value):
+        return None
+    number = int(value)
+    return number if -_MAX_START_VALUE - 1 <= number <= _MAX_START_VALUE else None
 
 
 def _read_level(lvl: Any, base: _ListLevel | None = None) -> _ListLevel:
     from docx.oxml.ns import qn
 
     level = _ListLevel(**vars(base)) if base else _ListLevel()
-    start = _w_int(lvl, qn("w:start"))
-    if start is not None:
-        level.start = start
+    if lvl.find(qn("w:start")) is not None:
+        start = _w_int(lvl, qn("w:start"))
+        if start is not None and start >= 0:
+            level.start = start
+            level.start_explicit = True
+            level.start_invalid = False
+        else:
+            level.start_invalid = True
     num_format = _w_val(lvl, qn("w:numFmt"))
     if num_format:
         level.num_format = num_format
@@ -474,8 +518,10 @@ class _Numbering:
                 if 0 <= ilvl <= _MAX_LIST_LEVEL:
                     cached[ilvl] = _read_level(lvl, cached.get(ilvl))
             for ilvl, start in starts.items():
-                if ilvl in cached:
-                    cached[ilvl] = _ListLevel(**{**vars(cached[ilvl]), "start": start})
+                if ilvl in cached and start >= 0:
+                    cached[ilvl] = _ListLevel(
+                        **{**vars(cached[ilvl]), "start": start, "start_explicit": True, "start_invalid": False}
+                    )
             self._level_cache[num_id] = cached
         return cached
 
@@ -593,17 +639,30 @@ def _render_list_labels(doc: Any) -> _ListLabels:
                 values[deeper] = None
         if level.num_format == "bullet" or not level.text:
             continue
+        if len(level.text) > _MAX_LABEL_CHARS:
+            fallback_formats.add("label_length")
+            continue
         # An empty numbered paragraph still advances Word's counter, but it was
         # never emitted as a block; do not turn it into a bare "제N조" line.
         if not "".join(run.text for run in paragraph.xpath(DocxParser._VISIBLE_RUN_XPATH)).strip():
             continue
 
+        used_default_start = False
+
         def render(match_level: int) -> str:
+            nonlocal used_default_start
             referenced = levels.get(match_level)
             if referenced is None:
                 return ""
+            if referenced.start_invalid:
+                fallback_formats.add("start_value")
+            elif not referenced.start_explicit:
+                used_default_start = True
             value = values[match_level] if values[match_level] is not None else referenced.start
             num_format = "decimal" if level.legal and referenced.num_format != "none" else referenced.num_format
+            if num_format not in {"decimal", "decimalZero", "none"} and value > _MAX_FORMATTED_VALUE:
+                fallback_formats.add(num_format)
+                return str(value)
             rendered = _format_number(value, num_format)
             if rendered is None:
                 # Unknown format, or a value outside it (e.g. the 15th 가나다 item):
@@ -623,8 +682,15 @@ def _render_list_labels(doc: Any) -> _ListLabels:
             else:
                 label += char
                 index += 1
+        if len(label) > _MAX_LABEL_CHARS:
+            fallback_formats.add("label_length")
+            continue
         if label.strip():
             separator = "" if level.suffix == "nothing" else " "
             result.labels[paragraph] = label + separator
+            if used_default_start:
+                result.default_start_used = True
+            if _ARTICLE_LABEL_RE.match(label):
+                result.article_label_count += 1
     result.fallback_formats = sorted(fallback_formats)
     return result
