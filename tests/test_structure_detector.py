@@ -1254,6 +1254,54 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertIn("둘째 세목의 계속 문장", by_number["(2)"].text)
         self.assertEqual(by_number["1."].node_id, by_number["나."].parent_id)
 
+    def test_korean_detail_markers_nest_below_hangul_subitems(self) -> None:
+        text = "\n".join(
+            [
+                "제1조(목적) 본문.",
+                "1. 첫째 호",
+                "가. 첫째 목",
+                "1) 첫째 세목",
+                "2) 둘째 세목",
+                "둘째 세목의 계속 문장",
+                "가) 세세목",
+                "나) 둘째 세세목",
+                "3) 셋째 세목",
+                "나. 둘째 목",
+                "2. 둘째 호",
+            ]
+        )
+
+        nodes = StructureDetector().detect_from_text(text)
+        by_number = {node.number: node for node in nodes if node.number}
+        by_id = {node.node_id: node for node in nodes}
+
+        def parent(number: str) -> str | None:
+            parent_node = by_id.get(by_number[number].parent_id)
+            return parent_node.number if parent_node else None
+
+        self.assertEqual("1.", parent("가."))
+        self.assertEqual("가.", parent("1)"))
+        self.assertEqual("가.", parent("2)"))
+        self.assertEqual("가.", parent("3)"))
+        self.assertEqual("2)", parent("가)"))
+        self.assertEqual("2)", parent("나)"))
+        self.assertEqual("1.", parent("나."))
+        self.assertEqual("제1조", parent("2."))
+        self.assertIn("둘째 세목의 계속 문장", by_number["2)"].text)
+        self.assertEqual("item", by_number["2."].node_type)
+
+    def test_parenthesized_numbers_without_a_dotted_item_remain_items(self) -> None:
+        nodes = StructureDetector().detect_from_text(
+            "\n".join(["제2조(정의) 본문.", "1) 첫째 호", "2) 둘째 호", "가) 목"])
+        )
+        by_number = {node.number: node for node in nodes if node.number}
+        by_id = {node.node_id: node for node in nodes}
+
+        self.assertEqual("item", by_number["1)"].node_type)
+        self.assertEqual("item", by_number["2)"].node_type)
+        self.assertEqual("제2조", by_id[by_number["1)"].parent_id].number)
+        self.assertEqual("2)", by_id[by_number["가)"].parent_id].number)
+
     def test_parenthesized_numeric_marker_at_article_start_remains_paragraph(self) -> None:
         nodes = StructureDetector().detect_from_text(
             "\n".join(

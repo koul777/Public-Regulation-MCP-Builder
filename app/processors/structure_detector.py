@@ -23,6 +23,7 @@ ARTICLE_TITLE_ANGLE_GUARD = (
 # 줄마다 화면을 갱신하면 진행 표시가 구조 분석보다 비싸진다.
 DETECT_PROGRESS_LINE_STEP = 500
 CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY = "_contextual_numeric_subitem"
+CONTEXTUAL_NESTED_DETAIL_METADATA_KEY = "_contextual_nested_detail"
 
 # Keep this set aligned with the internal-regulation title vocabulary used by
 # MetadataExtractor and the regulation metadata service.  The extra governance
@@ -211,6 +212,7 @@ class StructureDetector:
             "item": None,
             "subitem": None,
             "subitem_detail": None,
+            "subitem_detail_child": None,
             "supplementary": None,
             "regulation_parent": None,
             "last_article": None,
@@ -235,7 +237,9 @@ class StructureDetector:
                     pending_orphan_lines.append(line)
                 continue
             detected = self._contextualize_parenthesized_numeric_subitem(current, detected)
-            if detected.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY):
+            if detected.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY) or detected.metadata.get(
+                CONTEXTUAL_NESTED_DETAIL_METADATA_KEY
+            ):
                 detected = self._reindex_node(detected, len(nodes))
             if self._should_demote_unanchored_numbered_item(current, detected, pending_orphan_lines):
                 if not self._append_to_current(current, line):
@@ -1516,7 +1520,7 @@ class StructureDetector:
         return True
 
     def _append_target(self, current: dict[str, StructureNode | None]) -> StructureNode | None:
-        for key in ("subitem_detail", "subitem", "item", "paragraph", "article", "supplementary"):
+        for key in ("subitem_detail_child", "subitem_detail", "subitem", "item", "paragraph", "article", "supplementary"):
             if current.get(key):
                 return current[key]
         if current.get("regulation"):
@@ -1666,21 +1670,49 @@ class StructureDetector:
     def _strip_internal_metadata(self, node: StructureNode) -> None:
         node.metadata.pop("_merged_hwpx_count_sources", None)
         node.metadata.pop(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY, None)
+        node.metadata.pop(CONTEXTUAL_NESTED_DETAIL_METADATA_KEY, None)
 
     def _contextualize_parenthesized_numeric_subitem(
         self,
         current: dict[str, StructureNode | None],
         node: StructureNode,
     ) -> StructureNode:
-        """Treat ``(1)`` as a detail only while a numbered item is active."""
+        """Place lower Korean detail markers by context, not by marker alone.
 
+        The usual Korean hierarchy below an article is ``① > 1. > 가. > 1) > 가)``.
+        ``(1)`` is a detail only while a numbered item is active. ``1)`` is a
+        detail while a ``가.`` subitem of a ``1.`` item is active (otherwise it
+        stays an item marker), and ``가)`` nests under an active ``1)`` detail.
+        """
+
+        number = node.number or ""
+        item = current.get("item")
+        subitem = current.get("subitem")
+        detail = current.get("subitem_detail")
         if (
             node.node_type == "paragraph"
-            and current.get("item") is not None
-            and re.fullmatch(r"\(\d+\)", node.number or "")
+            and item is not None
+            and re.fullmatch(r"\(\d+\)", number)
         ):
             node.node_type = "subitem"
             node.metadata[CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY] = True
+        elif (
+            node.node_type == "item"
+            and item is not None
+            and subitem is not None
+            and re.fullmatch(r"\d+\)", number)
+            and re.fullmatch(r"\d+\.", item.number or "")
+            and re.fullmatch(r"[가-하]\.", subitem.number or "")
+        ):
+            node.node_type = "subitem"
+            node.metadata[CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY] = True
+        elif (
+            node.node_type == "subitem"
+            and re.fullmatch(r"[가-하]\)", number)
+            and detail is not None
+            and re.fullmatch(r"\d+\)", detail.number or "")
+        ):
+            node.metadata[CONTEXTUAL_NESTED_DETAIL_METADATA_KEY] = True
         return node
 
     def _reindex_node(self, node: StructureNode, order_index: int) -> StructureNode:
@@ -1692,8 +1724,11 @@ class StructureDetector:
     def _update_current(self, current: dict[str, StructureNode | None], node: StructureNode) -> None:
         node_type = node.node_type
         contextual_numeric_subitem = bool(node.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY))
-        if contextual_numeric_subitem:
+        if node.metadata.get(CONTEXTUAL_NESTED_DETAIL_METADATA_KEY):
+            current["subitem_detail_child"] = node
+        elif contextual_numeric_subitem:
             current["subitem_detail"] = node
+            self._clear(current, "subitem_detail_child")
         elif node_type in {"part", "chapter", "section", "subsection", "article", "paragraph", "item", "subitem"}:
             current[node_type] = node
             if node_type == "subitem":
@@ -1738,9 +1773,14 @@ class StructureDetector:
     def _clear(self, current: dict[str, StructureNode | None], *keys: str) -> None:
         for key in keys:
             current[key] = None
+        if "subitem_detail" in keys:
+            current["subitem_detail_child"] = None
 
     def _parent_id_for(self, node: StructureNode, current: dict[str, StructureNode | None]) -> str | None:
         node_type = node.node_type
+        if node.metadata.get(CONTEXTUAL_NESTED_DETAIL_METADATA_KEY):
+            parent = current.get("subitem_detail")
+            return parent.node_id if parent else None
         if node.metadata.get(CONTEXTUAL_NUMERIC_SUBITEM_METADATA_KEY):
             parent = current.get("subitem") or current.get("item")
             return parent.node_id if parent else None
