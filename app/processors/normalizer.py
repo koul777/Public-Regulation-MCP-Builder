@@ -58,6 +58,7 @@ class TextNormalizer:
         """
 
         repeated = self._repeated_edge_lines(parsed)
+        page_number_shapes = self._repeated_page_number_shapes(parsed)
         pages: list[ParsedPage] = []
         raw_parts: list[str] = []
         removed_chars = 0
@@ -68,18 +69,23 @@ class TextNormalizer:
             progress_callback(0, page_total)
         for page_index, page in enumerate(parsed.pages, start=1):
             blocks: list[ParsedBlock] = []
+            normalized_blocks: list[tuple[ParsedBlock, list[str]]] = []
             for block in page.blocks:
                 normalized, block_removed, block_boilerplate = self._normalize_text_with_stats(block.text)
                 boilerplate_chars += block_boilerplate
                 if block_removed:
                     removed_chars += block_removed
                     removed_blocks += 1
+                normalized_blocks.append((block, normalized.splitlines()))
+            page_number_lines = self._page_edge_number_positions(normalized_blocks, page_number_shapes)
+            for block_index, (block, lines) in enumerate(normalized_blocks):
                 filtered_lines = [
                     line
-                    for line in normalized.splitlines()
+                    for line_index, line in enumerate(lines)
                     if line.strip()
                     and line.strip() not in repeated
                     and not self._looks_like_page_footer(line.strip())
+                    and (block_index, line_index) not in page_number_lines
                 ]
                 if not filtered_lines:
                     continue
@@ -156,4 +162,75 @@ class TextNormalizer:
         return bool(HEADING_PREFIX.match(line) or line.startswith(("부칙", "[별표", "별표", "[별지", "별지")))
 
     def _looks_like_page_footer(self, line: str) -> bool:
-        return bool(re.fullmatch(r"-\s*\d+\s*-", line))
+        # "- 3 -", "— 3 —", "- 3 페이지 -": a dashed page number is never body text.
+        return bool(re.fullmatch(r"[-‐‑–—―]\s*\d+\s*(?:쪽|페이지)?\s*[-‐‑–—―]", line))
+
+    def _page_number_shape(self, line: str) -> str | None:
+        """Return the digit-free shape of a short page-number line, else None.
+
+        Recognized shapes: ``3``, ``(3)``, ``[3]``, ``3 / 12``, ``3 of 12``,
+        ``Page 3``, ``p. 3``, ``3쪽``, ``3 페이지`` and dashed variants.
+        """
+
+        stripped = line.strip()
+        if not stripped or len(stripped) > 24 or not re.search(r"\d", stripped):
+            return None
+        shape = re.sub(r"\s+", " ", re.sub(r"\d+", "#", stripped))
+        if re.fullmatch(
+            r"(?:[-‐‑–—―] ?)?(?:(?:page|p\.) ?)?[(\[<]?#[)\]>]?(?: ?(?:/|of) ?#)? ?(?:쪽|페이지)?(?: ?[-‐‑–—―])?",
+            shape,
+            re.IGNORECASE,
+        ):
+            return shape.casefold()
+        return None
+
+    def _repeated_page_number_shapes(self, parsed: ParsedDocument) -> set[str]:
+        """Find page-number shapes that sit at page edges on most pages.
+
+        Page numbers change on every page, so exact repetition cannot catch
+        them. A shape counts only when it appears at the first or last line of
+        at least half of the pages (minimum three) with at least two different
+        numbers, so a lone "1/2" or "(2)" inside a page is never removed.
+        """
+
+        if len(parsed.pages) < 3:
+            return set()
+        pages_by_shape: Counter[str] = Counter()
+        values_by_shape: dict[str, set[str]] = {}
+        for page in parsed.pages:
+            lines = [line.strip() for block in page.blocks for line in block.text.splitlines() if line.strip()]
+            page_shapes: set[str] = set()
+            for line in dict.fromkeys([*lines[:1], *lines[-1:]]):
+                shape = self._page_number_shape(line)
+                if shape:
+                    page_shapes.add(shape)
+                    values_by_shape.setdefault(shape, set()).add(re.sub(r"\s+", "", line))
+            pages_by_shape.update(page_shapes)
+        threshold = max(3, len(parsed.pages) // 2)
+        return {
+            shape
+            for shape, count in pages_by_shape.items()
+            if count >= threshold and len(values_by_shape.get(shape, ())) >= 2
+        }
+
+    def _page_edge_number_positions(
+        self,
+        normalized_blocks: list[tuple[ParsedBlock, list[str]]],
+        shapes: set[str],
+    ) -> set[tuple[int, int]]:
+        """Return (block, line) positions of page-number lines at this page's edges."""
+
+        if not shapes:
+            return set()
+        positions = [
+            (block_index, line_index)
+            for block_index, (_block, lines) in enumerate(normalized_blocks)
+            for line_index, line in enumerate(lines)
+            if line.strip()
+        ]
+        edges = dict.fromkeys([*positions[:1], *positions[-1:]])
+        return {
+            (block_index, line_index)
+            for block_index, line_index in edges
+            if self._page_number_shape(normalized_blocks[block_index][1][line_index]) in shapes
+        }

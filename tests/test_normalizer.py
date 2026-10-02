@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 from app.processors.mojibake import (
@@ -167,6 +168,91 @@ class TextNormalizerTests(unittest.TestCase):
             ["구분 | 대상 | 금액", "가족수당 | 배우자 | 40,000원", "가족수당 | 자녀 | 20,000원"],
             table_block.text.splitlines(),
         )
+
+
+class NormalizerPageNumberFooterTests(unittest.TestCase):
+    """쪽번호는 쪽마다 숫자가 바뀌어 반복 머리글 제거로는 잡히지 않는다."""
+
+    @staticmethod
+    def _pdf(pages: list[list[str]]) -> ParsedDocument:
+        return ParsedDocument(
+            document_id="doc-footer",
+            source_file="footer.pdf",
+            file_type="pdf",
+            pages=[
+                ParsedPage(page_no=index + 1, blocks=[ParsedBlock(type="text", text=line) for line in lines])
+                for index, lines in enumerate(pages)
+            ],
+            raw_text="",
+        )
+
+    def _normalized_lines(self, pages: list[list[str]]) -> list[str]:
+        normalized = TextNormalizer().normalize_document(self._pdf(pages))
+        return [line for page in normalized.pages for block in page.blocks for line in block.text.splitlines()]
+
+    def test_slash_page_numbers_at_page_bottoms_are_removed(self) -> None:
+        lines = self._normalized_lines(
+            [
+                ["제3조(적용) ① 모든 직원에게 적용한다.", "② 특별한 규정이 있으면 따르되,", "1 / 4"],
+                ["다만, 「근로기준법」의 경우는 제외한다.", "제4조(근무) 1일 8시간으로 한다.", "2 / 4"],
+                ["제5조(감액) 감액률은 다음과 같다.", "1/2", "제6조(휴가) 휴가를 쓴다.", "3 / 4"],
+                ["제7조(시행) 공포한 날부터 시행한다.", "4 / 4"],
+            ]
+        )
+
+        self.assertFalse([line for line in lines if re.fullmatch(r"\d / 4", line)])
+        self.assertIn("1/2", lines)
+
+    def test_other_repeated_page_number_shapes_are_removed(self) -> None:
+        for footers in (["(1)", "(2)", "(3)"], ["Page 1", "Page 2", "Page 3"], ["1쪽", "2쪽", "3쪽"], ["1", "2", "3"]):
+            with self.subTest(footers=footers):
+                lines = self._normalized_lines(
+                    [
+                        ["제1조(목적) 이 규정은 목적을 정한다.", footers[0]],
+                        ["제2조(정의) 용어의 뜻은 다음과 같다.", footers[1]],
+                        ["제3조(적용) 모든 직원에게 적용한다.", footers[2]],
+                    ]
+                )
+                self.assertEqual(
+                    [
+                        "제1조(목적) 이 규정은 목적을 정한다.",
+                        "제2조(정의) 용어의 뜻은 다음과 같다.",
+                        "제3조(적용) 모든 직원에게 적용한다.",
+                    ],
+                    lines,
+                )
+
+    def test_dashed_page_number_variants_are_removed_on_any_page(self) -> None:
+        normalizer = TextNormalizer()
+
+        for footer in ("- 3 -", "— 3 —", "– 3 –", "- 3 페이지 -"):
+            with self.subTest(footer=footer):
+                self.assertTrue(normalizer._looks_like_page_footer(footer))
+        self.assertFalse(normalizer._looks_like_page_footer("3"))
+        self.assertFalse(normalizer._looks_like_page_footer("1/2"))
+
+    def test_a_lone_number_at_one_page_edge_is_kept(self) -> None:
+        lines = self._normalized_lines(
+            [
+                ["제1조(목적) 이 규정은 목적을 정한다.", "제2조(배점) 배점은 다음과 같다."],
+                ["구분 배점", "20"],
+                ["제3조(적용) 모든 직원에게 적용한다.", "제4조(시행) 공포한 날부터 시행한다."],
+            ]
+        )
+
+        self.assertIn("20", " ".join(lines))
+
+    def test_same_shape_in_the_middle_of_a_page_is_kept(self) -> None:
+        lines = self._normalized_lines(
+            [
+                ["제1조(목적) 이 규정은 목적을 정한다.", "(2)", "제2조(정의) 용어를 정한다.", "(1)"],
+                ["제3조(적용) 모든 직원에게 적용한다.", "(2)"],
+                ["제4조(시행) 공포한 날부터 시행한다.", "(3)"],
+            ]
+        )
+
+        self.assertEqual(1, sum(1 for line in lines if "(2)" in line))
+
 
 class NormalizerMojibakeCleanupTests(unittest.TestCase):
     """깨진 글자를 지우되, 지웠다는 사실과 정상 한자는 남기는지 확인한다."""
