@@ -301,6 +301,225 @@ class DocxWrappedRunTextTests(unittest.TestCase):
 
         self.assertEqual(["제9조(용어) 漢字를 쓴다."], texts)
 
+@unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
+class DocxAutomaticNumberingTests(unittest.TestCase):
+    """Word 자동 번호(numbering.xml)로 붙은 조·항·호 번호를 본문에 되살린다."""
+
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+    # abstractNum 10: 제%1조 / %2(①) / %3.(가나다) / %4)(ㄱㄴㄷ), level 0 linked to style "Article".
+    ARTICLE_LIST = (
+        '<w:abstractNum w:abstractNumId="10"><w:multiLevelType w:val="multilevel"/>'
+        '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Article"/>'
+        '<w:lvlText w:val="제%1조"/></w:lvl>'
+        '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimalEnclosedCircle"/><w:lvlText w:val="%2"/></w:lvl>'
+        '<w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="ganada"/><w:lvlText w:val="%3."/></w:lvl>'
+        '<w:lvl w:ilvl="3"><w:start w:val="1"/><w:numFmt w:val="chosung"/><w:lvlText w:val="%4)"/></w:lvl>'
+        "</w:abstractNum>"
+    )
+    BULLET_LIST = (
+        '<w:abstractNum w:abstractNumId="20"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/>'
+        '<w:lvlText w:val="\u2022"/></w:lvl></w:abstractNum>'
+    )
+
+    def _build(self, paragraphs: list[str], abstracts: str, nums: str, *, table_cell: str | None = None):
+        from docx import Document
+        from docx.oxml import parse_xml
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "numbered.docx"
+        doc = Document()
+        numbering = doc.part.numbering_part.element
+        for child in list(numbering):
+            numbering.remove(child)
+        for xml in (abstracts, nums):
+            for element in parse_xml(f"<w:numbering {self.W}>{xml}</w:numbering>"):
+                numbering.append(element)
+        styles = doc.styles.element
+        styles.append(parse_xml(
+            f'<w:style {self.W} w:type="paragraph" w:styleId="Article"><w:name w:val="Article"/>'
+            '<w:basedOn w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+        ))
+        styles.append(parse_xml(
+            f'<w:style {self.W} w:type="paragraph" w:styleId="ArticleChild"><w:name w:val="Article Child"/>'
+            '<w:basedOn w:val="Article"/></w:style>'
+        ))
+        body = doc.element.body
+        for inner in paragraphs:
+            body.insert(len(body) - 1, parse_xml(f"<w:p {self.W}>{inner}</w:p>"))
+        if table_cell is not None:
+            table = doc.add_table(rows=1, cols=2)
+            table.cell(0, 0).text = "구분"
+            cell_p = table.cell(0, 1)._tc.p_lst[0]
+            cell_p.getparent().replace(cell_p, parse_xml(f"<w:p {self.W}>{table_cell}</w:p>"))
+        doc.save(path)
+        return DocxParser().parse(path, "doc_numbered")
+
+    @staticmethod
+    def _p(text: str, *, style: str | None = None, num_id: int | None = None, ilvl: int | None = None) -> str:
+        props = f'<w:pStyle w:val="{style}"/>' if style else ""
+        if num_id is not None or ilvl is not None:
+            props += "<w:numPr>"
+            props += f'<w:ilvl w:val="{ilvl}"/>' if ilvl is not None else ""
+            props += f'<w:numId w:val="{num_id}"/>' if num_id is not None else ""
+            props += "</w:numPr>"
+        return (f"<w:pPr>{props}</w:pPr>" if props else "") + f"<w:r><w:t>{text}</w:t></w:r>"
+
+    def _texts(self, parsed) -> list[str]:
+        return [block.text for block in parsed.pages[0].blocks]
+
+    def test_article_numbers_from_style_numbering_are_rendered(self) -> None:
+        parsed = self._build(
+            [
+                self._p("가상기관 복무규정"),
+                self._p("(목적) 이 규정은 복무를 정한다.", style="Article"),
+                self._p("(정의) 용어의 뜻은 다음과 같다.", style="ArticleChild"),
+                self._p("(시행) 공포한 날부터 시행한다.", style="Article"),
+            ],
+            self.ARTICLE_LIST,
+            '<w:num w:numId="1"><w:abstractNumId w:val="10"/></w:num>',
+        )
+
+        self.assertEqual(
+            ["가상기관 복무규정", "제1조 (목적) 이 규정은 복무를 정한다.",
+             "제2조 (정의) 용어의 뜻은 다음과 같다.", "제3조 (시행) 공포한 날부터 시행한다."],
+            self._texts(parsed),
+        )
+        self.assertEqual(3, parsed.metadata["docx_auto_numbered_paragraph_count"])
+        self.assertIn("docx_auto_numbering_rendered", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("low", parsed.metadata["parser_uncertainty_risk_level"])
+
+    def test_paragraph_and_item_levels_restart_when_the_article_advances(self) -> None:
+        parsed = self._build(
+            [
+                self._p("(휴가) 휴가는 다음과 같다.", style="Article"),
+                self._p("연차휴가는 15일로 한다.", num_id=1, ilvl=1),
+                self._p("특별휴가는 다음과 같다.", num_id=1, ilvl=1),
+                self._p("경조휴가", num_id=1, ilvl=2),
+                self._p("본인 결혼", num_id=1, ilvl=3),
+                self._p("포상휴가", num_id=1, ilvl=2),
+                self._p("(출장) 출장은 승인을 받는다.", style="Article"),
+                self._p("출장은 사전에 신청한다.", num_id=1, ilvl=1),
+                self._p("긴급 출장", num_id=1, ilvl=2),
+            ],
+            self.ARTICLE_LIST,
+            '<w:num w:numId="1"><w:abstractNumId w:val="10"/></w:num>',
+        )
+
+        self.assertEqual(
+            ["제1조 (휴가) 휴가는 다음과 같다.", "① 연차휴가는 15일로 한다.", "② 특별휴가는 다음과 같다.",
+             "가. 경조휴가", "ㄱ) 본인 결혼", "나. 포상휴가",
+             "제2조 (출장) 출장은 승인을 받는다.", "① 출장은 사전에 신청한다.", "가. 긴급 출장"],
+            self._texts(parsed),
+        )
+
+    def test_start_override_restarts_a_num_instance(self) -> None:
+        parsed = self._build(
+            [
+                self._p("(목적) 목적을 정한다.", num_id=1, ilvl=0),
+                self._p("(정의) 용어를 정한다.", num_id=1, ilvl=0),
+                self._p("(부칙 시행) 시행일을 정한다.", num_id=2, ilvl=0),
+            ],
+            self.ARTICLE_LIST,
+            '<w:num w:numId="1"><w:abstractNumId w:val="10"/></w:num>'
+            '<w:num w:numId="2"><w:abstractNumId w:val="10"/>'
+            '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="7"/></w:lvlOverride></w:num>',
+        )
+
+        self.assertEqual(
+            ["제1조 (목적) 목적을 정한다.", "제2조 (정의) 용어를 정한다.", "제7조 (부칙 시행) 시행일을 정한다."],
+            self._texts(parsed),
+        )
+
+    def test_bullets_and_unnumbered_paragraphs_are_left_unchanged(self) -> None:
+        parsed = self._build(
+            [
+                self._p("제1조(목적) 손으로 쓴 번호"),
+                self._p("첫째 항목", num_id=3, ilvl=0),
+                self._p("번호 해제 문단", style="Article", num_id=0),
+            ],
+            self.ARTICLE_LIST + self.BULLET_LIST,
+            '<w:num w:numId="1"><w:abstractNumId w:val="10"/></w:num>'
+            '<w:num w:numId="3"><w:abstractNumId w:val="20"/></w:num>',
+        )
+
+        self.assertEqual(["제1조(목적) 손으로 쓴 번호", "첫째 항목", "번호 해제 문단"], self._texts(parsed))
+        self.assertNotIn("docx_auto_numbered_paragraph_count", parsed.metadata)
+        self.assertEqual(["body_text_extracted"], parsed.metadata["parser_uncertainty_flags"])
+
+    def test_letter_roman_and_zero_padded_formats(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="30">'
+            '<w:lvl w:ilvl="0"><w:start w:val="2"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/></w:lvl>'
+            '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="(%2)"/></w:lvl>'
+            '<w:lvl w:ilvl="2"><w:start w:val="9"/><w:numFmt w:val="decimalZero"/>'
+            '<w:lvlText w:val="%1-%3"/><w:suff w:val="nothing"/></w:lvl>'
+            "</w:abstractNum>"
+        )
+        parsed = self._build(
+            [
+                self._p("총칙", num_id=5, ilvl=0),
+                self._p("세부", num_id=5, ilvl=1),
+                self._p("세부", num_id=5, ilvl=1),
+                self._p("호", num_id=5, ilvl=2),
+                self._p("호", num_id=5, ilvl=2),
+            ],
+            abstract,
+            '<w:num w:numId="5"><w:abstractNumId w:val="30"/></w:num>',
+        )
+
+        self.assertEqual(["II. 총칙", "(a) 세부", "(b) 세부", "II-09호", "II-10호"], self._texts(parsed))
+
+    def test_unsupported_format_falls_back_to_decimal_with_review_flag(self) -> None:
+        abstract = (
+            '<w:abstractNum w:abstractNumId="40"><w:lvl w:ilvl="0"><w:start w:val="1"/>'
+            '<w:numFmt w:val="koreanCounting"/><w:lvlText w:val="제%1장"/></w:lvl></w:abstractNum>'
+        )
+        parsed = self._build(
+            [self._p("총칙", num_id=6, ilvl=0)],
+            abstract,
+            '<w:num w:numId="6"><w:abstractNumId w:val="40"/></w:num>',
+        )
+
+        self.assertEqual(["제1장 총칙"], self._texts(parsed))
+        self.assertEqual(["koreanCounting"], parsed.metadata["docx_auto_numbering_fallback_formats"])
+        self.assertIn("docx_auto_numbering_format_fallback", parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertEqual("review_docx_list_numbering", parsed.metadata["parser_uncertainty_recommendation"])
+
+    def test_numbered_paragraph_inside_table_cell_gets_its_label(self) -> None:
+        parsed = self._build(
+            [self._p("(수당) 수당은 다음과 같다.", style="Article")],
+            self.ARTICLE_LIST,
+            '<w:num w:numId="1"><w:abstractNumId w:val="10"/></w:num>',
+            table_cell=self._p("월 4만원", num_id=1, ilvl=1),
+        )
+
+        self.assertEqual(["제1조 (수당) 수당은 다음과 같다.", "구분 | ① 월 4만원"], self._texts(parsed))
+
+    def test_structure_detector_finds_auto_numbered_articles(self) -> None:
+        from app.processors.structure_detector import StructureDetector
+
+        parsed = self._build(
+            [
+                self._p("가상기관 여비규정"),
+                self._p("(목적) 이 규정은 여비 지급을 정한다.", style="Article"),
+                self._p("(지급) 여비는 다음과 같이 지급한다.", style="Article"),
+                self._p("국내 여비는 실비로 한다.", num_id=1, ilvl=1),
+                self._p("국외 여비는 정액으로 한다.", num_id=1, ilvl=1),
+                self._p("(정산) 여비는 귀임 후 정산한다.", style="Article"),
+            ],
+            self.ARTICLE_LIST,
+            '<w:num w:numId="1"><w:abstractNumId w:val="10"/></w:num>',
+        )
+
+        nodes = StructureDetector().detect(parsed)
+        articles = [node for node in nodes if node.node_type == "article"]
+        self.assertEqual(["목적", "지급", "정산"], [node.title for node in articles])
+        paragraphs = [node for node in nodes if node.node_type == "paragraph" and node.text.startswith(("①", "②"))]
+        self.assertEqual(2, len(paragraphs))
+
 
 if __name__ == "__main__":
     unittest.main()
