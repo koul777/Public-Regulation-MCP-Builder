@@ -133,6 +133,13 @@ class TableExtractor:
         "결과",
     }
 
+    def __init__(self) -> None:
+        # DOCX/HWPX tables are serialized one physical row per line with cell
+        # text already joined, so a line break there is always a real row
+        # boundary. Wrapped-cell merging is only for text-extracted tables
+        # (PDF, OCR) where a long cell can spill onto the next line.
+        self.explicit_row_boundaries = False
+
     def analyze_text(self, text: str, context_type: str | None = None) -> dict:
         rows = self.extract_rows(text)
         cell_rows = self.extract_cell_rows(rows, context_type=context_type)
@@ -677,7 +684,11 @@ class TableExtractor:
         while index < len(cell_rows):
             current = dict(cell_rows[index])
             next_row = cell_rows[index + 1] if index + 1 < len(cell_rows) else None
-            if next_row and self._should_merge_wrapped_cell_rows(current, next_row):
+            if (
+                next_row
+                and not self.explicit_row_boundaries
+                and self._should_merge_wrapped_cell_rows(current, next_row)
+            ):
                 current_cells = [str(cell).strip() for cell in current.get("cells") or []]
                 next_cells = [str(cell).strip() for cell in next_row.get("cells") or []]
                 current["cells"] = [
