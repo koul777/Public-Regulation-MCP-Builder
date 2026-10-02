@@ -24,6 +24,16 @@ class HwpxParser(BaseParser):
     ROW_TAGS = {"tr", "row"}
     CELL_TAGS = {"tc", "cell"}
     STRUCTURAL_INLINE_TAGS = TABLE_TAGS | IMAGE_TAGS | NOTE_TAGS | {"caption"}
+    # Running page header/footer controls live inside the first paragraph's
+    # run. Their text is page furniture, not regulation body text.
+    PAGE_FURNITURE_TAGS = {"header", "footer"}
+    # Hancom stores these as empty elements inside <hp:t>; itertext() drops
+    # them, which glued words together ("이<nbSpace/>규정은" -> "이규정은").
+    INLINE_SPACE_TAGS = {"tab", "nbspace", "fwspace"}
+    INLINE_LINE_BREAK_TAGS = {"linebreak"}
+    # Placeholder for a paragraph-internal line break until whitespace is
+    # collapsed, so XML indentation never turns into a line break.
+    LINE_BREAK_SENTINEL = "\u2028"
 
     def __init__(self, *, archive_limits: OfficeArchiveLimits | None = None) -> None:
         self.archive_limits = archive_limits or OfficeArchiveLimits()
@@ -247,12 +257,14 @@ class HwpxParser(BaseParser):
             return
         if tag in {"p", "para"}:
             if self._has_structural_inline_child(element):
-                text = self._inline_text_excluding(element, self.STRUCTURAL_INLINE_TAGS)
+                text = self._inline_text_excluding(
+                    element, self.STRUCTURAL_INLINE_TAGS | self.PAGE_FURNITURE_TAGS
+                )
                 if text.strip():
                     blocks.append(("text", text, {"hwpx_block_type": "paragraph"}))
                 self._collect_structural_inline_blocks(element, blocks)
                 return
-            text = "".join(element.itertext())
+            text = self._inline_text_excluding(element, self.PAGE_FURNITURE_TAGS)
             if text.strip():
                 blocks.append(("text", text, {"hwpx_block_type": "paragraph"}))
             return
@@ -341,7 +353,13 @@ class HwpxParser(BaseParser):
         return sum(1 for descendant in element.iter() if descendant is not element and self._local_name(descendant) in tag_names)
 
     def _has_cell_span(self, cell: ElementTree.Element) -> bool:
-        for key, value in cell.attrib.items():
+        # Hancom writes spans on a <hp:cellSpan colSpan=".." rowSpan=".."/>
+        # child; some producers put them on the cell itself.
+        span_attributes = list(cell.attrib.items())
+        for child in list(cell):
+            if self._local_name(child) == "cellspan":
+                span_attributes.extend(child.attrib.items())
+        for key, value in span_attributes:
             local_key = key.rsplit("}", 1)[-1].lower()
             if local_key not in {"rowspan", "colspan"}:
                 continue
@@ -430,8 +448,13 @@ class HwpxParser(BaseParser):
         parts: list[str] = []
 
         def collect(current: ElementTree.Element) -> None:
-            if current is not element and self._local_name(current) in excluded_tags:
+            tag = self._local_name(current)
+            if current is not element and tag in excluded_tags:
                 return
+            if tag in self.INLINE_LINE_BREAK_TAGS:
+                parts.append(self.LINE_BREAK_SENTINEL)
+            elif tag in self.INLINE_SPACE_TAGS:
+                parts.append(" ")
             if current.text:
                 parts.append(current.text)
             for child in list(current):
@@ -456,7 +479,11 @@ class HwpxParser(BaseParser):
         return candidates
 
     def _clean_text(self, text: str) -> str:
-        return re.sub(r"\s+", " ", text).strip()
+        # Collapse whitespace (XML indentation included) inside each line and
+        # keep only explicit <hp:lineBreak/> breaks, so "제5조(휴가)" / "① …" /
+        # "② …" written with Shift+Enter stay on separate lines.
+        lines = [re.sub(r"\s+", " ", part).strip() for part in text.split(self.LINE_BREAK_SENTINEL)]
+        return "\n".join(line for line in lines if line)
 
     def _clean_table_text(self, text: str) -> str:
         lines = []

@@ -53,6 +53,85 @@ class HwpxParserTests(unittest.TestCase):
         self.assertEqual(parsed.raw_text.count("Article One"), 1)
         self.assertEqual(parsed.raw_text.count("Header A"), 1)
 
+    def test_inline_spaces_and_line_breaks_are_not_glued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "inline.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                "<hp:p><hp:run><hp:t>제5조(휴가)<hp:lineBreak/>① 연차는 15일로 한다.<hp:lineBreak/>② 병가는 60일로 한다.</hp:t></hp:run></hp:p>"
+                "<hp:p><hp:run><hp:t>이<hp:nbSpace/>규정은<hp:fwSpace/>공포한<hp:tab/>날부터 시행한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_inline")
+
+        texts = [block.text for block in parsed.pages[0].blocks]
+        self.assertEqual(
+            ["제5조(휴가)\n① 연차는 15일로 한다.\n② 병가는 60일로 한다.", "이 규정은 공포한 날부터 시행한다."],
+            texts,
+        )
+        nodes = StructureDetector().detect(parsed)
+        self.assertEqual(
+            [("article", "제5조"), ("paragraph", "①"), ("paragraph", "②")],
+            [(node.node_type, node.number) for node in nodes if node.node_type in {"article", "paragraph"}],
+        )
+
+    def test_xml_indentation_does_not_become_a_line_break(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "indented.hwpx"
+            self._write_hwpx(
+                path,
+                """
+                <root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+                  <hp:p>
+                    <hp:run><hp:t>제1조(목적)</hp:t></hp:run>
+                    <hp:run><hp:t>이 규정은 복무를 정한다.</hp:t></hp:run>
+                  </hp:p>
+                </root>
+                """,
+            )
+
+            parsed = HwpxParser().parse(path, "doc_indented")
+
+        self.assertEqual(["제1조(목적) 이 규정은 복무를 정한다."], [block.text for block in parsed.pages[0].blocks])
+
+    def test_running_header_and_footer_text_is_not_glued_to_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header-footer.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                "<hp:p><hp:run><hp:ctrl><hp:header id=\"1\"><hp:subList><hp:p><hp:run><hp:t>가상공단 복무규정</hp:t></hp:run></hp:p>"
+                "</hp:subList></hp:header></hp:ctrl><hp:ctrl><hp:footer id=\"2\"><hp:subList><hp:p><hp:run><hp:t>대외비</hp:t></hp:run></hp:p>"
+                "</hp:subList></hp:footer></hp:ctrl></hp:run><hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_header_footer")
+
+        self.assertEqual(["제1조(목적) 직원의 복무를 정한다."], [block.text for block in parsed.pages[0].blocks])
+        nodes = StructureDetector().detect(parsed)
+        self.assertEqual(["제1조"], [node.number for node in nodes if node.node_type == "article"])
+
+    def test_cell_span_child_element_marks_merged_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cell-span.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                "<hp:p><hp:run><hp:tbl>"
+                "<hp:tr><hp:tc><hp:cellSpan colSpan=\"2\" rowSpan=\"1\"/><hp:subList><hp:p><hp:run><hp:t>구분</hp:t></hp:run></hp:p></hp:subList></hp:tc></hp:tr>"
+                "<hp:tr><hp:tc><hp:cellSpan colSpan=\"1\" rowSpan=\"1\"/><hp:subList><hp:p><hp:run><hp:t>A</hp:t></hp:run></hp:p></hp:subList></hp:tc>"
+                "<hp:tc><hp:cellSpan colSpan=\"1\" rowSpan=\"1\"/><hp:subList><hp:p><hp:run><hp:t>B</hp:t></hp:run></hp:p></hp:subList></hp:tc></hp:tr>"
+                "</hp:tbl></hp:run></hp:p></root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_cell_span")
+
+        table = next(block for block in parsed.pages[0].blocks if block.type == "table")
+        self.assertEqual(1, table.metadata["hwpx_merged_cell_count"])
+
     def test_extracts_table_embedded_inside_paragraph_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "embedded-table.hwpx"
