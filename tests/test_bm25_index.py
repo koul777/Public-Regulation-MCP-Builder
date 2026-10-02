@@ -1152,6 +1152,25 @@ class Bm25IndexTests(unittest.TestCase):
         self.assertEqual(unbatched, batched)
         self.assertTrue(batched["documents"])
 
+    def test_bm25_build_uses_batched_kiwi_path_not_per_call_analysis(self) -> None:
+        from app.retrieval import tokenizer as tokenizer_module
+
+        records = [
+            _record("tenant-a:doc:c1", "제1조(목적) 이 규정은 직원의 복무에 관한 사항을 정한다.", article_title="목적"),
+            _record("tenant-a:doc:c2", "제12조(휴직) ① 직원이 질병으로 휴직을 신청하면 승인한다.", article_title="휴직"),
+            _record("tenant-a:doc:c3", "제12조(휴직) ② 육아휴직 수당은 별표 1에 따른다.", article_title="휴직"),
+        ]
+
+        with patch.object(
+            tokenizer_module,
+            "_kiwi_tokens",
+            wraps=tokenizer_module._kiwi_tokens,
+        ) as mock_kiwi_tokens:
+            Bm25Index.build(records)
+            # All Kiwi analysis should go through the batch; _kiwi_tokens should
+            # not be called for individual texts
+            self.assertEqual(0, mock_kiwi_tokens.call_count)
+
 
 def _record(
     record_id: str,

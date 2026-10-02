@@ -129,6 +129,35 @@ class RetrievalTokenizerTests(unittest.TestCase):
         with preloaded_kiwi_tokens([text]):
             self.assertEqual(expected, tokenize(text, tokenizer_model=FALLBACK_TOKENIZER_MODEL))
 
+    def test_preloaded_tokens_bypass_kiwi_per_call_analysis(self) -> None:
+        from app.retrieval import tokenizer as tokenizer_module
+
+        texts = [
+            "제12조(휴직) ① 직원이 질병으로 휴직을 신청하면",
+            "육아휴직 신청 절차와 수당 지급",
+            unicodedata.normalize("NFD", "병가를 사용한 직원"),
+        ]
+
+        with preloaded_kiwi_tokens(texts):
+            with patch.object(
+                tokenizer_module,
+                "_kiwi_tokens",
+                wraps=tokenizer_module._kiwi_tokens,
+            ) as mock_kiwi_tokens:
+                # Call tokenize for each preloaded text
+                for text in texts:
+                    tokenize(text, tokenizer_model=TOKENIZER_MODEL)
+                # _kiwi_tokens should not have been called for preloaded texts
+                self.assertEqual(0, mock_kiwi_tokens.call_count)
+
+                # Call tokenize on a text NOT in the preloaded list
+                tokenize(
+                    "이 문장은 사전로드되지 않았다",
+                    tokenizer_model=TOKENIZER_MODEL,
+                )
+                # Now _kiwi_tokens should have been called once
+                self.assertEqual(1, mock_kiwi_tokens.call_count)
+
 
 if __name__ == "__main__":
     unittest.main()
