@@ -83,7 +83,10 @@ class TextNormalizer:
                 ]
                 if not filtered_lines:
                     continue
-                text = self.repair_line_breaks("\n".join(filtered_lines))
+                joined = "\n".join(filtered_lines)
+                # 표 블록의 줄바꿈은 행 경계다. 문장 줄바꿈 복구를 적용하면 "다."로 끝나지
+                # 않는 행이 모두 한 줄로 합쳐져 셀이 "금액 가족수당"처럼 섞이고 표 판정도 잃는다.
+                text = joined if block.type == "table" else self.repair_line_breaks(joined)
                 blocks.append(block.model_copy(update={"text": text}))
                 raw_parts.append(text)
             pages.append(page.model_copy(update={"blocks": blocks}))
