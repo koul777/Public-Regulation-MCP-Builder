@@ -137,5 +137,75 @@ class DocxParserTests(unittest.TestCase):
                          [block.text for block in parsed.pages[0].blocks])
 
 
+@unittest.skipUnless(DOCX_AVAILABLE, "python-docx is not installed")
+class DocxWrappedRunTextTests(unittest.TestCase):
+    """변경 추적·스마트 태그·필드 안의 글자를 빠뜨리지 않는다."""
+
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+    def _parse(self, paragraphs: list[str], *, table_cell: str | None = None) -> list[str]:
+        from docx import Document
+        from docx.oxml import parse_xml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wrapped.docx"
+            doc = Document()
+            body = doc.element.body
+            for inner in paragraphs:
+                body.insert(len(body) - 1, parse_xml(f"<w:p {self.W}>{inner}</w:p>"))
+            if table_cell is not None:
+                table = doc.add_table(rows=1, cols=2)
+                table.cell(0, 0).text = "구분"
+                cell_p = table.cell(0, 1)._tc.p_lst[0]
+                cell_p.getparent().replace(cell_p, parse_xml(f"<w:p {self.W}>{table_cell}</w:p>"))
+            doc.save(path)
+            parsed = DocxParser().parse(path, "doc_wrapped")
+        return [block.text for block in parsed.pages[0].blocks]
+
+    def test_tracked_insertions_are_kept_and_deletions_dropped(self) -> None:
+        texts = self._parse(
+            [
+                '<w:r><w:t xml:space="preserve">① 연차는 </w:t></w:r>'
+                '<w:ins w:id="1" w:author="a"><w:r><w:t xml:space="preserve">20일로 </w:t></w:r></w:ins>'
+                '<w:del w:id="2" w:author="a"><w:r><w:delText xml:space="preserve">15일로 </w:delText></w:r></w:del>'
+                "<w:r><w:t>한다.</w:t></w:r>",
+                '<w:ins w:id="3" w:author="a"><w:r><w:t>제3조(특별휴가) 별도로 정한다.</w:t></w:r></w:ins>',
+                '<w:moveFrom w:id="4" w:author="a"><w:r><w:t>옮겨 간 문장</w:t></w:r></w:moveFrom>'
+                '<w:r><w:t>제5조(남는 문장) 그대로 둔다.</w:t></w:r>',
+            ]
+        )
+
+        self.assertEqual(
+            ["① 연차는 20일로 한다.", "제3조(특별휴가) 별도로 정한다.", "제5조(남는 문장) 그대로 둔다."],
+            texts,
+        )
+
+    def test_smart_tag_field_and_inline_content_control_text_is_kept(self) -> None:
+        texts = self._parse(
+            [
+                '<w:r><w:t>제4조(인용) 「</w:t></w:r><w:smartTag w:uri="x" w:element="y"><w:r><w:t>근로기준법</w:t></w:r></w:smartTag>'
+                "<w:r><w:t>」에 따른다.</w:t></w:r>",
+                '<w:r><w:t xml:space="preserve">신청은 </w:t></w:r><w:fldSimple w:instr="REF x"><w:r><w:t>별지 제1호 서식</w:t></w:r></w:fldSimple>'
+                "<w:r><w:t>에 따른다.</w:t></w:r>",
+                '<w:r><w:t xml:space="preserve">담당 부서는 </w:t></w:r><w:sdt><w:sdtContent><w:r><w:t>인사팀</w:t></w:r></w:sdtContent></w:sdt>'
+                "<w:r><w:t>이다.</w:t></w:r>",
+            ]
+        )
+
+        self.assertEqual(
+            ["제4조(인용) 「근로기준법」에 따른다.", "신청은 별지 제1호 서식에 따른다.", "담당 부서는 인사팀이다."],
+            texts,
+        )
+
+    def test_tracked_insertion_inside_a_table_cell_is_kept(self) -> None:
+        texts = self._parse(
+            ["<w:r><w:t>제6조(수당) 수당은 다음과 같다.</w:t></w:r>"],
+            table_cell='<w:r><w:t xml:space="preserve">월 </w:t></w:r>'
+            '<w:ins w:id="5" w:author="a"><w:r><w:t>4만원</w:t></w:r></w:ins>',
+        )
+
+        self.assertEqual(["제6조(수당) 수당은 다음과 같다.", "구분 | 월 4만원"], texts)
+
+
 if __name__ == "__main__":
     unittest.main()

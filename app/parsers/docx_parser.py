@@ -27,7 +27,6 @@ class DocxParser(BaseParser):
             from docx.oxml.table import CT_Tbl
             from docx.oxml.text.paragraph import CT_P
             from docx.table import Table
-            from docx.text.paragraph import Paragraph
         except ImportError as exc:
             raise ParserError("DOCX parsing requires python-docx. Install package 'python-docx'.") from exc
 
@@ -52,8 +51,7 @@ class DocxParser(BaseParser):
 
         for child in self._body_items(doc.element.body):
             if isinstance(child, CT_P):
-                paragraph = Paragraph(child, doc)
-                text = paragraph.text.strip()
+                text = self._paragraph_text(child).strip()
                 if text:
                     blocks.append(ParsedBlock(text=text))
                     raw_parts.append(text)
@@ -179,16 +177,32 @@ class DocxParser(BaseParser):
 
     def _cell_content(self, cell: Any) -> str:
         from docx.table import Table
-        from docx.text.paragraph import Paragraph
         parts = []
         for child in self._body_items(cell._tc):
             if child.tag.rsplit("}", 1)[-1] == "tbl":
                 text = self._table_text(Table(child, cell))
             else:
-                text = Paragraph(child, cell).text
+                text = self._paragraph_text(child)
             if text.strip():
                 parts.append(text.strip())
         return "\n".join(parts)
+
+    # Runs Word shows with tracked changes accepted: inserted text (w:ins),
+    # smart tags, simple fields and inline content controls are kept; deleted
+    # or moved-away text is not, and text boxes stay out as before.
+    _VISIBLE_RUN_XPATH = (
+        ".//w:r[not(ancestor::w:del) and not(ancestor::w:moveFrom) and not(ancestor::w:txbxContent)]"
+    )
+
+    def _paragraph_text(self, paragraph: Any) -> str:
+        """Return a paragraph's visible text, including runs nested in wrappers.
+
+        python-docx ``Paragraph.text`` joins only direct ``w:r``/``w:hyperlink``
+        children, so text inside ``w:ins``, ``w:smartTag``, ``w:fldSimple`` or an
+        inline ``w:sdt`` was silently dropped.
+        """
+
+        return "".join(run.text for run in paragraph.xpath(self._VISIBLE_RUN_XPATH))
 
     def _table_text(self, table: Any) -> str:
         from docx.table import _Cell
