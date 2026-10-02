@@ -47,8 +47,18 @@ class Validator:
                         "원문에서 누락된 조문 또는 PDF 추출 순서를 확인하세요.",
                     )
                 )
-            previous_by_parent[parent_key] = current
+            previous_by_parent[parent_key] = max(current, self._deleted_range_end_number(node) or current)
         return issues
+
+    def _deleted_range_end_number(self, node: StructureNode) -> int | None:
+        """"제5조부터 제7조까지 삭제" 한 노드가 제7조까지 차지한다고 본다."""
+
+        if node.metadata.get("lifecycle") != "deleted":
+            return None
+        deleted_range = node.metadata.get("deleted_article_range")
+        if not isinstance(deleted_range, dict):
+            return None
+        return self._article_number(str(deleted_range.get("end") or ""))
 
     def _mixed_article_order_parents(self, nodes: list[StructureNode]) -> set[str]:
         sequences: dict[str, list[int]] = {}

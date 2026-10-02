@@ -26,6 +26,40 @@ class ValidatorTests(unittest.TestCase):
 
         self.assertTrue(any(issue.issue_type == "article_sequence_gap" for issue in issues))
 
+    def test_range_deleted_articles_do_not_report_sequence_gap(self) -> None:
+        text = "제4조(목적) 내용\n제5조부터 제7조까지 삭제 <2020. 1. 1.>\n제8조(시행) 내용"
+        parsed = ParsedDocument(
+            document_id="doc_range_deleted",
+            source_file="range.md",
+            document_name="가상규정",
+            file_type="text",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+        nodes = StructureDetector().detect(parsed)
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+        issues = Validator().validate(nodes, chunks, parsed.document_id)
+
+        self.assertFalse(any(issue.issue_type == "article_sequence_gap" for issue in issues))
+
+    def test_range_deletion_does_not_hide_gap_after_its_end(self) -> None:
+        text = "제4조(목적) 내용\n제5조 내지 제7조 삭제\n제9조(시행) 내용"
+        parsed = ParsedDocument(
+            document_id="doc_range_deleted_gap",
+            source_file="range-gap.md",
+            document_name="가상규정",
+            file_type="text",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            raw_text=text,
+        )
+        nodes = StructureDetector().detect(parsed)
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+        issues = Validator().validate(nodes, chunks, parsed.document_id)
+
+        gaps = [issue for issue in issues if issue.issue_type == "article_sequence_gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("제9조", gaps[0].message)
+
     def test_suppresses_expected_amendment_sequence_gap(self) -> None:
         text = "\n".join(
             [
