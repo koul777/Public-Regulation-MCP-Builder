@@ -118,31 +118,10 @@ class Chunker:
         options: ChunkOptions | None = None,
         regulation_progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> list[Chunk]:
-        extractor = self.table_extractor
-        if not hasattr(extractor, "explicit_row_boundaries"):
-            return self._build_chunks(nodes, parsed, options, regulation_progress_callback)
-        previous = extractor.explicit_row_boundaries
-        extractor.explicit_row_boundaries = self._parser_writes_one_table_row_per_line(parsed)
-        try:
-            return self._build_chunks(nodes, parsed, options, regulation_progress_callback)
-        finally:
-            extractor.explicit_row_boundaries = previous
-
-    @staticmethod
-    def _parser_writes_one_table_row_per_line(parsed: ParsedDocument) -> bool:
-        file_type = str(parsed.file_type or "").strip().lower().lstrip(".")
-        if not file_type:
-            file_type = Path(str(parsed.source_file or "")).suffix.lower().lstrip(".")
-        return file_type in {"docx", "hwpx"}
-
-    def _build_chunks(
-        self,
-        nodes: list[StructureNode],
-        parsed: ParsedDocument,
-        options: ChunkOptions | None = None,
-        regulation_progress_callback: Callable[[int, int, str], None] | None = None,
-    ) -> list[Chunk]:
         options = options or ChunkOptions()
+        # Decided once per build and passed down as an argument, never stored on
+        # the shared extractor, so concurrent builds cannot interfere.
+        explicit_row_boundaries = self._parser_writes_one_table_row_per_line(parsed)
         lookup = {node.node_id: node for node in nodes}
         children_by_parent = self._children_by_parent(nodes)
         regulation_nodes = [node for node in nodes if node.node_type == "regulation"]
@@ -234,7 +213,13 @@ class Chunker:
                 metadata["part_count"] = len(parts)
                 metadata.update(self._entity_trace_metadata(working_node, text))
                 chunk_type = self._chunk_type(working_node)
-                metadata.update(self._table_metadata(text, chunk_type))
+                metadata.update(
+                    self._table_metadata(
+                        text,
+                        chunk_type,
+                        explicit_row_boundaries=explicit_row_boundaries,
+                    )
+                )
                 metadata.update(self._table_context_from_hierarchy(metadata))
                 metadata.update(
                     self.metadata_extractor.extract(
@@ -818,8 +803,30 @@ class Chunker:
             records.append({"row_index": row.get("row_index"), "record": record})
         return records
 
-    def _table_metadata(self, text: str, chunk_type: str) -> dict:
-        analysis = self.table_extractor.analyze_text(text, chunk_type)
+    @staticmethod
+    def _parser_writes_one_table_row_per_line(parsed: ParsedDocument) -> bool:
+        """DOCX/HWPX parsers write one physical table row per line.
+
+        For those formats a line break inside a ``table`` block is a real row
+        boundary, so the extractor must not merge rows as wrapped cells.
+        """
+        file_type = str(parsed.file_type or "").strip().lower().lstrip(".")
+        if not file_type:
+            file_type = Path(str(parsed.source_file or "")).suffix.lower().lstrip(".")
+        return file_type in {"docx", "hwpx"}
+
+    def _table_metadata(
+        self,
+        text: str,
+        chunk_type: str,
+        *,
+        explicit_row_boundaries: bool = False,
+    ) -> dict:
+        analysis = self.table_extractor.analyze_text(
+            text,
+            chunk_type,
+            explicit_row_boundaries=explicit_row_boundaries,
+        )
         if not analysis.get("table_like") and chunk_type != "table":
             metadata = {
                 "table_like": False,

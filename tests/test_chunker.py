@@ -3027,15 +3027,26 @@ class ChunkerTablePromotionKeepsProseTests(unittest.TestCase):
 
 
 class ChunkerExplicitTableRowsTests(unittest.TestCase):
-    """DOCX/HWPX 표는 한 줄이 곧 한 행이므로 줄 이어붙이기(wrapped cell) 병합을 하지 않는다."""
+    """DOCX/HWPX 표 블록은 한 줄이 곧 한 행이므로 줄 이어붙이기(wrapped cell) 병합을 하지 않는다.
+
+    같은 형식이라도 표 블록이 아닌 본문 줄로 배치한 별표(appendix)는 PDF와 같은 텍스트 추출
+    표이므로 기존 병합과 `wrapped_cell_merge` 검수 플래그를 유지한다.
+    """
 
     TABLE = (
         "구분 | 합성 처리 기준\n"
         "일반 휴가 | 신청서 제출 후 담당자 확인\n"
         "긴급 휴가 | 담당자에게 먼저 알린 뒤 신청서 보완"
     )
+    APPENDIX_LINES = [
+        "제1조(휴가) 휴가 처리 기준은 별표 1과 같다.",
+        "[별표 1] 휴가 처리 기준",
+        "구분 | 합성 처리 기준",
+        "일반 휴가 | 신청서 제출 후 담당자 확인",
+        "긴급 휴가 | 담당자에게 먼저 알린 뒤 신청서 보완",
+    ]
 
-    def _table_chunk(self, file_type: str) -> Chunk:
+    def _table_chunk(self, file_type: str, chunker: Chunker | None = None) -> Chunk:
         text = "제1조(휴가) 휴가 처리 기준은 다음 표와 같다.\n" + self.TABLE
         parsed = ParsedDocument(
             document_id="doc_rows",
@@ -3053,8 +3064,31 @@ class ChunkerExplicitTableRowsTests(unittest.TestCase):
             raw_text=text,
         )
         nodes = StructureDetector().detect(parsed)
-        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+        chunks = (chunker or Chunker()).build_chunks(
+            nodes, parsed, ChunkOptions(include_context_header=False)
+        )
         return next(chunk for chunk in chunks if chunk.chunk_type == "table")
+
+    def _appendix_text_chunk(self, file_type: str) -> Chunk:
+        parsed = ParsedDocument(
+            document_id="doc_appendix_rows",
+            source_file=f"appendix_rows.{file_type}",
+            file_type=file_type,
+            pages=[
+                ParsedPage(
+                    page_no=1,
+                    blocks=[ParsedBlock(type="text", text=line) for line in self.APPENDIX_LINES],
+                )
+            ],
+            raw_text="\n".join(self.APPENDIX_LINES),
+        )
+        nodes = StructureDetector().detect(parsed)
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+        return next(chunk for chunk in chunks if chunk.chunk_type == "appendix")
+
+    @staticmethod
+    def _flags(chunk: Chunk) -> list[str]:
+        return list(chunk.metadata.get("table_review_flags") or [])
 
     def test_docx_table_rows_are_not_merged_as_wrapped_cells(self) -> None:
         chunk = self._table_chunk("docx")
@@ -3063,28 +3097,52 @@ class ChunkerExplicitTableRowsTests(unittest.TestCase):
         self.assertEqual(3, len(rows))
         self.assertIn(["일반 휴가", "신청서 제출 후 담당자 확인"], rows)
         self.assertIn(["긴급 휴가", "담당자에게 먼저 알린 뒤 신청서 보완"], rows)
-        self.assertNotIn("wrapped_cell_merge", chunk.metadata.get("table_review_flags") or [])
+        self.assertNotIn("wrapped_cell_merge", self._flags(chunk))
 
     def test_hwpx_table_rows_are_not_merged_as_wrapped_cells(self) -> None:
         chunk = self._table_chunk("hwpx")
 
-        self.assertNotIn("wrapped_cell_merge", chunk.metadata.get("table_review_flags") or [])
+        self.assertEqual(3, len(chunk.metadata["table_cell_rows"]))
+        self.assertNotIn("wrapped_cell_merge", self._flags(chunk))
 
     def test_text_extracted_pdf_table_still_merges_wrapped_cells(self) -> None:
         chunk = self._table_chunk("pdf")
 
-        self.assertIn("wrapped_cell_merge", chunk.metadata.get("table_review_flags") or [])
+        self.assertEqual(2, len(chunk.metadata["table_cell_rows"]))
+        self.assertIn("wrapped_cell_merge", self._flags(chunk))
 
-    def test_row_boundary_mode_is_reset_after_building(self) -> None:
+    def test_docx_appendix_laid_out_as_text_still_merges_and_flags(self) -> None:
+        # 별표를 표 블록이 아닌 본문 줄로 배치한 DOCX는 PDF와 같은 텍스트 추출 표다.
+        chunk = self._appendix_text_chunk("docx")
+
+        self.assertEqual("appendix", chunk.chunk_type)
+        self.assertEqual(2, len(chunk.metadata["table_cell_rows"]))
+        self.assertIn("wrapped_cell_merge", self._flags(chunk))
+
+    def test_hwpx_appendix_laid_out_as_text_still_merges_and_flags(self) -> None:
+        chunk = self._appendix_text_chunk("hwpx")
+
+        self.assertEqual("appendix", chunk.chunk_type)
+        self.assertIn("wrapped_cell_merge", self._flags(chunk))
+
+    def test_row_boundary_choice_is_per_build_on_a_shared_chunker(self) -> None:
         chunker = Chunker()
-        parsed = ParsedDocument(
-            document_id="doc_reset", source_file="reset.docx", file_type="docx",
-            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(type="table", text=self.TABLE)])],
-            raw_text=self.TABLE,
-        )
-        chunker.build_chunks(StructureDetector().detect(parsed), parsed)
 
-        self.assertFalse(chunker.table_extractor.explicit_row_boundaries)
+        first_docx = self._table_chunk("docx", chunker)
+        pdf = self._table_chunk("pdf", chunker)
+        second_docx = self._table_chunk("docx", chunker)
+
+        self.assertNotIn("wrapped_cell_merge", self._flags(first_docx))
+        self.assertIn("wrapped_cell_merge", self._flags(pdf))
+        self.assertNotIn("wrapped_cell_merge", self._flags(second_docx))
+
+    def test_docx_build_leaves_shared_extractor_with_default_merging(self) -> None:
+        chunker = Chunker()
+        self._table_chunk("docx", chunker)
+
+        analysis = chunker.table_extractor.analyze_text(self.TABLE, "table")
+
+        self.assertIn("wrapped_cell_merge", analysis["table_review_flags"])
 
 
 if __name__ == "__main__":
