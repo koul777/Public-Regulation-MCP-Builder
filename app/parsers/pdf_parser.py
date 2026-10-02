@@ -494,22 +494,36 @@ class PDFParser(BaseParser):
     def _visual_char_groups(self, page, *, raw_dict: dict | None = None) -> list[list[dict]]:
         raw = raw_dict if raw_dict is not None else page.get_text("rawdict")
         chars: list[dict] = []
+        # 공백 glyph 자체는 문자 목록에 넣지 않는다. 다만 PDF가 실제로 인코딩한
+        # 공백(PyMuPDF가 추론한 synthetic 공백 제외)이 직전 glyph 바로 뒤에 붙어
+        # 있으면, 그 공백의 시작 x 좌표를 직전 문자에 "space_after_x0" 근거로 남긴다.
+        # 이 근거는 문자 dict와 함께 그룹화·정렬을 그대로 따라가며, 좁은 공백
+        # glyph(예: 1/3 em CJK 공백)가 간격 휴리스틱 기준보다 좁아도 단어 공백을
+        # 복원하는 데만 쓰인다.
+        previous_entry: dict | None = None
         for block in raw.get("blocks", []):
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     for char in span.get("chars", []):
                         value = str(char.get("c") or "")
-                        if not value or not value.strip():
+                        if not value:
+                            continue
+                        if not value.strip():
+                            if previous_entry is not None and char.get("synthetic") is False:
+                                self._record_space_after(
+                                    previous_entry,
+                                    char.get("bbox", (0, 0, 0, 0)),
+                                    size=float(span.get("size") or 0),
+                                )
                             continue
                         bbox = tuple(float(part) for part in char.get("bbox", (0, 0, 0, 0)))
-                        chars.append(
-                            {
-                                "c": value,
-                                "bbox": bbox,
-                                "size": float(span.get("size") or 0),
-                                "font": span.get("font"),
-                            }
-                        )
+                        previous_entry = {
+                            "c": value,
+                            "bbox": bbox,
+                            "size": float(span.get("size") or 0),
+                            "font": span.get("font"),
+                        }
+                        chars.append(previous_entry)
         chars.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
         groups: list[list[dict]] = []
         # chars는 y 좌표로 먼저 정렬되어 있으므로 각 그룹에 추가되는 y 값도 오름차순이다.
@@ -543,6 +557,32 @@ class PDFParser(BaseParser):
             )
         )
         return [group for group, _y_values in grouped_with_y]
+
+    @staticmethod
+    def _record_space_after(previous_entry: dict, space_bbox, *, size: float) -> None:
+        """Attach an encoded whitespace glyph to the glyph it directly follows.
+
+        Only the first adjacent whitespace glyph counts. A glyph that starts far
+        from the previous glyph's right edge or whose vertical center lies
+        outside the previous glyph is stream-order noise (out-of-order drawing,
+        another line or text object) and is not treated as word-space evidence.
+        """
+
+        if "space_after_x0" in previous_entry:
+            return
+        try:
+            sx0, sy0, sx1, sy1 = (float(part) for part in space_bbox)
+        except (TypeError, ValueError):
+            return
+        if sx1 < sx0:
+            return
+        _px0, py0, px1, py1 = previous_entry["bbox"]
+        reference_size = size or float(previous_entry.get("size") or 0) or 10.0
+        if abs(sx0 - px1) > max(1.0, reference_size * 0.5):
+            return
+        if not py0 <= (sy0 + sy1) / 2.0 <= py1:
+            return
+        previous_entry["space_after_x0"] = sx0
 
     def _visual_line_segments(
         self,
@@ -756,6 +796,7 @@ class PDFParser(BaseParser):
         space_threshold = max(2.8, typical_width * 0.35)
         parts: list[str] = []
         previous_x1: float | None = None
+        previous_space_x: float | None = None
         previous_char = ""
         ordered = chars if already_ordered else sorted(chars, key=lambda value: value["bbox"][0])
         for item in ordered:
@@ -765,10 +806,17 @@ class PDFParser(BaseParser):
             x0, _, x1, _ = item["bbox"]
             if previous_x1 is not None:
                 gap = x0 - previous_x1
-                if gap > space_threshold and not self._suppress_layout_space(previous_char, char):
+                # 간격 휴리스틱은 그대로 두고, 직전 glyph 뒤에 PDF가 인코딩한 공백
+                # glyph가 있고 현재 glyph가 그 공백 시작점 이후에서 시작할 때만 공백 근거를
+                # 추가로 인정한다. 억제 규칙(괄호·구두점·숫자 사이)은 동일하게 적용한다.
+                explicit_space = previous_space_x is not None and x0 >= previous_space_x
+                if (gap > space_threshold or explicit_space) and not self._suppress_layout_space(
+                    previous_char, char
+                ):
                     parts.append(" ")
             parts.append(char)
             previous_x1 = x1
+            previous_space_x = item.get("space_after_x0")
             previous_char = char
         text = "".join(parts)
         text = re.sub(r"\s+", " ", text).strip()
