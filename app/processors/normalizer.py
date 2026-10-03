@@ -15,6 +15,9 @@ from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
 # 쪽마다 화면을 갱신하면 진행 표시 자체가 정리보다 오래 걸린다.
 NORMALIZE_PROGRESS_PAGE_STEP = 20
+# 쪽번호로 보고 지운 줄 수. 본문 숫자를 잘못 지웠을 때 흔적이 남도록 기록한다.
+PAGE_NUMBER_LINES_REMOVED_KEY = "page_number_lines_removed"
+PAGE_NUMBER_EDGES = ("top", "bottom")
 HEADING_PREFIX = re.compile(
     r"^\s*(제\s*\d+\s*(?:편|장|절|관|조)|[①-⑳㉑-㉚]|\(\d+\)|\d+\.|[가-힣][\.\)])"
 )
@@ -58,12 +61,13 @@ class TextNormalizer:
         """
 
         repeated = self._repeated_edge_lines(parsed)
-        page_number_shapes = self._repeated_page_number_shapes(parsed)
+        page_number_patterns = self._repeated_page_number_patterns(parsed)
         pages: list[ParsedPage] = []
         raw_parts: list[str] = []
         removed_chars = 0
         removed_blocks = 0
         boilerplate_chars = 0
+        page_number_lines_removed = 0
         page_total = len(parsed.pages)
         if progress_callback is not None:
             progress_callback(0, page_total)
@@ -77,16 +81,19 @@ class TextNormalizer:
                     removed_chars += block_removed
                     removed_blocks += 1
                 normalized_blocks.append((block, normalized.splitlines()))
-            page_number_lines = self._page_edge_number_positions(normalized_blocks, page_number_shapes)
+            page_number_lines = self._page_edge_number_positions(
+                page_index, normalized_blocks, page_number_patterns
+            )
             for block_index, (block, lines) in enumerate(normalized_blocks):
-                filtered_lines = [
-                    line
-                    for line_index, line in enumerate(lines)
-                    if line.strip()
-                    and line.strip() not in repeated
-                    and not self._looks_like_page_footer(line.strip())
-                    and (block_index, line_index) not in page_number_lines
-                ]
+                filtered_lines: list[str] = []
+                for line_index, line in enumerate(lines):
+                    stripped = line.strip()
+                    if not stripped or stripped in repeated:
+                        continue
+                    if self._looks_like_page_footer(stripped) or (block_index, line_index) in page_number_lines:
+                        page_number_lines_removed += 1
+                        continue
+                    filtered_lines.append(line)
                 if not filtered_lines:
                     continue
                 joined = "\n".join(filtered_lines)
@@ -108,6 +115,7 @@ class TextNormalizer:
             MOJIBAKE_REMOVED_CHARS_KEY: removed_chars,
             MOJIBAKE_REMOVED_BLOCKS_KEY: removed_blocks,
             MOJIBAKE_CLEANED_CHARS_KEY: boilerplate_chars,
+            PAGE_NUMBER_LINES_REMOVED_KEY: page_number_lines_removed,
         }
         return parsed.model_copy(
             update={"pages": pages, "raw_text": "\n".join(raw_parts), "metadata": metadata}
@@ -184,43 +192,74 @@ class TextNormalizer:
             return shape.casefold()
         return None
 
-    def _repeated_page_number_shapes(self, parsed: ParsedDocument) -> set[str]:
-        """Find page-number shapes that sit at page edges on most pages.
+    def _page_number_parts(self, line: str) -> tuple[str, int, int | None] | None:
+        """Split a page-number line into (shape, page number, total pages).
+
+        ``3 / 12`` and ``3 of 12`` give ``(shape, 3, 12)``; single-number
+        shapes give ``(shape, 3, None)``. Anything else gives None.
+        """
+
+        shape = self._page_number_shape(line)
+        if shape is None:
+            return None
+        numbers = [int(value) for value in re.findall(r"\d+", line)]
+        if not numbers:
+            return None
+        return shape, numbers[0], numbers[1] if len(numbers) > 1 else None
+
+    def _repeated_page_number_patterns(
+        self, parsed: ParsedDocument
+    ) -> dict[tuple[str, str], frozenset[tuple[int, int | None]]]:
+        """Learn page-number patterns separately for the top and bottom page edge.
 
         Page numbers change on every page, so exact repetition cannot catch
-        them. A shape counts only when it appears at the first or last line of
-        at least half of the pages (minimum three) with at least two different
-        numbers, so a lone "1/2" or "(2)" inside a page is never removed.
+        them. A pattern is keyed by (edge, digit-free shape) and holds the
+        (offset, total) pairs it was learned with, where offset is the printed
+        number minus the page's position in the document (numbering may start
+        at any value) and total is the ``M`` of ``N / M`` or ``N of M``.
+
+        A pair is learned only when it occurs on the same edge of at least half
+        of the pages (minimum three). So a number has to track the page to be
+        treated as a page number: a table cell "20" or a carried-over "30" at a
+        page edge does not match the page's expected number and is kept, and a
+        pattern seen only at page bottoms never removes a top line.
         """
 
         if len(parsed.pages) < 3:
-            return set()
-        pages_by_shape: Counter[str] = Counter()
-        values_by_shape: dict[str, set[str]] = {}
-        for page in parsed.pages:
+            return {}
+        observed: dict[tuple[str, str], Counter[tuple[int, int | None]]] = {}
+        for page_index, page in enumerate(parsed.pages, start=1):
             lines = [line.strip() for block in page.blocks for line in block.text.splitlines() if line.strip()]
-            page_shapes: set[str] = set()
-            for line in dict.fromkeys([*lines[:1], *lines[-1:]]):
-                shape = self._page_number_shape(line)
-                if shape:
-                    page_shapes.add(shape)
-                    values_by_shape.setdefault(shape, set()).add(re.sub(r"\s+", "", line))
-            pages_by_shape.update(page_shapes)
+            if not lines:
+                continue
+            for edge, line in zip(PAGE_NUMBER_EDGES, (lines[0], lines[-1])):
+                parts = self._page_number_parts(line)
+                if parts is None:
+                    continue
+                shape, number, total = parts
+                observed.setdefault((edge, shape), Counter())[(number - page_index, total)] += 1
         threshold = max(3, len(parsed.pages) // 2)
-        return {
-            shape
-            for shape, count in pages_by_shape.items()
-            if count >= threshold and len(values_by_shape.get(shape, ())) >= 2
-        }
+        patterns: dict[tuple[str, str], frozenset[tuple[int, int | None]]] = {}
+        for key, counts in observed.items():
+            learned = frozenset(pair for pair, count in counts.items() if count >= threshold)
+            if learned:
+                patterns[key] = learned
+        return patterns
 
     def _page_edge_number_positions(
         self,
+        page_index: int,
         normalized_blocks: list[tuple[ParsedBlock, list[str]]],
-        shapes: set[str],
+        patterns: dict[tuple[str, str], frozenset[tuple[int, int | None]]],
     ) -> set[tuple[int, int]]:
-        """Return (block, line) positions of page-number lines at this page's edges."""
+        """Return (block, line) positions of this page's edge lines that are its page number.
 
-        if not shapes:
+        The first line is checked only against top-edge patterns and the last
+        line only against bottom-edge patterns, and the number must equal
+        ``page_index + offset`` (with the same total) for a learned pair.
+        """
+
+        if not patterns:
             return set()
         positions = [
             (block_index, line_index)
@@ -228,9 +267,14 @@ class TextNormalizer:
             for line_index, line in enumerate(lines)
             if line.strip()
         ]
-        edges = dict.fromkeys([*positions[:1], *positions[-1:]])
-        return {
-            (block_index, line_index)
-            for block_index, line_index in edges
-            if self._page_number_shape(normalized_blocks[block_index][1][line_index]) in shapes
-        }
+        if not positions:
+            return set()
+        found: set[tuple[int, int]] = set()
+        for edge, (block_index, line_index) in zip(PAGE_NUMBER_EDGES, (positions[0], positions[-1])):
+            parts = self._page_number_parts(normalized_blocks[block_index][1][line_index])
+            if parts is None:
+                continue
+            shape, number, total = parts
+            if (number - page_index, total) in patterns.get((edge, shape), frozenset()):
+                found.add((block_index, line_index))
+        return found

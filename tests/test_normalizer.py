@@ -11,6 +11,9 @@ from app.processors.mojibake import (
 from app.processors.normalizer import TextNormalizer
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 
+# 하류 품질 검사가 읽는 메타데이터 키 이름 자체를 고정한다.
+PAGE_NUMBER_LINES_REMOVED_KEY = "page_number_lines_removed"
+
 
 class TextNormalizerTests(unittest.TestCase):
     def test_removes_pdf_control_characters(self) -> None:
@@ -252,6 +255,83 @@ class NormalizerPageNumberFooterTests(unittest.TestCase):
         )
 
         self.assertEqual(1, sum(1 for line in lines if "(2)" in line))
+
+    def test_table_cell_number_at_page_edge_is_kept_when_it_does_not_track_the_page(self) -> None:
+        # 7쪽은 추출 순서가 바뀌어 쪽번호 "7"이 맨 위로 가고, 마지막 줄이 표 칸 "20"이다.
+        pages = [[f"제{page}조(조문) 본문 {page}.", str(page)] for page in range(1, 11)]
+        pages[6] = ["7", "제7조(배점) 배점은 다음과 같다.", "구분 배점", "20"]
+
+        lines = self._normalized_lines(pages)
+
+        self.assertIn("20", lines)
+        self.assertFalse([line for line in lines if line in {"1", "2", "3", "4", "5", "6", "8", "9", "10"}])
+
+    def test_carried_over_number_at_page_top_is_kept_while_real_footers_are_removed(self) -> None:
+        pages = [[f"제{page}조(조문) 본문 {page}.", str(page)] for page in range(1, 6)]
+        # 3쪽 첫 줄 "30"은 앞쪽 표에서 넘어온 일수다. 마지막 줄 "3"이 진짜 쪽번호다.
+        pages[2] = ["30", "제3조(휴가) 연차는 위 일수로 한다.", "3"]
+
+        lines = self._normalized_lines(pages)
+
+        self.assertIn("30", lines)
+        self.assertFalse([line for line in lines if line in {"1", "2", "3", "4", "5"}])
+
+    def test_page_numbers_that_start_at_an_offset_are_removed_but_mismatched_numbers_are_kept(self) -> None:
+        # 별책 일부라 1쪽이 "5"로 시작한다. 3쪽은 쪽번호가 추출되지 않았고,
+        # 마지막 줄 "3"은 쪽 위치와 같지만 배운 쪽번호(3+4=7)가 아니라 표 칸이다.
+        pages = [[f"제{page}조(조문) 본문 {page}.", str(page + 4)] for page in range(1, 6)]
+        pages[2] = ["제3조(점수) 점수는 다음과 같다.", "등급 점수", "3"]
+
+        lines = self._normalized_lines(pages)
+
+        self.assertFalse([line for line in lines if line in {"5", "6", "8", "9"}])
+        self.assertIn("3", lines)
+
+    def test_top_edge_page_numbers_are_removed_without_touching_bottom_numbers(self) -> None:
+        pages = [[str(page), f"제{page}조(조문) 본문 {page}.", f"정원 {page}0명"] for page in range(1, 5)]
+        # 쪽번호는 위쪽에만 있다. 2쪽 마지막 줄 "2"는 표 칸이고, 아래쪽에서는
+        # 쪽번호를 배운 적이 없으므로 숫자가 쪽 위치와 같아도 남는다.
+        pages[1] = ["2", "제2조(정원) 정원은 다음과 같다.", "구분 인원", "2"]
+
+        normalized = TextNormalizer().normalize_document(self._pdf(pages))
+        page_lines = [[line for block in page.blocks for line in block.text.splitlines()] for page in normalized.pages]
+
+        self.assertEqual(["제2조(정원) 정원은 다음과 같다.", "구분 인원", "2"], page_lines[1])
+        for page_no in (1, 3, 4):
+            self.assertEqual([f"제{page_no}조(조문) 본문 {page_no}.", f"정원 {page_no}0명"], page_lines[page_no - 1])
+        self.assertEqual(4, normalized.metadata[PAGE_NUMBER_LINES_REMOVED_KEY])
+
+    def test_slash_total_must_match_the_learned_page_count(self) -> None:
+        # 3쪽 마지막 줄 "3 / 10"은 출석 비율이다. 쪽번호는 "N / 4"로 배웠으므로 남는다.
+        lines = self._normalized_lines(
+            [
+                ["제1조(목적) 이 규정은 목적을 정한다.", "1 / 4"],
+                ["제2조(정의) 용어의 뜻은 다음과 같다.", "2 / 4"],
+                ["제3조(출석) 출석 비율은 다음과 같다.", "3 / 10"],
+                ["제4조(시행) 공포한 날부터 시행한다.", "4 / 4"],
+            ]
+        )
+
+        self.assertIn("3 / 10", lines)
+        self.assertFalse([line for line in lines if line.endswith(" / 4")])
+
+    def test_removed_page_number_line_count_is_recorded(self) -> None:
+        document = self._pdf(
+            [
+                ["제1조(목적) 이 규정은 목적을 정한다.", "1 / 3"],
+                ["제2조(정의) 용어의 뜻은 다음과 같다.", "- 9 -", "2 / 3"],
+                ["제3조(적용) 모든 직원에게 적용한다.", "3 / 3"],
+            ]
+        )
+        document.metadata = {"parser": "pdf"}
+
+        normalized = TextNormalizer().normalize_document(document)
+
+        self.assertEqual(4, normalized.metadata[PAGE_NUMBER_LINES_REMOVED_KEY])
+        self.assertEqual("pdf", normalized.metadata["parser"])
+        self.assertEqual(0, normalized.metadata[MOJIBAKE_REMOVED_CHARS_KEY])
+        clean = TextNormalizer().normalize_document(self._pdf([["제1조(목적) 이 규정은 목적을 정한다."]]))
+        self.assertEqual(0, clean.metadata[PAGE_NUMBER_LINES_REMOVED_KEY])
 
 
 class NormalizerMojibakeCleanupTests(unittest.TestCase):
