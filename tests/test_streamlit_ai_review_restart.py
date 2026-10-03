@@ -167,3 +167,57 @@ class BeginnerBulkFinishChoiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AIReviewNotRunLabelTests(unittest.TestCase):
+    """AI를 켜기 전에 전처리한 규정을 '대상 아님'으로 뭉뚱그리지 않는다."""
+
+    def _ready(self) -> Settings:
+        return Settings(enable_agent_review=True, llm_provider="openai", agent_review_model="gpt-4.1-mini", openai_api_key="k")
+
+    def test_not_requested_run_with_ai_now_ready_asks_to_reprocess(self) -> None:
+        from frontend import streamlit_app
+
+        label = streamlit_app._ai_review_not_run_label(
+            {"status": "skipped", "skip_reason": "agent_review_not_requested", "request_enabled": False},
+            settings_snapshot=self._ready(),
+        )
+        self.assertIn("켜기 전에 전처리", label)
+        self.assertIn("다시 전처리", label)
+
+    def test_not_requested_run_with_ai_still_off_points_to_the_switch(self) -> None:
+        from frontend import streamlit_app
+
+        label = streamlit_app._ai_review_not_run_label(
+            {"status": "skipped", "skip_reason": "agent_review_not_requested", "request_enabled": False},
+            settings_snapshot=Settings(enable_agent_review=False),
+        )
+        self.assertIn("AI 검수 없이 전처리", label)
+
+    def test_chunk_outside_executed_review_keeps_out_of_scope_label(self) -> None:
+        from frontend import streamlit_app
+
+        label = streamlit_app._ai_review_not_run_label(
+            {"status": "executed", "request_enabled": True, "selected_candidates": [{"chunk_id": "a"}]},
+            settings_snapshot=self._ready(),
+        )
+        self.assertEqual(streamlit_app.AI_REVIEW_OUT_OF_SCOPE_LABEL, label)
+
+    def test_configuration_needed_is_named(self) -> None:
+        from frontend import streamlit_app
+
+        label = streamlit_app._ai_review_not_run_label(
+            {"status": "api_configuration_needed", "skip_reason": "openai_api_key_missing", "request_enabled": True},
+            settings_snapshot=self._ready(),
+        )
+        self.assertIn("API 키", label)
+
+    def test_work_table_marks_unreviewed_rows_for_reprocessing(self) -> None:
+        from app.schemas.chunk import Chunk
+        from frontend import streamlit_app
+
+        chunk = Chunk(chunk_id="c1", document_id="d", chunk_type="article", text="합성", metadata={"regulation_title": "합성 규정"})
+        rows = streamlit_app._ai_review_work_rows(
+            [chunk], {"status": "skipped", "skip_reason": "agent_review_not_requested", "request_enabled": False}
+        )
+        self.assertIn("다시 전처리", rows[0]["AI 작업 상태"])
