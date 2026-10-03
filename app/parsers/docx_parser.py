@@ -75,23 +75,41 @@ class DocxParser(BaseParser):
             )
         )]
         metadata["docx_complex_table_count"] = len(complex_tables)
-        if unparsed_parts or complex_tables:
-            flags = (["docx_unparsed_parts"] if unparsed_parts else []) + (
-                ["docx_complex_table_layout"] if complex_tables else []
-            )
+        tracked_changes = self._tracked_change_counts(doc.element.body)
+        if tracked_changes:
+            metadata["docx_tracked_change_counts"] = tracked_changes
+        if unparsed_parts or complex_tables or tracked_changes:
+            flags: list[str] = []
+            recommendations: list[str] = []
+            hints: list[str] = []
+            if unparsed_parts:
+                flags.append("docx_unparsed_parts")
+                recommendations.append("review_missing_docx_parts")
+                hints.append(
+                    "Review DOCX parts not included in body order extraction before approval: "
+                    + ", ".join(unparsed_parts) + "."
+                )
+            if complex_tables:
+                flags.append("docx_complex_table_layout")
+                recommendations.append("review_docx_table_layout")
+                hints.append("Compare merged and nested table cell relationships with the original document.")
+            if tracked_changes:
+                flags.append("docx_tracked_changes_present")
+                recommendations.append("review_docx_tracked_changes")
+                counts = ", ".join(f"{name}={count}" for name, count in tracked_changes.items())
+                hints.append(
+                    "The DOCX has pending tracked changes (" + counts + "); extracted text follows Word's "
+                    "accepted view (inserted text kept, deleted or moved-away text dropped). Accept or reject "
+                    "the changes in Word, or compare the text with the original, before approval."
+                )
             metadata.update(
                 parser_uncertainty_metadata(
                     source="docx",
                     risk_level="medium",
                     flags=flags,
                     confidence=0.72,
-                    recommendation="review_missing_docx_parts" if unparsed_parts else "review_docx_table_layout",
-                    remediation_hint=(
-                        ("Review DOCX parts not included in body order extraction before approval: "
-                         + ", ".join(unparsed_parts) + ". " if unparsed_parts else "")
-                        + ("Compare merged and nested table cell relationships with the original document."
-                           if complex_tables else "")
-                    ),
+                    recommendation=recommendations[0],
+                    remediation_hint=" ".join(hints),
                 )
             )
         else:
@@ -189,10 +207,18 @@ class DocxParser(BaseParser):
 
     # Runs Word shows with tracked changes accepted: inserted text (w:ins),
     # smart tags, simple fields and inline content controls are kept; deleted
-    # or moved-away text is not, and text boxes stay out as before.
+    # or moved-away text is not, and text boxes stay out as before. Two more
+    # exclusions avoid double or foreign text: the mc:Fallback branch of
+    # mc:AlternateContent (a duplicate of the mc:Choice content; matched with
+    # local-name()/namespace-uri() because python-docx's nsmap has no mc prefix)
+    # and w:rt (ruby annotations; the ruby base text in w:rubyBase is kept).
+    _MC_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
     _VISIBLE_RUN_XPATH = (
-        ".//w:r[not(ancestor::w:del) and not(ancestor::w:moveFrom) and not(ancestor::w:txbxContent)]"
+        ".//w:r[not(ancestor::w:del) and not(ancestor::w:moveFrom) and not(ancestor::w:txbxContent)"
+        " and not(ancestor::w:rt)"
+        f" and not(ancestor::*[local-name()='Fallback' and namespace-uri()='{_MC_NAMESPACE}'])]"
     )
+    _TRACKED_CHANGE_TAGS = ("ins", "del", "moveFrom", "moveTo")
 
     def _paragraph_text(self, paragraph: Any) -> str:
         """Return a paragraph's visible text, including runs nested in wrappers.
@@ -203,6 +229,19 @@ class DocxParser(BaseParser):
         """
 
         return "".join(run.text for run in paragraph.xpath(self._VISIBLE_RUN_XPATH))
+
+    def _tracked_change_counts(self, body: Any) -> dict[str, int]:
+        """Count pending tracked changes in the body (empty when there are none).
+
+        Text-bearing wrappers (w:ins, w:del, w:moveFrom, w:moveTo) and their
+        paragraph-mark or table-row counterparts under w:rPr/w:trPr all count:
+        any of them means the indexed text depends on accepting the changes.
+        """
+
+        counts = {
+            tag: len(body.xpath(f".//w:{tag}")) for tag in self._TRACKED_CHANGE_TAGS
+        }
+        return counts if any(counts.values()) else {}
 
     def _table_text(self, table: Any) -> str:
         from docx.table import _Cell
