@@ -129,14 +129,41 @@ def local_hash_embedding(text: str, *, dimensions: int = 384) -> list[float]:
     if not tokens:
         tokens = [text]
     for token in tokens:
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % dimensions
-        sign = -1.0 if digest[4] & 1 else 1.0
+        if len(token) <= _TOKEN_BUCKET_CACHE_MAX_CHARS:
+            index, sign = _cached_token_bucket(token, dimensions)
+        else:
+            index, sign = _token_bucket(token, dimensions)
         vector[index] += sign
     norm = math.sqrt(sum(value * value for value in vector))
     if norm:
         vector = [round(value / norm, 8) for value in vector]
     return vector
+
+
+def _token_bucket(token: str, dimensions: int) -> tuple[int, float]:
+    """Return the (index, sign) one token contributes to a local hash embedding.
+
+    This is a pure function of ``token`` and ``dimensions``. Only this per-token
+    SHA-256 step is memoized; callers still recompute the full vector from the
+    record text, so integrity checks keep detecting tampered text or vectors.
+    """
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:4], "big") % dimensions
+    sign = -1.0 if digest[4] & 1 else 1.0
+    return index, sign
+
+
+# Integrity validation recomputes local_hash_embedding for every stored row on
+# each indexing run and cold search, and regulation vocabulary repeats heavily.
+# 65,536 entries holds a typical institution's whole token vocabulary for one
+# dimension count. Only tokens of at most 64 characters are cached, so a full
+# cache (entry, key tuple and retained token string) measures ~18 MiB for
+# typical Korean tokens and ~34 MiB in the worst case (64 astral-plane
+# characters per token). Longer tokens, such as a long whole-text fallback for
+# text without word characters, are hashed directly and never retained.
+_TOKEN_BUCKET_CACHE_SIZE = 65_536
+_TOKEN_BUCKET_CACHE_MAX_CHARS = 64
+_cached_token_bucket = lru_cache(maxsize=_TOKEN_BUCKET_CACHE_SIZE)(_token_bucket)
 
 
 @lru_cache(maxsize=4)
