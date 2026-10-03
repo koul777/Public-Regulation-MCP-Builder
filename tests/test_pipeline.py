@@ -29,6 +29,18 @@ class PipelineTests(unittest.TestCase):
             {"pipeline_version"},
         )
 
+    def test_october_parser_fixes_cannot_reuse_the_september_processing_identity(self) -> None:
+        # Table rows, HWPX spacing/line breaks, DOCX tracked/auto-numbered text,
+        # PDF spaces and footers, and structure fixes all change parse output.
+        # A re-upload must be reprocessed instead of reusing the old run.
+        options = ChunkOptions(enable_agent_review=False)
+        current = processing_options_payload(options)
+        with patch("app.core.pipeline.PREPROCESSOR_PIPELINE_VERSION", "2026.09.29-docx-cell-and-article-boundaries-3"):
+            previous = processing_options_payload(options)
+
+        self.assertNotEqual(previous["pipeline_version"], current["pipeline_version"])
+        self.assertNotEqual(previous, current)
+
     def test_processing_options_payload_includes_pipeline_version(self) -> None:
         payload = processing_options_payload(ChunkOptions(max_chunk_chars=1200, enable_agent_review=False))
 
