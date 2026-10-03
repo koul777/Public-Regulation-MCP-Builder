@@ -1009,9 +1009,12 @@ AI_REVIEW_FAMILY_LABELS = {
     "row_quality_flags": ("표 내용 확인", "중간", "표의 칸과 줄이 원래 문서와 같은지 확인하세요."),
     "review_flags": ("변환 결과 확인", "중간", "원래 문서와 비교해 빠지거나 바뀐 내용이 없는지 확인하세요."),
     "quality_flags": ("변환 결과 확인", "중간", "원래 문서와 비교해 빠지거나 바뀐 내용이 없는지 확인하세요."),
-    "parser_uncertainty_risk_level": ("자동 변환이 불확실한 부분", "높음", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
-    "parser_uncertainty_flags": ("자동 변환이 불확실한 부분", "높음", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
-    "parser_uncertainty_recommendation": ("자동 변환이 불확실한 부분", "높음", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
+    # Severity of the parser_uncertainty_* families follows the actual risk value
+    # (see _approval_review_reason_label); "중간" is only the fallback when the
+    # risk is unknown, because these reasons are never raised below medium.
+    "parser_uncertainty_risk_level": ("자동 변환이 불확실한 부분", "중간", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
+    "parser_uncertainty_flags": ("자동 변환이 불확실한 부분", "중간", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
+    "parser_uncertainty_recommendation": ("자동 변환이 불확실한 부분", "중간", "원래 문서와 비교해 빠지거나, 합쳐지거나, 잘못 나뉜 곳이 없는지 확인하세요."),
     "warning": ("변환 경고 확인", "중간", "변환 중 경고가 있었어요. 원래 문서와 비교해 내용이 맞는지 확인하세요."),
     "source_page_unavailable_reason": ("원래 위치 확인", "중간", "이 내용이 원래 문서의 어디에 있는지 직접 찾아 확인하세요."),
     "review_required": ("사람 확인 필요", "중간", "자동 변환만으로는 확신할 수 없어요. 원래 문서와 비교해 확인하세요."),
@@ -1021,19 +1024,142 @@ AI_REVIEW_FAMILY_LABELS = {
 AI_REVIEW_DEFAULT_LABEL = ("검수 항목 확인", "중간", "원래 문서와 비교해 이 내용이 맞는지 확인하세요.")
 
 
-def _approval_review_reason_label(reason: str) -> tuple[str, str, str]:
-    """Return plain (title, severity, suggestion) wording for one review reason code."""
+AI_REVIEW_RISK_SEVERITY = {"low": "낮음", "medium": "중간", "high": "높음", "critical": "높음"}
+AI_REVIEW_RISK_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+# One plain line per reason source. It is shown only when several items of a
+# chunk share a title, to say what makes this item different from the others.
+AI_REVIEW_DEFAULT_HINT = "다른 점검 단계에서 따로 표시된 항목이에요."
+AI_REVIEW_FAMILY_HINTS = {
+    "table_review_flags": "표 전체를 점검하다 나온 표시예요.",
+    "row_quality_flags": "표의 줄을 하나씩 점검하다 나온 표시예요.",
+    "review_flags": "변환 결과 점검에서 나온 표시예요.",
+    "quality_flags": "변환 품질 점검에서 나온 표시예요.",
+    "parser_uncertainty_risk_level": "자동 변환이 얼마나 불확실한지 알려 주는 표시예요.",
+    "parser_uncertainty_flags": "자동 변환기가 불확실하다고 꼽은 이유 중 하나예요.",
+    "parser_uncertainty_recommendation": "자동 변환기가 권하는 조치를 알려 주는 표시예요.",
+    "warning": "변환 중 나온 경고 한 건이에요.",
+    "source_page_unavailable_reason": "이 내용이 원래 문서의 몇 쪽인지 알 수 없다는 표시예요.",
+    "review_required": "변환기가 '검토 필요'라고 표시한 항목이에요.",
+    "manual_review_required": "'직접 확인 필요'라는 이름의 표시예요.",
+    "requires_manual_review": "'직접 확인 요구'라는 이름의 별도 표시예요. 뜻은 비슷해요.",
+    "table_extraction_failed": "표 추출 단계에서 실패 가능성이 따로 표시됐어요.",
+}
+AI_REVIEW_FLAG_HINTS = {
+    "probable_extraction_failed": "표 점검 단계에서 '추출 실패 가능'으로 표시됐어요.",
+    "probable_table_extraction_failed": "표 분류 단계에서 '추출 실패 가능'으로 판정됐어요.",
+    "raw_table_like_rows_without_cell_rows": "표처럼 보이는 줄이 있는데 칸이 만들어지지 않았어요.",
+    "compact_table_signals_without_cell_rows": "짧게 줄여 쓴 표 흔적이 있는데 칸이 만들어지지 않았어요.",
+}
+# Most specific topic first: "table_caption_split" is a caption problem.
+AI_REVIEW_WARNING_TOPICS = (
+    ("caption", "표·그림 제목"),
+    ("footnote", "각주"),
+    ("endnote", "미주"),
+    ("appendix", "별표"),
+    ("image", "그림"),
+    ("ocr", "스캔 글자 인식"),
+    ("mojibake", "깨진 글자"),
+    ("encoding", "깨진 글자"),
+    ("table", "표"),
+    ("row", "표 줄"),
+)
+
+
+def _approval_risk_level(value: object) -> str:
+    risk = str(value or "").strip().lower()
+    return risk if risk in AI_REVIEW_RISK_RANK else ""
+
+
+def _approval_parser_uncertainty_risk(chunk: object, reasons: list[str]) -> str:
+    """Return the highest known parser-uncertainty risk of one chunk, or "" if unknown."""
+
+    found = [
+        _approval_risk_level(value)
+        for family, _, value in (str(reason).partition(":") for reason in reasons)
+        if family.strip() == "parser_uncertainty_risk_level"
+    ]
+    metadata = getattr(chunk, "metadata", None) or {}
+    nested = metadata.get("parser_uncertainty")
+    found.append(
+        _approval_risk_level(
+            metadata.get("parser_uncertainty_risk_level")
+            or (nested.get("risk_level") if isinstance(nested, dict) else "")
+        )
+    )
+    return max((risk for risk in found if risk), key=AI_REVIEW_RISK_RANK.__getitem__, default="")
+
+
+def _approval_review_reason_label(reason: str, *, parser_uncertainty_risk: str = "") -> tuple[str, str, str]:
+    """Return plain (title, severity, suggestion) wording for one review reason code.
+
+    ``parser_uncertainty_risk`` is the chunk's risk level (low/medium/high/critical).
+    ``parser_uncertainty_risk_level:<value>`` reads its own value instead.
+    """
 
     code = str(reason or "").strip()
     if code in AI_REVIEW_REASON_LABELS:
         return AI_REVIEW_REASON_LABELS[code]
     family, _, flag = code.partition(":")
+    family = family.strip()
     flag = flag.strip()
     if flag in AI_REVIEW_FLAG_LABELS:
-        return AI_REVIEW_FLAG_LABELS[flag]
-    if flag in AI_REVIEW_REASON_LABELS:
-        return AI_REVIEW_REASON_LABELS[flag]
-    return AI_REVIEW_FAMILY_LABELS.get(family.strip(), AI_REVIEW_DEFAULT_LABEL)
+        label = AI_REVIEW_FLAG_LABELS[flag]
+    elif flag in AI_REVIEW_REASON_LABELS:
+        label = AI_REVIEW_REASON_LABELS[flag]
+    else:
+        label = AI_REVIEW_FAMILY_LABELS.get(family, AI_REVIEW_DEFAULT_LABEL)
+    if family.startswith("parser_uncertainty_"):
+        risk = _approval_risk_level(flag if family == "parser_uncertainty_risk_level" else parser_uncertainty_risk)
+        if risk:
+            label = (label[0], AI_REVIEW_RISK_SEVERITY[risk], label[2])
+    return label
+
+
+def _approval_review_reason_hint(reason: str) -> str:
+    """One plain line saying where a review reason came from (not its raw code)."""
+
+    code = str(reason or "").strip()
+    family, _, flag = code.partition(":")
+    family = family.strip()
+    flag = flag.strip()
+    if flag in AI_REVIEW_FLAG_HINTS:
+        return AI_REVIEW_FLAG_HINTS[flag]
+    if family == "warning":
+        lowered = flag.lower()
+        topic = next((label for keyword, label in AI_REVIEW_WARNING_TOPICS if keyword in lowered), "")
+        return f"변환 중 나온 경고 한 건이에요 ({topic} 관련)." if topic else AI_REVIEW_FAMILY_HINTS["warning"]
+    return AI_REVIEW_FAMILY_HINTS.get(family, AI_REVIEW_DEFAULT_HINT)
+
+
+def _approval_number_duplicate_review_titles(items: list[dict[str, object]]) -> None:
+    """Number items that share a title and say what differs, so each stays distinguishable.
+
+    Only display fields (title, hint) change; item ids, reasons and decision
+    keys are never touched.
+    """
+
+    totals: dict[str, int] = {}
+    for item in items:
+        totals[str(item["base_title"])] = totals.get(str(item["base_title"]), 0) + 1
+    seen: dict[str, int] = {}
+    duplicates: dict[str, list[dict[str, object]]] = {}
+    for item in items:
+        base = str(item["base_title"])
+        if totals[base] < 2:
+            continue
+        seen[base] = seen.get(base, 0) + 1
+        item["title"] = f"{base} ({seen[base]}/{totals[base]})"
+        item["hint"] = _approval_review_reason_hint(str(item["reason"]))
+        duplicates.setdefault(base, []).append(item)
+    for group in duplicates.values():
+        hint_counts: dict[str, int] = {}
+        for item in group:
+            hint_counts[str(item["hint"])] = hint_counts.get(str(item["hint"]), 0) + 1
+        for item in group:
+            if hint_counts[str(item["hint"])] > 1:
+                # Same source, so only the raw value tells them apart.
+                item["hint"] = f"{item['hint']} 서로 다른 점은 '자세히 보기'에서 볼 수 있어요."
 
 
 def _approval_tab_badge(confirmed: bool) -> str:
@@ -1136,18 +1262,25 @@ def _approval_ai_review_items(chunk, review_reasons: list[str], agent_review_sum
         candidate_reasons = ["chunk_warnings"]
 
     items: list[dict[str, object]] = []
-    for index, reason in enumerate(dict.fromkeys(candidate_reasons), start=1):
-        title, severity, suggestion = _approval_review_reason_label(reason)
+    unique_reasons = list(dict.fromkeys(candidate_reasons))
+    uncertainty_risk = _approval_parser_uncertainty_risk(chunk, unique_reasons)
+    for index, reason in enumerate(unique_reasons, start=1):
+        title, severity, suggestion = _approval_review_reason_label(
+            reason, parser_uncertainty_risk=uncertainty_risk
+        )
         items.append(
             {
                 "item_id": f"{chunk.chunk_id}:{reason}:{index}",
                 "reason": reason,
                 "title": title,
+                "base_title": title,
+                "hint": "",
                 "severity": severity,
                 "location": f"{chunk.chunk_id} · {_approval_chunk_location(chunk)}",
                 "suggestion": suggestion,
             }
         )
+    _approval_number_duplicate_review_titles(items)
     return items
 
 
@@ -10698,12 +10831,17 @@ def _render_approval_chunk_confirmation_controls(
         for item in review_items:
             item_id = str(item["item_id"])
             decision = ai_decisions.get(item_id, "")
-            # Beginners see plain wording only; the code stays visible to experts.
-            st.caption(
-                f"{item['severity']} · {item['title']} — {item['suggestion']}"
-                if focused
-                else f"{item['severity']} · {item['title']} — {item['suggestion']} (코드: {item['reason']})"
-            )
+            if focused:
+                # Beginners get plain wording on the main line; the raw code is
+                # one click away so no detail is hidden from them.
+                st.caption(f"{item['severity']} · {item['title']} — {item['suggestion']}")
+                if item.get("hint"):
+                    st.caption(f"구분: {item['hint']}")
+                with st.expander("자세히 보기 · 기술 정보", expanded=False):
+                    st.caption("자동 검수가 남긴 코드 그대로예요. 담당자에게 물어볼 때 알려 주세요.")
+                    st.code(str(item["reason"]), language="text")
+            else:
+                st.caption(f"{item['severity']} · {item['title']} — {item['suggestion']} (코드: {item['reason']})")
             reflect_button_key, skip_button_key = _approval_ai_decision_control_keys(item_id)
             decision_group_key = _approval_chunk_state_key(document_id, chunk_id, f"decision-{item_id}")
             decision_guide = st.empty()
