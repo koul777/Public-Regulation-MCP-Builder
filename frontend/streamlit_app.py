@@ -1688,6 +1688,11 @@ PENDING_UPLOAD_CACHE_KEY = "pending_upload_file_cache_v1"
 PENDING_UPLOAD_CACHE_MAX_ENTRIES = 128
 # 규정 이름을 올린 파일 이름에서 가져올지, 본문에서 찾은 제목에서 가져올지.
 PREPROCESS_DOCUMENT_NAME_MODE_KEY = "preprocess-document-name-mode"
+PREPROCESS_DETECTED_INFO_KEY = "preprocess-detected-regulation-info"
+# Streamlit's own uploader texts are not localizable and differ by version
+# ("Browse files" before 1.4x, "Upload" now). Name both so the Korean guide
+# matches whichever button the installed Streamlit actually draws.
+UPLOADER_BUTTON_LABELS = "'Upload' 또는 'Browse files'"
 SELECTED_APPROVAL_CONTEXT_CACHE_KEY = "selected_approval_context_cache"
 SELECTED_APPROVAL_CONTEXT_CACHE_MAX_ENTRIES = 4
 # 디렉터리에서 명시적으로 연 규정 1개만 상세 렌더링한다(전체 규정 동시 렌더링 방지).
@@ -2947,8 +2952,14 @@ def _render_beginner_action_marker(
     prerequisite: bool = False,
     control_key_prefix: str = "",
     control_keys: tuple[str, ...] = (),
+    context_keys: tuple[str, ...] = (),
 ) -> None:
-    """Render an accessible server-side marker next to an existing control."""
+    """Render an accessible server-side marker next to an existing control.
+
+    ``context_keys`` name keyed containers that are only read, never clicked, for
+    this step. The tour lights them together with the control so the user can see
+    what they are confirming; they get no click outline of their own.
+    """
 
     if not st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY):
         return
@@ -2985,9 +2996,18 @@ def _render_beginner_action_marker(
     tour_selectors = [f'div[class~="st-key-{key}"]' for key in safe_control_keys]
     if safe_prefix:
         tour_selectors.append(f'div[class*="st-key-{safe_prefix}"]')
+    tour_context_selectors = [
+        f'div[class~="st-key-{key}"]'
+        for key in (
+            _streamlit_key_css_fragment(context_key)
+            for context_key in context_keys
+            if str(context_key or "").strip()
+        )
+    ]
     tour_attributes = marker_attributes(
         title, description, selectors=tour_selectors, step=int(step), substep=int(substep),
         presentation="inline" if int(step) == 3 else "spotlight",
+        context_selectors=tour_context_selectors,
     )
     # Optional tooling stays discoverable in its own expander, while the tour
     # leads fast preprocessing directly to the upload action.
@@ -4423,6 +4443,25 @@ def _find_reusable_preprocessing_run(
 
 def _format_upload_mb(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):,.1f}MB"
+
+
+def _detected_value_label(value: object, source: str, *, revision_source: str = "") -> str:
+    """Mark an auto-detected date/version that was not read from the document.
+
+    Display only. ``infer_regulation_metadata`` fills a missing date with the
+    upload day (the effective date then copies it) and a missing version with a
+    sequence number. The table must not present those fallbacks as recognized
+    values, but the cell stays short because three such columns share one row.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return "문서에서 찾지 못함"
+    fallback = (
+        source in {"upload_date", "sequence"}
+        or (source == "revision_date" and revision_source == "upload_date")
+    )
+    return f"{text} · 임시 입력" if fallback else text
 
 
 def _format_elapsed_seconds(seconds: float) -> str:
@@ -8898,7 +8937,8 @@ def _page_preprocess() -> None:
         _render_beginner_action_marker(
             1,
             "먼저 규정 파일을 선택하세요",
-            "바로 아래 영역에 PDF·HWP·HWPX·DOCX 파일을 끌어놓거나 파일 찾기를 누르세요.",
+            "바로 아래 영역에 PDF·HWP·HWPX·DOCX 파일을 끌어놓거나, "
+            f"영역 안의 영어 버튼({UPLOADER_BUTTON_LABELS})을 눌러 파일을 고르세요.",
             control_key_prefix="regulation_document_upload",
             substep=3,
         )
@@ -8907,14 +8947,21 @@ def _page_preprocess() -> None:
         type=["pdf", "docx", "hwpx", "hwp"],
         accept_multiple_files=True,
         key="regulation_document_upload",
-        help="PDF, HWP, HWPX, DOCX 파일을 이 영역으로 드래그하거나 Browse files 버튼으로 선택하세요.",
+        help=(
+            "PDF, HWP, HWPX, DOCX 파일을 이 영역으로 드래그하거나 "
+            f"영역 안의 영어 버튼({UPLOADER_BUTTON_LABELS})으로 선택하세요."
+        ),
     )
     uploaded_files = sorted(
         _uploaded_file_list(uploaded),
         key=lambda item: regulation_upload_sort_key(str(item.name)),
     )
     selected_upload_bytes = sum(_uploaded_file_size(uploaded_file) for uploaded_file in uploaded_files)
-    st.caption("PDF·HWP·HWPX·DOCX를 여러 개 함께 선택할 수 있습니다.")
+    st.caption(
+        "PDF·HWP·HWPX·DOCX를 여러 개 함께 선택할 수 있습니다. "
+        f"영역 안의 영어 문구는 화면 기본 표시이며, {UPLOADER_BUTTON_LABELS} 버튼이 파일 선택 버튼입니다. "
+        "'per file'은 파일 1개당 올릴 수 있는 최대 용량입니다."
+    )
     if uploaded_files:
         st.caption(f"선택된 파일: {len(uploaded_files)}개, 총 {_format_upload_mb(selected_upload_bytes)}")
         _render_selected_upload_files(uploaded_files)
@@ -9181,6 +9228,7 @@ def _page_preprocess() -> None:
                 st.rerun()
     if upload_sources:
         detected_rows = []
+        detected_date_fallback = False
         for source in upload_sources:
             detected = infer_regulation_metadata(
                 str(source["filename"]),
@@ -9193,14 +9241,39 @@ def _page_preprocess() -> None:
                     "파일": str(source["filename"]),
                     "인식한 규정명": detected.document_name,
                     "규정 식별자": detected.regulation_id,
-                    "버전": detected.regulation_version,
-                    "개정일": detected.revision_date,
-                    "시행일": detected.effective_from,
+                    # Only a sequence-number fallback needs a note; a version read from
+                    # the file name or text is shown as before.
+                    "버전": _detected_value_label(
+                        detected.regulation_version,
+                        "sequence" if detected.version_source == "sequence" else "",
+                    ),
+                    "개정일": _detected_value_label(
+                        detected.revision_date, detected.revision_date_source,
+                    ),
+                    "시행일": _detected_value_label(
+                        detected.effective_from,
+                        detected.effective_from_source,
+                        revision_source=detected.revision_date_source,
+                    ),
                     "이전 승인본": detected.supersedes_document_id or "신규",
                 }
             )
-        st.markdown("#### 자동 인식한 규정 정보")
-        st.dataframe(detected_rows, width="stretch", hide_index=True)
+            # A missing revision date is the only way the upload day is used; the
+            # effective date then copies it, so one flag covers both columns.
+            detected_date_fallback = (
+                detected_date_fallback or detected.revision_date_source == "upload_date"
+            )
+        # The beginner tour lights this keyed block next to the confirmation
+        # checkbox, so the user can read what they are asked to confirm.
+        with st.container(key=PREPROCESS_DETECTED_INFO_KEY):
+            st.markdown("#### 자동 인식한 규정 정보")
+            st.dataframe(detected_rows, width="stretch", hide_index=True)
+            if detected_date_fallback:
+                st.info(
+                    "'임시 입력'이 붙은 값은 문서에서 찾지 못해 오늘 날짜(버전은 순번)를 대신 넣은 것입니다. "
+                    "전처리 때 본문에서 날짜를 찾으면 그 값으로 바뀌고, 못 찾으면 이 값이 저장됩니다. "
+                    "다르면 아래 '자동 인식값을 직접 수정'에서 고치세요."
+                )
         st.caption(
             "파일별로 규정명·버전·날짜를 자동 인식합니다. 전처리할 때 본문의 개정일·시행일도 다시 확인하며, "
             "같은 규정의 승인된 이전 버전이 있으면 자동으로 개정 관계를 연결합니다."
@@ -9363,6 +9436,7 @@ def _page_preprocess() -> None:
                 "자동 인식한 규정 정보를 확인하세요",
                 "파일명·규정명·버전·날짜가 맞는지 보고, 틀리면 직접 수정한 뒤 아래 확인란을 선택하세요.",
                 control_key_prefix=BEGINNER_GUIDE_PREPROCESS_INFO_CONFIRMED_KEY,
+                context_keys=(PREPROCESS_DETECTED_INFO_KEY,),
                 substep=4,
             )
         info_confirmed = st.checkbox(

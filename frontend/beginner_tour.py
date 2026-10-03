@@ -23,10 +23,19 @@ def marker_attributes(
     step: int,
     substep: int,
     presentation: str = "spotlight",
+    context_selectors: list[str] | None = None,
 ) -> str:
-    """Serialize trusted widget selectors and escaped copy into a DOM marker."""
+    """Serialize trusted widget selectors and escaped copy into a DOM marker.
+
+    ``context_selectors`` name read-only regions the user must look at while the
+    primary control is highlighted (for example the table being confirmed). The
+    controller lights them in the same spotlight but never points the user at
+    them as the action target.
+    """
     data = {"title": title, "description": description, "selectors": selectors,
             "step": step, "substep": substep}
+    if context_selectors:
+        data["context"] = list(context_selectors)
     if presentation == "inline":
         data["presentation"] = "inline"
     payload = json.dumps(data, ensure_ascii=False)

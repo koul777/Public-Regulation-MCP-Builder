@@ -34,13 +34,28 @@
   const card = find(".rr-tour-card");
   const shades = [...root.querySelectorAll(".rr-tour-shade")];
   const ring = find(".rr-tour-ring");
+  const rings = [ring];
   const dock = find(".rr-tour-dock");
+  // Read-only regions lit together with the target (e.g. the table being confirmed).
+  let companions = [];
   let active = null, target = null, slide = 0, opened = false, disposed = false;
   let frame = 0, scanTimer = 0, lastFocus = null, suspended = false;
   let chatInput = null;
   const inline = () => slide === 2 && active?.presentation === "inline";
   const visible = element => !!element && element.getClientRects().length > 0
     && win.getComputedStyle(element).visibility !== "hidden";
+  // Optional context regions are never the action target. A missing or hidden one
+  // is skipped, so a changed page degrades to the single-target spotlight.
+  const contextElements = marker => {
+    const found = [];
+    for (const selector of marker.context || []) {
+      let elements = [];
+      try {elements = [...doc.querySelectorAll(selector)];} catch (_) {continue;}
+      const element = elements.find(visible);
+      if (element) found.push(element);
+    }
+    return found;
+  };
   const resolve = marker => {
     for (const selector of marker.selectors || []) {
       let elements = [];
@@ -57,15 +72,15 @@
           if (parent.tagName==="DETAILS" && !parent.open) closed.push(parent);
         }
         const summary=closed.at(-1)?.querySelector("summary");
-        if (visible(summary)) return {target:summary, reveal:true};
-        if (visible(element)) return {target:element, reveal:false};
+        if (visible(summary)) return {target:summary, reveal:true, extras:[]};
+        if (visible(element)) return {target:element, reveal:false, extras:contextElements(marker)};
       }
     }
     return null;
   };
   const identity = marker => marker ? JSON.stringify([
     config.page, marker.step, marker.substep, marker.title, marker.selectors, marker.presentation,
-    marker.resolved.reveal,
+    marker.resolved.reveal, marker.context || [],
   ]) : "";
   const box = (element, left, top, width, height) => Object.assign(element.style, {
     left: left + "px", top: top + "px", width: Math.max(0, width) + "px", height: Math.max(0, height) + "px"
@@ -82,33 +97,79 @@
     dock.style.bottom = rect && rect.top < win.innerHeight && rect.bottom > 0
       ? Math.max(12, win.innerHeight - rect.top + 12) + "px" : "";
   };
+  const pooled = (pool, index, className) => {
+    while (pool.length <= index) {
+      const element = doc.createElement("div");
+      element.className = className; element.hidden = true; root.append(element); pool.push(element);
+    }
+    return pool[index];
+  };
+  // The dimmed area is the viewport minus every lit region, cut into horizontal
+  // bands. One region gives the familiar four rectangles; extra regions add more.
+  const dimRects = (w, h, holes) => {
+    const edges = [...new Set([0, h, ...holes.flatMap(hole => [hole.top, hole.bottom])])].sort((a, b) => a - b);
+    const out = [];
+    for (let i = 0; i < edges.length - 1; i++) {
+      const top = edges[i], bottom = edges[i + 1];
+      if (bottom <= top) continue;
+      let x = 0;
+      for (const hole of holes.filter(item => item.top < bottom && item.bottom > top).sort((a, b) => a.left - b.left)) {
+        if (hole.left > x) out.push([x, top, hole.left - x, bottom - top]);
+        x = Math.max(x, hole.right);
+      }
+      if (x < w) out.push([x, top, w - x, bottom - top]);
+    }
+    return out;
+  };
   const place = () => {
     frame = 0;
     if (disposed) return;
     placeDock();
     if (!opened) return;
     if (inline()) {
-      shades.forEach(element => {element.hidden = true;}); ring.hidden = true;
+      shades.forEach(element => {element.hidden = true;}); rings.forEach(element => {element.hidden = true;});
       return;
     }
     const w = win.innerWidth, h = win.innerHeight;
     const rect = visible(target) ? target.getBoundingClientRect() : null;
     const gap = 8;
-    const r = rect ? {left:Math.max(4, rect.left-gap), top:Math.max(4,rect.top-gap),
-      right:Math.min(w-4,rect.right+gap), bottom:Math.min(h-4,rect.bottom+gap)} : null;
-    shades.forEach(element => {element.hidden = false;});
-    ring.hidden = !r;
-    if (r && r.bottom > r.top && r.right > r.left) {
-      box(shades[0],0,0,w,r.top); box(shades[1],0,r.bottom,w,h-r.bottom);
-      box(shades[2],0,r.top,r.left,r.bottom-r.top); box(shades[3],r.right,r.top,w-r.right,r.bottom-r.top);
-      box(ring,r.left,r.top,r.right-r.left,r.bottom-r.top);
-    } else {box(shades[0],0,0,w,h); shades.slice(1).forEach(e => {e.hidden=true;}); ring.hidden=true;}
+    const around = box => ({left:Math.floor(Math.max(4, box.left-gap)), top:Math.floor(Math.max(4,box.top-gap)),
+      right:Math.ceil(Math.min(w-4,box.right+gap)), bottom:Math.ceil(Math.min(h-4,box.bottom+gap))});
+    const r = rect ? around(rect) : null;
+    const usable = box => box.bottom > box.top && box.right > box.left;
+    // Context regions only count while they are on screen; they never replace the target.
+    const extra = r && usable(r) ? companions.filter(visible)
+      .map(element => around(element.getBoundingClientRect())).filter(usable) : [];
+    const lit = r && usable(r) ? [r, ...extra] : [];
+    const bands = lit.length ? dimRects(w, h, lit) : [[0, 0, w, h]];
+    bands.forEach((band, index) => {
+      const element = pooled(shades, index, "rr-tour-shade"); element.hidden = false; box(element, ...band);
+    });
+    shades.slice(bands.length).forEach(element => {element.hidden = true;});
+    lit.forEach((hole, index) => {
+      const element = pooled(rings, index, "rr-tour-ring rr-tour-ring-context");
+      element.hidden = false; box(element, hole.left, hole.top, hole.right - hole.left, hole.bottom - hole.top);
+    });
+    rings.slice(lit.length).forEach(element => {element.hidden = true;});
     const cw = card.offsetWidth, ch = card.offsetHeight;
     let x = (w-cw)/2, y = (h-ch)/2;
     if (r) {
       if (w-r.right >= cw+24) {x=r.right+16; y=r.top;}
       else if (r.left >= cw+24) {x=r.left-cw-16; y=r.top;}
       else {x=r.left; y=h-r.bottom >= ch+24 ? r.bottom+16 : r.top-ch-16;}
+      if (extra.length) {
+        // Keep the card off every lit region so nothing being checked is covered.
+        const clampX = value => Math.max(12, Math.min(w-cw-12, value));
+        const clampY = value => Math.max(12, Math.min(h-ch-12, value));
+        const covers = (px, py) => lit.some(hole => clampX(px) < hole.right && clampX(px)+cw > hole.left
+          && clampY(py) < hole.bottom && clampY(py)+ch > hole.top);
+        if (covers(x, y)) {
+          const spots = [[r.right+16, r.top], [r.left-cw-16, r.top], [r.left, r.bottom+16],
+            [r.left, r.top-ch-16], [w-cw-12, r.top], [12, r.top]];
+          const free = spots.find(([px, py]) => !covers(px, py));
+          if (free) [x, y] = free;
+        }
+      }
     }
     card.style.left = Math.max(12,Math.min(w-cw-12,x)) + "px";
     card.style.top = Math.max(12,Math.min(h-ch-12,y)) + "px";
@@ -120,9 +181,27 @@
     resizeObserver.disconnect();
     // Dataframes and other async widgets can move the target without scrolling.
     for (let element=target; element; element=element.parentElement) resizeObserver.observe(element);
+    companions.forEach(element => resizeObserver.observe(element));
+  };
+  const scrollParent = element => {
+    for (let parent=element.parentElement; parent; parent=parent.parentElement) {
+      const overflow = win.getComputedStyle(parent).overflowY;
+      if ((overflow==="auto" || overflow==="scroll") && parent.scrollHeight > parent.clientHeight) return parent;
+    }
+    return doc.scrollingElement;
+  };
+  // Show the target together with its context when both fit on screen.
+  const frameContext = () => {
+    const boxes = [target, ...companions].filter(visible).map(element => element.getBoundingClientRect());
+    if (boxes.length < 2) return;
+    const top = Math.min(...boxes.map(box => box.top)), bottom = Math.max(...boxes.map(box => box.bottom));
+    if (bottom - top > win.innerHeight - 48) return;
+    const shift = (top + bottom) / 2 - win.innerHeight / 2;
+    if (Math.abs(shift) > 1) scrollParent(target)?.scrollBy({top:shift, behavior:"instant"});
   };
   const close = ({pause=false, dismiss=true, restoreFocus=true} = {}) => {
-    opened=false; card.hidden=true; ring.hidden=true; shades.forEach(e=>{e.hidden=true;}); dock.hidden=false;
+    opened=false; card.hidden=true; rings.forEach(e=>{e.hidden=true;}); shades.forEach(e=>{e.hidden=true;}); dock.hidden=false;
+    companions=[];
     root.classList.remove("rr-tour-inline");
     placeDock();
     saved.seen=true; saved.hidden=!!find("input").checked;
@@ -144,6 +223,7 @@
        tip:"밝게 보이는 실제 항목을 누르세요. 완료 상태가 바뀌면 다음 안내가 자동으로 이어집니다.", target:active?.resolved.target || null}
     ];
     const step=steps[slide]; target=step.target;
+    companions = slide===2 && !inline() ? (active?.resolved.extras || []) : [];
     watchLayout();
     find("h2").textContent=step.title; find("#rr-tour-description").textContent=step.description;
     find(".rr-tour-tip").textContent=step.tip;
@@ -162,7 +242,10 @@
     } else if (root.parentElement !== doc.body) doc.body.append(root);
     card.hidden=false; dock.hidden=true; opened=true;
     if (slide===2) {saved.seen=true; saved.openKey=identity(active); saved.dismissedKey=""; persist();}
-    if (focus) (inline() ? card : target)?.scrollIntoView({block:inline() || win.innerWidth<800 ? "start" : "center",behavior:"instant"});
+    if (focus) {
+      (inline() ? card : target)?.scrollIntoView({block:inline() || win.innerWidth<800 ? "start" : "center",behavior:"instant"});
+      if (!inline() && companions.length) frameContext();
+    }
     place(); if (focus) card.focus({preventScroll:true});
   };
   const open = index => {lastFocus=doc.activeElement; show(index);};
@@ -192,7 +275,14 @@
     if (opened && slide===2) {
       if (!active) close({dismiss:false, restoreFocus:false});
       else if (saved.openKey!==key || target!==active.resolved.target) show(2,false);
-      else schedulePlace();
+      else {
+        // Streamlit may swap a context node for a new one without touching the target.
+        const next = active.resolved.extras || [];
+        if (next.length !== companions.length || next.some((element, i) => element !== companions[i])) {
+          companions = next; watchLayout();
+        }
+        schedulePlace();
+      }
     } else if (!opened && active && saved.seen && !saved.paused && !saved.hidden
       && (suspended || saved.dismissedKey!==key)) {
       open(2);
