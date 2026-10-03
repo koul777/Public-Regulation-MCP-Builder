@@ -2813,7 +2813,7 @@ def _orchestrated_chat_answer(
             44,
             "Qwen3 8B가 읽을 승인 근거 문맥을 구성하는 중",
         )
-        context = ContextBuilder().build(results) if results else ContextBuilder().build([])
+        context = ContextBuilder().build(results, query=query) if results else ContextBuilder().build([])
         runtime = OllamaRuntime(settings.rag_llm_endpoint)
         _emit_rag_chat_progress(
             "answer_generation",

@@ -83,9 +83,42 @@ class AgentReviewExecutor:
         batches = self._candidate_batches(plan)
         payloads = [self._provider_payload(plan, chunks, provider=provider, candidates=batch) for batch in batches]
         payloads = [payload for payload in payloads if payload["_item_count"]]
+        # 로컬 경로가 섞인 조항은 그 조항만 빼고 보낸다. 예전에는 묶음 하나에서 걸리면
+        # 문서 전체 호출을 0회로 막아, 조항 6,571개짜리 규정이 조항 하나 때문에
+        # 'AI 검수 전송 차단'으로 끝났다. 유출은 막되 나머지 조항의 검수는 돌아가야 한다.
+        leak_blocked: list[dict[str, str]] = []
+        cleaned_payloads: list[dict[str, Any]] = []
+        for payload in payloads:
+            cleaned, blocked = self._strip_local_path_leaks(payload, plan, chunks, provider=provider)
+            leak_blocked.extend(blocked)
+            if cleaned is not None and cleaned["_item_count"]:
+                cleaned_payloads.append(cleaned)
+        payloads = cleaned_payloads
+        # 검사 순서가 아니라 조항 순서로 남긴다. 운영자가 목록을 문서 순서대로 따라가야 한다.
+        candidate_order = {
+            str(candidate.get("chunk_id") or ""): index
+            for index, candidate in enumerate(plan.get("selected_candidates") or [])
+            if isinstance(candidate, dict)
+        }
+        leak_blocked.sort(key=lambda item: candidate_order.get(item["chunk_id"], len(candidate_order)))
+        leak_blocked_chunk_ids = list(dict.fromkeys(item["chunk_id"] for item in leak_blocked))
         payload_digest = payload_hash(
             {"provider": self.settings.llm_provider, "request": [p["request"] for p in payloads]}
         )
+        if not payloads and leak_blocked:
+            # 보낼 조항이 하나도 남지 않았다. 제공자를 부르지 않았으므로 차단으로 남긴다.
+            result.update(
+                {
+                    "status": "provider_execution_blocked",
+                    "skip_reason": leak_blocked[0]["reason"],
+                    "api_call_count": 0,
+                    "payload_hash": payload_digest,
+                    "leak_blocked_chunk_ids": leak_blocked_chunk_ids,
+                    "leak_blocked_chunk_count": len(leak_blocked_chunk_ids),
+                    "leak_blocked_locations": [item["reason"] for item in leak_blocked],
+                }
+            )
+            return result
         if not payloads:
             # 고른 조항이 실제 본문으로 하나도 이어지지 않았다. 제공자를 한 번도 부르지
             # 않았으므로 실패로 적으면 안 된다. 실패로 남기면 화면이 없던 장애를 알리고,
@@ -102,18 +135,6 @@ class AgentReviewExecutor:
                 }
             )
             return result
-        for payload in payloads:
-            payload_leak_reason = _payload_local_path_leak_reason(payload["leak_scan"])
-            if payload_leak_reason:
-                result.update(
-                    {
-                        "status": "provider_execution_blocked",
-                        "skip_reason": payload_leak_reason,
-                        "api_call_count": 0,
-                        "payload_hash": payload_digest,
-                    }
-                )
-                return result
 
         review_items: list[dict[str, Any]] = []
         response_texts: list[str] = []
@@ -173,11 +194,21 @@ class AgentReviewExecutor:
             for chunk_id in failure["chunk_ids"]
             if chunk_id not in reviewed_chunk_ids
         ]
+        # 전송 전에 뺀 조항도 검수되지 않은 조항이다. 화면은 이 목록으로
+        # '일부 완료'를 판단하므로 여기에 넣어야 운영자가 그 조항을 직접 보게 된다.
+        failed_chunk_ids.extend(
+            chunk_id for chunk_id in leak_blocked_chunk_ids if chunk_id not in failed_chunk_ids
+        )
         # 응답이 비어 있는 것과 응답을 못 받은 것은 다르다. 제공자가 '고칠 곳 없음'으로
         # 빈 items를 준 경우까지 실패로 적으면 화면이 또 거짓말을 한다.
         if succeeded_batches:
             status = "executed"
-            skip_reason = "provider_partial_batches_failed" if failures else None
+            if failures:
+                skip_reason = "provider_partial_batches_failed"
+            elif leak_blocked_chunk_ids:
+                skip_reason = "provider_partial_chunks_blocked_local_path"
+            else:
+                skip_reason = None
         else:
             status = "provider_execution_failed"
             skip_reason = str(failures[0]["reason"]) if failures else "provider_request_failed"
@@ -194,6 +225,9 @@ class AgentReviewExecutor:
                 "unreviewed_chunk_ids": failed_chunk_ids,
                 "reviewed_chunk_ids": reviewed_chunk_ids,
                 "reviewed_chunk_count": len(reviewed_chunk_ids),
+                "leak_blocked_chunk_ids": leak_blocked_chunk_ids,
+                "leak_blocked_chunk_count": len(leak_blocked_chunk_ids),
+                "leak_blocked_locations": [item["reason"] for item in leak_blocked],
                 "provider_request_id": provider_request_id,
                 "provider_request_ids": request_ids,
                 "provider_elapsed_seconds": elapsed_seconds,
@@ -218,6 +252,46 @@ class AgentReviewExecutor:
             total_tokens=total_tokens,
         )
         return result
+
+    def _strip_local_path_leaks(
+        self,
+        payload: dict[str, Any],
+        plan: dict[str, Any],
+        chunks: list[Chunk],
+        *,
+        provider: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+        """묶음에서 로컬 경로가 든 조항만 빼고, 남은 조항으로 요청을 다시 만든다.
+
+        검사 위치는 ``...items[3].text`` 처럼 몇 번째 조항인지 가리키므로, 그 조항을
+        제외하고 묶음을 다시 만들어 검사한다. 조항 밖(모델 이름 등)에서 걸리면 어느
+        조항을 빼야 할지 알 수 없으므로 그 묶음은 통째로 보내지 않는다.
+        """
+        blocked: list[dict[str, str]] = []
+        current: dict[str, Any] | None = payload
+        candidates = list(payload.get("_candidates") or [])
+        for _ in range(len(candidates) + 1):
+            if current is None or not current["_item_count"]:
+                return None, blocked
+            reason = _payload_local_path_leak_reason(current["leak_scan"])
+            if not reason:
+                return current, blocked
+            match = re.search(r"items\[(\d+)\]", reason)
+            chunk_ids = list(current["chunk_ids"])
+            if not match or int(match.group(1)) >= len(chunk_ids):
+                blocked.extend({"chunk_id": chunk_id, "reason": reason} for chunk_id in chunk_ids)
+                return None, blocked
+            leaked_chunk_id = chunk_ids[int(match.group(1))]
+            blocked.append({"chunk_id": leaked_chunk_id, "reason": reason})
+            candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("chunk_id") or "") != leaked_chunk_id
+            ]
+            if not candidates:
+                return None, blocked
+            current = self._provider_payload(plan, chunks, provider=provider, candidates=candidates)
+        return None, blocked
 
     def _candidate_batches(self, plan: dict[str, Any]) -> list[list[dict[str, Any]]]:
         """선정된 조항을 작은 묶음으로 나눈다.
@@ -409,6 +483,7 @@ class AgentReviewExecutor:
             "request": request,
             "chunk_ids": chunk_ids,
             "_item_count": len(chunk_ids),
+            "_candidates": list(candidates if candidates is not None else (plan.get("selected_candidates") or [])),
             "leak_scan": _leak_scan_view(request, user_payload),
         }
 

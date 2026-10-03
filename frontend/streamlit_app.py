@@ -58,7 +58,14 @@ from app.api.routes_documents import (
     transition_regulation_status,
 )
 from app.core.api_audit import redact_sensitive_paths
+from app.core.ai_review_preferences import (
+    clear_ai_review_preferences,
+    load_ai_review_preferences,
+    save_ai_review_preferences,
+)
 from app.core.config import Settings, get_settings, set_runtime_settings_overrides
+from app.core.dotenv_file import write_dotenv_values
+from app.ingestion.embedding_adapter import embedding_progress
 from app.core.hidden_process import hidden_window_options
 from app.core.pipeline import kordoc_table_command_status, processing_options_payload
 from app.agents.role_registry import workflow_roles
@@ -259,9 +266,19 @@ SECURITY_LEVEL_LABELS = {
 }
 # AI 연결 설정 화면에서 운영자가 입력한 연결값을 담아 두는 세션 키.
 # 저장 시 Settings 필드 이름을 그대로 키로 쓴 dict을 넣고, 스크립트 최상단에서
-# set_runtime_settings_overrides로 적용한다. API 키는 이 세션 메모리에만 있고
-# 디스크에는 저장하지 않는다(영구 설정은 .env 사용).
+# set_runtime_settings_overrides로 적용한다. API 키는 이 세션 메모리에만 있고 디스크에는
+# 저장하지 않는다(운영자가 사이드바에서 명시적으로 .env 저장을 켠 경우만 예외). 비밀 아닌
+# 스위치·공급자·모델·한도는 data/ai_review_preferences.json에 남아 재시작 뒤 복원된다.
 AI_CONNECTION_STATE_KEY = "ai_connection_overrides"
+# 재시작 뒤 디스크에서 비밀 아닌 AI 검수 설정(스위치·공급자·모델·한도)을 복원했는지 기록한다.
+AI_PREFERENCES_RESTORED_KEY = "ai_review_preferences_restored"
+# 공급자별로 .env에 적을 환경 변수 이름. 키는 운영자가 체크한 경우에만 적는다.
+AI_REVIEW_ENV_KEY_NAMES = {
+    "openai": ("OPENAI_API_KEY", "AGENT_REVIEW_API_BASE_URL"),
+    "azure-openai": ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"),
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_API_BASE_URL"),
+    "openai-compatible": ("OPENAI_COMPATIBLE_API_KEY", "AGENT_REVIEW_API_BASE_URL"),
+}
 MCP_BUNDLE_STATE_PREFIX = "mcp_setup_bundle_written"
 MCP_CONNECTION_STAGE_LABELS = {
     "registration": "1. 설정 등록",
@@ -652,6 +669,12 @@ def _ai_review_retry_guidance(summary: dict) -> str:
         reason = str(failures[0].get("reason") or "") if failures and isinstance(failures[0], dict) else reason
     if summary.get("status") == "provider_execution_blocked":
         return "전송 대상에 로컬 경로 등 보호 정보가 포함됐는지 관리자와 확인하세요. 안전 검사는 끄지 마세요."
+    if reason == "provider_partial_chunks_blocked_local_path" or summary.get("leak_blocked_chunk_ids"):
+        blocked_count = int(summary.get("leak_blocked_chunk_count") or len(summary.get("leak_blocked_chunk_ids") or []))
+        return (
+            f"조항 {blocked_count:,}개는 본문에 로컬 경로 모양 문자열이 있어 전송하지 않았습니다. "
+            "나머지 조항의 AI 검수 의견은 그대로 쓸 수 있고, 전송하지 않은 조항은 사람이 직접 확인하세요."
+        )
     if summary.get("budget_exhausted") or reason == "review_budget_exhausted":
         return "왼쪽 AI 검수에서 조항 수·입력 토큰 한도를 확인하고 필요한 범위로 조정한 뒤 다시 전처리하세요."
     if reason == "provider_response_truncated":
@@ -798,6 +821,12 @@ def _render_ai_review_sidebar(ctx: dict | None) -> None:
             "AI는 볼 곳을 짚어 줄 뿐 본문을 다시 쓰지 않으므로, 승인·색인되는 "
             "✅ 최종본은 검수를 켜도 가운데 전처리본 칸입니다."
         )
+        if feature_enabled and setup_blocker and st.session_state.get(AI_PREFERENCES_RESTORED_KEY):
+            st.warning(
+                "지난 실행에서 켜 둔 AI 검수 설정(공급자·모델·한도)을 불러왔습니다. API 키는 저장하지 "
+                "않으므로 아래에 다시 입력하고 저장하세요. 다음부터 키 입력을 건너뛰려면 "
+                "'API 키를 이 PC의 .env 파일에도 저장'을 켜고 저장하면 됩니다."
+            )
         enable_choice = st.toggle(
             "AI 검수 사용",
             value=feature_enabled,
@@ -874,7 +903,10 @@ def _render_ai_review_sidebar(ctx: dict | None) -> None:
                 value=_review_provider_key(settings, provider),
                 type="password",
                 key=f"sidebar-ai-review-key-{provider}",
-                help="현재 실행 중인 세션 메모리에만 저장됩니다. 재시작 후에도 쓰려면 .env에 넣으세요.",
+                help=(
+                    "기본적으로 현재 실행 중인 프로그램 메모리에만 저장됩니다. 공급자·모델·한도는 "
+                    "저장 시 이 PC에 기억되지만, 키는 아래 '.env 파일에도 저장'을 켠 경우에만 남습니다."
+                ),
             )
             if provider == "azure-openai":
                 base_url_label, base_url_default = "Azure 엔드포인트", ""
@@ -923,6 +955,16 @@ def _render_ai_review_sidebar(ctx: dict | None) -> None:
                 )
             )
 
+            persist_key_to_env = st.checkbox(
+                "API 키를 이 PC의 .env 파일에도 저장 (재시작 후 자동 사용)",
+                value=False,
+                key="sidebar-ai-review-persist-env",
+                help=(
+                    "프로그램 폴더의 .env 파일에 공급자·모델·주소·한도와 API 키를 적습니다. "
+                    "앱을 다시 켜면 자동으로 읽어 AI 검수가 바로 켜집니다. 이 파일은 공개 저장소에 "
+                    "올라가지 않지만, 이 PC를 쓰는 다른 사람이 읽을 수 있으니 공용 PC에서는 끄세요."
+                ),
+            )
             if st.button("저장하고 AI 검수 켜기", type="primary", key="sidebar-ai-review-save", width="stretch"):
                 overrides = _ai_connection_overrides(
                     settings,
@@ -941,7 +983,25 @@ def _render_ai_review_sidebar(ctx: dict | None) -> None:
                     st.error(blocker_after_save)
                 else:
                     _apply_ai_connection_settings(overrides)
+                    if persist_key_to_env:
+                        try:
+                            _write_ai_review_env_file(
+                                provider=provider,
+                                model=model,
+                                api_key=api_key,
+                                base_url=base_url,
+                                max_chunks=max_chunks,
+                                max_input_tokens=max_input_tokens,
+                            )
+                            st.session_state["sidebar-ai-review-env-saved"] = True
+                        except OSError as exc:
+                            st.session_state["sidebar-ai-review-env-error"] = _safe_ui_error(exc)
                     st.rerun()
+            if st.session_state.pop("sidebar-ai-review-env-saved", False):
+                st.success("프로그램 폴더의 .env 파일에 저장했습니다. 다음 실행부터 AI 검수가 자동으로 켜집니다.")
+            env_error = st.session_state.pop("sidebar-ai-review-env-error", "")
+            if env_error:
+                st.error(f".env 파일에 저장하지 못했습니다. 이번 실행에는 켜졌지만 재시작 후 다시 입력해야 합니다. {env_error}")
 
             if setup_blocker:
                 st.warning(setup_blocker)
@@ -4195,10 +4255,31 @@ def _apply_ai_connection_overrides() -> None:
             if str(key).startswith("sidebar-ai-review-"):
                 st.session_state.pop(key, None)
     overrides = st.session_state.get(AI_CONNECTION_STATE_KEY)
+    if not (isinstance(overrides, dict) and overrides) and not st.session_state.get(AI_PREFERENCES_RESTORED_KEY):
+        # 첫 실행이면 지난 실행에서 저장한 비밀 아닌 설정을 되살린다. 스위치가 메모리에만
+        # 있던 때는 앱을 다시 켜면 조용히 꺼져, 다음 전처리가 'AI 검수 사용 안 함'으로 끝났다.
+        st.session_state[AI_PREFERENCES_RESTORED_KEY] = True
+        set_runtime_settings_overrides()
+        try:
+            restored = load_ai_review_preferences(get_settings().data_dir)
+        except Exception:
+            restored = {}
+        if restored:
+            st.session_state[AI_CONNECTION_STATE_KEY] = dict(restored)
+            overrides = st.session_state[AI_CONNECTION_STATE_KEY]
     if isinstance(overrides, dict) and overrides:
         set_runtime_settings_overrides(**overrides)
     else:
         set_runtime_settings_overrides()
+
+
+def _persist_ai_review_preferences(overrides: dict[str, object]) -> None:
+    """비밀 아닌 AI 검수 설정만 runtime data 폴더에 남긴다. 실패해도 화면은 계속 간다."""
+
+    try:
+        save_ai_review_preferences(get_settings().data_dir, overrides)
+    except Exception:
+        return
 
 
 def _blank_to_none(value: object) -> str | None:
@@ -5940,6 +6021,20 @@ def _long_operation_status(
                 failure_policy=failure_policy,
             )
             raise
+
+
+def _with_embedding_progress(
+    report: Callable[[int, str, int | None, int | None], None],
+    operation: Callable[[], object],
+) -> object:
+    """색인 중 조항 임베딩 진행을 'n/N'으로 화면에 보낸다(표시 전용)."""
+
+    def _on_embedding(done: int, total: int) -> None:
+        percent = int(done * 100 / total) if total else 0
+        report(percent, "검색용 벡터 만드는 중 (CPU에서 조항당 수 초, 멈춘 것이 아닙니다)", done, total)
+
+    with embedding_progress(_on_embedding):
+        return operation()
 
 
 def _run_background_operation_with_progress(
@@ -11745,68 +11840,12 @@ def _page_approval(ctx: dict | None) -> None:
             agent_review_summary=agent_review_summary,
         )
 
+    beginner_incomplete_ids: list[str] = []
     if _beginner_focus_review() and pending_compare_ids:
-        incomplete = [cid for cid in pending_compare_ids if not _approval_chunk_review_state_from_session(
+        beginner_incomplete_ids = [cid for cid in pending_compare_ids if not _approval_chunk_review_state_from_session(
             document_id=document_id, chunk=chunk_by_id[cid], review_attention=review_attention,
             agent_review_summary=agent_review_summary,
         )["state"]["approve_enabled"]]
-        if incomplete:
-            return
-
-    if pending_compare_ids and not _beginner_focus_review():
-        with st.expander("조항을 MCP에서 제외해야 하는 경우 (선택)", expanded=False):
-            st.caption(
-                "반려는 승인이나 색인이 아닙니다. 선택한 조항만 더 이상 승인 대기로 남지 않는 "
-                "최종 제외(terminal exclusion) 상태가 되어 MCP 검색에 들어가지 않습니다."
-            )
-            reject_targets_key = f"approval-reject-targets-{document_id}"
-            reject_reason_key = _approval_chunk_state_key(document_id, "batch", "reject_reason")
-            reject_confirm_key = _approval_chunk_state_key(document_id, "batch", "reject_confirm")
-            reject_button_key = f"approval-reject-{document_id}"
-            reject_targets = st.multiselect(
-                "제외할 조항 선택",
-                options=pending_compare_ids,
-                key=reject_targets_key,
-            )
-            rejection_reason = st.text_area(
-                "반려 사유 (필수)",
-                key=reject_reason_key,
-                max_chars=1000,
-                placeholder="예: 다른 규정의 조문이 잘못 합쳐져 MCP 검색에서 제외해야 함",
-            )
-            rejection_confirmed = st.checkbox(
-                "선택한 조항만 반려하여 MCP에서 제외하는 것을 확인했습니다.",
-                key=reject_confirm_key,
-            )
-            rejection_ready = _chunk_rejection_ready(
-                reason=str(rejection_reason or ""),
-                confirmed=bool(rejection_confirmed),
-                approvable=bool(reject_targets),
-            )
-            if st.button(
-                "선택한 조항 반려",
-                key=reject_button_key,
-                disabled=not rejection_ready,
-            ):
-                try:
-                    reject_review_chunks(
-                        document_id,
-                        RejectRequest(
-                            chunk_ids=list(reject_targets),
-                            reason=str(rejection_reason).strip(),
-                            note="streamlit_scroll_review_multi_chunk_rejection",
-                        ),
-                        local_auth,
-                    )
-                    st.session_state.pop(reject_reason_key, None)
-                    st.session_state.pop(reject_confirm_key, None)
-                    st.session_state.pop(reject_targets_key, None)
-                    st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
-                    _invalidate_document_context_cache(document_id)
-                    st.success("선택한 조항을 반려했습니다. 승인·색인하지 않았으며 MCP 검색에서 제외됩니다.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"청크를 반려하지 못했습니다: {_safe_ui_error(exc)}")
 
     pending_review_entries = [
         _approval_chunk_review_state_from_session(
@@ -11831,133 +11870,14 @@ def _page_approval(ctx: dict | None) -> None:
         for chunk in document_pending_chunks
     ]
 
-    st.markdown("### 마지막 확인" if _beginner_focus_review() else f"### 3단계 · '{opened_regulation_label}' 최종 확정")
-    st.caption(
-        f"전체 {total_chunks:,}개 중 {approved_count:,}개를 승인했어요. 남은 내용은 {len(pending_compare_ids):,}개예요."
-        if _beginner_focus_review() else
-        f"이 규정 조항 {total_chunks:,}개 중 승인 {approved_count:,}개 · 남은 미승인 "
-        f"{len(pending_compare_ids):,}개. 최종 확정을 누르면 고친 내용 저장 → 승인 → AI 등록(색인)이 "
-        "한 번에 실행됩니다."
-    )
     operation_error_key = f"approval-operation-error-{document_id}"
     operation_error = st.session_state.get(operation_error_key)
-    if operation_error:
-        st.error(f"승인·검색 등록을 끝내지 못했습니다. {operation_error}")
-        if approved_count:
-            st.info(
-                f"저장된 승인 {approved_count:,}개는 유지됩니다. 아래에서 검색 준비를 확인한 뒤 "
-                "'이미 승인된 내용 AI에 등록만 실행'을 누르세요. 남은 미승인 조항은 따로 확인할 수 있습니다."
-            )
-        else:
-            st.info("아직 승인된 조항은 없습니다. 입력한 수정 내용을 확인하고 원인을 해결한 뒤 다시 실행하세요.")
-    if len(regulation_units) > 1 and not _beginner_focus_review():
-        st.caption(
-            f"규정을 하나씩 열기 어려우면 옆의 **'이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정'** "
-            f"버튼으로 이 파일의 미승인 조항 {len(document_pending_compare_ids):,}개를 한 번에 승인·색인할 수 있습니다."
-        )
-    # 색인까지 끝났는지는 확정 버튼 바로 옆에서 알려 줘야 다음 행동을 정할 수 있다.
-    if not index_status_error:
-        if current_scope_state["state"] == "terminal-excluded":
-            st.info(
-                "이 규정의 모든 활성 청크는 명시적으로 반려되어 MCP에서 제외됩니다. "
-                "검토 미완료가 아니지만, 이 규정만으로는 MCP를 만들 수 없습니다."
-            )
-        elif not mcp_connection_gate.get("ready"):
-            st.warning(
-                "확인한 내용을 승인하면 AI가 답을 찾을 수 있도록 준비합니다. 아래 버튼을 누른 뒤 완료될 때까지 기다려 주세요."
-                if _beginner_focus_review() else
-                "AI는 '승인 후 색인된' 내용만 볼 수 있습니다. 승인과 색인을 마친 뒤에도 숫자가 맞지 않으면 아래 '다시 색인하기'를 눌러 주세요.\n\n"
-                "Claude/MCP can answer only from approved chunks that are currently indexed. "
-                "If Claude sees smoke-test documents or fewer records than expected, approve the intended chunks "
-                "and run Reindex approved chunks with the same data directory and tenant."
-            )
-        else:
-            st.success("질문할 준비가 끝났어요. 아래 안내에 따라 AI 질문 화면으로 이동하세요." if _beginner_focus_review() else "승인된 모든 청크가 색인되어 AI에서 사용할 수 있습니다.")
-    if reviewed_approval_entries:
-        st.info(
-            f"위에서 확인한 미승인 조항 {len(reviewed_approval_entries):,}/{len(pending_review_entries):,}개가 "
-            "아래 '최종 확정' 버튼 한 번으로 한꺼번에 저장·승인·색인됩니다."
-        )
-    if pending_review_entries and len(reviewed_approval_entries) < len(pending_review_entries):
-        remaining_review_count = len(pending_review_entries) - len(reviewed_approval_entries)
-        st.warning(
-            f"명시적 검수가 권고된 조항이 {remaining_review_count:,}개 남았습니다. "
-            "조항이 여러 쪽이면 위 검증 시트에서 확인할 수 있으며, 그대로 진행하면 미검수 승인으로 기록됩니다."
-        )
-
-    approve_enabled = bool(pending_review_entries) and len(reviewed_approval_entries) == len(pending_review_entries)
-
-    override_reason_key = _approval_chunk_state_key(document_id, "batch", "override_reason")
-    override_reason = ""
-    if approve_enabled:
-        st.success("모든 조항이 확인 완료 상태입니다. 아래에서 최종 확정할 수 있습니다.")
-    elif pending_compare_ids:
-        # 초보자/일반 모드 모두 같은 원클릭 정책을 쓴다. 사람 검수는 분명히 권고하지만
-        # 버튼을 막지는 않으며, 그대로 진행하면 기본 사유와 approved_without_review
-        # 이벤트를 남긴다. 별도 결재 등 더 정확한 사유가 있으면 선택적으로 바꿀 수 있다.
-        st.warning(
-            "⚠️ 사람 검수를 권장합니다. 확인이 끝나지 않은 조항이 있습니다. "
-            "미검수 조항은 사람이 원문을 대조하지 않은 상태로 AI 검색에 노출되므로, "
-            "가능하면 위 검증 시트에서 조항을 직접 확인한 뒤 확정하세요. "
-            "지금 최종 확정해도 진행되며, 미검수 사실은 감사 기록에 남습니다."
-        )
-        with st.expander("미검수 승인 감사 사유 바꾸기 (선택)", expanded=False):
-            override_reason = st.text_area(
-                "확인 생략 승인 사유",
-                key=override_reason_key,
-                placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
-                help="비워 두면 사람이 원문을 직접 대조하지 않았다는 기본 사유가 자동 기록됩니다.",
-            )
-
-    approve_index_button_key = f"approval-approve-index-{document_id}"
-    approve_all_index_button_key = f"approval-approve-index-all-{document_id}"
-    indexing_packages_ready = True
-    if not mcp_connection_gate.get("ready"):
-        indexing_packages_ready = _render_indexing_preparation(
-            document_id,
-            guide_substep=4 if approved_count >= total_chunks else 3 if approve_enabled else 0,
-            recovering=bool(operation_error),
-        )
-    if _beginner_focus_review() and not indexing_packages_ready:
-        return
-    if indexing_packages_ready and approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
-        _render_beginner_action_marker(
-            3,
-            "승인된 내용을 AI 검색에 등록하세요",
-            "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
-            control_key_prefix="quick-index-only-",
-            substep=4,
-        )
-    elif indexing_packages_ready and approved_count < total_chunks and approve_enabled:
-        _render_beginner_action_marker(
-            3,
-            "마지막으로 승인해 주세요",
-            "아래 버튼을 누르면 확인한 내용을 저장하고 승인합니다. 이어서 AI가 이 내용에서 답을 찾도록 준비해요.",
-            control_keys=(approve_index_button_key,),
-            substep=3,
-        )
-
-    # 통합본은 규정이 수백 개라 한 규정씩 확정하면 끝나지 않는다. 규정이 둘 이상일 때만
-    # '이 규정' 버튼 옆에 파일 전체를 한 번에 확정하는 버튼을 같이 둔다.
-    show_approve_all = len(regulation_units) > 1 and not _beginner_focus_review()
-    if show_approve_all:
-        approve_col, approve_all_col, index_col = st.columns([2, 2, 2])
-    else:
-        approve_col, index_col = st.columns([2, 2])
-        approve_all_col = None
-
-    override_reason_text = _approval_override_reason_for_entries(
-        pending_review_entries,
-        explicit_reason=str(override_reason or ""),
-    )
-    approval_target_entries = pending_review_entries
-    can_approve = bool(approval_target_entries)
 
     def _execute_final_approval(
         approval_target_entries: list[dict[str, object]],
         *,
         vector_sync_batch_suffix: str = "guided-approval",
-        override_reason_text: str = override_reason_text,
+        override_reason_text: str = "",
     ) -> None:
         """고친 내용 저장 → 승인 → 색인을 한 번에 실행한다.
 
@@ -12078,7 +11998,7 @@ def _page_approval(ctx: dict | None) -> None:
             approved_chunk_total += len(chunk_ids)
         if approval_index_result is None:
             result = _run_background_operation_with_progress(
-                lambda _report: index_document(
+                lambda _report: _with_embedding_progress(_report, lambda: index_document(
                     document_id,
                     IndexRequest(
                         target_type="local-jsonl",
@@ -12086,7 +12006,7 @@ def _page_approval(ctx: dict | None) -> None:
                         embedding_model="Qwen/Qwen3-Embedding-0.6B",
                     ),
                     local_auth,
-                ),
+                )),
                 progress_bar=approval_progress,
                 detail_box=approval_detail,
                 start_percent=58,
@@ -12106,6 +12026,238 @@ def _page_approval(ctx: dict | None) -> None:
         st.caption(f"자동 생성된 증빙: {evidence.get('artifacts', {}).get('review_batches_json', '')}")
         st.rerun()
 
+    if beginner_incomplete_ids:
+        # 초보자 화면은 한 조항씩 확인하는 흐름이 기본이다. 그래도 "AI가 검수한 대로 진행"을
+        # 택할 수 있어야 하므로, 사람 검수를 권하는 안내와 함께 한 번에 끝내는 길을 접어 둔다.
+        # 누르면 일반 모드의 최종 확정과 같은 절차(저장 → 승인 → 색인)를 타고, 미검수 사실은
+        # 기본 사유로 감사 기록에 남는다. 확인 완료 전에는 '승인하고 AI 질문 준비하기'를 보이지 않는다.
+        shortcut_whole_file = (
+            len(regulation_units) > 1
+            and len(document_pending_review_entries) > len(pending_review_entries)
+        )
+        shortcut_entries = document_pending_review_entries if shortcut_whole_file else pending_review_entries
+        shortcut_label = (
+            f"이 파일의 규정 {len(regulation_units):,}개 · 남은 조항 {len(shortcut_entries):,}개"
+            if shortcut_whole_file
+            else f"남은 조항 {len(shortcut_entries):,}개"
+        )
+        with st.expander(f"⏩ {shortcut_label}를 AI 검수 결과대로 한 번에 승인하기 (선택)", expanded=False):
+            st.warning(
+                "⚠️ 사람이 마지막은 직접 검수하는 것을 추천드립니다. AI 검수는 볼 곳을 짚어 줄 뿐 "
+                "승인 판단을 대신하지 않습니다. 확인하지 않은 조항을 지금 한 번에 승인하면 "
+                "'미검수 일괄 승인'으로 감사 기록에 남고, 그 조항은 사람이 원문을 대조하지 않은 채 "
+                "AI 검색에 노출됩니다."
+            )
+            st.caption(
+                "추천: 위에서 '내용이 맞아요 · 다음'으로 한 조항씩 확인을 이어가세요. "
+                "그래도 지금 한 번에 끝내려면 아래 확인란을 켜고 버튼을 누르세요."
+            )
+            if operation_error:
+                st.error(f"승인·검색 등록을 끝내지 못했습니다. {operation_error}")
+            shortcut_ready = True
+            if not mcp_connection_gate.get("ready"):
+                shortcut_ready = _render_indexing_preparation(
+                    document_id,
+                    guide_substep=0,
+                    recovering=bool(operation_error),
+                )
+            shortcut_acknowledged = st.checkbox(
+                "확인하지 않은 조항이 포함된 일괄 승인임을 이해했습니다.",
+                key=f"approval-bulk-finish-ack-{document_id}",
+            )
+            if st.button(
+                f"{shortcut_label} 한 번에 승인하고 AI 질문 준비하기",
+                key=f"approval-bulk-finish-{document_id}",
+                type="primary",
+                disabled=not (shortcut_acknowledged and shortcut_ready),
+                width="stretch",
+                help="고친 내용 저장 → 승인 → AI 등록(색인)을 한 번에 실행합니다. 보고 있는 조항만이 아니라 남은 조항 전부가 대상입니다.",
+            ):
+                try:
+                    _execute_final_approval(
+                        shortcut_entries,
+                        vector_sync_batch_suffix="beginner-bulk-finish",
+                        override_reason_text=_approval_override_reason_for_entries(shortcut_entries),
+                    )
+                except Exception as exc:
+                    _refresh_after_approval_failure(document_id, exc)
+        return
+
+    if pending_compare_ids and not _beginner_focus_review():
+        with st.expander("조항을 MCP에서 제외해야 하는 경우 (선택)", expanded=False):
+            st.caption(
+                "반려는 승인이나 색인이 아닙니다. 선택한 조항만 더 이상 승인 대기로 남지 않는 "
+                "최종 제외(terminal exclusion) 상태가 되어 MCP 검색에 들어가지 않습니다."
+            )
+            reject_targets_key = f"approval-reject-targets-{document_id}"
+            reject_reason_key = _approval_chunk_state_key(document_id, "batch", "reject_reason")
+            reject_confirm_key = _approval_chunk_state_key(document_id, "batch", "reject_confirm")
+            reject_button_key = f"approval-reject-{document_id}"
+            reject_targets = st.multiselect(
+                "제외할 조항 선택",
+                options=pending_compare_ids,
+                key=reject_targets_key,
+            )
+            rejection_reason = st.text_area(
+                "반려 사유 (필수)",
+                key=reject_reason_key,
+                max_chars=1000,
+                placeholder="예: 다른 규정의 조문이 잘못 합쳐져 MCP 검색에서 제외해야 함",
+            )
+            rejection_confirmed = st.checkbox(
+                "선택한 조항만 반려하여 MCP에서 제외하는 것을 확인했습니다.",
+                key=reject_confirm_key,
+            )
+            rejection_ready = _chunk_rejection_ready(
+                reason=str(rejection_reason or ""),
+                confirmed=bool(rejection_confirmed),
+                approvable=bool(reject_targets),
+            )
+            if st.button(
+                "선택한 조항 반려",
+                key=reject_button_key,
+                disabled=not rejection_ready,
+            ):
+                try:
+                    reject_review_chunks(
+                        document_id,
+                        RejectRequest(
+                            chunk_ids=list(reject_targets),
+                            reason=str(rejection_reason).strip(),
+                            note="streamlit_scroll_review_multi_chunk_rejection",
+                        ),
+                        local_auth,
+                    )
+                    st.session_state.pop(reject_reason_key, None)
+                    st.session_state.pop(reject_confirm_key, None)
+                    st.session_state.pop(reject_targets_key, None)
+                    st.session_state.pop(WORKFLOW_MCP_GATE_CACHE_KEY, None)
+                    _invalidate_document_context_cache(document_id)
+                    st.success("선택한 조항을 반려했습니다. 승인·색인하지 않았으며 MCP 검색에서 제외됩니다.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"청크를 반려하지 못했습니다: {_safe_ui_error(exc)}")
+
+    st.markdown("### 마지막 확인" if _beginner_focus_review() else f"### 3단계 · '{opened_regulation_label}' 최종 확정")
+    st.caption(
+        f"전체 {total_chunks:,}개 중 {approved_count:,}개를 승인했어요. 남은 내용은 {len(pending_compare_ids):,}개예요."
+        if _beginner_focus_review() else
+        f"이 규정 조항 {total_chunks:,}개 중 승인 {approved_count:,}개 · 남은 미승인 "
+        f"{len(pending_compare_ids):,}개. 최종 확정을 누르면 고친 내용 저장 → 승인 → AI 등록(색인)이 "
+        "한 번에 실행됩니다."
+    )
+    if operation_error:
+        st.error(f"승인·검색 등록을 끝내지 못했습니다. {operation_error}")
+        if approved_count:
+            st.info(
+                f"저장된 승인 {approved_count:,}개는 유지됩니다. 아래에서 검색 준비를 확인한 뒤 "
+                "'이미 승인된 내용 AI에 등록만 실행'을 누르세요. 남은 미승인 조항은 따로 확인할 수 있습니다."
+            )
+        else:
+            st.info("아직 승인된 조항은 없습니다. 입력한 수정 내용을 확인하고 원인을 해결한 뒤 다시 실행하세요.")
+    if len(regulation_units) > 1 and not _beginner_focus_review():
+        st.caption(
+            f"규정을 하나씩 열기 어려우면 옆의 **'이 파일의 전체 규정 {len(regulation_units):,}개 최종 확정'** "
+            f"버튼으로 이 파일의 미승인 조항 {len(document_pending_compare_ids):,}개를 한 번에 승인·색인할 수 있습니다."
+        )
+    # 색인까지 끝났는지는 확정 버튼 바로 옆에서 알려 줘야 다음 행동을 정할 수 있다.
+    if not index_status_error:
+        if current_scope_state["state"] == "terminal-excluded":
+            st.info(
+                "이 규정의 모든 활성 청크는 명시적으로 반려되어 MCP에서 제외됩니다. "
+                "검토 미완료가 아니지만, 이 규정만으로는 MCP를 만들 수 없습니다."
+            )
+        elif not mcp_connection_gate.get("ready"):
+            st.warning(
+                "확인한 내용을 승인하면 AI가 답을 찾을 수 있도록 준비합니다. 아래 버튼을 누른 뒤 완료될 때까지 기다려 주세요."
+                if _beginner_focus_review() else
+                "AI는 '승인 후 색인된' 내용만 볼 수 있습니다. 승인과 색인을 마친 뒤에도 숫자가 맞지 않으면 아래 '다시 색인하기'를 눌러 주세요.\n\n"
+                "Claude/MCP can answer only from approved chunks that are currently indexed. "
+                "If Claude sees smoke-test documents or fewer records than expected, approve the intended chunks "
+                "and run Reindex approved chunks with the same data directory and tenant."
+            )
+        else:
+            st.success("질문할 준비가 끝났어요. 아래 안내에 따라 AI 질문 화면으로 이동하세요." if _beginner_focus_review() else "승인된 모든 청크가 색인되어 AI에서 사용할 수 있습니다.")
+    if reviewed_approval_entries:
+        st.info(
+            f"위에서 확인한 미승인 조항 {len(reviewed_approval_entries):,}/{len(pending_review_entries):,}개가 "
+            "아래 '최종 확정' 버튼 한 번으로 한꺼번에 저장·승인·색인됩니다."
+        )
+    if pending_review_entries and len(reviewed_approval_entries) < len(pending_review_entries):
+        remaining_review_count = len(pending_review_entries) - len(reviewed_approval_entries)
+        st.warning(
+            f"명시적 검수가 권고된 조항이 {remaining_review_count:,}개 남았습니다. "
+            "조항이 여러 쪽이면 위 검증 시트에서 확인할 수 있으며, 그대로 진행하면 미검수 승인으로 기록됩니다."
+        )
+
+    approve_enabled = bool(pending_review_entries) and len(reviewed_approval_entries) == len(pending_review_entries)
+
+    override_reason_key = _approval_chunk_state_key(document_id, "batch", "override_reason")
+    override_reason = ""
+    if approve_enabled:
+        st.success("모든 조항이 확인 완료 상태입니다. 아래에서 최종 확정할 수 있습니다.")
+    elif pending_compare_ids:
+        # 초보자/일반 모드 모두 같은 원클릭 정책을 쓴다. 사람 검수는 분명히 권고하지만
+        # 버튼을 막지는 않으며, 그대로 진행하면 기본 사유와 approved_without_review
+        # 이벤트를 남긴다. 별도 결재 등 더 정확한 사유가 있으면 선택적으로 바꿀 수 있다.
+        st.warning(
+            "⚠️ 사람 검수를 권장합니다. 확인이 끝나지 않은 조항이 있습니다. "
+            "미검수 조항은 사람이 원문을 대조하지 않은 상태로 AI 검색에 노출되므로, "
+            "가능하면 위 검증 시트에서 조항을 직접 확인한 뒤 확정하세요. "
+            "지금 최종 확정해도 진행되며, 미검수 사실은 감사 기록에 남습니다."
+        )
+        with st.expander("미검수 승인 감사 사유 바꾸기 (선택)", expanded=False):
+            override_reason = st.text_area(
+                "확인 생략 승인 사유",
+                key=override_reason_key,
+                placeholder="예: 긴급 배포 필요, 별도 결재 문서에서 원문 대조 완료 등",
+                help="비워 두면 사람이 원문을 직접 대조하지 않았다는 기본 사유가 자동 기록됩니다.",
+            )
+
+    approve_index_button_key = f"approval-approve-index-{document_id}"
+    approve_all_index_button_key = f"approval-approve-index-all-{document_id}"
+    indexing_packages_ready = True
+    if not mcp_connection_gate.get("ready"):
+        indexing_packages_ready = _render_indexing_preparation(
+            document_id,
+            guide_substep=4 if approved_count >= total_chunks else 3 if approve_enabled else 0,
+            recovering=bool(operation_error),
+        )
+    if _beginner_focus_review() and not indexing_packages_ready:
+        return
+    if indexing_packages_ready and approved_count >= total_chunks and not bool(mcp_connection_gate.get("ready")):
+        _render_beginner_action_marker(
+            3,
+            "승인된 내용을 AI 검색에 등록하세요",
+            "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
+            control_key_prefix="quick-index-only-",
+            substep=4,
+        )
+    elif indexing_packages_ready and approved_count < total_chunks and approve_enabled:
+        _render_beginner_action_marker(
+            3,
+            "마지막으로 승인해 주세요",
+            "아래 버튼을 누르면 확인한 내용을 저장하고 승인합니다. 이어서 AI가 이 내용에서 답을 찾도록 준비해요.",
+            control_keys=(approve_index_button_key,),
+            substep=3,
+        )
+
+    # 통합본은 규정이 수백 개라 한 규정씩 확정하면 끝나지 않는다. 규정이 둘 이상일 때만
+    # '이 규정' 버튼 옆에 파일 전체를 한 번에 확정하는 버튼을 같이 둔다.
+    show_approve_all = len(regulation_units) > 1 and not _beginner_focus_review()
+    if show_approve_all:
+        approve_col, approve_all_col, index_col = st.columns([2, 2, 2])
+    else:
+        approve_col, index_col = st.columns([2, 2])
+        approve_all_col = None
+
+    override_reason_text = _approval_override_reason_for_entries(
+        pending_review_entries,
+        explicit_reason=str(override_reason or ""),
+    )
+    approval_target_entries = pending_review_entries
+    can_approve = bool(approval_target_entries)
+
     if (not _beginner_focus_review() or (can_approve and approved_count < total_chunks)) and approve_col.button(
         "승인하고 AI 질문 준비하기" if _beginner_focus_review() else "이 규정 최종 확정 · 승인하고 색인",
         type="primary",
@@ -12117,7 +12269,7 @@ def _page_approval(ctx: dict | None) -> None:
         ),
     ):
         try:
-            _execute_final_approval(approval_target_entries)
+            _execute_final_approval(approval_target_entries, override_reason_text=override_reason_text)
         except Exception as exc:
             _refresh_after_approval_failure(document_id, exc)
 
@@ -12164,7 +12316,7 @@ def _page_approval(ctx: dict | None) -> None:
                 quick_index_progress = st.progress(0, text="색인 준비 · 0%")
                 quick_index_detail = st.empty()
                 result = _run_background_operation_with_progress(
-                    lambda _report: index_document(
+                    lambda _report: _with_embedding_progress(_report, lambda: index_document(
                         document_id,
                         IndexRequest(
                             target_type="local-jsonl",
@@ -12172,7 +12324,7 @@ def _page_approval(ctx: dict | None) -> None:
                             embedding_model="Qwen/Qwen3-Embedding-0.6B",
                         ),
                         local_auth,
-                    ),
+                    )),
                     progress_bar=quick_index_progress,
                     detail_box=quick_index_detail,
                     start_percent=0,
@@ -12904,7 +13056,7 @@ def _page_approval(ctx: dict | None) -> None:
                     index_progress = st.progress(0, text="색인 준비 · 0%")
                     index_detail = st.empty()
                     result = _run_background_operation_with_progress(
-                        lambda _report: index_document(
+                        lambda _report: _with_embedding_progress(_report, lambda: index_document(
                             document_id,
                             IndexRequest(
                                 target_type="local-jsonl",
@@ -12912,7 +13064,7 @@ def _page_approval(ctx: dict | None) -> None:
                                 embedding_model="Qwen/Qwen3-Embedding-0.6B",
                             ),
                             local_auth,
-                        ),
+                        )),
                         progress_bar=index_progress,
                         detail_box=index_detail,
                         start_percent=0,
@@ -12942,7 +13094,7 @@ def _page_approval(ctx: dict | None) -> None:
                     index_progress = st.progress(0, text="재색인 준비 · 0%")
                     index_detail = st.empty()
                     result = _run_background_operation_with_progress(
-                        lambda _report: reindex_document(
+                        lambda _report: _with_embedding_progress(_report, lambda: reindex_document(
                             document_id,
                             IndexRequest(
                                 target_type="local-jsonl",
@@ -12950,7 +13102,7 @@ def _page_approval(ctx: dict | None) -> None:
                                 embedding_model="Qwen/Qwen3-Embedding-0.6B",
                             ),
                             local_auth,
-                        ),
+                        )),
                         progress_bar=index_progress,
                         detail_box=index_detail,
                         start_percent=0,
@@ -13024,6 +13176,34 @@ def _review_provider_key(settings_snapshot, provider: str) -> str:
     return str(settings_snapshot.openai_api_key or "")
 
 
+def _write_ai_review_env_file(
+    *,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    max_chunks: int,
+    max_input_tokens: int,
+) -> None:
+    """운영자가 명시적으로 켠 경우에만 .env에 AI 검수 연결값과 키를 적는다.
+
+    app.core.config가 시작 시 .env를 읽으므로, 여기 적힌 값은 다음 실행부터 기본값이 된다.
+    키 이름은 공급자별로 다르며 다른 줄은 그대로 둔다. 값은 로그나 화면에 다시 적지 않는다.
+    """
+    key_name, base_url_name = AI_REVIEW_ENV_KEY_NAMES.get(provider, AI_REVIEW_ENV_KEY_NAMES["openai"])
+    values = {
+        "ENABLE_AGENT_REVIEW": "true",
+        "LLM_PROVIDER": provider,
+        "AGENT_REVIEW_MODEL": str(model or ""),
+        "AGENT_REVIEW_MAX_CHUNKS_PER_DOCUMENT": str(int(max_chunks)),
+        "AGENT_REVIEW_MAX_INPUT_TOKENS_PER_DOCUMENT": str(int(max_input_tokens)),
+        key_name: str(api_key or ""),
+    }
+    if str(base_url or "").strip():
+        values[base_url_name] = str(base_url).strip()
+    write_dotenv_values(values)
+
+
 def _ai_connection_overrides(
     settings_snapshot,
     *,
@@ -13083,6 +13263,7 @@ def _apply_ai_connection_settings(overrides: dict[str, object]) -> None:
     st.session_state["ai-review-settings-saved"] = True
     st.session_state.pop(OPEN_API_KEY_DIALOG_KEY, None)
     set_runtime_settings_overrides(**merged)
+    _persist_ai_review_preferences(merged)
 
 
 def _review_api_connection_status(s) -> tuple[str, str]:
@@ -13159,8 +13340,9 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
     st.markdown("### AI 연결 설정")
     st.caption(
         "AI 검수는 선택 기능입니다. 기능을 켠 경우에만 선택한 공급자로 의심 구간을 전송해 검수 초안을 만듭니다. "
-        "키는 이 세션(현재 실행) 메모리에만 저장되고 디스크에는 남지 않습니다. "
-        "PC를 재시작해도 유지하려면 전산 담당자가 .env 파일에 넣어 두면 됩니다."
+        "공급자·모델·한도는 저장 시 이 PC에 기억되고, 키는 기본적으로 현재 실행 메모리에만 남습니다. "
+        "재시작 후에도 키를 쓰려면 왼쪽 'AI 검수'에서 '.env 파일에도 저장'을 켜거나, 전산 담당자가 "
+        "프로그램 폴더의 .env 파일에 넣어 두면 앱이 시작할 때 자동으로 읽습니다."
     )
     st.info(
         "전처리 AI 검수는 선택한 공급자로 의심 구간을 검토하는 기능입니다. "
@@ -13372,14 +13554,20 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
         st.session_state.pop(OPEN_API_KEY_DIALOG_KEY, None)
         st.session_state["ai-review-settings-saved"] = True
         set_runtime_settings_overrides()
+        try:
+            clear_ai_review_preferences(get_settings().data_dir)
+        except Exception:
+            pass
         st.success("화면에서 입력한 연결값을 지웠습니다. .env/환경변수 값으로 되돌립니다.")
         st.rerun()
 
     with st.expander("전산 담당자용 — 환경변수로 영구 설정하기", expanded=False):
         st.markdown(
             """
-            - 이 화면 입력값은 현재 실행 중인 프로그램에만 적용되고 재시작하면 사라집니다.
-            - PC 재시작 후에도 유지하려면 아래 항목을 `.env`(또는 환경변수)에 넣으세요:
+            - 이 화면에서 입력한 API 키는 현재 실행 중인 프로그램에만 적용되고 재시작하면 사라집니다.
+              스위치·공급자·모델·한도는 `data/ai_review_preferences.json`에 남아 다음 실행에 복원됩니다.
+            - PC 재시작 후에도 키까지 유지하려면 프로그램 폴더의 `.env` 파일(시작 시 자동으로 읽음) 또는
+              환경변수에 아래 항목을 넣으세요:
               `ENABLE_AGENT_REVIEW`, `LLM_PROVIDER`, `AGENT_REVIEW_MODEL`, `AGENT_REVIEW_API_BASE_URL`,
               `OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
               `ANTHROPIC_API_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`.

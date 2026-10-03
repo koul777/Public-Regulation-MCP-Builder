@@ -283,3 +283,41 @@ class GroundedQATests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtractiveExcerptTests(unittest.TestCase):
+    """Fallback 발췌가 '다음과 같다'에서 끊겨 정작 답이 빠지던 문제를 고정한다."""
+
+    def test_list_introduction_keeps_the_numbered_items(self) -> None:
+        from app.agents.grounded_qa import _extractive_excerpt
+
+        text = (
+            "제35조(징계의 종류) ① 교직원에 대한 징계는 중징계와 경징계로 구분하며, 그 종류는 다음과 같다. "
+            "1. 중징계라 함은 파면, 해임, 강등 또는 정직을 말한다. 2. 경징계라 함은 감봉 또는 견책을 말한다."
+        )
+        excerpt = _extractive_excerpt(text)
+        self.assertIn("파면, 해임, 강등 또는 정직", excerpt)
+        self.assertIn("감봉 또는 견책", excerpt)
+        self.assertTrue(text.startswith(excerpt.rstrip(" …")))
+
+    def test_plain_article_still_uses_first_sentence(self) -> None:
+        from app.agents.grounded_qa import _extractive_excerpt
+
+        text = "제5조(임용 일자 소급 금지) 교직원의 임용은 그 일자를 소급하여서는 안 된다. 다른 문장이 이어진다."
+        self.assertEqual("제5조(임용 일자 소급 금지) 교직원의 임용은 그 일자를 소급하여서는 안 된다.", _extractive_excerpt(text))
+
+    def test_answer_classification_metadata_is_not_shown(self) -> None:
+        from app.agents.grounded_qa import _extractive_excerpt
+
+        text = "제1조(목적) 이 규정은 인사를 정한다. [답변분류] 의도: duration 키워드: 정년"
+        self.assertNotIn("답변분류", _extractive_excerpt(text))
+
+    def test_long_list_is_bounded(self) -> None:
+        from app.agents.grounded_qa import _extractive_excerpt
+
+        text = "제28조(직권 면직) 다음 각 호의 어느 하나에 해당될 때에는 면직시킬 수 있다. " + " ".join(
+            f"{number}. 사유 {number}에 해당할 때." for number in range(1, 80)
+        )
+        excerpt = _extractive_excerpt(text)
+        self.assertLessEqual(len(excerpt), 702)
+        self.assertTrue(excerpt.endswith("…"))

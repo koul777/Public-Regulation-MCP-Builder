@@ -274,12 +274,37 @@ def _validated_fast_model_draft(
     )
 
 
+_LIST_INTRODUCTION = re.compile(r"(?:다음과\s*같(?:다|이)|다음\s*각\s*호)")
+_ANSWER_CLASSIFICATION_MARKER = "[답변분류]"
+_EXTRACTIVE_LIST_CHARS = 700
+
+
+def _extractive_excerpt(text: str) -> str:
+    """First sentence, or the enumerated items when that sentence only introduces them.
+
+    Regulation articles often say "그 종류는 다음과 같다" and put the actual answer in
+    numbered items. Cutting at the first sentence returned the introduction alone,
+    so the fallback answer cited the right article but contained no answer.
+    """
+
+    body = text.split(_ANSWER_CLASSIFICATION_MARKER, 1)[0].strip()
+    sentence = re.split(r"(?<=[.!?다])\s+", body, maxsplit=1)[0][:_EXTRACTIVE_LIST_CHARS].strip()
+    if not _LIST_INTRODUCTION.search(sentence) or len(body) <= len(sentence):
+        return sentence
+    window = body[:_EXTRACTIVE_LIST_CHARS]
+    if len(body) > _EXTRACTIVE_LIST_CHARS:
+        cut = max(window.rfind(". "), window.rfind("다. "), window.rfind("> "))
+        window = window[: cut + 1] if cut > len(sentence) else window
+        window = window.rstrip() + " …"
+    return window.strip()
+
+
 def _extractive_draft(context: GroundingContext) -> GroundedAnswerDraft:
     claims: list[AnswerClaim] = []
     lines: list[str] = []
     for index, item in enumerate(context.items[:3], start=1):
         text = " ".join(item.text.split())
-        sentence = re.split(r"(?<=[.!?다])\s+", text, maxsplit=1)[0][:700].strip()
+        sentence = _extractive_excerpt(text)
         if not sentence:
             continue
         claim = AnswerClaim(

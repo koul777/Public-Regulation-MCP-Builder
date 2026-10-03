@@ -17,7 +17,7 @@ if /I "%~1"=="--check" (
     exit /b 0
 )
 
-echo [1/3] Checking the Python virtual environment.
+echo [1/3] Checking the Python virtual environment. (about 10-30 seconds)
 if defined RECREATE_VENV (
     call :verify_recreate_target
     if errorlevel 1 goto :venv_recreate_refused
@@ -39,7 +39,9 @@ if not exist ".venv\Scripts\python.exe" (
 )
 if not exist ".venv\Scripts\python.exe" goto :venv_missing
 
-echo [2/3] Installing required Python packages.
+echo [2/3] Installing required Python packages. (first time: usually 5-15 minutes)
+echo       Progress lines will appear below. A pause of a few minutes with no new lines
+echo       is normal while a large package downloads. Do not close this window.
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 goto :failed
 ".venv\Scripts\python.exe" -m pip install -e .
@@ -48,7 +50,7 @@ if errorlevel 1 goto :failed
 call :check_venv_isolation
 if errorlevel 1 goto :isolation_failed
 
-echo [3/3] Setup is complete. Starting the application.
+echo [3/3] Setup is complete. Starting the application. (first start: 1-3 minutes)
 call "%~dp0RUN_APP.bat"
 exit /b %ERRORLEVEL%
 

@@ -67,10 +67,10 @@ class ContextBuilder:
         self.max_context_chars = int(max_context_chars)
         self.max_items = int(max_items)
 
-    def build(self, evidence: list[dict[str, Any]]) -> GroundingContext:
+    def build(self, evidence: list[dict[str, Any]], *, query: str = "") -> GroundingContext:
         validated = [_validated_approved_record(item) for item in evidence]
         deduplicated = _deduplicate(validated)
-        groups = _merge_article_records(deduplicated)
+        groups = _prioritize_title_matches(_merge_article_records(deduplicated), query)
         selected: list[ContextEvidence] = []
         consumed_chars = 0
         truncated_any = False
@@ -215,6 +215,38 @@ def _merge_article_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
         )
     groups.sort(key=lambda item: float(item["score"]), reverse=True)
     return groups
+
+
+_TITLE_NORMALIZER = re.compile(r"[\s\W_]+", flags=re.UNICODE)
+
+
+def _normalized_title_key(value: str) -> str:
+    return _TITLE_NORMALIZER.sub("", str(value or ""))
+
+
+def _prioritize_title_matches(groups: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Put articles whose title the question names ahead of higher-scored neighbours.
+
+    A real 214-chunk personnel regulation showed the right article (``징계의 종류``)
+    retrieved but ranked third behind a 2,650-character unrelated article. Qwen3 8B
+    then answered from the long neighbour. When the question literally contains an
+    article title (spaces ignored), that article is the most direct evidence. Only
+    the order changes: no evidence is added or removed, and without a query the
+    score order is kept unchanged.
+    """
+
+    normalized_query = _normalized_title_key(query)
+    if len(normalized_query) < 2:
+        return groups
+    matched: list[dict[str, Any]] = []
+    others: list[dict[str, Any]] = []
+    for group in groups:
+        title_key = _normalized_title_key(group.get("article_title") or "")
+        if len(title_key) >= 2 and title_key in normalized_query:
+            matched.append(group)
+        else:
+            others.append(group)
+    return matched + others
 
 
 def _append_without_overlap(left: str, right: str) -> str:

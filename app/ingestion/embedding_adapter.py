@@ -5,6 +5,9 @@ import json
 import math
 import re
 from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Iterable
@@ -15,6 +18,15 @@ from app.retrieval.semantic_models import Qwen3EmbeddingAdapter
 
 
 EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION = "reg-rag-embedded-vector-record-v1"
+# 로컬 Qwen3 임베딩은 CPU에서 조항당 수 초가 걸린다. 조항 200개짜리 규정이면 수십 분인데
+# 진행 보고가 없으면 화면이 멈춘 것처럼 보인다. 표시 전용 콜백을 문맥 변수로 넘겨
+# API 계약을 바꾸지 않고 '임베딩 n/N'을 화면에 보여 준다.
+EmbeddingProgressCallback = Callable[[int, int], None]
+_EMBEDDING_PROGRESS_CALLBACK: ContextVar[EmbeddingProgressCallback | None] = ContextVar(
+    "embedding_progress_callback",
+    default=None,
+)
+EMBEDDING_PROGRESS_SLICE = 16
 LOCAL_HASH_EMBEDDING_MODEL = "local-hash-embedding-v1"
 MAX_EMBEDDING_DIMENSIONS = 4096
 
@@ -71,6 +83,40 @@ def _embedded_record(
     return embedded
 
 
+@contextmanager
+def embedding_progress(callback: EmbeddingProgressCallback) -> Iterator[None]:
+    """Report ``(embedded, total)`` while Qwen3 vectors are computed in this context."""
+
+    token = _EMBEDDING_PROGRESS_CALLBACK.set(callback)
+    try:
+        yield
+    finally:
+        _EMBEDDING_PROGRESS_CALLBACK.reset(token)
+
+
+def _emit_embedding_progress(done: int, total: int) -> None:
+    callback = _EMBEDDING_PROGRESS_CALLBACK.get()
+    if callback is None:
+        return
+    try:
+        callback(int(done), int(total))
+    except Exception:
+        # A display callback must never break indexing.
+        return
+
+
+def _encode_with_progress(adapter: Any, texts: list[str]) -> list[list[float]]:
+    if _EMBEDDING_PROGRESS_CALLBACK.get() is None:
+        return adapter.encode_documents(texts)
+    total = len(texts)
+    _emit_embedding_progress(0, total)
+    vectors: list[list[float]] = []
+    for start in range(0, total, EMBEDDING_PROGRESS_SLICE):
+        vectors.extend(adapter.encode_documents(texts[start : start + EMBEDDING_PROGRESS_SLICE]))
+        _emit_embedding_progress(len(vectors), total)
+    return vectors
+
+
 def embed_vector_records(
     records: Iterable[dict[str, Any]],
     *,
@@ -83,7 +129,7 @@ def embed_vector_records(
         return embedded, summarize_embedded_records(embedded, model=model, dimensions=dimensions)
 
     texts = [_validated_record_text(record, model=model) for record in record_list]
-    embeddings = _qwen_embedding_adapter(dimensions).encode_documents(texts)
+    embeddings = _encode_with_progress(_qwen_embedding_adapter(dimensions), texts)
     if len(embeddings) != len(record_list):
         raise ValueError(
             "Qwen3 embedding adapter returned "
