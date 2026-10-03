@@ -19,6 +19,8 @@ set "VENV_PYTHON_WORKS="
 set "VENV_ISOLATED="
 set "VENV_ISOLATION_FAILED="
 if exist ".venv\Scripts\python.exe" (
+    echo [CHECK] Checking the installed environment. This takes 10-60 seconds and prints nothing while it works.
+    echo         The window is not frozen. Please wait.
     call :check_venv_isolation
     if errorlevel 1 (
         set "VENV_ISOLATION_FAILED=1"
@@ -47,7 +49,10 @@ if defined VENV_PYTHON_WORKS (
 if defined VENV_READY (
     call "%~dp0RUN_APP.bat"
 ) else (
-    echo Installation requires an internet connection and may take a few minutes.
+    echo Installation requires an internet connection and usually takes 5-15 minutes.
+    echo Package download lines will scroll below. Long pauses with no new lines are normal
+    echo while large packages such as PyMuPDF, kiwipiepy and Streamlit are downloaded and unpacked.
+    echo Do not close this window. The app starts by itself when installation finishes.
     echo.
     if defined VENV_PYTHON_WORKS (
         echo The previous setup did not finish. Repairing required packages now.

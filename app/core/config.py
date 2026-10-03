@@ -6,6 +6,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.core.dotenv_file import load_dotenv_file
+
+# Operators are told to keep permanent AI connection values in ``.env``. Read it
+# before the Settings defaults below are evaluated, so the file actually takes
+# effect. Real environment variables keep precedence over the file.
+load_dotenv_file()
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)

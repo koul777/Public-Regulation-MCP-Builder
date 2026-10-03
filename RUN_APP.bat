@@ -32,6 +32,7 @@ if not exist "frontend\streamlit_app.py" (
     exit /b 1
 )
 
+echo [CHECK] Verifying installed packages. This takes 10-60 seconds and prints nothing while it works.
 "%VENV_PYTHON%" -c "from app.utils.fitz_compat import fitz; import sys, pip, streamlit, fastapi, pydantic, pandas, docx, olefile, mcp, kiwipiepy, app; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if errorlevel 1 (
     echo [STOPPED] The virtual environment needs Python 3.11 or newer with pip.
@@ -67,8 +68,10 @@ if /I "%~1"=="--check" (
 
 echo.
 echo Application URL: http://127.0.0.1:%APP_PORT%
-echo If the browser does not open, copy the URL above into the browser address bar.
-echo Press Ctrl+C in this window to stop the application.
+echo The browser opens by itself once the app is ready. The first start can take 1-3 minutes
+echo while Python loads the parsing and search libraries; later starts are faster.
+echo If the browser does not open after a few minutes, copy the URL above into the browser address bar.
+echo Keep this window open while you use the app. Press Ctrl+C here to stop it.
 echo.
 
 "%VENV_PYTHON%" -m streamlit run "frontend\streamlit_app.py" --server.address 127.0.0.1 --server.port %APP_PORT% --server.headless false
