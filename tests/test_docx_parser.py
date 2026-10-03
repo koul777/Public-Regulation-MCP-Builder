@@ -143,7 +143,11 @@ class DocxWrappedRunTextTests(unittest.TestCase):
 
     W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
 
-    def _parse(self, paragraphs: list[str], *, table_cell: str | None = None) -> list[str]:
+    MC = 'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+
+    def _parse_document(
+        self, paragraphs: list[str], *, table_cell: str | None = None, header_text: str | None = None
+    ):
         from docx import Document
         from docx.oxml import parse_xml
 
@@ -152,14 +156,19 @@ class DocxWrappedRunTextTests(unittest.TestCase):
             doc = Document()
             body = doc.element.body
             for inner in paragraphs:
-                body.insert(len(body) - 1, parse_xml(f"<w:p {self.W}>{inner}</w:p>"))
+                body.insert(len(body) - 1, parse_xml(f"<w:p {self.W} {self.MC}>{inner}</w:p>"))
             if table_cell is not None:
                 table = doc.add_table(rows=1, cols=2)
                 table.cell(0, 0).text = "구분"
                 cell_p = table.cell(0, 1)._tc.p_lst[0]
                 cell_p.getparent().replace(cell_p, parse_xml(f"<w:p {self.W}>{table_cell}</w:p>"))
+            if header_text is not None:
+                doc.sections[0].header.paragraphs[0].text = header_text
             doc.save(path)
-            parsed = DocxParser().parse(path, "doc_wrapped")
+            return DocxParser().parse(path, "doc_wrapped")
+
+    def _parse(self, paragraphs: list[str], *, table_cell: str | None = None) -> list[str]:
+        parsed = self._parse_document(paragraphs, table_cell=table_cell)
         return [block.text for block in parsed.pages[0].blocks]
 
     def test_tracked_insertions_are_kept_and_deletions_dropped(self) -> None:
@@ -205,6 +214,92 @@ class DocxWrappedRunTextTests(unittest.TestCase):
         )
 
         self.assertEqual(["제6조(수당) 수당은 다음과 같다.", "구분 | 월 4만원"], texts)
+
+
+    def test_tracked_changes_raise_parser_uncertainty_to_medium(self) -> None:
+        parsed = self._parse_document(
+            [
+                '<w:r><w:t xml:space="preserve">① 연차는 </w:t></w:r>'
+                '<w:ins w:id="1" w:author="a"><w:r><w:t xml:space="preserve">20일로 </w:t></w:r></w:ins>'
+                '<w:del w:id="2" w:author="a"><w:r><w:delText xml:space="preserve">15일로 </w:delText></w:r></w:del>'
+                "<w:r><w:t>한다.</w:t></w:r>",
+                '<w:moveFrom w:id="3" w:author="a"><w:r><w:t>옮겨 간 문장</w:t></w:r></w:moveFrom>',
+                '<w:moveTo w:id="4" w:author="a"><w:r><w:t>옮겨 온 문장</w:t></w:r></w:moveTo>',
+            ]
+        )
+
+        metadata = parsed.metadata
+        self.assertEqual("medium", metadata["parser_uncertainty_risk_level"])
+        self.assertIn("docx_tracked_changes_present", metadata["parser_uncertainty_flags"])
+        self.assertEqual("review_docx_tracked_changes", metadata["parser_uncertainty_recommendation"])
+        self.assertIn("tracked changes", metadata["parser_uncertainty_remediation_hint"])
+        self.assertEqual({"ins": 1, "del": 1, "moveFrom": 1, "moveTo": 1}, metadata["docx_tracked_change_counts"])
+
+    def test_paragraph_mark_and_table_cell_tracked_changes_are_detected(self) -> None:
+        parsed = self._parse_document(
+            ['<w:pPr><w:rPr><w:ins w:id="7" w:author="a"/></w:rPr></w:pPr><w:r><w:t>제1조(목적) 이 규정은 목적을 정한다.</w:t></w:r>'],
+            table_cell='<w:ins w:id="8" w:author="a"><w:r><w:t>4만원</w:t></w:r></w:ins>',
+        )
+
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertEqual(2, parsed.metadata["docx_tracked_change_counts"]["ins"])
+
+    def test_tracked_changes_replace_the_low_risk_body_text_flag(self) -> None:
+        parsed = self._parse_document(
+            ['<w:ins w:id="1" w:author="a"><w:r><w:t>제1조(목적) 이 규정은 목적을 정한다.</w:t></w:r></w:ins>'],
+        )
+
+        self.assertEqual(["docx_tracked_changes_present"], parsed.metadata["parser_uncertainty_flags"])
+        self.assertNotIn("body_text_extracted", parsed.metadata["parser_uncertainty_flags"])
+
+    def test_tracked_changes_flag_is_combined_with_unparsed_part_flag(self) -> None:
+        parsed = self._parse_document(
+            ['<w:ins w:id="1" w:author="a"><w:r><w:t>제1조(목적) 이 규정은 목적을 정한다.</w:t></w:r></w:ins>'],
+            header_text="머리말",
+        )
+
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertEqual(
+            ["docx_tracked_changes_present", "docx_unparsed_parts"], parsed.metadata["parser_uncertainty_flags"]
+        )
+        # Existing recommendation precedence is unchanged: unparsed parts first.
+        self.assertEqual("review_missing_docx_parts", parsed.metadata["parser_uncertainty_recommendation"])
+        self.assertIn("tracked changes", parsed.metadata["parser_uncertainty_remediation_hint"])
+
+    def test_document_without_tracked_changes_keeps_low_risk_and_metadata_shape(self) -> None:
+        parsed = self._parse_document(["<w:r><w:t>제1조(목적) 이 규정은 목적을 정한다.</w:t></w:r>"])
+
+        self.assertEqual("low", parsed.metadata["parser_uncertainty_risk_level"])
+        self.assertEqual(["body_text_extracted"], parsed.metadata["parser_uncertainty_flags"])
+        self.assertEqual("none", parsed.metadata["parser_uncertainty_recommendation"])
+        self.assertNotIn("docx_tracked_change_counts", parsed.metadata)
+
+    def test_alternate_content_fallback_is_not_duplicated(self) -> None:
+        texts = self._parse(
+            [
+                "<w:r><w:t xml:space=\"preserve\">제8조(대체) </w:t></w:r>"
+                "<mc:AlternateContent>"
+                '<mc:Choice Requires="w14"><w:r><w:t>선택 본문</w:t></w:r></mc:Choice>'
+                "<mc:Fallback><w:r><w:t>선택 본문</w:t></w:r></mc:Fallback>"
+                "</mc:AlternateContent>"
+                "<w:r><w:t>이다.</w:t></w:r>",
+            ]
+        )
+
+        self.assertEqual(["제8조(대체) 선택 본문이다."], texts)
+
+    def test_ruby_base_text_is_kept_and_annotation_dropped(self) -> None:
+        texts = self._parse(
+            [
+                "<w:r><w:t>제9조(용어) </w:t></w:r>"
+                "<w:r><w:ruby><w:rubyPr><w:rubyAlign w:val=\"center\"/></w:rubyPr>"
+                "<w:rt><w:r><w:t>한자</w:t></w:r></w:rt>"
+                "<w:rubyBase><w:r><w:t>漢字</w:t></w:r></w:rubyBase></w:ruby></w:r>"
+                "<w:r><w:t>를 쓴다.</w:t></w:r>",
+            ]
+        )
+
+        self.assertEqual(["제9조(용어) 漢字를 쓴다."], texts)
 
 
 if __name__ == "__main__":

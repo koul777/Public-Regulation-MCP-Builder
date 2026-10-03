@@ -133,16 +133,29 @@ class TableExtractor:
         "결과",
     }
 
-    def __init__(self) -> None:
-        # DOCX/HWPX tables are serialized one physical row per line with cell
-        # text already joined, so a line break there is always a real row
-        # boundary. Wrapped-cell merging is only for text-extracted tables
-        # (PDF, OCR) where a long cell can spill onto the next line.
-        self.explicit_row_boundaries = False
+    def analyze_text(
+        self,
+        text: str,
+        context_type: str | None = None,
+        *,
+        explicit_row_boundaries: bool = False,
+    ) -> dict:
+        """Analyze one chunk's text for table structure.
 
-    def analyze_text(self, text: str, context_type: str | None = None) -> dict:
+        ``explicit_row_boundaries`` is a per-call switch for callers whose
+        parser already writes one physical table row per line (DOCX/HWPX
+        ``table`` blocks): a line break is then always a real row boundary and
+        the wrapped-cell merger must not join rows.  It only applies to the
+        ``table`` context.  Appendix text may be laid out with paragraphs and
+        spaces, so it keeps merging.  The value is never stored on the
+        extractor, so concurrent analyses cannot affect one another.
+        """
         rows = self.extract_rows(text)
-        cell_rows = self.extract_cell_rows(rows, context_type=context_type)
+        cell_rows = self.extract_cell_rows(
+            rows,
+            context_type=context_type,
+            explicit_row_boundaries=explicit_row_boundaries,
+        )
         appendix_context = self._appendix_context(rows)
         if len(rows) < 3:
             return {
@@ -237,7 +250,13 @@ class TableExtractor:
             return ""
         return self.rows_to_markdown(rows)
 
-    def extract_cell_rows(self, rows: list[str], context_type: str | None = None) -> list[dict]:
+    def extract_cell_rows(
+        self,
+        rows: list[str],
+        context_type: str | None = None,
+        *,
+        explicit_row_boundaries: bool = False,
+    ) -> list[dict]:
         parse_rows = self._appendix_title_stripped_rows(rows)
         late_table_rows = self._extract_late_aks_table_cell_rows(parse_rows)
         if late_table_rows:
@@ -282,7 +301,11 @@ class TableExtractor:
                     "numeric_cell_count": sum(1 for cell in cells if re.search(r"\d", cell)),
                 }
             )
-        return self._merge_wrapped_cell_rows(cell_rows, context_type=context_type)
+        return self._merge_wrapped_cell_rows(
+            cell_rows,
+            context_type=context_type,
+            explicit_row_boundaries=explicit_row_boundaries,
+        )
 
     def _extract_late_aks_table_cell_rows(self, rows: list[str]) -> list[dict]:
         """Recover high-confidence rows from flattened AKS appendix/form tables.
@@ -676,9 +699,19 @@ class TableExtractor:
         numeric_headers = sum(1 for header in headers if re.search(r"\d", header))
         return numeric_headers <= max(1, len(headers) // 3)
 
-    def _merge_wrapped_cell_rows(self, cell_rows: list[dict], context_type: str | None = None) -> list[dict]:
+    def _merge_wrapped_cell_rows(
+        self,
+        cell_rows: list[dict],
+        context_type: str | None = None,
+        *,
+        explicit_row_boundaries: bool = False,
+    ) -> list[dict]:
         if context_type not in {"appendix", "table"} or len(cell_rows) < 2:
             return cell_rows
+        # Only real table blocks have trustworthy row boundaries.  An appendix
+        # (별표) may be laid out as paragraphs and spaces even in DOCX/HWPX, so
+        # it keeps merging and keeps the ``wrapped_cell_merge`` review flag.
+        keep_rows_separate = explicit_row_boundaries and context_type == "table"
         merged: list[dict] = []
         index = 0
         while index < len(cell_rows):
@@ -686,7 +719,7 @@ class TableExtractor:
             next_row = cell_rows[index + 1] if index + 1 < len(cell_rows) else None
             if (
                 next_row
-                and not self.explicit_row_boundaries
+                and not keep_rows_separate
                 and self._should_merge_wrapped_cell_rows(current, next_row)
             ):
                 current_cells = [str(cell).strip() for cell in current.get("cells") or []]

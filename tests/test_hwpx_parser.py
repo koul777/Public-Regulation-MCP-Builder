@@ -114,6 +114,189 @@ class HwpxParserTests(unittest.TestCase):
         nodes = StructureDetector().detect(parsed)
         self.assertEqual(["제1조"], [node.number for node in nodes if node.node_type == "article"])
 
+    def test_table_and_picture_inside_running_header_do_not_become_body_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header-table-picture.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                '<hp:p><hp:run><hp:ctrl><hp:header id="1"><hp:subList>'
+                "<hp:p><hp:run><hp:tbl><hp:tr>"
+                "<hp:tc><hp:subList><hp:p><hp:run><hp:t>문서번호</hp:t></hp:run></hp:p></hp:subList></hp:tc>"
+                "<hp:tc><hp:subList><hp:p><hp:run><hp:t>개정일</hp:t></hp:run></hp:p></hp:subList></hp:tc>"
+                "</hp:tr></hp:tbl></hp:run></hp:p>"
+                "<hp:p><hp:run><hp:pic><hp:caption><hp:subList><hp:p><hp:run><hp:t>기관 로고</hp:t></hp:run></hp:p></hp:subList></hp:caption></hp:pic></hp:run></hp:p>"
+                "</hp:subList></hp:header></hp:ctrl></hp:run>"
+                "<hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_header_table_picture")
+
+        blocks = parsed.pages[0].blocks
+        self.assertEqual(["text"], [block.type for block in blocks])
+        self.assertEqual(["제1조(목적) 직원의 복무를 정한다."], [block.text for block in blocks])
+        self.assertNotIn("문서번호", parsed.raw_text)
+        self.assertNotIn("기관 로고", parsed.raw_text)
+
+    def test_body_table_next_to_running_header_is_still_emitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header-and-body-table.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                '<hp:p><hp:run><hp:ctrl><hp:header id="1"><hp:subList>'
+                "<hp:p><hp:run><hp:tbl><hp:tr><hp:tc><hp:subList><hp:p><hp:run><hp:t>머리말표</hp:t></hp:run></hp:p></hp:subList></hp:tc></hp:tr></hp:tbl></hp:run></hp:p>"
+                "</hp:subList></hp:header></hp:ctrl></hp:run>"
+                "<hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run>"
+                "<hp:run><hp:tbl><hp:tr>"
+                "<hp:tc><hp:subList><hp:p><hp:run><hp:t>구분</hp:t></hp:run></hp:p></hp:subList></hp:tc>"
+                "<hp:tc><hp:subList><hp:p><hp:run><hp:t>일수</hp:t></hp:run></hp:p></hp:subList></hp:tc>"
+                "</hp:tr></hp:tbl></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_header_and_body_table")
+
+        blocks = parsed.pages[0].blocks
+        self.assertEqual(
+            [("text", "제1조(목적) 직원의 복무를 정한다."), ("table", "구분 | 일수")],
+            [(block.type, block.text) for block in blocks],
+        )
+        self.assertNotIn("머리말표", parsed.raw_text)
+
+    def test_loose_text_fallback_skips_page_header_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "loose-with-header.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                '<hp:header id="1"><hp:subList><hp:run><hp:t>머리말 문구</hp:t></hp:run></hp:subList></hp:header>'
+                "<hp:run><hp:t>Loose Body</hp:t></hp:run>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_loose_header")
+
+        self.assertEqual(["Loose Body"], [block.text for block in parsed.pages[0].blocks])
+        self.assertEqual(1, parsed.metadata["hwpx_page_header_footer_excluded_count"])
+        self.assertEqual(["머리말 문구"], parsed.metadata["hwpx_page_header_footer_excluded_texts"])
+
+    def test_excluded_header_footer_text_is_recorded_with_review_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header-footer-record.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                '<hp:p><hp:run><hp:ctrl><hp:header id="1"><hp:subList><hp:p><hp:run><hp:t>가상공단 복무규정</hp:t></hp:run></hp:p>'
+                '</hp:subList></hp:header></hp:ctrl><hp:ctrl><hp:footer id="2"><hp:subList><hp:p><hp:run><hp:t>- 1 -</hp:t></hp:run></hp:p>'
+                "</hp:subList></hp:footer></hp:ctrl></hp:run><hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_header_footer_record")
+
+        metadata = parsed.metadata
+        self.assertEqual(["제1조(목적) 직원의 복무를 정한다."], [block.text for block in parsed.pages[0].blocks])
+        self.assertEqual(2, metadata["hwpx_page_header_footer_excluded_count"])
+        self.assertEqual(["가상공단 복무규정", "- 1 -"], metadata["hwpx_page_header_footer_excluded_texts"])
+        self.assertIn("hwpx_page_header_footer_excluded", metadata["parser_uncertainty_flags"])
+        self.assertNotIn("hwpx_confidentiality_marking_in_header_footer", metadata["parser_uncertainty_flags"])
+        self.assertNotIn("hwpx_page_header_footer_confidentiality_markers", metadata)
+        self.assertEqual("low", metadata["parser_uncertainty_risk_level"])
+        self.assertEqual("none", metadata["parser_uncertainty_recommendation"])
+
+    def test_excluded_header_footer_record_is_bounded(self) -> None:
+        headers = "".join(
+            f'<hp:ctrl><hp:header id="{index}"><hp:subList><hp:p><hp:run><hp:t>머리말{index}</hp:t></hp:run></hp:p></hp:subList></hp:header></hp:ctrl>'
+            for index in range(7)
+        )
+        long_footer = "가" * 200
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "header-footer-bounded.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                f"<hp:p><hp:run>{headers}"
+                f'<hp:ctrl><hp:footer id="9"><hp:subList><hp:p><hp:run><hp:t>{long_footer}</hp:t></hp:run></hp:p></hp:subList></hp:footer></hp:ctrl>'
+                "</hp:run><hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_header_footer_bounded")
+
+        self.assertEqual(8, parsed.metadata["hwpx_page_header_footer_excluded_count"])
+        recorded = parsed.metadata["hwpx_page_header_footer_excluded_texts"]
+        self.assertEqual(5, len(recorded))
+        self.assertTrue(all(len(text) <= 80 for text in recorded))
+
+    def test_confidentiality_marking_in_footer_raises_medium_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "confidential-footer.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                '<hp:p><hp:run><hp:ctrl><hp:header id="1"><hp:subList><hp:p><hp:run><hp:t>가상공단 복무규정</hp:t></hp:run></hp:p>'
+                '</hp:subList></hp:header></hp:ctrl><hp:ctrl><hp:footer id="2"><hp:subList><hp:p><hp:run><hp:t>대 외 비</hp:t></hp:run></hp:p>'
+                "</hp:subList></hp:footer></hp:ctrl></hp:run><hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_confidential_footer")
+
+        metadata = parsed.metadata
+        self.assertEqual(["제1조(목적) 직원의 복무를 정한다."], [block.text for block in parsed.pages[0].blocks])
+        self.assertEqual("medium", metadata["parser_uncertainty_risk_level"])
+        self.assertEqual("medium", metadata["parser_uncertainty"]["risk_level"])
+        self.assertIn("hwpx_page_header_footer_excluded", metadata["parser_uncertainty_flags"])
+        self.assertIn("hwpx_confidentiality_marking_in_header_footer", metadata["parser_uncertainty_flags"])
+        self.assertEqual("review_security_level", metadata["parser_uncertainty_recommendation"])
+        self.assertIn("security level", metadata["parser_uncertainty_remediation_hint"])
+        self.assertEqual(["대외비"], metadata["hwpx_page_header_footer_confidentiality_markers"])
+        self.assertEqual("대 외 비", metadata["hwpx_page_header_footer_excluded_texts"][0])
+
+    def test_confidentiality_marking_is_recorded_even_behind_many_running_headers(self) -> None:
+        headers = "".join(
+            f'<hp:ctrl><hp:header id="{index}"><hp:subList><hp:p><hp:run><hp:t>머리말{index}</hp:t></hp:run></hp:p></hp:subList></hp:header></hp:ctrl>'
+            for index in range(6)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "confidential-after-headers.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                f"<hp:p><hp:run>{headers}"
+                '<hp:ctrl><hp:footer id="9"><hp:subList><hp:p><hp:run><hp:t>비공개</hp:t></hp:run></hp:p></hp:subList></hp:footer></hp:ctrl>'
+                "</hp:run><hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_confidential_after_headers")
+
+        self.assertEqual("비공개", parsed.metadata["hwpx_page_header_footer_excluded_texts"][0])
+        self.assertEqual(["비공개"], parsed.metadata["hwpx_page_header_footer_confidentiality_markers"])
+        self.assertEqual("medium", parsed.metadata["parser_uncertainty_risk_level"])
+
+    def test_document_without_page_header_footer_keeps_previous_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "no-header-footer.hwpx"
+            self._write_hwpx(
+                path,
+                '<root xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+                "<hp:p><hp:run><hp:t>제1조(목적) 직원의 복무를 정한다.</hp:t></hp:run></hp:p>"
+                "</root>",
+            )
+
+            parsed = HwpxParser().parse(path, "doc_no_header_footer")
+
+        metadata = parsed.metadata
+        self.assertEqual([], [key for key in metadata if key.startswith("hwpx_page_header_footer")])
+        self.assertEqual(["xml_structured_extraction"], metadata["parser_uncertainty_flags"])
+        self.assertEqual("low", metadata["parser_uncertainty_risk_level"])
+        self.assertEqual(0.92, metadata["parser_uncertainty_confidence"])
+        self.assertEqual("none", metadata["parser_uncertainty_recommendation"])
+        self.assertEqual("", metadata["parser_uncertainty_remediation_hint"])
+
     def test_cell_span_child_element_marks_merged_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cell-span.hwpx"

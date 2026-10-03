@@ -13,6 +13,7 @@ from app.core.config import Settings
 from app.core.institution_profiles import InstitutionProfile, InstitutionProfileRegistry
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
+from app.services.approval_governance import approval_review_completion_state
 from app.services.institution_purge_service import (
     InstitutionPurgePlan,
     InstitutionPurgeResult,
@@ -1306,6 +1307,101 @@ class ApprovalReviewReasonLabelTests(unittest.TestCase):
             self.assertNotIn(code.partition(":")[0], suggestion)
 
 
+    def test_parser_uncertainty_severity_follows_the_risk_value(self) -> None:
+        expected = {"low": "낮음", "medium": "중간", "high": "높음", "critical": "높음"}
+        for risk, severity in expected.items():
+            title, actual, _suggestion = streamlit_app._approval_review_reason_label(
+                f"parser_uncertainty_risk_level:{risk}"
+            )
+            self.assertEqual(severity, actual, risk)
+            self.assertEqual("자동 변환이 불확실한 부분", title)
+        # An unknown or empty value is shown at the minimum level these reasons are raised at.
+        for risk in ("", "bogus"):
+            self.assertEqual(
+                "중간", streamlit_app._approval_review_reason_label(f"parser_uncertainty_risk_level:{risk}")[1]
+            )
+
+    def test_flags_and_recommendation_share_the_chunk_risk_severity(self) -> None:
+        detail = ["parser_uncertainty_flags:some_flag", "parser_uncertainty_recommendation:manual_review"]
+        for risk, severity in (("medium", "중간"), ("high", "높음"), ("low", "낮음")):
+            items = self._items([f"parser_uncertainty_risk_level:{risk}", *detail])
+            self.assertEqual([severity] * 3, [item["severity"] for item in items], risk)
+        # No risk reason in the list: fall back to the risk stored in the chunk metadata.
+        chunk = SimpleNamespace(
+            chunk_id="c1", warnings=[], metadata={"parser_uncertainty": {"risk_level": "high"}}, chunk_type="article"
+        )
+        items = streamlit_app._approval_ai_review_items(chunk, detail, None)
+        self.assertEqual(["높음", "높음"], [item["severity"] for item in items])
+        # Nothing known at all: "중간", never an unconditional "높음".
+        self.assertEqual(["중간", "중간"], [item["severity"] for item in self._items(detail)])
+
+    def test_items_sharing_a_title_are_numbered_and_explained(self) -> None:
+        items = self._items(
+            [
+                "warning:table_caption_split",
+                "table_review_flags:possible_truncated_cell",
+                "warning:ocr_low_confidence",
+            ]
+        )
+
+        self.assertEqual(
+            ["변환 경고 확인 (1/2)", "표 칸 잘림 가능성", "변환 경고 확인 (2/2)"],
+            [item["title"] for item in items],
+        )
+        # A unique title is left alone and needs no extra hint.
+        self.assertEqual("", items[1]["hint"])
+        self.assertEqual("표 칸 잘림 가능성", items[1]["base_title"])
+        # The two warnings differ by topic, in plain words and without the raw code.
+        self.assertIn("표·그림 제목", items[0]["hint"])
+        self.assertIn("스캔 글자 인식", items[2]["hint"])
+        for item in (items[0], items[2]):
+            self.assertNotIn(item["reason"], item["hint"])
+
+    def test_same_source_duplicates_point_to_the_detail_and_stay_distinguishable(self) -> None:
+        reasons = [
+            "parser_uncertainty_risk_level:medium",
+            "parser_uncertainty_flags:flag_a",
+            "parser_uncertainty_flags:flag_b",
+            "parser_uncertainty_recommendation:manual_review",
+            "warning:first_table_note",
+            "warning:second_table_note",
+        ]
+        items = self._items(reasons)
+
+        titles = [str(item["title"]) for item in items]
+        self.assertEqual(len(titles), len(set(titles)))
+        self.assertEqual(
+            [f"자동 변환이 불확실한 부분 ({n}/4)" for n in range(1, 5)]
+            + [f"변환 경고 확인 ({n}/2)" for n in (1, 2)],
+            titles,
+        )
+        hints = [str(item["hint"]) for item in items]
+        self.assertTrue(all(hints))
+        # Items whose source wording is identical are told apart through the detail expander.
+        self.assertIn("자세히 보기", hints[1])
+        self.assertIn("자세히 보기", hints[2])
+        self.assertNotIn("자세히 보기", hints[0])
+        self.assertIn("자세히 보기", hints[4])
+        self.assertIn("자세히 보기", hints[5])
+
+    def test_numbering_never_changes_item_ids_reasons_or_the_completion_gate(self) -> None:
+        reasons = ["warning:table_caption_split", "warning:ocr_low_confidence", "table_review_required"]
+        items = self._items(reasons)
+
+        self.assertEqual([f"c1:{reason}:{index}" for index, reason in enumerate(reasons, start=1)],
+                         [item["item_id"] for item in items])
+        self.assertEqual(reasons, [item["reason"] for item in items])
+        item_ids = [str(item["item_id"]) for item in items]
+        decisions = {item_ids[0]: "skip", item_ids[1]: "skip"}
+        state = approval_review_completion_state(item_ids, decisions, human_confirmed=True)
+        self.assertFalse(state["approve_enabled"])
+        self.assertEqual([item_ids[2]], state["undecided_item_ids"])
+        decisions[item_ids[2]] = "skip"
+        self.assertTrue(
+            approval_review_completion_state(item_ids, decisions, human_confirmed=True)["approve_enabled"]
+        )
+
+
 class ApprovalReviewGuideBannerTests(unittest.TestCase):
     """초보자 안내 배너는 판단하지 않은 첫 항목 위에 한 번만 나온다."""
 
@@ -1362,6 +1458,72 @@ class ApprovalReviewGuideBannerTests(unittest.TestCase):
             app.button(key=key).click().run(timeout=60)
             self.assertFalse(app.exception)
         self.assertEqual([], self._guide_markers(app))
+
+
+    DUPLICATE_REASONS = [
+        "warning:table_caption_split",
+        "warning:ocr_low_confidence",
+        "parser_uncertainty_risk_level:medium",
+    ]
+
+    def _duplicate_app(self, *, beginner: bool):
+        app = self._app()
+        app.session_state["reasons"] = list(self.DUPLICATE_REASONS)
+        app.session_state[streamlit_app.BEGINNER_GUIDE_ENABLED_KEY] = beginner
+        return app
+
+    def test_beginner_keeps_plain_wording_and_gets_the_raw_code_in_a_collapsed_expander(self) -> None:
+        app = self._duplicate_app(beginner=True)
+        app.run(timeout=60)
+        self.assertFalse(app.exception)
+
+        detail = [expander for expander in app.expander if expander.label == "자세히 보기 · 기술 정보"]
+        self.assertEqual(3, len(detail))
+        # Every item gets its own expander holding exactly its raw code.
+        self.assertEqual(
+            self.DUPLICATE_REASONS,
+            [str(expander.code[0].value) for expander in detail],
+        )
+        # Captions stay plain: numbered titles, a distinguishing hint, no raw code (it lives in st.code).
+        lines = " ".join(str(item.value) for item in app.caption)
+        self.assertIn("변환 경고 확인 (1/2)", lines)
+        self.assertIn("변환 경고 확인 (2/2)", lines)
+        self.assertIn("구분: 변환 중 나온 경고 한 건이에요 (표·그림 제목 관련).", lines)
+        self.assertIn("구분: 변환 중 나온 경고 한 건이에요 (스캔 글자 인식 관련).", lines)
+        self.assertNotIn("(코드:", lines)
+        for reason in self.DUPLICATE_REASONS:
+            self.assertNotIn(reason, lines)
+        # Collapsed by default: opening it is optional and decides nothing.
+        self.assertTrue(all(not expander.proto.expanded for expander in detail))
+
+    def test_operator_mode_keeps_the_inline_code_and_has_no_detail_expander(self) -> None:
+        app = self._duplicate_app(beginner=False)
+        app.run(timeout=60)
+        self.assertFalse(app.exception)
+
+        lines = [str(item.value) for item in app.caption]
+        for reason in self.DUPLICATE_REASONS:
+            self.assertTrue(any(f"(코드: {reason})" in line for line in lines), reason)
+        self.assertEqual([], [e for e in app.expander if e.label == "자세히 보기 · 기술 정보"])
+
+    def test_decision_keys_and_item_ids_are_unchanged_in_both_modes(self) -> None:
+        item_ids = [f"c1:{reason}:{index}" for index, reason in enumerate(self.DUPLICATE_REASONS, start=1)]
+        for beginner in (True, False):
+            app = self._duplicate_app(beginner=beginner)
+            app.run(timeout=60)
+            self.assertFalse(app.exception)
+            skip_label = "이 문제는 없어요" if beginner else "해당 없음"
+            skip_keys = [item.key for item in app.button if item.label == skip_label]
+            self.assertEqual([f"ai-skip-{item_id}" for item_id in item_ids], skip_keys, beginner)
+
+            decisions_key = streamlit_app._approval_chunk_state_key("doc", "c1", "ai_decisions")
+            for number, key in enumerate(skip_keys, start=1):
+                app.button(key=key).click().run(timeout=60)
+                self.assertFalse(app.exception)
+                recorded = dict(app.session_state[decisions_key])
+                self.assertEqual(item_ids[:number], list(recorded), beginner)
+                gate = approval_review_completion_state(item_ids, recorded, human_confirmed=True)
+                self.assertEqual(number == len(item_ids), gate["approve_enabled"], (beginner, number))
 
 
 if __name__ == "__main__":
