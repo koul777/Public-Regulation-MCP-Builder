@@ -91,6 +91,20 @@ PATTERNS = {
     "supplementary": re.compile(r"^\s*(부\s*칙)\s*(.*)$"),
 }
 
+# "제5조부터 제7조까지 삭제 <2020. 1. 1.>", "제9조 내지 제11조 삭제",
+# "제5조 ~ 제7조 삭제"처럼 여러 조를 한 줄로 삭제한 표시. 줄이 "삭제"와 선택적
+# 개정 표시로 끝나야 하므로 "제5조부터 제7조까지의 규정을 준용한다." 같은 본문
+# 문장은 걸리지 않는다.
+ARTICLE_NUMBER_TOKEN_PATTERN = r"제\s*\d+\s*조(?:\s*의\s*\d+)?"
+ARTICLE_RANGE_DELETION_PATTERN = re.compile(
+    rf"^\s*(?P<start>{ARTICLE_NUMBER_TOKEN_PATTERN})\s*"
+    rf"(?:부터\s*(?P<end_buteo>{ARTICLE_NUMBER_TOKEN_PATTERN})\s*까지"
+    rf"|(?:내지|[~∼～〜])\s*(?P<end_other>{ARTICLE_NUMBER_TOKEN_PATTERN}))"
+    r"\s*(?P<deletion>(?:삭제\.?|<\s*삭제[^<>\n]{0,80}>)"
+    r"(?:\s*(?:<[^<>\n]{1,80}>|〈[^〈〉\n]{1,80}〉|\[[^\[\]\n]{1,80}\]|【[^【】\n]{1,80}】))*)\s*$"
+)
+ARTICLE_RANGE_EXPANSION_LIMIT = 100
+
 ATTACHMENT_REF_PATTERNS = {
     "appendix": re.compile(r"별\s*표\s*(?:제\s*)?(?:\d+(?:\s*(?:의|-)\s*\d+)?)?(?:\s*호)?"),
     "form": re.compile(r"별\s*지\s*제?\s*(?:\d+(?:\s*(?:의|-)\s*\d+)?)?\s*호?\s*서식"),
@@ -347,6 +361,10 @@ class StructureDetector:
                     return None
                 return self._node(document_id, node_type, number, title or None, text, line.page_no, order_index, line.metadata)
 
+        range_deletion = self._article_range_deletion_node(line, document_id, order_index)
+        if range_deletion is not None:
+            return range_deletion
+
         match = PATTERNS["article"].match(text)
         if match:
             number = self._normalize_number(match.group(1))
@@ -438,6 +456,58 @@ class StructureDetector:
         if compact.startswith("삭제"):
             return "삭제"
         return None
+
+    def _article_range_deletion_node(
+        self,
+        line: SourceLine,
+        document_id: str,
+        order_index: int,
+    ) -> StructureNode | None:
+        """Keep a one-line range deletion as one deleted article node.
+
+        The line is a single source unit, so it stays one node (and one chunk)
+        instead of being duplicated per article number.  The first number is
+        the node number and the full range is kept in metadata.
+        """
+
+        match = ARTICLE_RANGE_DELETION_PATTERN.match(line.text)
+        if not match:
+            return None
+        start = self._normalize_number(match.group("start")) or ""
+        end = self._normalize_number(match.group("end_buteo") or match.group("end_other")) or ""
+        deletion = re.sub(r"\s+", " ", match.group("deletion")).strip()
+        title = self._article_lifecycle_title(deletion)
+        node = self._node(document_id, "article", start, title, line.text, line.page_no, order_index, line.metadata)
+        node.metadata["lifecycle"] = "deleted"
+        node.metadata["article_lead_text"] = deletion
+        node.metadata["deleted_article_range"] = {"start": start, "end": end}
+        numbers = self._expand_article_number_range(start, end)
+        if numbers:
+            node.metadata["deleted_article_numbers"] = numbers
+        else:
+            node.warnings.append("deleted_article_range_unexpanded")
+            node.confidence = 0.9
+        return node
+
+    def _expand_article_number_range(self, start: str, end: str) -> list[str]:
+        start_match = re.fullmatch(r"제(\d+)조(?:의(\d+))?", start)
+        end_match = re.fullmatch(r"제(\d+)조(?:의(\d+))?", end)
+        if not start_match or not end_match:
+            return []
+        start_main, start_branch = int(start_match.group(1)), start_match.group(2)
+        end_main, end_branch = int(end_match.group(1)), end_match.group(2)
+        if start_branch is None and end_branch is None:
+            if start_main > end_main or end_main - start_main >= ARTICLE_RANGE_EXPANSION_LIMIT:
+                return []
+            return [f"제{number}조" for number in range(start_main, end_main + 1)]
+        if start_branch is not None and end_branch is not None and start_main == end_main:
+            first, last = int(start_branch), int(end_branch)
+            if first > last or last - first >= ARTICLE_RANGE_EXPANSION_LIMIT:
+                return []
+            return [f"제{start_main}조의{branch}" for branch in range(first, last + 1)]
+        # "제5조부터 제6조의2까지"처럼 가지번호가 섞이면 사이에 어떤 조가 있었는지
+        # 원문만으로 알 수 없다. 범위만 남기고 검수 경고를 단다.
+        return []
 
     def _plain_article_title(self, trailing: str) -> str | None:
         """Return an unbracketed article heading only when it is title-only.
@@ -1225,6 +1295,9 @@ class StructureDetector:
         if FOOTNOTE_CAPTION_MARKER_PATTERN.match(text):
             return [text]
         if PATTERNS["appendix"].match(text) or PATTERNS["form"].match(text):
+            return [text]
+        if ARTICLE_RANGE_DELETION_PATTERN.match(text):
+            # "제5조 ~ 제7조 <삭제 2020.1.1.>"의 끝 조번호를 새 조문으로 쪼개지 않는다.
             return [text]
         starts: list[int] = []
         for match in INLINE_ARTICLE_MARKER_PATTERN.finditer(text):

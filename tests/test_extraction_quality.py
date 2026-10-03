@@ -44,6 +44,24 @@ class ExtractionQualityTests(unittest.TestCase):
         self.assertFalse(report["ready_for_normalization"])
         self.assertEqual(["no_pages_or_text_extracted"], report["blocking_reasons"])
 
+    def test_image_only_hwpx_placeholder_block_is_reported_as_image_for_review(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc-hwpx-image",
+            source_file="scan.hwpx",
+            file_type="hwpx",
+            raw_text="[그림]",
+            pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(type="image", text="[그림]")])],
+            metadata={"parser_uncertainty_flags": ["xml_structured_extraction"]},
+        )
+
+        report = build_extraction_quality_report(parsed)
+
+        self.assertEqual("review_required", report["status"])
+        self.assertTrue(report["ready_for_normalization"])
+        self.assertEqual(1, report["image_block_count"])
+        self.assertEqual([1], report["image_page_numbers"])
+        self.assertIn("image_blocks_detected", report["review_reasons"])
+
     def test_clean_text_document_can_continue_without_review(self) -> None:
         parsed = ParsedDocument(
             document_id="doc-3",

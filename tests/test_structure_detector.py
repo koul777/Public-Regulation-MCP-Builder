@@ -396,6 +396,63 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertEqual([node.title for node in articles], ["삭제", "생략"])
         self.assertFalse(any("article_title_missing" in node.warnings for node in articles))
 
+    def test_range_deleted_articles_become_one_deleted_article_node(self) -> None:
+        cases = (
+            ("제5조부터 제7조까지 삭제 <2020. 1. 1.>", "제5조", "제7조", ["제5조", "제6조", "제7조"]),
+            ("제9조 내지 제11조 삭제", "제9조", "제11조", ["제9조", "제10조", "제11조"]),
+            ("제5조 ~ 제7조 삭제 <2020. 1. 1.>", "제5조", "제7조", ["제5조", "제6조", "제7조"]),
+            ("제5조∼제7조 삭제<2020.1.1.>", "제5조", "제7조", ["제5조", "제6조", "제7조"]),
+            ("제5조 ~ 제7조 <삭제 2020.1.1.>", "제5조", "제7조", ["제5조", "제6조", "제7조"]),
+            ("제5조의2부터 제5조의4까지 삭제 <2021. 3. 1.>", "제5조의2", "제5조의4", ["제5조의2", "제5조의3", "제5조의4"]),
+        )
+        for line, start, end, numbers in cases:
+            with self.subTest(line=line):
+                text = "\n".join(["제4조(목적) 가상의 목적을 정한다.", line, "제12조(시행) 가상의 시행일을 정한다."])
+
+                nodes = StructureDetector().detect_from_text(text)
+                articles = [node for node in nodes if node.node_type == "article"]
+
+                self.assertEqual([node.number for node in articles], ["제4조", start, "제12조"])
+                deleted = articles[1]
+                self.assertEqual(deleted.title, "삭제")
+                self.assertEqual(deleted.text, line)
+                self.assertEqual(deleted.metadata.get("lifecycle"), "deleted")
+                self.assertEqual(deleted.metadata.get("deleted_article_range"), {"start": start, "end": end})
+                self.assertEqual(deleted.metadata.get("deleted_article_numbers"), numbers)
+                self.assertNotIn("article_title_missing", deleted.warnings)
+                self.assertNotIn(line, articles[0].text)
+
+    def test_range_deletion_with_mixed_branch_numbers_keeps_range_and_flags_review(self) -> None:
+        nodes = StructureDetector().detect_from_text("제4조(목적) 본문\n제5조 ~ 제6조의2 삭제\n제7조(시행) 본문")
+        deleted = [node for node in nodes if node.node_type == "article"][1]
+
+        self.assertEqual(deleted.metadata.get("lifecycle"), "deleted")
+        self.assertEqual(deleted.metadata.get("deleted_article_range"), {"start": "제5조", "end": "제6조의2"})
+        self.assertNotIn("deleted_article_numbers", deleted.metadata)
+        self.assertIn("deleted_article_range_unexpanded", deleted.warnings)
+
+    def test_article_range_reference_sentences_are_not_deletions(self) -> None:
+        for line in (
+            "제5조부터 제7조까지의 규정을 준용한다.",
+            "제5조 내지 제7조에 따른 신청은 삭제한다.",
+            "제5조부터 제7조까지를 각각 삭제한다.",
+        ):
+            with self.subTest(line=line):
+                nodes = StructureDetector().detect_from_text(f"제4조(목적) 가상의 목적을 정한다.\n{line}")
+                articles = [node for node in nodes if node.node_type == "article"]
+
+                self.assertEqual([node.number for node in articles], ["제4조"])
+                self.assertIn(line, articles[0].text)
+                self.assertNotIn("lifecycle", articles[0].metadata)
+                self.assertNotIn("deleted_article_range", articles[0].metadata)
+
+    def test_tilde_range_sentence_without_deletion_is_not_marked_deleted(self) -> None:
+        nodes = StructureDetector().detect_from_text("제4조(목적) 본문\n제5조 ~ 제7조 삭제한다.")
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertFalse(any(node.metadata.get("lifecycle") == "deleted" for node in articles))
+        self.assertFalse(any("deleted_article_range" in node.metadata for node in articles))
+
     def test_regulation_heading_clears_supplementary_scope(self) -> None:
         text = "\n".join(
             [

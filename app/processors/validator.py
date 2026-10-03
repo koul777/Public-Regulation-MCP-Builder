@@ -47,8 +47,24 @@ class Validator:
                         "원문에서 누락된 조문 또는 PDF 추출 순서를 확인하세요.",
                     )
                 )
-            previous_by_parent[parent_key] = current
+            previous_by_parent[parent_key] = max(current, self._deleted_range_end_number(node) or current)
         return issues
+
+    def _deleted_range_end_number(self, node: StructureNode) -> int | None:
+        """"제5조부터 제7조까지 삭제" 한 노드가 제7조까지 차지한다고 본다.
+
+        구조 탐지기가 범위를 실제로 풀어 쓴 경우(``deleted_article_numbers``)에만 그 끝
+        번호까지 순서를 전진시킨다. 가지번호가 섞였거나 역순이거나 한도를 넘어 풀지 못한
+        범위("제5조 ~ 제70조 삭제")의 끝 번호는 원문 그대로 믿지 않는다. 믿으면 사이의
+        누락 경고가 가려진다.
+        """
+
+        if node.metadata.get("lifecycle") != "deleted":
+            return None
+        expanded = node.metadata.get("deleted_article_numbers")
+        if not isinstance(expanded, list) or not expanded:
+            return None
+        return self._article_number(str(expanded[-1] or ""))
 
     def _mixed_article_order_parents(self, nodes: list[StructureNode]) -> set[str]:
         sequences: dict[str, list[int]] = {}
