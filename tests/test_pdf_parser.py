@@ -366,6 +366,125 @@ class PDFParserTests(unittest.TestCase):
         self.assertEqual("left table cell 2", blocks[2].text)
         self.assertNotIn("pdf_layout_reading_order", blocks[0].metadata)
 
+    def test_layout_line_blocks_keep_encoded_narrow_space_glyphs_as_word_spaces(self) -> None:
+        # 10pt 한글 glyph 사이의 3.3pt 공백 glyph는 간격 휴리스틱 기준(3.5pt)보다 좁다.
+        page = _FakePdfPage(
+            width=600,
+            height=800,
+            lines=[[_fake_chars_with_glyph_spaces("제1조(목적) 이 규정은 복무를 정한다.", x=40, y=100)]],
+        )
+
+        blocks = PDFParser()._layout_line_blocks(page, 1)
+
+        self.assertEqual(["제1조(목적) 이 규정은 복무를 정한다."], [block.text for block in blocks])
+        self.assertEqual("제1조(목적) 이 규정은 복무를 정한다.", blocks[0].metadata["raw_text"])
+
+    def test_layout_line_blocks_do_not_infer_space_without_encoded_glyph(self) -> None:
+        # 같은 3.3pt 간격이라도 공백 glyph가 없으면 한글 단어 사이에 공백을 만들지 않는다.
+        page = _FakePdfPage(
+            width=600,
+            height=800,
+            lines=[[_fake_chars_with_glyph_spaces("가상공단 복무규정", x=40, y=100, space_char=None)]],
+        )
+
+        blocks = PDFParser()._layout_line_blocks(page, 1)
+
+        self.assertEqual(["가상공단복무규정"], [block.text for block in blocks])
+
+    def test_layout_line_blocks_ignore_synthetic_or_detached_space_glyphs(self) -> None:
+        synthetic = _fake_chars_with_glyph_spaces("가상공단 복무규정", x=40, y=100, synthetic=True)
+        detached = _fake_chars_with_glyph_spaces("직원복무 운영기준", x=40, y=140)
+        # 스트림상 직전 glyph 뒤에 오지만 다른 위치에 그려진 공백 glyph는 근거가 아니다.
+        detached[4] = {**detached[4], "bbox": (400.0, 140.0, 403.3, 150.0)}
+        page = _FakePdfPage(width=600, height=800, lines=[[synthetic], [detached]])
+
+        blocks = PDFParser()._layout_line_blocks(page, 1)
+
+        self.assertEqual(["가상공단복무규정", "직원복무운영기준"], [block.text for block in blocks])
+
+    def test_space_glyph_evidence_follows_char_through_visual_sorting(self) -> None:
+        chars = _fake_chars_with_glyph_spaces("가나 다라", x=40, y=100)
+        # 스트림 순서와 y 정렬 순서가 다른 경우에도 근거가 해당 문자와 함께 이동해야 한다.
+        chars[1] = {**chars[1], "bbox": (50.0, 99.4, 60.0, 109.4)}
+        chars[2] = {**chars[2], "bbox": (60.0, 99.4, 63.3, 109.4)}
+        page = _FakePdfPage(width=600, height=800, lines=[[chars]])
+
+        groups = PDFParser()._visual_char_groups(page)
+
+        self.assertEqual([["가", "나", "다", "라"]], [[str(item["c"]) for item in group] for group in groups])
+        self.assertEqual("가나 다라", PDFParser()._text_from_chars(groups[0], already_ordered=True))
+
+    def test_pdf_with_narrow_cjk_space_glyphs_keeps_word_spaces_across_pages_and_table(self) -> None:
+        try:
+            cjk_font = fitz.Font("cjk")
+        except Exception as exc:  # pragma: no cover - depends on the PyMuPDF build
+            self.skipTest(f"PyMuPDF built-in CJK font unavailable: {type(exc).__name__}")
+        if cjk_font.text_length(" ", 10.5) >= 10.5 * 0.35:
+            self.skipTest("PyMuPDF built-in CJK font does not have a narrow space glyph")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "narrow-space.pdf"
+            doc = fitz.open()
+            for page_index, lines in enumerate(_NARROW_SPACE_PAGES):
+                page = doc.new_page(width=595, height=842)
+                page.insert_font(fontname="K0", fontbuffer=cjk_font.buffer)
+                y = 80.0
+                for line in lines:
+                    page.insert_text((56, y), line, fontname="K0", fontsize=10.5)
+                    y += 20
+                if page_index == 0:
+                    word_width = cjk_font.text_length("가상공단", 10.5)
+                    page.insert_text((56, y), "가상공단", fontname="K0", fontsize=10.5)
+                    page.insert_text((56 + word_width + 2, y), "복무규정", fontname="K0", fontsize=10.5)
+                    y += 30
+                    for row in _NARROW_SPACE_TABLE:
+                        for x, cell in zip(_NARROW_SPACE_TABLE_COLUMNS, row):
+                            page.insert_text((x, y), cell, fontname="K0", fontsize=10.5)
+                        y += 20
+            doc.subset_fonts()
+            doc.save(path, garbage=3, deflate=True)
+            doc.close()
+            _skip_unless_rawdict_marks_encoded_spaces(self, path)
+
+            parsed = PDFParser().parse(path, "doc_narrow_space_pdf")
+
+        self.assertEqual(_expected_narrow_space_pages(), [[block.text for block in page.blocks] for page in parsed.pages])
+        self.assertIn("제1조(목적) 이 규정은 직원의 복무에 관한 사항을 정한다.", parsed.raw_text)
+        self.assertEqual("low", parsed.metadata["parser_uncertainty_risk_level"])
+
+    def test_reportlab_cid_font_pdf_keeps_third_em_word_spaces(self) -> None:
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+            from reportlab.pdfgen import canvas
+        except ImportError:
+            self.skipTest("reportlab is not installed")
+        font_name = "HYSMyeongJo-Medium"
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+        except Exception as exc:  # pragma: no cover - depends on reportlab CID data
+            self.skipTest(f"reportlab CID font unavailable: {type(exc).__name__}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cid-space.pdf"
+            pdf = canvas.Canvas(str(path))
+            for lines in _NARROW_SPACE_PAGES:
+                y = 760
+                for line in lines:
+                    pdf.setFont(font_name, 10.5)
+                    pdf.drawString(56, y, line)
+                    y -= 20
+                pdf.showPage()
+            pdf.save()
+            _skip_unless_rawdict_marks_encoded_spaces(self, path)
+
+            parsed = PDFParser().parse(path, "doc_cid_space_pdf")
+
+        self.assertEqual(
+            [list(lines) for lines in _NARROW_SPACE_PAGES],
+            [[block.text for block in page.blocks] for page in parsed.pages],
+        )
+
     def test_footnote_marker_references_count_unique_roman_markers_without_bottom_notes(self) -> None:
         page = _FakePdfPage(
             width=600,
@@ -527,6 +646,86 @@ def _fake_chars(text: str, *, x: float, y: float, width: float = 5.0) -> list[di
         chars.append({"c": char, "bbox": (cursor, y, cursor + width, y + 10)})
         cursor += width
     return chars
+
+
+def _fake_chars_with_glyph_spaces(
+    text: str,
+    *,
+    x: float,
+    y: float,
+    width: float = 10.0,
+    space_width: float = 3.3,
+    space_char: str | None = " ",
+    synthetic: bool = False,
+) -> list[dict]:
+    """Build rawdict chars whose word spaces are narrow encoded glyphs (or plain gaps)."""
+
+    chars = []
+    cursor = x
+    for char in text:
+        if char == " ":
+            if space_char is not None:
+                chars.append(
+                    {
+                        "c": space_char,
+                        "bbox": (cursor, y, cursor + space_width, y + 10),
+                        "synthetic": synthetic,
+                    }
+                )
+            cursor += space_width
+            continue
+        chars.append({"c": char, "bbox": (cursor, y, cursor + width, y + 10)})
+        cursor += width
+    return chars
+
+
+def _skip_unless_rawdict_marks_encoded_spaces(test_case: unittest.TestCase, path: Path) -> None:
+    """Skip when the installed PyMuPDF cannot tell encoded spaces from synthetic ones."""
+
+    with fitz.open(path) as doc:
+        raw = doc[0].get_text("rawdict")
+    space_chars = [
+        char
+        for block in raw.get("blocks", [])
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        for char in span.get("chars", [])
+        if not str(char.get("c") or "x").strip()
+    ]
+    if not space_chars:
+        test_case.skipTest("generated PDF has no whitespace glyphs in rawdict")
+    if not all("synthetic" in char for char in space_chars):
+        test_case.skipTest("installed PyMuPDF rawdict does not report the synthetic-space flag")
+
+
+_NARROW_SPACE_PAGES = (
+    (
+        "가상기관 복무규정",
+        "제1조(목적) 이 규정은 직원의 복무에 관한 사항을 정한다.",
+        "제2조(정의) 이 규정에서 사용하는 용어의 뜻은 다음과 같다.",
+    ),
+    (
+        "제3조(근무시간) ① 근무시간은 1일 8시간으로 한다.",
+        "② 부서장은 필요한 경우 근무시간을 조정할 수 있다.",
+    ),
+)
+_NARROW_SPACE_TABLE = (
+    ("구분", "근무 형태", "비고 사항"),
+    ("일반 직원", "주 5일 근무", "시차 출퇴근 가능"),
+)
+_NARROW_SPACE_TABLE_COLUMNS = (56, 200, 360)
+
+
+def _expected_narrow_space_pages() -> list[list[str]]:
+    return [
+        [
+            *_NARROW_SPACE_PAGES[0],
+            # 공백 glyph 없이 따로 배치된 한글 단어는 기존 간격 휴리스틱 결과를 유지한다.
+            "가상공단복무규정",
+            *[" ".join(row) for row in _NARROW_SPACE_TABLE],
+        ],
+        list(_NARROW_SPACE_PAGES[1]),
+    ]
 
 
 if __name__ == "__main__":
