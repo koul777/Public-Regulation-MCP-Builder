@@ -16,66 +16,51 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.processors.table_extractor import TableExtractor
 
 
-RUN_ROOT = PROJECT_ROOT / "reports" / "overnight_runs" / "20260714-140648"
-DEFAULT_CHUNKS_JSON = (
-    RUN_ROOT
-    / "tmp"
-    / "aks_reindexed_eval"
-    / "tenants"
-    / "tenant-aks-publish"
-    / "repository"
-    / "doc_035798a12673_chunks.json"
-)
-DEFAULT_OUT_JSON = RUN_ROOT / "parsing" / "aks_late_table_cases_eval.json"
-DEFAULT_OUT_MD = RUN_ROOT / "parsing" / "aks_late_table_cases_eval.md"
+# Case definitions describe one private regulation corpus (chunk id fragments,
+# page numbers, table titles), so they are never kept in public source. The
+# operator passes them as a JSON file next to the private runtime data:
+#
+#   [
+#     {
+#       "case_id": "allowance",
+#       "case_label": "수당 지급 기준표",
+#       "chunk_id_fragment": "p0123_001",
+#       "required_row_tokens": ["수당 지급 기준표", "구 분"]
+#     }
+#   ]
+CASE_REQUIRED_FIELDS = ("case_id", "case_label", "chunk_id_fragment", "required_row_tokens")
 
 
-CASES: list[dict[str, Any]] = [
-    {
-        "case_id": "qualification",
-        "case_label": "교수직 임용 자격 기준표",
-        "chunk_id_fragment": "5580_p775_001",
-        "required_row_tokens": ["교수직 임용 자격 기준표", "구 분 자 격"],
-    },
-    {
-        "case_id": "career_conversion",
-        "case_label": "연구직 경력기간 환산율표",
-        "chunk_id_fragment": "7008_p1063_001",
-        "required_row_tokens": ["연구직 경력기간 환산율표", "경 력 종 별 환산율"],
-    },
-    {
-        "case_id": "account_title",
-        "case_label": "계정과목 / 관항목해설",
-        "chunk_id_fragment": "9937_p1494_001",
-        "required_row_tokens": ["계 정 과 목", "관 항 목 해 설"],
-    },
-    {
-        "case_id": "allowance",
-        "case_label": "기타수당 지급 기준표",
-        "chunk_id_fragment": "7015_p1068_001",
-        "required_row_tokens": ["신분 및 복무 변동사항에 따른 기타수당 지급 기준표", "구 분 월정직책급 특정직무급 가족수당"],
-    },
-    {
-        "case_id": "record_retention_continuation",
-        "case_label": "기록물보존기간 기준표 연속 조각",
-        "chunk_id_fragment": "p1254_002",
-        "required_row_tokens": ["4-5-2 기록물관리규정", "3년 보존", "1년 보존"],
-    },
-    {
-        "case_id": "recruitment_sanction",
-        "case_label": "채용 비리 처리 기준",
-        "chunk_id_fragment": "5968_p848_001",
-        "required_row_tokens": ["채용 비리 처리 기준", "□ 채 용"],
-    },
-]
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate flattened late-table cases of one processed regulation corpus with the current parser. "
+            "All inputs and outputs are explicit so no private runtime path is built into public source."
+        )
+    )
+    parser.add_argument("--chunks-json", type=Path, required=True, help="Processed *_chunks.json of the corpus.")
+    parser.add_argument("--cases-json", type=Path, required=True, help="JSON array of case definitions.")
+    parser.add_argument("--out-json", type=Path, required=True)
+    parser.add_argument("--out-md", type=Path, required=True)
+    return parser.parse_args(argv)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate AKS late-table cases with the current parser.")
-    parser.add_argument("--chunks-json", type=Path, default=DEFAULT_CHUNKS_JSON)
-    parser.add_argument("--out-json", type=Path, default=DEFAULT_OUT_JSON)
-    parser.add_argument("--out-md", type=Path, default=DEFAULT_OUT_MD)
-    return parser.parse_args()
+def load_cases(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"{path} must contain a non-empty JSON array of cases.")
+    cases: list[dict[str, Any]] = []
+    for index, case in enumerate(payload):
+        if not isinstance(case, dict):
+            raise ValueError(f"Case #{index} in {path} must be an object.")
+        missing = [field for field in CASE_REQUIRED_FIELDS if not case.get(field)]
+        if missing:
+            raise ValueError(f"Case #{index} in {path} is missing: {', '.join(missing)}.")
+        tokens = case["required_row_tokens"]
+        if not isinstance(tokens, list) or not all(isinstance(token, str) and token for token in tokens):
+            raise ValueError(f"Case #{index} in {path}: required_row_tokens must be a list of strings.")
+        cases.append({field: case[field] for field in CASE_REQUIRED_FIELDS})
+    return cases
 
 
 def load_chunks(path: Path) -> list[dict[str, Any]]:
@@ -141,13 +126,14 @@ def classify_case(analysis: dict[str, Any]) -> str:
     return "ambiguous"
 
 
-def build_report(chunks_json: Path, out_json: Path, out_md: Path) -> dict[str, Any]:
+def build_report(chunks_json: Path, cases_json: Path, out_json: Path, out_md: Path) -> dict[str, Any]:
     extractor = TableExtractor()
     chunks = load_chunks(chunks_json)
+    cases = load_cases(cases_json)
     generated_at = datetime.now(timezone.utc).isoformat()
 
     case_rows: list[dict[str, Any]] = []
-    for case in CASES:
+    for case in cases:
         chunk = find_case_chunk(chunks, case)
         rows, text = chunk_text(chunk)
         analysis = extractor.analyze_text(text, chunk.get("chunk_type"))
@@ -182,9 +168,10 @@ def build_report(chunks_json: Path, out_json: Path, out_md: Path) -> dict[str, A
     flag_counts = Counter(flag for row in case_rows for flag in row["table_review_flags"])
 
     report = {
-        "report_type": "aks_late_table_cases_eval",
+        "report_type": "late_table_cases_eval",
         "generated_at": generated_at,
-        "source_chunks_json": str(chunks_json),
+        "source_chunks_json": chunks_json.name,
+        "source_cases_json": cases_json.name,
         "case_count": len(case_rows),
         "status_counts": dict(status_counts),
         "classification_counts": dict(classification_counts),
@@ -193,8 +180,8 @@ def build_report(chunks_json: Path, out_json: Path, out_md: Path) -> dict[str, A
         "ambiguous_case_count": status_counts["ambiguous"] + status_counts["ambiguous_review_required"],
         "cases": case_rows,
         "artifacts": {
-            "json": str(out_json),
-            "markdown": str(out_md),
+            "json": out_json.name,
+            "markdown": out_md.name,
         },
         "safety_note": (
             "Read-only evaluation artifact. It does not modify parser code, approve chunks, or change indexes."
@@ -210,7 +197,7 @@ def build_report(chunks_json: Path, out_json: Path, out_md: Path) -> dict[str, A
 
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [
-        "# AKS Late Table Case Evaluation",
+        "# Late Table Case Evaluation",
         "",
         f"- Generated at: {report['generated_at']}",
         f"- Source chunks: `{report['source_chunks_json']}`",
@@ -294,9 +281,9 @@ def md(value: Any) -> str:
     return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
-def main() -> int:
-    args = parse_args()
-    report = build_report(args.chunks_json, args.out_json, args.out_md)
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    report = build_report(args.chunks_json, args.cases_json, args.out_json, args.out_md)
     print(json.dumps({"out_json": str(args.out_json), "out_md": str(args.out_md), "case_count": report["case_count"]}, ensure_ascii=False))
     return 0
 
