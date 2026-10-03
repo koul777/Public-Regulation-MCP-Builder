@@ -67,3 +67,4 @@ vercel-mcp-stage-*/
 debug.log
 poc-*.png
 demo-video-skill/
+data/ai_review_preferences.json

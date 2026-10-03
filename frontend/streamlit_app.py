@@ -523,6 +523,35 @@ AI_REVIEW_STATUS_MESSAGES: dict[tuple[str, str], str] = {
 }
 
 
+AI_REVIEW_OUT_OF_SCOPE_LABEL = "AI 검수 대상 아님"
+
+
+def _ai_review_not_run_label(agent_review_summary: dict | None, *, settings_snapshot=None) -> str:
+    """조항에 AI 의견이 없는 이유를 실행 기록대로 짧게 돌려준다.
+
+    예전에는 AI 검수를 켜지 않고 전처리한 규정까지 'AI 검수 대상 아님'으로 표시했다.
+    그래서 나중에 AI를 켠 운영자는 화면만 보고 다시 전처리해야 한다는 것을 알 수 없었고,
+    '연결했는데 검수가 안 된다'는 문의가 반복됐다. 한도 밖 조항만 '대상 아님'으로 남긴다.
+    """
+    summary = agent_review_summary if isinstance(agent_review_summary, dict) else {}
+    status = str(summary.get("status") or "").strip()
+    reason = str(summary.get("skip_reason") or "").strip()
+    if not summary or not _agent_review_requested(summary) or reason in {
+        "agent_review_not_requested",
+        "agent_review_api_disabled",
+    } or status == "disabled":
+        current = settings_snapshot if settings_snapshot is not None else get_settings()
+        ready_now = bool(getattr(current, "enable_agent_review", False)) and not _ai_review_setup_blocker(current)
+        if ready_now:
+            return "AI 검수를 켜기 전에 전처리한 규정입니다. ①에서 다시 전처리하면 AI 의견이 붙습니다."
+        return "AI 검수 없이 전처리한 규정입니다. 왼쪽 'AI 검수'를 켠 뒤 ①에서 다시 전처리하세요."
+    if status == "api_configuration_needed":
+        return "AI 검수를 켰지만 API 키·모델 설정이 없어 실행되지 않았습니다. 설정 후 다시 전처리하세요."
+    if status == "provider_execution_blocked":
+        return "전송 전 안전 검사로 AI 호출이 막혔습니다. 사람이 직접 확인하세요."
+    return AI_REVIEW_OUT_OF_SCOPE_LABEL
+
+
 def _ai_review_scope_caption(agent_review_summary: dict | None) -> str:
     """AI 검수가 이 문서에서 어디까지 도는지 한 줄로 설명한다.
 
@@ -742,6 +771,11 @@ def _ai_review_work_rows(chunks: list, summary: dict) -> list[dict[str, object]]
     selected = _agent_review_selected_chunk_ids(summary)
     reviewed = _agent_review_reviewed_chunk_ids(summary)
     reused = _agent_review_candidate_chunk_ids(summary, "reused_candidates")
+    not_run_state = (
+        AI_REVIEW_OUT_OF_SCOPE_LABEL
+        if _ai_review_not_run_label(summary) == AI_REVIEW_OUT_OF_SCOPE_LABEL
+        else "AI 검수 없이 전처리됨 · 다시 전처리 필요"
+    )
     rows = []
     for chunk in chunks:
         chunk_id = str(chunk.chunk_id)
@@ -756,7 +790,7 @@ def _ai_review_work_rows(chunks: list, summary: dict) -> list[dict[str, object]]
         elif chunk_id in selected:
             state = "미완료 · 결과 없음"
         else:
-            state = "AI 검수 대상 아님"
+            state = not_run_state
         rows.append({
             "규정": _regulation_unit_label({
                 "number": str(metadata.get("regulation_no") or ""),
@@ -10868,7 +10902,7 @@ def _render_agent_review_findings(chunk, *, selected_for_review: bool, reviewed:
                 "왼쪽 사이드바 'AI 검수'에서 실행 상태를 확인하세요."
             )
         else:
-            st.caption("AI 검수 대상 아님")
+            st.caption(_ai_review_not_run_label(agent_review_summary))
         return
     risk = display.risk_level
     st.caption(f"위험도 {AGENT_REVIEW_RISK_MARKS.get(risk, '🟡 중간')}")
@@ -11752,6 +11786,15 @@ def _page_approval(ctx: dict | None) -> None:
     attention_ids = {str(chunk_id) for chunk_id in review_attention}
     ai_selected_chunk_ids = _agent_review_selected_chunk_ids(agent_review_summary)
     ai_reviewed_chunk_ids = _agent_review_reviewed_chunk_ids(agent_review_summary)
+    ai_not_run_notice = _ai_review_not_run_label(agent_review_summary)
+    if ai_not_run_notice != AI_REVIEW_OUT_OF_SCOPE_LABEL and not ai_reviewed_chunk_ids:
+        # 조항마다 같은 문구를 보기 전에, 이 규정 전체에 AI 의견이 없는 이유와 할 일을 먼저 알린다.
+        st.warning(f"🤖 {ai_not_run_notice}")
+        _render_workflow_next_button(
+            "①에서 이 규정 다시 전처리하기",
+            NAV_PREPROCESS,
+            key=f"approval-ai-not-run-reprocess-{document_id}",
+        )
     original_order = {cid: index for index, cid in enumerate(chunk_by_id)}
     ordered_compare_ids = sorted(
         chunk_by_id,
