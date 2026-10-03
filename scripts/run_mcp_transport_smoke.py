@@ -33,6 +33,12 @@ from scripts.report_metadata import (
 
 
 DEFAULT_SEARCH_QUERY = "Article"
+MISSING_HIERARCHY_REMEDIATION = (
+    "The MCP runtime hierarchy is missing for this data directory. Approved and indexed "
+    "data alone is not an MCP runtime: run the Builder's 'MCP로 쓸 파일 묶음 만들기' step "
+    "(scripts.generate_mcp_client_config.write_mcp_runtime_data_bundle) and point "
+    "--data-dir at the generated bundle's data folder."
+)
 TEMPORAL_REGULATION_TITLE = "MCP Smoke Regulation"
 TEMPORAL_REGULATION_ID = "reg_mcp_smoke"
 TEMPORAL_CURRENT_DOCUMENT_ID = "doc_mcp_smoke_v2"
@@ -257,6 +263,12 @@ def _run_transport_smoke_with_data_dir(
         "mcp_initialized": bool(full_profile.get("mcp_initialized")),
         "tools_discovered": bool(full_profile.get("tools_discovered")),
         "end_to_end_verified": bool(full_profile.get("end_to_end_verified")),
+        "hierarchical_index_ready": full_profile.get("hierarchical_index_ready"),
+        "remediation": (
+            MISSING_HIERARCHY_REMEDIATION
+            if full_profile.get("hierarchical_index_ready") is False
+            else None
+        ),
         "as_of_date_verification_passed": full_profile.get("as_of_date_verification_passed"),
         "preparation": {
             "passed": bool(preparation.get("passed")),
@@ -602,6 +614,7 @@ async def _call_profile_tools(
     reference_cycle_lookup_attempted = False
     reference_cycle_result_count = 0
     catalog_rows: list[Any] = []
+    hierarchical_index_ready: bool | None = None
     if "list_regulations" in tool_names:
         list_regulations_started_at = time.perf_counter()
         list_regulations = await session.call_tool(
@@ -617,6 +630,15 @@ async def _call_profile_tools(
         )
         list_regulations_result_count = len(catalog_rows)
         list_regulations_total_count = int(list_regulations_payload.get("total_count") or 0)
+        list_regulations_metadata = list_regulations_payload.get("metadata")
+        if isinstance(list_regulations_metadata, dict) and "hierarchical_index_ready" in list_regulations_metadata:
+            hierarchical_index_ready = bool(list_regulations_metadata.get("hierarchical_index_ready"))
+        elif list_regulations_payload.get("tool_is_error") and "hierarchy" in str(
+            list_regulations_payload.get("tool_error_text") or ""
+        ).lower():
+            # An official runtime whose generated hierarchy is missing or changed
+            # refuses the call instead of returning an empty catalog.
+            hierarchical_index_ready = False
         first_catalog_row = next(
             (
                 row
@@ -886,6 +908,7 @@ async def _call_profile_tools(
         "tool_profile": tool_profile,
         "tool_names": tool_names,
         "list_regulations_result_count": list_regulations_result_count,
+        "hierarchical_index_ready": hierarchical_index_ready,
         "list_regulations_total_count": list_regulations_total_count,
         "list_regulations_elapsed_ms": list_regulations_elapsed_ms,
         "hierarchy_verified": hierarchy_verified,
@@ -1271,7 +1294,16 @@ def _tool_payload(result: Any) -> dict[str, Any]:
     if isinstance(content, list) and content:
         text = getattr(content[0], "text", "")
         if text:
-            decoded = json.loads(text)
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                # A tool error comes back as plain text. Keep it as data so the
+                # report names the failing tool instead of dying inside the
+                # MCP client task group with an opaque ExceptionGroup.
+                return {
+                    "tool_error_text": str(text)[:1000],
+                    "tool_is_error": bool(getattr(result, "isError", False)),
+                }
             if isinstance(decoded, dict):
                 return decoded
     return {}

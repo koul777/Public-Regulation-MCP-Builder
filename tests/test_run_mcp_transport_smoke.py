@@ -239,6 +239,35 @@ class RunMcpTransportSmokeTests(unittest.TestCase):
         self.assertTrue(report["preparation"]["skipped"])
         self.assertEqual(before, after)
 
+    def test_missing_runtime_hierarchy_is_reported_with_remediation(self) -> None:
+        """Approved data without the MCP bundle step must fail clearly, not with a TaskGroup crash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            tenant_id = "tenant-mcp-transport-smoke"
+            run_mcp_smoke(
+                data_dir=data_dir,
+                tenant_id=tenant_id,
+                tenant_storage_isolation=True,
+                allow_persistent_smoke_data=True,
+            )
+            removed = [path for path in data_dir.rglob("regulation_hierarchy.sqlite3*")]
+            self.assertTrue(removed)
+            for path in removed:
+                path.unlink()
+
+            report = run_mcp_transport_smoke(
+                data_dir=data_dir,
+                tenant_id=tenant_id,
+                tenant_storage_isolation=True,
+                prepare=False,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["mcp_initialized"], report.get("error"))
+        self.assertNotIn("TaskGroup", str(report.get("error") or ""))
+        self.assertIs(report["hierarchical_index_ready"], False)
+        self.assertIn("MCP로 쓸 파일 묶음 만들기", report["remediation"])
+
     def test_explicit_runtime_with_preparation_requires_persistent_smoke_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
