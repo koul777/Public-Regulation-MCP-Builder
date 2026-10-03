@@ -1126,5 +1126,80 @@ class TableExtractorTests(unittest.TestCase):
         self.assertEqual(analysis["table_record_count"], 8)
 
 
+class TableExtractorExplicitRowBoundariesTests(unittest.TestCase):
+    """DOCX/HWPX 표 블록은 줄바꿈이 곧 행 경계이므로 호출자가 wrapped cell 병합을 끌 수 있다.
+
+    스위치는 호출 인자이며 추출기 인스턴스에 상태를 남기지 않는다. 표 블록(`table`)
+    문맥에만 적용하고, 텍스트로 배치한 별표(`appendix`)의 병합은 유지한다.
+    """
+
+    TABLE_TEXT = "\n".join(
+        [
+            "구분 | 합성 처리 기준",
+            "일반 휴가 | 신청서 제출 후 담당자 확인",
+            "긴급 휴가 | 담당자에게 먼저 알린 뒤 신청서 보완",
+        ]
+    )
+    MERGED_ROW = ["일반 휴가 긴급 휴가", "신청서 제출 후 담당자 확인 담당자에게 먼저 알린 뒤 신청서 보완"]
+
+    @staticmethod
+    def _cells(analysis: dict) -> list[list[str]]:
+        return [row["cells"] for row in analysis["table_cell_rows"]]
+
+    def test_table_context_merges_wrapped_rows_by_default(self) -> None:
+        analysis = TableExtractor().analyze_text(self.TABLE_TEXT, "table")
+
+        self.assertEqual(2, len(analysis["table_cell_rows"]))
+        self.assertIn(self.MERGED_ROW, self._cells(analysis))
+        self.assertIn("wrapped_cell_merge", analysis["table_review_flags"])
+
+    def test_explicit_row_boundaries_keep_table_context_rows_separate(self) -> None:
+        analysis = TableExtractor().analyze_text(
+            self.TABLE_TEXT, "table", explicit_row_boundaries=True
+        )
+
+        self.assertEqual(
+            [
+                ["구분", "합성 처리 기준"],
+                ["일반 휴가", "신청서 제출 후 담당자 확인"],
+                ["긴급 휴가", "담당자에게 먼저 알린 뒤 신청서 보완"],
+            ],
+            self._cells(analysis),
+        )
+        self.assertNotIn("wrapped_cell_merge", analysis["table_review_flags"])
+        self.assertTrue(
+            all("merged_from_row_indices" not in row for row in analysis["table_cell_rows"])
+        )
+
+    def test_explicit_row_boundaries_reach_extract_cell_rows_directly(self) -> None:
+        extractor = TableExtractor()
+        rows = extractor.extract_rows(self.TABLE_TEXT)
+
+        merged = extractor.extract_cell_rows(rows, "table")
+        separate = extractor.extract_cell_rows(rows, "table", explicit_row_boundaries=True)
+
+        self.assertEqual(2, len(merged))
+        self.assertEqual(3, len(separate))
+
+    def test_explicit_row_boundaries_do_not_change_appendix_context(self) -> None:
+        # 별표는 본문 줄과 공백으로 만든 텍스트 표일 수 있어 병합과 검수 플래그를 유지한다.
+        analysis = TableExtractor().analyze_text(
+            self.TABLE_TEXT, "appendix", explicit_row_boundaries=True
+        )
+
+        self.assertIn(self.MERGED_ROW, self._cells(analysis))
+        self.assertIn("wrapped_cell_merge", analysis["table_review_flags"])
+
+    def test_explicit_row_boundaries_is_per_call_and_leaves_no_state(self) -> None:
+        extractor = TableExtractor()
+
+        separate = extractor.analyze_text(self.TABLE_TEXT, "table", explicit_row_boundaries=True)
+        default_after = extractor.analyze_text(self.TABLE_TEXT, "table")
+
+        self.assertEqual(3, len(separate["table_cell_rows"]))
+        self.assertEqual(2, len(default_after["table_cell_rows"]))
+        self.assertIn("wrapped_cell_merge", default_after["table_review_flags"])
+
+
 if __name__ == "__main__":
     unittest.main()
