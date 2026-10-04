@@ -29,13 +29,27 @@
 **잘 모르겠어요 · 확인 방법 보기**를 펼치면 날짜·금액·표를 비교하는 방법을 알려 줍니다.
 확인이나 승인은 직접 해야 하며, **AI 제안을 최종본에 반영**을 눌러야 편집 칸에 들어갑니다.
 
+![안내 카드, 확인 방법 도움말, AI가 짚은 날짜 오류, 승인, 근거 조문이 붙은 Qwen 답변으로 이어지는 실제 화면 시연](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/beginner-guided-demo.gif)
+
+[**처음부터 끝까지 3분 시연 MP4 (자막 있음)**](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/download/beginner-demo-2026-10/beginner-guided-demo.mp4)
+
+기관 만들기 → 파일 올리기 → 전처리 → 한 조항씩 확인 → 승인 → Qwen 질문까지, 초보자 안내만 따라
+누른 실제 화면 녹화입니다. 가상 장비 대여규정을 썼고, AI 검수(`gpt-4.1-mini`)와 내 PC의 Qwen3 8B 답변은
+실제 실행 결과입니다. 기다리는 구간과 같은 확인이 반복되는 구간은 빠르게 재생했고 화면에 배속을 표시했습니다.
+어린이를 대상으로 한 사용성 시험은 아닙니다.
+
+<details>
+<summary>이전 쉬운 안내 24초 시연</summary>
+
 ![쉬운 버튼과 도움말로 진행하는 실제 화면 시연](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/d44fb1007bbb25611e5a7b693125a6628bc25f44/docs/assets/easier-beginner-demo.gif)
 
 [쉬운 안내 24초 시연 MP4](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/d44fb1007bbb25611e5a7b693125a6628bc25f44/docs/assets/easier-beginner-demo.mp4) ·
 [검토 내용과 실제 실행 결과](docs/easier_beginner_verification_ko.md)
 
 가상 규정을 사용한 실제 브라우저 녹화에서 도움말·조항 확인·최종 승인·AI 답변 장면을 원래 속도로 발췌했습니다.
-기다리는 구간과 일부 조항은 생략했습니다. 어린이를 대상으로 한 사용성 시험은 아닙니다.
+기다리는 구간과 일부 조항은 생략했습니다.
+
+</details>
 
 <details>
 <summary>이전 조항별 검토·저장된 AI 제안 표시 시연</summary>
