@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.gif" alt="Kordoc 4.16.0 연동, 초보자 클릭 안내, 문서와 표 구조화, 사람 승인, 로컬 Qwen과 MCP를 소개하는 20초 홍보 영상" width="960">
+  <img src="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-cinematic-trailer.gif" alt="규정 문서 구조화, AI 검수 의견, 사람 승인 도장, 로컬 Qwen과 MCP 연결, 로고로 이어지는 홍보 영상 하이라이트" width="960">
 </p>
 
-<p align="center"><strong>Kordoc 4.16.0 연동 · 초보자 클릭 안내 · 승인된 규정 기반 로컬 RAG</strong></p>
+<p align="center"><strong>구조화 · AI 검수 · 사람 승인 · 로컬 Qwen과 MCP 연결</strong></p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.mp4">20초 홍보 영상 MP4</a> ·
-  <a href="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-brand-trailer.png">정지 화면 보기</a> ·
+  <a href="https://github.com/koul777/Public-Regulation-MCP-Builder/releases/download/promo-trailer-2026-10/pr-mcp-builder-cinematic-trailer.mp4"><strong>66초 홍보 영상 MP4 (소리 있음)</strong></a> ·
+  <a href="https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/pr-mcp-builder-cinematic-trailer-poster.jpg">정지 화면 보기</a> ·
   <a href="#초보자-클릭-안내-시연">실제 사용 시연 바로 보기</a> ·
   <a href="#실행-방법-한눈에"><strong>실행 방법 바로 보기</strong></a>
 </p>
@@ -15,6 +15,7 @@
 
 최신 Kordoc **4.16.0** 연동과 설치 도구를 반영했습니다(2026년 9월 29일 확인).
 홍보 영상은 기능 소개이며, 아래 영상은 실제 앱의 클릭 과정을 녹화한 시연입니다.
+홍보 영상 속 규정과 질문은 가상 예시입니다. AI 검수 의견 장면만 합성 규정에 실제 `gpt-4.1-mini` 검수를 돌린 결과입니다.
 
 ## 초보자 클릭 안내 시연
 
