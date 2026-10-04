@@ -866,29 +866,12 @@ def _render_ai_review_sidebar(ctx: dict | None) -> None:
             value=feature_enabled,
             key="sidebar-ai-review-enabled",
             help="켜면 품질 검사·파서 경고에 걸린 의심 구간만 외부 AI로 보내 검수 초안을 만듭니다.",
+            on_change=_on_sidebar_ai_review_toggle,
         )
         if enable_choice and not feature_enabled:
             st.info("아직 켜지지 않았습니다. 아래 연결값을 입력하고 '저장하고 AI 검수 켜기'를 누르세요.")
 
         if not enable_choice:
-            if feature_enabled and st.button(
-                "끄고 저장",
-                key="sidebar-ai-review-disable",
-                width="stretch",
-            ):
-                _apply_ai_connection_settings(
-                    _ai_connection_overrides(
-                        settings,
-                        enabled=False,
-                        provider=normalize_agent_review_provider(settings.llm_provider),
-                        model=str(settings.agent_review_model or ""),
-                        api_key=_review_provider_key(
-                            settings, normalize_agent_review_provider(settings.llm_provider)
-                        ),
-                        base_url=str(settings.agent_review_api_base_url or ""),
-                    )
-                )
-                st.rerun()
             st.caption("꺼져 있으면 외부 전송 없이 파서 전처리본이 최종본입니다.")
         else:
             configured_provider = normalize_agent_review_provider(settings.llm_provider)
@@ -13307,6 +13290,41 @@ def _apply_ai_connection_settings(overrides: dict[str, object]) -> None:
     st.session_state.pop(OPEN_API_KEY_DIALOG_KEY, None)
     set_runtime_settings_overrides(**merged)
     _persist_ai_review_preferences(merged)
+
+
+def _on_sidebar_ai_review_toggle() -> None:
+    """사이드바 스위치를 바꾸는 순간 실제 설정에 반영한다.
+
+    스위치만 켜고 저장 버튼을 누르지 않으면 화면은 켜진 것처럼 보이는데 전처리는
+    'agent_review_not_requested'로 끝났다. 끄기는 언제나 바로 반영하고, 켜기는 .env 등으로
+    키·모델이 이미 갖춰져 실행할 수 있을 때만 바로 반영한다. 모자라면 스위치는 켜진 채
+    연결값 입력 칸을 보여 주고 저장 버튼에서 마무리한다.
+    """
+
+    enabled = bool(st.session_state.get("sidebar-ai-review-enabled"))
+    current = get_settings()
+    if enabled == bool(current.enable_agent_review) and (not enabled or not _ai_review_setup_blocker(current)):
+        return
+    provider = normalize_agent_review_provider(current.llm_provider)
+    if provider not in SUPPORTED_AGENT_REVIEW_PROVIDERS:
+        provider = "openai"
+    if provider == "azure-openai":
+        base_url = str(current.azure_openai_endpoint or "")
+    elif provider == "anthropic":
+        base_url = str(current.anthropic_api_base_url or "")
+    else:
+        base_url = str(current.agent_review_api_base_url or "")
+    overrides = _ai_connection_overrides(
+        current,
+        enabled=enabled,
+        provider=provider,
+        model=str(current.agent_review_model or ""),
+        api_key=_review_provider_key(current, provider),
+        base_url=base_url,
+    )
+    if enabled and _ai_review_setup_blocker(replace(current, **overrides)):
+        return
+    _apply_ai_connection_settings(overrides)
 
 
 def _review_api_connection_status(s) -> tuple[str, str]:
