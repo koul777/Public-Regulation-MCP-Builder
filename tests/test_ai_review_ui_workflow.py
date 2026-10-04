@@ -75,8 +75,11 @@ class AIReviewStatusTests(unittest.TestCase):
 
 
 @unittest.skipIf(AppTest is None, "Streamlit AppTest is unavailable")
-class AIReviewUIWorkflowTests(unittest.TestCase):
-    """Drive real UI + parser + HTTP transport with synthetic, local-only data."""
+class AIReviewUIFixture(unittest.TestCase):
+    """Drive real UI + parser + HTTP transport with synthetic, local-only data.
+
+    Holds no tests so other modules can reuse the fixture without rerunning these.
+    """
 
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -213,6 +216,9 @@ class AIReviewUIWorkflowTests(unittest.TestCase):
 
     def _work_table(self):
         return next(frame.value for frame in self.app.dataframe if "AI 작업 상태" in frame.value.columns)
+
+
+class AIReviewUIWorkflowTests(AIReviewUIFixture):
 
     def test_sidebar_configuration_partial_findings_and_reupload_retry(self) -> None:
         self.fail_first = True
