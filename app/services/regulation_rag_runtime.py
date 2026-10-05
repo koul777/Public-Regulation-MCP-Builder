@@ -620,12 +620,22 @@ def load_cached_bm25_index(
         cached = _RAG_BM25_INDEX_CACHE.get(path)
         if cached and cached[0] == signature:
             return cached[1]
-    index = load_bm25_index(path)
-    with _RAG_VECTOR_CACHE_LOCK:
-        if index is None:
+    try:
+        index = load_bm25_index(path, raise_on_unavailable=True)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        # Retry transient read failures or a partially written JSON document.
+        # Only a successfully read but unusable schema is negatively cached.
+        with _RAG_VECTOR_CACHE_LOCK:
             _RAG_BM25_INDEX_CACHE.pop(path, None)
-        else:
-            _RAG_BM25_INDEX_CACHE[path] = (signature, index)
+        return None
+    # A rejected schema is stable for the same file identity too. Otherwise an
+    # older bundle reparses its entire index on every search. Never publish a
+    # read that crossed a replacement; verified callers perform their own
+    # request-wide postflight when supplying a prevalidated signature.
+    if prevalidated_signature is None and path_signature(path) != signature:
+        return None
+    with _RAG_VECTOR_CACHE_LOCK:
+        _RAG_BM25_INDEX_CACHE[path] = (signature, index)
     return index
 
 
@@ -1133,6 +1143,42 @@ def runtime_approval_snapshot_file_signatures(
     }
 
 
+def _runtime_approval_document_scopes(
+    repository: Any,
+    document_ids: set[str],
+) -> dict[str, tuple[str, str]] | None:
+    """Read canonical scope from manifest-pinned documents without repository imports."""
+    documents: dict[str, Any] = {}
+    for path in (repository.manifest_path, repository.legacy_path):
+        if document_ids.issubset(documents):
+            break
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("documents"), dict):
+            return None
+        for document_id in document_ids - documents.keys():
+            if document_id in payload["documents"]:
+                # Manifest entries take precedence over legacy repository rows,
+                # including malformed entries, which must never fall open.
+                documents[document_id] = payload["documents"][document_id]
+    scopes: dict[str, tuple[str, str]] = {}
+    for document_id, document in documents.items():
+        if not isinstance(document, dict) or document.get("document_id") != document_id:
+            continue
+        tenant_id = document.get("tenant_id")
+        profile_id = document.get("profile_id")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            continue
+        if profile_id is not None and not isinstance(profile_id, str):
+            continue
+        scopes[document_id] = (tenant_id, str(profile_id or "").strip().casefold())
+    return scopes
+
+
 def load_runtime_approval_snapshot_sidecar(
     repository: Any,
     document_ids: list[str],
@@ -1231,6 +1277,9 @@ def load_runtime_approval_snapshot_sidecar(
         or payload.get("snapshot_count") != len(entries)
     ):
         return None
+    document_scopes = _runtime_approval_document_scopes(repository, requested_ids)
+    if document_scopes is None:
+        return None
     snapshot: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1238,6 +1287,9 @@ def load_runtime_approval_snapshot_sidecar(
         document_id = str(entry.get("document_id") or "")
         chunk_id = str(entry.get("chunk_id") or "")
         if document_id not in requested_ids or not chunk_id:
+            continue
+        scope = document_scopes.get(document_id)
+        if scope is None or scope[0] != auth.tenant_id:
             continue
         security_level = str(
             entry.get("security_level") or ""
@@ -1251,6 +1303,8 @@ def load_runtime_approval_snapshot_sidecar(
             "department_acl": department_acl_set(entry.get("department_acl")),
             "content_hash": str(entry.get("content_hash") or ""),
         }
+        if scope[1]:
+            snapshot[(document_id, chunk_id)]["document_profile_id"] = scope[1]
     return snapshot
 
 
@@ -1842,6 +1896,10 @@ def expected_vector_record_for_chunk(
 
     chunk_data = chunk.model_dump(mode="json")
     metadata = dict(chunk_data.get("metadata") or {})
+    document_profile = str(getattr(document, "profile_id", "") or "").strip().casefold()
+    chunk_profile = str(metadata.get("profile_id") or "").strip().casefold()
+    if document_profile and chunk_profile and document_profile != chunk_profile:
+        return None
     for key, value in {
         "institution_name": getattr(document, "institution_name", None),
         "apba_id": getattr(document, "apba_id", None),
@@ -2241,6 +2299,25 @@ def build_approval_snapshot(
     return snapshot
 
 
+def load_fresh_approval_snapshot(
+    repository: Any,
+    records: list[dict[str, Any]],
+    auth: AuthContext,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Read durable approval/review authority without sidecar or result caches."""
+    document_ids = sorted({
+        str(record.get("document_id") or (record.get("metadata") or {}).get("document_id") or "")
+        for record in records
+    } - {""})
+    signature = approval_snapshot_signature(repository, document_ids)
+    if signature is None:
+        return {}
+    snapshot = build_approval_snapshot(repository, document_ids, auth)
+    if approval_snapshot_signature(repository, document_ids) != signature:
+        return {}
+    return snapshot
+
+
 def load_cached_approval_snapshot(
     repository: Any,
     records: list[dict[str, Any]],
@@ -2340,25 +2417,6 @@ def record_visible_to_request(
     record_profile_id = str(
         metadata.get("profile_id") or record.get("profile_id") or ""
     ).strip()
-    if request.profile_id:
-        requested_profile_id = str(request.profile_id).strip().casefold()
-        if record_profile_id:
-            if record_profile_id.casefold() != requested_profile_id:
-                return False
-        else:
-            document = (
-                repository_cache.get_document(document_id)
-                if repository_cache is not None
-                else repository.get_document(document_id)
-            )
-            document_profile_id = str(
-                getattr(document, "profile_id", "") or ""
-            ).strip().casefold()
-            if (
-                not document_profile_id
-                or document_profile_id != requested_profile_id
-            ):
-                return False
     security_level = str(
         metadata.get("security_level") or ""
     ).strip().lower()
@@ -2377,6 +2435,30 @@ def record_visible_to_request(
     chunk_id = str(
         record.get("chunk_id") or metadata.get("chunk_id") or ""
     )
+    document = (
+        repository_cache.get_document(document_id)
+        if repository_cache is not None
+        else repository.get_document(document_id)
+    )
+    if (
+        document is None
+        or not resource_visible_to_tenant(document, auth.tenant_id)
+    ):
+        return False
+    document_profile_id = str(getattr(document, "profile_id", "") or "").strip().casefold()
+    indexed_profiles = {
+        str(value).strip().casefold()
+        for value in (metadata.get("profile_id"), record.get("profile_id"))
+        if str(value or "").strip()
+    }
+    if document_profile_id and any(
+        value != document_profile_id for value in indexed_profiles
+    ):
+        return False
+    if request.profile_id:
+        authoritative_profile = document_profile_id or record_profile_id.casefold()
+        if authoritative_profile != str(request.profile_id).strip().casefold():
+            return False
     if approval_snapshot is not None:
         current = approval_snapshot.get((document_id, chunk_id))
         if current is None:
@@ -2398,16 +2480,6 @@ def record_visible_to_request(
     ) != str(record.get("content_hash") or ""):
         return False
     if embedded_vector_integrity_reason(record):
-        return False
-    document = (
-        repository_cache.get_document(document_id)
-        if repository_cache is not None
-        else repository.get_document(document_id)
-    )
-    if (
-        document is None
-        or not resource_visible_to_tenant(document, auth.tenant_id)
-    ):
         return False
     chunk = current_repository_chunk(
         repository,
@@ -2435,6 +2507,50 @@ def record_visible_to_request(
     )
 
 
+def document_is_latest_catalog_version(
+    document_id: str,
+    *,
+    repository: Any,
+    auth: AuthContext,
+    as_of_date: str | None,
+    profile_id: str | None = None,
+) -> bool:
+    """Resolve currency from scoped document authority without scanning vectors."""
+    from app.core.tenant_access import resource_visible_to_tenant
+    from app.services.regulation_catalog_service import (
+        latest_active_version, latest_history_version, read_regulation_metadata,
+    )
+
+    document = repository.get_document(document_id)
+    if document is None or not resource_visible_to_tenant(document, auth.tenant_id):
+        return False
+    canonical = read_regulation_metadata(document)
+    if profile_id and canonical.profile_id and (
+        canonical.profile_id.casefold() != profile_id.strip().casefold()
+    ):
+        return False
+    if not (canonical.regulation_id and canonical.version and canonical.effective_from):
+        # Approved documents created before catalog metadata retain compatibility.
+        return True
+    siblings = repository.find_documents_by_regulation(
+        canonical.regulation_id,
+        profile_id=canonical.profile_id,
+        tenant_id=auth.tenant_id,
+    )
+    scoped_siblings = [
+        sibling
+        for sibling in siblings
+        if resource_visible_to_tenant(sibling, auth.tenant_id)
+        and str(read_regulation_metadata(sibling).profile_id or "").casefold()
+        == str(canonical.profile_id or "").casefold()
+        and str(read_regulation_metadata(sibling).regulation_id or "").casefold()
+        == canonical.regulation_id.casefold()
+    ]
+    selector = latest_history_version if as_of_date and as_of_date.strip() else latest_active_version
+    latest = selector(scoped_siblings, as_of=as_of_date)
+    return latest is not None and latest.document_id == document_id
+
+
 def load_visible_records(
     *,
     request: Any,
@@ -2447,6 +2563,7 @@ def load_visible_records(
     requested_department_ids_value: frozenset[str] | None = None,
     requested_department_ids: frozenset[str] | None = None,
     latest_only: bool = True,
+    use_cache: bool = True,
     visibility_checker: Callable[..., bool] | None = None,
     lifecycle_filter: Callable[..., list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -2461,6 +2578,13 @@ def load_visible_records(
     )
     visibility_checker = visibility_checker or record_visible_to_request
     lifecycle_filter = lifecycle_filter or filter_to_latest_active_versions
+    # A scoped result cache cannot establish family currency: another document
+    # may have become effective while this document and its approval stayed unchanged.
+    if latest_only and request.document_id and not document_is_latest_catalog_version(
+        str(request.document_id), repository=repository, auth=auth,
+        as_of_date=request.as_of_date, profile_id=request.profile_id,
+    ):
+        return []
     cache_key = (
         path_signature(local_vector_path(settings, auth)),
         id(approval_snapshot) if approval_snapshot is not None else None,
@@ -2480,11 +2604,12 @@ def load_visible_records(
         tuple(sorted(requested_departments)),
         latest_only,
     )
-    with _RAG_VISIBLE_RECORDS_CACHE_LOCK:
-        cached = _RAG_VISIBLE_RECORDS_CACHE.get(cache_key)
-        if cached is not None:
-            _RAG_VISIBLE_RECORDS_CACHE.move_to_end(cache_key)
-            return list(cached)
+    if use_cache:
+        with _RAG_VISIBLE_RECORDS_CACHE_LOCK:
+            cached = _RAG_VISIBLE_RECORDS_CACHE.get(cache_key)
+            if cached is not None:
+                _RAG_VISIBLE_RECORDS_CACHE.move_to_end(cache_key)
+                return list(cached)
     visible_records = [
         record
         for record in records
@@ -2504,12 +2629,13 @@ def load_visible_records(
             as_of=request.as_of_date,
             include_legacy=True,
         )
-    with _RAG_VISIBLE_RECORDS_CACHE_LOCK:
-        _RAG_VISIBLE_RECORDS_CACHE[cache_key] = list(visible_records)
-        _RAG_VISIBLE_RECORDS_CACHE.move_to_end(cache_key)
-        entry_limit = max(1, int(_RAG_VISIBLE_RECORDS_MAX_ENTRIES))
-        while len(_RAG_VISIBLE_RECORDS_CACHE) > entry_limit:
-            _RAG_VISIBLE_RECORDS_CACHE.popitem(last=False)
+    if use_cache:
+        with _RAG_VISIBLE_RECORDS_CACHE_LOCK:
+            _RAG_VISIBLE_RECORDS_CACHE[cache_key] = list(visible_records)
+            _RAG_VISIBLE_RECORDS_CACHE.move_to_end(cache_key)
+            entry_limit = max(1, int(_RAG_VISIBLE_RECORDS_MAX_ENTRIES))
+            while len(_RAG_VISIBLE_RECORDS_CACHE) > entry_limit:
+                _RAG_VISIBLE_RECORDS_CACHE.popitem(last=False)
     return visible_records
 
 

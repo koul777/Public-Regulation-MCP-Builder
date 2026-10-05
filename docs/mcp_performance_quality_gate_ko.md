@@ -112,6 +112,12 @@ flat 저장을 검사할 때는 위 명령의 `--tenant-storage-isolation`만 `-
 
 `process_wall_elapsed_ms`는 프로세스 생성, import, 설정·인증 구성, 첫 검색, 결과 집계, 프로세스 종료를 포함한다. `cold.search_elapsed_ms`는 child 내부의 첫 `search_regulations` 호출만 측정한다. `warm.search_elapsed_ms`는 같은 프로세스에서 뒤따른 호출 시간이다. `trace_timing_ms`는 검색 응답 metadata가 제공한 로드, 가시성 필터, scoring 등의 단계 시간을 집계한다.
 
+`--warm-iterations`가 0보다 크면 child가 warm 반복까지 마친 뒤 종료하므로
+`process_wall_elapsed_ms`에는 그 반복 시간도 포함된다. 첫 요청의 프로세스 전체
+지연을 비교할 때는 양쪽 모두 `--warm-iterations 0`으로 실행한다. warm 반복을
+포함한 실행은 cold 검색 내부 시간과 warm 검색 내부 시간을 따로 비교하며,
+전체 프로세스 시간을 순수한 첫 요청 지연으로 표시하지 않는다.
+
 여기서 cold는 **새 Python 프로세스와 새 애플리케이션 런타임**을 뜻한다. 운영체제 page cache, 디스크 cache, 백신 상태까지 초기화한 물리적 cold boot를 뜻하지 않는다. 기준선 비교 시 장비와 cache 정책을 동일하게 유지하고 이 한계를 기록한다.
 
 성능 child는 다음 설정 override를 항상 사용한다.
@@ -133,6 +139,34 @@ MCP 검색·조회 성능을 높일 때 승인 철회나 tenant/profile 경계 �
 - 경량 길이·형식 검사는 Pydantic을 import하지 않는 `app.core.input_limits`에 둔다. MCP/API의 공개 `Annotated`·`Field` schema는 별도 모듈에 두되 기존 최소·최대값과 JSON schema 계약은 바꾸지 않는다.
 
 이 구조에서 prevalidated identity는 같은 요청의 바깥쪽 postflight가 최종 변경 검사를 수행할 때만 전달할 수 있다. 호출자가 임의 path나 오래된 signature를 넣을 수 있는 범용 우회로를 만들거나, directory mtime·TTL만으로 승인 상태를 신뢰해서는 안 된다. 또한 runtime manifest가 strict reindex를 요구하면 성능 최적화를 이유로 해당 blocker를 완화하지 않는다.
+
+### 선택적 BM25 색인의 호환성과 검색 순위
+
+같은 승인 문서라도 코드가 요구하는 BM25 schema/structured metadata 버전과
+번들 색인 버전이 다르면 BM25 재정렬을 사용할 수 없다. 비교 전에
+`warm_mcp_runtime`의 `candidate_reranker_ready`도 확인한다. 문서 수가 같거나
+`catalog_toc_body` 전략이 선택됐다는 사실만으로 재정렬까지 같다고 판단하지 않는다.
+
+호환되지 않는 색인을 현재 형식으로 간주하거나 manifest 검사를 완화하지 않는다.
+선택적 BM25 재정렬을 사용할 수 없는 계층형 검색은 이미 허용된 후보의 기존
+`local-hash-embedding-v1` 벡터를 이용해 본문 일치도를 보완하고 규정명, 조항,
+별표·서식 및 부칙 참조에 대한 구조적 순위 보정을 적용한다. 이 벡터 계산은
+형태소 분석기나 의미 모델을 새로 적재하지 않으며 새 색인도 만들지 않는다.
+다른 모델, 비정상 차원·값 또는 정규화되지 않은 벡터는 사용하지 않는다.
+수치 벡터의 정규화 검사·0 좌표 제거만 실제 좌표값을 키로 제한된 캐시에 저장한다.
+이 캐시에는 문서 식별자나 승인 판단을 저장하지 않으며 값이 바뀌면 다시 계산한다.
+공통 토큰 확장은 128자 이하의 단어에 한해 최대 2,048개를 재사용한다.
+캐시에는 변경 불가능한 토큰 묶음을 저장하고 호출마다 새 목록을 반환하므로,
+한 요청이 결과 목록을 바꿔도 다른 요청의 토큰이나 중복 제거 옵션에 영향을 주지 않는다.
+계층형 검색 내부 trace의 `candidate_reranker`는 벡터를 사용하면 `local_hash_structured_query`,
+구조적 보정만 사용하면 `structured_query`다. 후보의 승인,
+기관, ACL, 최신 버전 범위는 바뀌지 않는다. 승인된 현재 형식 번들로 갱신하는
+절차의 검증 조건도 그대로 유지한다.
+
+정상적으로 읽었지만 지원하지 않는 색인은 파일 identity에 묶어 부정 캐시한다.
+같은 파일을 요청마다 읽고 JSON으로 해석하지 않으며, 교체·수정·삭제하면 다시
+검사한다. 읽기 오류나 미완성 JSON은 부정 캐시하지 않아 다음 요청에서 재시도한다.
+색인 읽기 전후 identity 검사와 MCP 요청의 postflight 검사는 유지한다.
 
 ### 2026-07-31 개발 비교 기록
 

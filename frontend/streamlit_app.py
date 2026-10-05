@@ -8364,17 +8364,11 @@ def _workflow_states(ctx: dict | None) -> list[bool]:
             or approval_evidence_complete
         )
     )
-    approval_and_index_complete = bool(
-        results_complete and approval_evidence_complete
-    )
-    if _ai_usage_path() == AI_USAGE_PATH_QWEN:
-        final_use_complete = bool(
-            approval_and_index_complete and all(_qwen_beginner_procedure_states(ctx))
-        )
-    else:
-        final_use_complete = bool(
-            approval_and_index_complete and _mcp_bundle_created(ctx)
-        )
+    # Both views use the same scope and bundle-revision-bound client acknowledgement.
+    # Keep the home card's quality/result presentation separate from handoff evidence.
+    guide_states = _beginner_guide_completed_steps(ctx)
+    approval_and_index_complete = bool(results_complete and guide_states[2])
+    final_use_complete = bool(approval_and_index_complete and guide_states[3])
     return [
         preprocessing_complete,
         results_complete,
@@ -8400,10 +8394,12 @@ def _next_action(ctx: dict | None) -> tuple[str, str]:
     if next_stage == WorkflowStage.USE:
         if _ai_usage_path() == AI_USAGE_PATH_QWEN:
             return ("로컬 Qwen 챗봇을 켜고 질문한 뒤 답변과 근거 조문을 함께 확인하세요.", NAV_MCP)
+        if _mcp_bundle_created(ctx):
+            return ("현재 MCP 설정 묶음이 준비됐습니다. ④ 화면에서 AI 앱 등록·연결 진단 후 실제 대화의 search·fetch 결과를 확인하고 확인란에 기록하세요.", NAV_MCP)
         return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. ChatGPT 웹 HTTPS 또는 Claude·Codex 연결용 ④ 단계입니다.", NAV_MCP)
     if _ai_usage_path() == AI_USAGE_PATH_QWEN:
-        return ("Qwen 답변과 근거 조문을 확인했습니다. ④ 화면에서 다음 질문을 이어가세요.", NAV_MCP)
-    return ("MCP 설정 묶음까지 생성됐습니다. ④ 화면에서 검색 점검과 연결 상태를 확인해 보세요.", NAV_MCP)
+        return ("Qwen 앱으로 이어갈 준비가 됐습니다. Qwen 창에서 질문하고 답변과 근거 조문을 함께 확인하세요.", NAV_MCP)
+    return ("현재 MCP의 실제 AI 대화 검색·조회 확인을 운영자가 기록했습니다. ④ 화면에서 연결 상태를 확인하고 다음 질문을 이어가세요.", NAV_MCP)
 
 
 # ---------------------------------------------------------------------------
@@ -12053,7 +12049,7 @@ def _page_approval(ctx: dict | None) -> None:
         st.rerun()
 
     if beginner_incomplete_ids:
-        # 초보자 화면은 한 조항씩 확인하는 흐름이 기본이다. 그래도 "AI가 검수한 대로 진행"을
+        # 초보자 화면은 한 조항씩 확인하는 흐름이 기본이다. 그래도 "미검수 일괄 승인"을
         # 택할 수 있어야 하므로, 사람 검수를 권하는 안내와 함께 한 번에 끝내는 길을 접어 둔다.
         # 누르면 일반 모드의 최종 확정과 같은 절차(저장 → 승인 → 색인)를 타고, 미검수 사실은
         # 기본 사유로 감사 기록에 남는다. 확인 완료 전에는 '승인하고 AI 질문 준비하기'를 보이지 않는다.
@@ -12067,7 +12063,9 @@ def _page_approval(ctx: dict | None) -> None:
             if shortcut_whole_file
             else f"남은 조항 {len(shortcut_entries):,}개"
         )
-        with st.expander(f"⏩ {shortcut_label}를 AI 검수 결과대로 한 번에 승인하기 (선택)", expanded=False):
+        with st.expander(f"⏩ {shortcut_label}를 한 번에 승인하기 (선택)", expanded=False):
+            ai_status_label, ai_status_message, _ai_executed = _ai_review_status_text(agent_review_summary)
+            st.caption(f"이 규정의 실행 기록: {ai_status_label} · {ai_status_message}")
             st.warning(
                 "⚠️ 사람이 마지막은 직접 검수하는 것을 추천드립니다. AI 검수는 볼 곳을 짚어 줄 뿐 "
                 "승인 판단을 대신하지 않습니다. 확인하지 않은 조항을 지금 한 번에 승인하면 "
@@ -12421,7 +12419,11 @@ def _page_approval(ctx: dict | None) -> None:
                     pending_sync_batch_ids
                 )
             workflow_review_entries.append((approval_ctx, pending_entries))
-            ai_complete = sum(bool(dict(entry["state"]).get("ai_confirmed")) for entry in pending_entries)
+            opinion_target_count = sum(bool(entry.get("item_ids")) for entry in pending_entries)
+            ai_complete = sum(
+                bool(entry.get("item_ids")) and bool(dict(entry["state"]).get("ai_confirmed"))
+                for entry in pending_entries
+            )
             human_complete = sum(bool(entry.get("human_confirmed")) for entry in pending_entries)
             ready_count = sum(bool(dict(entry["state"]).get("approve_enabled")) for entry in pending_entries)
             approval_ctx_chunks = list(approval_ctx["chunks"])
@@ -12435,7 +12437,8 @@ def _page_approval(ctx: dict | None) -> None:
                     "규정": _workflow_document_label(approval_ctx["document"]),
                     "전체 청크": len(approval_ctx_chunks),
                     "미승인": len(pending_entries),
-                    "AI 검수": f"{ai_complete}/{len(pending_entries)}",
+                    "AI 검수 실행": _ai_review_status_text(approval_ctx.get("agent_review_summary"))[0],
+                    "검수 의견 확인": f"{ai_complete}/{opinion_target_count}",
                     "사람 확인": f"{human_complete}/{len(pending_entries)}",
                     "승인 청크": approved_chunks,
                     "상태": (
@@ -15269,16 +15272,16 @@ def _page_connect(
                     bundle_state.get("connection_display_value") or ""
                 ),
             )
-            if mcp_beginner_mode:
-                st.markdown("### 마지막 확인: 실제 AI 대화에서 검색하기")
-                st.caption(
-                    "위의 앱 등록·활성화·연결 진단을 마친 뒤 새 AI 대화를 열어 "
-                    "search와 fetch를 차례로 호출하세요."
-                )
-                _render_beginner_connection_confirmation(
-                    document_id,
-                    scope=mcp_scope,
-                )
+            st.markdown("### 마지막 확인: 실제 AI 대화에서 검색하기")
+            st.caption(
+                "위의 앱 등록·활성화·연결 진단을 마친 뒤 새 AI 대화를 열어 "
+                "search와 fetch를 차례로 호출하세요. 확인란은 운영자가 직접 확인한 "
+                "결과를 기록하며, 앱이 실제 대화의 도구 실행을 자동 검증한 증거는 아닙니다."
+            )
+            _render_beginner_connection_confirmation(
+                document_id,
+                scope=mcp_scope,
+            )
         with st.expander("전산 담당자용 JSON/명령어 보기", expanded=False):
             if isinstance(mcp_quickstart, dict):
                 for warning in mcp_quickstart.get("warnings") or []:
@@ -16171,7 +16174,11 @@ with st.sidebar:
             workflow_states = _workflow_states(ctx)
             workflow_readiness = safe_summarize_workflow_readiness(workflow_states)
             if workflow_readiness.is_complete:
-                st.caption("진행 상태: 전체 4단계 완료")
+                st.caption(
+                    "진행 상태: 전체 4단계 완료 · Qwen 앱 인계 준비"
+                    if _ai_usage_path() == AI_USAGE_PATH_QWEN else
+                    "진행 상태: 전체 4단계 완료 · 운영자가 현재 MCP 연결을 직접 확인했다고 기록함"
+                )
             else:
                 next_stage = workflow_readiness.current_stage or WorkflowStage.USE
                 next_message, next_target = _next_action(ctx)

@@ -197,5 +197,47 @@ class ExportVectorDbIngestionTests(unittest.TestCase):
         self.assertEqual(manifest["summary"]["skipped_unapproved_count"], 1)
 
 
+
+class OfficialApprovedExportTests(unittest.TestCase):
+    def test_official_export_accepts_genuine_approved_record_and_rejects_tampered_payload(self) -> None:
+        import copy
+        from test_approval_validation import approved_ingestion_fixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, _repository, _auth, document, _chunk, exported, _record = approved_ingestion_fixture(root)
+            exports = root / "exports"
+            exports.mkdir()
+            chunks_path = exports / f"{document.document_id}.jsonl"
+            quality = exports / f"{document.document_id}.quality.json"
+            quality.write_text("{}", encoding="utf-8")
+            report = root / "batch.json"
+            report.write_text(json.dumps({"rows": [{"status": "completed", "document_id": document.document_id,
+                                                     "quality_json": str(quality)}]}), encoding="utf-8")
+            chunks_path.write_text(json.dumps(exported) + "\n", encoding="utf-8")
+            result = export_vectordb_ingestion(
+                report, out_jsonl=root / "approved.jsonl", out_manifest=root / "approved-manifest.json",
+                data_dir=settings.data_dir, tenant_id="tenant-a", require_repository_approval=True,
+            )
+            self.assertEqual(1, result["summary"]["record_count"])
+            for field, value in {"text": "changed text", "retrieval_text": "changed retrieval",
+                                 "department_acl": ["other-department"], "security_level": "public",
+                                 "profile_id": "profile-b"}.items():
+                with self.subTest(field=field):
+                    changed = copy.deepcopy(exported)
+                    if field == "profile_id":
+                        changed["metadata"][field] = value
+                    else:
+                        changed[field] = value
+                    chunks_path.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+                    rejected_output = root / f"rejected-{field}.jsonl"
+                    with self.assertRaises(ValueError):
+                        export_vectordb_ingestion(
+                            report, out_jsonl=rejected_output, out_manifest=root / f"rejected-{field}.json",
+                            data_dir=settings.data_dir, tenant_id="tenant-a", require_repository_approval=True,
+                        )
+                    self.assertFalse(rejected_output.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4980,5 +4980,279 @@ def _auth_context() -> AuthContext:
     )
 
 
+
+class RevisionIndexRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.settings = Settings(data_dir=self.root / "data", artifact_root=self.root,
+                                 tenant_storage_isolation=False, app_env="test")
+        self.repository = JsonRepository(self.settings)
+        self.auth = _auth_context()
+        self.settings_patch = patch.object(routes_documents, "get_settings", return_value=self.settings)
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+        for document_id, version, effective, status, prior in (
+            ("prior-revision", "v1", "2025-01-01", "approved", None),
+            ("pending-revision", "v2", "2026-01-01", "pending_approval", "prior-revision"),
+        ):
+            self.repository.upsert_document(Document(
+                document_id=document_id, filename="synthetic.pdf", document_name="Synthetic revision",
+                file_type="pdf", file_hash=f"synthetic-{version}", tenant_id="tenant-a", profile_id="profile-a",
+                regulation_id="synthetic-recovery", regulation_version=version,
+                effective_from=effective, revision_date=effective, regulation_status=status,
+                supersedes_document_id=prior, status="completed",
+            ))
+        self.repository.save_processing_result("pending-revision", [], [Chunk(
+            chunk_id="revision-article", document_id="pending-revision", chunk_type="article",
+            text="Synthetic revised article.", retrieval_text="Synthetic revised article.",
+            security_level="internal", metadata={"tenant_id": "tenant-a", "profile_id": "profile-a",
+                                                 "regulation_status": "pending_approval"},
+        )], [])
+        evidence = _write_approval_evidence(
+            self.root, settings=self.settings, document_id="pending-revision",
+            chunks=self.repository.get_chunks("pending-revision"),
+        )
+        self.request = routes_documents.ApprovalRequest(
+            chunk_ids=["revision-article"], approval_id="synthetic-revision-approval",
+            security_level="internal", **evidence,
+        )
+        with patch.object(routes_documents, "_run_document_indexing", side_effect=RuntimeError("synthetic first-index failure")):
+            with self.assertRaises(HTTPException) as failed:
+                routes_documents.approve_review_chunks("pending-revision", self.request, self.auth)
+        self.assertEqual(500, failed.exception.status_code)
+        self.assertTrue(failed.exception.detail["reindex_required"])
+        self.assertEqual(1, len(self.repository.list_approval_journal_records("pending-revision")))
+        self.assert_pending()
+
+    def assert_pending(self) -> None:
+        self.assertEqual("pending_approval", self.repository.get_document("pending-revision").regulation_status)
+        self.assertEqual("approved", self.repository.get_document("prior-revision").regulation_status)
+        self.assertIsNone(self.repository.get_document("prior-revision").effective_to)
+
+    def test_reindex_activates_failed_revision_only_after_success_and_preserves_journal(self) -> None:
+        result = routes_documents.reindex_document(
+            "pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth,
+        )
+        self.assertEqual("indexed", result["status"])
+        self.assertTrue(result["revision_activated"])
+        self.assertEqual("approved", self.repository.get_document("pending-revision").regulation_status)
+        self.assertEqual("superseded", self.repository.get_document("prior-revision").regulation_status)
+        self.assertEqual("2025-12-31", self.repository.get_document("prior-revision").effective_to)
+        self.assertEqual(1, len(self.repository.list_approval_journal_records("pending-revision")))
+        store = self.settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+        records = [json.loads(line) for line in store.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual("approved", records[0]["metadata"]["regulation_status"])
+
+    def test_default_approval_retry_recovers_without_duplicate_approval(self) -> None:
+        response = routes_documents.approve_review_chunks("pending-revision", self.request, self.auth)
+        self.assertTrue(response["recovery_retry"])
+        self.assertEqual("synthetic-revision-approval", response["approval_id"])
+        self.assertEqual("indexed", response["vector_sync"]["status"])
+        self.assertEqual("approved", self.repository.get_document("pending-revision").regulation_status)
+        self.assertEqual(1, len(self.repository.list_approval_journal_records("pending-revision")))
+        second = routes_documents.approve_review_chunks("pending-revision", self.request, self.auth)
+        self.assertTrue(second["recovery_retry"])
+        self.assertEqual(1, len(self.repository.list_approval_journal_records("pending-revision")))
+
+    def test_multibatch_recovery_returns_sync_event_for_requested_existing_approval(self) -> None:
+        chunks = self.repository.get_chunks("pending-revision")
+        chunks.append(Chunk(chunk_id="second-article", document_id="pending-revision", chunk_type="article",
+                            text="Synthetic second batch.", retrieval_text="Synthetic second batch.",
+                            security_level="internal", metadata={"tenant_id": "tenant-a", "profile_id": "profile-a",
+                                                                 "regulation_status": "pending_approval"}))
+        self.repository.save_chunks("pending-revision", chunks)
+        evidence = _write_approval_evidence(self.root, settings=self.settings, document_id="pending-revision", chunks=[chunks[-1]])
+        second_request = routes_documents.ApprovalRequest(chunk_ids=["second-article"], approval_id="second-approval",
+                                                          security_level="internal", **evidence)
+        with patch.object(routes_documents, "_run_document_indexing", side_effect=RuntimeError("synthetic second-batch index failure")):
+            with self.assertRaises(HTTPException):
+                routes_documents.approve_review_chunks("pending-revision", second_request, self.auth)
+        response = routes_documents.approve_review_chunks("pending-revision", self.request, self.auth)
+        self.assertEqual("synthetic-revision-approval", response["approval_id"])
+        event = next(event for event in self.repository.list_maintenance_events("approval_vector_sync_outcome")
+                     if event["event_id"] == response["vector_sync_event_id"])
+        self.assertEqual(response["approval_record_id"], event["approval_record_id"])
+        self.assertEqual("completed", event["outcome"])
+        self.assertEqual(2, len(self.repository.list_approval_journal_records("pending-revision")))
+
+    def test_recovery_dry_run_and_partial_approval_do_not_activate(self) -> None:
+        result = routes_documents.reindex_document(
+            "pending-revision", routes_documents.IndexRequest(embedding_dimensions=8, dry_run=True), self.auth,
+        )
+        self.assertEqual("not_indexed", result["status"])
+        self.assert_pending()
+        chunks = self.repository.get_chunks("pending-revision")
+        chunks.append(Chunk(chunk_id="still-draft", document_id="pending-revision", chunk_type="article",
+                            text="Unapproved synthetic article.", metadata={"tenant_id": "tenant-a"}))
+        self.repository.save_chunks("pending-revision", chunks)
+        routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+        self.assert_pending()
+
+    def test_recovery_missing_journal_snapshot_or_foreign_tenant_does_not_activate(self) -> None:
+        with patch.object(JsonRepository, "list_approval_journal_records", return_value=[]):
+            with self.assertRaises(HTTPException) as missing:
+                routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+            self.assertEqual(400, missing.exception.status_code)
+        self.assert_pending()
+        foreign = AuthContext(actor="other-reviewer", tenant_id="tenant-b", auth_mode="local", role="admin")
+        with self.assertRaises(HTTPException) as denied:
+            routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), foreign)
+        self.assertEqual(404, denied.exception.status_code)
+        record = self.repository.list_approval_journal_records("pending-revision")[0]
+        (self.settings.data_dir / record["snapshot"]).unlink()
+        with self.assertRaises(HTTPException) as snapshot:
+            routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+        self.assertEqual(400, snapshot.exception.status_code)
+        self.assert_pending()
+
+    def test_recovery_failed_upsert_does_not_activate_or_supersede(self) -> None:
+        class FailedTarget:
+            def upsert(self, *args, **kwargs):
+                raise RuntimeError("synthetic retry upsert failure")
+
+        with patch.object(routes_documents, "vector_upsert_target", return_value=FailedTarget()):
+            with self.assertRaises(HTTPException) as failed:
+                routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+            self.assertEqual(500, failed.exception.status_code)
+        self.assert_pending()
+        self.assertEqual([], self.repository.list_indexing_jobs("pending-revision"))
+
+    def test_recovery_rejects_changed_payload_or_newer_review_with_old_approval(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        chunk = self.repository.get_chunks("pending-revision")[0]
+        self.repository.save_chunks("pending-revision", [chunk.model_copy(update={"retrieval_text": "Tampered synthetic revision."})])
+        with self.assertRaises(HTTPException) as changed:
+            routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+        self.assertEqual(400, changed.exception.status_code)
+        self.assert_pending()
+        self.repository.save_chunks("pending-revision", [chunk])
+        self.repository.append_review_record({
+            "review_id": "newer-review", "document_id": "pending-revision", "tenant_id": "tenant-a",
+            "chunk_ids": [chunk.chunk_id], "action": "reject",
+            "reviewed_at": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
+        })
+        with self.assertRaises(HTTPException) as revoked:
+            routes_documents.approve_review_chunks("pending-revision", self.request, self.auth)
+        self.assertEqual(400, revoked.exception.status_code)
+        self.assert_pending()
+
+    def test_successful_upsert_cannot_activate_concurrently_changed_revision(self) -> None:
+        original_target_factory = routes_documents.vector_upsert_target
+
+        def mutating_target(*args, **kwargs):
+            target = original_target_factory(*args, **kwargs)
+            original_upsert = target.upsert
+
+            def upsert_then_edit(*upsert_args, **upsert_kwargs):
+                result = original_upsert(*upsert_args, **upsert_kwargs)
+                chunks = self.repository.get_chunks("pending-revision")
+                chunks[0].retrieval_text = "Concurrent synthetic review edit."
+                self.repository.save_chunks("pending-revision", chunks)
+                return result
+
+            class MutatingTarget:
+                def upsert(self, *upsert_args, **upsert_kwargs):
+                    return upsert_then_edit(*upsert_args, **upsert_kwargs)
+
+            return MutatingTarget()
+
+        with patch.object(routes_documents, "vector_upsert_target", side_effect=mutating_target):
+            with self.assertRaises(HTTPException):
+                routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+        self.assert_pending()
+        self.assertEqual("Concurrent synthetic review edit.", self.repository.get_chunks("pending-revision")[0].retrieval_text)
+
+    def test_pending_revision_without_failed_approval_evidence_is_not_activated(self) -> None:
+        with patch.object(JsonRepository, "list_maintenance_events", return_value=[]):
+            result = routes_documents.reindex_document(
+                "pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth,
+            )
+        self.assertEqual("indexed", result["status"])
+        self.assertNotIn("revision_activated", result)
+        self.assert_pending()
+
+    def test_recovery_reindex_reads_approval_snapshot_once(self) -> None:
+        record = self.repository.list_approval_journal_records("pending-revision")[0]
+        snapshot = (self.settings.data_dir / record["snapshot"]).resolve()
+        original_open = Path.open
+        loads = []
+
+        def counted_open(path, *args, **kwargs):
+            if path.resolve() == snapshot:
+                loads.append(path)
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", counted_open):
+            routes_documents.reindex_document("pending-revision", routes_documents.IndexRequest(embedding_dimensions=8), self.auth)
+        self.assertEqual(1, len(loads))
+
+    def test_chunks_for_indexing_uses_canonical_document_profile(self) -> None:
+        from app.ingestion.vector_adapter import vector_record_from_chunk
+
+        document = self.repository.get_document("pending-revision")
+        chunk = self.repository.get_chunks("pending-revision")[0]
+        chunk.metadata["profile_id"] = "profile-b"
+        prepared = routes_documents._chunks_for_indexing([chunk], document, self.auth)[0]
+        record = vector_record_from_chunk(prepared)
+        self.assertEqual("profile-a", record["metadata"]["profile_id"])
+        self.assertEqual("profile-b", chunk.metadata["profile_id"])
+
+
+
+class CanonicalReviewProfileTests(unittest.TestCase):
+    def test_review_profile_patch_remains_retrievable_in_canonical_profile_after_approval(self) -> None:
+        from app.mcp_server import regulation_tools
+        from app.services.regulation_rag_service import RegulationQuery, get_visible_records
+        from test_approval_validation import approved_ingestion_fixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, repository, auth, document, chunk, _exported, _record = approved_ingestion_fixture(root)
+            with patch.object(routes_documents, "get_settings", return_value=settings):
+                updated = routes_documents.update_review_chunk(
+                    document.document_id, chunk.chunk_id,
+                    routes_documents.ReviewChunkUpdateRequest(metadata_patch={"profile_id": "profile-b"}), auth,
+                )
+                self.assertEqual("profile-a", updated["chunk"]["metadata"]["profile_id"])
+                self.assertEqual("profile-a", repository.get_chunks(document.document_id)[0].metadata["profile_id"])
+                evidence = _write_approval_evidence(root, settings=settings, document_id=document.document_id,
+                                                    chunks=repository.get_chunks(document.document_id))
+                approved = routes_documents.approve_review_chunks(
+                    document.document_id, routes_documents.ApprovalRequest(
+                        chunk_ids=[chunk.chunk_id], approval_id="canonical-profile-reapproval",
+                        security_level="internal", review_flags_acknowledged=True, **evidence,
+                    ), auth,
+                )
+                routes_documents.index_document(document.document_id, routes_documents.IndexRequest(embedding_dimensions=8), auth)
+            approved_chunk = repository.get_chunks(document.document_id)[0]
+            snapshot = settings.data_dir / approved["snapshot"]
+            snapshot_chunk = json.loads(snapshot.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual("profile-a", approved_chunk.metadata["profile_id"])
+            self.assertEqual("profile-a", snapshot_chunk["metadata"]["profile_id"])
+            self.assertEqual(approved_chunk.approved_content_hash, approved["approved_content_hashes"][chunk.chunk_id])
+            own = get_visible_records(
+                query=RegulationQuery(query="Synthetic article", profile_id="profile-a", security_levels=["internal"]),
+                auth=auth, settings=settings, repository=repository,
+            )
+            foreign = get_visible_records(
+                query=RegulationQuery(query="Synthetic article", profile_id="profile-b", security_levels=["internal"]),
+                auth=auth, settings=settings, repository=repository,
+            )
+            self.assertEqual([document.document_id], [item["document_id"] for item in own])
+            self.assertEqual([], foreign)
+            result_id = regulation_tools._encode_result_id(document_id=document.document_id, chunk_id=chunk.chunk_id)
+            fetched = regulation_tools.fetch_regulation(
+                settings=settings, auth=auth, result_id=result_id, security_levels=["internal"], profile_id="profile-a",
+            )
+            self.assertTrue(fetched["text"])
+            with self.assertRaises(ValueError):
+                regulation_tools.fetch_regulation(
+                    settings=settings, auth=auth, result_id=result_id, security_levels=["internal"], profile_id="profile-b",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

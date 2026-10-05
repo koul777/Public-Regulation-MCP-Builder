@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +27,20 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         history_anchor = '<a id="update-history"></a>'
 
         self.assertTrue(readme.startswith('<p align="center">'))
-        self.assertLess(readme.index("docs/assets/pr-mcp-builder-brand-trailer.gif"), readme.index(product_heading))
+        hero_match = re.search(r"<img\b[^>]*>", readme, re.IGNORECASE)
+        self.assertIsNotNone(hero_match, "README must start with a hero image.")
+        hero_tag = hero_match.group(0) if hero_match else ""
+        self.assertLess(hero_match.start() if hero_match else len(readme), readme.index(product_heading))
+        source_match = re.search(r"\ssrc\s*=\s*([\"'])(.*?)\1", hero_tag, re.IGNORECASE | re.DOTALL)
+        alt_match = re.search(r"\salt\s*=\s*([\"'])(.*?)\1", hero_tag, re.IGNORECASE | re.DOTALL)
+        self.assertIsNotNone(source_match, "Hero image must reference its media asset.")
+        self.assertIsNotNone(alt_match, "Hero image must have descriptive alt text.")
+        self.assertTrue((alt_match.group(2) if alt_match else "").strip())
+        source = source_match.group(2) if source_match else ""
+        asset_match = re.search(r"(?:^|/)(docs/assets/[^/]+\.gif)$", unquote(urlsplit(source).path), re.IGNORECASE)
+        self.assertIsNotNone(asset_match, "Hero image must reference a repository docs/assets GIF.")
+        asset = REPO_ROOT / (asset_match.group(1) if asset_match else "")
+        self.assertTrue(asset.is_file(), "Referenced hero GIF must exist in the repository.")
         self.assertLess(readme.index("## 초보자 클릭 안내 시연"), readme.index("## 로컬 Qwen 질문 시연"))
         self.assertLess(readme.index(product_heading), readme.index(today_heading))
         self.assertIn('[업데이트 내역 보기](#update-history)', readme)

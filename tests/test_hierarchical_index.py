@@ -23,6 +23,7 @@ from uuid import uuid4
 from app.mcp_server import regulation_tools
 from app.retrieval import hierarchical_index as hierarchical_index_module
 from app.ingestion.vector_adapter import stable_content_hash
+from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, local_hash_embedding
 from app.core.config import Settings
 from app.mcp_server.regulation_tools import (
     get_regulation_article,
@@ -4557,6 +4558,91 @@ class HierarchicalIndexTests(unittest.TestCase):
         )
         self.assertIsNotNone(loaded)
         self.assertEqual("batch-chunk-1", loaded["chunk_id"])
+
+    def test_catalog_ranking_observes_changed_search_text_after_warmup(self) -> None:
+        row = {"title": "시설규정", "regulation_no": "7-2", "search_text": "시설 안전",
+               "revision_date": "2026-07-01"}
+        before = hierarchical_index._rank_versions("보관", ["보관"], [row])
+        self.assertEqual(0.0, before[0][0])
+        row["search_text"] = "시설 안전 보관"
+        after = hierarchical_index._rank_versions("보관", ["보관"], [row])
+        self.assertGreater(after[0][0], 0.0)
+
+    def test_search_without_bm25_keeps_exact_attachment_ranking_and_scope(self) -> None:
+        title = "시설관리규정"
+        records = [
+            _record("doc-allowed", "body", regulation_no="7-2", regulation_title=title,
+                    article_no="제2조", article_title="시설관리규정 별표2 기준",
+                    text="시설관리규정 별표2 기준 " * 20, revision_date="2026-07-01"),
+            _record("doc-allowed", "attachment", regulation_no="7-2", regulation_title=title,
+                    article_no="", article_title="", text="별표2 시설 점검 기준",
+                    revision_date="2026-07-01", chunk_type="appendix",
+                    metadata_updates={"appendix_refs": ["별표2"], "table_appendix_no": "별표2"}),
+            _record("doc-denied", "denied", regulation_no="9-1", regulation_title="비공개 시설규정",
+                    article_no="", article_title="", text="시설관리규정 별표2 기준 " * 30,
+                    revision_date="2026-07-01", chunk_type="appendix",
+                    metadata_updates={"appendix_refs": ["별표2"], "table_appendix_no": "별표2"}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "hierarchy.sqlite3"
+            build_hierarchical_runtime_index(index_path, records, tenant_id="tenant-a",
+                                             profile_id="institution-a", vector_offsets=offsets)
+            results, trace = search_hierarchical_records(
+                index_path, vector_path, query="시설관리규정 별표2 기준", top_k=3,
+                profile_id="institution-a", rerank_index=None,
+                allowed_unit_ids={regulation_unit_id_for(profile_id="institution-a",
+                    regulation_title=title, regulation_no="7-2")},
+            )
+        self.assertEqual("attachment", results[0][1]["chunk_id"])
+        self.assertEqual("structured_query", trace["candidate_reranker"])
+        self.assertEqual({"doc-allowed"}, {record["document_id"] for _, record in results})
+
+    def test_local_hash_fallback_only_receives_authorized_hierarchy_candidates(self) -> None:
+        query = "정기 안전 점검"
+        records = [
+            _record(
+                document_id, chunk_id, regulation_no=number, regulation_title=title,
+                article_no="제1조", article_title="점검", text=text,
+                revision_date="2026-07-01",
+            )
+            for document_id, chunk_id, number, title, text in (
+                ("doc-hash", "match", "7-2", "시설관리규정", query),
+                ("doc-hash", "other", "7-2", "시설관리규정", "정기 안전 점검 결과의 서식을 보관한다."),
+                ("doc-denied", "denied", "9-1", "비공개 점검규정", query),
+            )
+        ]
+        for record in records:
+            record["embedding_model"] = LOCAL_HASH_EMBEDDING_MODEL
+            record["embedding"] = local_hash_embedding(record["text"])
+        allowed_unit = regulation_unit_id_for(
+            profile_id="institution-a", regulation_title="시설관리규정", regulation_no="7-2"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vector_path = root / "vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = root / "hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path, records, tenant_id="tenant-a", profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+            with patch.object(
+                hierarchical_index, "rerank_fallback_candidates",
+                wraps=hierarchical_index.rerank_fallback_candidates,
+            ) as rerank:
+                results, trace = search_hierarchical_records(
+                    index_path, vector_path, query=query, top_k=5,
+                    profile_id="institution-a", allowed_unit_ids={allowed_unit},
+                )
+        self.assertEqual("match", results[0][1]["chunk_id"])
+        self.assertEqual("local_hash_structured_query", trace["candidate_reranker"])
+        self.assertEqual({"doc-hash"}, {r["document_id"] for _, r in results})
+        self.assertEqual(1, rerank.call_count)
+        candidates = rerank.call_args.args[1]
+        self.assertEqual({"match", "other"}, {r["chunk_id"] for _, r in candidates})
 
     def test_search_reranks_only_loaded_hierarchy_candidates_with_bm25(self) -> None:
         records = [

@@ -3,18 +3,24 @@
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
+import math
 import re
 from typing import Any
 import unicodedata
 
-from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, local_hash_embedding
+from app.ingestion.embedding_adapter import (
+    LOCAL_HASH_EMBEDDING_MODEL,
+    MAX_EMBEDDING_DIMENSIONS,
+    local_hash_embedding,
+)
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.retrieval.bm25_index import BM25_RETRIEVAL_MODEL, Bm25Index
 from app.retrieval.semantic_models import Qwen3EmbeddingAdapter, cosine_similarity, semantic_runtime_available
-from app.retrieval.tokenizer import tokenize
+from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL, tokenize
 
 
 LEXICAL_FALLBACK_MODEL = "token-lexical-fallback-v1"
+_ARTICLE_REFERENCE_PATTERN = re.compile(r"제\s*\d+\s*조(?:\s*의\s*\d+)?")
 _APPENDIX_FORM_MARKERS = ("\ubcc4\ud45c", "\ubcc4\uc9c0", "\uc11c\uc2dd")
 _NAMED_REGULATION_PATTERN = re.compile(
     r"(?<![0-9A-Za-z\uac00-\ud7a3])"
@@ -394,6 +400,7 @@ def _apply_query_boosts(
     scored: list[tuple[float, dict[str, Any]]],
     *,
     structured_context: _StructuredQueryContext | None = None,
+    tokenizer_model: str | None = None,
 ) -> list[tuple[float, dict[str, Any]]]:
     if not scored:
         return scored
@@ -402,7 +409,7 @@ def _apply_query_boosts(
         structured_context = _build_structured_query_context(query, scored)
     generic_appendix_form_query = (
         _is_appendix_form_query(compact_query)
-        and _is_generic_appendix_form_query(query)
+        and _is_generic_appendix_form_query(query, tokenizer_model=tokenizer_model)
         and not structured_context.matching_titles
     )
     boosted = [
@@ -453,6 +460,86 @@ def rerank_bm25_candidates(
         for base_score, record in scored
     ]
     return _apply_query_boosts(query, fused)
+
+
+def rerank_structured_candidates(
+    query: str,
+    scored: list[tuple[float, dict[str, Any]]],
+) -> list[tuple[float, dict[str, Any]]]:
+    """Preserve named regulation and locator ranking without a usable BM25 index.
+
+    Only the already-authorized input candidates are reordered. An absent or
+    incompatible optional index must not disable structural query matching.
+    """
+    return _apply_query_boosts(query, scored, tokenizer_model=FALLBACK_TOKENIZER_MODEL)
+
+
+def rerank_fallback_candidates(
+    query: str,
+    scored: list[tuple[float, dict[str, Any]]],
+) -> tuple[list[tuple[float, dict[str, Any]]], str]:
+    """Use existing local hash vectors and structure on authorized candidates.
+
+    A missing optional BM25 index must not discard either available signal.
+    Vector scoring never loads a semantic model, initializes Kiwi, builds an
+    index, or adds candidates. Unknown models and malformed vectors simply
+    retain their original lexical score. Visibility is still the caller's job.
+    """
+
+    query_vectors: dict[int, list[float]] = {}
+    fused: list[tuple[float, dict[str, Any]]] = []
+    used_local_hash = False
+    for base_score, record in scored:
+        embedding = record.get("embedding")
+        if (
+            record.get("embedding_model") != LOCAL_HASH_EMBEDDING_MODEL
+            or not isinstance(embedding, list)
+            or not 1 <= len(embedding) <= MAX_EMBEDDING_DIMENSIONS
+        ):
+            fused.append((base_score, record))
+            continue
+        sparse_vector = _local_hash_sparse_vector(embedding)
+        if sparse_vector is None:
+            fused.append((base_score, record))
+            continue
+        dimensions = len(embedding)
+        if dimensions not in query_vectors:
+            query_vectors[dimensions] = local_hash_embedding(query, dimensions=dimensions)
+        query_vector = query_vectors[dimensions]
+        similarity = round(sum(query_vector[position] * value for position, value in sparse_vector), 8)
+        fused.append((float(base_score) + max(-1.0, min(1.0, similarity)), record))
+        used_local_hash = True
+    return (
+        rerank_structured_candidates(query, fused),
+        "local_hash_structured_query" if used_local_hash else "structured_query",
+    )
+
+
+def _local_hash_sparse_vector(embedding: list[Any]) -> tuple[tuple[int, float], ...] | None:
+    # Checking types separately also prevents True from sharing a numeric
+    # cache key with 1. Arbitrary objects and oversized integers are rejected
+    # before they could be retained in the bounded cache.
+    if not set(map(type, embedding)).issubset((int, float)):
+        return None
+    values = tuple(embedding)
+    if not -1.0 <= min(values) <= max(values) <= 1.0:
+        return None
+    if len(values) > 1024:
+        return _normalized_sparse_hash_vector(values)
+    return _cached_sparse_hash_vector(values)
+
+
+def _normalized_sparse_hash_vector(values: tuple[float, ...]) -> tuple[tuple[int, float], ...] | None:
+    # A malformed optional vector must never dominate the lexical score.
+    norm_squared = sum(value * value for value in values)
+    if not math.isclose(norm_squared, 1.0, rel_tol=1e-4, abs_tol=1e-4):
+        return None
+    return tuple((position, value) for position, value in enumerate(values) if value)
+
+
+# Pure numeric transformation only: no record, identifier, visibility decision,
+# or query is retained. Both key dimensions and entry count are bounded.
+_cached_sparse_hash_vector = lru_cache(maxsize=256)(_normalized_sparse_hash_vector)
 
 
 def _promote_enumeration_definitions(
@@ -629,6 +716,33 @@ def _record_query_boost(
         metadata,
         context=structured_context,
     )
+    if (
+        "부칙" in compact
+        and metadata.get("chunk_type") == "supplementary_provision"
+        and (
+            structured_context is None
+            or not structured_context.matching_titles
+            or _cached_compact_match_text(
+                structured_context, str(metadata.get("regulation_title") or "")
+            ) in structured_context.matching_titles
+        )
+    ):
+        # An article mentioned in an effective-date question is a reference
+        # inside the supplementary provisions, not necessarily the body article
+        # being requested. Match full locators so 제7조 cannot match 제70조.
+        boost += 24.0
+        query_locators = {
+            re.sub(r"\s+", "", locator)
+            for locator in _ARTICLE_REFERENCE_PATTERN.findall(unicodedata.normalize("NFKC", query))
+        }
+        body_locators = {
+            re.sub(r"\s+", "", locator)
+            for locator in _ARTICLE_REFERENCE_PATTERN.findall(
+                unicodedata.normalize("NFKC", str(record.get("text") or ""))
+            )
+        }
+        if query_locators.intersection(body_locators):
+            boost += 24.0
     if "육아휴직" in compact:
         if "제29조" in blob and ("만 8세" in blob or "초등학교 2학년" in blob or "자녀를 양육" in blob):
             boost += 18.0
@@ -1049,7 +1163,7 @@ def _is_leave_foreign_travel_report_query(compact_query: str) -> bool:
     return "휴직자" in compact_query and "국외출국" in compact_query and "신고서" in compact_query
 
 
-def _is_generic_appendix_form_query(query: str) -> bool:
+def _is_generic_appendix_form_query(query: str, *, tokenizer_model: str | None = None) -> bool:
     normalized_query = unicodedata.normalize("NFKC", str(query or ""))
     if _NUMBERED_APPENDIX_FORM_PATTERN.search(normalized_query):
         return False
@@ -1057,7 +1171,7 @@ def _is_generic_appendix_form_query(query: str) -> bool:
         return False
     query_tokens = {
         token
-        for token in tokenize(normalized_query)
+        for token in tokenize(normalized_query, tokenizer_model=tokenizer_model)
         if len(str(token or "").strip()) > 1 and not str(token or "").strip().isdigit()
     }
     domain_tokens = {

@@ -4633,6 +4633,10 @@ print(json.dumps({
                 role="operator",
                 department_ids=["hr"],
             )
+            JsonRepository(settings).upsert_document(Document(
+                document_id="doc_governing", filename="synthetic.pdf", file_type="pdf", file_hash="synthetic",
+                tenant_id="tenant-a", profile_id="profile-a", status="completed",
+            ))
             target_record = {
                 "document_id": "doc_governing",
                 "chunk_id": "form-15",
@@ -4807,6 +4811,10 @@ print(json.dumps({
                 settings,
                 auth,
             )
+            JsonRepository(settings).upsert_document(Document(
+                document_id="doc-binding", filename="synthetic.pdf", file_type="pdf", file_hash="synthetic",
+                tenant_id="tenant-a", profile_id="profile-a", status="completed",
+            ))
             target_record = {
                 "document_id": "doc-binding",
                 "chunk_id": "chunk-binding",
@@ -5122,6 +5130,17 @@ print(json.dumps({
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             mcp_auth = mcp_auth_context(tenant_id="tenant-a")
+
+            repository = JsonRepository(settings)
+            for record in (superseded, current):
+                metadata = record["metadata"]
+                repository.upsert_document(Document(
+                    document_id=record["document_id"], filename="synthetic.pdf", file_type="pdf",
+                    file_hash=record["document_id"], tenant_id="tenant-a", profile_id="institution-a",
+                    regulation_id=metadata["regulation_id"], regulation_version=metadata["regulation_version"],
+                    regulation_status=metadata["regulation_status"], effective_from=metadata["effective_from"],
+                    effective_to=metadata["effective_to"],
+                ))
 
             def resolve(*_args, document_id: str, chunk_id: str, **_kwargs):
                 return superseded if document_id == "doc-old" else current
@@ -6013,6 +6032,10 @@ print(json.dumps({
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             auth = mcp_auth_context(tenant_id="tenant-a")
+            JsonRepository(settings).upsert_document(Document(
+                document_id="doc-a", filename="synthetic.pdf", file_type="pdf", file_hash="synthetic",
+                tenant_id="tenant-a", profile_id="profile-a", status="completed",
+            ))
             hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
             vector_path = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
             record = {
@@ -6091,6 +6114,10 @@ print(json.dumps({
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             auth = mcp_auth_context(tenant_id="tenant-a")
+            JsonRepository(settings).upsert_document(Document(
+                document_id="doc-a", filename="synthetic.pdf", file_type="pdf", file_hash="synthetic",
+                tenant_id="tenant-a", profile_id="profile-a", status="completed",
+            ))
             hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
             vector_path = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
             record = {
@@ -6175,6 +6202,10 @@ print(json.dumps({
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             auth = mcp_auth_context(tenant_id="tenant-a")
+            JsonRepository(settings).upsert_document(Document(
+                document_id="doc-a", filename="synthetic.pdf", file_type="pdf", file_hash="synthetic",
+                tenant_id="tenant-a", profile_id="profile-a", status="completed",
+            ))
             hierarchy_path = settings.data_dir / "hierarchy" / "regulations.sqlite"
             vector_path = (
                 settings.data_dir
@@ -8055,6 +8086,311 @@ def _save_document_with_chunks(
             auth,
         )
 
+
+class ApprovedReadVisibilityTests(unittest.TestCase):
+    """Synthetic approval fixtures; no real documents or human review evidence."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.settings = Settings(data_dir=self.root / "data", artifact_root=self.root,
+                                 tenant_storage_isolation=False)
+        self.repository = JsonRepository(self.settings)
+        self.approver = AuthContext(actor="test", tenant_id="tenant-a", auth_mode="local", role="admin")
+        self.reader = mcp_auth_context(tenant_id="tenant-a")
+
+    def _approved_document(self, document_id, *, version="v1", effective="2000-01-01",
+                           prior=None, table=False, chunk_profile=None):
+        self.repository.upsert_document(Document(
+            document_id=document_id, filename="synthetic.pdf", file_type="pdf", file_hash=document_id,
+            tenant_id="tenant-a", profile_id="profile-a", regulation_id="synthetic-regulation",
+            regulation_version=version, effective_from=effective, revision_date=effective,
+            regulation_status="pending_approval", supersedes_document_id=prior, status="completed",
+        ))
+        metadata = {
+            "tenant_id": "tenant-a", "profile_id": chunk_profile or "profile-a", "regulation_id": "synthetic-regulation",
+            "regulation_version": version, "effective_from": effective,
+            "regulation_status": "pending_approval", "article_no": "Article 1", "article_title": "Policy",
+        }
+        if table:
+            metadata.update(table_like=True, table_id="synthetic-table",
+                            table_rows=["Item | Value", "Leave | 5"])
+        chunks = [Chunk(chunk_id=document_id + "-chunk", document_id=document_id,
+                        chunk_type="table" if table else "article", text="Synthetic policy " + version,
+                        retrieval_text="Synthetic policy " + version, security_level="internal", metadata=metadata)]
+        self.repository.save_processing_result(document_id, [], chunks, [])
+        _approve_and_index_test_chunks(self.root, settings=self.settings, repository=self.repository,
+                                      document_id=document_id, chunks=chunks, auth=self.approver,
+                                      approval_id="approval-" + document_id)
+
+    def _table(self):
+        return get_table(settings=self.settings, auth=self.reader, document_id="table-doc",
+                         table_id="synthetic-table", profile_id="profile-a", security_levels=["internal"])["tables"]
+
+    def _fetch(self, document_id, *, as_of=None):
+        return fetch_regulation(
+            settings=self.settings, auth=self.reader,
+            result_id=regulation_tools._encode_result_id(document_id=document_id, chunk_id=document_id + "-chunk"),
+            profile_id="profile-a", security_levels=["internal"], as_of_date=as_of,
+        )
+
+    def test_table_requires_journal_after_successful_warm_read(self) -> None:
+        self._approved_document("table-doc", table=True)
+        self.assertEqual(1, len(self._table()))
+        (self.repository.root / "journals" / "approvals.jsonl").write_text("", encoding="utf-8")
+        self.assertEqual([], self.repository.list_approval_journal_records("table-doc"))
+        self.assertEqual([], self._table())
+
+    def test_table_latest_review_revokes_still_approved_chunk(self) -> None:
+        from datetime import datetime, timedelta
+
+        self._approved_document("table-doc", table=True)
+        self.assertEqual(1, len(self._table()))
+        approved_at = self.repository.list_approval_journal_records("table-doc")[-1]["approved_at"]
+        reviewed_at = datetime.fromisoformat(approved_at.replace("Z", "+00:00")) + timedelta(seconds=1)
+        self.repository.append_review_record({
+            "review_id": "synthetic-review", "tenant_id": "tenant-a", "document_id": "table-doc",
+            "chunk_ids": ["table-doc-chunk"], "reviewed_at": reviewed_at.isoformat(),
+        })
+        self.assertEqual("approved", self.repository.get_chunks("table-doc")[0].approval_status)
+        self.assertEqual([], self._table())
+
+    def test_flat_fetch_rejects_same_date_still_approved_sibling(self) -> None:
+        self._approved_document("prior")
+        self._approved_document("new", version="v2", prior="prior")
+        self.assertEqual("approved", self.repository.get_document("prior").regulation_status)
+        with patch.object(regulation_tools.routes_rag, "load_local_vector_records",
+                          side_effect=AssertionError("fetch must not scan all vectors")):
+            with self.assertRaises(ValueError):
+                self._fetch("prior")
+            self.assertEqual("new-chunk", self._fetch("new")["metadata"]["chunk_id"])
+
+    def test_flat_fetch_scheduled_version_and_scoped_siblings(self) -> None:
+        self._approved_document("prior")
+        self._approved_document("scheduled", version="v2", effective="2099-01-01", prior="prior")
+        for suffix, tenant, profile in (("tenant", "tenant-b", "profile-a"),
+                                        ("profile", "tenant-a", "profile-b")):
+            self.repository.upsert_document(Document(
+                document_id="other-" + suffix, filename="synthetic.pdf", file_type="pdf", file_hash=suffix,
+                tenant_id=tenant, profile_id=profile, regulation_id="synthetic-regulation",
+                regulation_version="v9", effective_from="2001-01-01", regulation_status="approved",
+            ))
+        self.assertEqual("prior-chunk", self._fetch("prior", as_of="2098-12-31")["metadata"]["chunk_id"])
+        with self.assertRaises(ValueError):
+            self._fetch("scheduled", as_of="2098-12-31")
+        with self.assertRaises(ValueError):
+            self._fetch("prior", as_of="2099-01-01")
+        self.assertEqual("scheduled-chunk", self._fetch("scheduled", as_of="2099-01-01")["metadata"]["chunk_id"])
+
+    def test_hierarchy_fetch_uses_authoritative_family_for_same_date_and_scheduled_versions(self) -> None:
+        self._approved_document("prior")
+        self._approved_document("new", version="v2", prior="prior")
+        self._approved_document("scheduled", version="v3", effective="2099-01-01", prior="new")
+        records = regulation_tools.routes_rag.load_local_vector_records(self.settings, self.reader)
+        by_document = {record["document_id"]: record for record in records}
+        snapshot = regulation_rag_runtime.build_approval_snapshot(self.repository, list(by_document), self.reader)
+        token = SimpleNamespace(index_identity=("index",), vector_identity=("vector",))
+        context = SimpleNamespace(
+            hierarchy_paths=(Path("synthetic-index"), Path("synthetic-vectors")), runtime_token=token,
+            authorization_identity=("authority",), prevalidated_sidecar_identity=("sidecar",),
+            postflight_is_current=lambda: True,
+        )
+        with patch.object(regulation_tools, "_resolve_mcp_profile_scope_with_runtime_token",
+                          return_value=("profile-a", token)), patch.object(
+            regulation_tools, "_verified_hierarchical_read_context", return_value=context,
+        ), patch.object(regulation_tools.routes_rag, "load_cached_runtime_approval_snapshot", return_value=snapshot), patch.object(
+            regulation_tools, "_load_cached_hierarchical_record_by_chunk",
+            side_effect=lambda **kwargs: by_document[kwargs["document_id"]],
+        ), patch.object(regulation_tools, "_visible_record_by_chunk",
+                        side_effect=AssertionError("must exercise hierarchy branch")):
+            for document_id, as_of, expected in (
+                ("prior", None, False), ("new", None, True),
+                ("new", "2098-12-31", True), ("scheduled", "2098-12-31", False),
+                ("new", "2099-01-01", False), ("scheduled", "2099-01-01", True),
+            ):
+                with self.subTest(document_id=document_id, as_of=as_of):
+                    record, _related = regulation_tools._visible_record_with_related_by_chunk(
+                        settings=self.settings, auth=self.reader, document_id=document_id,
+                        chunk_id=document_id + "-chunk", security_levels=["internal"],
+                        department_ids=[], profile_id="profile-a", as_of_date=as_of,
+                    )
+                    self.assertEqual(expected, record is not None)
+
+    def test_as_of_reads_superseded_interval_with_boundary_and_current_controls(self) -> None:
+        self._approved_document("prior")
+        self._approved_document("new", version="v2", effective="2001-01-01", prior="prior")
+        self.assertEqual("superseded", self.repository.get_document("prior").regulation_status)
+        self.assertEqual("prior-chunk", self._fetch("prior", as_of="2000-12-31")["metadata"]["chunk_id"])
+        for as_of in (None, "1999-12-31", "2001-01-01"):
+            with self.subTest(as_of=as_of), self.assertRaises(ValueError):
+                self._fetch("prior", as_of=as_of)
+        self.assertEqual("new-chunk", self._fetch("new", as_of="2001-01-01")["metadata"]["chunk_id"])
+        visible = regulation_tools.routes_rag.get_visible_records(
+            query=regulation_tools.routes_rag.RegulationQuery(query="policy", profile_id="profile-a",
+                                                              as_of_date="2000-12-31"),
+            auth=self.reader, settings=self.settings, repository=self.repository,
+        )
+        self.assertEqual(["prior"], [record["document_id"] for record in visible])
+
+
+    def _scoped_content(self, document_id, *, as_of=None):
+        scope = dict(settings=self.settings, auth=self.reader, document_id=document_id,
+                     profile_id="profile-a", security_levels=["internal"], as_of_date=as_of)
+        return {
+            "document": get_document(**scope)["chunks"],
+            "article": get_article(**scope, article_no="Article 1")["articles"],
+            "table": get_table(**scope, table_id="synthetic-table")["tables"],
+            "search": search_regulations(**scope, query="Synthetic policy")["results"],
+        }
+
+    def test_document_scoped_content_rejects_same_date_sibling_and_keeps_current(self) -> None:
+        self._approved_document("prior", table=True)
+        for tool, rows in self._scoped_content("prior").items():
+            with self.subTest(stage="warm", tool=tool):
+                self.assertTrue(rows)
+        self._approved_document("new", version="v2", prior="prior", table=True)
+        self.assertEqual("approved", self.repository.get_document("prior").regulation_status)
+        for tool, rows in self._scoped_content("prior").items():
+            with self.subTest(stage="obsolete", tool=tool):
+                self.assertEqual([], rows)
+        for tool, rows in self._scoped_content("new").items():
+            with self.subTest(stage="current", tool=tool):
+                self.assertTrue(rows)
+
+    def test_document_scoped_content_allows_explicit_historical_interval(self) -> None:
+        self._approved_document("prior", table=True)
+        self._approved_document("new", version="v2", effective="2001-01-01", prior="prior", table=True)
+        for as_of, expected in ((None, False), ("2000-12-31", True), ("2001-01-01", False)):
+            for tool, rows in self._scoped_content("prior", as_of=as_of).items():
+                with self.subTest(as_of=as_of, tool=tool):
+                    self.assertEqual(expected, bool(rows))
+
+    def test_scoped_rag_rechecks_family_and_preserves_history_bypass(self) -> None:
+        self._approved_document("prior")
+        query = regulation_tools.routes_rag.RegulationQuery(query="policy", document_id="prior", profile_id="profile-a")
+        kwargs = dict(query=query, auth=self.reader, settings=self.settings, repository=self.repository)
+        self.assertEqual(1, len(regulation_tools.routes_rag.get_visible_records(**kwargs)))
+        self._approved_document("new", version="v2", prior="prior")
+        self.assertEqual([], regulation_tools.routes_rag.get_visible_records(**kwargs))
+        historical = regulation_tools.routes_rag.get_visible_records(**kwargs, latest_only=False)
+        self.assertEqual(["prior"], [record["document_id"] for record in historical])
+
+    def test_hierarchy_document_reads_and_search_recheck_scoped_family(self) -> None:
+        self._approved_document("prior")
+        self._approved_document("new", version="v2", prior="prior")
+        self._approved_document("scheduled", version="v3", effective="2099-01-01", prior="new")
+        records = regulation_tools.routes_rag.load_local_vector_records(self.settings, self.reader)
+        by_document = {record["document_id"]: record for record in records}
+        snapshot = regulation_rag_runtime.build_approval_snapshot(self.repository, list(by_document), self.reader)
+        paths = (self.root / "synthetic-index", self.root / "synthetic-vectors")
+        token = SimpleNamespace(index_identity=("index",), vector_identity=("vector",))
+        context = SimpleNamespace(
+            hierarchy_paths=paths, runtime_token=token, prevalidated_sidecar_identity=("sidecar",),
+            verified_vector_cache_namespace=None, postflight_is_current=lambda: True,
+        )
+        def search_rows(*_args, **kwargs):
+            return [(1.0, by_document[kwargs["document_id"]])], {
+                "retrieval_model": "synthetic", "retrieval_strategy": "synthetic",
+                "candidate_regulations": [],
+            }
+        with patch.object(regulation_tools, "_resolve_mcp_profile_scope", return_value="profile-a"), patch.object(
+            regulation_tools, "_verified_hierarchical_runtime_paths", return_value=paths,
+        ), patch.object(regulation_tools, "_verified_hierarchical_read_context", return_value=context), patch.object(
+            regulation_tools, "_verified_hierarchical_runtime_bm25", return_value=None,
+        ), patch.object(regulation_tools, "_fully_visible_regulation_units", return_value={"synthetic"}), patch.object(
+            regulation_tools, "search_hierarchical_records", side_effect=search_rows,
+        ), patch.object(regulation_tools, "load_hierarchical_document_records",
+                        side_effect=lambda *_args, **kwargs: [by_document[kwargs["document_id"]]]), patch.object(
+            regulation_tools.routes_rag, "path_signature", return_value=("stable",),
+        ), patch.object(regulation_tools.routes_rag, "runtime_approval_snapshot_identity", return_value=("authority",)), patch.object(
+            regulation_tools.routes_rag, "load_cached_runtime_approval_snapshot", return_value=snapshot,
+        ), patch.object(regulation_tools.routes_rag, "get_visible_records",
+                        side_effect=AssertionError("must exercise hierarchy document branch")):
+            for document_id, as_of, expected in (
+                ("prior", None, False), ("new", None, True),
+                ("new", "2098-12-31", True), ("scheduled", "2098-12-31", False),
+                ("new", "2099-01-01", False), ("scheduled", "2099-01-01", True),
+            ):
+                with self.subTest(document_id=document_id, as_of=as_of):
+                    visible = regulation_tools._visible_records(
+                        settings=self.settings, auth=self.reader, document_id=document_id,
+                        security_levels=["internal"], profile_id="profile-a", as_of_date=as_of,
+                    )
+                    self.assertEqual(expected, bool(visible))
+                    result = regulation_tools._search_hierarchical_runtime(
+                        settings=self.settings, auth=self.reader,
+                        query=regulation_tools.routes_rag.RegulationQuery(
+                            query="policy", document_id=document_id, profile_id="profile-a", as_of_date=as_of,
+                        ), runtime_token=token,
+                    )
+                    self.assertIsNotNone(result)
+                    self.assertEqual(expected, bool(result[0]))
+            visible = regulation_tools._visible_records(
+                settings=self.settings, auth=self.reader, document_id="prior", security_levels=["internal"],
+                profile_id="profile-a", latest_only=False,
+            )
+            self.assertEqual(["prior"], [record["document_id"] for record in visible])
+
+    def _legacy_hierarchy_bundle(self, *, profile_id="profile-a", document_tenant="tenant-a"):
+        from app.ingestion.vector_adapter import vector_record_from_chunk
+
+        # Simulate an internally consistent bundle written before canonical
+        # document profile enforcement, with genuine synthetic approval evidence.
+        self._approved_document("legacy-profile", chunk_profile=profile_id)
+        chunk = self.repository.get_chunks("legacy-profile")[0]
+        exported = chunk.model_dump(mode="json")
+        exported["tenant_id"] = "tenant-a"
+        record = vector_record_from_chunk(exported)
+        self.assertIsNotNone(record)
+        self.assertEqual(profile_id, record["metadata"]["profile_id"])
+        if document_tenant != "tenant-a":
+            document = self.repository.get_document("legacy-profile")
+            document.tenant_id = document_tenant
+            self.repository.upsert_document(document)
+        vector_path = regulation_tools.routes_rag.local_vector_path(self.settings, self.reader)
+        offsets = write_vector_records_with_offsets(vector_path, [record])
+        hierarchy = build_hierarchical_runtime_index(
+            hierarchical_index_path(self.settings.data_dir), [record], tenant_id="tenant-a",
+            profile_id=profile_id, vector_offsets=offsets,
+        )
+        _write_runtime_approval_snapshot_sidecar(self.settings.data_dir, [record], tenant_id="tenant-a")
+        manifest_path = self.settings.data_dir / "mcp_runtime_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(profile_id=profile_id, hierarchical_index_status="ready",
+                        files={"hierarchical_index_sha256": hierarchy["sha256"]})
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return record
+
+    def _assert_cold_and_warm_hierarchy_scope(self, record, *, profile_id, expected_count):
+        with patch.object(regulation_tools.routes_rag, "load_local_vector_records",
+                          side_effect=AssertionError("sidecar authorization must not scan vectors")), patch.object(
+            regulation_tools, "_json_repository",
+            side_effect=AssertionError("sidecar authorization must not initialize a live repository"),
+        ), patch.object(regulation_rag_runtime, "_runtime_approval_document_scopes",
+                        wraps=regulation_rag_runtime._runtime_approval_document_scopes) as load_scopes:
+            for cache_state in ("cold", "warm"):
+                with self.subTest(cache_state=cache_state):
+                    result = search_regulations(
+                        settings=self.settings, auth=self.reader, query=record["text"],
+                        profile_id=profile_id, security_levels=["internal"],
+                    )
+                    self.assertEqual(expected_count, len(result["results"]))
+                    self.assertEqual("catalog_toc_body", result["metadata"]["retrieval_strategy"])
+            self.assertEqual(1, load_scopes.call_count)
+
+    def test_legacy_hierarchy_profile_mismatch_is_denied_cold_and_warm(self) -> None:
+        record = self._legacy_hierarchy_bundle(profile_id="profile-b")
+        self.assertEqual("profile-a", self.repository.get_document("legacy-profile").profile_id)
+        self._assert_cold_and_warm_hierarchy_scope(record, profile_id="profile-b", expected_count=0)
+
+    def test_valid_hierarchy_sidecar_stays_visible_cold_and_warm(self) -> None:
+        record = self._legacy_hierarchy_bundle()
+        self._assert_cold_and_warm_hierarchy_scope(record, profile_id="profile-a", expected_count=1)
+
+    def test_hierarchy_sidecar_cannot_override_canonical_document_tenant(self) -> None:
+        record = self._legacy_hierarchy_bundle(document_tenant="tenant-b")
+        self._assert_cold_and_warm_hierarchy_scope(record, profile_id="profile-a", expected_count=0)
 
 if __name__ == "__main__":
     unittest.main()

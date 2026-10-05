@@ -403,5 +403,113 @@ class RegulationRagRuntimeTests(unittest.TestCase):
             self.assertIs(sentinel, loaded_second)
             self.assertEqual(1, load_index.call_count)
 
+    def test_rejected_bm25_index_is_cached_until_file_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bm25.json"
+            path.write_text('{"index_version":"reg-rag-bm25-index-v2"}', encoding="utf-8")
+            with patch.object(runtime, "load_bm25_index", wraps=runtime.load_bm25_index) as loader:
+                self.assertIsNone(runtime.load_cached_bm25_index(path))
+                self.assertIsNone(runtime.load_cached_bm25_index(path))
+                self.assertEqual(1, loader.call_count)
+
+            original_stat = path.stat()
+            replacement = path.with_suffix(".replacement")
+            replacement.write_bytes(path.read_bytes())
+            os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            replacement.replace(path)
+            sentinel = object()
+            with patch.object(runtime, "load_bm25_index", return_value=sentinel) as loader:
+                self.assertIs(sentinel, runtime.load_cached_bm25_index(path))
+                self.assertEqual(1, loader.call_count)
+            path.unlink()
+            self.assertIsNone(runtime.load_cached_bm25_index(path))
+            self.assertNotIn(path, runtime._RAG_BM25_INDEX_CACHE)
+
+    def test_bm25_read_crossing_replacement_is_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bm25.json"
+            before = (1, 20, 3, 4)
+            after = (1, 20, 5, 6)
+            stale, fresh = object(), object()
+            with patch.object(runtime, "path_signature", side_effect=[before, after, after, after]), patch.object(
+                runtime, "load_bm25_index", side_effect=[stale, fresh]
+            ) as loader:
+                self.assertIsNone(runtime.load_cached_bm25_index(path))
+                self.assertNotIn(path, runtime._RAG_BM25_INDEX_CACHE)
+                self.assertIs(fresh, runtime.load_cached_bm25_index(path))
+                self.assertEqual(2, loader.call_count)
+
+    def test_bm25_transient_read_failure_is_retried_without_identity_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bm25.json"
+            path.write_text("{}", encoding="utf-8")
+            sentinel = object()
+            with patch.object(runtime, "load_bm25_index", side_effect=[OSError("busy"), sentinel]) as loader:
+                self.assertIsNone(runtime.load_cached_bm25_index(path))
+                self.assertNotIn(path, runtime._RAG_BM25_INDEX_CACHE)
+                self.assertIs(sentinel, runtime.load_cached_bm25_index(path))
+                self.assertEqual(2, loader.call_count)
+
+    def test_snapshot_authority_cannot_override_canonical_document_profile(self) -> None:
+        from app.core.security_primitives import AuthContext
+        from app.schemas.document import Document
+
+        document = Document(document_id="doc-a", filename="synthetic.pdf", file_type="pdf",
+                            file_hash="synthetic", tenant_id="tenant-a", profile_id="profile-a")
+        auth = AuthContext(actor="test", tenant_id="tenant-a", auth_mode="local", role="admin")
+        repository = SimpleNamespace(get_document=lambda _document_id: document)
+        record = {
+            "document_id": "doc-a", "chunk_id": "chunk-a", "content_hash": "bound-content",
+            "metadata": {"approval_status": "approved", "approval_id": "approval-a",
+                         "approved_content_hash": "approved-content", "security_level": "internal",
+                         "department_acl": [], "profile_id": "profile-a"},
+        }
+        snapshot = {("doc-a", "chunk-a"): {
+            "approval_id": "approval-a", "approved_content_hash": "approved-content",
+            "content_hash": "bound-content", "security_level": "internal", "department_acl": set(),
+        }}
+        def visible(candidate, profile):
+            return runtime.record_visible_to_request(
+                candidate, request=runtime.RegulationQuery(query="policy", profile_id=profile),
+                auth=auth, repository=repository, approval_snapshot=snapshot,
+                requested_department_ids=frozenset(),
+            )
+        self.assertTrue(visible(record, "profile-a"))
+        for profile in (None, "profile-a", "profile-b"):
+            with self.subTest(profile=profile):
+                conflicting = {**record, "metadata": {**record["metadata"], "profile_id": "profile-b"}}
+                self.assertFalse(visible(conflicting, profile))
+        self.assertFalse(visible({**record, "profile_id": "profile-b"}, "profile-a"))
+        document.tenant_id = "tenant-b"
+        self.assertFalse(visible(record, "profile-a"))
+
+    def test_expected_record_rejects_conflicting_chunk_profile(self) -> None:
+        from app.core.security_primitives import AuthContext
+        from app.schemas.chunk import Chunk
+        from app.schemas.document import Document
+
+        document = Document(document_id="doc-a", filename="synthetic.pdf", file_type="pdf",
+                            file_hash="synthetic", tenant_id="tenant-a", profile_id="profile-a")
+        chunk = Chunk(chunk_id="chunk-a", document_id="doc-a", chunk_type="article",
+                      text="synthetic policy", retrieval_text="synthetic policy",
+                      security_level="internal", approval_status="approved", approval_id="approval-a",
+                      approved_content_hash="hash-a", metadata={"profile_id": "profile-a"})
+        auth = AuthContext(actor="test", tenant_id="tenant-a", auth_mode="local", role="admin")
+        self.assertIsNotNone(runtime.expected_vector_record_for_chunk(chunk, document, auth))
+        chunk.metadata["profile_id"] = "profile-b"
+        self.assertIsNone(runtime.expected_vector_record_for_chunk(chunk, document, auth))
+
+    def test_fresh_snapshot_fails_closed_when_authority_changes_during_read(self) -> None:
+        from app.core.security_primitives import AuthContext
+
+        auth = AuthContext(actor="test", tenant_id="tenant-a", auth_mode="local", role="admin")
+        snapshot = {("doc-a", "chunk-a"): {"approval_id": "approval-a"}}
+        with patch.object(runtime, "approval_snapshot_signature", side_effect=[("before",), ("after",)]), patch.object(
+            runtime, "build_approval_snapshot", return_value=snapshot,
+        ):
+            self.assertEqual({}, runtime.load_fresh_approval_snapshot(
+                object(), [{"document_id": "doc-a"}], auth,
+            ))
+
 if __name__ == "__main__":
     unittest.main()

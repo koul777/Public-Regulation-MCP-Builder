@@ -114,6 +114,10 @@ from app.services.review_workflow_service import (
     validate_approval_preconditions as _service_validate_approval_preconditions,
     verify_approval_evidence as _service_verify_approval_evidence,
 )
+from app.services.approval_validation import (
+    ApprovalValidationContext, build_repository_approval_validation_context,
+    validate_repository_approval_content,
+)
 from app.services.approval_governance import (
     approval_state_transition as _approval_state_transition,
     sanitize_review_decision_events as _sanitize_review_decision_events,
@@ -755,6 +759,9 @@ def _chunks_for_indexing(chunks: list[Chunk], document: Document, auth: AuthCont
         }.items():
             if value and not metadata.get(key):
                 metadata[key] = value
+        # Document identity is authoritative even after editable chunk metadata changes.
+        if document.profile_id:
+            metadata["profile_id"] = document.profile_id
         metadata["tenant_id"] = tenant_id
         chunk_data["tenant_id"] = tenant_id
         chunk_data["department_acl"] = _department_acl_set(chunk.department_acl)
@@ -909,8 +916,18 @@ def _run_document_indexing(
         },
     )
     chunks = chunks if chunks is not None else _load_review_chunks(repository, document_id)
+    recovery_records = (
+        _pending_revision_recovery_context(
+            repository=repository, document=document, chunks=chunks, auth=auth,
+        )
+        if action in {"index", "reindex"} else None
+    )
+    indexing_chunks = [
+        chunk.model_copy(update={"metadata": {**dict(chunk.metadata or {}), "regulation_status": "approved"}})
+        for chunk in chunks
+    ] if recovery_records else chunks
     try:
-        prepared_chunks = _chunks_for_indexing(chunks, document, auth)
+        prepared_chunks = _chunks_for_indexing(indexing_chunks, document, auth)
         _require_approval_journal_records(repository, document_id=document_id, chunks=chunks, auth=auth)
         timing_ms["load_validate"] = round((time.perf_counter() - step_started) * 1000, 3)
         step_started = time.perf_counter()
@@ -993,6 +1010,11 @@ def _run_document_indexing(
         },
     }
     repository.append_indexing_job(indexing_job)
+    if recovery_records and not request.dry_run:
+        indexing_job.update(_complete_pending_revision_recovery(
+            settings=settings, repository=repository, document=document, chunks=chunks,
+            auth=auth, indexing_job=indexing_job, snapshot_context=recovery_records[1],
+        ))
     return indexing_job
 
 
@@ -1323,6 +1345,111 @@ def _complete_deferred_vector_sync_batch(
             },
             outcome="completed",
         )
+
+
+def _pending_revision_recovery_context(
+    *,
+    repository: JsonRepository,
+    document: Document | None,
+    chunks: Sequence[Chunk],
+    auth: AuthContext,
+    snapshot_context: ApprovalValidationContext | None = None,
+) -> tuple[list[dict[str, Any]], ApprovalValidationContext] | None:
+    """Recover only a failed, durably approved revision with unchanged content."""
+    if (
+        document is None
+        or document.regulation_status != "pending_approval"
+        or not document.regulation_id
+        or not document.supersedes_document_id
+        or document.tenant_id != auth.tenant_id
+        or not _document_chunks_ready_for_approval(chunks)
+    ):
+        return None
+    records = repository.list_approval_journal_records(document.document_id)
+    failed_ids = {
+        str(event.get("approval_record_id") or "")
+        for event in repository.list_maintenance_events("approval_vector_sync_outcome")
+        if event.get("document_id") == document.document_id
+        and event.get("tenant_id") == auth.tenant_id
+        and event.get("outcome") == "failure"
+    }
+    if not any(str(record.get("approval_record_id") or "") in failed_ids for record in records):
+        return None
+    _require_approval_journal_records(
+        repository, document_id=document.document_id, chunks=list(chunks), auth=auth,
+    )
+    context = build_repository_approval_validation_context(
+        repository, document_id=document.document_id, tenant_id=auth.tenant_id, approval_records=records,
+    )
+    if snapshot_context is not None:
+        context.snapshot_chunks = snapshot_context.snapshot_chunks
+    matched_records: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        if chunk.approval_status != APPROVED_CHUNK_STATUS:
+            continue
+        try:
+            record = validate_repository_approval_content(
+                repository, chunk, document, tenant_id=auth.tenant_id, context=context,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not record.get("snapshot"):
+            raise HTTPException(status_code=400, detail="Revision recovery requires an approval snapshot.")
+        matched_records[str(record.get("approval_record_id") or "")] = dict(record)
+    return list(matched_records.values()), context
+
+
+def _complete_pending_revision_recovery(
+    *,
+    settings: Settings,
+    repository: JsonRepository,
+    document: Document,
+    chunks: list[Chunk],
+    auth: AuthContext,
+    indexing_job: dict[str, Any],
+    snapshot_context: ApprovalValidationContext,
+) -> dict[str, Any]:
+    """Activate after successful indexing and revalidate against concurrent edits."""
+    current_document = repository.get_document(document.document_id)
+    current_chunks = repository.get_chunks(document.document_id)
+    records = _pending_revision_recovery_context(
+        repository=repository, document=current_document, chunks=current_chunks, auth=auth,
+        snapshot_context=snapshot_context,
+    )
+    if (
+        not records or current_document is None
+        or current_document.model_dump(mode="json") != document.model_dump(mode="json")
+        or [item.model_dump(mode="json") for item in current_chunks]
+        != [item.model_dump(mode="json") for item in chunks]
+        or indexing_job.get("status") != "indexed"
+        or indexing_job.get("dry_run")
+        or int(indexing_job.get("record_count") or 0)
+        != sum(item.approval_status == APPROVED_CHUNK_STATUS for item in current_chunks)
+    ):
+        raise HTTPException(status_code=409, detail="Revision changed during indexing; recovery requires a fresh retry.")
+    activated_chunks = [
+        item.model_copy(update={"metadata": {**dict(item.metadata or {}), "regulation_status": "approved"}})
+        for item in current_chunks
+    ]
+    activated_document = current_document.model_copy(update={"regulation_status": "approved"})
+    repository.save_chunks(document.document_id, activated_chunks)
+    repository.upsert_document(activated_document)
+    events = []
+    for record in records[0]:
+        recovery_record = {**record, "vector_sync_event_id": f"approval_vector_sync_recovery_{uuid.uuid4().hex[:12]}"}
+        events.append(_append_approval_vector_sync_outcome(
+            repository=repository, document_id=document.document_id, auth=auth,
+            approval_record=recovery_record, vector_sync=indexing_job, outcome="completed",
+        ))
+    supersede_event = _automatically_supersede_prior_version(
+        settings=settings, repository=repository, document=activated_document, auth=auth,
+    )
+    return {
+        "revision_activated": True,
+        "vector_sync_event_ids": [event["event_id"] for event in events],
+        "approval_vector_sync_event_ids": {event["approval_record_id"]: event["event_id"] for event in events},
+        "automatic_supersede_event": supersede_event,
+    }
 
 
 def _committed_revision_retry_context(
@@ -2369,7 +2496,7 @@ def update_review_chunk(
     repository = _repository(request_settings)
     try:
         require_api_role(auth, API_WRITE_ROLES)
-        _require_document_access(repository, document_id, auth)
+        document = _require_document_access(repository, document_id, auth)
         chunks = _load_review_chunks(repository, document_id)
         _require_chunk_ids(chunks, [chunk_id])
         before_hashes = _chunk_hashes(chunks, {chunk_id})
@@ -2394,6 +2521,14 @@ def update_review_chunk(
             update_fields["metadata"] = {**target.metadata, **request.metadata_patch}
         if not update_fields:
             raise HTTPException(status_code=400, detail="No review chunk updates were provided.")
+        # Document profile is immutable chunk scope. Normalize during review,
+        # before worklist evidence, approval hashes and snapshots are prepared.
+        if document.profile_id:
+            target = next(chunk for chunk in chunks if chunk.chunk_id == chunk_id)
+            metadata = dict(update_fields.get("metadata", target.metadata))
+            metadata["profile_id"] = document.profile_id
+            if metadata != target.metadata or "metadata" in update_fields:
+                update_fields["metadata"] = metadata
         update_fields.update(_clear_approval_fields())
 
         updated_chunk: Chunk | None = None
@@ -2784,6 +2919,62 @@ def approve_review_chunks(
                     f"automatic_supersede_document_id="
                     f"{(automatic_supersede_event or {}).get('document_id') or ''}"
                 ),
+            )
+            return response_record
+        pending_recovery = (
+            _pending_revision_recovery_context(
+                repository=repository, document=document, chunks=chunks, auth=auth,
+            )
+            if not request.allow_reapproval and not request.defer_vector_sync else None
+        )
+        if pending_recovery and document is not None:
+            selected = [chunk for chunk in chunks if chunk.chunk_id in requested_ids]
+            if any(
+                chunk.approval_status != APPROVED_CHUNK_STATUS
+                or (request.security_level is not None
+                    and _normalize_security_level(chunk.security_level)
+                    != _normalize_security_level(request.security_level))
+                for chunk in selected
+            ):
+                raise HTTPException(status_code=409, detail="Recovery cannot change committed approval decisions.")
+            approval_state_committed = True
+            approval_record = next((
+                record for record in reversed(pending_recovery[0])
+                if requested_ids <= set(record.get("chunk_ids") or [])
+            ), None)
+            if approval_record is None:
+                raise HTTPException(status_code=409, detail="Retry each committed approval batch separately.")
+            try:
+                vector_sync = _sync_vector_index_after_review_change(
+                    settings=request_settings, repository=repository, document_id=document_id,
+                    auth=auth, chunks=chunks, action="reindex", index_if_missing=True,
+                )
+            except Exception as exc:
+                failed_event = _append_approval_vector_sync_outcome(
+                    repository=repository, document_id=document_id, auth=auth,
+                    approval_record={**approval_record, "vector_sync_event_id": f"approval_vector_sync_retry_{uuid.uuid4().hex[:12]}"},
+                    vector_sync=_failed_vector_sync_payload(exc), outcome="failure",
+                )
+                raise HTTPException(status_code=500, detail={
+                    "message": "Approval was persisted, but revision indexing recovery failed.",
+                    "approval_id": str(approval_record.get("approval_id") or ""),
+                    "approval_record_id": str(approval_record.get("approval_record_id") or ""),
+                    "vector_sync_event_id": failed_event["event_id"],
+                    "reindex_required": True,
+                }) from exc
+            response_record = dict(approval_record)
+            response_record.update({
+                "vector_sync": vector_sync,
+                "vector_sync_event_id": (vector_sync.get("approval_vector_sync_event_ids") or {}).get(
+                    str(approval_record.get("approval_record_id") or ""), "",
+                ),
+                "automatic_supersede_event": vector_sync.get("automatic_supersede_event"),
+                "recovery_retry": True,
+            })
+            audit_api_event(
+                request_settings, auth, action="document.review.approve", outcome="success",
+                status_code=200, resource_type="document", document_id=document_id,
+                detail=f"approval_recovery_retry=true approval_record_id={approval_record.get('approval_record_id') or ''}",
             )
             return response_record
         approved_request_chunks = [

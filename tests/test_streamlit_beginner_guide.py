@@ -28,6 +28,10 @@ from app.core.institution_profiles import (
     institution_profile_registry_to_bytes,
 )
 from app.services.approval_governance import approval_review_completion_state
+from app.services.workflow_readiness import (
+    WorkflowStage,
+    safe_summarize_workflow_readiness,
+)
 from app.core.tenant_access import institution_storage_dir
 from app.services.synthetic_sample_service import (
     SYNTHETIC_SAMPLE_FILENAME,
@@ -1659,6 +1663,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         state["method-b-destination-doc-1-selected_documents"] = "codex"
         self.assertEqual(method_b_key, confirmation_key("doc-1"))
 
+        namespace["_document_context_revision"] = lambda document_id: f"updated-{document_id}"
+        self.assertNotEqual(method_b_key, confirmation_key("doc-1"))
+
     def test_home_workflow_cards_complete_only_in_fail_closed_order(self) -> None:
         _source, module = _source_and_module()
         helper = _function(module, "_workflow_states")
@@ -1675,6 +1682,10 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
                 }
             ),
             "_mcp_bundle_created": lambda ctx: bool(ctx.get("bundle_ready")),
+            "_beginner_scope_approval_ready": lambda ctx: bool(ctx.get("scope_ready", True)),
+            "_beginner_guide_connection_confirmed_key": lambda document_id: (
+                f"client-confirmed:{document_id}"
+            ),
             "_beginner_guide_results_confirmed_key": lambda document_id: (
                 f"results-confirmed:{document_id}"
             ),
@@ -1690,7 +1701,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         }
         exec(
             compile(
-                ast.Module(body=[helper], type_ignores=[]),
+                ast.Module(body=[helper, _function(module, "_beginner_guide_completed_steps")], type_ignores=[]),
                 "<home-workflow-states>",
                 "exec",
             ),
@@ -1770,7 +1781,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "bundle_ready": True,
         }
         self.assertEqual(
-            [True, True, True, True],
+            [True, True, True, False],
             workflow_states(actual_bundle_ready),
         )
         usage_path["value"] = "qwen"
@@ -3432,6 +3443,167 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         self.assertEqual("③ 검수하고 승인", self.app.session_state["nav_page"])
         self.assertEqual(before, self._file_snapshot())
         self.assertEqual([], repository.list_approval_journal_records(second_id))
+
+
+
+class StreamlitOperatorCompletionRegressionTests(unittest.TestCase):
+    def _namespace(self) -> dict[str, object]:
+        _source, module = _source_and_module()
+        helpers = [
+            _function(module, name)
+            for name in (
+                "_qwen_beginner_procedure_states",
+                "_beginner_guide_completed_steps",
+                "_workflow_states",
+                "_next_action",
+            )
+        ]
+        state = {"usage": "mcp", "revision": "current", "scope": "selected_documents", "results-confirmed": True}
+        namespace = {
+            "APPROVABLE_CHUNK_STATUSES": {"draft", "pending", "needs_review"},
+            "AI_USAGE_PATH_QWEN": "qwen",
+            "QWEN_CHAT_APP_LAUNCH_STATE_KEY": "qwen_launch",
+            "NAV_PREPROCESS": "preprocess",
+            "NAV_RESULTS": "results",
+            "NAV_APPROVAL": "approval",
+            "NAV_MCP": "use",
+            "WorkflowStage": WorkflowStage,
+            "safe_summarize_workflow_readiness": safe_summarize_workflow_readiness,
+            "_ai_usage_path": lambda: state["usage"],
+            "_selected_institution_profile_id": lambda: "synthetic",
+            "_standalone_qwen_chat_is_healthy": lambda _url: True,
+            "_mcp_bundle_created": lambda ctx: bool((ctx or {}).get("bundle_ready")),
+            "_beginner_scope_approval_ready": lambda ctx: bool(ctx.get("scope_ready", True)),
+            "_results_step_is_used": lambda _ctx: True,
+            "_beginner_guide_results_confirmed_key": lambda _id: "results-confirmed",
+            "_beginner_guide_connection_confirmed_key": lambda _id: (
+                f"client-confirmed:{state['scope']}:{state['revision']}"
+            ),
+            "st": SimpleNamespace(session_state=state),
+        }
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "<operator-completion>", "exec"), namespace)
+        return namespace
+
+    def _ready_context(self) -> dict[str, object]:
+        return {
+            "document_id": "synthetic-document",
+            "document": SimpleNamespace(status="completed", profile_id="synthetic"),
+            "chunks": [object()],
+            "quality_report": SimpleNamespace(passed=True),
+            "approval_counts": {"approved": 1},
+            "approved_count": 1,
+            "mcp_connection_gate": {"ready": True},
+            "bundle_ready": True,
+        }
+
+    def test_home_and_guide_require_current_scoped_client_confirmation(self) -> None:
+        namespace = self._namespace()
+        ctx = self._ready_context()
+        state = namespace["st"].session_state
+        for revision, scope, scope_ready, expected in (
+            ("current", "selected_documents", True, False),
+            ("current", "selected_documents", True, True),
+            ("regenerated", "selected_documents", True, False),
+            ("current", "current_document", True, False),
+            ("current", "selected_documents", False, False),
+        ):
+            if expected:
+                state["client-confirmed:selected_documents:current"] = True
+            state.update(revision=revision, scope=scope)
+            current_ctx = {**ctx, "scope_ready": scope_ready}
+            with self.subTest(revision=revision, scope=scope, scope_ready=scope_ready, expected=expected):
+                home = namespace["_workflow_states"](current_ctx)
+                guide = namespace["_beginner_guide_completed_steps"](current_ctx)
+                self.assertEqual(home, list(guide))
+                self.assertEqual(expected, home[-1])
+        state.update(revision="current", scope="selected_documents")
+        stale_bundle = {**ctx, "bundle_ready": False}
+        self.assertFalse(namespace["_workflow_states"](stale_bundle)[-1])
+        self.assertFalse(namespace["_beginner_guide_completed_steps"](stale_bundle)[-1])
+
+    def test_generated_unconfirmed_bundle_routes_to_client_checks(self) -> None:
+        namespace = self._namespace()
+        message, page = namespace["_next_action"](self._ready_context())
+        self.assertEqual("use", page)
+        self.assertIn("search", message)
+        self.assertIn("fetch", message)
+        self.assertNotIn("생성하세요", message)
+        message, _page = namespace["_next_action"]({**self._ready_context(), "bundle_ready": False})
+        self.assertIn("생성하세요", message)
+
+    def test_healthy_qwen_process_does_not_claim_answers_or_citations_checked(self) -> None:
+        namespace = self._namespace()
+        namespace["st"].session_state.update(
+            usage="qwen", qwen_launch={"url": "http://127.0.0.1:8502", "_process": SimpleNamespace(poll=lambda: None)}
+        )
+        ctx = self._ready_context()
+        self.assertTrue(namespace["_workflow_states"](ctx)[-1])
+        message, page = namespace["_next_action"](ctx)
+        self.assertEqual("use", page)
+        self.assertIn("준비", message)
+        self.assertIn("근거", message)
+        self.assertNotIn("확인했습니다", message)
+
+    def test_current_client_confirmation_is_reachable_in_advanced_mode(self) -> None:
+        _source, module = _source_and_module()
+        page = _function(module, "_page_connect")
+        calls = [node for node in ast.walk(page) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                 and node.func.id == "_render_beginner_connection_confirmation"]
+        self.assertEqual(1, len(calls))
+        for node in ast.walk(page):
+            if isinstance(node, ast.If) and "mcp_beginner_mode" in ast.unparse(node.test):
+                self.assertFalse(any(calls[0] is child for statement in node.body for child in ast.walk(statement)))
+
+    def test_bulk_approval_labels_execution_and_preserves_acknowledgement_and_audit(self) -> None:
+        source, module = _source_and_module()
+        page_source = ast.get_source_segment(source, _function(module, "_page_approval")) or ""
+        self.assertNotIn("를 AI 검수 결과대로 한 번에 승인하기", page_source)
+        self.assertIn("_ai_review_status_text(agent_review_summary)", page_source)
+        self.assertIn('_ai_review_status_text(approval_ctx.get("agent_review_summary"))', page_source)
+        self.assertIn('"검수 의견 확인"', page_source)
+        self.assertIn("approval-bulk-finish-ack-", page_source)
+        self.assertIn("disabled=not (shortcut_acknowledged and shortcut_ready)", page_source)
+        self.assertIn("override_reason_text=_approval_override_reason_for_entries(shortcut_entries)", page_source)
+        self.assertIn("approved_without_review", page_source)
+
+    def test_bulk_opinion_confirmation_does_not_count_rows_without_opinions(self) -> None:
+        _source, module = _source_and_module()
+        page = _function(module, "_page_approval")
+        assignments = [
+            node for node in ast.walk(page)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in {"ai_complete", "opinion_target_count"}
+                    for target in node.targets)
+            and "pending_entries" in ast.unparse(node.value)
+        ]
+        namespace = {"pending_entries": [
+            {"item_ids": [], "state": {"ai_confirmed": True}},
+            {"item_ids": ["opinion-1"], "state": {"ai_confirmed": True}},
+            {"item_ids": ["opinion-2"], "state": {"ai_confirmed": False}},
+        ]}
+        exec(compile(ast.Module(body=assignments, type_ignores=[]), "<bulk-opinion-count>", "exec"), namespace)
+        self.assertEqual(1, namespace["ai_complete"])
+        self.assertEqual(2, namespace["opinion_target_count"])
+
+    def test_bulk_execution_status_distinguishes_not_run_failed_partial_and_succeeded(self) -> None:
+        _source, module = _source_and_module()
+        nodes = [_function(module, name) for name in ("_agent_review_requested", "_ai_review_status_text")]
+        namespace = {"AI_REVIEW_STATUS_MESSAGES": {}, "_ai_review_retry_guidance": lambda _summary: "다시 확인"}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<bulk-execution-status>", "exec"), namespace)
+        status_text = namespace["_ai_review_status_text"]
+        for summary, expected, executed in (
+            ({"status": "disabled"}, "not_run", False),
+            ({"status": "failed", "request_enabled": True}, "failed", False),
+            ({"status": "partial", "request_enabled": True}, "partial", False),
+            ({"status": "executed", "request_enabled": True}, "succeeded", True),
+            ({"status": "executed", "failed_batch_count": 1}, "partial", False),
+        ):
+            # Assert Korean labels without assuming that acknowledgement means execution.
+            expected_word = {"not_run": "실행 안 됨", "failed": "실패", "partial": "일부", "succeeded": "완료"}[expected]
+            with self.subTest(summary=summary):
+                label, _message, completed = status_text(summary)
+                self.assertIn(expected_word, label)
+                self.assertEqual(executed, completed)
 
 
 if __name__ == "__main__":

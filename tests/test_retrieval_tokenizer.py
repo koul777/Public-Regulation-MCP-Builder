@@ -4,6 +4,7 @@ import unicodedata
 import unittest
 from unittest.mock import patch
 
+from app.retrieval import tokenizer as tokenizer_module
 from app.retrieval.tokenizer import (
     FALLBACK_TOKENIZER_MODEL,
     TOKENIZER_MODEL,
@@ -14,6 +15,35 @@ from app.retrieval.tokenizer import (
 
 
 class RetrievalTokenizerTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        tokenizer_module._cached_expanded_token.cache_clear()
+
+    def test_cached_expansion_does_not_share_mutable_results(self) -> None:
+        expected = ["점검규정", "점검", "규정"]
+        first = tokenizer_module._expand_token("점검규정")
+        self.assertEqual(expected, first)
+        first[:] = ["다른 요청에서 변경한 값"]
+        self.assertEqual(expected, tokenizer_module._expand_token("점검규정"))
+
+    def test_oversized_token_is_processed_without_cache_retention(self) -> None:
+        tokenizer_module._cached_expanded_token.cache_clear()
+        token = "가" * 129 + "규정"
+        self.assertEqual(
+            [token, "가" * 129, "규정"],
+            tokenizer_module._expand_token(token),
+        )
+        self.assertEqual(0, tokenizer_module._cached_expanded_token.cache_info().currsize)
+
+    def test_cached_expansion_preserves_repeated_and_deduplicated_tokens(self) -> None:
+        text = "제７조 점검규정 점검규정"
+        repeated = tokenize(text, dedupe=False, tokenizer_model=FALLBACK_TOKENIZER_MODEL)
+        self.assertEqual(2, repeated.count("점검규정"))
+        self.assertIn("제7조", repeated)
+        deduplicated = tokenize(text, tokenizer_model=FALLBACK_TOKENIZER_MODEL)
+        self.assertEqual(list(dict.fromkeys(repeated)), deduplicated)
+        repeated.clear()
+        self.assertEqual(deduplicated, tokenize(text, tokenizer_model=FALLBACK_TOKENIZER_MODEL))
+
     def test_tokenize_normalizes_unicode_so_nfd_matches_nfc(self) -> None:
         # Korean text from PDF/DOCX extraction or macOS filenames can arrive
         # decomposed (NFD).  Indexing and querying both flow through tokenize,

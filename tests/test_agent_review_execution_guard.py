@@ -72,7 +72,17 @@ def allowed_reservation(plan: dict | None = None) -> dict:
 
 class AgentReviewExecutionGuardTests(unittest.TestCase):
     def test_preflight_fails_closed_without_batch_caps(self) -> None:
-        result = preflight_agent_review_execution([planned_review()], Settings(data_dir=Path("data"), enable_agent_review=False))
+        missing_settings = Settings(
+            data_dir=Path("data"),
+            enable_agent_review=False,
+            llm_provider="openai",
+            openai_api_key="",
+            agent_review_max_documents_per_batch=0,
+            agent_review_max_input_tokens_per_batch=0,
+            agent_review_max_total_tokens_per_batch=0,
+            agent_review_max_cost_per_batch=0,
+        )
+        result = preflight_agent_review_execution([planned_review()], missing_settings)
 
         self.assertFalse(result["allowed"])
         self.assertEqual(result["api_call_count"], 0)

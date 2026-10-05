@@ -4,6 +4,7 @@ from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
+from functools import lru_cache
 import errno
 import hashlib
 import json
@@ -21,7 +22,7 @@ from uuid import uuid4
 
 from app.ingestion.vector_adapter import stable_content_hash
 from app.retrieval.bm25_index import Bm25Index, source_content_hashes
-from app.retrieval.searcher import rerank_bm25_candidates
+from app.retrieval.searcher import rerank_bm25_candidates, rerank_fallback_candidates
 
 
 HIERARCHICAL_INDEX_SCHEMA_VERSION = "reg-rag-hierarchical-index-v2"
@@ -1991,6 +1992,9 @@ def search_hierarchical_records(
         results.append((round(lexical_score + catalog_score, 8), record))
     if rerank_index is not None:
         results = rerank_bm25_candidates(query, results, rerank_index)
+        candidate_reranker = "verified_bm25_fast_query"
+    else:
+        results, candidate_reranker = rerank_fallback_candidates(query, results)
     results.sort(
         key=lambda item: (
             item[0],
@@ -2024,11 +2028,7 @@ def search_hierarchical_records(
         "retrieval_model": "institution-hierarchical-sqlite-fts-v1",
         "retrieval_strategy": "catalog_toc_body",
         "retrieval_fallback": False,
-        "candidate_reranker": (
-            "verified_bm25_fast_query"
-            if rerank_index is not None
-            else None
-        ),
+        "candidate_reranker": candidate_reranker,
         "candidate_regulation_count": len(candidate_regulations),
         "candidate_regulations": candidate_regulations,
         "query_terms": terms,
@@ -3359,18 +3359,18 @@ def _rank_versions(
     versions: Iterable[sqlite3.Row],
 ) -> list[tuple[float, sqlite3.Row]]:
     compact_query = _compact(query)
+    compact_terms = [_compact(term) for term in terms]
     ranked: list[tuple[float, sqlite3.Row]] = []
     for row in versions:
-        title = _compact(row["title"])
-        regulation_no = _compact(row["regulation_no"])
-        search_text = _compact(row["search_text"])
+        title = _compact_catalog_text(str(row["title"] or ""))
+        regulation_no = _compact_catalog_text(str(row["regulation_no"] or ""))
+        search_text = _compact_catalog_text(str(row["search_text"] or ""))
         score = 0.0
         if compact_query and title and (title in compact_query or compact_query in title):
             score += 100.0
         if regulation_no and regulation_no in compact_query:
             score += 80.0
-        for term in terms:
-            compact_term = _compact(term)
+        for compact_term in compact_terms:
             if not compact_term:
                 continue
             if compact_term in title:
@@ -3389,6 +3389,19 @@ def _rank_versions(
         ),
         reverse=True,
     )
+
+
+def _compact_catalog_text(text: str) -> str:
+    # Cache only a pure text transform, never catalog selection or visibility.
+    # Bound both entry count and string length; changed metadata has a new key.
+    if len(text) > 8192:
+        return _compact(text)
+    return _cached_compact_catalog_text(text)
+
+
+@lru_cache(maxsize=256)
+def _cached_compact_catalog_text(text: str) -> str:
+    return _compact(text)
 
 
 def _search_chunk_rows(
