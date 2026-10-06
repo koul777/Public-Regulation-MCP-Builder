@@ -8,6 +8,7 @@ include *.bat
 include docs/mcp_client_config_examples_ko.md
 include docs/mcp_quickconnect_ko.md
 include docs/mcp_tool_contract_ko.md
+include docs/mcp_performance_quality_gate_ko.md
 include docs/operator_quickstart_ko.md
 include docs/harness_engineering_plan_ko.md
 include docs/hermes_engineering_plan_ko.md

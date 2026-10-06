@@ -26,9 +26,9 @@ def _default_api_auth_required() -> bool:
 
 
 def _default_regulation_authoring_enabled() -> bool:
-    """Keep the beginner workspace available locally and opt-in when deployed."""
+    """Keep the retained draft API opt-in in every environment."""
 
-    return os.getenv("APP_ENV", "local").lower() in {"local", "dev", "development", "test"}
+    return False
 
 
 @dataclass(frozen=True)

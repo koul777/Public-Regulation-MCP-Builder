@@ -22,21 +22,27 @@ class AuthoringConfigTests(unittest.TestCase):
 
         self.assertFalse(settings.enable_regulation_authoring)
 
+    def test_all_environment_defaults_require_explicit_opt_in(self) -> None:
+        for environment in ("local", "dev", "development", "test", "production"):
+            with self.subTest(environment=environment):
+                with patch.dict("os.environ", {"APP_ENV": environment}):
+                    self.assertFalse(_default_regulation_authoring_enabled())
+
     def test_protected_environment_default_requires_explicit_opt_in(self) -> None:
         with patch.dict("os.environ", {"APP_ENV": "production"}):
             enabled = _default_regulation_authoring_enabled()
 
         self.assertFalse(enabled)
 
-    def test_local_compose_profile_enables_beginner_authoring_separately(self) -> None:
+    def test_local_compose_profile_keeps_draft_api_opt_in(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         env_example = (project_root / ".env.example").read_text(encoding="utf-8")
         compose = (project_root / "docker-compose.yml").read_text(encoding="utf-8")
 
         self.assertIn("ENABLE_REGULATION_AUTHORING=false", env_example)
-        self.assertIn("STREAMLIT_ENABLE_REGULATION_AUTHORING=true", env_example)
+        self.assertIn("STREAMLIT_ENABLE_REGULATION_AUTHORING=false", env_example)
         self.assertIn(
-            "ENABLE_REGULATION_AUTHORING: ${STREAMLIT_ENABLE_REGULATION_AUTHORING:-true}",
+            "ENABLE_REGULATION_AUTHORING: ${STREAMLIT_ENABLE_REGULATION_AUTHORING:-false}",
             compose,
         )
 

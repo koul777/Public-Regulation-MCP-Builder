@@ -766,6 +766,183 @@ class StructureDetectorTests(unittest.TestCase):
         )
         self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
 
+    def test_explicit_heading_followed_by_same_page_title_is_not_an_ambiguous_boundary(self) -> None:
+        for repeated_title in ("보수규정", "보 수 규 정", "「보수규정」"):
+            with self.subTest(repeated_title=repeated_title):
+                parsed = ParsedDocument(
+                    document_id="doc-numbered-book",
+                    source_file="combined-book.pdf",
+                    document_name="통합규정집",
+                    file_type="pdf",
+                    pages=[
+                        ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                            "1-1-1. 인사규정",
+                            "인사규정",
+                            "제1조(목적) 인사 기준을 정한다.",
+                            "[별표 1]",
+                            "첨부 내용",
+                        ]))]),
+                        ParsedPage(page_no=2, blocks=[ParsedBlock(text="\n".join([
+                            "1-1-2. 보수규정",
+                            repeated_title,
+                            "2026. 1. 1. 제정",
+                            "제1조(목적) 보수 기준을 정한다.",
+                            "제2조(범위) 적용 범위를 정한다.",
+                        ]))]),
+                    ],
+                    raw_text="",
+                )
+
+                nodes = StructureDetector().detect(parsed)
+                regulations = [node for node in nodes if node.node_type == "regulation"]
+                articles = [node for node in nodes if node.node_type == "article"]
+
+                self.assertEqual(["인사규정", "보수규정"], [node.title for node in regulations])
+                self.assertEqual(
+                    [regulations[0].node_id, regulations[1].node_id, regulations[1].node_id],
+                    [node.parent_id for node in articles],
+                )
+                self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+
+    def test_missing_numbered_heading_dot_requires_exact_later_heading_and_article_restart(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc-missing-heading-dot",
+            source_file="combined-book.pdf",
+            document_name="통합규정집",
+            file_type="pdf",
+            pages=[
+                ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-1. 인사규정", "제1조(목적) 인사 기준.", "[별표 1]", "첨부 내용",
+                ]))]),
+                ParsedPage(page_no=2, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-2 보수규정", "보수규정", "2026. 1. 1. 제정", "제1조(목적) 보수 기준.",
+                ]))]),
+                ParsedPage(page_no=3, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-2. 보수규정", "제2조(범위) 보수 적용 범위.",
+                ]))]),
+            ],
+            raw_text="",
+        )
+
+        nodes = StructureDetector().detect(parsed)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        articles = [node for node in nodes if node.node_type == "article"]
+
+        self.assertEqual(["인사규정", "보수규정"], [node.title for node in regulations])
+        self.assertEqual(2, regulations[1].page_start)
+        self.assertIn(
+            "regulation_heading_separator_inferred_from_later_heading",
+            regulations[1].warnings,
+        )
+        self.assertEqual(
+            [regulations[0].node_id, regulations[1].node_id, regulations[1].node_id],
+            [node.parent_id for node in articles],
+        )
+        self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+
+    def test_missing_heading_dot_is_not_recovered_from_incomplete_or_conflicting_evidence(self) -> None:
+        cases = (
+            ("no_later_heading", "보수규정\n제1조(목적) 보수 기준.", ""),
+            ("different_number", "보수규정\n제1조(목적) 보수 기준.", "1-1-3. 보수규정"),
+            ("different_title", "보수규정\n제1조(목적) 보수 기준.", "1-1-2. 보상규정"),
+            ("different_plain_title", "보상규정\n제1조(목적) 보상 기준.", "1-1-2. 보수규정"),
+            ("no_restart", "보수규정\n제2조(범위) 보수 기준.", "1-1-2. 보수규정"),
+            ("nested_attachment", "보수규정\n[별표 2]\n제1조(목적) 견본 본문.", "1-1-2. 보수규정"),
+            ("intervening_title", "보수규정\n복무규정\n제1조(목적) 별도 본문.", "1-1-2. 보수규정"),
+        )
+        for name, body, later_heading in cases:
+            with self.subTest(case=name):
+                pages = [
+                    ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                        "1-1-1. 인사규정", "제1조(목적) 인사 기준.", "[별표 1]", "첨부 내용",
+                    ]))]),
+                    ParsedPage(page_no=2, blocks=[ParsedBlock(text="1-1-2 보수규정\n" + body)]),
+                ]
+                if later_heading:
+                    pages.append(ParsedPage(page_no=3, blocks=[ParsedBlock(
+                        text=later_heading + "\n제2조(범위) 후속 본문."
+                    )]))
+                parsed = ParsedDocument(
+                    document_id="doc-unconfirmed-heading-dot",
+                    source_file="combined-book.pdf",
+                    document_name="통합규정집",
+                    file_type="pdf",
+                    pages=pages,
+                    raw_text="",
+                )
+
+                nodes = StructureDetector().detect(parsed)
+
+                self.assertFalse(any(
+                    node.node_type == "regulation" and node.page_start == 2
+                    for node in nodes
+                ))
+                self.assertFalse(any(
+                    "regulation_heading_separator_inferred_from_later_heading" in node.warnings
+                    for node in nodes
+                ))
+
+    def test_mismatched_title_below_numbered_header_still_requires_boundary_review(self) -> None:
+        parsed = ParsedDocument(
+            document_id="doc-mismatched-header",
+            source_file="combined-book.pdf",
+            document_name="통합규정집",
+            file_type="pdf",
+            pages=[
+                ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-1. 인사규정", "인사규정", "제1조(목적) 인사 기준.",
+                    "[별표 1]", "첨부 내용",
+                ]))]),
+                ParsedPage(page_no=2, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-1. 인사규정", "보수규정", "제1조(목적) 보수 기준.",
+                ]))]),
+                ParsedPage(page_no=3, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-2. 보수규정", "제2조(범위) 보수 적용 범위.",
+                ]))]),
+            ],
+            raw_text="",
+        )
+
+        StructureDetector().detect(parsed)
+
+        self.assertEqual(
+            "ambiguous_combined_book_boundary_after_attachment",
+            parsed.metadata.get("structure_boundary_diagnostic"),
+        )
+
+    def test_nonadjacent_or_later_page_title_is_not_treated_as_explicit_heading_repeat(self) -> None:
+        for later_page in (False, True):
+            with self.subTest(later_page=later_page):
+                pages = [ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                    "1-1-1. 인사규정", "인사규정", "제1조(목적) 인사 기준.",
+                    "[별표 1]", "첨부 내용",
+                ]))])]
+                title_text = "보수규정\n제1조(목적) 별도 내용."
+                if later_page:
+                    pages.extend([
+                        ParsedPage(page_no=2, blocks=[ParsedBlock(text="1-1-2. 보수규정")]),
+                        ParsedPage(page_no=3, blocks=[ParsedBlock(text=title_text)]),
+                    ])
+                else:
+                    pages.append(ParsedPage(page_no=2, blocks=[ParsedBlock(
+                        text="1-1-2. 보수규정\n중간 내용\n" + title_text
+                    )]))
+                parsed = ParsedDocument(
+                    document_id="doc-unresolved-title",
+                    source_file="combined-book.pdf",
+                    document_name="통합규정집",
+                    file_type="pdf",
+                    pages=pages,
+                    raw_text="",
+                )
+
+                StructureDetector().detect(parsed)
+
+                self.assertEqual(
+                    "ambiguous_combined_book_boundary_after_attachment",
+                    parsed.metadata.get("structure_boundary_diagnostic"),
+                )
+
     def test_ordinary_single_document_fallback_has_no_ambiguous_book_diagnostic(self) -> None:
         text = "일반 안내문\n구조화되지 않은 단일 문서 본문"
         parsed = ParsedDocument(

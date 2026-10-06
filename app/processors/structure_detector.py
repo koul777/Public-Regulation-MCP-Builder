@@ -194,6 +194,7 @@ class StructureDetector:
             detected_lines.append(self._detect_line(line, parsed.document_id, 0))
             if line_index == line_total or line_index % DETECT_PROGRESS_LINE_STEP == 0:
                 report("scan", line_index, line_total)
+        self._recover_numbered_heading_separators(lines, parsed.document_id, detected_lines)
         title_only_regulation_boundaries = self._title_only_regulation_boundaries(
             lines,
             parsed.document_id,
@@ -554,6 +555,83 @@ class StructureDetector:
         same_title = (active.title or "").strip() == (detected.title or "").strip()
         return bool(same_number and same_title)
 
+    def _recover_numbered_heading_separators(
+        self,
+        lines: list[SourceLine],
+        document_id: str,
+        detected_lines: list[StructureNode | None],
+    ) -> None:
+        """Recover a missing heading dot only with exact later heading evidence.
+
+        The same-page plain title and Article 1 must precede any other unit or
+        attachment. A later normally numbered heading must confirm both number
+        and title. This deliberately does not repair title spelling or accept
+        arbitrary date-shaped lines as regulation headings.
+        """
+        explicit_occurrences: dict[tuple[str | None, str], list[int]] = {}
+        article_indexes: list[int] = []
+        barriers: list[int] = []
+        for index, node in enumerate(detected_lines):
+            if node is None:
+                continue
+            if node.node_type == "regulation":
+                identity = (node.number, self._regulation_title_identity(node.title or ""))
+                explicit_occurrences.setdefault(identity, []).append(index)
+            if node.node_type == "article":
+                article_indexes.append(index)
+            if node.node_type in {"regulation", "appendix", "form", "supplementary"}:
+                barriers.append(index)
+        if not explicit_occurrences:
+            return
+        for index, line in enumerate(lines[:-1]):
+            if line.block_type == "table" or detected_lines[index] is not None:
+                continue
+            match = re.fullmatch(r"(\d+-\d+-\d+)\s+(.+)", line.text.strip())
+            if match is None:
+                continue
+            title_line = lines[index + 1]
+            if (
+                title_line.block_type == "table"
+                or detected_lines[index + 1] is not None
+                or line.page_no is None
+                or line.page_no != title_line.page_no
+                or not self._looks_like_implicit_regulation_title(title_line.text)
+            ):
+                continue
+            identity = self._regulation_title_identity(match.group(2))
+            if identity != self._regulation_title_identity(title_line.text):
+                continue
+            later_headings = explicit_occurrences.get((match.group(1), identity), [])
+            if not later_headings or later_headings[-1] <= index:
+                continue
+            article_position = bisect_right(article_indexes, index + 1)
+            if article_position >= len(article_indexes):
+                continue
+            article_index = article_indexes[article_position]
+            barrier_position = bisect_right(barriers, index)
+            next_barrier = barriers[barrier_position] if barrier_position < len(barriers) else len(lines)
+            article = detected_lines[article_index]
+            if (
+                article_index >= next_barrier
+                or lines[article_index].page_no != line.page_no
+                or article is None
+                or article.number != "제1조"
+                or any(
+                    detected_lines[body_index] is None
+                    and self._looks_like_implicit_regulation_title(lines[body_index].text)
+                    for body_index in range(index + 2, article_index)
+                )
+            ):
+                continue
+            node = self._node(
+                document_id, "regulation", match.group(1), match.group(2).strip(),
+                line.text, line.page_no, 0, line.metadata,
+            )
+            node.confidence = 0.96
+            node.warnings.append("regulation_heading_separator_inferred_from_later_heading")
+            node.metadata["regulation_boundary_source"] = "matching_numbered_heading_and_article_restart"
+            detected_lines[index] = node
+
     def _title_only_regulation_boundaries(
         self,
         lines: list[SourceLine],
@@ -741,6 +819,7 @@ class StructureDetector:
             if line.block_type != "table"
             and detected_lines[index] is None
             and self._looks_like_implicit_regulation_title(line.text)
+            and not self._repeats_explicit_regulation_title(index, lines, detected_lines)
         ]
         if not raw_candidates:
             return {}
@@ -1111,6 +1190,31 @@ class StructureDetector:
             ):
                 starts[index] = contents_start
         return starts
+
+    def _repeats_explicit_regulation_title(
+        self,
+        index: int,
+        lines: list[SourceLine],
+        detected_lines: list[StructureNode | None],
+    ) -> bool:
+        """Exclude an adjacent same-page title already anchored by a numbered heading.
+
+        A book can print its numbered regulation heading above the same plain
+        title. That title is not another implicit boundary, even when an older
+        regulation ended with an attachment. Different titles and intervening
+        content still require the usual boundary evidence.
+        """
+        if index == 0:
+            return False
+        previous = detected_lines[index - 1]
+        return bool(
+            previous is not None
+            and previous.node_type == "regulation"
+            and lines[index].page_no is not None
+            and lines[index - 1].page_no == lines[index].page_no
+            and self._regulation_title_identity(previous.title or "")
+            == self._regulation_title_identity(lines[index].text)
+        )
 
     def _has_new_unit_evidence_after_attachment(
         self,

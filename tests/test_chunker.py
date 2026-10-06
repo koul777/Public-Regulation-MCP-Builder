@@ -12,6 +12,11 @@ from app.processors.structure_detector import StructureDetector
 from app.schemas.chunk import Chunk, ChunkOptions
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
 from app.schemas.structure import StructureNode
+from app.services.review_workflow_service import (
+    ReviewWorkflowError,
+    ambiguous_combined_book_chunk_ids,
+    validate_approval_preconditions,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_regulation.md"
@@ -2403,6 +2408,55 @@ class ChunkerTests(unittest.TestCase):
             "ambiguous_combined_book_boundary_requires_reparse",
             fallback.warnings,
         )
+
+    def test_numbered_book_title_repeats_do_not_hide_later_unresolved_boundary(self) -> None:
+        for unresolved in (False, True):
+            with self.subTest(unresolved=unresolved):
+                pages = [
+                    ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                        "1-1-1. 인사규정", "인사규정", "제1조(목적) 인사 기준.",
+                        "[별표 1]", "첨부 내용",
+                    ]))]),
+                    ParsedPage(page_no=2, blocks=[ParsedBlock(text="\n".join([
+                        "1-1-2. 보수규정", "보수규정", "제1조(목적) 보수 기준.",
+                    ]))]),
+                ]
+                if unresolved:
+                    pages.append(ParsedPage(page_no=3, blocks=[ParsedBlock(text="\n".join([
+                        "[별표 2]", "별도 첨부", "복무규정", "제1조(목적) 복무 기준.",
+                    ]))]))
+                parsed = ParsedDocument(
+                    document_id="doc-numbered-book",
+                    source_file="combined-book.pdf",
+                    document_name="통합규정집",
+                    file_type="pdf",
+                    pages=pages,
+                    raw_text="",
+                )
+                nodes = StructureDetector().detect(parsed)
+                chunks = Chunker().build_chunks(
+                    nodes, parsed, ChunkOptions(include_context_header=False)
+                )
+
+                self.assertTrue(chunks)
+                self.assertTrue(all(chunk.approval_status == "draft" for chunk in chunks))
+                self.assertEqual(
+                    {chunk.chunk_id for chunk in chunks} if unresolved else set(),
+                    ambiguous_combined_book_chunk_ids(chunks),
+                )
+                if unresolved:
+                    # Even an earlier, explicitly delimited unit must not be
+                    # approved while any later boundary remains unresolved.
+                    with self.assertRaises(ReviewWorkflowError) as raised:
+                        validate_approval_preconditions(
+                            chunks=chunks,
+                            chunk_ids=[chunks[0].chunk_id],
+                            review_flags_acknowledged=True,
+                            approval_override_reason="reviewed earlier unit",
+                        )
+                    self.assertIn("must be reparsed before approval", raised.exception.detail)
+                else:
+                    self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
 
     def test_root_item_with_subitems_becomes_recoverable_chunk(self) -> None:
         parsed = ParsedDocument(

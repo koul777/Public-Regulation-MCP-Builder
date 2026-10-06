@@ -474,6 +474,28 @@ def _seed_app(
     }
 
 
+# Exercise retained draft components directly; the operator app has no authoring route.
+_AUTHORING_COMPONENT_APP = """
+import streamlit as st
+from app.core.config import Settings
+from app.core.institution_profiles import load_institution_profile_registry_from_bytes
+from frontend.authoring_page import render_authoring_page
+
+settings = Settings(**st.session_state["ai_connection_overrides"])
+registry = load_institution_profile_registry_from_bytes(
+    st.session_state["institution_profile_registry_bytes"]
+)
+profile_id = st.session_state["selected_institution_profile_id"]
+profile = registry.profiles[profile_id]
+render_authoring_page(
+    settings=settings,
+    profile_id=profile_id,
+    institution_name=profile.institution_name,
+    tenant_id=profile.tenant_id or "default",
+)
+"""
+
+
 def _create_drafting_project(app, *, title: str) -> str:
     """Drive the production page to a persisted drafting project."""
 
@@ -1079,60 +1101,65 @@ class StreamlitAuthoringTests(unittest.TestCase):
         self.assertIn("새 개정본", source)
         self.assertEqual("", safe_review_reason(None))
 
-    def test_disabled_flag_hides_menu_and_blocks_direct_navigation(self) -> None:
+    def test_operator_hides_authoring_even_with_explicit_opt_in(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as tmp:
+                app = AppTest.from_file(
+                    str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                    default_timeout=30,
+                )
+                _seed_app(app, enabled=enabled, data_dir=Path(tmp) / "data", nav_page="🏠 시작하기")
+                app.run()
+                self.assertFalse(app.exception)
+                self.assertFalse(any(button.label == AUTHORING_NAV_LABEL for button in app.button))
+                navigation = next(item for item in app.radio if item.label == "기본 작업 순서")
+                self.assertIn("① 문서 올려서 전처리", navigation.options)
+                self.assertNotIn(AUTHORING_NAV_LABEL, navigation.options)
+                app.session_state["_nav_target"] = "① 문서 올려서 전처리"
+                app.run()
+                self.assertFalse(app.exception)
+                self.assertTrue(app.get("file_uploader"))
 
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp) / "data"
-            home = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
-                default_timeout=30,
-            )
-            _seed_app(home, enabled=False, data_dir=data_dir, nav_page="🏠 시작하기")
-            home.run()
-            home_labels = [button.label for button in home.button]
-
-            direct = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
-                default_timeout=30,
-            )
-            _seed_app(
-                direct,
-                enabled=False,
-                data_dir=data_dir,
-                nav_page=AUTHORING_NAV_LABEL,
-            )
-            direct.run()
-
-        self.assertFalse(home.exception)
-        self.assertNotIn(AUTHORING_NAV_LABEL, home_labels)
-        self.assertFalse(direct.exception)
-        self.assertTrue(
-            any("꺼져 있어" in error.value for error in direct.error),
-            [error.value for error in direct.error],
-        )
-
-    def test_enabled_home_and_sidebar_offer_authoring_entry(self) -> None:
+    def test_stale_authoring_navigation_recovers_home_and_preserves_drafts(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
-                default_timeout=30,
-            )
-            _seed_app(
-                app,
-                enabled=True,
-                data_dir=Path(tmp) / "data",
-                nav_page="🏠 시작하기",
-            )
-            app.run()
-            labels = [button.label for button in app.button]
-
-        self.assertFalse(app.exception)
-        self.assertGreaterEqual(labels.count(AUTHORING_NAV_LABEL), 2)
+        for enabled in (False, True):
+            for route_source in ("nav_page", "_nav_target", "authoring_query", "enactment_query"):
+                with self.subTest(enabled=enabled, route_source=route_source), tempfile.TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp) / "data"
+                    project = _project(AuthoringProjectStatus.PLANNING)
+                    draft_path = data_dir / "authoring" / "projects" / f"{project.project_id}.json"
+                    draft_path.parent.mkdir(parents=True)
+                    saved_draft = project.model_dump_json().encode("utf-8")
+                    draft_path.write_bytes(saved_draft)
+                    app = AppTest.from_file(
+                        str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+                        default_timeout=30,
+                    )
+                    _seed_app(app, enabled=enabled, data_dir=data_dir, nav_page="🏠 시작하기")
+                    if route_source.endswith("_query"):
+                        app.query_params["nav"] = route_source.removesuffix("_query")
+                        app.query_params["retained"] = "synthetic-value"
+                    else:
+                        app.session_state[route_source] = AUTHORING_NAV_LABEL
+                    app.session_state["authoring_selected_project_id"] = str(project.project_id)
+                    app.run()
+                    self.assertFalse(app.exception)
+                    self.assertEqual("🏠 시작하기", app.session_state["nav_page"])
+                    self.assertFalse(any(item.label == "규정명" for item in app.text_input))
+                    self.assertEqual(saved_draft, draft_path.read_bytes())
+                    self.assertEqual(str(project.project_id), app.session_state["authoring_selected_project_id"])
+                    if route_source.endswith("_query"):
+                        self.assertNotIn("nav", app.query_params)
+                        self.assertIn("synthetic-value", app.query_params["retained"])
+                    app.session_state["_nav_target"] = "① 문서 올려서 전처리"
+                    app.run()
+                    self.assertFalse(app.exception)
+                    self.assertEqual("① 문서 올려서 전처리", app.session_state["nav_page"])
+                    self.assertTrue(app.get("file_uploader"))
+                    self.assertEqual(saved_draft, draft_path.read_bytes())
 
     def test_authoring_screen_is_clearly_practice_only_and_hides_official_guide(
         self,
@@ -1141,8 +1168,8 @@ class StreamlitAuthoringTests(unittest.TestCase):
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
         with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1167,7 +1194,6 @@ class StreamlitAuthoringTests(unittest.TestCase):
         self.assertIn("1인 연습용", visible_text)
         self.assertIn("모든 출력은 연습용", visible_text)
         self.assertIn("보호 모드 API", visible_text)
-        self.assertIn("본문의 1~6단계", visible_text)
         self.assertNotIn("기본 작업 순서", radio_labels)
         self.assertNotIn("Qwen 또는 MCP 선택", radio_labels)
         self.assertNotIn("초보자 안내 모드", toggle_labels)
@@ -1215,8 +1241,8 @@ for severity in AuthoringLintSeverity:
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(app, enabled=True, data_dir=data_dir, nav_page=AUTHORING_NAV_LABEL)
@@ -1238,8 +1264,8 @@ for severity in AuthoringLintSeverity:
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1270,8 +1296,8 @@ for severity in AuthoringLintSeverity:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
         with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1354,8 +1380,8 @@ for severity in AuthoringLintSeverity:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
         with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1443,8 +1469,8 @@ for severity in AuthoringLintSeverity:
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1483,112 +1509,6 @@ for severity in AuthoringLintSeverity:
         self.assertEqual("", selected_after_switch)
         self.assertNotIn("기관 A 비공개 초안", visible_text)
 
-    def test_dirty_authoring_requires_confirmation_before_institution_switch(
-        self,
-    ) -> None:
-        if AppTest is None:
-            self.skipTest("streamlit.testing.v1.AppTest is not available")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
-                default_timeout=30,
-            )
-            _seed_app(
-                app,
-                enabled=True,
-                data_dir=Path(tmp) / "data",
-                nav_page=AUTHORING_NAV_LABEL,
-                profile_ids=("test-profile", "other-profile"),
-            )
-            app.run()
-            next(item for item in app.text_input if item.label == "규정명").set_value(
-                "기관 전환 확인 초안"
-            )
-            next(
-                button for button in app.button if button.label == "초안 공간 만들기"
-            ).click().run()
-            next(area for area in app.text_area if area.label == "목적").set_value(
-                "아직 저장하지 않은 목적"
-            ).run()
-
-            app.session_state["institution_switcher"] = "other-profile"
-            app.run()
-            continue_button = next(
-                button for button in app.button if button.label == "기관 전환 계속"
-            )
-            self.assertEqual(
-                "test-profile",
-                app.session_state["selected_institution_profile_id"],
-            )
-            self.assertTrue(continue_button.disabled)
-            self.assertTrue(
-                any("저장하지 않은 입력" in item.value for item in app.warning)
-            )
-
-            next(
-                item
-                for item in app.checkbox
-                if item.label
-                == "미저장 입력이 있는 현재 기관을 떠나 다른 기관으로 전환하겠습니다."
-            ).set_value(True).run()
-            next(
-                button for button in app.button if button.label == "기관 전환 계속"
-            ).click().run()
-
-            selected_profile_id = str(
-                app.session_state["selected_institution_profile_id"]
-            )
-
-        self.assertFalse(app.exception)
-        self.assertEqual("other-profile", selected_profile_id)
-
-    def test_missing_profile_tenant_uses_default_for_dirty_switch_guard(
-        self,
-    ) -> None:
-        if AppTest is None:
-            self.skipTest("streamlit.testing.v1.AppTest is not available")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
-                default_timeout=30,
-            )
-            _seed_app(
-                app,
-                enabled=True,
-                data_dir=Path(tmp) / "data",
-                nav_page=AUTHORING_NAV_LABEL,
-                profile_ids=("test-profile", "other-profile"),
-                tenant_id=None,
-            )
-            app.run()
-            next(item for item in app.text_input if item.label == "규정명").set_value(
-                "기본 tenant 기관 전환 초안"
-            )
-            next(
-                button for button in app.button if button.label == "초안 공간 만들기"
-            ).click().run()
-            next(area for area in app.text_area if area.label == "목적").set_value(
-                "아직 저장하지 않은 목적"
-            ).run()
-
-            app.session_state["institution_switcher"] = "other-profile"
-            app.run()
-            continue_button = next(
-                button for button in app.button if button.label == "기관 전환 계속"
-            )
-            selected_profile_id = str(
-                app.session_state["selected_institution_profile_id"]
-            )
-
-        self.assertFalse(app.exception)
-        self.assertEqual("test-profile", selected_profile_id)
-        self.assertTrue(continue_button.disabled)
-        self.assertTrue(
-            any("저장하지 않은 입력" in item.value for item in app.warning)
-        )
-
     def test_unsaved_project_survives_new_project_and_project_round_trip(
         self,
     ) -> None:
@@ -1596,8 +1516,8 @@ for severity in AuthoringLintSeverity:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
         with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1640,29 +1560,15 @@ for severity in AuthoringLintSeverity:
                 app.session_state[_session_key("dirty", project_a, "metadata")]
             )
 
-            # A deselected dirty project must still guard an institution switch.
-            next(
-                item for item in app.selectbox if item.label == "초안 선택"
-            ).set_value(project_b).run()
-            app.session_state["institution_switcher"] = "other-profile"
-            app.run()
-            continue_button = next(
-                button for button in app.button if button.label == "기관 전환 계속"
-            )
-
         self.assertFalse(app.exception)
-        self.assertTrue(continue_button.disabled)
-        self.assertTrue(
-            any("저장하지 않은 입력" in item.value for item in app.warning)
-        )
 
     def test_partial_section_saves_preserve_other_unsaved_sections(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")
 
         with tempfile.TemporaryDirectory() as tmp:
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1735,8 +1641,8 @@ for severity in AuthoringLintSeverity:
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
-            app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1872,8 +1778,8 @@ for severity in AuthoringLintSeverity:
 
             # Start a fresh browser session at the frozen draft. This also
             # verifies that the isolated project is durable across sessions.
-            export_app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            export_app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(
@@ -1898,8 +1804,8 @@ for severity in AuthoringLintSeverity:
                 _session_key("export", project_id)
             ]
 
-            download_app = AppTest.from_file(
-                str(REPO_ROOT / "frontend" / "streamlit_app.py"),
+            download_app = AppTest.from_string(
+                _AUTHORING_COMPONENT_APP,
                 default_timeout=30,
             )
             _seed_app(

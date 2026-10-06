@@ -224,6 +224,19 @@ def require_chunk_ids(chunks: Sequence[Chunk], chunk_ids: Sequence[str]) -> set[
     return requested_ids
 
 
+def ambiguous_combined_book_chunk_ids(chunks: Sequence[Chunk]) -> set[str]:
+    """Return chunks that require boundary reparsing before any approval.
+
+    This shares the approval gate's exact marker rules with read-only preflight
+    callers. Review acknowledgements and override reasons cannot waive it.
+    """
+    return {
+        chunk.chunk_id
+        for chunk in chunks
+        if _has_ambiguous_combined_book_boundary(chunk)
+    }
+
+
 def validate_approval_preconditions(
     *,
     chunks: Sequence[Chunk],
@@ -232,16 +245,9 @@ def validate_approval_preconditions(
     approval_override_reason: str | None = None,
 ) -> ApprovalPreconditions:
     requested_ids = require_chunk_ids(chunks, chunk_ids)
-    ambiguous_boundary_chunks = [
-        chunk
-        for chunk in chunks
-        if chunk.chunk_id in requested_ids and _has_ambiguous_combined_book_boundary(chunk)
-    ]
-    if ambiguous_boundary_chunks:
-        sample = ", ".join(
-            chunk.chunk_id
-            for chunk in sorted(ambiguous_boundary_chunks, key=lambda item: item.chunk_id)[:20]
-        )
+    ambiguous_boundary_ids = ambiguous_combined_book_chunk_ids(chunks) & requested_ids
+    if ambiguous_boundary_ids:
+        sample = ", ".join(sorted(ambiguous_boundary_ids)[:20])
         raise ReviewWorkflowError(
             "Ambiguous combined-book regulation boundaries must be reparsed before approval: "
             f"{sample}",

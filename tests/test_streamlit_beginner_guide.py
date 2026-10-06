@@ -747,10 +747,20 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             for keyword in approval_button_call.keywords
             if keyword.arg == "disabled"
         )
-        self.assertEqual(
-            "not can_approve or approved_count >= total_chunks",
-            ast.unparse(disabled_value),
-        )
+        disabled_expression = compile(ast.Expression(body=disabled_value), "<approval-button>", "eval")
+        for has_targets, approved, total, blocker, expected in (
+            (True, 0, 2, "", False),  # Ordinary/unreviewed targets retain one-click approval.
+            (False, 0, 2, "", True),
+            (True, 2, 2, "", True),
+            (True, 0, 2, "규정 경계 불명확", True),
+        ):
+            with self.subTest(has_targets=has_targets, approved=approved, blocker=blocker):
+                self.assertEqual(expected, eval(disabled_expression, {"bool": bool}, {
+                    "can_approve": has_targets,
+                    "approved_count": approved,
+                    "total_chunks": total,
+                    "current_approval_blocker": blocker,
+                }))
 
     def test_connection_confirmation_requires_each_external_step_in_order(self) -> None:
         _source, module = _source_and_module()
@@ -2670,10 +2680,27 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn("not workflow_contexts_complete", page_source)
         self.assertIn("disabled=beginner_mode_active", page_source)
         self.assertIn("show_advanced_approval = False", page_source)
-        self.assertIn(
-            "official_approval_disabled = bool(approval_evidence_missing) or beginner_mode_active",
-            page_source,
+        manual_gate = next(
+            node.value
+            for node in ast.walk(page)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "official_approval_disabled"
+                    for target in node.targets)
         )
+        manual_expression = compile(ast.Expression(body=manual_gate), "<manual-approval-gate>", "eval")
+        for missing, beginner, blocker, expected in (
+            ([], False, "", False),
+            (["검수 증빙"], False, "", True),
+            ([], True, "", True),
+            ([], False, "규정 경계 불명확", True),
+            (["검수 증빙"], True, "규정 경계 불명확", True),
+        ):
+            with self.subTest(missing=missing, beginner=beginner, blocker=blocker):
+                self.assertEqual(expected, eval(manual_expression, {"bool": bool}, {
+                    "approval_evidence_missing": missing,
+                    "beginner_mode_active": beginner,
+                    "manual_approval_blocker": blocker,
+                }))
 
     def test_institution_switch_discards_selected_approval_context_cache(self) -> None:
         source, module = _source_and_module()

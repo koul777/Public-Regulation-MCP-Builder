@@ -1154,10 +1154,11 @@ class PendingUploadCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pending_path = Path(tmp) / "pending.hwp"
             pending_path.write_bytes(b"same source")
-            document = SimpleNamespace(tenant_id="tenant-a")
+            document = SimpleNamespace(document_id="doc-a", tenant_id="tenant-a")
             reusable_run = SimpleNamespace(run_id="run-a")
             repository = SimpleNamespace(
-                find_reusable_run=Mock(return_value=(document, reusable_run))
+                find_reusable_run=Mock(return_value=(document, reusable_run)),
+                get_chunks=Mock(return_value=[]),
             )
             options = {
                 "pipeline_version": "pipeline-v1",
