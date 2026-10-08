@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL
 from app.ingestion.vector_adapter import VECTOR_RECORD_SCHEMA_VERSION, stable_content_hash, vector_record_path_leaks
-from app.retrieval.semantic_models import Qwen3EmbeddingAdapter
+from app.retrieval.semantic_models import QWEN3_EMBEDDING_INPUT_STRATEGY, Qwen3EmbeddingAdapter
 
 
 EMBEDDED_VECTOR_RECORD_SCHEMA_VERSION = "reg-rag-embedded-vector-record-v1"
@@ -77,6 +77,8 @@ def _embedded_record(
     embedded["embedding_hash"] = stable_embedding_hash(embedding)
     embedded["embedding_runtime"] = runtime
     embedded["embedding_semantic"] = semantic
+    if semantic:
+        embedded["embedding_input_strategy"] = QWEN3_EMBEDDING_INPUT_STRATEGY
     embedded["embedding_normalized"] = True
     embedded["embedding_generated_at"] = datetime.now(timezone.utc).isoformat()
     embedded["content_hash"] = stable_content_hash(text, embedded.get("metadata") or {})
@@ -221,7 +223,7 @@ def _qwen_embedding_adapter(dimensions: int) -> Qwen3EmbeddingAdapter:
     ):
         raise ValueError("Qwen3 embedding dimensions must be between 64 and 4096")
     return Qwen3EmbeddingAdapter(
-        device="cpu",
+        device="auto",
         truncate_dim=dimensions,
         local_files_only=True,
     )
