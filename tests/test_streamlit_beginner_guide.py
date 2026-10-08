@@ -3408,12 +3408,19 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
                 self.assertEqual({}, self._file_snapshot())
 
     def test_completed_current_document_opens_next_pending_document_before_ai_handoff(self) -> None:
+        from app.services.indexing_readiness_service import IndexingPackageStatus
         from tests.test_streamlit_approval_app import (
             _confirm_rendered_approval_rows,
             _seed_app_institution_context,
             _seed_streamlit_multi_approval_documents,
         )
 
+        # This navigation test supplies a fake embedding adapter below. Its
+        # readiness must also be independent of optional local model packages.
+        self.enterContext(patch(
+            "app.services.indexing_readiness_service.check_indexing_packages",
+            return_value=IndexingPackageStatus(),
+        ))
         _seed_streamlit_multi_approval_documents(self.settings)
         _seed_app_institution_context(self.app)
         first_id = "doc_streamlit_approval"

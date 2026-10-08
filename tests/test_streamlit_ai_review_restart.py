@@ -16,6 +16,7 @@ from app.core import config as config_module
 from app.core.ai_review_preferences import load_ai_review_preferences, save_ai_review_preferences
 from app.core.config import Settings
 from app.storage.repository import JsonRepository
+from tests import test_streamlit_approval_app as approval_test_support
 from tests.test_streamlit_approval_app import (
     _seed_app_institution_context,
     _seed_streamlit_approval_document,
@@ -97,6 +98,11 @@ class AIReviewPreferencesRestoreUITests(unittest.TestCase):
 
 @unittest.skipIf(AppTest is None, "Streamlit AppTest is unavailable")
 class BeginnerBulkFinishChoiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Exercise real approvals and journals without requiring local model
+        # packages or inference on the source-only CI runner.
+        approval_test_support.StreamlitApprovalAppTests.setUp(self)
+
     def _beginner_app(self, root: Path) -> tuple[AppTest, Settings]:
         settings = Settings(data_dir=root / "data", artifact_root=root)
         _seed_streamlit_approval_document(settings)
