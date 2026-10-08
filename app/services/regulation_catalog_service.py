@@ -224,11 +224,18 @@ def filter_to_latest_active_versions(
 ) -> list[DocumentLike]:
     """Retain one approved active version per regulation.
 
+    An explicit as_of date also admits superseded versions within their
+    closed effective interval; default reads consider current active statuses.
+    This historical eligibility is independent of legacy compatibility.
+
     Catalog views keep legacy records by default for remediation. RAG/MCP
     callers must set ``include_legacy=False`` so records without an
     institution profile, regulation family, version, or effective start are
     never treated as current evidence.
     """
+    historical = as_of is not None and not (isinstance(as_of, str) and not as_of.strip())
+    if historical and _parse_date(as_of) is None:
+        return []
     grouped: dict[RegulationGroupKey, list[tuple[DocumentLike, RegulationMetadata]]] = {}
     for document in documents:
         metadata = read_regulation_metadata(document)
@@ -241,7 +248,7 @@ def filter_to_latest_active_versions(
             continue
         candidate_group = group
         active_statuses = DEFAULT_ACTIVE_STATUSES
-        if not include_legacy:
+        if historical:
             strict_candidates: list[tuple[DocumentLike, RegulationMetadata]] = []
             for document, metadata in group:
                 if _normalize_status(metadata.status) == "superseded" and metadata.effective_to is None:

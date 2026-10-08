@@ -460,12 +460,16 @@ def _record_document_id(record: dict[str, Any]) -> str:
     return str(record.get("document_id") or metadata.get("document_id") or "")
 
 
-def load_bm25_index(path: Path) -> Bm25Index | None:
-    if not path.is_file():
+def load_bm25_index(path: Path, *, raise_on_unavailable: bool = False) -> Bm25Index | None:
+    # Cache callers must distinguish an unreadable/missing file from a parsed
+    # but unsupported schema, including when a stat probe would hide an error.
+    if not raise_on_unavailable and not path.is_file():
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        if raise_on_unavailable:
+            raise
         return None
     if not isinstance(payload, dict):
         return None

@@ -52,7 +52,20 @@ function Write-Utf8NoBom {
 
 function Get-Sha256Lower {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
-    return (Get-FileHash -LiteralPath $LiteralPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    # A Windows PowerShell child can inherit a PowerShell 7 module search path.
+    # Hash directly so artifact verification does not depend on Get-FileHash discovery.
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    $Stream = $null
+    try {
+        $Stream = [System.IO.File]::OpenRead($LiteralPath)
+        return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $Stream) {
+            $Stream.Dispose()
+        }
+        $Hasher.Dispose()
+    }
 }
 
 function Test-PathWithinRoot {

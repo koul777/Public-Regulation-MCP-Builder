@@ -350,7 +350,7 @@ class ReleaseHarnessTests(unittest.TestCase):
 
     def test_skip_build_bundle_uses_root_dist_when_rebased_artifact_dist_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             dist_dir = root / "dist"
             dist_dir.mkdir()
             (dist_dir / "reg_rag_preprocessor-1.2.16-py3-none-any.whl").write_text("wheel", encoding="utf-8")

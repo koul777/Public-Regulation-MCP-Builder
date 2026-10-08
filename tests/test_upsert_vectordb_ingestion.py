@@ -244,5 +244,45 @@ def _record(record_id: str, text: str) -> dict:
     }
 
 
+
+class OfficialApprovedUpsertTests(unittest.TestCase):
+    def test_official_upsert_accepts_genuine_approval_and_rejects_restamped_tampering(self) -> None:
+        import copy
+        from app.ingestion.vector_adapter import with_vector_record_verification
+        from tests.test_approval_validation import approved_ingestion_fixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, _repository, _auth, _document, _chunk, _exported, record = approved_ingestion_fixture(root)
+            records_path = root / "records.jsonl"
+            target = settings.data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            result = upsert_vectordb_ingestion(
+                records_path, target_type="local-jsonl", target_path=target,
+                out_manifest=root / "approved-manifest.json", data_dir=settings.data_dir,
+                tenant_id="tenant-a", require_repository_approval=True,
+            )
+            self.assertTrue(result["repository_approval_validation"]["checked"])
+            original_store = target.read_bytes()
+            for field, value in {"text": "changed text", "retrieval_text": "changed retrieval",
+                                 "department_acl": ["other-department"], "security_level": "public",
+                                 "profile_id": "profile-b"}.items():
+                with self.subTest(field=field):
+                    changed = copy.deepcopy(record)
+                    if field == "text":
+                        changed[field] = value
+                    else:
+                        changed["metadata"][field] = value
+                    changed = with_vector_record_verification(changed)
+                    records_path.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        upsert_vectordb_ingestion(
+                            records_path, target_type="local-jsonl", target_path=target,
+                            out_manifest=root / f"rejected-{field}.json", data_dir=settings.data_dir,
+                            tenant_id="tenant-a", require_repository_approval=True,
+                        )
+                    self.assertEqual(original_store, target.read_bytes())
+
+
 if __name__ == "__main__":
     unittest.main()

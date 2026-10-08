@@ -49,7 +49,6 @@ except Exception:  # pragma: no cover - optional in minimal environments
 
 from app.core import config as config_module
 from app.core.config import Settings
-from frontend.authoring_page import AUTHORING_NAV_LABEL
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -102,10 +101,6 @@ KNOWN_DUPLICATE_BUTTON_LABELS = frozenset(
         # The Home page shows one "이동" button per workflow step card, so the
         # buttons cannot be told apart by their visible label.
         "이동",
-        # With regulation authoring enabled (the local default) the sidebar
-        # ("sidebar-open-authoring") and the Home page ("home-open-authoring")
-        # both render this same label in non-beginner mode.
-        AUTHORING_NAV_LABEL,
     }
 )
 

@@ -250,5 +250,46 @@ class RegulationCatalogServiceTests(unittest.TestCase):
         self.assertEqual("doc-current", current["document_id"])
 
 
+    def test_explicit_history_is_independent_of_legacy_compatibility(self) -> None:
+        old = {
+            "document_id": "old", "profile_id": "profile-a", "regulation_id": "reg-a",
+            "regulation_version": "v1", "regulation_status": "superseded",
+            "effective_from": "2000-01-01", "effective_to": "2000-12-31",
+        }
+        current = {
+            **old, "document_id": "current", "regulation_version": "v2",
+            "regulation_status": "approved", "effective_from": "2001-01-01",
+            "effective_to": None,
+        }
+        for include_legacy in (True, False):
+            for as_of, expected in (
+                ("1999-12-31", []), ("2000-01-01", [old]),
+                ("2000-12-31", [old]), ("2001-01-01", [current]),
+                (None, [current]), ("invalid-date", []),
+            ):
+                with self.subTest(include_legacy=include_legacy, as_of=as_of):
+                    self.assertEqual(expected, filter_to_latest_active_versions(
+                        [old, current], as_of=as_of, include_legacy=include_legacy,
+                    ))
+
+    def test_superseded_requires_explicit_history_and_closed_interval(self) -> None:
+        superseded = {
+            "document_id": "old", "profile_id": "profile-a", "regulation_id": "reg-a",
+            "regulation_version": "v1", "regulation_status": "superseded",
+            "effective_from": "2000-01-01", "effective_to": "9999-12-31",
+        }
+        for include_legacy in (True, False):
+            with self.subTest(include_legacy=include_legacy):
+                self.assertEqual([], filter_to_latest_active_versions(
+                    [superseded], include_legacy=include_legacy,
+                ))
+                self.assertEqual([superseded], filter_to_latest_active_versions(
+                    [superseded], as_of="2000-06-01", include_legacy=include_legacy,
+                ))
+                self.assertEqual([], filter_to_latest_active_versions(
+                    [{**superseded, "effective_to": None}], as_of="2000-06-01",
+                    include_legacy=include_legacy,
+                ))
+
 if __name__ == "__main__":
     unittest.main()

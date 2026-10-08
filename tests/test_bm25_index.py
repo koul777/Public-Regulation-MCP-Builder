@@ -23,6 +23,19 @@ from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL, tokenize
 
 
 class Bm25IndexTests(unittest.TestCase):
+    def test_loader_can_distinguish_unreadable_json_from_rejected_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bm25.json"
+            self.assertIsNone(load_bm25_index(path))
+            with self.assertRaises(FileNotFoundError):
+                load_bm25_index(path, raise_on_unavailable=True)
+            path.write_text("{partial", encoding="utf-8")
+            self.assertIsNone(load_bm25_index(path))
+            with self.assertRaises(ValueError):
+                load_bm25_index(path, raise_on_unavailable=True)
+            path.write_text('{"index_version":"reg-rag-bm25-index-v2"}', encoding="utf-8")
+            self.assertIsNone(load_bm25_index(path, raise_on_unavailable=True))
+
     def test_search_reuses_full_candidate_structured_context_for_boosts(
         self,
     ) -> None:

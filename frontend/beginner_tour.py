@@ -66,9 +66,9 @@ def render_journey(
             f'<p>{description}</p></li>'
         )
     done_count = sum(step <= len(completed) and completed[step - 1] for step, _, _ in stages)
-    completion_title = "모든 준비를 마쳤어요" if mcp else "빌더의 Qwen 인계 준비를 마쳤어요"
+    completion_title = "AI 앱 연결 확인을 기록했어요" if mcp else "빌더의 Qwen 인계 준비를 마쳤어요"
     completion_description = (
-        "승인한 규정을 AI에서 활용할 수 있어요. 새 문서도 같은 순서로 진행하세요."
+        "운영자가 현재 MCP 설정의 실제 대화 검색·조회 결과를 직접 확인했다고 기록했어요. 새 문서도 같은 순서로 진행하세요."
         if mcp else "기관·규정 선택, 질문, 답변의 근거 인용 확인은 Qwen 창에서 계속하세요."
     )
     ribbon = (

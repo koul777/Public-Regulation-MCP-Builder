@@ -978,6 +978,22 @@ def _search_hierarchical_runtime(
     vector_signature = verified_runtime_token.vector_identity
     if index_signature is None or vector_signature is None:
         return None
+    if query.document_id and not routes_rag.document_is_latest_catalog_version(
+        str(query.document_id), repository=_json_repository(settings), auth=auth,
+        as_of_date=query.as_of_date, profile_id=profile_id,
+    ):
+        if not read_context.postflight_is_current():
+            return None
+        return [], {
+            "trace_id": f"hier-{uuid.uuid4().hex}",
+            "retrieval_strategy": "catalog_scope",
+            "candidate_regulations": [],
+            "lifecycle_selection": {
+                "mode": "latest_internal_regulation_version",
+                "as_of_date": query.as_of_date,
+                "selected_record_count": 0,
+            },
+        }
     prevalidated_sidecar_identity = read_context.prevalidated_sidecar_identity
     bm25_runtime = _verified_hierarchical_runtime_bm25(
         settings=settings,
@@ -4068,6 +4084,19 @@ def _aggregate_comparison_hash(parts: list[dict[str, str]]) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _record_is_latest_catalog_version(
+    record: dict[str, Any],
+    *,
+    repository: Any,
+    auth: AuthContext,
+    as_of_date: str | None,
+) -> bool:
+    metadata = record.get("metadata") or {}
+    return routes_rag.document_is_latest_catalog_version(
+        str(record.get("document_id") or metadata.get("document_id") or ""),
+        repository=repository, auth=auth, as_of_date=as_of_date,
+    )
+
 def _visible_record_by_chunk(
     *,
     settings: Settings,
@@ -4111,14 +4140,10 @@ def _visible_record_by_chunk(
     )
     if record is None:
         return None
-    # Approval and scope alone do not prove currency.  Every other content tool
-    # filters to the latest active version; fetch must apply the same gate or it
-    # serves a superseded or repealed chunk as current evidence.  Run the same
-    # filter over just the fetched record so the targeted lookup is preserved (no
-    # full vector load): a record with a dead status or an elapsed effective/
-    # repeal date is dropped, while a current or pre-catalog record is kept.
     if not filter_to_latest_active_versions(
         [record], as_of=as_of_date, include_legacy=True
+    ) or not _record_is_latest_catalog_version(
+        record, repository=repository, auth=auth, as_of_date=as_of_date
     ):
         return None
     return record
@@ -4235,7 +4260,9 @@ def _visible_record_with_related_by_chunk(
                     as_of=as_of_date,
                     include_legacy=True,
                 )
-                if visible(candidate)
+                if visible(candidate) and _record_is_latest_catalog_version(
+                    candidate, repository=repository, auth=auth, as_of_date=as_of_date
+                )
                 else []
             )
             related_records: list[dict[str, Any]] = []
@@ -4473,7 +4500,7 @@ def _visible_records(
             auth=auth,
             profile_id=profile_id,
         )
-        if document_id
+        if document_id and use_cached_approval_snapshot
         else None
     )
     query_request = routes_rag.RegulationQuery(
@@ -4487,6 +4514,11 @@ def _visible_records(
     )
     repository = _json_repository(settings)
     _validate_mcp_security_scope(query_request, auth)
+    if latest_only and document_id and not routes_rag.document_is_latest_catalog_version(
+        document_id, repository=repository, auth=auth, as_of_date=as_of_date,
+        profile_id=profile_id,
+    ):
+        return []
     if hierarchical_paths is not None:
         index_signature = routes_rag.path_signature(hierarchical_paths[0])
         vector_signature = routes_rag.path_signature(hierarchical_paths[1])
@@ -4801,6 +4833,9 @@ def _runtime_sidecar_visible_regulation_units(
                 or not content_hash
                 or security_level not in requested_levels
             ):
+                continue
+            document_profile_id = str(current.get("document_profile_id") or "").strip().casefold()
+            if document_profile_id and document_profile_id != str(profile_id or "").strip().casefold():
                 continue
             department_acl = routes_rag.department_acl_set(
                 current.get("department_acl")

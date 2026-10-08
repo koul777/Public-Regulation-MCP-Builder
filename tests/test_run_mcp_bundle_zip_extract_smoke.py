@@ -339,7 +339,7 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
 
     def test_extract_smoke_validates_runtime_integrity_before_client_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source = root / "source"
             source.mkdir()
             extracted = root / "extracted"

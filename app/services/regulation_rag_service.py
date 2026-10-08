@@ -213,6 +213,7 @@ def get_visible_records(
         approval_snapshot=approval_snapshot,
         requested_department_ids=requested_department_ids_value,
         latest_only=latest_only,
+        use_cache=use_cached_approval_snapshot,
     )
     if not latest_only:
         return visible_records
@@ -454,6 +455,20 @@ def _regulation_version_sort_key(version: str) -> tuple[tuple[int, object], ...]
     )
 
 
+def document_is_latest_catalog_version(
+    document_id: str,
+    *,
+    repository: Any,
+    auth: Any,
+    as_of_date: str | None,
+    profile_id: str | None = None,
+) -> bool:
+    return _runtime.document_is_latest_catalog_version(
+        document_id, repository=repository, auth=auth,
+        as_of_date=as_of_date, profile_id=profile_id,
+    )
+
+
 def repository_cache(repository):
     return _runtime.RagRequestRepositoryCache(repository)
 
@@ -464,7 +479,7 @@ def repository_document(repository_cache_obj, document_id: str):
 
 def approval_snapshot_for_records(repository, records, auth, *, enabled: bool = True):
     if not enabled:
-        return None
+        return _runtime.load_fresh_approval_snapshot(repository, records, auth)
     return load_cached_approval_snapshot(repository, records, auth)
 
 

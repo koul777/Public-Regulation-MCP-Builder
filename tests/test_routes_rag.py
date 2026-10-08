@@ -2963,21 +2963,22 @@ def _write_runtime_approval_snapshot_sidecar_fixture(
     )
     (journal_dir / "approvals.jsonl").write_text("", encoding="utf-8")
     repository = JsonRepository(Settings(data_dir=data_dir))
-    repository.upsert_document(
-        Document(
-            document_id="doc",
-            filename="rules.pdf",
-            document_name="Rules",
-            file_type="pdf",
-            file_hash="document-hash",
-            institution_name="Test Institution",
-            source_system="PUBLIC_PORTAL",
-            source_url="https://example.test/rules",
-            profile_id="public_portal-test-profile",
-            tenant_id=tenant_id,
-            status="completed",
+    for document_id in document_ids:
+        repository.upsert_document(
+            Document(
+                document_id=document_id,
+                filename="rules.pdf",
+                document_name="Rules",
+                file_type="pdf",
+                file_hash="document-hash",
+                institution_name="Test Institution",
+                source_system="PUBLIC_PORTAL",
+                source_url="https://example.test/rules",
+                profile_id="public_portal-test-profile",
+                tenant_id=tenant_id,
+                status="completed",
+            )
         )
-    )
     entries = []
     for record in records:
         metadata = record.get("metadata") or {}

@@ -14,7 +14,7 @@ from app.processors.kordoc_table_parser import resolve_kordoc_command, split_com
 from app.schemas.chunk import ChunkOptions
 
 
-PREPROCESSOR_PIPELINE_VERSION = "2026.10.02-table-rows-hwpx-docx-pdf-structure-fixes-1"
+PREPROCESSOR_PIPELINE_VERSION = "2026.10.08-combined-book-typeset-boundaries-1"
 _SAFE_VERSION = re.compile(r"(?<![A-Za-z0-9])v?(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?![A-Za-z0-9])")
 
 

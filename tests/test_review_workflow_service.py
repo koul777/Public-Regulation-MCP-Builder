@@ -8,6 +8,7 @@ from pathlib import Path
 from app.schemas.chunk import Chunk
 from app.services.review_workflow_service import (
     ReviewWorkflowError,
+    ambiguous_combined_book_chunk_ids,
     approval_worklist_evidence,
     build_approval_record,
     build_rejection_record,
@@ -259,34 +260,145 @@ class ReviewWorkflowServiceTests(unittest.TestCase):
         self.assertEqual({"chunk-1"}, result.requested_ids)
         self.assertEqual({"chunk-1": ["warning:table parse warning"]}, result.review_attention)
 
-    def test_validate_approval_preconditions_hard_blocks_ambiguous_combined_book(self) -> None:
-        blocked = _chunk("chunk-ambiguous").model_copy(
-            update={
-                "metadata": {"ambiguous_combined_book_boundary": True},
-                "warnings": ["ambiguous_combined_book_boundary_requires_reparse"],
-            }
+    def test_ambiguous_combined_book_chunk_ids_recognizes_each_marker_without_mutation(self) -> None:
+        marker_updates = (
+            {"metadata": {"ambiguous_combined_book_boundary": True}},
+            {"metadata": {
+                "structure_boundary_diagnostic": "ambiguous_combined_book_boundary_after_attachment",
+            }},
+            {"metadata": {
+                "structure_boundary_diagnostic": "  ambiguous_combined_book_boundary_after_attachment\n",
+            }},
+            {"warnings": ["ambiguous_combined_book_boundary_requires_reparse"]},
         )
+        for update in marker_updates:
+            with self.subTest(update=update):
+                blocked = _chunk("chunk-ambiguous").model_copy(update=update)
+                clean = _chunk("chunk-clean")
+                chunks = (blocked, clean, blocked)
+                before = [chunk.model_dump() for chunk in chunks]
 
-        for acknowledged, override_reason in (
-            (True, None),
-            (False, "director override"),
-            (True, "director override"),
-        ):
-            with self.subTest(
-                review_flags_acknowledged=acknowledged,
-                approval_override_reason=override_reason,
+                self.assertEqual(
+                    {blocked.chunk_id},
+                    ambiguous_combined_book_chunk_ids(chunks),
+                )
+                self.assertEqual(before, [chunk.model_dump() for chunk in chunks])
+
+        self.assertEqual(set(), ambiguous_combined_book_chunk_ids([]))
+
+    def test_ambiguous_combined_book_chunk_ids_preserves_exact_marker_rules(self) -> None:
+        unaffected_updates = (
+            {},
+            {"metadata": {}},
+            {"metadata": {"ambiguous_combined_book_boundary": False}},
+            {"metadata": {"ambiguous_combined_book_boundary": "true"}},
+            {"metadata": {"ambiguous_combined_book_boundary": 1}},
+            {"metadata": {"structure_boundary_diagnostic": "ordinary_fallback"}},
+            {"metadata": {"structure_boundary_diagnostic": "ambiguous_combined_book_boundary"}},
+            {"metadata": {"structure_fallback": True}},
+            {"metadata": {"review_required": True}},
+            {"warnings": ["table parse warning"]},
+            {"warnings": ["ambiguous_combined_book_boundary_requires_reparse extra"]},
+            {"warnings": [" ambiguous_combined_book_boundary_requires_reparse "]},
+        )
+        for update in unaffected_updates:
+            with self.subTest(update=update):
+                chunk = _chunk("chunk-unaffected").model_copy(update=update)
+
+                self.assertEqual(set(), ambiguous_combined_book_chunk_ids([chunk]))
+                result = validate_approval_preconditions(
+                    chunks=[chunk],
+                    chunk_ids=[chunk.chunk_id],
+                    review_flags_acknowledged=True,
+                )
+                self.assertEqual({chunk.chunk_id}, result.requested_ids)
+
+    def test_validate_approval_preconditions_hard_blocks_ambiguous_combined_book(self) -> None:
+        marker_updates = (
+            {"metadata": {"ambiguous_combined_book_boundary": True}},
+            {"metadata": {
+                "structure_boundary_diagnostic": "ambiguous_combined_book_boundary_after_attachment",
+            }},
+            {"metadata": {
+                "structure_boundary_diagnostic": "  ambiguous_combined_book_boundary_after_attachment\n",
+            }},
+            {"warnings": ["ambiguous_combined_book_boundary_requires_reparse"]},
+        )
+        for update in marker_updates:
+            blocked = _chunk("chunk-ambiguous").model_copy(update=update)
+            for acknowledged, override_reason in (
+                (False, None),
+                (True, None),
+                (False, "director override"),
+                (True, "director override"),
             ):
-                with self.assertRaises(ReviewWorkflowError) as raised:
-                    validate_approval_preconditions(
-                        chunks=[blocked],
-                        chunk_ids=[blocked.chunk_id],
-                        review_flags_acknowledged=acknowledged,
-                        approval_override_reason=override_reason,
+                with self.subTest(
+                    update=update,
+                    review_flags_acknowledged=acknowledged,
+                    approval_override_reason=override_reason,
+                ):
+                    with self.assertRaises(ReviewWorkflowError) as raised:
+                        validate_approval_preconditions(
+                            chunks=[blocked],
+                            chunk_ids=[blocked.chunk_id],
+                            review_flags_acknowledged=acknowledged,
+                            approval_override_reason=override_reason,
+                        )
+
+                    self.assertEqual(400, raised.exception.status_code)
+                    self.assertEqual(
+                        "Ambiguous combined-book regulation boundaries must be reparsed before approval: "
+                        "chunk-ambiguous",
+                        raised.exception.detail,
                     )
 
-                self.assertEqual(400, raised.exception.status_code)
-                self.assertIn("must be reparsed before approval", raised.exception.detail)
-                self.assertIn(blocked.chunk_id, raised.exception.detail)
+    def test_validate_approval_preconditions_reports_only_selected_ambiguous_ids(self) -> None:
+        blocked = _chunk("chunk-ambiguous").model_copy(
+            update={"metadata": {"ambiguous_combined_book_boundary": True}}
+        )
+        unrequested = _chunk("chunk-unrequested").model_copy(
+            update={"warnings": ["ambiguous_combined_book_boundary_requires_reparse"]}
+        )
+        clean = _chunk("chunk-clean")
+        chunks = [blocked, unrequested, clean]
+
+        self.assertEqual(
+            {blocked.chunk_id, unrequested.chunk_id},
+            ambiguous_combined_book_chunk_ids(chunks),
+        )
+        with self.assertRaises(ReviewWorkflowError) as raised:
+            validate_approval_preconditions(
+                chunks=chunks,
+                chunk_ids=[blocked.chunk_id, clean.chunk_id],
+                review_flags_acknowledged=True,
+                approval_override_reason="director override",
+            )
+
+        self.assertEqual(
+            "Ambiguous combined-book regulation boundaries must be reparsed before approval: "
+            "chunk-ambiguous",
+            raised.exception.detail,
+        )
+
+    def test_validate_approval_preconditions_bounds_and_sorts_ambiguous_ids(self) -> None:
+        chunks = [
+            _chunk(f"chunk-{index:02d}").model_copy(
+                update={"metadata": {"ambiguous_combined_book_boundary": True}}
+            )
+            for index in reversed(range(25))
+        ]
+        with self.assertRaises(ReviewWorkflowError) as raised:
+            validate_approval_preconditions(
+                chunks=chunks,
+                chunk_ids=[chunk.chunk_id for chunk in chunks],
+                review_flags_acknowledged=True,
+            )
+
+        self.assertEqual(
+            "Ambiguous combined-book regulation boundaries must be reparsed before approval: "
+            + ", ".join(f"chunk-{index:02d}" for index in range(20)),
+            raised.exception.detail,
+        )
 
     def test_validate_approval_preconditions_does_not_hard_block_ordinary_fallback(self) -> None:
         fallback = _chunk("chunk-fallback").model_copy(

@@ -218,6 +218,20 @@ def _regex_tokens(text: str) -> list[str]:
 
 
 def _expand_token(token: str) -> list[str]:
+    # Only a pure, short-word transform is shared. Return a fresh list so a
+    # caller cannot mutate another request's token expansion. Full documents
+    # and oversized words are never retained by this bounded cache.
+    if not isinstance(token, str) or len(token) > 128:
+        return _expand_token_uncached(token)
+    return list(_cached_expanded_token(token))
+
+
+@lru_cache(maxsize=2048)
+def _cached_expanded_token(token: str) -> tuple[str, ...]:
+    return tuple(_expand_token_uncached(token))
+
+
+def _expand_token_uncached(token: str) -> list[str]:
     normalized = _normalize_token(token)
     if not normalized:
         return []
