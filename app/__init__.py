@@ -1,3 +1,3 @@
 """RegRAG Prep application package."""
 
-__version__ = "1.2.21"
+__version__ = "1.3.1"
