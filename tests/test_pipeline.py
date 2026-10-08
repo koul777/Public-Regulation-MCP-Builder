@@ -18,6 +18,15 @@ from app.schemas.chunk import ChunkOptions
 
 
 class PipelineTests(unittest.TestCase):
+    def test_typeset_book_boundary_fix_invalidates_previous_processing_identity(self) -> None:
+        options = ChunkOptions(enable_agent_review=False)
+        current = processing_options_payload(options)
+        with patch("app.core.pipeline.PREPROCESSOR_PIPELINE_VERSION",
+                   "2026.10.02-table-rows-hwpx-docx-pdf-structure-fixes-1"):
+            previous = processing_options_payload(options)
+        self.assertNotEqual(previous, current)
+        self.assertEqual({key for key in current if previous[key] != current[key]}, {"pipeline_version"})
+
     def test_docx_boundary_fix_cannot_reuse_previous_processing_identity(self) -> None:
         options = ChunkOptions(enable_agent_review=False)
         current = processing_options_payload(options)

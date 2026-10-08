@@ -2348,6 +2348,33 @@ class ChunkerTests(unittest.TestCase):
         self.assertNotIn("ambiguous_combined_book_boundary", chunk.metadata)
         self.assertNotIn("ambiguous_combined_book_boundary_requires_reparse", chunk.warnings)
 
+    def test_recovered_boundary_review_evidence_is_scoped_to_its_regulation(self) -> None:
+        parsed = ParsedDocument(document_id="book", source_file="combined.pdf", file_type="pdf")
+        nodes = StructureDetector().detect_from_text(
+            "1-1-1. 인사규정\n제1조(목적) 인사 기준.\n"
+            "1-1-2. 보수규정\n제1조(목적) 보수 기준.", document_id="book",
+        )
+        recovered = next(n for n in nodes if n.node_type == "regulation" and n.number == "1-1-2")
+        warning = "regulation_boundary_recovered_from_typeset_title"
+        recovered.warnings.append(warning)
+        recovered.confidence = 0.96
+        recovered.metadata["regulation_boundary_source"] = "typeset_title_revision_and_article_restart"
+        chunks = Chunker().build_chunks(nodes, parsed)
+        personnel = next(c for c in chunks if c.metadata.get("regulation_title") == "인사규정")
+        salary = next(c for c in chunks if c.metadata.get("regulation_title") == "보수규정")
+        self.assertNotIn(warning, personnel.warnings)
+        self.assertNotIn("regulation_boundary_source", personnel.metadata)
+        self.assertIn(warning, salary.warnings)
+        self.assertIn(warning, salary.metadata["review_flags"])
+        self.assertLessEqual(salary.confidence, 0.96)
+        self.assertFalse(ambiguous_combined_book_chunk_ids(chunks))
+        with self.assertRaisesRegex(ReviewWorkflowError, "Review flags must be acknowledged"):
+            validate_approval_preconditions(chunks=chunks, chunk_ids=[salary.chunk_id],
+                                            review_flags_acknowledged=False)
+        validate_approval_preconditions(chunks=chunks, chunk_ids=[salary.chunk_id],
+                                        review_flags_acknowledged=True)
+        self.assertEqual("draft", salary.approval_status)
+
     def test_ambiguous_combined_book_chunks_retain_text_and_hard_block_marker(self) -> None:
         text = "\n".join(
             [

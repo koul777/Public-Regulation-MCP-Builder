@@ -3,8 +3,15 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from app.processors.chunker import Chunker
 from app.processors.structure_detector import StructureDetector
+from app.schemas.chunk import ChunkOptions
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
+from app.services.review_workflow_service import (
+    ReviewWorkflowError,
+    ambiguous_combined_book_chunk_ids,
+    validate_approval_preconditions,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_regulation.md"
@@ -909,6 +916,119 @@ class StructureDetectorTests(unittest.TestCase):
             "ambiguous_combined_book_boundary_after_attachment",
             parsed.metadata.get("structure_boundary_diagnostic"),
         )
+
+    @staticmethod
+    def _typeset_book(*, typo: bool = False, early_header: bool = False) -> ParsedDocument:
+        printed = "1-1-2. 보수규졍" if typo else "1-1-1. 인사규정"
+        pages = [ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+            "1-1-1. 인사규정", "제1조(목적) 인사 기준.", "[별표 1]", "인사 첨부 내용",
+        ]))])]
+        if early_header:
+            pages.append(ParsedPage(page_no=2, blocks=[ParsedBlock(text="\n".join([
+                printed, "앞 규정의 마지막 첨부 내용", "부 칙", "제1조(시행일) 공포일부터 시행한다.",
+            ]))]))
+        pages.append(ParsedPage(page_no=len(pages) + 1, blocks=[
+            ParsedBlock(text=printed, bbox=(30, 20, 260, 30), metadata={"font_size_median": 10}),
+            ParsedBlock(text="보수규정", bbox=(90, 65, 230, 81), metadata={"font_size_median": 16}),
+            ParsedBlock(text="제정 2024. 1. 1. 규정 제20호", bbox=(30, 100, 260, 108)),
+            ParsedBlock(text="일부개정 2025. 2. 1. 규정 제30호", bbox=(30, 115, 260, 123)),
+            ParsedBlock(text="제1조(목적) 보수 기준.", bbox=(30, 160, 300, 172),
+                        metadata={"font_size_median": 12}),
+        ]))
+        pages.append(ParsedPage(page_no=len(pages) + 1, blocks=[
+            ParsedBlock(text=printed if typo else "1-1-2. 보수규정",
+                        bbox=(30, 20, 260, 30), metadata={"font_size_median": 10}),
+            ParsedBlock(text="제2조(범위) 모든 직원에게 적용한다."),
+        ]))
+        return ParsedDocument(document_id="doc-typeset-book", source_file="combined.pdf",
+                              document_name="통합규정집", file_type="pdf", pages=pages)
+
+    def test_typeset_opening_recovers_stale_and_misspelled_running_headers(self) -> None:
+        for typo, early in ((False, False), (True, False), (True, True)):
+            with self.subTest(typo=typo, early_header=early):
+                parsed = self._typeset_book(typo=typo, early_header=early)
+                nodes = StructureDetector().detect(parsed)
+                regulations = [n for n in nodes if n.node_type == "regulation"]
+                self.assertEqual([("1-1-1", "인사규정"), ("1-1-2", "보수규정")],
+                                 [(n.number, n.title) for n in regulations])
+                recovered = regulations[1]
+                self.assertEqual(3 if early else 2, recovered.page_start)
+                self.assertEqual("typeset_title_revision_and_article_restart",
+                                 recovered.metadata["regulation_boundary_source"])
+                self.assertIn("regulation_boundary_recovered_from_typeset_title", recovered.warnings)
+                self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+                for article in (n for n in nodes if n.node_type == "article" and n.page_start >= recovered.page_start):
+                    self.assertEqual(recovered.node_id, article.parent_id)
+                if early:
+                    continuation = next(n for n in nodes if "앞 규정의 마지막 첨부 내용" in n.text)
+                    self.assertEqual(regulations[0].node_id, continuation.parent_id)
+
+    def test_typeset_boundary_recovery_requires_independent_layout_and_structure(self) -> None:
+        cases = ("no_layout", "small_title", "overlap", "no_revision", "embedded_form",
+                 "table_title", "no_restart", "conflicting_numbers", "unconfirmed_stale_number",
+                 "nonfinite_font", "bad_bbox")
+        for case in cases:
+            with self.subTest(case=case):
+                parsed = self._typeset_book()
+                blocks = parsed.pages[1].blocks
+                if case == "no_layout":
+                    blocks[1].metadata.clear()
+                elif case == "small_title":
+                    blocks[1].metadata["font_size_median"] = 10
+                elif case == "overlap":
+                    blocks[1].bbox = (30, 20, 260, 30)
+                elif case == "no_revision":
+                    blocks[2].text = "인용문은 다음과 같다."
+                elif case == "embedded_form":
+                    blocks.insert(4, ParsedBlock(text="[별지 제1호서식]"))
+                elif case == "table_title":
+                    blocks[1].type = "table"
+                elif case == "no_restart":
+                    blocks[-1].text = "제3조(범위) 보수 기준."
+                elif case == "conflicting_numbers":
+                    parsed.pages.append(ParsedPage(page_no=4, blocks=[ParsedBlock(
+                        text="1-1-3. 보수규정\n제1조(목적) 다른 버전."
+                    )]))
+                elif case == "unconfirmed_stale_number":
+                    parsed.pages[2].blocks[0].text = "1-1-1. 인사규정"
+                elif case == "nonfinite_font":
+                    blocks[1].metadata["font_size_median"] = float("inf")
+                elif case == "bad_bbox":
+                    blocks[1].metadata["source_bbox"] = ["invalid"]
+                nodes = StructureDetector().detect(parsed)
+                self.assertFalse(any(
+                    "regulation_boundary_recovered_from_typeset_title" in n.warnings for n in nodes
+                ))
+                if case in {"no_layout", "small_title", "overlap", "no_revision",
+                            "conflicting_numbers", "unconfirmed_stale_number", "nonfinite_font", "bad_bbox"}:
+                    self.assertEqual("ambiguous_combined_book_boundary_after_attachment",
+                                     parsed.metadata.get("structure_boundary_diagnostic"))
+
+    def test_typeset_book_chunks_keep_ownership_and_require_human_approval(self) -> None:
+        for recoverable in (True, False):
+            with self.subTest(recoverable=recoverable):
+                parsed = self._typeset_book()
+                if not recoverable:
+                    parsed.pages[1].blocks[1].metadata.clear()
+                nodes = StructureDetector().detect(parsed)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                self.assertTrue(chunks)
+                self.assertTrue(all(chunk.approval_status == "draft" for chunk in chunks))
+                self.assertTrue(all(chunk.approved_content_hash is None for chunk in chunks))
+                if recoverable:
+                    self.assertEqual(set(), ambiguous_combined_book_chunk_ids(chunks))
+                    salaries = [c for c in chunks if "보수 기준" in (c.normalized_text or "")]
+                    self.assertEqual(1, len(salaries))
+                    self.assertEqual("보수규정", salaries[0].metadata["regulation_title"])
+                    self.assertIn("regulation_boundary_recovered_from_typeset_title", salaries[0].warnings)
+                    validate_approval_preconditions(chunks=chunks, chunk_ids=[c.chunk_id for c in chunks],
+                                                    review_flags_acknowledged=True)
+                else:
+                    self.assertEqual({c.chunk_id for c in chunks}, ambiguous_combined_book_chunk_ids(chunks))
+                    with self.assertRaisesRegex(ReviewWorkflowError, "must be reparsed"):
+                        validate_approval_preconditions(chunks=chunks, chunk_ids=[c.chunk_id for c in chunks],
+                                                        review_flags_acknowledged=True,
+                                                        approval_override_reason="확인 생략 사유")
 
     def test_nonadjacent_or_later_page_title_is_not_treated_as_explicit_heading_repeat(self) -> None:
         for later_page in (False, True):

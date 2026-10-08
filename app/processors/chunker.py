@@ -17,6 +17,7 @@ from app.processors.kordoc_table_matcher import (
     prepare_kordoc_table_match_index,
 )
 from app.processors.metadata_extractor import MetadataExtractor
+from app.processors.structure_detector import RECOVERED_TYPESET_BOUNDARY_WARNING
 from app.processors.table_extractor import TableExtractor, disambiguate_table_headers
 from app.schemas.chunk import Chunk, ChunkOptions
 from app.schemas.parsed import ParsedDocument
@@ -304,7 +305,23 @@ class Chunker:
         self._inherit_temporal_metadata_from_chunks(chunks)
         self._attach_reference_edges(chunks)
         self._attach_structure_boundary_diagnostic(chunks, parsed)
+        self._attach_recovered_boundary_evidence(chunks, lookup)
         return chunks
+
+    @staticmethod
+    def _attach_recovered_boundary_evidence(chunks: list[Chunk], lookup: dict[str, StructureNode]) -> None:
+        for chunk in chunks:
+            regulation = lookup.get(chunk.metadata.get("regulation_node_id"))
+            if regulation is None or RECOVERED_TYPESET_BOUNDARY_WARNING not in regulation.warnings:
+                continue
+            chunk.metadata["regulation_boundary_source"] = regulation.metadata["regulation_boundary_source"]
+            flags = list(chunk.metadata.get("review_flags") or [])
+            if RECOVERED_TYPESET_BOUNDARY_WARNING not in flags:
+                flags.append(RECOVERED_TYPESET_BOUNDARY_WARNING)
+            chunk.metadata["review_flags"] = flags
+            if RECOVERED_TYPESET_BOUNDARY_WARNING not in chunk.warnings:
+                chunk.warnings.append(RECOVERED_TYPESET_BOUNDARY_WARNING)
+            chunk.confidence = min(chunk.confidence, regulation.confidence)
 
     def _attach_structure_boundary_diagnostic(
         self,

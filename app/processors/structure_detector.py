@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from math import isfinite
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -161,6 +162,7 @@ STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
 AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
     "ambiguous_combined_book_boundary_after_attachment"
 )
+RECOVERED_TYPESET_BOUNDARY_WARNING = "regulation_boundary_recovered_from_typeset_title"
 
 
 @dataclass
@@ -195,6 +197,9 @@ class StructureDetector:
             if line_index == line_total or line_index % DETECT_PROGRESS_LINE_STEP == 0:
                 report("scan", line_index, line_total)
         self._recover_numbered_heading_separators(lines, parsed.document_id, detected_lines)
+        recovered_header_indexes = self._recover_regulation_titles_below_running_headers(
+            lines, parsed.document_id, detected_lines,
+        )
         title_only_regulation_boundaries = self._title_only_regulation_boundaries(
             lines,
             parsed.document_id,
@@ -214,6 +219,7 @@ class StructureDetector:
             detected_lines,
             title_only_regulation_boundaries,
         )
+        navigation_line_indexes.update(recovered_header_indexes)
         nodes: list[StructureNode] = []
         pending_orphan_lines: list[SourceLine] = []
         current: dict[str, StructureNode | None] = {
@@ -631,6 +637,161 @@ class StructureDetector:
             node.warnings.append("regulation_heading_separator_inferred_from_later_heading")
             node.metadata["regulation_boundary_source"] = "matching_numbered_heading_and_article_restart"
             detected_lines[index] = node
+
+    def _recover_regulation_titles_below_running_headers(
+        self,
+        lines: list[SourceLine],
+        document_id: str,
+        detected_lines: list[StructureNode | None],
+    ) -> set[int]:
+        """Use a typeset opening to recover stale or misspelled PDF headers.
+
+        A small numbered running header is weaker than a separate, larger body
+        title followed by dated revision history and Article 1 on the same page.
+        Keep text-only mismatches unresolved. Never use edit distance to guess
+        a regulation title or move a numbered heading across an attachment.
+        """
+        first_text_by_page: dict[int, int] = {}
+        numbers_by_title: dict[str, set[str]] = {}
+        headings_by_number: dict[str, list[int]] = {}
+        first_body_start_by_number: dict[str, int] = {}
+        article_indexes: list[int] = []
+        active_number: str | None = None
+        supplementary = False
+        for index, (line, node) in enumerate(zip(lines, detected_lines)):
+            if line.page_no is not None and line.block_type == "text":
+                first_text_by_page.setdefault(line.page_no, index)
+            if node is None:
+                continue
+            if node.node_type == "article":
+                article_indexes.append(index)
+                if active_number and node.number == "제1조" and not supplementary:
+                    first_body_start_by_number.setdefault(active_number, index)
+            if node.node_type in {"supplementary", "appendix", "form"}:
+                supplementary = True
+            if node.node_type == "regulation" and node.number:
+                identity = self._regulation_title_identity(node.title or "")
+                numbers_by_title.setdefault(identity, set()).add(node.number)
+                headings_by_number.setdefault(node.number, []).append(index)
+                active_number = node.number
+                supplementary = False
+
+        # Aliases apply only to subsequent page-top repeats of the exact printed
+        # header. A different body heading must still create its own boundary.
+        aliases: dict[tuple[str | None, str], tuple[str, str]] = {}
+        suppressed_headers: set[int] = set()
+        revision = re.compile(
+            r"^(?:제정|(?:일부|전부|전문|일괄|타규정|타세칙)?개정|시행)\s*"
+            r"\d{4}\s*[.년]\s*\d{1,2}\s*[.월]\s*\d{1,2}(?:\s*[.일]|\s|$)"
+        )
+        for index, line in enumerate(lines[:-1]):
+            header = detected_lines[index]
+            if (
+                header is None or header.node_type != "regulation"
+                or not header.number or line.block_type != "text"
+                or first_text_by_page.get(line.page_no) != index
+            ):
+                continue
+            printed_identity = (header.number, self._regulation_title_identity(header.title or ""))
+            alias = aliases.get(printed_identity)
+            title_line = lines[index + 1]
+            title = self._regulation_title_for_matching(title_line.text)
+            title_identity = self._regulation_title_identity(title)
+            if (
+                title_line.page_no != line.page_no or title_line.block_type != "text"
+                or detected_lines[index + 1] is not None
+                or not self._looks_like_implicit_regulation_title(title)
+                or title_identity == printed_identity[1]
+            ):
+                if alias is not None:
+                    header.title = alias[1]
+                    header.text = f"{alias[0]}. {alias[1]}"
+                    header.metadata["regulation_boundary_source"] = "typeset_title_header_alias"
+                    header.warnings.append("regulation_running_header_title_reconciled")
+                continue
+            article_position = bisect_right(article_indexes, index + 1)
+            if article_position >= len(article_indexes):
+                continue
+            article_index = article_indexes[article_position]
+            article = detected_lines[article_index]
+            if (
+                article is None or article.number != "제1조"
+                or lines[article_index].page_no != line.page_no
+                or article_index <= index + 2
+                or not revision.match(lines[index + 2].text)
+                or not self._has_prominent_body_title(line, title_line, lines[article_index])
+            ):
+                continue
+            if any(
+                not revision.match(lines[body_index].text)
+                and not (
+                    detected_lines[body_index] is not None
+                    and detected_lines[body_index].node_type in {"part", "chapter"}
+                )
+                for body_index in range(index + 2, article_index)
+            ):
+                continue
+            confirmed_numbers = numbers_by_title.get(title_identity, set())
+            if len(confirmed_numbers) > 1:
+                continue
+            if confirmed_numbers:
+                number = next(iter(confirmed_numbers))
+            elif first_body_start_by_number.get(header.number, len(lines)) > index:
+                # A new number printed above a typeset opening can retain its
+                # number while its misspelled title is corrected from the body.
+                number = header.number
+            else:
+                # A previously used number may be a stale header. Require an
+                # exact numbered-title match elsewhere before assigning it.
+                continue
+            recovered = self._node(
+                document_id, "regulation", number, title, title_line.text,
+                title_line.page_no, 0, title_line.metadata,
+            )
+            recovered.confidence = 0.96
+            recovered.warnings.append(RECOVERED_TYPESET_BOUNDARY_WARNING)
+            recovered.metadata["regulation_boundary_source"] = "typeset_title_revision_and_article_restart"
+            detected_lines[index] = recovered
+            if number == header.number:
+                aliases[printed_identity] = (number, title)
+                # Some PDFs switch their running header one page too early,
+                # while the preceding regulation's supplementary text continues.
+                # Suppress only those page-top headers before the actual opening.
+                for earlier_index in headings_by_number[number]:
+                    if earlier_index >= index:
+                        break
+                    earlier = detected_lines[earlier_index]
+                    if (
+                        first_body_start_by_number.get(number, len(lines)) > index
+                        and earlier is not None
+                        and self._regulation_title_identity(earlier.title or "") == printed_identity[1]
+                        and first_text_by_page.get(lines[earlier_index].page_no) == earlier_index
+                    ):
+                        detected_lines[earlier_index] = None
+                        suppressed_headers.add(earlier_index)
+        return suppressed_headers
+
+    @staticmethod
+    def _has_prominent_body_title(header: SourceLine, title: SourceLine, article: SourceLine) -> bool:
+        try:
+            header_size, title_size, article_size = (
+                float((line.metadata or {}).get("font_size_median", 0))
+                for line in (header, title, article)
+            )
+            header_box, title_box, article_box = (
+                tuple(float(value) for value in (line.metadata or {}).get("source_bbox", ()))
+                for line in (header, title, article)
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            all(isfinite(size) and size > 0 for size in (header_size, title_size, article_size))
+            and all(len(box) == 4 and all(isfinite(value) for value in box)
+                    for box in (header_box, title_box, article_box))
+            and title_size >= header_size * 1.25
+            and title_size >= article_size * 1.15
+            and header_box[3] < title_box[1] < title_box[3] < article_box[1]
+        )
 
     def _title_only_regulation_boundaries(
         self,
