@@ -249,7 +249,7 @@ class OfficialApprovedUpsertTests(unittest.TestCase):
     def test_official_upsert_accepts_genuine_approval_and_rejects_restamped_tampering(self) -> None:
         import copy
         from app.ingestion.vector_adapter import with_vector_record_verification
-        from test_approval_validation import approved_ingestion_fixture
+        from tests.test_approval_validation import approved_ingestion_fixture
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

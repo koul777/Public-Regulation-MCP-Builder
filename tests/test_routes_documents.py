@@ -5206,7 +5206,7 @@ class CanonicalReviewProfileTests(unittest.TestCase):
     def test_review_profile_patch_remains_retrievable_in_canonical_profile_after_approval(self) -> None:
         from app.mcp_server import regulation_tools
         from app.services.regulation_rag_service import RegulationQuery, get_visible_records
-        from test_approval_validation import approved_ingestion_fixture
+        from tests.test_approval_validation import approved_ingestion_fixture
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

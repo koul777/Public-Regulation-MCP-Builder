@@ -18,7 +18,7 @@ from app.services.approval_validation import (
     validate_export_chunks_against_repository, validate_vector_records_against_repository,
 )
 from app.storage.repository import JsonRepository
-from test_routes_documents import _write_approval_evidence
+from tests.test_routes_documents import _write_approval_evidence
 
 
 def approved_ingestion_fixture(root: Path, *, chunk_count: int = 1) -> tuple[Settings, JsonRepository, AuthContext, Document, Chunk, dict, dict]:

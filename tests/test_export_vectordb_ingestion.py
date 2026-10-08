@@ -201,7 +201,7 @@ class ExportVectorDbIngestionTests(unittest.TestCase):
 class OfficialApprovedExportTests(unittest.TestCase):
     def test_official_export_accepts_genuine_approved_record_and_rejects_tampered_payload(self) -> None:
         import copy
-        from test_approval_validation import approved_ingestion_fixture
+        from tests.test_approval_validation import approved_ingestion_fixture
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
