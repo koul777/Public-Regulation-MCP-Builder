@@ -20,6 +20,30 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingEntrypointTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell is required")
+    def test_portable_hash_works_without_powershell_utility_module_discovery(self) -> None:
+        build_script = (ROOT / "scripts" / "build_windows_portable.ps1").read_text(encoding="utf-8-sig")
+        hash_function = build_script[
+            build_script.index("function Get-Sha256Lower") : build_script.index("function Test-PathWithinRoot")
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "artifact [1]'s.bin"
+            payload = bytes(range(256)) * 17
+            artifact.write_bytes(payload)
+            literal_path = str(artifact).replace("'", "''")
+            completed = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                    "$ErrorActionPreference = 'Stop'; $env:PSModulePath = ''; "
+                    + hash_function + f"\nGet-Sha256Lower -LiteralPath '{literal_path}'",
+                ],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), completed.stdout.strip())
+            # An exclusive writer can open the file after hashing: the read stream was closed.
+            artifact.write_bytes(b"replaced")
+
     def test_operational_scripts_are_included_in_package_discovery(self) -> None:
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 

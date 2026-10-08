@@ -222,7 +222,7 @@ class AuthoringRepositoryPurgeTests(unittest.TestCase):
             original_write = repository._atomic_write_json
 
             def stop_before_manifest(path, payload):
-                if Path(path).parent == repository.projects_root:
+                if Path(path).parent.resolve() == repository.projects_root.resolve():
                     raise KeyboardInterrupt("simulated abrupt stop")
                 return original_write(path, payload)
 
@@ -277,7 +277,7 @@ class AuthoringRepositoryPurgeTests(unittest.TestCase):
             original_write = repository._atomic_write_json
 
             def stop_before_manifest(path, payload):
-                if Path(path).parent == repository.projects_root:
+                if Path(path).parent.resolve() == repository.projects_root.resolve():
                     raise KeyboardInterrupt("simulated abrupt stop")
                 return original_write(path, payload)
 
@@ -314,7 +314,7 @@ class AuthoringRepositoryPurgeTests(unittest.TestCase):
             original_write = repository._atomic_write_json
 
             def stop_before_manifest(path, payload):
-                if Path(path).parent == repository.projects_root:
+                if Path(path).parent.resolve() == repository.projects_root.resolve():
                     raise KeyboardInterrupt("simulated abrupt stop")
                 return original_write(path, payload)
 
