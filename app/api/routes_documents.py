@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import gc
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import json
@@ -936,6 +937,14 @@ def _run_document_indexing(
         if not records and action not in {"reindex", "review_vector_sync"}:
             raise HTTPException(status_code=400, detail="No approved chunks are available for indexing.")
         timing_ms["vector_record_build"] = round((time.perf_counter() - step_started) * 1000, 3)
+
+        # The approval and vector contracts have been validated. Do not retain
+        # both full review objects and their serialized copies while loading a
+        # local model; integrated books can otherwise exhaust Windows commit.
+        del prepared_chunks, indexing_chunks
+        if not recovery_records:
+            chunks = []
+        gc.collect()
 
         step_started = time.perf_counter()
         embedded_records, embedding_summary = embed_vector_records(

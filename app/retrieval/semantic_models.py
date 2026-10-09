@@ -14,6 +14,8 @@ QWEN3_EMBEDDING_TASK = (
     "Retrieve the most relevant Korean public-institution regulation clauses "
     "that answer the user's question with exact structural and temporal context."
 )
+QWEN3_EMBEDDING_WINDOW_CHARS = 2048
+QWEN3_EMBEDDING_INPUT_STRATEGY = "char-windows-2048-weighted-mean-v1"
 
 
 def semantic_runtime_available() -> bool:
@@ -45,8 +47,31 @@ class Qwen3EmbeddingAdapter:
 
     def encode_documents(self, texts: list[str], *, batch_size: int = 8) -> list[list[float]]:
         normalized = _validated_texts(texts)
-        vectors = self._encode(normalized, batch_size=batch_size)
-        return [_normalized_vector(vector) for vector in vectors]
+        windows: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for text in normalized:
+            start = len(windows)
+            windows.extend(text[offset : offset + QWEN3_EMBEDDING_WINDOW_CHARS]
+                           for offset in range(0, len(text), QWEN3_EMBEDDING_WINDOW_CHARS))
+            spans.append((start, len(windows)))
+        vectors = self._encode(windows, batch_size=batch_size)
+        if len(vectors) != len(windows):
+            raise ValueError("embedding model returned an unexpected number of window vectors")
+        result: list[list[float]] = []
+        for start, end in spans:
+            parts = [_normalized_vector(vector) for vector in vectors[start:end]]
+            if len(parts) == 1:
+                result.append(parts[0])
+                continue
+            dimension = len(parts[0])
+            if any(len(part) != dimension for part in parts):
+                raise ValueError("embedding window dimensions must match")
+            # Keep every character of long appendices represented. Weight by
+            # length so a short final window cannot dominate the document.
+            pooled = [sum(part[axis] * len(windows[start + index])
+                          for index, part in enumerate(parts)) for axis in range(dimension)]
+            result.append(_normalized_vector(pooled))
+        return result
 
     def encode_queries(self, queries: list[str], *, batch_size: int = 8) -> list[list[float]]:
         normalized = _validated_texts(queries)
@@ -62,8 +87,27 @@ class Qwen3EmbeddingAdapter:
             "convert_to_numpy": True,
             "show_progress_bar": False,
         }
-        vectors = model.encode(texts, **kwargs)
-        return list(vectors)
+        if str(getattr(model, "device", self.device)).startswith("cuda"):
+            # SentenceTransformer pads each batch to its longest input. A long
+            # appendix must not multiply that allocation across eight clauses.
+            longest = max((len(text) for text in texts), default=1)
+            kwargs["batch_size"] = min(kwargs["batch_size"], max(1, 8192 // max(1, longest)))
+        while True:
+            try:
+                return list(model.encode(texts, **kwargs))
+            except RuntimeError as exc:
+                if (
+                    not str(getattr(model, "device", self.device)).startswith("cuda")
+                    or "out of memory" not in str(exc).lower()
+                    or kwargs["batch_size"] <= 1
+                ):
+                    raise
+                kwargs["batch_size"] = max(1, kwargs["batch_size"] // 2)
+            # Leave the exception scope first so its traceback releases tensors.
+            # Retry the same complete input, without shortening or dropping text.
+            import torch
+
+            torch.cuda.empty_cache()
 
     def _load_model(self) -> Any:
         if self._model is not None:
@@ -72,12 +116,23 @@ class Qwen3EmbeddingAdapter:
             raise RuntimeError("sentence-transformers, transformers, and torch are required")
         from sentence_transformers import SentenceTransformer
 
+        device = self.device
+        model_kwargs: dict[str, Any] = {}
+        if device == "auto":
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device.startswith("cuda"):
+            # Load directly at half precision instead of first allocating FP32
+            # weights in host memory. Keep CPU callers at their original dtype.
+            model_kwargs["torch_dtype"] = "float16"
         self._model = SentenceTransformer(
             self.model_name,
-            device=self.device,
+            device=device,
             truncate_dim=self.truncate_dim,
             trust_remote_code=True,
             local_files_only=self.local_files_only,
+            **({"model_kwargs": model_kwargs} if model_kwargs else {}),
         )
         return self._model
 
@@ -220,6 +275,6 @@ def _normalized_vector(vector: Any) -> list[float]:
     if not values:
         raise ValueError("embedding model returned an empty vector")
     norm = math.sqrt(sum(value * value for value in values))
-    if norm <= 0.0:
-        raise ValueError("embedding model returned a zero vector")
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise ValueError("embedding model returned a zero or non-finite vector")
     return [round(value / norm, 8) for value in values]

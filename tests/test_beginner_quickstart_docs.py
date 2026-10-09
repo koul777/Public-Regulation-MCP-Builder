@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from app import __version__
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,7 +25,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "# 이전 업데이트: 2026년 7월 29일~8월 1일",
         )
         prior_heading = prior_headings[-1]
-        product_heading = "# PR MCP Builder v1.2.21"
+        product_heading = f"# PR MCP Builder v{__version__}"
         history_anchor = '<a id="update-history"></a>'
 
         self.assertTrue(readme.startswith('<p align="center">'))
