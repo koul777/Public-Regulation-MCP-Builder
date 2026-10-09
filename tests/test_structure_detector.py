@@ -518,6 +518,46 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertEqual(articles[0].parent_id, regulations[0].node_id)
         self.assertEqual(articles[1].parent_id, regulations[1].node_id)
 
+    def test_trailing_code_contents_preserves_first_numbered_body_and_chunk_ownership(self) -> None:
+        pages = [
+            ParsedPage(page_no=1, blocks=[ParsedBlock(text=(
+                "목 차\n제1편 기본법령\n"
+                "예시기관 육성법················1-1-1\n"
+                "시설관리규정················1-1-2"
+            ))]),
+            ParsedPage(page_no=2, blocks=[ParsedBlock(text=(
+                "1-1-1. 예시기관 육성법\n예시기관 육성법\n"
+                "제정 2020. 01. 01. 법률 제12345호\n"
+                "제1조(목적) 예시기관을 육성한다.\n"
+                "제2조(출연금) 출연금을 지급할 수 있다."
+            ))]),
+            ParsedPage(page_no=3, blocks=[ParsedBlock(text=(
+                "1-1-1. 예시기관 육성법\n제3조(사업계획) 사업계획서를 제출한다.\n"
+                "부칙\n제1조(시행일) 이 법은 공포한 날부터 시행한다."
+            ))]),
+            ParsedPage(page_no=4, blocks=[ParsedBlock(text=(
+                "1-1-2. 시설관리규정\n제1조(목적) 시설을 관리한다."
+            ))]),
+        ]
+        parsed = ParsedDocument(
+            document_id="doc-trailing-code-contents", source_file="combined.pdf",
+            document_name="통합규정집", file_type="pdf", pages=pages,
+            raw_text="\n".join(block.text for page in pages for block in page.blocks),
+        )
+        nodes = StructureDetector().detect(parsed)
+        regulations = [node for node in nodes if node.node_type == "regulation"]
+        self.assertEqual([(2, "1-1-1"), (4, "1-1-2")],
+                         [(node.page_start, node.number) for node in regulations])
+        self.assertFalse(any("목 차" in node.text or "····" in node.text for node in nodes))
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(min_chunk_chars=1))
+        law_articles = [chunk for chunk in chunks if chunk.chunk_type == "article"
+                        and chunk.source_page_start in {2, 3}]
+        self.assertEqual(4, len(law_articles))
+        self.assertTrue(all(chunk.metadata.get("regulation_no") == "1-1-1"
+                            and chunk.metadata.get("regulation_title") == "예시기관 육성법"
+                            for chunk in law_articles))
+        self.assertTrue(all(chunk.approval_status == "draft" for chunk in chunks))
+
     def test_contents_entries_seed_title_only_body_regulation_boundaries(self) -> None:
         text = "\n".join(
             [
