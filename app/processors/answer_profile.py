@@ -7,11 +7,58 @@ from typing import Any, Mapping
 ANSWER_PROFILE_VERSION = "reg-rag-answer-profile-v1"
 ANSWER_PROFILE_MARKER = "[답변분류]"
 
+# Patterns are compiled once; ``re.sub(pattern_string, ...)`` goes through the
+# same compiled object but pays a cache lookup on every call, and the profile is
+# built for every chunk and cleaned again for every MCP answer.
+_ANGLE_PAIR_RE = re.compile(r"\s*<[^>]{1,120}>")
+_ANGLE_OPEN_TAIL_RE = re.compile(r"\s*<[^>]*$")
+_TITLE_ONLY_RE = re.compile(
+    r"(?:\d+(?:-\d+)+\.\s*)?[가-힣A-Za-z0-9·ㆍ\s]+(?:규정|세칙|지침|요강|규칙)\s*\d+(?:\.\d+)*\.?>?"
+)
+_CIRCLED_NUMBER_RE = re.compile(r"([①-⑳])(?=[가-힣A-Za-z0-9])")
+_DURATION_BOUND_RE = re.compile(r"(\d+\s*(?:년|개월|월|일|시간|분))\s*(이내|이상|이하|초과|미만|까지)")
+_JOSA_SPACE_RE = re.compile(r"([가-힣])\s+(으로|로|에|에서|에게|부터|까지|보다|처럼|만큼|와|과|를|을|은|는|도|의)\b")
+_LEADING_BULLET_RE = re.compile(r"^[-•]\s*")
+_BRACKET_SPAN_RE = re.compile(r"\[[^\]]+\]")
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?:(?<=[.!?。])\s+|(?=제\s*\d+\s*조\s*\()|(?=\d+\.\s)|(?=[①②③④⑤⑥⑦⑧⑨⑩]))"
+)
+_TERM_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9·ㆍ%]+")
+_DIGITS_ONLY_RE = re.compile(r"\d+")
+_TERM_KEYWORD_RE = re.compile(r"(휴직|채용|임용|심사|공고|지급|연봉|보수|수당|기간|자녀|시간선택제|자격|기준|위원회)")
+_PROCEDURE_WORD_RE = re.compile(r"(절차|단계|심사|공고|접수|선정|선발|임용|채용)")
+_PROCEDURE_STEP_RE = re.compile(
+    r"(?:^|\s)(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])\s*([^①②③④⑤⑥⑦⑧⑨⑩]+?)(?=\s+(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])|$)"
+)
+_SHORT_PROCEDURE_RE = re.compile(r"(심사|공고|접수|면접|선발|선정|임용|채용)")
+_DURATION_NUMBER_RE = re.compile(r"\d+\s*(?:년|개월|월|일|시간|분)")
+_DURATION_WORD_RE = re.compile(r"(기간|기한|이내|이상|이하|초과|미만|까지|범위)")
+_DURATION_VALUES_RE = re.compile(r"\d+\s*(?:년|개월|월|일|시간|분)(?:\s*(?:이내|이상|이하|초과|미만|까지))?")
+_PAYMENT_WORD_RE = re.compile(r"(지급|수당|연봉|보수|급여|금액|일시금|성과급|환수|계좌이체|요구불예금)")
+_PAYMENT_NUMBER_RE = re.compile(r"\d+\s*(?:원|만원|%)")
+_PAYMENT_VALUES_RE = re.compile(r"\d+\s*(?:월|원|만원|%|퍼센트)|일시금|매월|계좌이체|요구불예금")
+_CONDITION_RE = re.compile(r"(대상|자격|요건|기준|경우|해당|제외|제한)")
+_OBLIGATION_RE = re.compile(r"(하여야 한다|해야 한다|하여야 하며|제출|신고|통보|금지|할 수 없다)")
+_EXCEPTION_RE = re.compile(r"(다만|예외|불구하고|제외한다|아니하다)")
+_OUTLINE_VERB_RE = re.compile(r"(한다|하여야|할 수 있다|할 수 없다|이내|이상|지급|심사|공고|자격)")
+_OUTLINE_ARTICLE_RE = re.compile(r"(제\d+조|제\s*\d+\s*조)")
+_INTENT_RULES = (
+    ("procedure", ("절차", "단계", "심사", "공고", "접수", "선정", "선발", "임용", "채용", "신청", "승인")),
+    ("eligibility", ("대상", "자격", "요건", "기준", "해당", "제외", "제한")),
+    ("duration", ("기간", "기한", "이내", "이상", "이하", "초과", "미만", "까지", "년", "개월", "일")),
+    ("payment", ("지급", "수당", "연봉", "보수", "급여", "금액", "만원", "%", "퍼센트", "일시금")),
+    ("obligation", ("하여야 한다", "해야 한다", "하여야 하며", "제출", "신고", "통보", "금지")),
+    ("exception", ("다만", "예외", "불구하고", "제외한다", "아니하다")),
+    ("definition", ("정의", "뜻은", "이란", "라 함은", "말한다")),
+)
+_TERM_STOPWORDS = frozenset({"한다", "있는", "없는", "경우", "다음", "각호", "사항", "따라", "대한", "관한"})
+
 
 def clean_answer_profile_text(value: str) -> str:
     cleaned = " ".join(str(value or "").split())
-    cleaned = re.sub(r"\s*<[^>]{1,120}>", "", cleaned)
-    cleaned = re.sub(r"\s*<[^>]*$", "", cleaned)
+    cleaned = _ANGLE_PAIR_RE.sub("", cleaned)
+    cleaned = _ANGLE_OPEN_TAIL_RE.sub("", cleaned)
     cleaned = cleaned.replace("일 시금", "일시금").replace("정 산", "정산")
     cleaned = cleaned.replace("하 되", "하되").replace("경 우", "경우")
     cleaned = cleaned.replace("교 직원", "교직원").replace("재직기 간", "재직기간")
@@ -20,14 +67,11 @@ def clean_answer_profile_text(value: str) -> str:
     cleaned = cleaned.replace("임신또는", "임신 또는").replace("3년이내", "3년 이내")
     cleaned = cleaned.replace("다 음", "다음").replace("음주운 전", "음주운전")
     cleaned = cleaned.replace("등 급", "등급").replace("징계 량", "징계량").replace("다 시", "다시")
-    if re.fullmatch(
-        r"(?:\d+(?:-\d+)+\.\s*)?[가-힣A-Za-z0-9·ㆍ\s]+(?:규정|세칙|지침|요강|규칙)\s*\d+(?:\.\d+)*\.?>?",
-        cleaned,
-    ):
+    if _TITLE_ONLY_RE.fullmatch(cleaned):
         return ""
-    cleaned = re.sub(r"([①-⑳])(?=[가-힣A-Za-z0-9])", r"\1 ", cleaned)
-    cleaned = re.sub(r"(\d+\s*(?:년|개월|월|일|시간|분))\s*(이내|이상|이하|초과|미만|까지)", r"\1 \2", cleaned)
-    cleaned = re.sub(r"([가-힣])\s+(으로|로|에|에서|에게|부터|까지|보다|처럼|만큼|와|과|를|을|은|는|도|의)\b", r"\1\2", cleaned)
+    cleaned = _CIRCLED_NUMBER_RE.sub(r"\1 ", cleaned)
+    cleaned = _DURATION_BOUND_RE.sub(r"\1 \2", cleaned)
+    cleaned = _JOSA_SPACE_RE.sub(r"\1\2", cleaned)
     return cleaned.strip(" ;,")
 
 
@@ -88,17 +132,8 @@ def _answer_intents(text: str, metadata: Mapping[str, Any]) -> list[str]:
             metadata.get("paragraph_label"),
         )
     )
-    rules = (
-        ("procedure", ("절차", "단계", "심사", "공고", "접수", "선정", "선발", "임용", "채용", "신청", "승인")),
-        ("eligibility", ("대상", "자격", "요건", "기준", "해당", "제외", "제한")),
-        ("duration", ("기간", "기한", "이내", "이상", "이하", "초과", "미만", "까지", "년", "개월", "일")),
-        ("payment", ("지급", "수당", "연봉", "보수", "급여", "금액", "만원", "%", "퍼센트", "일시금")),
-        ("obligation", ("하여야 한다", "해야 한다", "하여야 하며", "제출", "신고", "통보", "금지")),
-        ("exception", ("다만", "예외", "불구하고", "제외한다", "아니하다")),
-        ("definition", ("정의", "뜻은", "이란", "라 함은", "말한다")),
-    )
     intents: list[str] = []
-    for intent, terms in rules:
+    for intent, terms in _INTENT_RULES:
         if any(term in haystack for term in terms):
             intents.append(intent)
     return intents
@@ -117,15 +152,15 @@ def _answer_keywords(text: str, metadata: Mapping[str, Any], intents: list[str])
 
 def _terms_from_text(text: str) -> list[str]:
     terms: list[str] = []
-    for token in re.findall(r"[가-힣A-Za-z0-9·ㆍ%]+", text):
+    for token in _TERM_TOKEN_RE.findall(text):
         token = token.strip()
         if len(token) < 2:
             continue
-        if token in {"한다", "있는", "없는", "경우", "다음", "각호", "사항", "따라", "대한", "관한"}:
+        if token in _TERM_STOPWORDS:
             continue
-        if re.fullmatch(r"\d+", token):
+        if _DIGITS_ONLY_RE.fullmatch(token):
             continue
-        if re.search(r"(휴직|채용|임용|심사|공고|지급|연봉|보수|수당|기간|자녀|시간선택제|자격|기준|위원회)", token):
+        if _TERM_KEYWORD_RE.search(token):
             terms.append(token)
     return terms
 
@@ -151,15 +186,15 @@ def _answer_facts(sentences: list[str]) -> list[dict[str, str]]:
 
 
 def _procedure_steps(sentence: str) -> list[str]:
-    if not re.search(r"(절차|단계|심사|공고|접수|선정|선발|임용|채용)", sentence):
+    if not _PROCEDURE_WORD_RE.search(sentence):
         return []
-    matches = list(re.finditer(r"(?:^|\s)(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])\s*([^①②③④⑤⑥⑦⑧⑨⑩]+?)(?=\s+(?:\d+\.|[가-힣]\.|[①②③④⑤⑥⑦⑧⑨⑩])|$)", sentence))
+    matches = list(_PROCEDURE_STEP_RE.finditer(sentence))
     steps = [_clean_fact_value(match.group(1)) for match in matches]
     steps = [step for step in steps if step]
     if steps:
         return steps[:12]
     cleaned = _clean_fact_value(sentence)
-    if len(cleaned) <= 40 and re.search(r"(심사|공고|접수|면접|선발|선정|임용|채용)", cleaned):
+    if len(cleaned) <= 40 and _SHORT_PROCEDURE_RE.search(cleaned):
         return [cleaned]
     if "단계" in sentence and "심사" in sentence:
         return [_clean_fact_value(sentence)]
@@ -167,42 +202,37 @@ def _procedure_steps(sentence: str) -> list[str]:
 
 
 def _has_duration_fact(sentence: str) -> bool:
-    return bool(re.search(r"\d+\s*(?:년|개월|월|일|시간|분)", sentence)) and bool(
-        re.search(r"(기간|기한|이내|이상|이하|초과|미만|까지|범위)", sentence)
-    )
+    return bool(_DURATION_NUMBER_RE.search(sentence)) and bool(_DURATION_WORD_RE.search(sentence))
 
 
 def _duration_value(sentence: str) -> str:
-    values = re.findall(r"\d+\s*(?:년|개월|월|일|시간|분)(?:\s*(?:이내|이상|이하|초과|미만|까지))?", sentence)
+    values = _DURATION_VALUES_RE.findall(sentence)
     if values:
         return ", ".join(_unique([value.replace(" ", "") for value in values], limit=8))
     return sentence
 
 
 def _has_payment_fact(sentence: str) -> bool:
-    return bool(
-        re.search(r"(지급|수당|연봉|보수|급여|금액|일시금|성과급|환수|계좌이체|요구불예금)", sentence)
-        or re.search(r"\d+\s*(?:원|만원|%)", sentence)
-    )
+    return bool(_PAYMENT_WORD_RE.search(sentence) or _PAYMENT_NUMBER_RE.search(sentence))
 
 
 def _payment_value(sentence: str) -> str:
-    values = re.findall(r"\d+\s*(?:월|원|만원|%|퍼센트)|일시금|매월|계좌이체|요구불예금", sentence)
+    values = _PAYMENT_VALUES_RE.findall(sentence)
     if values:
         return ", ".join(_unique([value.replace(" ", "") for value in values], limit=10))
     return sentence
 
 
 def _has_condition_fact(sentence: str) -> bool:
-    return bool(re.search(r"(대상|자격|요건|기준|경우|해당|제외|제한)", sentence))
+    return bool(_CONDITION_RE.search(sentence))
 
 
 def _has_obligation_fact(sentence: str) -> bool:
-    return bool(re.search(r"(하여야 한다|해야 한다|하여야 하며|제출|신고|통보|금지|할 수 없다)", sentence))
+    return bool(_OBLIGATION_RE.search(sentence))
 
 
 def _has_exception_fact(sentence: str) -> bool:
-    return bool(re.search(r"(다만|예외|불구하고|제외한다|아니하다)", sentence))
+    return bool(_EXCEPTION_RE.search(sentence))
 
 
 def _answer_outline(sentences: list[str], facts: list[dict[str, str]]) -> list[str]:
@@ -212,9 +242,9 @@ def _answer_outline(sentences: list[str], facts: list[dict[str, str]]) -> list[s
         score = 0
         if sentence in fact_sentences:
             score += 4
-        if re.search(r"(한다|하여야|할 수 있다|할 수 없다|이내|이상|지급|심사|공고|자격)", sentence):
+        if _OUTLINE_VERB_RE.search(sentence):
             score += 2
-        if re.search(r"(제\d+조|제\s*\d+\s*조)", sentence):
+        if _OUTLINE_ARTICLE_RE.search(sentence):
             score += 1
         if score:
             scored.append((-score, index, sentence))
@@ -239,12 +269,12 @@ def _merge_spaced_numeric_dates(text: str) -> str:
 
 def _sentences(text: str) -> list[str]:
     cleaned = str(text or "")
-    cleaned = re.sub(r"\[[^\]]+\]", "\n", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _BRACKET_SPAN_RE.sub("\n", cleaned)
+    cleaned = _WHITESPACE_RUN_RE.sub(" ", cleaned).strip()
     if not cleaned:
         return []
     cleaned = _merge_spaced_numeric_dates(cleaned)
-    raw = re.split(r"(?:(?<=[.!?。])\s+|(?=제\s*\d+\s*조\s*\()|(?=\d+\.\s)|(?=[①②③④⑤⑥⑦⑧⑨⑩]))", cleaned)
+    raw = _SENTENCE_SPLIT_RE.split(cleaned)
     sentences: list[str] = []
     for part in raw:
         sentence = _clean_fact_value(part)
@@ -255,7 +285,7 @@ def _sentences(text: str) -> list[str]:
 
 def _clean_fact_value(value: str) -> str:
     value = clean_answer_profile_text(value)
-    value = re.sub(r"^[-•]\s*", "", value)
+    value = _LEADING_BULLET_RE.sub("", value)
     return value.strip(" ;,")
 
 
