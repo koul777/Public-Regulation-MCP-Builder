@@ -690,5 +690,110 @@ class ReviewContentHashEquivalenceTests(unittest.TestCase):
         self.assertEqual(before, json.dumps(chunk, sort_keys=True))
 
 
+class WorklistSkipsNonCandidateRowsTests(unittest.TestCase):
+    STATUSES = ("draft", "approved", "needs_review", "rejected", "security_blocked", "approved")
+
+    def _chunks(self) -> list[Chunk]:
+        chunks = []
+        for index, status in enumerate(self.STATUSES):
+            chunks.append(
+                Chunk(
+                    chunk_id=f"c{index}",
+                    document_id="doc-a",
+                    chunk_type="table" if index % 2 else "article",
+                    text=f"text {index}",
+                    approval_status=status,
+                    metadata=(
+                        {"table_review_required": True, "table_review_flags": ["row_review_required"]}
+                        if index % 2
+                        else {"article_no": "1", "article_title": "Purpose"}
+                    ),
+                )
+            )
+        return chunks
+
+    def _seed(self, tmp: str) -> Settings:
+        settings = Settings(data_dir=Path(tmp) / "data")
+        repository = JsonRepository(settings)
+        repository.upsert_document(
+            Document(
+                document_id="doc-a",
+                filename="a.pdf",
+                document_name="A",
+                file_type="pdf",
+                file_hash="hash-a",
+                institution_name="Institution A",
+                apba_id="C0001",
+                source_system="PUBLIC_PORTAL",
+                source_record_id="record-a",
+                profile_id="public_portal-c0001",
+            )
+        )
+        repository.save_processing_result("doc-a", [], self._chunks(), [])
+        return settings
+
+    def test_rows_are_built_only_for_chunks_awaiting_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._seed(tmp)
+            seen: list[str] = []
+            real_row = worklist_module.approval_chunk_row
+
+            def spy(chunk):
+                seen.append(chunk.chunk_id)
+                return real_row(chunk)
+
+            with mock.patch.object(worklist_module, "approval_chunk_row", spy):
+                report = build_approval_worklist(data_dir=settings.data_dir)
+
+        self.assertEqual(["c0", "c2"], seen)
+        document = report["documents"][0]
+        self.assertEqual(6, document["total_chunks"])
+        self.assertEqual(2, document["approved_chunks"])
+        self.assertEqual(1, document["draft_chunks"])
+        self.assertEqual(1, document["needs_review_chunks"])
+
+    def test_report_equals_the_one_computed_from_rows_of_every_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._seed(tmp)
+            report = build_approval_worklist(data_dir=settings.data_dir)
+            chunks = JsonRepository(settings).get_chunks("doc-a")
+
+        all_rows = [worklist_module.approval_chunk_row(chunk) for chunk in chunks]
+        candidates = [row for row in all_rows if row["approval_status"] in worklist_module.APPROVAL_WORKLIST_STATUSES]
+        document = report["documents"][0]
+        self.assertEqual(worklist_module.review_candidate_fingerprint(candidates), document["review_candidate_fingerprint"])
+        self.assertEqual(
+            worklist_module.review_candidate_fingerprint([row for row in candidates if row["manual_attention"]]),
+            document["manual_attention_fingerprint"],
+        )
+        self.assertEqual(sum(1 for row in candidates if row["manual_attention"]), document["manual_attention_chunks"])
+        self.assertEqual(
+            sum(1 for row in candidates if row["low_risk_batch_candidate"]),
+            document["bulk_review_candidate_chunks"],
+        )
+
+    def test_chunk_approval_status_matches_the_row_status(self) -> None:
+        class Plain:
+            def __init__(self, status) -> None:
+                self.approval_status = status
+                self.chunk_id = "x"
+                self.chunk_type = "article"
+                self.text = "t"
+                self.normalized_text = None
+                self.retrieval_text = None
+                self.metadata = {}
+                self.warnings = []
+                self.document_id = "d"
+
+        for status in ("draft", " Needs_Review ", "APPROVED", "", None, "weird"):
+            with self.subTest(status=status):
+                chunk = Plain(status)
+                self.assertEqual(
+                    worklist_module.approval_chunk_row(chunk)["approval_status"],
+                    worklist_module.chunk_approval_status(chunk),
+                )
+        self.assertEqual("missing", worklist_module.chunk_approval_status(object()))
+
+
 if __name__ == "__main__":
     unittest.main()

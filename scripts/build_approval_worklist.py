@@ -118,11 +118,14 @@ def build_approval_worklist(
         chunks = repository.get_chunks(document.document_id)
         if not document_matches_filters(document, chunks, filters):
             continue
-        chunk_rows = [approval_chunk_row(chunk) for chunk in chunks]
         status_counts = Counter(clean_text(chunk.approval_status) or "missing" for chunk in chunks)
         status_totals.update(status_counts)
+        # Only chunks that still await review contribute a row to this report;
+        # approved, blocked or rejected chunks are counted from their status alone.
         review_candidate_rows = [
-            row for row in chunk_rows if row["approval_status"] in APPROVAL_WORKLIST_STATUSES
+            approval_chunk_row(chunk)
+            for chunk in chunks
+            if chunk_approval_status(chunk) in APPROVAL_WORKLIST_STATUSES
         ]
         priority_counts = Counter(str(row["review_priority_tier"]) for row in review_candidate_rows)
         for tier in REVIEW_PRIORITY_TIERS:
@@ -241,8 +244,14 @@ def build_approval_worklist(
     }
 
 
+def chunk_approval_status(chunk: Any) -> str:
+    """The ``approval_status`` an approval row reports for a chunk, without building the row."""
+
+    return clean_text(getattr(chunk, "approval_status", "")).lower() or "missing"
+
+
 def approval_chunk_row(chunk: Any) -> dict[str, Any]:
-    status = clean_text(getattr(chunk, "approval_status", "")).lower() or "missing"
+    status = chunk_approval_status(chunk)
     # The review dict is read-only for the signal and the hash, so one dump serves both.
     review_row = chunk_to_review_dict(chunk)
     signal = _review_signal_from_row(review_row)
