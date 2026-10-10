@@ -22,7 +22,8 @@ the generator ground truth (``scripts/generate_synthetic_combined_regulation_boo
              for the ``chatgpt-data`` and ``full`` tool profiles.
 
 Every stage records wall time, CPU time and peak RSS (``VmHWM`` reset per stage on
-Linux, ``ru_maxrss`` otherwise), optionally ``tracemalloc`` peaks and one cProfile
+Linux; elsewhere only the process-wide ``ru_maxrss`` or, on Windows, the peak
+working set), optionally ``tracemalloc`` peaks and one cProfile
 ``.prof`` file per stage. Checks never stop at the first failure; each check
 reports pass/fail with counts and failure samples.
 
@@ -43,6 +44,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import cProfile
+import ctypes
 import gc
 import hashlib
 import json
@@ -50,7 +52,6 @@ import math
 import os
 import platform
 import re
-import resource
 import shutil
 import statistics
 import subprocess
@@ -65,6 +66,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from unittest.mock import patch
+
+try:
+    import resource
+except ImportError:  # Windows: memory comes from ``_windows_memory_counters``.
+    resource = None  # type: ignore[assignment]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -164,7 +170,57 @@ def _reset_peak_rss() -> bool:
         return False
 
 
-def _ru_maxrss_mb() -> float:
+class _ProcessMemoryCounters(ctypes.Structure):
+    """Win32 ``PROCESS_MEMORY_COUNTERS``."""
+
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _windows_memory_counters() -> _ProcessMemoryCounters | None:
+    """Working-set counters of this process on Windows, ``None`` elsewhere or on error."""
+
+    if sys.platform != "win32":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        get_memory_info = kernel32.K32GetProcessMemoryInfo
+        get_memory_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessMemoryCounters), ctypes.c_ulong]
+        get_memory_info.restype = ctypes.c_int
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not get_memory_info(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return None
+        return counters
+    except (AttributeError, OSError):
+        return None
+
+
+def _current_rss_kb() -> int | None:
+    value = _read_proc_status_kb("VmRSS")
+    if value is not None:
+        return value
+    counters = _windows_memory_counters()
+    return None if counters is None else counters.WorkingSetSize // 1024
+
+
+def _ru_maxrss_mb() -> float | None:
+    """Process-wide peak RSS; Windows reports the peak working set (no per-stage reset)."""
+
+    if resource is None:
+        counters = _windows_memory_counters()
+        return None if counters is None else round(counters.PeakWorkingSetSize / (1024 * 1024), 1)
     value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Linux reports KiB, macOS bytes.
     return round(value / (1024 * 1024) if sys.platform == "darwin" else value / 1024, 1)
@@ -252,7 +308,7 @@ class StageRecorder:
         record: dict[str, Any] = {"name": name, "status": "running", "substages": {}}
         gc.collect()
         hwm_reset = _reset_peak_rss()
-        rss_start = _read_proc_status_kb("VmRSS")
+        rss_start = _current_rss_kb()
         if self.trace_memory:
             if not tracemalloc.is_tracing():
                 tracemalloc.start()
@@ -277,7 +333,7 @@ class StageRecorder:
             record["cpu_s"] = round(time.process_time() - cpu_started, 4)
             record["status"] = "ok" if ok else "error"
             record["rss_start_mb"] = _kb_to_mb(rss_start)
-            record["rss_end_mb"] = _kb_to_mb(_read_proc_status_kb("VmRSS"))
+            record["rss_end_mb"] = _kb_to_mb(_current_rss_kb())
             record["peak_rss_mb"] = _kb_to_mb(_read_proc_status_kb("VmHWM")) if hwm_reset else None
             record["peak_rss_source"] = "VmHWM_reset_per_stage" if hwm_reset else "unavailable"
             record["process_max_rss_mb"] = _ru_maxrss_mb()
