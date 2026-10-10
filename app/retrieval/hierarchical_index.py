@@ -17,7 +17,7 @@ import threading
 import time
 from types import MappingProxyType
 import unicodedata
-from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from app.ingestion.vector_adapter import stable_content_hash
@@ -835,6 +835,15 @@ def _canonical_record_regulation_identities(
             for group_key, group_entries in numbered_groups.items()
         }
         sole_numbered_group = next(iter(numbered_groups)) if len(numbered_groups) == 1 else None
+        first_numbered_order = min(
+            (
+                order
+                for group_entries in numbered_groups.values()
+                for entry in group_entries
+                if (order := _integer(entry["metadata"].get("order_index"), -1)) >= 0
+            ),
+            default=None,
+        )
         matched_numbered_group_by_title: dict[str, str | None] = {}
         for entry in unassigned_entries:
             selected_group = sole_numbered_group
@@ -888,6 +897,12 @@ def _canonical_record_regulation_identities(
                 "regulation_no": regulation_no,
                 "profile_id": profile_id,
             }
+            if (
+                group_key.startswith("title:")
+                and len(numbered_groups) > 1
+                and _is_book_front_matter(group_entries, first_numbered_order)
+            ):
+                identity["front_matter"] = "true"
             for entry in group_entries:
                 identities[entry["record_key"]] = identity
     identities = _assign_canonical_title_unit_ids(
@@ -899,6 +914,35 @@ def _canonical_record_regulation_identities(
         records_by_document,
         identities,
     )
+
+
+def _is_book_front_matter(
+    entries: Sequence[Mapping[str, Any]],
+    first_numbered_order: int | None,
+) -> bool:
+    """Whether an unnumbered segment is the cover text before a book's first regulation.
+
+    No regulation boundary precedes the cover lines of a combined book, so the
+    chunker gives them the book's own title ("…총규정"). They are not a
+    regulation; the segment is kept as a navigation unit instead of a catalog
+    entry. Articles, chunks tied to a regulation boundary and records without
+    a source order stay ordinary units.
+    """
+
+    if first_numbered_order is None:
+        return False
+    for entry in entries:
+        metadata = entry["metadata"]
+        order = _integer(metadata.get("order_index"), -1)
+        if (
+            order < 0
+            or order >= first_numbered_order
+            or str(metadata.get("article_no") or "").strip()
+            or str(metadata.get("regulation_node_id") or "").strip()
+            or str(metadata.get("regulation_source_node_id") or "").strip()
+        ):
+            return False
+    return True
 
 
 def _assign_canonical_title_unit_ids(
@@ -3162,7 +3206,9 @@ def _add_runtime_record_to_version_groups(
             "logical_chunk_hashes": [],
             "search_values": [],
             "chunk_count": 0,
-            "is_navigation": int(_is_navigation_unit(title, regulation_no)),
+            "is_navigation": int(
+                _is_navigation_unit(title, regulation_no) or bool(identity.get("front_matter"))
+            ),
         },
     )
     if revision_date:
