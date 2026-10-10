@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
+from unittest import mock
 
 from app.core.config import Settings
 from app.core.tenant_access import settings_for_tenant
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.storage.repository import JsonRepository
+from scripts import build_approval_worklist as worklist_module
 from scripts.build_approval_worklist import build_approval_worklist
 
 
@@ -503,6 +508,186 @@ class BuildApprovalWorklistTests(unittest.TestCase):
         self.assertEqual("tenant-a", report["tenant_id"])
         self.assertEqual(str(tenant_settings.data_dir), report["effective_data_dir"])
         self.assertEqual("bulk_review_candidate", report["documents"][0]["suggested_action"])
+
+
+def _reference_json_safe(value):
+    """Verbatim copy of the pre-optimization _json_safe, kept as the oracle."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _reference_json_safe(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_reference_json_safe(item) for item in value]
+    return str(value)
+
+
+def _reference_review_content_hash(chunk) -> str:
+    """Pre-optimization review_content_hash: separate dump, always rebuilds via _json_safe."""
+    row = worklist_module.chunk_to_review_dict(chunk)
+    text_basis, text = worklist_module._review_text_basis(row)
+    payload = {
+        "schema_version": worklist_module.REVIEW_CONTENT_HASH_VERSION,
+        "chunk_type": worklist_module.clean_text(row.get("chunk_type")),
+        "source_page_start": row.get("source_page_start"),
+        "source_page_end": row.get("source_page_end"),
+        "text_basis": text_basis,
+        "text": text,
+        "metadata": _reference_json_safe(row.get("metadata") or {}),
+        "warnings": _reference_json_safe(row.get("warnings") or []),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class _Opaque:
+    def __str__(self) -> str:
+        return "opaque-value"
+
+
+class _StrSub(str):
+    pass
+
+
+class _IntSub(int):
+    pass
+
+
+class ReviewContentHashEquivalenceTests(unittest.TestCase):
+    """The shared-row / plain-JSON fast path must keep every review_content_hash byte-identical."""
+
+    METADATA_CASES = [
+        {},
+        {"article_no": "\uc81c1\uc870", "article_title": "\ubaa9\uc801"},
+        {"nested": {"b": [1, 2.5, None, True, "x"], "a": {"z": [], "y": {}}}, "k": "\ud55c\uae00 \u2603"},
+        {"floats": [float("nan"), float("inf"), -0.0, 1e300], "big": 2**70},
+        {"tuple": (1, 2, ("a", "b")), "set": {3}, "opaque": _Opaque()},
+        {1: "int-key", "1": "str-key-collides", None: "none-key", True: "bool-key"},
+        {2: "b", 10: "c", 1: "a"},
+        {"str_sub": _StrSub("sub"), "int_sub": _IntSub(7), "ordered": OrderedDict([("b", 1), ("a", 2)])},
+        {"deep": [[[[[[[{"leaf": ["x"]}]]]]]]]},
+        {"shared": [1, 2, 3]},
+    ]
+
+    def test_hash_matches_reference_for_dict_chunks(self) -> None:
+        for index, metadata in enumerate(self.METADATA_CASES):
+            for warnings in ([], ["w1", "\ud55c\uae00"], [("t", 1)], None):
+                chunk = {
+                    "chunk_id": f"c{index}",
+                    "document_id": "d",
+                    "chunk_type": "article",
+                    "text": "  body text  ",
+                    "retrieval_text": "",
+                    "normalized_text": "normalized",
+                    "source_page_start": 1,
+                    "source_page_end": 2,
+                    "metadata": metadata,
+                    "warnings": warnings,
+                    "approval_status": "draft",
+                }
+                with self.subTest(index=index, warnings=warnings):
+                    self.assertEqual(
+                        _reference_review_content_hash(chunk),
+                        worklist_module.review_content_hash(chunk),
+                    )
+                    row = worklist_module.approval_chunk_row(chunk)
+                    self.assertEqual(_reference_review_content_hash(chunk), row["review_content_hash"])
+
+    def test_hash_matches_reference_for_model_chunks(self) -> None:
+        for index, metadata in enumerate(self.METADATA_CASES[:5] + self.METADATA_CASES[8:]):
+            try:
+                chunk = Chunk(
+                    chunk_id=f"m{index}",
+                    document_id="d",
+                    chunk_type="table" if index % 2 else "article",
+                    text="body",
+                    metadata=metadata,
+                    warnings=["w"] if index % 3 == 0 else [],
+                )
+                chunk.model_dump(mode="json")
+            except Exception:  # unsupported metadata shapes (for example opaque objects) cannot be model inputs
+                continue
+            with self.subTest(index=index):
+                self.assertEqual(
+                    _reference_review_content_hash(chunk),
+                    worklist_module.review_content_hash(chunk),
+                )
+                self.assertEqual(
+                    _reference_review_content_hash(chunk),
+                    worklist_module.approval_chunk_row(chunk)["review_content_hash"],
+                )
+
+    def test_approval_chunk_row_keeps_signal_and_hash_independent_of_sharing(self) -> None:
+        chunk = Chunk(
+            chunk_id="shared-row",
+            document_id="d",
+            chunk_type="table",
+            text="table",
+            metadata={"table_review_required": True, "table_review_flags": ["row_review_required"]},
+        )
+        row = worklist_module.approval_chunk_row(chunk)
+        signal = worklist_module.chunk_review_signal(chunk)
+        self.assertEqual(signal["review_flags"], row["review_flags"])
+        self.assertEqual(signal["review_priority_tier"], row["review_priority_tier"])
+        self.assertEqual(signal["review_category"], row["review_category"])
+        self.assertEqual(_reference_review_content_hash(chunk), row["review_content_hash"])
+        self.assertTrue(row["manual_attention"])
+        # the model object itself is untouched by the shared dump
+        self.assertEqual({"table_review_required": True, "table_review_flags": ["row_review_required"]}, chunk.metadata)
+
+    def test_plain_json_detection_accepts_only_exact_plain_data(self) -> None:
+        plain = {"a": [1, 2.0, "x", None, True, {"b": []}], "c": {}}
+        self.assertTrue(worklist_module._is_plain_json(plain))
+        self.assertTrue(worklist_module._is_plain_json([]))
+        self.assertTrue(worklist_module._is_plain_json("text"))
+        self.assertTrue(worklist_module._is_plain_json(None))
+        for not_plain in (
+            {"a": (1, 2)},
+            {"a": {1}},
+            {"a": _Opaque()},
+            {1: "x"},
+            {"a": [{"b": {2: "x"}}]},
+            {"a": _StrSub("x")},
+            {"a": _IntSub(1)},
+            OrderedDict(a=1),
+            [b"bytes"],
+        ):
+            with self.subTest(value=repr(not_plain)):
+                self.assertFalse(worklist_module._is_plain_json(not_plain))
+
+    def test_hash_safe_is_the_input_for_plain_data_and_json_safe_otherwise(self) -> None:
+        plain = {"b": [1, {"z": 1, "a": 2}], "a": "x"}
+        self.assertIs(plain, worklist_module._hash_safe(plain))
+        mixed = {"k": (1, 2), 3: {"x"}}
+        self.assertEqual(_reference_json_safe(mixed), worklist_module._hash_safe(mixed))
+        # _json_safe itself is unchanged
+        self.assertEqual(_reference_json_safe(mixed), worklist_module._json_safe(mixed))
+
+    def test_cyclic_input_falls_back_to_the_original_failure(self) -> None:
+        cyclic: dict = {"a": []}
+        cyclic["a"].append(cyclic)
+        with mock.patch.object(worklist_module, "_JSON_PLAIN_MAX_CONTAINERS", 500):
+            self.assertFalse(worklist_module._is_plain_json(cyclic))
+            with self.assertRaises(RecursionError):
+                worklist_module._hash_safe(cyclic)
+        with self.assertRaises(RecursionError):
+            _reference_json_safe(cyclic)
+
+    def test_review_row_is_shared_but_never_mutated(self) -> None:
+        chunk = {
+            "chunk_id": "r",
+            "document_id": "d",
+            "chunk_type": "article",
+            "text": "body",
+            "metadata": {"review_flags": ["x"], "nested": {"k": [1, 2]}},
+            "warnings": ["w"],
+            "approval_status": "draft",
+        }
+        before = json.dumps(chunk, sort_keys=True)
+        worklist_module.approval_chunk_row(chunk)
+        self.assertEqual(before, json.dumps(chunk, sort_keys=True))
 
 
 if __name__ == "__main__":
