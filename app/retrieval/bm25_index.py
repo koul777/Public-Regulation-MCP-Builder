@@ -11,6 +11,7 @@ import re
 from typing import Any, Iterable
 import unicodedata
 
+from app.core.gc_pause import gc_paused_call
 from app.retrieval.tokenizer import (
     FALLBACK_TOKENIZER_MODEL,
     preloaded_kiwi_tokens,
@@ -75,6 +76,7 @@ class Bm25Index:
     documents: list[dict[str, Any]]
 
     @classmethod
+    @gc_paused_call  # the build allocates one long-lived acyclic term table per record
     def build(
         cls,
         records: Iterable[dict[str, Any]],
