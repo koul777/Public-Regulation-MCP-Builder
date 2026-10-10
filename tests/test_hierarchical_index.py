@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from app.mcp_server import regulation_tools
 from app.retrieval import hierarchical_index as hierarchical_index_module
-from app.ingestion.vector_adapter import stable_content_hash
+from app.ingestion.vector_adapter import build_vector_records, stable_content_hash
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, local_hash_embedding
 from app.core.config import Settings
 from app.mcp_server.regulation_tools import (
@@ -2940,6 +2940,72 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual("chapter", node_types["제6장 특별 지급"])
         self.assertEqual("article", node_types["제97조 서식"])
         self.assertNotIn("form", node_types.values())
+
+    def test_toc_lists_vector_records_in_chunk_source_order(self) -> None:
+        # Records go through build_vector_records like the index button does:
+        # the chunk order_index must survive it, otherwise the TOC falls back
+        # to sorting hierarchy paths as text (제10장 < 제1장, 제12조 < 제5조).
+        source_rows = (
+            ("제1장 총칙", "제1조", "목적"),
+            ("제1장 총칙", "제2조", "정의"),
+            ("제2장 채용 > 제1절 공개채용", "제5조", "공개채용"),
+            ("제2장 채용 > 제1절 공개채용", "제12조", "계약직 채용"),
+            ("제10장 보칙", "제137조", "시행세칙"),
+        )
+        chunks = []
+        for order_index, (parents, article_no, article_title) in enumerate(source_rows):
+            chunk_id = f"order-{article_no}"
+            chunks.append(
+                {
+                    "chunk_id": chunk_id,
+                    "document_id": "doc-order",
+                    "tenant_id": "tenant-a",
+                    "profile_id": "institution-a",
+                    "document_name": "통합 규정집",
+                    "regulation_id": "reg-binder",
+                    "regulation_version": "rev-20260701",
+                    "regulation_status": "approved",
+                    "regulation_no": "2-1-1",
+                    "regulation_title": "인사규정",
+                    "revision_date": "2026-07-01",
+                    "effective_from": "2026-07-01",
+                    "chunk_type": "article",
+                    "hierarchy_path": f"인사규정 > {parents} > {article_no} {article_title}",
+                    "article_no": article_no,
+                    "article_title": article_title,
+                    "retrieval_text": f"{article_no}({article_title}) 본문",
+                    "metadata": {"order_index": order_index * 10},
+                    "approval_status": "approved",
+                    "approval_id": f"approval-{chunk_id}",
+                    "approved_content_hash": f"approved-{chunk_id}",
+                    "security_level": "internal",
+                }
+            )
+        records, _ = build_vector_records(reversed(chunks))
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="인사규정",
+                regulation_no="2-1-1",
+            )
+            toc = regulation_toc(index_path, regulation_unit_id=unit_id)
+
+        nodes = toc["nodes"]
+        self.assertEqual(
+            ["제1조", "제2조", "제5조", "제12조", "제137조"],
+            [node["number"] for node in nodes if node["node_type"] == "article"],
+        )
+        self.assertEqual(
+            ["제1장 총칙", "제2장 채용", "제10장 보칙"],
+            [node["label"] for node in nodes if node["node_type"] == "chapter"],
+        )
 
     def test_toc_node_type_reads_leading_marker_before_attachment_keywords(self) -> None:
         cases = {

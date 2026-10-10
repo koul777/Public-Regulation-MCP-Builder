@@ -60,6 +60,27 @@ class VectorIngestionAdapterTests(unittest.TestCase):
             metadata["regulation_source_node_id"],
         )
 
+    def test_keeps_chunk_source_order_index(self) -> None:
+        for order_index in (0, 1287):
+            with self.subTest(order_index=order_index):
+                record = vector_record_from_chunk(
+                    {
+                        "chunk_id": f"chunk-order-{order_index}",
+                        "document_id": "doc-combined-book",
+                        "tenant_id": "tenant-a",
+                        "retrieval_text": "제1조(목적) 본문",
+                        "metadata": {"order_index": order_index},
+                        "approval_status": "approved",
+                        "approval_id": f"approval-order-{order_index}",
+                        "approved_content_hash": f"approved-order-{order_index}",
+                        "security_level": "internal",
+                    }
+                )
+
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(order_index, record["metadata"]["order_index"])
+
     def test_semantic_fingerprints_cover_retrieval_lifecycle_acl_and_profile_metadata(self) -> None:
         base = {
             "chunk_id": "chunk-semantic",

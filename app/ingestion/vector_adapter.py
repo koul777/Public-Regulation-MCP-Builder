@@ -85,6 +85,9 @@ VECTOR_METADATA_FIELDS = (
     "entity_id",
     "regulation_node_id",
     "regulation_source_node_id",
+    # Source order of the chunk; the hierarchical index orders TOC and
+    # document reads by it instead of sorting hierarchy paths as text.
+    "order_index",
     "structural_child_count_source",
     "paragraph_unit_count",
     "item_unit_count",
