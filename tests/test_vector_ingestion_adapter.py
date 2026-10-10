@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import unittest
 
+from app.ingestion import vector_adapter as vector_adapter_module
 from app.ingestion.vector_adapter import (
     VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION,
     VECTOR_RECORD_SCHEMA_VERSION,
     VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION,
     VECTOR_RECORD_VERIFICATION_VERSION,
     build_vector_records,
+    stable_content_hash,
     vector_metadata_semantic_fingerprint,
     vector_record_semantic_fingerprint,
     vector_record_verification_hash,
     vector_record_from_chunk,
     vector_record_path_leaks,
+    with_vector_record_verification,
 )
 
 
@@ -489,6 +492,97 @@ class VectorIngestionAdapterTests(unittest.TestCase):
         self.assertIn("$.metadata.source_file", leaked_paths)
         self.assertIn("$.metadata.quality_json", leaked_paths)
         self.assertIn("$.metadata.runtime_path", leaked_paths)
+
+
+_VERIFICATION_METADATA_CASES = [
+    {},
+    {"approval_status": "approved", "approval_id": "a", "approved_content_hash": "h", "tenant_id": "t"},
+    {
+        "nested": {"z": [1, 2.5, None, True, "\ud55c\uae00"], "a": {"k": []}},
+        "unicode": "\u2603 \ud55c\uae00 \"quote\" \\ back",
+    },
+    {"floats": [0.1, 1e-7, 1e21, -0.0], "ints": [0, -1, 2**65]},
+    {"department_acl": ["b", "a"], "security_level": "Internal"},
+]
+
+
+class VectorRecordVerificationEquivalenceTests(unittest.TestCase):
+    """The single-serialization verification path must keep every digest unchanged."""
+
+    def test_combined_digests_equal_the_individual_helpers(self) -> None:
+        for index, metadata in enumerate(_VERIFICATION_METADATA_CASES):
+            for text in ("", "plain", "\ud55c\uae00 \ubcf8\ubb38\n\t\"quoted\"", "x" * 5000):
+                with self.subTest(index=index, text=text[:10]):
+                    content_hash, metadata_fingerprint = vector_adapter_module._content_hash_and_metadata_fingerprint(
+                        text, metadata
+                    )
+                    self.assertEqual(stable_content_hash(text, metadata), content_hash)
+                    self.assertEqual(vector_metadata_semantic_fingerprint(metadata), metadata_fingerprint)
+
+    def test_verification_equals_the_unoptimized_composition(self) -> None:
+        for index, metadata in enumerate(_VERIFICATION_METADATA_CASES):
+            record = {
+                "schema_version": VECTOR_RECORD_SCHEMA_VERSION,
+                "id": f"doc:chunk-{index}",
+                "document_id": "doc",
+                "chunk_id": f"chunk-{index}",
+                "tenant_id": "tenant-a",
+                "text": "\ubcf8\ubb38 text",
+                "metadata": metadata,
+                "content_hash": "stale",
+            }
+            expected = dict(record)
+            expected["content_hash"] = stable_content_hash(record["text"], metadata)
+            expected["metadata_semantic_fingerprint_version"] = VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION
+            expected["metadata_semantic_fingerprint"] = vector_metadata_semantic_fingerprint(metadata)
+            expected["record_semantic_fingerprint_version"] = VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION
+            expected["record_semantic_fingerprint"] = vector_record_semantic_fingerprint(expected)
+            expected["verification_version"] = VECTOR_RECORD_VERIFICATION_VERSION
+            expected["verification_hash"] = vector_record_verification_hash(expected)
+            expected["verified_at"] = "2026-01-01T00:00:00+00:00"
+            with self.subTest(index=index):
+                actual = with_vector_record_verification(record, verified_at="2026-01-01T00:00:00+00:00")
+                self.assertEqual(expected, actual)
+                self.assertEqual(list(expected), list(actual))
+
+    def test_record_fingerprint_accepts_a_precomputed_metadata_fingerprint(self) -> None:
+        record = {
+            "id": "doc:c",
+            "document_id": "doc",
+            "chunk_id": "c",
+            "tenant_id": "t",
+            "text": "text",
+            "metadata": {"k": "v"},
+        }
+        precomputed = vector_metadata_semantic_fingerprint(record["metadata"])
+        self.assertEqual(
+            vector_record_semantic_fingerprint(record),
+            vector_record_semantic_fingerprint(record, metadata_fingerprint=precomputed),
+        )
+        # the argument is trusted verbatim, so a different value yields a different digest
+        self.assertNotEqual(
+            vector_record_semantic_fingerprint(record),
+            vector_record_semantic_fingerprint(record, metadata_fingerprint="0" * 64),
+        )
+
+    def test_vector_record_from_chunk_hash_matches_its_final_text_and_metadata(self) -> None:
+        record = vector_record_from_chunk(
+            {
+                "chunk_id": "c1",
+                "document_id": "d1",
+                "tenant_id": "t",
+                "retrieval_text": "\ubcf8\ubb38",
+                "approval_status": "approved",
+                "approval_id": "ap",
+                "approved_content_hash": "h",
+                "security_level": "internal",
+            }
+        )
+        self.assertEqual(stable_content_hash(record["text"], record["metadata"]), record["content_hash"])
+        self.assertEqual(
+            list(record)[:7],
+            ["schema_version", "id", "document_id", "chunk_id", "text", "metadata", "content_hash"],
+        )
 
 
 if __name__ == "__main__":
