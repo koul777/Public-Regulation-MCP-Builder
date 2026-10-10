@@ -15,6 +15,11 @@ source record's exact tenant/profile scope by:
 Matching keys receive only Unicode NFKC, surrounding/internal whitespace, and
 case normalization.  Punctuation and words are never removed, and no fuzzy
 matching is performed.
+
+A unit mention written with a combined book's classification code
+(``"3-1-1.보수규정"``) is read as an explicit number plus a title.  When no
+unit in scope publishes that number, the exact title resolves it only for a
+unit that has no number or the same number.
 """
 
 from __future__ import annotations
@@ -52,6 +57,10 @@ REASON_ARTICLE_LOCATOR_MISSING = "article_locator_missing"
 REASON_INVALID_ARTICLE_LOCATOR = "invalid_article_locator"
 REASON_TARGET_ARTICLE_NOT_FOUND = "target_article_not_found"
 
+
+_CLASSIFICATION_CODED_REFERENCE_RE = re.compile(
+    r"^\s*(?P<number>[0-9]+(?:-[0-9]+)+)\.\s*(?P<title>\S.*?)\s*$"
+)
 
 _ARTICLE_LOCATOR_RE = re.compile(
     r"^\s*제\s*(?P<article>[0-9]+)\s*조"
@@ -466,7 +475,7 @@ def build_regulation_reference_graph(
             if not _is_internal_reference(raw_reference):
                 ignored_external_reference_count += 1
                 continue
-            internal_article_reference_keys.add(_reference_identity_key(raw_reference))
+            internal_article_reference_keys.update(_reference_identity_keys(raw_reference))
             _add_reference_edge(
                 edge_accumulators,
                 source_unit=source_unit,
@@ -488,10 +497,16 @@ def build_regulation_reference_graph(
             if not _is_internal_reference(raw_reference):
                 ignored_external_reference_count += 1
                 continue
-            if _reference_identity_key(raw_reference) in internal_article_reference_keys:
+            if _reference_identity_keys(raw_reference) & internal_article_reference_keys:
                 # Metadata extraction intentionally records a regulation name
                 # in both collections when an exact cross-regulation article
                 # citation is present. Keep the richer article edge only.
+                suppressed_redundant_unit_reference_count += 1
+                continue
+            if _is_own_classification_heading(raw_reference, source_unit):
+                # Records processed before the extractor skipped a book's
+                # "2-1-1. 인사규정" heading still carry it as a mention of
+                # their own regulation; it is not a reference.
                 suppressed_redundant_unit_reference_count += 1
                 continue
             _add_reference_edge(
@@ -717,6 +732,21 @@ def _resolve_unit(
             (),
         )
         if not candidates:
+            # A combined book cites "3-1-1. 보수규정" while the catalog keeps no
+            # number for a uniquely titled unit; the exact title then decides,
+            # but never for a unit numbered differently.
+            title_candidates = tuple(
+                unit
+                for unit in indexes["title"].get(scope, {}).get(_match_key(identity), ())
+                if not unit.regulation_no or _match_key(unit.regulation_no) == _match_key(explicit_no)
+            ) if identity else ()
+            if title_candidates:
+                return _resolution_for_candidates(
+                    title_candidates,
+                    match_type=MATCH_CANONICAL_TITLE,
+                    resolved_reason=REASON_RESOLVED_BY_CANONICAL_TITLE,
+                    ambiguous_reason=REASON_AMBIGUOUS_CANONICAL_TITLE,
+                )
             return _Resolution(
                 status=UNRESOLVED,
                 reason_code=REASON_TARGET_REGULATION_NUMBER_NOT_FOUND,
@@ -1015,14 +1045,32 @@ def _reference_parts(raw_reference: Any) -> tuple[str, str, str | None]:
         if article_marker_present and article_raw is None:
             article_raw = ""
         return identity, explicit_no, article_raw
-    return _optional_text(raw_reference) or "", "", None
+    text = _optional_text(raw_reference) or ""
+    coded = _CLASSIFICATION_CODED_REFERENCE_RE.match(text)
+    if coded:
+        return coded.group("title"), coded.group("number"), None
+    return text, "", None
 
 
-def _reference_identity_key(raw_reference: Any) -> tuple[str, str]:
+def _reference_identity_keys(raw_reference: Any) -> set[tuple[str, str]]:
     identity, explicit_no, _ = _reference_parts(raw_reference)
+    keys = set()
     if explicit_no:
-        return "regulation_no", _match_key(explicit_no)
-    return "identity", _match_key(identity)
+        keys.add(("regulation_no", _match_key(explicit_no)))
+    if identity:
+        keys.add(("identity", _match_key(identity)))
+    return keys
+
+
+def _is_own_classification_heading(raw_reference: Any, source_unit: _Unit) -> bool:
+    if isinstance(raw_reference, Mapping):
+        return False
+    coded = _CLASSIFICATION_CODED_REFERENCE_RE.match(_optional_text(raw_reference) or "")
+    if not coded:
+        return False
+    if source_unit.regulation_no:
+        return _match_key(coded.group("number")) == _match_key(source_unit.regulation_no)
+    return _match_key(coded.group("title")) == _match_key(source_unit.title)
 
 
 def _is_internal_reference(raw_reference: Any) -> bool:
