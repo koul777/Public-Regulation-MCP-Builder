@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import threading
 import unittest
+import weakref
 
 from app.core import gc_pause
 from app.core.gc_pause import gc_paused
@@ -69,11 +70,23 @@ class GcPausedTests(unittest.TestCase):
         self.assertEqual([False, False, True], states)
 
     def test_garbage_cycles_are_still_collected_after_the_pause(self) -> None:
+        # Track the cycles by weak reference instead of counting what one
+        # explicit gc.collect() returns: once the pause ends, an automatic
+        # young-generation collection may legitimately free some of them first,
+        # which made a count-based assertion depend on allocation history.
+        class Node:
+            pass
+
+        refs: list[weakref.ref] = []
         with gc_paused():
             for _ in range(100):
-                node: list = []
-                node.append(node)
-        self.assertGreaterEqual(gc.collect(), 100)
+                node = Node()
+                node.self_ref = node  # type: ignore[attr-defined]
+                refs.append(weakref.ref(node))
+            del node
+            self.assertTrue(all(ref() is not None for ref in refs))
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in refs))
 
 
 if __name__ == "__main__":
