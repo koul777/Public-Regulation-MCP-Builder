@@ -2900,6 +2900,64 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertEqual(toc["nodes"][0]["node_id"], toc["nodes"][1]["parent_id"])
         self.assertEqual(toc["nodes"][1]["node_id"], toc["nodes"][2]["parent_id"])
 
+    def test_toc_chapter_whose_title_contains_attachment_keyword_stays_chapter(self) -> None:
+        # "특별 지급" contains 별지 once spaces are removed; the chapter used to
+        # be listed as a form and dropped from the chapter count.
+        records = [
+            _record(
+                "doc-pay",
+                f"pay-{article_no}",
+                regulation_no="3-1-1",
+                regulation_title="보수규정",
+                article_no=article_no,
+                article_title=article_title,
+                text=f"{article_no}({article_title}) 본문",
+                revision_date="2026-07-01",
+                hierarchy_path=f"{chapter} > {article_no} {article_title}",
+            )
+            for chapter, article_no, article_title in (
+                ("제1장 총칙", "제1조", "목적"),
+                ("제6장 특별 지급", "제96조", "파견자 보수"),
+                ("제6장 특별 지급", "제97조", "서식"),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="보수규정",
+                regulation_no="3-1-1",
+            )
+            toc = regulation_toc(index_path, regulation_unit_id=unit_id)
+
+        node_types = {node["label"]: node["node_type"] for node in toc["nodes"]}
+        self.assertEqual("chapter", node_types["제6장 특별 지급"])
+        self.assertEqual("article", node_types["제97조 서식"])
+        self.assertNotIn("form", node_types.values())
+
+    def test_toc_node_type_reads_leading_marker_before_attachment_keywords(self) -> None:
+        cases = {
+            "제6장 특별 지급": "chapter",
+            "제3장 개별 지원": "chapter",
+            "제2절 특별표창": "section",
+            "제15조(서식)": "article",
+            "제20조 별표의 개정": "article",
+            "제5조의2 부칙의 적용": "article",
+            "제12장 부칙": "supplementary",
+            "부칙 <2004. 5. 1.>": "supplementary",
+            "[별표 1] 직급별 월 봉급표(제53조 관련)": "appendix",
+            "[별지 제1호서식] 휴직 신청서": "form",
+        }
+        for label, expected in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(expected, hierarchical_index._toc_node_type(label, 1))
+
     def test_canonical_title_unit_id_matches_numbered_combined_and_unnumbered_standalone(self) -> None:
         combined = _record(
             "doc-combined-unit",

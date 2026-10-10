@@ -3909,6 +3909,15 @@ def _toc_node_type(label: str, depth: int, *, chunk_type: str = "") -> str:
     marker = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(label or "")))
     if depth == 0:
         return "regulation"
+    # A leading \uc7a5/\uc808/\uc870 marker decides the type before the keyword checks
+    # below, which match anywhere: "\uc81c6\uc7a5 \ud2b9\ubcc4 \uc9c0\uae09" contains \ubcc4\uc9c0 once the
+    # spaces are gone, and "\uc81c15\uc870(\uc11c\uc2dd)" is an article, not a form.
+    # "\uc81cN\uc7a5 \ubd80\uce59" keeps its supplementary type.
+    leading = re.match(r"\uc81c\d+(?:\uc758\d+)?(\uc7a5|\uc808)", marker)
+    if leading and not _compact(marker[leading.end():]).startswith("\ubd80\uce59"):
+        return "chapter" if leading.group(1) == "\uc7a5" else "section"
+    if _ARTICLE_RE.match(label):
+        return "article"
     if "\ubd80\uce59" in compact:
         return "supplementary"
     if "\ubcc4\ud45c" in compact:
@@ -3919,8 +3928,6 @@ def _toc_node_type(label: str, depth: int, *, chunk_type: str = "") -> str:
         return "chapter"
     if re.search(r"\uc81c\d+\uc808", compact):
         return "section"
-    if _ARTICLE_RE.match(label):
-        return "article"
     normalized_chunk_type = str(chunk_type or "").strip().casefold()
     if normalized_chunk_type == "article":
         return "article"
