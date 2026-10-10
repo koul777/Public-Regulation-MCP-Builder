@@ -12,11 +12,15 @@ after the pause runs one ordinary young-generation collection.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import functools
 import gc
 from threading import Lock
+from typing import Any, TypeVar
 
+
+_Function = TypeVar("_Function", bound=Callable[..., Any])
 
 _STATE_LOCK = Lock()
 _pause_depth = 0
@@ -47,3 +51,14 @@ def gc_paused() -> Iterator[None]:
             if _pause_depth == 0 and _restore_on_exit:
                 gc.enable()
                 _restore_on_exit = False
+
+
+def gc_paused_call(function: _Function) -> _Function:
+    """Run a (non-generator) function inside :func:`gc_paused`."""
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with gc_paused():
+            return function(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]

@@ -7,6 +7,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from app.core.gc_pause import gc_paused_call
+
 
 VECTOR_RECORD_SCHEMA_VERSION = "reg-rag-vector-record-v1"
 VECTOR_RECORD_VERIFICATION_VERSION_V1 = "reg-rag-vector-verification-v1"
@@ -372,6 +374,7 @@ def _public_structural_child_sample(value: Any) -> list[dict[str, str]]:
     return result
 
 
+@gc_paused_call  # builds one long-lived acyclic record per chunk
 def build_vector_records(
     chunks: Iterable[dict[str, Any]],
     *,
@@ -722,6 +725,9 @@ def vector_record_path_leaks(records: Iterable[dict[str, Any]]) -> list[dict[str
     return leaks
 
 
+_NON_STRING_SCALAR_TYPES = frozenset({float, int, bool, type(None)})
+
+
 def _collect_string_path_leaks(value: Any, path: str, found: list[tuple[str, str]]) -> None:
     """Append ``(field_path, string)`` for every string under ``value`` that looks like a local path."""
 
@@ -730,6 +736,9 @@ def _collect_string_path_leaks(value: Any, path: str, found: list[tuple[str, str
             found.append((path, value))
         return
     if isinstance(value, list):
+        if set(map(type, value)) <= _NON_STRING_SCALAR_TYPES:
+            # Embedding vectors and other numeric lists hold no strings.
+            return
         for index, item in enumerate(value):
             kind = type(item)
             if kind is str:
@@ -811,7 +820,15 @@ def _json_safe(value: Any) -> Any:
 
 
 def _is_empty(value: Any) -> bool:
-    return value is None or value == "" or value == [] or value == {}
+    if value is None:
+        return True
+    kind = type(value)
+    if kind is str or kind is list or kind is dict:
+        return not value
+    if kind is int or kind is float or kind is bool:
+        # ``value == ""``, ``== []`` and ``== {}`` are all False for numbers.
+        return False
+    return value == "" or value == [] or value == {}
 
 
 def _metadata_value(record: dict[str, Any], key: str) -> str:

@@ -841,7 +841,9 @@ def validate_vector_records(records: Iterable[dict[str, Any]]) -> list[dict[str,
             embedding = record.get("embedding")
             if not isinstance(embedding, list) or not embedding:
                 raise ValueError(f"Embedded vector record {record_id} is missing embedding.")
-            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in embedding):
+            if set(map(type, embedding)) != {float} and any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) for value in embedding
+            ):
                 raise ValueError(f"Embedded vector record {record_id} embedding must contain only numbers.")
             dimensions = record.get("embedding_dimensions")
             if (

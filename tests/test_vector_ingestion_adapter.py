@@ -585,5 +585,129 @@ class VectorRecordVerificationEquivalenceTests(unittest.TestCase):
         )
 
 
+def _reference_is_empty(value) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _reference_json_safe(value):
+    """Verbatim copy of vector_adapter._json_safe before items were evaluated once."""
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_reference_json_safe(item) for item in value if not _reference_is_empty(_reference_json_safe(item))]
+    if isinstance(value, tuple):
+        return [_reference_json_safe(item) for item in value if not _reference_is_empty(_reference_json_safe(item))]
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            safe_item = _reference_json_safe(item)
+            if _reference_is_empty(safe_item):
+                continue
+            cleaned[str(key)] = safe_item
+        return cleaned
+    return str(value)
+
+
+class _EqualsEverything:
+    def __eq__(self, other) -> bool:
+        return True
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class _StrBox(str):
+    pass
+
+
+class VectorMetadataSanitizingEquivalenceTests(unittest.TestCase):
+    VALUES = [
+        None,
+        "",
+        "text",
+        0,
+        1,
+        0.0,
+        float("nan"),
+        False,
+        True,
+        [],
+        {},
+        [None, "", [], {}, "x", 0, [[]]],
+        (1, "", None, ("a", ())),
+        {"a": None, "b": "", "c": [], "d": {}, "e": 0, "f": {"g": [None, "h"]}},
+        {1: "int key", (2, 3): "tuple key"},
+        {"s": {1, 2}, "o": object},
+        _StrBox(""),
+        _StrBox("boxed"),
+        _EqualsEverything(),
+    ]
+
+    def test_is_empty_matches_the_original_expression(self) -> None:
+        for value in self.VALUES:
+            with self.subTest(value=repr(value)[:40]):
+                try:
+                    expected = _reference_is_empty(value)
+                except TypeError:
+                    continue
+                self.assertEqual(expected, vector_adapter_module._is_empty(value))
+
+    def test_json_safe_matches_the_original_recursion(self) -> None:
+        for value in self.VALUES:
+            with self.subTest(value=repr(value)[:40]):
+                try:
+                    expected = _reference_json_safe(value)
+                except TypeError:
+                    continue
+                actual = vector_adapter_module._json_safe(value)
+                if isinstance(expected, float) and expected != expected:
+                    self.assertTrue(actual != actual)
+                else:
+                    self.assertEqual(expected, actual)
+        nested = {"outer": [self.VALUES[11], self.VALUES[12], {"inner": self.VALUES[13]}], "empty": self.VALUES[9]}
+        self.assertEqual(_reference_json_safe(nested), vector_adapter_module._json_safe(nested))
+
+    def test_numeric_lists_are_skipped_by_the_leak_scan_but_strings_inside_are_not(self) -> None:
+        clean = {"id": "r", "embedding": [0.1, 0.2, 3, True, None]}
+        self.assertEqual([], vector_record_path_leaks([clean]))
+        leaking = {"id": "r", "embedding": [0.1, 0.2, "/home/user/secret.txt"]}
+        self.assertEqual(
+            [("r", "$.embedding[2]")],
+            [(item["id"], item["field_path"]) for item in vector_record_path_leaks([leaking])],
+        )
+        nested = {"id": "n", "rows": [[1, 2], [3, "C:\\leak\\file"]]}
+        self.assertEqual(
+            [("n", "$.rows[1][1]")],
+            [(item["id"], item["field_path"]) for item in vector_record_path_leaks([nested])],
+        )
+
+    def test_build_vector_records_leaves_the_collector_state_alone(self) -> None:
+        import gc
+
+        was_enabled = gc.isenabled()
+        gc.enable()
+        try:
+            records, summary = build_vector_records(
+                [
+                    {
+                        "chunk_id": "c1",
+                        "document_id": "d1",
+                        "tenant_id": "t",
+                        "retrieval_text": "본문",
+                        "approval_status": "approved",
+                        "approval_id": "ap",
+                        "approved_content_hash": "h",
+                        "security_level": "internal",
+                    }
+                ]
+            )
+            self.assertTrue(gc.isenabled())
+            self.assertEqual(1, len(records))
+            self.assertEqual(1, summary["record_count"])
+        finally:
+            if not was_enabled:
+                gc.disable()
+
+
 if __name__ == "__main__":
     unittest.main()
