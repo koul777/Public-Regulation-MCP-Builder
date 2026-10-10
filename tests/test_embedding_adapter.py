@@ -222,5 +222,87 @@ def _record(record_id: str, text: str) -> dict:
     }
 
 
+def _reference_local_hash_embedding(text: str, *, dimensions: int = 384) -> list[float]:
+    """Verbatim copy of the dense algorithm local_hash_embedding used before it went sparse."""
+
+    vector = [0.0] * dimensions
+    tokens = embedding_adapter._tokens(text)
+    if not tokens:
+        tokens = [text]
+    for token in tokens:
+        index, sign = embedding_adapter._token_bucket(token, dimensions)
+        vector[index] += sign
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm:
+        vector = [round(value / norm, 8) for value in vector]
+    return vector
+
+
+class LocalHashEmbeddingEquivalenceTests(unittest.TestCase):
+    WORDS = ["제1조", "목적", "휴직", "절차", "신청", "budget", "Rule", "x", "a1", "인사규정", "지급", "수당", "of", "the"]
+
+    def test_sparse_embedding_is_bit_identical_to_the_dense_algorithm(self) -> None:
+        import random
+
+        rng = random.Random(20260110)
+        compared = 0
+        for _ in range(400):
+            words = [rng.choice(self.WORDS) for _ in range(rng.randint(0, 60))]
+            text = " ".join(words)
+            if rng.random() < 0.2:
+                text += " " + "가" * rng.choice([5, 64, 65, 200])
+            for dimensions in (1, 2, 3, 8, 16, 384, 1000, 4096):
+                with self.subTest(text=text[:30], dimensions=dimensions):
+                    self.assertEqual(
+                        _reference_local_hash_embedding(text, dimensions=dimensions),
+                        local_hash_embedding(text, dimensions=dimensions),
+                    )
+                compared += 1
+        self.assertEqual(3200, compared)
+
+    def test_texts_without_word_characters_and_cancelling_buckets_match(self) -> None:
+        for text in ("", "   ", "!!! ??? ...", "---", "\n", "한", "x" * 500):
+            for dimensions in (1, 4, 384):
+                self.assertEqual(
+                    _reference_local_hash_embedding(text, dimensions=dimensions),
+                    local_hash_embedding(text, dimensions=dimensions),
+                )
+        # one dimension: opposite-sign tokens cancel to an all-zero vector (norm == 0)
+        positive = next(w for w in ("a", "b", "c", "d", "e", "f") if embedding_adapter._token_bucket(w, 1)[1] > 0)
+        negative = next(w for w in ("a", "b", "c", "d", "e", "f", "g", "h") if embedding_adapter._token_bucket(w, 1)[1] < 0)
+        cancelled = f"{positive} {negative}"
+        self.assertEqual([0.0], local_hash_embedding(cancelled, dimensions=1))
+        self.assertEqual(
+            _reference_local_hash_embedding(cancelled, dimensions=1),
+            local_hash_embedding(cancelled, dimensions=1),
+        )
+
+    def test_result_is_a_fresh_list_of_floats(self) -> None:
+        first = local_hash_embedding("제1조 목적", dimensions=32)
+        first[0] = 99.0
+        second = local_hash_embedding("제1조 목적", dimensions=32)
+        self.assertNotEqual(99.0, second[0])
+        self.assertTrue(all(type(value) is float for value in second))
+
+    def test_dimension_validation_is_unchanged(self) -> None:
+        for dimensions in (0, -1, 4097, True, 3.5):
+            with self.assertRaises(ValueError):
+                local_hash_embedding("text", dimensions=dimensions)  # type: ignore[arg-type]
+
+    def test_embed_vector_records_collects_garbage_normally_afterwards(self) -> None:
+        import gc
+
+        was_enabled = gc.isenabled()
+        gc.enable()
+        try:
+            embedded, summary = embed_vector_records([_record("doc:chunk-1", "제1조 목적")], dimensions=8)
+            self.assertTrue(gc.isenabled())
+            self.assertEqual(1, summary["record_count"])
+            self.assertEqual(1, len(embedded))
+        finally:
+            if not was_enabled:
+                gc.disable()
+
+
 if __name__ == "__main__":
     unittest.main()

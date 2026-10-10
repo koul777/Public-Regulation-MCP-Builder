@@ -17,7 +17,7 @@ import threading
 import time
 from types import MappingProxyType
 import unicodedata
-from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from app.ingestion.vector_adapter import stable_content_hash
@@ -835,6 +835,15 @@ def _canonical_record_regulation_identities(
             for group_key, group_entries in numbered_groups.items()
         }
         sole_numbered_group = next(iter(numbered_groups)) if len(numbered_groups) == 1 else None
+        first_numbered_order = min(
+            (
+                order
+                for group_entries in numbered_groups.values()
+                for entry in group_entries
+                if (order := _integer(entry["metadata"].get("order_index"), -1)) >= 0
+            ),
+            default=None,
+        )
         matched_numbered_group_by_title: dict[str, str | None] = {}
         for entry in unassigned_entries:
             selected_group = sole_numbered_group
@@ -888,6 +897,12 @@ def _canonical_record_regulation_identities(
                 "regulation_no": regulation_no,
                 "profile_id": profile_id,
             }
+            if (
+                group_key.startswith("title:")
+                and len(numbered_groups) > 1
+                and _is_book_front_matter(group_entries, first_numbered_order)
+            ):
+                identity["front_matter"] = "true"
             for entry in group_entries:
                 identities[entry["record_key"]] = identity
     identities = _assign_canonical_title_unit_ids(
@@ -899,6 +914,35 @@ def _canonical_record_regulation_identities(
         records_by_document,
         identities,
     )
+
+
+def _is_book_front_matter(
+    entries: Sequence[Mapping[str, Any]],
+    first_numbered_order: int | None,
+) -> bool:
+    """Whether an unnumbered segment is the cover text before a book's first regulation.
+
+    No regulation boundary precedes the cover lines of a combined book, so the
+    chunker gives them the book's own title ("…총규정"). They are not a
+    regulation; the segment is kept as a navigation unit instead of a catalog
+    entry. Articles, chunks tied to a regulation boundary and records without
+    a source order stay ordinary units.
+    """
+
+    if first_numbered_order is None:
+        return False
+    for entry in entries:
+        metadata = entry["metadata"]
+        order = _integer(metadata.get("order_index"), -1)
+        if (
+            order < 0
+            or order >= first_numbered_order
+            or str(metadata.get("article_no") or "").strip()
+            or str(metadata.get("regulation_node_id") or "").strip()
+            or str(metadata.get("regulation_source_node_id") or "").strip()
+        ):
+            return False
+    return True
 
 
 def _assign_canonical_title_unit_ids(
@@ -3162,7 +3206,9 @@ def _add_runtime_record_to_version_groups(
             "logical_chunk_hashes": [],
             "search_values": [],
             "chunk_count": 0,
-            "is_navigation": int(_is_navigation_unit(title, regulation_no)),
+            "is_navigation": int(
+                _is_navigation_unit(title, regulation_no) or bool(identity.get("front_matter"))
+            ),
         },
     )
     if revision_date:
@@ -3909,6 +3955,15 @@ def _toc_node_type(label: str, depth: int, *, chunk_type: str = "") -> str:
     marker = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(label or "")))
     if depth == 0:
         return "regulation"
+    # A leading \uc7a5/\uc808/\uc870 marker decides the type before the keyword checks
+    # below, which match anywhere: "\uc81c6\uc7a5 \ud2b9\ubcc4 \uc9c0\uae09" contains \ubcc4\uc9c0 once the
+    # spaces are gone, and "\uc81c15\uc870(\uc11c\uc2dd)" is an article, not a form.
+    # "\uc81cN\uc7a5 \ubd80\uce59" keeps its supplementary type.
+    leading = re.match(r"\uc81c\d+(?:\uc758\d+)?(\uc7a5|\uc808)", marker)
+    if leading and not _compact(marker[leading.end():]).startswith("\ubd80\uce59"):
+        return "chapter" if leading.group(1) == "\uc7a5" else "section"
+    if _ARTICLE_RE.match(label):
+        return "article"
     if "\ubd80\uce59" in compact:
         return "supplementary"
     if "\ubcc4\ud45c" in compact:
@@ -3919,8 +3974,6 @@ def _toc_node_type(label: str, depth: int, *, chunk_type: str = "") -> str:
         return "chapter"
     if re.search(r"\uc81c\d+\uc808", compact):
         return "section"
-    if _ARTICLE_RE.match(label):
-        return "article"
     normalized_chunk_type = str(chunk_type or "").strip().casefold()
     if normalized_chunk_type == "article":
         return "article"

@@ -189,5 +189,71 @@ class RetrievalTokenizerTests(unittest.TestCase):
                 self.assertEqual(1, mock_kiwi_tokens.call_count)
 
 
+class _FakeKiwiItem:
+    def __init__(self, form, tag) -> None:
+        self.form = form
+        self.tag = tag
+
+
+def _reference_kiwi_items_to_tokens(analyzed) -> list[str]:
+    """Verbatim copy of _kiwi_items_to_tokens before the (form, tag) table."""
+
+    tokens: list[str] = []
+    for item in analyzed:
+        form = str(getattr(item, "form", "") or "").strip().lower()
+        tag = str(getattr(item, "tag", "") or "")
+        if not form:
+            continue
+        if tokenizer_module._is_article_no(form) or tag.startswith(tokenizer_module._KEEP_KIWI_TAG_PREFIXES):
+            tokens.extend(tokenizer_module._expand_token(form))
+    return tokens
+
+
+class KiwiItemTokenTableTests(unittest.TestCase):
+    FORMS = ["점검규정", "제7조", "제 7 조", "휴직", "Rule", "  ", "", None, "으로", "하는", "ABC", "제12조의2", "가" * 129 + "규정"]
+    TAGS = ["NNG", "NNP", "VV", "VA", "XR", "SL", "SN", "JKS", "EF", "SF", "", None, "NNG-extra", "J"]
+
+    def tearDown(self) -> None:
+        tokenizer_module._KIWI_ITEM_TOKEN_CACHE.clear()
+        tokenizer_module._cached_expanded_token.cache_clear()
+
+    def test_items_to_tokens_matches_the_reference_for_all_form_tag_pairs(self) -> None:
+        items = [_FakeKiwiItem(form, tag) for form in self.FORMS for tag in self.TAGS]
+        for _ in range(2):  # the second pass is answered from the table
+            self.assertEqual(_reference_kiwi_items_to_tokens(items), tokenizer_module._kiwi_items_to_tokens(items))
+        for item in items:
+            self.assertEqual(
+                _reference_kiwi_items_to_tokens([item]),
+                tokenizer_module._kiwi_items_to_tokens([item]),
+                (item.form, item.tag),
+            )
+
+    def test_non_string_attributes_and_missing_attributes_take_the_original_path(self) -> None:
+        class Odd:
+            form = 123
+            tag = "NNG"
+
+        class Bare:
+            pass
+
+        class StrSub(str):
+            pass
+
+        items = [Odd(), Bare(), _FakeKiwiItem(StrSub("점검규정"), "NNG"), _FakeKiwiItem("점검규정", StrSub("NNG"))]
+        self.assertEqual(_reference_kiwi_items_to_tokens(items), tokenizer_module._kiwi_items_to_tokens(items))
+
+    def test_table_is_bounded_and_returns_fresh_lists(self) -> None:
+        with patch.object(tokenizer_module, "_KIWI_ITEM_TOKEN_CACHE_MAX", 3):
+            items = [_FakeKiwiItem(f"단어{index}규정", "NNG") for index in range(20)]
+            self.assertEqual(_reference_kiwi_items_to_tokens(items), tokenizer_module._kiwi_items_to_tokens(items))
+            self.assertLessEqual(len(tokenizer_module._KIWI_ITEM_TOKEN_CACHE), 3)
+        first = tokenizer_module._kiwi_items_to_tokens([_FakeKiwiItem("점검규정", "NNG")])
+        first.append("mutated")
+        self.assertEqual(
+            ["점검규정", "점검", "규정"],
+            tokenizer_module._kiwi_items_to_tokens([_FakeKiwiItem("점검규정", "NNG")]),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

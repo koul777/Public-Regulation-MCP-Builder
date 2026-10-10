@@ -2485,6 +2485,38 @@ class ChunkerTests(unittest.TestCase):
                 else:
                     self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
 
+    def test_book_classification_header_is_not_a_reference_to_its_own_regulation(self) -> None:
+        pages = [
+            ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join([
+                "1-1-1. 인사규정", "인사규정", "제1조(목적) 인사 기준을 정한다.",
+            ]))]),
+            ParsedPage(page_no=2, blocks=[ParsedBlock(text="\n".join([
+                "1-1-2. 보수규정", "보수규정", "제1조(목적) 보수 기준을 정한다.",
+                "제2조(준용) 휴직자의 보수는 1-1-1. 인사규정 제1조를 준용한다.",
+            ]))]),
+        ]
+        parsed = ParsedDocument(
+            document_id="doc-coded-book",
+            source_file="combined-book.pdf",
+            document_name="통합규정집",
+            file_type="pdf",
+            pages=pages,
+            raw_text="",
+        )
+        chunks = Chunker().build_chunks(
+            StructureDetector().detect(parsed), parsed, ChunkOptions(include_context_header=False)
+        )
+
+        refs_by_text = {
+            chunk.text.splitlines()[0]: chunk.metadata["internal_regulation_refs"] for chunk in chunks
+        }
+        self.assertEqual([], refs_by_text["1-1-1. 인사규정"])
+        self.assertEqual([], refs_by_text["1-1-2. 보수규정"])
+        self.assertIn(
+            "1-1-1.인사규정",
+            refs_by_text["제2조(준용) 휴직자의 보수는 1-1-1. 인사규정 제1조를 준용한다."],
+        )
+
     def test_root_item_with_subitems_becomes_recoverable_chunk(self) -> None:
         parsed = ParsedDocument(
             document_id="doc_root_item",

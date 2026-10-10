@@ -13,6 +13,7 @@ from functools import lru_cache
 from typing import Any, Iterable
 
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL
+from app.core.gc_pause import gc_paused
 from app.ingestion.vector_adapter import VECTOR_RECORD_SCHEMA_VERSION, stable_content_hash, vector_record_path_leaks
 from app.retrieval.semantic_models import Qwen3EmbeddingAdapter
 
@@ -125,8 +126,9 @@ def embed_vector_records(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     record_list = list(records)
     if model != QWEN3_EMBEDDING_MODEL or not record_list:
-        embedded = [embed_vector_record(record, dimensions=dimensions, model=model) for record in record_list]
-        return embedded, summarize_embedded_records(embedded, model=model, dimensions=dimensions)
+        with gc_paused():  # local hash embeddings: a long-lived acyclic list per record
+            embedded = [embed_vector_record(record, dimensions=dimensions, model=model) for record in record_list]
+            return embedded, summarize_embedded_records(embedded, model=model, dimensions=dimensions)
 
     texts = [_validated_record_text(record, model=model) for record in record_list]
     embeddings = _encode_with_progress(_qwen_embedding_adapter(dimensions), texts)
@@ -170,10 +172,42 @@ def local_hash_embedding(text: str, *, dimensions: int = 384) -> list[float]:
         raise ValueError(
             f"Embedding dimensions must be an integer between 1 and {MAX_EMBEDDING_DIMENSIONS}."
         )
-    vector = [0.0] * dimensions
     tokens = _tokens(text)
     if not tokens:
         tokens = [text]
+    if len(tokens) > _SPARSE_EMBEDDING_MAX_TOKENS:
+        return _dense_local_hash_embedding(tokens, dimensions)
+    # A text touches far fewer buckets than there are dimensions, so only the
+    # touched buckets are accumulated and normalized.  Every touched bucket
+    # holds a sum of +/-1.0 added in token order (an exact small integer, as in
+    # the dense algorithm), the sum of squares is an exact integer below 2**53,
+    # and untouched or cancelled buckets are 0.0 either way
+    # (round(0.0 / norm, 8) == 0.0), so the result is bit-identical.
+    buckets: dict[int, float] = {}
+    for token in tokens:
+        if len(token) <= _TOKEN_BUCKET_CACHE_MAX_CHARS:
+            index, sign = _cached_token_bucket(token, dimensions)
+        else:
+            index, sign = _token_bucket(token, dimensions)
+        buckets[index] = buckets.get(index, 0.0) + sign
+    norm = math.sqrt(sum(value * value for value in buckets.values()))
+    vector = [0.0] * dimensions
+    if norm:
+        for index, value in buckets.items():
+            vector[index] = round(value / norm, 8)
+    else:
+        for index, value in buckets.items():
+            vector[index] = value
+    return vector
+
+
+# Beyond this many tokens the squared bucket sums are no longer guaranteed to
+# be exactly representable, so the original dense accumulation order is used.
+_SPARSE_EMBEDDING_MAX_TOKENS = 1_000_000
+
+
+def _dense_local_hash_embedding(tokens: list[str], dimensions: int) -> list[float]:
+    vector = [0.0] * dimensions
     for token in tokens:
         if len(token) <= _TOKEN_BUCKET_CACHE_MAX_CHARS:
             index, sign = _cached_token_bucket(token, dimensions)

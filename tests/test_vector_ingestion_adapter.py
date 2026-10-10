@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import unittest
 
+from app.ingestion import vector_adapter as vector_adapter_module
 from app.ingestion.vector_adapter import (
     VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION,
     VECTOR_RECORD_SCHEMA_VERSION,
     VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION,
     VECTOR_RECORD_VERIFICATION_VERSION,
     build_vector_records,
+    stable_content_hash,
     vector_metadata_semantic_fingerprint,
     vector_record_semantic_fingerprint,
     vector_record_verification_hash,
     vector_record_from_chunk,
     vector_record_path_leaks,
+    with_vector_record_verification,
 )
 
 
@@ -56,6 +59,27 @@ class VectorIngestionAdapterTests(unittest.TestCase):
             "source-regulation-boundary",
             metadata["regulation_source_node_id"],
         )
+
+    def test_keeps_chunk_source_order_index(self) -> None:
+        for order_index in (0, 1287):
+            with self.subTest(order_index=order_index):
+                record = vector_record_from_chunk(
+                    {
+                        "chunk_id": f"chunk-order-{order_index}",
+                        "document_id": "doc-combined-book",
+                        "tenant_id": "tenant-a",
+                        "retrieval_text": "제1조(목적) 본문",
+                        "metadata": {"order_index": order_index},
+                        "approval_status": "approved",
+                        "approval_id": f"approval-order-{order_index}",
+                        "approved_content_hash": f"approved-order-{order_index}",
+                        "security_level": "internal",
+                    }
+                )
+
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(order_index, record["metadata"]["order_index"])
 
     def test_semantic_fingerprints_cover_retrieval_lifecycle_acl_and_profile_metadata(self) -> None:
         base = {
@@ -489,6 +513,221 @@ class VectorIngestionAdapterTests(unittest.TestCase):
         self.assertIn("$.metadata.source_file", leaked_paths)
         self.assertIn("$.metadata.quality_json", leaked_paths)
         self.assertIn("$.metadata.runtime_path", leaked_paths)
+
+
+_VERIFICATION_METADATA_CASES = [
+    {},
+    {"approval_status": "approved", "approval_id": "a", "approved_content_hash": "h", "tenant_id": "t"},
+    {
+        "nested": {"z": [1, 2.5, None, True, "\ud55c\uae00"], "a": {"k": []}},
+        "unicode": "\u2603 \ud55c\uae00 \"quote\" \\ back",
+    },
+    {"floats": [0.1, 1e-7, 1e21, -0.0], "ints": [0, -1, 2**65]},
+    {"department_acl": ["b", "a"], "security_level": "Internal"},
+]
+
+
+class VectorRecordVerificationEquivalenceTests(unittest.TestCase):
+    """The single-serialization verification path must keep every digest unchanged."""
+
+    def test_combined_digests_equal_the_individual_helpers(self) -> None:
+        for index, metadata in enumerate(_VERIFICATION_METADATA_CASES):
+            for text in ("", "plain", "\ud55c\uae00 \ubcf8\ubb38\n\t\"quoted\"", "x" * 5000):
+                with self.subTest(index=index, text=text[:10]):
+                    content_hash, metadata_fingerprint = vector_adapter_module._content_hash_and_metadata_fingerprint(
+                        text, metadata
+                    )
+                    self.assertEqual(stable_content_hash(text, metadata), content_hash)
+                    self.assertEqual(vector_metadata_semantic_fingerprint(metadata), metadata_fingerprint)
+
+    def test_verification_equals_the_unoptimized_composition(self) -> None:
+        for index, metadata in enumerate(_VERIFICATION_METADATA_CASES):
+            record = {
+                "schema_version": VECTOR_RECORD_SCHEMA_VERSION,
+                "id": f"doc:chunk-{index}",
+                "document_id": "doc",
+                "chunk_id": f"chunk-{index}",
+                "tenant_id": "tenant-a",
+                "text": "\ubcf8\ubb38 text",
+                "metadata": metadata,
+                "content_hash": "stale",
+            }
+            expected = dict(record)
+            expected["content_hash"] = stable_content_hash(record["text"], metadata)
+            expected["metadata_semantic_fingerprint_version"] = VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION
+            expected["metadata_semantic_fingerprint"] = vector_metadata_semantic_fingerprint(metadata)
+            expected["record_semantic_fingerprint_version"] = VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION
+            expected["record_semantic_fingerprint"] = vector_record_semantic_fingerprint(expected)
+            expected["verification_version"] = VECTOR_RECORD_VERIFICATION_VERSION
+            expected["verification_hash"] = vector_record_verification_hash(expected)
+            expected["verified_at"] = "2026-01-01T00:00:00+00:00"
+            with self.subTest(index=index):
+                actual = with_vector_record_verification(record, verified_at="2026-01-01T00:00:00+00:00")
+                self.assertEqual(expected, actual)
+                self.assertEqual(list(expected), list(actual))
+
+    def test_record_fingerprint_accepts_a_precomputed_metadata_fingerprint(self) -> None:
+        record = {
+            "id": "doc:c",
+            "document_id": "doc",
+            "chunk_id": "c",
+            "tenant_id": "t",
+            "text": "text",
+            "metadata": {"k": "v"},
+        }
+        precomputed = vector_metadata_semantic_fingerprint(record["metadata"])
+        self.assertEqual(
+            vector_record_semantic_fingerprint(record),
+            vector_record_semantic_fingerprint(record, metadata_fingerprint=precomputed),
+        )
+        # the argument is trusted verbatim, so a different value yields a different digest
+        self.assertNotEqual(
+            vector_record_semantic_fingerprint(record),
+            vector_record_semantic_fingerprint(record, metadata_fingerprint="0" * 64),
+        )
+
+    def test_vector_record_from_chunk_hash_matches_its_final_text_and_metadata(self) -> None:
+        record = vector_record_from_chunk(
+            {
+                "chunk_id": "c1",
+                "document_id": "d1",
+                "tenant_id": "t",
+                "retrieval_text": "\ubcf8\ubb38",
+                "approval_status": "approved",
+                "approval_id": "ap",
+                "approved_content_hash": "h",
+                "security_level": "internal",
+            }
+        )
+        self.assertEqual(stable_content_hash(record["text"], record["metadata"]), record["content_hash"])
+        self.assertEqual(
+            list(record)[:7],
+            ["schema_version", "id", "document_id", "chunk_id", "text", "metadata", "content_hash"],
+        )
+
+
+def _reference_is_empty(value) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _reference_json_safe(value):
+    """Verbatim copy of vector_adapter._json_safe before items were evaluated once."""
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_reference_json_safe(item) for item in value if not _reference_is_empty(_reference_json_safe(item))]
+    if isinstance(value, tuple):
+        return [_reference_json_safe(item) for item in value if not _reference_is_empty(_reference_json_safe(item))]
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            safe_item = _reference_json_safe(item)
+            if _reference_is_empty(safe_item):
+                continue
+            cleaned[str(key)] = safe_item
+        return cleaned
+    return str(value)
+
+
+class _EqualsEverything:
+    def __eq__(self, other) -> bool:
+        return True
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class _StrBox(str):
+    pass
+
+
+class VectorMetadataSanitizingEquivalenceTests(unittest.TestCase):
+    VALUES = [
+        None,
+        "",
+        "text",
+        0,
+        1,
+        0.0,
+        float("nan"),
+        False,
+        True,
+        [],
+        {},
+        [None, "", [], {}, "x", 0, [[]]],
+        (1, "", None, ("a", ())),
+        {"a": None, "b": "", "c": [], "d": {}, "e": 0, "f": {"g": [None, "h"]}},
+        {1: "int key", (2, 3): "tuple key"},
+        {"s": {1, 2}, "o": object},
+        _StrBox(""),
+        _StrBox("boxed"),
+        _EqualsEverything(),
+    ]
+
+    def test_is_empty_matches_the_original_expression(self) -> None:
+        for value in self.VALUES:
+            with self.subTest(value=repr(value)[:40]):
+                try:
+                    expected = _reference_is_empty(value)
+                except TypeError:
+                    continue
+                self.assertEqual(expected, vector_adapter_module._is_empty(value))
+
+    def test_json_safe_matches_the_original_recursion(self) -> None:
+        for value in self.VALUES:
+            with self.subTest(value=repr(value)[:40]):
+                try:
+                    expected = _reference_json_safe(value)
+                except TypeError:
+                    continue
+                actual = vector_adapter_module._json_safe(value)
+                if isinstance(expected, float) and expected != expected:
+                    self.assertTrue(actual != actual)
+                else:
+                    self.assertEqual(expected, actual)
+        nested = {"outer": [self.VALUES[11], self.VALUES[12], {"inner": self.VALUES[13]}], "empty": self.VALUES[9]}
+        self.assertEqual(_reference_json_safe(nested), vector_adapter_module._json_safe(nested))
+
+    def test_numeric_lists_are_skipped_by_the_leak_scan_but_strings_inside_are_not(self) -> None:
+        clean = {"id": "r", "embedding": [0.1, 0.2, 3, True, None]}
+        self.assertEqual([], vector_record_path_leaks([clean]))
+        leaking = {"id": "r", "embedding": [0.1, 0.2, "/home/user/secret.txt"]}
+        self.assertEqual(
+            [("r", "$.embedding[2]")],
+            [(item["id"], item["field_path"]) for item in vector_record_path_leaks([leaking])],
+        )
+        nested = {"id": "n", "rows": [[1, 2], [3, "C:\\leak\\file"]]}
+        self.assertEqual(
+            [("n", "$.rows[1][1]")],
+            [(item["id"], item["field_path"]) for item in vector_record_path_leaks([nested])],
+        )
+
+    def test_build_vector_records_leaves_the_collector_state_alone(self) -> None:
+        import gc
+
+        was_enabled = gc.isenabled()
+        gc.enable()
+        try:
+            records, summary = build_vector_records(
+                [
+                    {
+                        "chunk_id": "c1",
+                        "document_id": "d1",
+                        "tenant_id": "t",
+                        "retrieval_text": "본문",
+                        "approval_status": "approved",
+                        "approval_id": "ap",
+                        "approved_content_hash": "h",
+                        "security_level": "internal",
+                    }
+                ]
+            )
+            self.assertTrue(gc.isenabled())
+            self.assertEqual(1, len(records))
+            self.assertEqual(1, summary["record_count"])
+        finally:
+            if not was_enabled:
+                gc.disable()
 
 
 if __name__ == "__main__":

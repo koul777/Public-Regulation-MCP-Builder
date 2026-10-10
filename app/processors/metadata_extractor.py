@@ -94,6 +94,8 @@ class MetadataExtractor:
             text,
             external_law_refs,
             [item["regulation_ref"] for item in regulation_article_refs],
+            current_regulation_no=current_regulation_no,
+            current_regulation_title=current_regulation_title,
         )
         external_law_refs = self._external_law_refs_only(external_law_refs, internal_regulation_refs)
         revision_events = self._revision_events(text)
@@ -246,6 +248,9 @@ class MetadataExtractor:
         text: str,
         quoted_refs: list[str],
         prefixed_refs: list[str] | None = None,
+        *,
+        current_regulation_no: str | None = None,
+        current_regulation_title: str | None = None,
     ) -> list[str]:
         refs: list[str] = []
         refs.extend(value for value in prefixed_refs or [] if self._is_internal_regulation_name(value))
@@ -255,6 +260,13 @@ class MetadataExtractor:
         for match in self.REGULATION_NUMBER_REF.finditer(text):
             number = self._compact(match.group(1))
             title = self._regulation_title_from_number_ref(match.group(2))
+            # A combined book heads each regulation with its own
+            # classification code ("2-1-1. 인사규정"); that is not a reference.
+            if any(
+                self._is_current_regulation_prefix(value, current_regulation_no, current_regulation_title)
+                for value in (number, title)
+            ):
+                continue
             if title and self._is_internal_regulation_name(title):
                 refs.append(f"{number}.{title}")
         return self._unique(refs)
