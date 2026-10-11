@@ -39,6 +39,23 @@ class MetadataExtractorTests(unittest.TestCase):
         self.assertNotIn("제2조", metadata["article_refs"])
         self.assertIn("제3조", metadata["article_refs"])
 
+    def test_skips_current_regulation_classification_header(self) -> None:
+        text = "2-1-1. 인사규정\n인사규정\n제정 2014. 12. 1."
+
+        own = MetadataExtractor().extract(
+            text,
+            current_regulation_no="2-1-1",
+            current_regulation_title="인사규정",
+        )
+        other = MetadataExtractor().extract(
+            text,
+            current_regulation_no="3-1-1",
+            current_regulation_title="보수규정",
+        )
+
+        self.assertEqual([], own["internal_regulation_refs"])
+        self.assertEqual(["2-1-1.인사규정"], other["internal_regulation_refs"])
+
     def test_extracts_halfwidth_law_quotes_and_spaced_revision_events(self) -> None:
         text = (
             "다른 법령이나 지침상의 ｢공기업·준정부기관 예산편성지침｣ 및 "

@@ -6,11 +6,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.core.config import Settings
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document
 from app.storage.repository import JsonRepository
+from scripts import build_approval_review_batches as review_batches_module
 from scripts.build_approval_review_batches import build_approval_review_batches, main
 from scripts.build_approval_worklist import build_approval_worklist
 
@@ -316,6 +318,53 @@ class BuildApprovalReviewBatchesTests(unittest.TestCase):
         self.assertEqual(0, report["manual_attention_chunks"])
         self.assertEqual(1, report["low_risk_batch_review_candidate_chunks"])
         self.assertEqual(["low_risk_batch"], report["include_review_types"])
+
+
+class ReviewBatchesSkipNonCandidateRowsTests(unittest.TestCase):
+    def test_review_rows_are_built_only_for_chunks_awaiting_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(data_dir=root / "data")
+            _seed_document(
+                settings,
+                [
+                    Chunk(chunk_id="draft-1", document_id="doc-a", chunk_type="article", text="draft one",
+                          metadata={"article_no": "1", "article_title": "Purpose"}),
+                    Chunk(chunk_id="done-1", document_id="doc-a", chunk_type="article", text="done one",
+                          approval_status="approved", metadata={"article_no": "2", "article_title": "Scope"}),
+                    Chunk(chunk_id="review-1", document_id="doc-a", chunk_type="table", text="table",
+                          approval_status="needs_review",
+                          metadata={"table_review_required": True, "table_review_flags": ["row_review_required"]}),
+                    Chunk(chunk_id="rejected-1", document_id="doc-a", chunk_type="article", text="rejected",
+                          approval_status="rejected"),
+                ],
+            )
+            worklist_path = root / "reports" / "approval_worklist.json"
+            worklist_path.parent.mkdir(parents=True)
+            worklist = build_approval_worklist(data_dir=settings.data_dir, source_system="PUBLIC_PORTAL")
+            worklist_path.write_text(json.dumps(worklist, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            seen: list[str] = []
+            real_row = review_batches_module.approval_chunk_row
+
+            def spy(chunk):
+                seen.append(chunk.chunk_id)
+                return real_row(chunk)
+
+            with mock.patch.object(review_batches_module, "approval_chunk_row", spy):
+                report = build_approval_review_batches(
+                    data_dir=settings.data_dir,
+                    worklist_report=worklist_path,
+                    worklist_report_artifact_path="reports/approval_worklist.json",
+                    max_chunks_per_batch=10,
+                )
+
+        self.assertEqual(["draft-1", "review-1"], seen)
+        self.assertTrue(report["passed"])
+        batched = sorted(
+            chunk["chunk_id"] for batch in report["batches"] for chunk in batch["chunks"]
+        )
+        self.assertEqual(["draft-1", "review-1"], batched)
 
 
 def _seed_document(settings: Settings, chunks: list[Chunk]) -> None:

@@ -1185,6 +1185,47 @@ class Bm25IndexTests(unittest.TestCase):
             self.assertEqual(0, mock_kiwi_tokens.call_count)
 
 
+class Bm25IndexBuildCollectorTests(unittest.TestCase):
+    def test_build_pauses_the_collector_only_while_running(self) -> None:
+        import gc
+
+        from app.retrieval import bm25_index as bm25_module
+
+        states: list[bool] = []
+
+        real = bm25_module._weighted_term_frequencies
+
+        def spy(record, *, title_weight):
+            states.append(gc.isenabled())
+            return real(record, title_weight=title_weight)
+
+        was_enabled = gc.isenabled()
+        gc.enable()
+        try:
+            with patch.object(bm25_module, "_weighted_term_frequencies", spy):
+                index = Bm25Index.build(
+                    [_record("doc:a", "휴직 절차 신청", article_title="휴직"), _record("doc:b", "수당 지급 기준")]
+                )
+            self.assertTrue(gc.isenabled())
+        finally:
+            if not was_enabled:
+                gc.disable()
+        self.assertEqual(2, index.document_count)
+        self.assertTrue(states)
+        self.assertFalse(any(states))
+
+    def test_build_is_unchanged_when_called_through_the_classmethod_on_a_subclass(self) -> None:
+        class Sub(Bm25Index):
+            pass
+
+        records = [_record("doc:a", "휴직 절차 신청"), _record("doc:b", "수당 지급 기준")]
+        base = Bm25Index.build(records)
+        sub = Sub.build(records)
+        self.assertIsInstance(sub, Sub)
+        self.assertEqual(base.document_frequencies, sub.document_frequencies)
+        self.assertEqual(base.documents, sub.documents)
+
+
 def _record(
     record_id: str,
     text: str,

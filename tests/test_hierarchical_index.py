@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from app.mcp_server import regulation_tools
 from app.retrieval import hierarchical_index as hierarchical_index_module
-from app.ingestion.vector_adapter import stable_content_hash
+from app.ingestion.vector_adapter import build_vector_records, stable_content_hash
 from app.ingestion.embedding_adapter import LOCAL_HASH_EMBEDDING_MODEL, local_hash_embedding
 from app.core.config import Settings
 from app.mcp_server.regulation_tools import (
@@ -2684,6 +2684,118 @@ class HierarchicalIndexTests(unittest.TestCase):
         )
         self.assertEqual(2, len({item["regulation_unit_id"] for item in catalog}))
 
+    def test_combined_book_cover_is_not_listed_or_searched_as_a_regulation(self) -> None:
+        # The chunker gives the cover lines before the first regulation the
+        # book's own title; they used to become an extra catalog entry that
+        # also captured every query mentioning the institution name.
+        def book_record(chunk_id: str, order_index: int, **fields: object) -> dict:
+            node_updates = (
+                {"regulation_node_id": f"node-{fields['regulation_no']}"} if fields["regulation_no"] else {}
+            )
+            return _record(
+                "doc-coded-book",
+                chunk_id,
+                revision_date="2026-09-30",
+                metadata_updates={
+                    "document_name": "combined_book.docx",
+                    "order_index": order_index,
+                    **node_updates,
+                },
+                **fields,
+            )
+
+        records = [
+            book_record(
+                "cover",
+                0,
+                regulation_no="",
+                regulation_title="한국공공가상연구원 총규정",
+                article_no="",
+                article_title="",
+                text="한국공공가상연구원 총규정\n(2026년 9월 30일 현재)",
+                chunk_type="paragraph",
+                hierarchy_path="한국공공가상연구원 총규정 > preamble",
+            ),
+            book_record(
+                "service-article-5",
+                1,
+                regulation_no="2-2-1",
+                regulation_title="복무규정",
+                article_no="제5조",
+                article_title="근무시간",
+                text="제5조(근무시간) 직원의 점심시간은 12시부터 13시까지로 한다.",
+            ),
+            book_record(
+                "pay-article-1",
+                2,
+                regulation_no="3-1-1",
+                regulation_title="보수규정",
+                article_no="제1조",
+                article_title="목적",
+                text="제1조(목적) 이 규정은 직원의 보수에 관한 사항을 정한다.",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            vector_path = data_dir / "vector_db" / "tenant-a" / "approved_vectors.jsonl"
+            offsets = write_vector_records_with_offsets(vector_path, records)
+            index_path = data_dir / "hierarchy" / "regulation_hierarchy.sqlite3"
+            summary = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+                vector_offsets=offsets,
+            )
+            catalog = list_indexed_regulations(index_path, profile_id="institution-a")
+            results, _trace = search_hierarchical_records(
+                index_path,
+                vector_path,
+                query="연구원의 점심시간은 몇 시부터인가요?",
+                top_k=3,
+                profile_id="institution-a",
+            )
+
+        self.assertEqual(2, summary["regulation_count"])
+        self.assertEqual({"복무규정", "보수규정"}, {item["regulation_title"] for item in catalog})
+        self.assertTrue(results)
+        self.assertEqual("service-article-5", results[0][1]["chunk_id"])
+        self.assertNotIn("cover", {record["chunk_id"] for _score, record in results})
+
+    def test_unnumbered_article_before_first_book_regulation_stays_listed(self) -> None:
+        records = [
+            _record(
+                "doc-charter-book",
+                chunk_id,
+                regulation_no=regulation_no,
+                regulation_title=regulation_title,
+                article_no=article_no,
+                article_title=article_title,
+                text=text,
+                revision_date="2026-09-30",
+                chunk_type=chunk_type,
+                metadata_updates={"order_index": order_index},
+            )
+            for chunk_id, order_index, regulation_no, regulation_title, article_no, article_title, text, chunk_type in (
+                ("cover", 0, "", "기관 정관", "", "", "기관 정관", "paragraph"),
+                ("charter-article-1", 1, "", "기관 정관", "제1조", "목적", "제1조(목적) 정관의 목적", "article"),
+                ("hr-article-1", 2, "2-1-1", "인사규정", "제1조", "목적", "제1조(목적) 인사 기준", "article"),
+                ("pay-article-1", 3, "3-1-1", "보수규정", "제1조", "목적", "제1조(목적) 보수 기준", "article"),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            summary = build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            catalog = list_indexed_regulations(index_path, profile_id="institution-a")
+
+        self.assertEqual(3, summary["regulation_count"])
+        self.assertIn("기관 정관", {item["regulation_title"] for item in catalog})
+
     def test_shared_stable_id_with_concurrent_distinct_identities_fails_closed(self) -> None:
         records = [
             _record(
@@ -2899,6 +3011,130 @@ class HierarchicalIndexTests(unittest.TestCase):
         self.assertIsNone(toc["nodes"][0]["parent_id"])
         self.assertEqual(toc["nodes"][0]["node_id"], toc["nodes"][1]["parent_id"])
         self.assertEqual(toc["nodes"][1]["node_id"], toc["nodes"][2]["parent_id"])
+
+    def test_toc_chapter_whose_title_contains_attachment_keyword_stays_chapter(self) -> None:
+        # "특별 지급" contains 별지 once spaces are removed; the chapter used to
+        # be listed as a form and dropped from the chapter count.
+        records = [
+            _record(
+                "doc-pay",
+                f"pay-{article_no}",
+                regulation_no="3-1-1",
+                regulation_title="보수규정",
+                article_no=article_no,
+                article_title=article_title,
+                text=f"{article_no}({article_title}) 본문",
+                revision_date="2026-07-01",
+                hierarchy_path=f"{chapter} > {article_no} {article_title}",
+            )
+            for chapter, article_no, article_title in (
+                ("제1장 총칙", "제1조", "목적"),
+                ("제6장 특별 지급", "제96조", "파견자 보수"),
+                ("제6장 특별 지급", "제97조", "서식"),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="보수규정",
+                regulation_no="3-1-1",
+            )
+            toc = regulation_toc(index_path, regulation_unit_id=unit_id)
+
+        node_types = {node["label"]: node["node_type"] for node in toc["nodes"]}
+        self.assertEqual("chapter", node_types["제6장 특별 지급"])
+        self.assertEqual("article", node_types["제97조 서식"])
+        self.assertNotIn("form", node_types.values())
+
+    def test_toc_lists_vector_records_in_chunk_source_order(self) -> None:
+        # Records go through build_vector_records like the index button does:
+        # the chunk order_index must survive it, otherwise the TOC falls back
+        # to sorting hierarchy paths as text (제10장 < 제1장, 제12조 < 제5조).
+        source_rows = (
+            ("제1장 총칙", "제1조", "목적"),
+            ("제1장 총칙", "제2조", "정의"),
+            ("제2장 채용 > 제1절 공개채용", "제5조", "공개채용"),
+            ("제2장 채용 > 제1절 공개채용", "제12조", "계약직 채용"),
+            ("제10장 보칙", "제137조", "시행세칙"),
+        )
+        chunks = []
+        for order_index, (parents, article_no, article_title) in enumerate(source_rows):
+            chunk_id = f"order-{article_no}"
+            chunks.append(
+                {
+                    "chunk_id": chunk_id,
+                    "document_id": "doc-order",
+                    "tenant_id": "tenant-a",
+                    "profile_id": "institution-a",
+                    "document_name": "통합 규정집",
+                    "regulation_id": "reg-binder",
+                    "regulation_version": "rev-20260701",
+                    "regulation_status": "approved",
+                    "regulation_no": "2-1-1",
+                    "regulation_title": "인사규정",
+                    "revision_date": "2026-07-01",
+                    "effective_from": "2026-07-01",
+                    "chunk_type": "article",
+                    "hierarchy_path": f"인사규정 > {parents} > {article_no} {article_title}",
+                    "article_no": article_no,
+                    "article_title": article_title,
+                    "retrieval_text": f"{article_no}({article_title}) 본문",
+                    "metadata": {"order_index": order_index * 10},
+                    "approval_status": "approved",
+                    "approval_id": f"approval-{chunk_id}",
+                    "approved_content_hash": f"approved-{chunk_id}",
+                    "security_level": "internal",
+                }
+            )
+        records, _ = build_vector_records(reversed(chunks))
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "regulation_hierarchy.sqlite3"
+            build_hierarchical_runtime_index(
+                index_path,
+                records,
+                tenant_id="tenant-a",
+                profile_id="institution-a",
+            )
+            unit_id = regulation_unit_id_for(
+                profile_id="institution-a",
+                regulation_title="인사규정",
+                regulation_no="2-1-1",
+            )
+            toc = regulation_toc(index_path, regulation_unit_id=unit_id)
+
+        nodes = toc["nodes"]
+        self.assertEqual(
+            ["제1조", "제2조", "제5조", "제12조", "제137조"],
+            [node["number"] for node in nodes if node["node_type"] == "article"],
+        )
+        self.assertEqual(
+            ["제1장 총칙", "제2장 채용", "제10장 보칙"],
+            [node["label"] for node in nodes if node["node_type"] == "chapter"],
+        )
+
+    def test_toc_node_type_reads_leading_marker_before_attachment_keywords(self) -> None:
+        cases = {
+            "제6장 특별 지급": "chapter",
+            "제3장 개별 지원": "chapter",
+            "제2절 특별표창": "section",
+            "제15조(서식)": "article",
+            "제20조 별표의 개정": "article",
+            "제5조의2 부칙의 적용": "article",
+            "제12장 부칙": "supplementary",
+            "부칙 <2004. 5. 1.>": "supplementary",
+            "[별표 1] 직급별 월 봉급표(제53조 관련)": "appendix",
+            "[별지 제1호서식] 휴직 신청서": "form",
+        }
+        for label, expected in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(expected, hierarchical_index._toc_node_type(label, 1))
 
     def test_canonical_title_unit_id_matches_numbered_combined_and_unnumbered_standalone(self) -> None:
         combined = _record(

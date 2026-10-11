@@ -22,6 +22,7 @@ from app.storage.repository import JsonRepository
 from scripts.build_approval_worklist import (
     APPROVAL_WORKLIST_STATUSES,
     approval_chunk_row,
+    chunk_approval_status,
     clean_text,
     review_candidate_fingerprint,
 )
@@ -120,9 +121,11 @@ def build_approval_review_batches(
         chunks = repository.get_chunks(document_id)
         grouped_chunks: dict[str, list[dict[str, Any]]] = {review_type: [] for review_type in REVIEW_TYPES}
         for chunk in chunks:
-            row = approval_chunk_row(chunk)
-            if row["approval_status"] not in APPROVAL_WORKLIST_STATUSES:
+            # The status decides whether a chunk is a candidate at all, so the
+            # (much more expensive) review row is only built for candidates.
+            if chunk_approval_status(chunk) not in APPROVAL_WORKLIST_STATUSES:
                 continue
+            row = approval_chunk_row(chunk)
             review_type = _review_type_for_row(row)
             if not review_type or review_type not in include_types:
                 continue

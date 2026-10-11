@@ -787,12 +787,16 @@ def validate_vector_records(records: Iterable[dict[str, Any]]) -> list[dict[str,
             raise ValueError(
                 f"Vector record {record_id} is missing metadata_semantic_fingerprint."
             )
-        if metadata_fingerprint and (
-            metadata_fingerprint != vector_metadata_semantic_fingerprint(metadata)
-        ):
-            raise ValueError(
-                f"Vector record {record_id} has invalid metadata_semantic_fingerprint."
-            )
+        # Recomputed from the record's own metadata for the integrity check; the
+        # same value feeds the record-fingerprint check below so that metadata
+        # is serialized once per record instead of twice.
+        recomputed_metadata_fingerprint: str | None = None
+        if metadata_fingerprint:
+            recomputed_metadata_fingerprint = vector_metadata_semantic_fingerprint(metadata)
+            if metadata_fingerprint != recomputed_metadata_fingerprint:
+                raise ValueError(
+                    f"Vector record {record_id} has invalid metadata_semantic_fingerprint."
+                )
         record_fingerprint_version = str(
             record.get("record_semantic_fingerprint_version") or ""
         )
@@ -813,7 +817,10 @@ def validate_vector_records(records: Iterable[dict[str, Any]]) -> list[dict[str,
                 f"Vector record {record_id} is missing record_semantic_fingerprint."
             )
         if record_fingerprint and (
-            record_fingerprint != vector_record_semantic_fingerprint(record)
+            record_fingerprint
+            != vector_record_semantic_fingerprint(
+                record, metadata_fingerprint=recomputed_metadata_fingerprint
+            )
         ):
             raise ValueError(
                 f"Vector record {record_id} has invalid record_semantic_fingerprint."
@@ -834,7 +841,9 @@ def validate_vector_records(records: Iterable[dict[str, Any]]) -> list[dict[str,
             embedding = record.get("embedding")
             if not isinstance(embedding, list) or not embedding:
                 raise ValueError(f"Embedded vector record {record_id} is missing embedding.")
-            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in embedding):
+            if set(map(type, embedding)) != {float} and any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) for value in embedding
+            ):
                 raise ValueError(f"Embedded vector record {record_id} embedding must contain only numbers.")
             dimensions = record.get("embedding_dimensions")
             if (

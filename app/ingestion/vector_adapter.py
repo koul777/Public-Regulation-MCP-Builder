@@ -7,6 +7,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from app.core.gc_pause import gc_paused_call
+
 
 VECTOR_RECORD_SCHEMA_VERSION = "reg-rag-vector-record-v1"
 VECTOR_RECORD_VERIFICATION_VERSION_V1 = "reg-rag-vector-verification-v1"
@@ -83,6 +85,9 @@ VECTOR_METADATA_FIELDS = (
     "entity_id",
     "regulation_node_id",
     "regulation_source_node_id",
+    # Source order of the chunk; the hierarchical index orders TOC and
+    # document reads by it instead of sorting hierarchy paths as text.
+    "order_index",
     "structural_child_count_source",
     "paragraph_unit_count",
     "item_unit_count",
@@ -269,6 +274,15 @@ LOCAL_PATH_PATTERNS = (
     re.compile(r"(?i)(?:^|[\s\"'])(?:/app/|/data/|/home/|/mnt/|/tmp/|/usr/src/app/|/users/|/var/|/workspace/)[^\s\"']+"),
     re.compile(r"(?i)(?:^|[\s\"'])\\\\[^\\/\s]+[\\/][^\s\"']+"),
 )
+# One alternation of the patterns above: ``any(p.search(v) for p in
+# LOCAL_PATH_PATTERNS)`` is true exactly when this combined search matches, but
+# it scans the value once instead of once per pattern.  The ``(?i)`` prefix is
+# the only per-pattern flag and is replaced by one shared IGNORECASE flag.
+_LOCAL_PATH_COMBINED_PATTERN = re.compile(
+    "|".join(f"(?:{pattern.pattern.removeprefix('(?i)')})" for pattern in LOCAL_PATH_PATTERNS),
+    re.IGNORECASE,
+)
+assert all(pattern.flags == _LOCAL_PATH_COMBINED_PATTERN.flags for pattern in LOCAL_PATH_PATTERNS)
 
 
 def vector_record_from_chunk(
@@ -287,7 +301,6 @@ def vector_record_from_chunk(
     chunk_id = str(chunk.get("chunk_id") or "")
     document_id = str(chunk.get("document_id") or "")
     record_id = stable_vector_id(document_id, chunk_id)
-    content_hash = stable_content_hash(text, metadata)
     record = {
         "schema_version": VECTOR_RECORD_SCHEMA_VERSION,
         "id": record_id,
@@ -295,7 +308,10 @@ def vector_record_from_chunk(
         "chunk_id": chunk_id,
         "text": text,
         "metadata": metadata,
-        "content_hash": content_hash,
+        # Placeholder that keeps the established key order: the verification
+        # step below always overwrites content_hash with the hash of this very
+        # text and metadata, so it is not computed twice.
+        "content_hash": "",
     }
     return with_vector_record_verification(record)
 
@@ -361,6 +377,7 @@ def _public_structural_child_sample(value: Any) -> list[dict[str, str]]:
     return result
 
 
+@gc_paused_call  # builds one long-lived acyclic record per chunk
 def build_vector_records(
     chunks: Iterable[dict[str, Any]],
     *,
@@ -525,11 +542,18 @@ def approval_provenance_issue_fields(chunk: dict[str, Any]) -> list[str]:
 def with_vector_record_verification(record: dict[str, Any], *, verified_at: str | None = None) -> dict[str, Any]:
     stamped = dict(record)
     metadata = stamped.get("metadata") if isinstance(stamped.get("metadata"), dict) else {}
-    stamped["content_hash"] = stable_content_hash(str(stamped.get("text") or ""), metadata)
+    # The content hash, the metadata fingerprint and (through it) the record
+    # fingerprint all hash the same metadata object; serialize it only once.
+    content_hash, metadata_fingerprint = _content_hash_and_metadata_fingerprint(
+        str(stamped.get("text") or ""), metadata
+    )
+    stamped["content_hash"] = content_hash
     stamped["metadata_semantic_fingerprint_version"] = VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION
-    stamped["metadata_semantic_fingerprint"] = vector_metadata_semantic_fingerprint(metadata)
+    stamped["metadata_semantic_fingerprint"] = metadata_fingerprint
     stamped["record_semantic_fingerprint_version"] = VECTOR_RECORD_SEMANTIC_FINGERPRINT_VERSION
-    stamped["record_semantic_fingerprint"] = vector_record_semantic_fingerprint(stamped)
+    stamped["record_semantic_fingerprint"] = vector_record_semantic_fingerprint(
+        stamped, metadata_fingerprint=metadata_fingerprint
+    )
     stamped["verification_version"] = VECTOR_RECORD_VERIFICATION_VERSION
     stamped["verification_hash"] = vector_record_verification_hash(stamped)
     stamped["verified_at"] = verified_at or datetime.now(timezone.utc).isoformat()
@@ -573,12 +597,21 @@ def vector_metadata_semantic_fingerprint(metadata: dict[str, Any]) -> str:
     return _stable_payload_hash(payload)
 
 
-def vector_record_semantic_fingerprint(record: dict[str, Any]) -> str:
+def vector_record_semantic_fingerprint(
+    record: dict[str, Any],
+    *,
+    metadata_fingerprint: str | None = None,
+) -> str:
     """Hash retrieval-visible record identity, text, and the complete metadata payload.
 
     Embedding model/vector semantics are intentionally tracked separately by the
     vector target so embedding an already verified provider-neutral record does
     not invalidate this source-record fingerprint.
+
+    ``metadata_fingerprint`` lets a caller that has just computed
+    ``vector_metadata_semantic_fingerprint`` for this record's own metadata
+    avoid serializing that metadata a second time; when omitted the value is
+    computed here.
     """
 
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -589,7 +622,11 @@ def vector_record_semantic_fingerprint(record: dict[str, Any]) -> str:
         "chunk_id": str(record.get("chunk_id") or ""),
         "tenant_id": str(record.get("tenant_id") or ""),
         "text": str(record.get("text") or ""),
-        "metadata_semantic_fingerprint": vector_metadata_semantic_fingerprint(metadata),
+        "metadata_semantic_fingerprint": (
+            metadata_fingerprint
+            if metadata_fingerprint is not None
+            else vector_metadata_semantic_fingerprint(metadata)
+        ),
     }
     return _stable_payload_hash(payload)
 
@@ -621,6 +658,37 @@ def _stable_payload_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _content_hash_and_metadata_fingerprint(text: str, metadata: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(stable_content_hash(text, metadata), vector_metadata_semantic_fingerprint(metadata))``.
+
+    Both digests canonical-serialize a two-key document with sorted keys:
+    ``{"metadata":<M>,"text":<T>}`` and ``{"metadata":<M>,"version":<V>}``,
+    where ``<M>`` is the same canonical serialization of ``metadata`` in both
+    (``metadata`` sorts before ``text`` and ``version``).  Assembling the two
+    documents from one serialization of ``<M>`` produces byte-identical hash
+    input to the original ``json.dumps`` calls, so the digests are unchanged
+    while the (large) metadata is encoded once instead of twice.
+    """
+
+    metadata_json = _canonical_json(metadata)
+    content_document = '{"metadata":' + metadata_json + ',"text":' + _canonical_json(text) + "}"
+    fingerprint_document = (
+        '{"metadata":'
+        + metadata_json
+        + ',"version":'
+        + _canonical_json(VECTOR_METADATA_SEMANTIC_FINGERPRINT_VERSION)
+        + "}"
+    )
+    return (
+        hashlib.sha256(content_document.encode("utf-8")).hexdigest(),
+        hashlib.sha256(fingerprint_document.encode("utf-8")).hexdigest(),
+    )
+
+
 def chunk_approval_status(chunk: dict[str, Any]) -> str:
     return str(_chunk_value(chunk, "approval_status") or "missing").strip().lower() or "missing"
 
@@ -649,10 +717,52 @@ def _stable_list(value: Any) -> list[str]:
 def vector_record_path_leaks(records: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
     leaks: list[dict[str, str]] = []
     for record in records:
-        for path, value in _iter_string_values(record):
-            if _looks_like_local_path(value):
-                leaks.append({"id": str(record.get("id", "")), "field_path": path, "value": value[:240]})
+        # Same result and order as testing every ``_iter_string_values`` item
+        # with ``_looks_like_local_path``, but field paths are only formatted
+        # for strings that really leak, and numeric payloads (embeddings) are
+        # skipped without a call per element.
+        found: list[tuple[str, str]] = []
+        _collect_string_path_leaks(record, "$", found)
+        for path, value in found:
+            leaks.append({"id": str(record.get("id", "")), "field_path": path, "value": value[:240]})
     return leaks
+
+
+_NON_STRING_SCALAR_TYPES = frozenset({float, int, bool, type(None)})
+
+
+def _collect_string_path_leaks(value: Any, path: str, found: list[tuple[str, str]]) -> None:
+    """Append ``(field_path, string)`` for every string under ``value`` that looks like a local path."""
+
+    if isinstance(value, str):
+        if _looks_like_local_path(value):
+            found.append((path, value))
+        return
+    if isinstance(value, list):
+        if set(map(type, value)) <= _NON_STRING_SCALAR_TYPES:
+            # Embedding vectors and other numeric lists hold no strings.
+            return
+        for index, item in enumerate(value):
+            kind = type(item)
+            if kind is str:
+                # Inline fast path: most list items are plain strings.
+                if _looks_like_local_path(item):
+                    found.append((f"{path}[{index}]", item))
+            elif kind is float or kind is int or kind is bool or item is None:
+                continue
+            else:
+                _collect_string_path_leaks(item, f"{path}[{index}]", found)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            kind = type(item)
+            if kind is str:
+                if _looks_like_local_path(item):
+                    found.append((f"{path}.{key}", item))
+            elif kind is float or kind is int or kind is bool or item is None:
+                continue
+            else:
+                _collect_string_path_leaks(item, f"{path}.{key}", found)
 
 
 def stable_vector_id(document_id: str, chunk_id: str) -> str:
@@ -697,10 +807,11 @@ def _with_table_markdown(text: str, chunk: dict[str, Any]) -> str:
 def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
-    if isinstance(value, list):
-        return [_json_safe(item) for item in value if not _is_empty(_json_safe(item))]
-    if isinstance(value, tuple):
-        return [_json_safe(item) for item in value if not _is_empty(_json_safe(item))]
+    if isinstance(value, (list, tuple)):
+        # Evaluate each item once; evaluating it for the emptiness filter and
+        # again for the result doubled the work at every nesting level.
+        safe_items = [_json_safe(item) for item in value]
+        return [item for item in safe_items if not _is_empty(item)]
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
@@ -712,7 +823,15 @@ def _json_safe(value: Any) -> Any:
 
 
 def _is_empty(value: Any) -> bool:
-    return value is None or value == "" or value == [] or value == {}
+    if value is None:
+        return True
+    kind = type(value)
+    if kind is str or kind is list or kind is dict:
+        return not value
+    if kind is int or kind is float or kind is bool:
+        # ``value == ""``, ``== []`` and ``== {}`` are all False for numbers.
+        return False
+    return value == "" or value == [] or value == {}
 
 
 def _metadata_value(record: dict[str, Any], key: str) -> str:
@@ -734,4 +853,11 @@ def _iter_string_values(value: Any, *, path: str = "$") -> Iterable[tuple[str, s
 
 
 def _looks_like_local_path(value: str) -> bool:
-    return any(pattern.search(value) for pattern in LOCAL_PATH_PATTERNS)
+    # Every local-path pattern needs a literal "/" or "\" (drive/UNC/posix/file
+    # URL forms), and neither character has a case variant under IGNORECASE, so
+    # a value without them cannot match.  Checking that first skips the regex
+    # for almost every metadata string and passage; values that contain one are
+    # still decided by the full combined pattern.
+    if "/" not in value and "\\" not in value:
+        return False
+    return _LOCAL_PATH_COMBINED_PATTERN.search(value) is not None

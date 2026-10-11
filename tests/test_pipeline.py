@@ -18,6 +18,19 @@ from app.schemas.chunk import ChunkOptions
 
 
 class PipelineTests(unittest.TestCase):
+    def test_merged_contents_opening_and_self_reference_fixes_invalidate_each_branch_identity(self) -> None:
+        options = ChunkOptions(enable_agent_review=False)
+        current = processing_options_payload(options)
+        for previous_version in (
+            "2026.10.09-combined-book-contents-opening-1",
+            "2026.10.10-classification-header-self-reference-1",
+        ):
+            with self.subTest(previous_version=previous_version):
+                with patch("app.core.pipeline.PREPROCESSOR_PIPELINE_VERSION", previous_version):
+                    previous = processing_options_payload(options)
+                self.assertNotEqual(previous, current)
+                self.assertEqual({key for key in current if previous[key] != current[key]}, {"pipeline_version"})
+
     def test_contents_opening_fix_invalidates_previous_processing_identity(self) -> None:
         options = ChunkOptions(enable_agent_review=False)
         current = processing_options_payload(options)

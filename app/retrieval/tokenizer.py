@@ -198,15 +198,42 @@ def _kiwi_tokens(kiwi: Any, text: str) -> list[str]:
     return _kiwi_items_to_tokens(analyzed)
 
 
+# Kiwi analyses repeat a small set of (form, tag) pairs thousands of times in a
+# bulk index build, and the tokens a pair yields depend on nothing else.  The
+# table maps the raw (form, tag) strings of an analysis item to those tokens
+# (an empty tuple for items that are dropped).  It stops growing at the cap, so
+# it cannot hold more than a bounded amount of memory; uncached pairs are
+# simply computed.
+_KIWI_ITEM_TOKEN_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
+_KIWI_ITEM_TOKEN_CACHE_MAX = 200_000
+
+
+def _kiwi_item_to_tokens(raw_form: Any, raw_tag: Any) -> tuple[str, ...]:
+    form = str(raw_form or "").strip().lower()
+    tag = str(raw_tag or "")
+    if not form:
+        return ()
+    if tag.startswith(_KEEP_KIWI_TAG_PREFIXES) or _is_article_no(form):
+        return tuple(_expand_token(form))
+    return ()
+
+
 def _kiwi_items_to_tokens(analyzed: Iterable[Any]) -> list[str]:
     tokens: list[str] = []
+    cache = _KIWI_ITEM_TOKEN_CACHE
     for item in analyzed:
-        form = str(getattr(item, "form", "") or "").strip().lower()
-        tag = str(getattr(item, "tag", "") or "")
-        if not form:
-            continue
-        if _is_article_no(form) or tag.startswith(_KEEP_KIWI_TAG_PREFIXES):
-            tokens.extend(_expand_token(form))
+        raw_form = getattr(item, "form", "")
+        raw_tag = getattr(item, "tag", "")
+        if type(raw_form) is str and type(raw_tag) is str:
+            key = (raw_form, raw_tag)
+            cached = cache.get(key)
+            if cached is None:
+                cached = _kiwi_item_to_tokens(raw_form, raw_tag)
+                if len(cache) < _KIWI_ITEM_TOKEN_CACHE_MAX and len(raw_form) <= 128:
+                    cache[key] = cached
+            tokens.extend(cached)
+        else:
+            tokens.extend(_kiwi_item_to_tokens(raw_form, raw_tag))
     return tokens
 
 

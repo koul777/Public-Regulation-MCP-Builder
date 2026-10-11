@@ -118,11 +118,14 @@ def build_approval_worklist(
         chunks = repository.get_chunks(document.document_id)
         if not document_matches_filters(document, chunks, filters):
             continue
-        chunk_rows = [approval_chunk_row(chunk) for chunk in chunks]
         status_counts = Counter(clean_text(chunk.approval_status) or "missing" for chunk in chunks)
         status_totals.update(status_counts)
+        # Only chunks that still await review contribute a row to this report;
+        # approved, blocked or rejected chunks are counted from their status alone.
         review_candidate_rows = [
-            row for row in chunk_rows if row["approval_status"] in APPROVAL_WORKLIST_STATUSES
+            approval_chunk_row(chunk)
+            for chunk in chunks
+            if chunk_approval_status(chunk) in APPROVAL_WORKLIST_STATUSES
         ]
         priority_counts = Counter(str(row["review_priority_tier"]) for row in review_candidate_rows)
         for tier in REVIEW_PRIORITY_TIERS:
@@ -241,16 +244,24 @@ def build_approval_worklist(
     }
 
 
+def chunk_approval_status(chunk: Any) -> str:
+    """The ``approval_status`` an approval row reports for a chunk, without building the row."""
+
+    return clean_text(getattr(chunk, "approval_status", "")).lower() or "missing"
+
+
 def approval_chunk_row(chunk: Any) -> dict[str, Any]:
-    status = clean_text(getattr(chunk, "approval_status", "")).lower() or "missing"
-    signal = chunk_review_signal(chunk)
+    status = chunk_approval_status(chunk)
+    # The review dict is read-only for the signal and the hash, so one dump serves both.
+    review_row = chunk_to_review_dict(chunk)
+    signal = _review_signal_from_row(review_row)
     metadata_reasons = metadata_attention_reasons(chunk)
     tier = str(signal["review_priority_tier"])
     manual_attention = status == "needs_review" or tier in MANUAL_ATTENTION_TIERS or bool(metadata_reasons)
     low_risk_batch_candidate = status == "draft" and not manual_attention and tier in LOW_RISK_BATCH_REVIEW_TIERS
     return {
         "chunk_id": clean_text(getattr(chunk, "chunk_id", "")),
-        "review_content_hash": review_content_hash(chunk),
+        "review_content_hash": _review_content_hash_from_row(review_row),
         "approval_status": status,
         "review_flags": signal["review_flags"],
         "review_priority_tier": tier,
@@ -282,7 +293,10 @@ def review_candidate_fingerprint(rows: Sequence[dict[str, Any]]) -> str:
 
 
 def review_content_hash(chunk: Any) -> str:
-    row = chunk_to_review_dict(chunk)
+    return _review_content_hash_from_row(chunk_to_review_dict(chunk))
+
+
+def _review_content_hash_from_row(row: dict[str, Any]) -> str:
     text_basis, text = _review_text_basis(row)
     payload = {
         "schema_version": REVIEW_CONTENT_HASH_VERSION,
@@ -291,8 +305,8 @@ def review_content_hash(chunk: Any) -> str:
         "source_page_end": row.get("source_page_end"),
         "text_basis": text_basis,
         "text": text,
-        "metadata": _json_safe(row.get("metadata") or {}),
-        "warnings": _json_safe(row.get("warnings") or []),
+        "metadata": _hash_safe(row.get("metadata") or {}),
+        "warnings": _hash_safe(row.get("warnings") or []),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -316,8 +330,61 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+_JSON_PLAIN_LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
+_JSON_PLAIN_KEY_TYPES = frozenset({str})
+_JSON_PLAIN_CONTAINER_TYPES = frozenset({dict, list})
+_JSON_PLAIN_MAX_CONTAINERS = 1_000_000
+
+
+def _is_plain_json(value: Any) -> bool:
+    """True when value only holds exact dict (str keys) / list / str / int / float / bool / None.
+
+    For such data _json_safe() only rebuilds an equal structure, and the hash payload is dumped with
+    sort_keys=True anyway, so the encoded bytes are identical without the rebuild. Anything else
+    (tuple, set, subclasses, non-str keys, other objects, or a structure too large or cyclic to
+    inspect) returns False so the caller falls back to _json_safe().
+    """
+    leaf_types = _JSON_PLAIN_LEAF_TYPES
+    stack = [value]
+    budget = _JSON_PLAIN_MAX_CONTAINERS
+    while stack:
+        item = stack.pop()
+        item_type = type(item)
+        if item_type is dict:
+            if not item:
+                continue
+            if not _JSON_PLAIN_KEY_TYPES.issuperset(map(type, item)):
+                return False
+            children = item.values()
+        elif item_type is list:
+            if not item:
+                continue
+            children = item
+        elif item_type in leaf_types:
+            continue
+        else:
+            return False
+        budget -= 1
+        if budget < 0:
+            return False
+        child_types = set(map(type, children))
+        if leaf_types.issuperset(child_types):
+            continue
+        if not (leaf_types | _JSON_PLAIN_CONTAINER_TYPES).issuperset(child_types):
+            return False
+        stack += [child for child in children if type(child) in _JSON_PLAIN_CONTAINER_TYPES]
+    return True
+
+
+def _hash_safe(value: Any) -> Any:
+    return value if _is_plain_json(value) else _json_safe(value)
+
+
 def chunk_review_signal(chunk: Any) -> dict[str, Any]:
-    row = chunk_to_review_dict(chunk)
+    return _review_signal_from_row(chunk_to_review_dict(chunk))
+
+
+def _review_signal_from_row(row: dict[str, Any]) -> dict[str, Any]:
     flags = chunk_review_flags(row)
     tier = review_priority_tier(row, flags)
     severity = review_severity_for_flags(flags, tier)

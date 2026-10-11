@@ -20,6 +20,7 @@ from typing import TextIO, TypeVar
 from uuid import uuid4
 
 from app.core.config import Settings
+from app.core.gc_pause import gc_paused
 from app.schemas.chunk import Chunk
 from app.schemas.document import Document, ProcessingJob
 from app.schemas.quality import QualityReport
@@ -125,43 +126,92 @@ def _iter_journal_lines(handle: TextIO) -> Iterator[str]:
         yield pending
 
 
-def _json_value_needs_buffered_encoding(value: object) -> bool:
-    """Detect exceptional JSON shapes with a bounded iterative traversal."""
+_JSON_SCALAR_LEAF_TYPES = frozenset({int, float, bool, type(None)})
 
-    pending: list[object] = [value]
+
+def _json_value_needs_buffered_encoding(value: object) -> bool:
+    """Detect exceptional JSON shapes with a bounded iterative traversal.
+
+    The answer is True when the value holds more than
+    ``_JSON_BUFFERED_ENCODE_MAX_INSPECTED_VALUES`` objects (every object
+    reachable through the first visit of each container, keys and values
+    included, counted once per reference), a string longer than
+    ``_JSON_BUFFERED_ENCODE_MAX_STRING_CHARS``, more than
+    ``_JSON_BUFFERED_ENCODE_MAX_TOTAL_STRING_CHARS`` string characters in
+    total (one count per reference), or a container with more than
+    ``_JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS`` items.
+
+    Only containers go through the work list; scalar children are counted and
+    classified in the loop that already walks their parent, and the keys of a
+    dict whose keys are all strings are measured with C-level helpers.  That
+    avoids a per-object push/pop and a flattening generator, which made this
+    pre-check cost more than the encoding it chooses a strategy for.
+    """
+
+    max_values = _JSON_BUFFERED_ENCODE_MAX_INSPECTED_VALUES
+    max_items = _JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS
+    max_string = _JSON_BUFFERED_ENCODE_MAX_STRING_CHARS
+    max_total = _JSON_BUFFERED_ENCODE_MAX_TOTAL_STRING_CHARS
+    scalar_leaf_types = _JSON_SCALAR_LEAF_TYPES
+    root_type = type(value)
+    if root_type is str or isinstance(value, str):
+        return len(value) > max_string or len(value) > max_total
+    if root_type in scalar_leaf_types or not isinstance(value, (dict, list, tuple)):
+        return False
+
+    containers: list[object] = [value]
     seen_containers: set[int] = set()
-    inspected_values = 0
+    inspected_values = 1  # the root value
     total_string_chars = 0
-    while pending:
-        current = pending.pop()
-        inspected_values += 1
-        if inspected_values > _JSON_BUFFERED_ENCODE_MAX_INSPECTED_VALUES:
-            return True
-        if isinstance(current, str):
-            string_chars = len(current)
-            total_string_chars += string_chars
-            if (
-                string_chars > _JSON_BUFFERED_ENCODE_MAX_STRING_CHARS
-                or total_string_chars
-                > _JSON_BUFFERED_ENCODE_MAX_TOTAL_STRING_CHARS
-            ):
+    while containers:
+        current = containers.pop()
+        container_id = id(current)
+        if container_id in seen_containers:
+            continue
+        seen_containers.add(container_id)
+        children: Iterable[object]
+        if isinstance(current, dict):
+            item_count = len(current)
+            if item_count > max_items:
                 return True
-        elif isinstance(current, dict):
-            if len(current) > _JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS:
+            inspected_values += 2 * item_count
+            if inspected_values > max_values:
                 return True
-            container_id = id(current)
-            if container_id in seen_containers:
+            if set(map(type, current)) <= {str}:
+                key_chars = sum(map(len, current))
+                if key_chars > max_total or (key_chars and max(map(len, current)) > max_string):
+                    return True
+                total_string_chars += key_chars
+                if total_string_chars > max_total:
+                    return True
+                children = current.values()
+            else:
+                # Non-string keys: treat keys like any other child.
+                children = [child for pair in current.items() for child in pair]
+        else:
+            item_count = len(current)  # list or tuple
+            if item_count > max_items:
+                return True
+            inspected_values += item_count
+            if inspected_values > max_values:
+                return True
+            children = current
+        for child in children:
+            child_type = type(child)
+            if child_type is str:
+                string_chars = len(child)
+                total_string_chars += string_chars
+                if string_chars > max_string or total_string_chars > max_total:
+                    return True
+            elif child_type in scalar_leaf_types:
                 continue
-            seen_containers.add(container_id)
-            pending.extend(child for pair in current.items() for child in pair)
-        elif isinstance(current, (list, tuple)):
-            if len(current) > _JSON_BUFFERED_ENCODE_MAX_CONTAINER_ITEMS:
-                return True
-            container_id = id(current)
-            if container_id in seen_containers:
-                continue
-            seen_containers.add(container_id)
-            pending.extend(current)
+            elif isinstance(child, str):
+                string_chars = len(child)
+                total_string_chars += string_chars
+                if string_chars > max_string or total_string_chars > max_total:
+                    return True
+            elif isinstance(child, (dict, list, tuple)):
+                containers.append(child)
     return False
 
 
@@ -1042,10 +1092,14 @@ class JsonRepository:
         return sorted(records, key=lambda record: str(record.get("created_at") or ""))
 
     def get_nodes(self, document_id: str) -> list[StructureNode]:
-        return [StructureNode.model_validate(raw) for raw in self._read_result(document_id, "nodes")]
+        # Decoding and validating a whole result file allocates a large acyclic
+        # object graph; pausing the cyclic GC avoids repeated heap traversals.
+        with gc_paused():
+            return [StructureNode.model_validate(raw) for raw in self._read_result(document_id, "nodes")]
 
     def get_chunks(self, document_id: str) -> list[Chunk]:
-        return [Chunk.model_validate(raw) for raw in self._read_result(document_id, "chunks")]
+        with gc_paused():
+            return [Chunk.model_validate(raw) for raw in self._read_result(document_id, "chunks")]
 
     def get_chunk_records(self, document_id: str) -> list[dict]:
         """Chunks as stored, without schema validation.
@@ -1053,10 +1107,12 @@ class JsonRepository:
         조항 수나 승인 상태만 세면 되는 화면이 있다. 규정 100여 개를 한꺼번에 세는데
         전부 검증까지 하면 첫 화면이 10초 넘게 멈춘다. 세기만 할 때는 이쪽을 쓴다.
         """
-        return [raw for raw in self._read_result(document_id, "chunks") if isinstance(raw, dict)]
+        with gc_paused():
+            return [raw for raw in self._read_result(document_id, "chunks") if isinstance(raw, dict)]
 
     def get_issues(self, document_id: str) -> list[ValidationIssue]:
-        return [ValidationIssue.model_validate(raw) for raw in self._read_result(document_id, "issues")]
+        with gc_paused():
+            return [ValidationIssue.model_validate(raw) for raw in self._read_result(document_id, "issues")]
 
     def save_quality_report(
         self,

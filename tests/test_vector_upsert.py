@@ -26,6 +26,7 @@ from app.ingestion.vector_upsert import (
     QdrantRestManifestTarget,
     chroma_row_from_record,
     load_vector_records_jsonl,
+    validate_vector_records,
     pgvector_row_from_record,
     qdrant_point_from_record,
     validate_vector_record_tenant_scope,
@@ -40,6 +41,38 @@ from app.retrieval.bm25_index import (
 
 
 class VectorUpsertTests(unittest.TestCase):
+    def test_validate_vector_records_recomputes_each_fingerprint_from_the_record(self) -> None:
+        record = with_vector_record_verification(_record("doc:chunk-1", "text"))
+        self.assertEqual([record], validate_vector_records([record]))
+
+        stale_metadata = json.loads(json.dumps(record))
+        stale_metadata["metadata"]["department"] = "changed"
+        with self.assertRaisesRegex(ValueError, "invalid metadata_semantic_fingerprint"):
+            validate_vector_records([stale_metadata])
+
+        stale_text = json.loads(json.dumps(record))
+        stale_text["text"] = "different text"
+        with self.assertRaisesRegex(ValueError, "invalid record_semantic_fingerprint"):
+            validate_vector_records([stale_text])
+
+        stale_chunk = json.loads(json.dumps(record))
+        stale_chunk["chunk_id"] = "other"
+        with self.assertRaisesRegex(ValueError, "invalid record_semantic_fingerprint"):
+            validate_vector_records([stale_chunk])
+
+    def test_validate_vector_records_reuses_one_metadata_fingerprint_per_record(self) -> None:
+        record = with_vector_record_verification(_record("doc:chunk-1", "text"))
+        calls: list[dict] = []
+        original = vector_upsert_module.vector_metadata_semantic_fingerprint
+
+        def counting(metadata: dict) -> str:
+            calls.append(metadata)
+            return original(metadata)
+
+        with patch.object(vector_upsert_module, "vector_metadata_semantic_fingerprint", counting):
+            validate_vector_records([record])
+        self.assertEqual(1, len(calls))
+
     def test_tenant_scope_rejects_mixed_records(self) -> None:
         first = _record("doc:chunk-1", "text")
         second = _record("doc:chunk-2", "text")
