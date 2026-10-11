@@ -14,10 +14,13 @@ class MetadataExtractor:
     APPENDIX_REF = re.compile(r"별\s*표\s*(?:제\s*)?\d*(?:\s*-\s*\d+)?(?:\s*호)?")
     FORM_REF = re.compile(r"별\s*지\s*제?\s*\d*(?:\s*-\s*\d+)?\s*호\s*서식?")
     LAW_REF = re.compile(r"[「｢『“\"]([^」｣』”\"]+)[」｣』”\"]")
-    INTERNAL_REGULATION_SUFFIXES = ("규정", "지침", "내규", "정관", "세칙", "요령", "기준", "편람", "규칙", "예규")
+    INTERNAL_REGULATION_SUFFIXES = ("규정", "지침", "내규", "정관", "세칙", "요령", "기준", "편람", "규칙", "예규", "강령")
+    # 「공무원 행동강령」 is a presidential decree that institution codes of
+    # conduct cite as their parent law, not an institution's own rule.
+    STATUTORY_REGULATION_NAMES = frozenset({"공무원행동강령"})
     REGULATION_ARTICLE_PREFIX = re.compile(
         r"(?P<name>[가-힣A-Za-z0-9·ㆍ\-\(\)（）\s]{1,80}?"
-        r"(?:규정|지침|내규|정관|세칙|요령|기준|편람|규칙|예규))\s*$"
+        rf"(?:{'|'.join(INTERNAL_REGULATION_SUFFIXES)}))\s*$"
     )
     LAW_ARTICLE_PREFIX = re.compile(
         r"(?P<name>[가-힣A-Za-z0-9·ㆍ\-\(\)（）\s]{1,80}?"
@@ -284,6 +287,8 @@ class MetadataExtractor:
         if not self._is_reference_name_candidate(cleaned):
             return False
         compact = self._compact(cleaned)
+        if compact in self.STATUTORY_REGULATION_NAMES:
+            return False
         return any(compact.endswith(suffix) for suffix in self.INTERNAL_REGULATION_SUFFIXES)
 
     def _is_law_name(self, value: str) -> bool:
