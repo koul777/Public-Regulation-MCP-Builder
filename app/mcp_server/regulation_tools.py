@@ -1046,8 +1046,22 @@ def _search_hierarchical_runtime(
         )
     ][: int(query.top_k or 5)]
     related_records = [record for _score, record in visible_scored]
+    governing_article_candidates = _fetch_governing_article_candidates(
+        settings=settings,
+        auth=auth,
+        query=query,
+        profile_id=profile_id,
+        records=related_records,
+    )
     results = [
-        routes_rag.public_search_result(record, score, related_records=related_records)
+        routes_rag.public_search_result(
+            record,
+            score,
+            related_records=governing_article_candidates.get(
+                _record_chunk_key(record),
+                related_records,
+            ),
+        )
         for score, record in visible_scored
     ]
     elapsed_ms = _elapsed_ms(started_at)
@@ -4342,6 +4356,63 @@ def _visible_record_with_related_by_chunk(
         article_candidates_only=True,
     )
     return record, related_records
+
+
+def _fetch_governing_article_candidates(
+    *,
+    settings: Settings,
+    auth: AuthContext,
+    query: Any,
+    profile_id: str | None,
+    records: list[dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Give search the governing-article candidates fetch uses for each result.
+
+    The article citing a form or appendix is rarely among a page's top hits,
+    so choosing only from that page left search without the governing article
+    that fetch of the same result reports, or with the wrong one when only one
+    of two citing articles ranked. Reusing fetch's authorization keeps hidden
+    article numbers out of search exactly as they stay out of fetch.
+
+    The candidates depend only on the document and the caller's scope, so
+    once fetch authorizes one result of a document, the page's other
+    results from that document reuse them instead of authorizing again.
+    """
+
+    candidates: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    document_candidates: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        key = _record_chunk_key(record)
+        if (
+            key in candidates
+            or not all(key)
+            or not _needs_governing_article_enrichment(record)
+        ):
+            continue
+        if key[0] in document_candidates:
+            candidates[key] = document_candidates[key[0]]
+            continue
+        visible_record, candidates[key] = _visible_record_with_related_by_chunk(
+            settings=settings,
+            auth=auth,
+            document_id=key[0],
+            chunk_id=key[1],
+            security_levels=query.security_levels,
+            department_ids=query.department_ids,
+            profile_id=profile_id,
+            as_of_date=str(query.as_of_date or "").strip() or None,
+        )
+        if visible_record is not None:
+            document_candidates[key[0]] = candidates[key]
+    return candidates
+
+
+def _record_chunk_key(record: dict[str, Any]) -> tuple[str, str]:
+    metadata = record.get("metadata") or {}
+    return (
+        str(record.get("document_id") or metadata.get("document_id") or ""),
+        str(record.get("chunk_id") or metadata.get("chunk_id") or ""),
+    )
 
 
 def _needs_governing_article_enrichment(record: dict[str, Any]) -> bool:
