@@ -19,7 +19,9 @@ except ImportError:  # pragma: no cover - exercised only when optional dependenc
     olefile = None
 
 
+HWP_TAG_PARA_HEADER = 66
 HWP_TAG_PARA_TEXT = 67
+HWP_TAG_PARA_LINE_SEG = 69
 HWP_TAG_CTRL_HEADER = 71
 HWP_TAG_TABLE = 77
 HWP_TABLE_CONTROL_ID = b" lbt"
@@ -152,7 +154,7 @@ class HwpParser(BaseParser):
                 section_table_inventory = self._table_inventory_from_section(data, stream_name)
                 table_records.extend(section_table_inventory["tables"])
                 table_control_flags.update(section_table_inventory["table_control_flags"])
-                for text in self._paragraph_texts(data, diagnostics=parser_diagnostics):
+                for text, paragraph_metadata in self._paragraph_entries(data, diagnostics=parser_diagnostics):
                     clean = self._clean_text(text)
                     if clean and not self._looks_like_hwp_mojibake_block(clean):
                         blocks.append(
@@ -163,6 +165,7 @@ class HwpParser(BaseParser):
                                     "section_index": section_index,
                                     "hwp_extraction_mode": HWP_LEGACY_EXTRACTION_MODE,
                                     "hwp_native_table_geometry": False,
+                                    **paragraph_metadata,
                                 },
                             )
                         )
@@ -375,8 +378,61 @@ class HwpParser(BaseParser):
         *,
         diagnostics: dict[str, int] | None = None,
     ) -> list[str]:
-        texts: list[str] = []
-        for tag_id, _level, payload in self._record_infos(section_data, diagnostics=diagnostics):
+        return [text for text, _metadata in self._paragraph_entries(section_data, diagnostics=diagnostics)]
+
+    def _paragraph_entries(
+        self,
+        section_data: bytes,
+        *,
+        diagnostics: dict[str, int] | None = None,
+    ) -> list[tuple[str, dict]]:
+        """Keep native paragraph ancestry and line metrics beside extracted text.
+
+        HWP sections are not pages. A header paragraph and a top-level body
+        paragraph must remain distinguishable even when both are flattened
+        into the same ParsedPage. Unknown/truncated paragraph records provide
+        no layout evidence; text extraction and its diagnostics still apply.
+        """
+        entries: list[tuple[str, dict]] = []
+        ancestors: list[tuple[int, int, dict]] = []
+        for tag_id, level, payload in self._record_infos(section_data, diagnostics=diagnostics):
+            while ancestors and ancestors[-1][0] >= level:
+                ancestors.pop()
+            if tag_id == HWP_TAG_PARA_HEADER:
+                metadata = {}
+                if len(payload) >= 22:
+                    metadata = {
+                        "hwp_paragraph_level": level,
+                        "hwp_control_path": [
+                            info["control_id"] for _depth, tag, info in ancestors
+                            if tag == HWP_TAG_CTRL_HEADER and "control_id" in info
+                        ],
+                    }
+                ancestors.append((level, tag_id, metadata))
+                continue
+            if tag_id == HWP_TAG_CTRL_HEADER:
+                info = {}
+                if len(payload) >= 4:
+                    info["control_id"] = payload[:4][::-1].decode("ascii", errors="replace").strip()
+                ancestors.append((level, tag_id, info))
+                continue
+            paragraph_metadata = (
+                ancestors[-1][2]
+                if ancestors and ancestors[-1][1] == HWP_TAG_PARA_HEADER
+                and ancestors[-1][0] == level - 1
+                else {}
+            )
+            if (tag_id == HWP_TAG_PARA_LINE_SEG and paragraph_metadata
+                    and payload and len(payload) % 36 == 0):
+                # HWP 5.0 line segment: text position, y, line height, text
+                # height (HWPUNIT). Keep the largest text height so a title
+                # must be prominent against every line of the body article.
+                paragraph_metadata["hwp_line_y"] = int.from_bytes(payload[4:8], "little", signed=True)
+                paragraph_metadata["hwp_line_count"] = len(payload) // 36
+                paragraph_metadata["hwp_line_text_height"] = max(
+                    int.from_bytes(payload[offset + 12:offset + 16], "little", signed=True)
+                    for offset in range(0, len(payload), 36)
+                )
             if tag_id != HWP_TAG_PARA_TEXT:
                 continue
             try:
@@ -390,8 +446,8 @@ class HwpParser(BaseParser):
             for _ in range(dropped_equations):
                 self._increment_diagnostic(diagnostics, HWP_DROPPED_EQUATION_DIAGNOSTIC)
             if text.strip():
-                texts.append(text)
-        return texts
+                entries.append((text, paragraph_metadata))
+        return entries
 
     @staticmethod
     def _control_id(text: str, index: int) -> str:

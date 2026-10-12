@@ -1044,6 +1044,97 @@ class StructureDetectorTests(unittest.TestCase):
                     self.assertEqual("ambiguous_combined_book_boundary_after_attachment",
                                      parsed.metadata.get("structure_boundary_diagnostic"))
 
+    @classmethod
+    def _native_hwp_book(cls, *, paired: bool = False) -> ParsedDocument:
+        parsed = cls._typeset_book(typo=paired)
+        parsed.file_type = "hwp"
+        parsed.source_file = "combined.hwp"
+        body = parsed.pages[1].blocks
+        if paired:
+            body.insert(1, ParsedBlock(text="1-1-1. 인사규정", metadata={"font_size_median": 10}))
+        for page in parsed.pages:
+            for block in page.blocks:
+                header = block.text.startswith("1-1-") and "\n" not in block.text
+                size = block.metadata.get("font_size_median", 12)
+                block.bbox = None
+                block.metadata = {
+                    "hwp_extraction_mode": "legacy_ole_para_text_only",
+                    "hwp_stream": "BodyText/Section0",
+                    "hwp_paragraph_level": 2 if header else 0,
+                    "hwp_control_path": ["head"] if header else [],
+                    "hwp_line_text_height": int(size * 100),
+                    "hwp_line_y": 0,
+                    "hwp_line_count": 1,
+                }
+        # HWP exposes one synthetic page, regardless of physical pagination.
+        parsed.pages = [ParsedPage(page_no=1, blocks=[b for p in parsed.pages for b in p.blocks])]
+        return parsed
+
+    def test_native_hwp_openings_recover_stale_and_conflicting_odd_even_headers(self) -> None:
+        for paired in (False, True):
+            with self.subTest(paired=paired):
+                parsed = self._native_hwp_book(paired=paired)
+                nodes = StructureDetector().detect(parsed)
+                regulations = [n for n in nodes if n.node_type == "regulation"]
+                self.assertEqual([("1-1-1", "인사규정"), ("1-1-2", "보수규정")],
+                                 [(n.number, n.title) for n in regulations])
+                self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+                for article in (n for n in nodes if n.node_type == "article" and "보수" in n.text):
+                    self.assertEqual(regulations[1].node_id, article.parent_id)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                self.assertEqual(set(), ambiguous_combined_book_chunk_ids(chunks))
+                salary = next(c for c in chunks if "보수 기준" in (c.normalized_text or ""))
+                self.assertEqual("보수규정", salary.metadata["regulation_title"])
+                self.assertIn("regulation_boundary_recovered_from_typeset_title", salary.warnings)
+                self.assertTrue(all(c.approval_status == "draft" and c.approved_content_hash is None
+                                    for c in chunks))
+
+    def test_native_hwp_boundary_recovery_fails_closed_without_independent_evidence(self) -> None:
+        cases = ("no_ancestry", "table_title", "body_header", "small_title", "multiline_title",
+                 "mid_page_title", "no_metrics", "different_section", "no_revision",
+                 "intervening_form", "unknown_number", "competing_new_numbers")
+        for case in cases:
+            with self.subTest(case=case):
+                parsed = self._native_hwp_book(paired=case == "competing_new_numbers")
+                blocks = parsed.pages[0].blocks
+                title = next(b for b in blocks if b.text == "보수규정")
+                if case == "no_ancestry":
+                    title.metadata.pop("hwp_control_path")
+                elif case == "table_title":
+                    title.metadata.update(hwp_control_path=["tbl"], hwp_paragraph_level=2)
+                elif case == "body_header":
+                    blocks[1].metadata.update(hwp_control_path=[], hwp_paragraph_level=0)
+                elif case == "small_title":
+                    title.metadata["hwp_line_text_height"] = 1000
+                elif case == "multiline_title":
+                    title.metadata["hwp_line_count"] = 2
+                elif case == "mid_page_title":
+                    title.metadata["hwp_line_y"] = 5000
+                elif case == "no_metrics":
+                    title.metadata.pop("hwp_line_text_height")
+                elif case == "different_section":
+                    title.metadata["hwp_stream"] = "BodyText/Section1"
+                elif case == "no_revision":
+                    blocks[3].text = "다음은 규정의 예시이다."
+                elif case == "intervening_form":
+                    blocks[4].text = "[별지 제1호서식]"
+                elif case == "unknown_number":
+                    blocks[-2].text = "1-1-1. 인사규정"
+                elif case == "competing_new_numbers":
+                    blocks[2].text = "1-1-3. 회계규정"
+                nodes = StructureDetector().detect(parsed)
+                self.assertFalse(any("regulation_boundary_recovered_from_typeset_title" in n.warnings
+                                     for n in nodes))
+                if case != "intervening_form":
+                    self.assertEqual("ambiguous_combined_book_boundary_after_attachment",
+                                     parsed.metadata.get("structure_boundary_diagnostic"))
+                    chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                    with self.assertRaisesRegex(ReviewWorkflowError, "must be reparsed"):
+                        validate_approval_preconditions(
+                            chunks=chunks, chunk_ids=[c.chunk_id for c in chunks],
+                            review_flags_acknowledged=True, approval_override_reason="직접 확인함",
+                        )
+
     def test_typeset_book_chunks_keep_ownership_and_require_human_approval(self) -> None:
         for recoverable in (True, False):
             with self.subTest(recoverable=recoverable):
