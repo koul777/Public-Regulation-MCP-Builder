@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL, QWEN3_RERANKER_MODEL
 from app.ingestion.embedding_adapter import embed_vector_record
@@ -29,6 +30,82 @@ class _EmbeddingAdapter:
 
 
 class SemanticModelTests(unittest.TestCase):
+    def test_long_appendix_pools_all_windows_and_preserves_document_order(self) -> None:
+        texts = ["가" * 2048 + "나" * 1024, "제1조 목적"]
+        model = SimpleNamespace(device="cuda:0", encode=Mock(return_value=[[1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]))
+        result = Qwen3EmbeddingAdapter(model=model).encode_documents(texts)
+        inputs = model.encode.call_args.args[0]
+        self.assertEqual(texts[0], "".join(inputs[:2]))
+        self.assertEqual(texts[1], inputs[2])
+        self.assertLessEqual(max(map(len, inputs)), 2048)
+        self.assertAlmostEqual(2 / (5 ** .5), result[0][0])
+        self.assertAlmostEqual(1 / (5 ** .5), result[0][1])
+        self.assertEqual([0.0, 1.0], result[1])
+
+    def test_missing_window_vectors_fail_instead_of_dropping_text(self) -> None:
+        model = SimpleNamespace(encode=Mock(return_value=[[1.0, 0.0]]))
+        with self.assertRaisesRegex(ValueError, "number of window"):
+            Qwen3EmbeddingAdapter(model=model).encode_documents(["가" * 3000])
+
+    def test_non_finite_window_vector_is_rejected(self) -> None:
+        model = SimpleNamespace(encode=Mock(return_value=[[float("nan"), 1.0]]))
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            Qwen3EmbeddingAdapter(model=model).encode_documents(["제1조 목적"])
+
+    def test_cuda_memory_retry_preserves_every_input_in_order(self) -> None:
+        texts = ["긴 별표", "제1조 목적", "제2조 적용"]
+        model = SimpleNamespace(device="cuda:0", encode=Mock(side_effect=[
+            RuntimeError("CUDA out of memory"), RuntimeError("CUDA out of memory"),
+            [[3.0, 4.0], [0.0, 5.0], [5.0, 0.0]],
+        ]))
+        empty_cache = Mock()
+        with patch.dict("sys.modules", {"torch": SimpleNamespace(cuda=SimpleNamespace(empty_cache=empty_cache))}):
+            result = Qwen3EmbeddingAdapter(device="auto", model=model).encode_documents(texts)
+        self.assertEqual([[0.6, 0.8], [0.0, 1.0], [1.0, 0.0]], result)
+        self.assertEqual([8, 4, 2], [call.kwargs["batch_size"] for call in model.encode.call_args_list])
+        self.assertTrue(all(call.args[0] == texts for call in model.encode.call_args_list))
+        self.assertEqual(2, empty_cache.call_count)
+
+    def test_single_item_cuda_memory_failure_is_not_hidden(self) -> None:
+        model = SimpleNamespace(device="cuda:0", encode=Mock(side_effect=RuntimeError("CUDA out of memory")))
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            Qwen3EmbeddingAdapter(model=model).encode_documents(["긴 별표"], batch_size=1)
+        model.encode.assert_called_once()
+
+    def test_unrelated_cuda_error_is_not_retried(self) -> None:
+        model = SimpleNamespace(device="cuda:0", encode=Mock(side_effect=RuntimeError("invalid device function")))
+        with self.assertRaisesRegex(RuntimeError, "invalid device function"):
+            Qwen3EmbeddingAdapter(model=model).encode_documents(["제1조 목적"])
+        model.encode.assert_called_once()
+
+    def test_auto_embedding_uses_cuda_half_precision_when_available(self) -> None:
+        factory = Mock(return_value=_EmbeddingModel())
+        torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+        with patch.dict("sys.modules", {"torch": torch, "sentence_transformers": SimpleNamespace(SentenceTransformer=factory)}), \
+             patch("app.retrieval.semantic_models.semantic_runtime_available", return_value=True):
+            adapter = Qwen3EmbeddingAdapter(device="auto", truncate_dim=384, local_files_only=True)
+            self.assertEqual([[0.6, 0.8]], adapter.encode_documents(["제1조 목적"]))
+        self.assertEqual("cuda", factory.call_args.kwargs["device"])
+        self.assertEqual({"torch_dtype": "float16"}, factory.call_args.kwargs["model_kwargs"])
+        self.assertTrue(factory.call_args.kwargs["local_files_only"])
+
+    def test_auto_embedding_keeps_cpu_without_cuda(self) -> None:
+        factory = Mock(return_value=_EmbeddingModel())
+        torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+        with patch.dict("sys.modules", {"torch": torch, "sentence_transformers": SimpleNamespace(SentenceTransformer=factory)}), \
+             patch("app.retrieval.semantic_models.semantic_runtime_available", return_value=True):
+            Qwen3EmbeddingAdapter(device="auto").encode_documents(["제1조 목적"])
+        self.assertEqual("cpu", factory.call_args.kwargs["device"])
+        self.assertNotIn("model_kwargs", factory.call_args.kwargs)
+
+    def test_explicit_cpu_embedding_does_not_select_cuda(self) -> None:
+        factory = Mock(return_value=_EmbeddingModel())
+        with patch.dict("sys.modules", {"sentence_transformers": SimpleNamespace(SentenceTransformer=factory)}), \
+             patch("app.retrieval.semantic_models.semantic_runtime_available", return_value=True):
+            Qwen3EmbeddingAdapter(device="cpu").encode_queries(["목적"])
+        self.assertEqual("cpu", factory.call_args.kwargs["device"])
+        self.assertNotIn("model_kwargs", factory.call_args.kwargs)
+
     def test_embedding_adapter_instructs_queries_but_not_documents(self) -> None:
         model = _EmbeddingModel()
         adapter = Qwen3EmbeddingAdapter(model=model, truncate_dim=128)

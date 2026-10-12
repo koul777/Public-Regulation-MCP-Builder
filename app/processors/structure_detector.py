@@ -1222,6 +1222,26 @@ class StructureDetector:
                 continue
             toc_start = contents_starts.get(index)
             has_dot_leader = self._looks_like_navigation_entry(lines[index].text)
+            next_node = detected_lines[index + 1] if index + 1 < len(lines) else None
+            has_body_intro = bool(
+                (next_node is not None and next_node.node_type in {"part", "chapter", "section", "article"})
+                or (
+                    index + 1 < len(lines)
+                    and self._regulation_title_identity(lines[index + 1].text)
+                    == self._regulation_title_identity(_regulation.title or "")
+                )
+            )
+            if not has_dot_leader and has_body_intro and body_article_evidence.get(index, False):
+                # A TOC can print its codes at the right edge, so none of its
+                # rows are numbered regulation nodes. The first left-numbered
+                # heading followed by body articles then starts the real unit;
+                # an earlier contents marker must not swallow that heading or
+                # its revision history. A mismatched plain title may instead
+                # follow the last TOC row, so it is insufficient body evidence.
+                # Stop the navigation range before the matched opening.
+                if toc_start is not None:
+                    navigation_indexes.update(range(toc_start, index))
+                break
             if toc_start is None and not has_dot_leader:
                 continue
             identity = self._navigation_regulation_identity(_regulation)

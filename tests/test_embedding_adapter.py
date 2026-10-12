@@ -20,6 +20,19 @@ from app.ingestion.vector_integrity import embedded_vector_integrity_reason
 
 
 class EmbeddingAdapterTests(unittest.TestCase):
+    def test_ingestion_selects_available_accelerator_without_changing_model_contract(self) -> None:
+        embedding_adapter._qwen_embedding_adapter.cache_clear()
+        self.addCleanup(embedding_adapter._qwen_embedding_adapter.cache_clear)
+        with patch("app.ingestion.embedding_adapter.Qwen3EmbeddingAdapter") as factory:
+            embedding_adapter._qwen_embedding_adapter(384)
+        factory.assert_called_once_with(device="auto", truncate_dim=384, local_files_only=True)
+
+    def test_qwen_record_identifies_windowed_input_strategy(self) -> None:
+        adapter = _RecordingEmbeddingAdapter([[1.0] + [0.0] * 63])
+        with patch("app.ingestion.embedding_adapter._qwen_embedding_adapter", return_value=adapter):
+            records, _ = embed_vector_records([_record("doc:chunk-1", "긴 별표")], dimensions=64, model=QWEN3_EMBEDDING_MODEL)
+        self.assertEqual("char-windows-2048-weighted-mean-v1", records[0]["embedding_input_strategy"])
+
     def test_local_hash_embedding_is_deterministic_and_normalized(self) -> None:
         first = local_hash_embedding("??0議??덉궛 吏묓뻾 湲곗?", dimensions=16)
         second = local_hash_embedding("??0議??덉궛 吏묓뻾 湲곗?", dimensions=16)
