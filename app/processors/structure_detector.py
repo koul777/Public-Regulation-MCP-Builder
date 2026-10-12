@@ -644,10 +644,12 @@ class StructureDetector:
         document_id: str,
         detected_lines: list[StructureNode | None],
     ) -> set[int]:
-        """Use a typeset opening to recover stale or misspelled PDF headers.
+        """Use a typeset opening to recover stale or misspelled running headers.
 
         A small numbered running header is weaker than a separate, larger body
         title followed by dated revision history and Article 1 on the same page.
+        HWP additionally supplies native header/body ancestry and line metrics;
+        its synthetic page number is not physical page evidence.
         Keep text-only mismatches unresolved. Never use edit distance to guess
         a regulation title or move a numbered heading across an attachment.
         """
@@ -689,17 +691,24 @@ class StructureDetector:
             if (
                 header is None or header.node_type != "regulation"
                 or not header.number or line.block_type != "text"
-                or first_text_by_page.get(line.page_no) != index
+                or (first_text_by_page.get(line.page_no) != index
+                    and not self._is_hwp_running_header(line))
             ):
                 continue
             printed_identity = (header.number, self._regulation_title_identity(header.title or ""))
             alias = aliases.get(printed_identity)
-            title_line = lines[index + 1]
+            title_index = index + 1
+            if self._is_hwp_running_header(line):
+                # Odd/even headers can be consecutive in HWP record order,
+                # including an obsolete header paired with a new one.
+                while title_index < len(lines) - 1 and self._is_hwp_running_header(lines[title_index]):
+                    title_index += 1
+            title_line = lines[title_index]
             title = self._regulation_title_for_matching(title_line.text)
             title_identity = self._regulation_title_identity(title)
             if (
                 title_line.page_no != line.page_no or title_line.block_type != "text"
-                or detected_lines[index + 1] is not None
+                or detected_lines[title_index] is not None
                 or not self._looks_like_implicit_regulation_title(title)
                 or title_identity == printed_identity[1]
             ):
@@ -709,7 +718,7 @@ class StructureDetector:
                     header.metadata["regulation_boundary_source"] = "typeset_title_header_alias"
                     header.warnings.append("regulation_running_header_title_reconciled")
                 continue
-            article_position = bisect_right(article_indexes, index + 1)
+            article_position = bisect_right(article_indexes, title_index)
             if article_position >= len(article_indexes):
                 continue
             article_index = article_indexes[article_position]
@@ -717,8 +726,8 @@ class StructureDetector:
             if (
                 article is None or article.number != "제1조"
                 or lines[article_index].page_no != line.page_no
-                or article_index <= index + 2
-                or not revision.match(lines[index + 2].text)
+                or article_index <= title_index + 1
+                or not revision.match(lines[title_index + 1].text)
                 or not self._has_prominent_body_title(line, title_line, lines[article_index])
             ):
                 continue
@@ -728,7 +737,7 @@ class StructureDetector:
                     detected_lines[body_index] is not None
                     and detected_lines[body_index].node_type in {"part", "chapter"}
                 )
-                for body_index in range(index + 2, article_index)
+                for body_index in range(title_index + 1, article_index)
             ):
                 continue
             confirmed_numbers = numbers_by_title.get(title_identity, set())
@@ -736,6 +745,19 @@ class StructureDetector:
                 continue
             if confirmed_numbers:
                 number = next(iter(confirmed_numbers))
+            elif self._is_hwp_running_header(line):
+                group_start = index
+                while group_start > 0 and self._is_hwp_running_header(lines[group_start - 1]):
+                    group_start -= 1
+                new_numbers = {
+                    candidate.number for candidate in detected_lines[group_start:title_index]
+                    if candidate is not None and candidate.node_type == "regulation"
+                    and candidate.number
+                    and first_body_start_by_number.get(candidate.number, len(lines)) > group_start
+                }
+                if len(new_numbers) != 1 or header.number not in new_numbers:
+                    continue
+                number = header.number
             elif first_body_start_by_number.get(header.number, len(lines)) > index:
                 # A new number printed above a typeset opening can retain its
                 # number while its misspelled title is corrected from the body.
@@ -751,7 +773,13 @@ class StructureDetector:
             recovered.confidence = 0.96
             recovered.warnings.append(RECOVERED_TYPESET_BOUNDARY_WARNING)
             recovered.metadata["regulation_boundary_source"] = "typeset_title_revision_and_article_restart"
-            detected_lines[index] = recovered
+            recovered_index = title_index if self._is_hwp_running_header(line) else index
+            detected_lines[recovered_index] = recovered
+            suppressed_range = (range(index, title_index) if recovered_index == title_index
+                                else range(index + 1, title_index))
+            for intermediate_index in suppressed_range:
+                detected_lines[intermediate_index] = None
+                suppressed_headers.add(intermediate_index)
             if number == header.number:
                 aliases[printed_identity] = (number, title)
                 # Some PDFs switch their running header one page too early,
@@ -765,14 +793,39 @@ class StructureDetector:
                         first_body_start_by_number.get(number, len(lines)) > index
                         and earlier is not None
                         and self._regulation_title_identity(earlier.title or "") == printed_identity[1]
-                        and first_text_by_page.get(lines[earlier_index].page_no) == earlier_index
+                        and (first_text_by_page.get(lines[earlier_index].page_no) == earlier_index
+                             or self._is_hwp_running_header(lines[earlier_index]))
                     ):
                         detected_lines[earlier_index] = None
                         suppressed_headers.add(earlier_index)
         return suppressed_headers
 
     @staticmethod
+    def _is_hwp_running_header(line: SourceLine) -> bool:
+        metadata = line.metadata or {}
+        return bool(
+            metadata.get("hwp_extraction_mode") == "legacy_ole_para_text_only"
+            and metadata.get("hwp_control_path") == ["head"]
+        )
+
+    @staticmethod
     def _has_prominent_body_title(header: SourceLine, title: SourceLine, article: SourceLine) -> bool:
+        if StructureDetector._is_hwp_running_header(header):
+            metadata = [line.metadata or {} for line in (header, title, article)]
+            heights = [item.get("hwp_line_text_height") for item in metadata]
+            return bool(
+                metadata[0].get("hwp_stream")
+                and all(item.get("hwp_stream") == metadata[0]["hwp_stream"] for item in metadata)
+                and all(item.get("hwp_extraction_mode") == "legacy_ole_para_text_only" for item in metadata)
+                and all(item.get("hwp_paragraph_level") == 0 and item.get("hwp_control_path") == []
+                        for item in metadata[1:])
+                and metadata[1].get("hwp_line_y") == 0
+                and metadata[1].get("hwp_line_count") == 1
+                and all(isinstance(height, (int, float)) and isfinite(height) and height > 0
+                        for height in heights)
+                and heights[1] >= heights[0] * 1.25
+                and heights[1] >= heights[2] * 1.15
+            )
         try:
             header_size, title_size, article_size = (
                 float((line.metadata or {}).get("font_size_median", 0))

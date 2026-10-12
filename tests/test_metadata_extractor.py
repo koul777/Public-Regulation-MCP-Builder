@@ -259,6 +259,38 @@ class MetadataExtractorTests(unittest.TestCase):
             metadata["regulation_article_refs"],
         )
 
+    def test_treats_institution_code_of_conduct_article_as_regulation_article_ref(self) -> None:
+        text = "금품 등의 수수 금지는 「임직원 행동강령」 제13조에 따른다."
+
+        metadata = MetadataExtractor().extract(text, current_regulation_title="윤리경영규정")
+
+        self.assertNotIn("제13조", metadata["article_refs"])
+        self.assertEqual([], metadata["external_law_refs"])
+        self.assertEqual(["임직원 행동강령"], metadata["internal_regulation_refs"])
+        self.assertEqual(
+            [{"regulation_ref": "임직원 행동강령", "article_ref": "제13조"}],
+            metadata["regulation_article_refs"],
+        )
+
+    def test_keeps_statutory_public_official_code_of_conduct_external(self) -> None:
+        text = "이 강령은 「공무원 행동강령」 제24조에 따라 임직원이 지켜야 할 행동기준을 정한다."
+
+        metadata = MetadataExtractor().extract(text, current_regulation_title="임직원 행동강령")
+
+        self.assertEqual(["공무원 행동강령"], metadata["external_law_refs"])
+        self.assertEqual([], metadata["internal_regulation_refs"])
+        self.assertEqual([], metadata["regulation_article_refs"])
+        self.assertNotIn("제24조", metadata["article_refs"])
+
+    def test_keeps_own_code_of_conduct_article_as_internal_article_ref(self) -> None:
+        text = "제14조(외부강의) 외부강의의 사례금은 이 강령 제13조에도 불구하고 받을 수 있다."
+
+        metadata = MetadataExtractor().extract(text, "제14조", current_regulation_title="임직원 행동강령")
+
+        self.assertEqual(["제13조"], metadata["article_refs"])
+        self.assertEqual([], metadata["external_law_refs"])
+        self.assertEqual([], metadata["regulation_article_refs"])
+
     def test_inherits_external_law_prefix_for_parallel_article_refs(self) -> None:
         text = (
             "「국가공무원법」 제63조 및 제64조를 준수한다. "

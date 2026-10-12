@@ -4973,6 +4973,103 @@ print(json.dumps({
             fallback["metadata"]["form_refs"],
         )
 
+    def test_search_cites_governing_article_outside_result_page_like_fetch(self) -> None:
+        scope = {
+            "security_levels": ["internal"],
+            "department_ids": ["hr"],
+            "profile_id": "profile-a",
+            "as_of_date": "2026-07-01",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, auth, result_id = _prepare_mcp_governing_article_document(Path(tmp))
+            _build_verified_hierarchy_runtime(settings, auth, profile_id="profile-a")
+
+            searched = search_regulations(settings=settings, auth=auth, query="휴직원", top_k=1, **scope)
+            fetched = fetch_regulation(settings=settings, auth=auth, result_id=result_id, **scope)
+
+        self.assertEqual("catalog_toc_body", searched["metadata"]["retrieval_strategy"])
+        self.assertEqual([result_id], [result["id"] for result in searched["results"]])
+        governing_keys = (
+            "governing_article_no",
+            "governing_article_title",
+            "governing_article_chunk_id",
+            "governing_article_match_ref",
+        )
+        self.assertEqual(
+            {key: fetched["metadata"][key] for key in governing_keys},
+            {key: searched["results"][0]["metadata"][key] for key in governing_keys},
+        )
+        self.assertEqual("article-31", fetched["metadata"]["governing_article_chunk_id"])
+
+    def test_search_authorizes_governing_candidates_once_per_document(self) -> None:
+        def form(document_id: str, chunk_id: str) -> dict:
+            return {"document_id": document_id, "chunk_id": chunk_id, "metadata": {"form_refs": ["별지제1호서식"]}}
+
+        records = [
+            form("doc-a", "form-1"),
+            form("doc-a", "form-2"),
+            form("doc-b", "form-3"),
+            form("doc-b", "form-4"),
+            {"document_id": "doc-a", "chunk_id": "article-1", "metadata": {"article_no": "제1조", "article_title": "목적"}},
+        ]
+        # fetch denies form-3, so its empty candidates must not stand in for form-4.
+        authorized = {"form-1": ({"chunk_id": "form-1"}, ["a"]), "form-3": (None, []), "form-4": ({"chunk_id": "form-4"}, ["b"])}
+
+        with patch.object(
+            regulation_tools,
+            "_visible_record_with_related_by_chunk",
+            side_effect=lambda **kwargs: authorized[kwargs["chunk_id"]],
+        ) as authorize:
+            candidates = regulation_tools._fetch_governing_article_candidates(
+                settings=SimpleNamespace(),
+                auth=SimpleNamespace(),
+                query=SimpleNamespace(security_levels=["internal"], department_ids=["hr"], as_of_date=None),
+                profile_id="profile-a",
+                records=records,
+            )
+
+        self.assertEqual(["form-1", "form-3", "form-4"], [item.kwargs["chunk_id"] for item in authorize.call_args_list])
+        self.assertEqual(
+            {
+                ("doc-a", "form-1"): ["a"],
+                ("doc-a", "form-2"): ["a"],
+                ("doc-b", "form-3"): [],
+                ("doc-b", "form-4"): ["b"],
+            },
+            candidates,
+        )
+
+    def test_search_leaves_governing_article_empty_when_two_articles_cite_the_form(self) -> None:
+        scope = {
+            "security_levels": ["internal"],
+            "department_ids": ["hr"],
+            "profile_id": "profile-a",
+            "as_of_date": "2026-07-01",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, auth, result_id = _prepare_mcp_governing_article_document(
+                Path(tmp),
+                second_citing_article=True,
+            )
+            _build_verified_hierarchy_runtime(settings, auth, profile_id="profile-a")
+
+            searched = search_regulations(
+                settings=settings,
+                auth=auth,
+                query="휴직원 휴직의 운영",
+                top_k=2,
+                **scope,
+            )
+            fetched = fetch_regulation(settings=settings, auth=auth, result_id=result_id, **scope)
+
+        # Only one of the two citing articles ranks on this page.
+        self.assertEqual(
+            ["form-15", "article-31"],
+            [result["metadata"]["chunk_id"] for result in searched["results"]],
+        )
+        self.assertEqual("", searched["results"][0]["metadata"]["governing_article_chunk_id"])
+        self.assertEqual("", fetched["metadata"]["governing_article_chunk_id"])
+
     def test_fetch_reuses_chunk_index_for_repeated_result_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
@@ -7786,6 +7883,8 @@ def _approve_and_index_test_chunks(
 
 def _prepare_mcp_governing_article_document(
     root: Path,
+    *,
+    second_citing_article: bool = False,
 ) -> tuple[Settings, AuthContext, str]:
     settings = Settings(data_dir=root / "data", artifact_root=root)
     repository = JsonRepository(settings)
@@ -7846,6 +7945,22 @@ def _prepare_mcp_governing_article_document(
             security_level="internal",
         ),
     ]
+    if second_citing_article:
+        chunks.append(
+            Chunk(
+                chunk_id="article-32",
+                document_id=document_id,
+                chunk_type="article",
+                text="제32조 복직 신청은 별지제15호서식을 준용한다.",
+                retrieval_text="제32조 복직 신청은 별지제15호서식을 준용한다.",
+                metadata={
+                    **chunks[0].metadata,
+                    "article_no": "제32조",
+                    "article_title": "복직 신청",
+                },
+                security_level="internal",
+            )
+        )
     repository.save_processing_result(document_id, [], chunks, [])
     admin_auth = AuthContext(
         actor="reviewer",
@@ -7879,6 +7994,33 @@ def _prepare_mcp_governing_article_document(
         chunk_id="form-15",
     )
     return settings, fetch_auth, result_id
+
+
+def _build_verified_hierarchy_runtime(settings: Settings, auth: AuthContext, *, profile_id: str) -> None:
+    vector_path = routes_rag._local_vector_path(settings, auth)
+    records = [
+        json.loads(line)
+        for line in vector_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    offsets = write_vector_records_with_offsets(vector_path, records)
+    hierarchy = build_hierarchical_runtime_index(
+        hierarchical_index_path(settings.data_dir),
+        records,
+        tenant_id=str(auth.tenant_id),
+        profile_id=profile_id,
+        vector_offsets=offsets,
+    )
+    _write_runtime_approval_snapshot_sidecar(settings.data_dir, records, tenant_id=str(auth.tenant_id))
+    manifest_path = settings.data_dir / "mcp_runtime_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        profile_id=profile_id,
+        hierarchical_index_status="ready",
+        files={"hierarchical_index_sha256": hierarchy["sha256"]},
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False) + "\n", encoding="utf-8")
+    routes_rag._RAG_APPROVAL_SNAPSHOT_CACHE.clear()
 
 
 def _sha256_file(path: Path) -> str:

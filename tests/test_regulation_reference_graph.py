@@ -141,6 +141,68 @@ class RegulationReferenceGraphTests(unittest.TestCase):
         )
         self.assertEqual(["regulation_no"], resolved["match_types"])
 
+    def test_classification_coded_mention_resolves_by_exact_title_without_published_number(self) -> None:
+        # A combined book cites "3-1-1. 보수규정"; the catalog keeps no number
+        # for a uniquely titled unit, so the number alone cannot resolve it.
+        records = [
+            _record("source", "인사규정", unit_refs=["3-1-1.보수규정"]),
+            _record("pay", "보수규정", article="제29조"),
+        ]
+
+        graph = build_regulation_reference_graph(records)
+
+        edge = _only_edge(graph, status="resolved")
+        self.assertEqual("pay", edge["target_unit"]["unit_id"])
+        self.assertEqual(["resolved_by_canonical_title"], edge["reason_codes"])
+        self.assertEqual(0, graph["stats"]["unresolved_edge_count"])
+
+    def test_classification_coded_mention_does_not_resolve_a_differently_numbered_unit(self) -> None:
+        records = [
+            _record("source", "인사규정", unit_refs=["3-1-1.보수규정"]),
+            _record("pay", "보수규정", regulation_no="3-1-2", article="제29조"),
+        ]
+
+        graph = build_regulation_reference_graph(records)
+
+        edge = _only_edge(graph, status="unresolved")
+        self.assertEqual(["target_regulation_number_not_found"], edge["reason_codes"])
+        self.assertIsNone(edge["target_unit"])
+
+    def test_classification_coded_mention_of_an_article_citation_keeps_only_the_article_edge(self) -> None:
+        # "3-1-1. 보수규정 제29조에 따른다." is extracted as an article reference
+        # plus the unit mentions "보수규정" and "3-1-1.보수규정".
+        records = [
+            _record(
+                "source",
+                "인사규정",
+                article_refs=[{"regulation_ref": "보수규정", "article_ref": "제29조"}],
+                unit_refs=["보수규정", "3-1-1.보수규정"],
+            ),
+            _record("pay", "보수규정", article="제29조"),
+        ]
+
+        graph = build_regulation_reference_graph(records)
+
+        self.assertEqual(1, graph["stats"]["edge_count"])
+        edge = _only_edge(graph, status="resolved")
+        self.assertEqual("regulation_article_reference", edge["edge_type"])
+        self.assertEqual("제29조", edge["target_article"]["locator"])
+        self.assertEqual(2, graph["stats"]["suppressed_redundant_unit_reference_count"])
+
+    def test_own_classification_heading_in_unreprocessed_records_is_not_a_self_cycle(self) -> None:
+        records = [
+            _record("personnel", "인사규정", unit_refs=["2-1-1.인사규정"]),
+            _record("pay", "보수규정", regulation_no="3-1-1", unit_refs=["3-1-1.보수규정", "2-1-1.인사규정"]),
+        ]
+
+        graph = build_regulation_reference_graph(records)
+
+        edge = _only_edge(graph, status="resolved")
+        self.assertEqual("pay", edge["source_unit"]["unit_id"])
+        self.assertEqual("personnel", edge["target_unit"]["unit_id"])
+        self.assertEqual([], graph["cycles"])
+        self.assertEqual(2, graph["stats"]["suppressed_redundant_unit_reference_count"])
+
     def test_alias_conflict_is_ambiguous_and_canonical_title_has_precedence(self) -> None:
         records = [
             _record(

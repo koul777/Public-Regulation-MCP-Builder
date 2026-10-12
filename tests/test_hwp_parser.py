@@ -21,16 +21,62 @@ from app.parsers.hwp_parser import (
 )
 
 
-def hwp_record(tag_id: int, payload: bytes) -> bytes:
+def hwp_record(tag_id: int, payload: bytes, level: int = 0) -> bytes:
     size = len(payload)
     if size < 0xFFF:
-        header = tag_id | (0 << 10) | (size << 20)
+        header = tag_id | (level << 10) | (size << 20)
         return header.to_bytes(4, byteorder="little") + payload
-    header = tag_id | (0 << 10) | (0xFFF << 20)
+    header = tag_id | (level << 10) | (0xFFF << 20)
     return header.to_bytes(4, byteorder="little") + size.to_bytes(4, byteorder="little") + payload
 
 
 class HwpParserTests(unittest.TestCase):
+    def test_paragraph_entries_preserve_native_header_body_and_nested_table_scope(self) -> None:
+        def paragraph(text: str, level: int, height: int) -> bytes:
+            layout = bytearray(36)
+            layout[12:16] = height.to_bytes(4, "little")
+            return (hwp_record(66, bytes(22), level)
+                    + hwp_record(67, text.encode("utf-16le"), level + 1)
+                    + hwp_record(69, bytes(layout), level + 1))
+
+        section = (
+            paragraph("본문 앞", 0, 1200)
+            + hwp_record(71, b"daeh", 1)
+            + paragraph("1-1-1. 인사규정", 2, 1000)
+            + hwp_record(71, b" lbt", 3)
+            + paragraph("머리말 안 표", 4, 900)
+            + paragraph("보수규정", 0, 1600)
+            + paragraph("제1조(목적) 보수 기준.", 0, 1200)
+            + hwp_record(71, b" lbt", 1)
+            + paragraph("첨부 표", 2, 1100)
+            + paragraph("끝", 0, 1200)
+        )
+        entries = HwpParser()._paragraph_entries(section)
+        self.assertEqual([[], ["head"], ["head", "tbl"], [], [], ["tbl"], []],
+                         [metadata["hwp_control_path"] for _text, metadata in entries])
+        self.assertEqual([0, 2, 4, 0, 0, 2, 0],
+                         [metadata["hwp_paragraph_level"] for _text, metadata in entries])
+        self.assertEqual(1600, entries[3][1]["hwp_line_text_height"])
+        self.assertEqual(0, entries[3][1]["hwp_line_y"])
+        self.assertEqual(1, entries[3][1]["hwp_line_count"])
+        self.assertEqual([text for text, _metadata in entries], HwpParser()._paragraph_texts(section))
+
+    def test_paragraph_layout_requires_complete_records_and_keeps_multiline_body_size(self) -> None:
+        first = bytearray(36)
+        first[12:16] = (1200).to_bytes(4, "little")
+        second = bytearray(36)
+        second[12:16] = (1400).to_bytes(4, "little")
+        for header, layout, expected in ((bytes(22), bytes(first + second), 1400),
+                                         (bytes(21), bytes(first), None),
+                                         (bytes(22), bytes(first[:-1]), None)):
+            with self.subTest(header_size=len(header), layout_size=len(layout)):
+                section = (hwp_record(66, header) + hwp_record(67, "본문".encode("utf-16le"), 1)
+                           + hwp_record(69, layout, 1))
+                metadata = HwpParser()._paragraph_entries(section)[0][1]
+                self.assertEqual(expected, metadata.get("hwp_line_text_height"))
+                if expected:
+                    self.assertEqual(2, metadata["hwp_line_count"])
+
     def test_factory_supports_legacy_hwp_extension(self) -> None:
         self.assertIsInstance(get_parser(Path("sample.hwp")), HwpParser)
 
