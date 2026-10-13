@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.core.config import Settings, clear_runtime_settings_overrides, set_runtime_settings_overrides
+from app.services.boundary_reprocessing_service import BoundaryReprocessingError, BoundaryReprocessingResult
 from app.storage.repository import JsonRepository
 from frontend import streamlit_app
 from tests import test_streamlit_approval_app as approval_test_support
@@ -67,12 +68,22 @@ class StreamlitBulkApprovalBlockerAppTests(unittest.TestCase):
                 button = app.button(key=key)
                 self.assertTrue(button.disabled)
                 self.assertTrue(any("규정 경계" in item.value and "조항 1개" in item.value for item in app.error))
+                message = next(item.value for item in app.error if "규정 경계" in item.value)
+                self.assertIn("규정집 통합본 · 파일: bundle.pdf", message)
+                self.assertIn("문서 ID: doc_streamli", message)
+                self.assertIn("영향 조항 1개", message)
+                self.assertIn("각각 별도의 오류라는 뜻은 아닙니다", message)
                 self.assertTrue(any(item.label == "같은 원본 다시 올려 전처리하기" for item in app.button))
+                self.assertTrue(any(item.label == "저장된 원본으로 새 초안 복구" for item in app.button))
                 # Disabled controls cannot be clicked by a browser or AppTest.
                 # A normal rerun must not mutate approval state either.
-                with patch("app.api.routes_documents.approve_review_chunks") as approve:
+                with (
+                    patch("app.api.routes_documents.approve_review_chunks") as approve,
+                    patch("app.services.boundary_reprocessing_service.BoundaryReprocessingService.recover") as recover,
+                ):
                     app.run()
                 approve.assert_not_called()
+                recover.assert_not_called()
                 self.assertFalse(app.exception)
                 self._assert_no_approval_mutation(repository, "doc_streamlit_bundle", before, settings)
                 self.assertEqual("아직 저장하지 않은 합성 수정안", app.session_state[edit_key])
@@ -87,17 +98,19 @@ class StreamlitBulkApprovalBlockerAppTests(unittest.TestCase):
                 self.assertEqual("① 문서 올려서 전처리", app.session_state["nav_page"])
                 self.assertTrue(app.get("file_uploader"))
 
-    def test_beginner_shortcut_blocks_even_after_unreviewed_acknowledgement(self) -> None:
+    def test_beginner_batch_blocks_even_after_unreviewed_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp))
             _seed_streamlit_regulation_bundle_document(settings)
             repository = JsonRepository(settings)
             before = self._mark_blocked(repository, "doc_streamlit_bundle")
             app = self._app(settings, "doc_streamlit_bundle", beginner=True)
-            app.session_state["approval-bulk-finish-ack-doc_streamlit_bundle"] = True
             app.run()
             self.assertFalse(app.exception)
-            button = app.button(key="approval-bulk-finish-doc_streamlit_bundle")
+            app.button(key="approval-batch-entry-doc_streamlit_bundle").click().run()
+            app.checkbox(key="approval-batch-unreviewed-ack-doc_streamlit_bundle").check().run()
+            self.assertFalse(app.exception)
+            button = app.button(key="workflow-approve-index-doc_streamlit_bundle")
             self.assertTrue(button.disabled)
             with patch("app.api.routes_documents.approve_review_chunks") as approve:
                 app.run()
@@ -150,12 +163,115 @@ class StreamlitBulkApprovalBlockerAppTests(unittest.TestCase):
             self.assertFalse(app.button(key="approval-approve-index-doc_streamlit_approval").disabled)
             button = app.button(key="workflow-approve-index-doc_streamlit_approval")
             self.assertTrue(button.disabled)
+            message = next(item.value for item in app.error if "규정 경계" in item.value)
+            self.assertIn("복무규정 · 파일: service.hwp", message)
+            self.assertNotIn("인사규정", message)
             with patch("app.api.routes_documents.approve_review_chunks") as approve:
                 app.run()
             approve.assert_not_called()
             self.assertFalse(app.exception)
             self._assert_no_approval_mutation(repository, "doc_streamlit_approval", normal_before, settings)
             self._assert_no_approval_mutation(repository, "doc_streamlit_service", blocked_before, settings)
+
+    def test_explicit_recovery_opens_new_draft_without_approving_or_changing_originals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp))
+            _seed_streamlit_multi_approval_documents(settings)
+            repository = JsonRepository(settings)
+            source_id = "doc_streamlit_approval"
+            other_id = "doc_streamlit_service"
+            draft_id = "doc_synthetic_recovered"
+            before = self._mark_blocked(repository, source_id)
+            other_before = [chunk.model_dump(mode="json") for chunk in repository.get_chunks(other_id)]
+            source_document = repository.get_document(source_id)
+            app = self._app(settings, source_id, beginner=True)
+            app.session_state["workflow_document_ids"] = [source_id, other_id]
+            app.session_state["workflow_selected_document_ids"] = [source_id, other_id]
+            for document_id in (source_id, other_id):
+                app.session_state[f"workflow-document-selected-{document_id}"] = True
+
+            def recover_draft(document_id, *, tenant_id, profile_id, progress_callback):
+                self.assertEqual(source_id, document_id)
+                self.assertEqual("default", tenant_id)
+                self.assertEqual("test-profile", profile_id)
+                repository.upsert_document(source_document.model_copy(update={
+                    "document_id": draft_id,
+                    "status": "completed",
+                    "regulation_status": "draft",
+                    "reprocessing_source_document_id": source_id,
+                }))
+                recovered_chunks = []
+                for index, chunk in enumerate(repository.get_chunks(source_id)):
+                    metadata = dict(chunk.metadata)
+                    metadata.pop("ambiguous_combined_book_boundary", None)
+                    recovered_chunks.append(chunk.model_copy(deep=True, update={
+                        "document_id": draft_id,
+                        "chunk_id": f"synthetic-recovered-{index}",
+                        "metadata": metadata,
+                        "approval_status": "draft",
+                    }))
+                repository.save_processing_result(draft_id, [], recovered_chunks, [])
+                return BoundaryReprocessingResult(source_id, draft_id, len(recovered_chunks))
+
+            with (
+                patch("app.services.boundary_reprocessing_service.BoundaryReprocessingService.recover", side_effect=recover_draft) as recover,
+                patch("app.api.routes_documents.approve_review_chunks") as approve,
+                patch("app.api.routes_documents.index_document") as index,
+                patch("app.api.routes_documents.index_documents_batch") as batch_index,
+            ):
+                app.run()
+                self.assertFalse(app.exception)
+                recover.assert_not_called()
+                app.button(key=f"approval-boundary-upload-{source_id}-recover").click().run()
+            self.assertFalse(app.exception)
+            recover.assert_called_once()
+            approve.assert_not_called()
+            index.assert_not_called()
+            batch_index.assert_not_called()
+            self.assertEqual("③ 검수하고 승인", app.session_state["nav_page"])
+            self.assertEqual(draft_id, app.session_state["document_id"])
+            self.assertEqual(draft_id, app.session_state["workflow_opened_document_id"])
+            self.assertEqual([draft_id, other_id], app.session_state["workflow_selected_document_ids"])
+            self.assertEqual([draft_id, other_id], app.session_state["workflow_document_ids"])
+            self.assertEqual(source_document, repository.get_document(source_id))
+            self._assert_no_approval_mutation(repository, source_id, before, settings)
+            self._assert_no_approval_mutation(repository, other_id, other_before, settings)
+            self.assertTrue(all(chunk.approval_status == "draft" for chunk in repository.get_chunks(draft_id)))
+            self.assertEqual([], repository.list_approval_records(draft_id))
+            self.assertEqual([], repository.list_indexing_jobs(draft_id))
+            self.assertFalse(any("승인 차단" in item.value for item in app.error))
+
+    def test_failed_recovery_preserves_current_selection_and_reports_unapproved_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp) / "data", artifact_root=Path(tmp))
+            _seed_streamlit_regulation_bundle_document(settings)
+            repository = JsonRepository(settings)
+            source_id = "doc_streamlit_bundle"
+            before = self._mark_blocked(repository, source_id)
+            app = self._app(settings, source_id)
+            app.session_state["workflow_document_ids"] = [source_id]
+            app.session_state["workflow_selected_document_ids"] = [source_id]
+            with (
+                patch("app.services.boundary_reprocessing_service.BoundaryReprocessingService.recover", side_effect=BoundaryReprocessingError(
+                    "합성 복구 실패: 새 초안의 경계 확인이 필요합니다.", draft_document_id="doc_synthetic_unresolved",
+                )) as recover,
+                patch("app.api.routes_documents.approve_review_chunks") as approve,
+                patch("app.api.routes_documents.index_document") as index,
+                patch("app.api.routes_documents.index_documents_batch") as batch_index,
+            ):
+                app.run()
+                recover.assert_not_called()
+                app.button(key=f"approval-boundary-upload-{source_id}-recover").click().run()
+            self.assertFalse(app.exception)
+            recover.assert_called_once()
+            approve.assert_not_called()
+            index.assert_not_called()
+            batch_index.assert_not_called()
+            self.assertEqual(source_id, app.session_state["document_id"])
+            self.assertEqual([source_id], app.session_state["workflow_selected_document_ids"])
+            self.assertTrue(any("합성 복구 실패" in item.value for item in app.error))
+            self.assertTrue(any("doc_synthetic_unresolved" in item.value and "승인·색인하지 않았습니다" in item.value for item in app.caption))
+            self._assert_no_approval_mutation(repository, source_id, before, settings)
 
 
 if __name__ == "__main__":
