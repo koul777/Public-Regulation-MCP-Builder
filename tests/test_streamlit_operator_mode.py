@@ -1338,7 +1338,9 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("ChatGPT · Vercel HTTPS MCP", source)
         self.assertIn("Claude · Vercel HTTPS MCP", source)
         self.assertIn("배포된 Vercel HTTPS `/mcp` 주소 (첫 배포 전에는 비워도 됨)", source)
-        self.assertIn("배포 준비용 MCP 묶음", source)
+        self.assertIn("Vercel에 배포하고 AI에 연결하기", source)
+        self.assertIn("from frontend.vercel_deployment import render_vercel_deployment", source)
+        self.assertIn("고급: 수동 배포·비공개 인증 설정 안내", source)
         self.assertIn("아직 없음 — 배포 준비 묶음부터 생성하세요", source)
         self.assertIn('mcp_http_url.startswith("https://")', source)
         self.assertIn("Settings > Apps > Advanced settings > Developer mode", source)
@@ -1896,7 +1898,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             node
             for node in module.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_render_mcp_completion_connection_course"
+            and node.name == "_render_mcp_manual_connection_course"
         )
         helper_source = ast.get_source_segment(source, helper_node) or ""
 
@@ -1956,7 +1958,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             node
             for node in module.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_render_mcp_completion_connection_course"
+            and node.name == "_render_mcp_manual_connection_course"
         )
 
         class StreamlitRecorder:
@@ -1989,7 +1991,7 @@ class StreamlitOperatorModeTests(unittest.TestCase):
             ),
             namespace,
         )
-        render = namespace["_render_mcp_completion_connection_course"]
+        render = namespace["_render_mcp_manual_connection_course"]
 
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp) / "bundle"
@@ -2198,8 +2200,8 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn('start_percent=35', bundle_source)
         self.assertIn('end_percent=78', bundle_source)
         self.assertIn('label="MCP 데이터·검색 인덱스 생성"', bundle_source)
-        self.assertIn("④ MCP 생성·업데이트 한 번으로 선택 범위의 규정 목록·목차·조문 계층 색인", source)
-        self.assertIn("개별 규정 파일 여러 개와 통합 규정집 모두 동일하게 처리됩니다.", source)
+        self.assertIn("선택한 승인 규정을 검색할 수 있도록 준비합니다.", source)
+        self.assertIn("통합 규정집도 한 번에 처리합니다.", source)
         self.assertIn("목차 노드 {runtime_data.get('toc_node_count', 0)}개와 조문 계층 색인을 자동 생성했습니다.", source)
         self.assertIn("current_bundle_regulation", bundle_source)
         self.assertIn('bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")', bundle_source)

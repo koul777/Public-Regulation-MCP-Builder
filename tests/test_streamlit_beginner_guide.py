@@ -507,7 +507,8 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('[data-testid="stRadio"]', source)
         self.assertIn('[data-testid="stLinkButton"]', source)
         self.assertIn("승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요", source)
-        self.assertEqual(2, source.count("_render_beginner_connection_confirmation("))
+        # Definition plus the mutually exclusive resumed-remote and newly-built paths.
+        self.assertEqual(3, source.count("_render_beginner_connection_confirmation("))
         registration_course = source.index("_render_mcp_completion_connection_course(", 8000)
         final_confirmation = source.index(
             "_render_beginner_connection_confirmation(", registration_course
@@ -894,7 +895,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "규정 스크롤하며 원본·전처리·AI 검수 의견 비교",
             "다음 미완료 규정으로 이동해 같은 검수 반복",
             "선택한 모든 규정의 검수·승인·색인 완료 확인",
-            "MCP 원리와 변환 과정 확인",
+            "승인 규정 연결 준비",
             "MCP에 넣을 규정 범위 확인",
             "list_regulations 목록 호출 확인",
             "search 조문 검색 확인",
@@ -987,6 +988,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         for step_index, group in enumerate(groups, start=1):
             for procedure_index, name in enumerate(group, start=1):
                 if (step_index, procedure_index) in numbered:
+                    continue
+                # The initial MCP overview is informational, with no mandatory acknowledgement.
+                if (step_index, procedure_index) == (4, 1):
                     continue
                 # 4-6 … 4-11 are the six external connection confirmations, which the
                 # loop in _render_beginner_connection_confirmation numbers at runtime.
@@ -1135,12 +1139,14 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertTrue(first.startswith("mcp-principle:doc-1:"))
 
-    def test_beginner_mcp_requires_scope_and_output_confirmation_before_bundle(self) -> None:
+    def test_beginner_mcp_requires_scope_and_valid_output_before_bundle(self) -> None:
         source, module = _source_and_module()
         page_source = ast.get_source_segment(source, _function(module, "_page_connect")) or ""
 
         self.assertIn("MCP에 포함할 규정 범위를 확인했습니다.", page_source)
-        self.assertIn("저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.", page_source)
+        self.assertNotIn("저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.", page_source)
+        self.assertIn('normalized_mcp_server_name == mcp_server_name', page_source)
+        self.assertIn('st.session_state[save_mode_key] = "folder-only"', page_source)
         self.assertIn("BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX", page_source)
         self.assertIn("BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX", page_source)
         self.assertIn("mcp_target_ready = False", page_source)
@@ -2638,32 +2644,19 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('st.session_state["document_id"] = next_document_id', page_source)
         self.assertIn("NAV_APPROVAL if _beginner_focus_review() else NAV_RESULTS", page_source)
 
-    def test_beginner_mcp_explains_and_gates_principle_before_configuration(self) -> None:
+    def test_beginner_mcp_help_does_not_block_configuration(self) -> None:
         source, module = _source_and_module()
         page_source = ast.get_source_segment(
             source,
             _function(module, "_page_connect"),
         ) or ""
 
-        for text in (
-            "MCP는 규정 파일을 단순히 다른 파일 형식으로 바꾸는 기능이 아닙니다.",
-            "규정이 MCP로 준비되는 순서",
-            "승인 청크에 규정명·조문 번호·상위 계층·원문 출처",
-            "list_regulations",
-            "get_regulation_toc",
-            "get_regulation_article",
-            "get_regulation_references",
-            "list_regulation_reference_cycles",
-            "로컬 STDIO",
-            "원격 HTTPS",
-            "승인된 조문이 계층 색인과 MCP 도구로 변환되는 원리를 확인했습니다.",
-            "위 원리를 확인하면 MCP에 넣을 규정 범위 선택이 열립니다.",
-        ):
-            self.assertIn(text, page_source)
-        principle_gate = page_source.index("if not principle_confirmed:")
-        scope_control = page_source.index('st.radio(\n            "MCP 데이터 범위"')
-        self.assertLess(principle_gate, scope_control)
-        self.assertIn("return", page_source[principle_gate:scope_control])
+        self.assertIn('st.expander("MCP 연결이란?", expanded=False)', page_source)
+        self.assertIn("승인한 규정만 연결합니다.", page_source)
+        self.assertNotIn("if not principle_confirmed:", page_source)
+        self.assertNotIn("위 원리를 확인하면", page_source)
+        self.assertIn('expanded=not kordoc_preflight["ready"]', page_source)
+        self.assertIn('remote_candidates and _mcp_bundle_created(ctx, scope=mcp_scope)', page_source)
 
     def test_beginner_mode_uses_one_click_batch_override_and_hides_advanced_path(self) -> None:
         source, module = _source_and_module()
@@ -3563,7 +3556,7 @@ class StreamlitOperatorCompletionRegressionTests(unittest.TestCase):
         self.assertIn("fetch", message)
         self.assertNotIn("생성하세요", message)
         message, _page = namespace["_next_action"]({**self._ready_context(), "bundle_ready": False})
-        self.assertIn("생성하세요", message)
+        self.assertIn("준비하세요", message)
 
     def test_healthy_qwen_process_does_not_claim_answers_or_citations_checked(self) -> None:
         namespace = self._namespace()
@@ -3578,15 +3571,28 @@ class StreamlitOperatorCompletionRegressionTests(unittest.TestCase):
         self.assertIn("근거", message)
         self.assertNotIn("확인했습니다", message)
 
+    def test_remote_next_action_distinguishes_prepared_deployed_and_verified(self) -> None:
+        namespace = self._namespace()
+        ctx = self._ready_context()
+        namespace["st"].session_state[f"mcp-connection-target-{ctx['document_id']}"] = "chatgpt-remote"
+        for receipt, expected in (({}, "계정 연결"), ({"verified": False}, "연결 검사"), ({"verified": True}, "주소를 AI 앱에 등록")):
+            with self.subTest(receipt=receipt):
+                namespace["_current_remote_deployment"] = lambda _ctx: receipt
+                message, page = namespace["_next_action"](ctx)
+                self.assertEqual("use", page)
+                self.assertIn(expected, message)
+                self.assertFalse(namespace["_workflow_states"](ctx)[-1])
+
     def test_current_client_confirmation_is_reachable_in_advanced_mode(self) -> None:
         _source, module = _source_and_module()
         page = _function(module, "_page_connect")
         calls = [node for node in ast.walk(page) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                  and node.func.id == "_render_beginner_connection_confirmation"]
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         for node in ast.walk(page):
             if isinstance(node, ast.If) and "mcp_beginner_mode" in ast.unparse(node.test):
-                self.assertFalse(any(calls[0] is child for statement in node.body for child in ast.walk(statement)))
+                for confirmation_call in calls:
+                    self.assertFalse(any(confirmation_call is child for statement in node.body for child in ast.walk(statement)))
 
     def test_bulk_approval_labels_execution_and_preserves_acknowledgement_and_audit(self) -> None:
         source, module = _source_and_module()

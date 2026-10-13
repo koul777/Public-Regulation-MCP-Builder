@@ -53,6 +53,10 @@ class VercelMcpEndToEndTests(unittest.IsolatedAsyncioTestCase):
             prepare_vercel_mcp_deployment(
                 runtime_data_dir=bundle_dir / "data",
                 out_dir=stage_dir,
+                # Even an aggressive upload setting must preserve sealed approval
+                # artifacts, or the live catalog/search silently return no records.
+                compress_runtime_file_under_bytes=0,
+                verify_sealed_runtime=True,
             )
 
             app = _load_staged_entrypoint(stage_dir / "api" / "index.py", stage_dir / "mcp_runtime")

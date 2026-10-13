@@ -69,6 +69,7 @@ def prepare_vercel_mcp_deployment(
     out_dir: Path,
     max_runtime_bytes: int = DEFAULT_MAX_RUNTIME_BYTES,
     compress_runtime_file_under_bytes: int | None = None,
+    verify_sealed_runtime: bool = False,
 ) -> dict[str, Any]:
     if compress_runtime_file_under_bytes is None:
         compress_runtime_file_under_bytes = MAX_RUNTIME_FILE_BYTES
@@ -94,6 +95,12 @@ def prepare_vercel_mcp_deployment(
     (target / "api").mkdir()
     (target / "api" / "index.py").write_text(_vercel_entrypoint(), encoding="utf-8")
     shutil.copytree(source_runtime, target / "mcp_runtime")
+    if verify_sealed_runtime:
+        from scripts.generate_mcp_client_config import validate_mcp_runtime_data_bundle_integrity
+
+        validate_mcp_runtime_data_bundle_integrity(target / "mcp_runtime")
+    # The server restores packed files and verifies their sealed hashes before
+    # serving them. Approval snapshots must see the original names and bytes.
     compressed_runtime_files = _compress_oversized_runtime_files(
         target / "mcp_runtime",
         max_bytes=compress_runtime_file_under_bytes,
@@ -124,14 +131,14 @@ def prepare_vercel_mcp_deployment(
         "json_response": True,
         "local_trace_writes": False,
         "local_api_audit_writes": False,
-        "deploy_command": f'vercel --cwd "{target}"',
-        "production_deploy_command": f'vercel --prod --cwd "{target}"',
+        "deploy_command": f'vercel --archive=tgz --cwd "{target}"',
+        "production_deploy_command": f'vercel --prod --archive=tgz --cwd "{target}"',
     }
     deployment_report = {
         **report,
         "out_dir": ".",
-        "deploy_command": "vercel --cwd .",
-        "production_deploy_command": "vercel --prod --cwd .",
+        "deploy_command": "vercel --archive=tgz --cwd .",
+        "production_deploy_command": "vercel --prod --archive=tgz --cwd .",
     }
     (target / "deployment_report.json").write_text(
         json.dumps(deployment_report, ensure_ascii=False, indent=2) + "\n",
@@ -246,6 +253,9 @@ app = create_vercel_mcp_app(os.environ)
 def _vercel_config() -> dict[str, Any]:
     return {
         "$schema": "https://openapi.vercel.sh/vercel.json",
+        # The framework routes requests directly to the ASGI entrypoint. Rewriting
+        # /mcp to /api/index changes the path seen by Starlette and returns 404.
+        "framework": "fastapi",
         "functions": {
             "api/index.py": {
                 "maxDuration": 300,
@@ -253,10 +263,10 @@ def _vercel_config() -> dict[str, Any]:
                 "excludeFiles": "{**/__pycache__/**,**/*.pyc,**/*.pyo}",
             }
         },
-        "rewrites": [
+        "headers": [
             {
-                "source": "/mcp",
-                "destination": "/api/index",
+                "source": "/(.*)",
+                "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}],
             }
         ],
     }
@@ -303,8 +313,8 @@ This directory contains source code plus one approved, read-only MCP runtime.
      front of this origin. A static bearer cannot be entered in ChatGPT.
 2. If using a custom domain, set `MCP_AUTH_ISSUER_URL=https://your-domain` and
    `MCP_ALLOWED_HTTP_HOSTS=your-domain`.
-3. Run `vercel`, test the preview endpoint at `https://<preview-host>/mcp`, then run
-   `vercel --prod`.
+3. Run `vercel --archive=tgz`, test the preview endpoint at `https://<preview-host>/mcp`, then run
+   `vercel --prod --archive=tgz`. The server restores packed runtime files and verifies their sealed hashes at startup.
 4. Use Streamable HTTP and the same final `https://<production-host>/mcp` URL in
    both ChatGPT and Claude connectors.
 
