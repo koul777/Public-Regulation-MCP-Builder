@@ -1086,13 +1086,14 @@ class StreamlitOperatorModeTests(unittest.TestCase):
         self.assertIn("bulk_review_requested and not batch_loaded", source)
         self.assertIn("bulk_review_requested and batch_loaded", source)
         self.assertIn("사람 검수를 권장합니다", source)
-        self.assertIn("미검수 조항은 감사 기록에 구분해 남습니다", source)
-        # 초보자와 일반 모드 모두 같은 최종 버튼을 쓰며 추가 동의 체크를 요구하지 않는다.
+        self.assertIn("미검수 조항은 감사 기록에 구분해 남으며", source)
+        # Both modes share the final operation; beginner unreviewed approval has
+        # an explicit acknowledgment while approved-only indexing does not.
         self.assertNotIn("workflow-beginner-bulk-ack", source)
         self.assertNotIn("beginner_bulk_review_disabled", source)
         self.assertIn("_prepare_reviewed_document_approval_plan", source)
         self.assertIn("_execute_reviewed_document_approval_plan", source)
-        self.assertIn("규정별 문서 ID·규정 ID·목차 계층", source)
+        self.assertIn("각 규정의 이름과 조문 구조는 유지됩니다", source)
         self.assertIn('"selected_documents": f"선택한 규정 {len(selected_document_ids):,}개"', source)
         self.assertIn("document_ids=mcp_export_document_ids", source)
 
