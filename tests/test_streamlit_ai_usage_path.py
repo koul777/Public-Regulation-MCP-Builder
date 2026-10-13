@@ -381,7 +381,7 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             page_source,
         )
         self.assertIn(
-            'st.markdown("### AI 앱에 연결하기" if mcp_beginner_mode else "### MCP client connection")',
+            'st.markdown("### 승인 규정을 AI 앱에 연결하기")',
             page_source,
         )
 
@@ -390,13 +390,13 @@ class StreamlitAiUsagePathContractTests(unittest.TestCase):
             for node in ast.walk(page)
             if isinstance(node, ast.If)
             and ast.unparse(node.test) == "mcp_beginner_mode"
-            and "MCP가 작동하고 변환되는 원리를 먼저 확인하세요"
+            and "_beginner_guide_mcp_principle_confirmed_key(document_id)"
             in (ast.get_source_segment(self.source, node) or "")
         ]
         self.assertEqual(1, len(guarded_mcp_course))
-        self.assertTrue(
+        self.assertFalse(
             any(isinstance(node, ast.Return) for node in ast.walk(guarded_mcp_course[0])),
-            "the MCP-only beginner gate should remain inside mcp_beginner_mode",
+            "the informational MCP overview must not block the configuration form",
         )
 
 

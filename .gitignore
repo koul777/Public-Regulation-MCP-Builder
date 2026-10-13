@@ -57,6 +57,7 @@ data/public_portal_laws_sample/
 
 reports/*
 vercel-mcp-stage-*/
+.vercel-deployments/
 
 .tmp/
 .agents/

@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.mcp_server.regulation_server import create_regulation_mcp_server
+from app.mcp_server.vercel_runtime import materialize_vercel_runtime
 
 
 DEFAULT_VERCEL_DATA_DIR = "mcp_runtime"
@@ -21,6 +22,7 @@ def create_vercel_mcp_app(environ: Mapping[str, str]) -> Starlette:
     """Create a stateless, read-only Streamable HTTP app for Vercel."""
     data_dir = Path(environ.get("MCP_DATA_DIR", DEFAULT_VERCEL_DATA_DIR))
     manifest = _load_runtime_manifest(data_dir)
+    data_dir = materialize_vercel_runtime(data_dir)
     tenant_id = _bound_runtime_value(
         environ=environ,
         environment_name="MCP_TENANT_ID",

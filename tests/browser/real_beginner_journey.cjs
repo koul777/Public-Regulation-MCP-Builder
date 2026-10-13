@@ -223,6 +223,55 @@ async function main() {
     assert.equal(after.documents[0].approval_journal_count,0);
     assert.deepEqual(after.documents[0].indexing_jobs,[]);
     assert.deepEqual(after.vector_files,[]);
+    if(process.env.RR_COMPLETE_MCP_JOURNEY==='1') {
+      const approve=page.getByRole('button',{name:/^(승인하고 AI 질문 준비하기|이 규정 최종 확정 · 승인하고 색인)$/});
+      for(let row=0;row<document.chunks.length+2;row++) {
+        if(await approve.count() && await approve.isEnabled()) break;
+        const marker=await eventuallyMarker(page,m=>!!markerChunk(m,document),'remaining review row');
+        const resolved=await resolveFocusedWarnings(page,marker);
+        await page.locator(resolved.marker.selector).getByRole('button',{name:'내용이 맞아요 · 다음',exact:true}).click();
+        for(let attempt=0;attempt<100;attempt++) {
+          if(await approve.count() && await approve.isEnabled()) break;
+          const next=await activeMarker(page);
+          if(next && next.selector!==resolved.marker.selector) break;
+          await page.waitForTimeout(200);
+          if(attempt===99) throw new Error('review did not advance after confirmation');
+        }
+      }
+      await approve.click();
+      const go=page.locator('div[class*="st-key-approval-goto-connect-simple"] button');
+      await go.waitFor({timeout:180000});
+      const approvedState=await snapshot();
+      assert(approvedState.documents[0].chunks.every(chunk=>chunk.approval_status==='approved'));
+      assert(approvedState.documents[0].approval_journal_count>0);
+      assert(approvedState.vector_files.length>0);
+      await go.click();
+      const scope=page.getByRole('checkbox',{name:'MCP에 포함할 규정 범위를 확인했습니다.',exact:true});
+      await scope.waitFor();
+      await page.locator('div[class*="st-key-beginner_guide_mcp_scope_confirmed"] label').click();
+      await page.getByText('ChatGPT · Vercel HTTPS MCP',{exact:true}).click();
+      await page.getByText('고급: 저장 폴더·전달용 ZIP',{exact:true}).click();
+      const output=page.getByRole('textbox',{name:'MCP 파일 묶음을 만들 폴더',exact:true});
+      await output.fill(path.join(runtime,'bundle'));
+      await output.press('Enter');
+      assert.equal(await output.inputValue(),path.join(runtime,'bundle'));
+      const serverName=page.getByRole('textbox',{name:'생성할 MCP 이름 (필수 입력)',exact:true});
+      await serverName.fill('synthetic-mcp');
+      await serverName.press('Enter');
+      assert.equal(await output.inputValue(),path.join(runtime,'bundle'));
+      await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).click();
+      await page.getByRole('button',{name:'Vercel 계정 연결',exact:true}).waitFor({timeout:240000});
+      assert(fs.existsSync(path.join(runtime,'bundle','data','mcp_runtime_manifest.json')));
+      assert.equal(fs.existsSync(path.join(runtime,'bundle','mcp_connection_bundle.zip')),false,'remote default unexpectedly created a ZIP');
+      assert.equal(await page.getByRole('checkbox',{name:'저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.',exact:true}).count(),0);
+      assert.equal(await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).count(),0,'completed generation form remained above deployment');
+      await page.getByText('Vercel에 배포하고 AI에 연결하기',{exact:true}).scrollIntoViewIfNeeded();
+      const deploymentMarker=await eventuallyMarker(page,m=>m?.title==='Vercel 계정을 연결하세요','Vercel account connection');
+      assert.equal(deploymentMarker.substep,5);
+      await page.screenshot({path:path.join(runtime,'approved-to-vercel.png'),fullPage:true});
+      fs.writeFileSync(path.join(runtime,'completion.json'),JSON.stringify({approvalJournal:approvedState.documents[0].approval_journal_count,
+        vectorFiles:approvedState.vector_files,bundleCreated:true,vercelButtonReached:true,externalDeployment:false},null,2));
+    }
     assert.equal(await page.locator('#rr-tour-root').count(),1,'rerun leaked tour controller');
     assert.deepEqual(errors,[]);
     assert.equal(await page.locator('[data-testid="stException"]').count(),0);

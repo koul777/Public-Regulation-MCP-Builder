@@ -294,7 +294,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "Aliased",
             "브라우저로 읽는 홈페이지가 아니므로",
             "Settings > Apps > Advanced settings > Developer mode",
-            "OpenAI 공식 ChatGPT Developer mode·MCP 지원 안내",
+            "OpenAI 공식 연결 안내",
             "OpenAI Secure MCP Tunnel",
             "ChatGPT 웹 앱 설정",
             "**인증**",
@@ -563,7 +563,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "서버 이름 옆 파란 배지가 **`running`**",
             "%APPDATA%\\Claude\\claude_desktop_config.json",
             "Settings > Apps > Advanced settings > Developer mode",
-            "Apps 설정에서 새 앱",
+            "Add custom MCP server",
             "ChatGPT 웹 앱 설정",
             "**URL (MCP URL / Server URL)**",
             "OpenAI Secure MCP Tunnel",
@@ -597,7 +597,7 @@ class McpQuickConnectDocsTests(unittest.TestCase):
             "**URL (MCP URL / Server URL)**",
             "**인증**",
             "**로컬 Command / Arguments / Working directory** | 넣지 않음",
-            "Apps 설정에서 새 앱을 만들고",
+            "Create as a plugin",
         ):
             self.assertIn(expected, text)
         self.assertNotIn("ChatGPT의 **실행 명령** 칸", text)

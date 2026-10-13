@@ -411,11 +411,11 @@ BEGINNER_GUIDE_PROCEDURES: tuple[tuple[str, ...], ...] = (
         "선택한 모든 규정의 검수·승인·색인 완료 확인",
     ),
     (
-        "MCP 원리와 변환 과정 확인",
+        "승인 규정 연결 준비",
         "MCP에 넣을 규정 범위 확인",
         "연결할 AI 앱 선택",
-        "저장 위치·방식과 MCP 이름 확인",
-        "MCP 파일 묶음 생성",
+        "MCP 이름과 저장 설정",
+        "MCP 파일 준비·원격 서버 배포",
         "AI 앱에 MCP 등록",
         "AI 앱 재시작 또는 새 대화 열기",
         "연결 진단 결과 확인",
@@ -2243,7 +2243,9 @@ def _render_beginner_connection_confirmation(
         ),
         None,
     )
-    if first_incomplete is not None:
+    remote_target = st.session_state.get(f"mcp-connection-target-{document_id}") in {"chatgpt-remote", "claude-api"}
+    remote_ready = not remote_target or bool(_current_remote_deployment({"document_id": document_id}).get("verified"))
+    if first_incomplete is not None and remote_ready:
         incomplete_index, incomplete_item, incomplete_label, incomplete_help = first_incomplete
         _render_beginner_action_marker(
             4,
@@ -2484,12 +2486,15 @@ def _beginner_guide_procedure_states(
                 "fetch",
             )
         )
+        server_ready = bool(bundle_created)
+        if server_ready and st.session_state.get(f"mcp-connection-target-{document_id}") in {"chatgpt-remote", "claude-api"}:
+            server_ready = bool(_current_remote_deployment(ctx).get("verified")) or all(external_states)
         return (
             principle_confirmed,
             scope_confirmed,
             target_selected,
             output_confirmed,
-            bool(bundle_created),
+            server_ready,
             *external_states,
         )
     return ()
@@ -2547,7 +2552,7 @@ def _render_beginner_mode_choice(*, show_hero: bool = True) -> None:
     st.markdown("## 내 규정으로 AI에 질문하기")
     st.caption("파일 올리기 → 원문 확인·승인 → AI에 연결. 화면 안내를 따라 하나씩 진행하세요.")
     st.session_state.setdefault(AI_USAGE_PATH_KEY, AI_USAGE_PATH_QWEN)
-    with st.expander("사용할 AI 바꾸기 (기본: 로컬 Qwen)", expanded=False):
+    with st.expander("사용할 AI 바꾸기", expanded=False):
         st.session_state[AI_USAGE_PATH_FIRST_WIDGET_KEY] = _ai_usage_path()
         selected_usage_path = st.radio(
             "최종 사용 방법",
@@ -3080,7 +3085,7 @@ def _render_beginner_action_marker(
     ]
     tour_attributes = marker_attributes(
         title, description, selectors=tour_selectors, step=int(step), substep=int(substep),
-        presentation="inline" if int(step) == 3 else "spotlight",
+        presentation="inline" if int(step) in {3, 4} else "spotlight",
         context_selectors=tour_context_selectors,
     )
     # Optional tooling stays discoverable in its own expander, while the tour
@@ -5020,6 +5025,38 @@ def _render_mcp_completion_connection_course(
     runtime_data_dir: str,
     connection_display_value: str,
 ) -> None:
+    if target in {"chatgpt-remote", "claude-api"}:
+        from frontend.vercel_deployment import render_vercel_deployment
+
+        def guide(title: str, description: str, control_key: str) -> None:
+            _render_beginner_action_marker(
+                4, title, description, substep=5, control_key_prefix=control_key,
+            )
+
+        render_vercel_deployment(
+            runtime_data_dir=runtime_data_dir, server_name=server_name, target=target,
+            guide=guide,
+        )
+        with st.expander("고급: 수동 배포·비공개 인증 설정 안내", expanded=False):
+            _render_mcp_manual_connection_course(
+                target=target, server_name=server_name, bundle_dir=bundle_dir,
+                runtime_data_dir=runtime_data_dir, connection_display_value=connection_display_value,
+            )
+        return
+    _render_mcp_manual_connection_course(
+        target=target, server_name=server_name, bundle_dir=bundle_dir,
+        runtime_data_dir=runtime_data_dir, connection_display_value=connection_display_value,
+    )
+
+
+def _render_mcp_manual_connection_course(
+    *,
+    target: str,
+    server_name: str,
+    bundle_dir: str,
+    runtime_data_dir: str,
+    connection_display_value: str,
+) -> None:
     """Render a beginner-safe handoff that distinguishes local and remote MCP."""
 
     if target == "chatgpt-desktop-local":
@@ -5360,15 +5397,14 @@ def _render_mcp_completion_connection_course(
         st.markdown("**4. 선택한 앱의 원격 커넥터에 URL만 등록**")
         if target == "chatgpt-remote":
             st.markdown(
-                "ChatGPT **웹**의 **Settings > Apps > Advanced settings > Developer mode**를 "
-                "켠 뒤 Apps 설정에서 새 앱을 만들어 위 `HTTPS /mcp` URL을 "
-                "등록합니다. 이용 가능 범위는 플랜과 워크스페이스 관리자 설정에 따라 "
-                "달라질 수 있습니다. 로컬 서버는 ChatGPT에 직접 연결되지 않으며, 필요한 "
-                "경우 OpenAI Secure MCP Tunnel을 별도로 구성해야 합니다."
+                "ChatGPT **Plugins → + → Add custom MCP server**에서 위 `HTTPS /mcp` URL을 등록합니다. "
+                "개인 플러그인 목록에서 설치하고 Work 새 대화에서 선택하세요. "
+                "이전 UI는 **Settings > Apps > Advanced settings > Developer mode**로 표시될 수 있습니다. "
+                "메뉴는 워크스페이스 권한에 따라 다릅니다. 사설망은 OpenAI Secure MCP Tunnel을 확인하세요."
             )
             st.link_button(
                 "OpenAI 공식 ChatGPT MCP 안내",
-                "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
+                "https://developers.openai.com/plugins/quickstart",
             )
             st.link_button(
                 "OpenAI Secure MCP Tunnel 안내",
@@ -8463,6 +8499,21 @@ def _workflow_states(ctx: dict | None) -> list[bool]:
     ]
 
 
+def _current_remote_deployment(ctx: dict | None) -> dict:
+    """Read only the receipt for the active, current runtime bundle."""
+    if not ctx:
+        return {}
+    from app.services.vercel_deployment_service import read_deployment
+
+    document_id = str(ctx["document_id"])
+    scope = _active_mcp_scope(document_id, None)
+    candidates = _matching_mcp_bundle_state_candidates(document_id, scope)
+    if not candidates:
+        return {}
+    runtime = str(candidates[0][1].get("runtime_data_dir") or "")
+    return read_deployment(Path(runtime)) if runtime else {}
+
+
 def _next_action(ctx: dict | None) -> tuple[str, str]:
     """(안내 문구, 이동할 화면)"""
     workflow_states = _workflow_states(ctx)
@@ -8481,8 +8532,16 @@ def _next_action(ctx: dict | None) -> tuple[str, str]:
         if _ai_usage_path() == AI_USAGE_PATH_QWEN:
             return ("로컬 Qwen 챗봇을 켜고 질문한 뒤 답변과 근거 조문을 함께 확인하세요.", NAV_MCP)
         if _mcp_bundle_created(ctx):
+            target = str(st.session_state.get(f"mcp-connection-target-{ctx['document_id']}") or "")
+            if target in {"chatgpt-remote", "claude-api"}:
+                deployment = _current_remote_deployment(ctx)
+                if not deployment:
+                    return ("규정 파일 준비가 끝났습니다. ④ 화면에서 Vercel 계정 연결 후 배포 버튼을 누르세요.", NAV_MCP)
+                if not deployment.get("verified"):
+                    return ("Vercel 주소가 생성됐습니다. ④ 화면에서 연결 검사를 마친 뒤 AI 앱에 등록하세요.", NAV_MCP)
+                return ("Vercel 배포·검색 검사가 끝났습니다. ④ 화면의 주소를 AI 앱에 등록하고 새 대화에서 search·fetch를 확인하세요.", NAV_MCP)
             return ("현재 MCP 설정 묶음이 준비됐습니다. ④ 화면에서 AI 앱 등록·연결 진단 후 실제 대화의 search·fetch 결과를 확인하고 확인란에 기록하세요.", NAV_MCP)
-        return ("승인 데이터 검색 점검 후 MCP 설정 묶음을 생성하세요. ChatGPT 웹 HTTPS 또는 Claude·Codex 연결용 ④ 단계입니다.", NAV_MCP)
+        return ("④ 화면에서 규정 범위와 사용할 AI를 선택하고 연결 파일을 준비하세요. ChatGPT·Claude 원격 연결은 이어서 Vercel에 배포합니다.", NAV_MCP)
     if _ai_usage_path() == AI_USAGE_PATH_QWEN:
         return ("Qwen 앱으로 이어갈 준비가 됐습니다. Qwen 창에서 질문하고 답변과 근거 조문을 함께 확인하세요.", NAV_MCP)
     return ("현재 MCP의 실제 AI 대화 검색·조회 확인을 운영자가 기록했습니다. ④ 화면에서 연결 상태를 확인하고 다음 질문을 이어가세요.", NAV_MCP)
@@ -13762,7 +13821,7 @@ def _page_connect(
     heading = _connect_nav_display_label()
     st.markdown(f"## {heading}")
     _render_operator_project_controls(NAV_MCP)
-    with st.expander("AI 연결 설정·도움말", expanded=False) if _beginner_focus_review() and qwen_path else nullcontext():
+    with st.expander("AI 연결 설정·도움말", expanded=False):
         _render_beginner_page_compass(
             4,
             ctx=ctx,
@@ -13792,7 +13851,7 @@ def _page_connect(
     if not _require_document_context(ctx):
         st.info("Qwen 규정 챗봇과 MCP 연결은 '① 문서 올려서 전처리'를 마친 뒤 이 화면에서 이어집니다.")
         return
-    with st.expander("연결할 규정 목록", expanded=False) if _beginner_focus_review() and qwen_path else nullcontext():
+    with st.expander("연결할 규정 목록", expanded=False):
         selected_document_ids = _render_workflow_document_directory(page_key="mcp")
     document_id = ctx["document_id"]
     document = ctx["document"]
@@ -13825,7 +13884,7 @@ def _page_connect(
     mcp_label = (
         "AI 앱 연결 설정"
         if mcp_beginner_mode
-        else "AI 프로그램 연결 — MCP 연결 (전산 담당자용)"
+        else "AI 앱 연결·Vercel 배포"
     )
     if qwen_path:
         chat_tab = nullcontext()
@@ -13872,17 +13931,16 @@ def _page_connect(
             )
             return
     with mcp_tab:
-        st.markdown("### AI 앱에 연결하기" if mcp_beginner_mode else "### MCP client connection")
+        st.markdown("### 승인 규정을 AI 앱에 연결하기")
         st.caption(
             (
                 "승인된 규정을 AI 앱에서 읽을 수 있도록 연결 파일을 만들고, "
                 "앱 등록부터 실제 검색 확인까지 순서대로 안내합니다."
                 if mcp_beginner_mode
-                else "승인·인덱싱 후 Claude Code, Codex CLI·IDE, Claude Desktop, "
-                "ChatGPT 웹 원격 MCP 또는 Claude HTTPS에 붙일 설정을 생성합니다."
+                else "규정 범위와 AI 앱 선택 → 연결 파일 준비 → 배포·AI 앱 등록 순서로 진행합니다."
             )
         )
-        with st.expander("MCP/AI connection guide", expanded=False):
+        with st.expander("MCP 연결이란?", expanded=False):
             st.markdown(
                 """
                 - 이 프로그램은 승인된 규정 데이터베이스와 MCP 서버 명령, 클라이언트 설정 묶음을 만들어 줍니다. 실제 연결 등록은 담당자가 각 AI 프로그램에서 직접 승인해야 합니다.
@@ -13894,61 +13952,9 @@ def _page_connect(
                 """
             )
         if mcp_beginner_mode:
-            principle_confirmation_key = (
-                _beginner_guide_mcp_principle_confirmed_key(document_id)
-            )
-            _clear_other_beginner_confirmations(
-                f"{BEGINNER_GUIDE_MCP_PRINCIPLE_CONFIRMED_PREFIX}:{document_id}:",
-                principle_confirmation_key,
-            )
-            if not st.session_state.get(principle_confirmation_key):
-                _render_beginner_action_marker(
-                    4,
-                    "MCP가 작동하고 변환되는 원리를 먼저 확인하세요",
-                    "아래 설명에서 승인된 조문이 계층 색인·실행 데이터·AI 도구로 바뀌는 순서와 로컬 STDIO/원격 HTTPS 차이를 읽은 뒤 확인란을 선택하세요.",
-                    control_key_prefix=principle_confirmation_key,
-                    substep=1,
-                )
-            st.markdown("#### 먼저 이해할 것: MCP는 어떻게 작동하나요?")
-            st.info(
-                "MCP는 규정 파일을 단순히 다른 파일 형식으로 바꾸는 기능이 아닙니다. "
-                "AI 앱이 승인된 규정 검색 서버의 도구를 안전하게 호출하도록 연결하는 공통 규칙입니다."
-            )
-            st.markdown(
-                """
-                **규정이 MCP로 준비되는 순서**
-
-                1. 업로드한 원문을 규정 → 장·절 → 조문 → 항·호 → 별표·서식 계층으로 나눕니다.
-                2. AI 제안과 원본/처리 결과 비교 권고를 확인한 뒤, 운영자가 최종 승인한 청크만 남깁니다.
-                3. 승인 청크에 규정명·조문 번호·상위 계층·원문 출처를 붙여 계층 색인과 검색 색인을 만듭니다.
-                4. 선택한 규정 범위의 승인 데이터, MCP 서버 실행 명령, 앱별 연결 설정과 사용 안내를 한 묶음으로 생성합니다.
-                5. AI 앱에 그 연결을 등록하면 질문할 때 아래 도구를 호출하고, 서버는 승인 데이터만 돌려줍니다.
-
-                | AI가 호출하는 도구 | 하는 일 |
-                | --- | --- |
-                | `list_regulations` | MCP에 포함된 승인 규정 목록 확인 |
-                | `get_regulation_toc` | 규정의 장·절·조·별표 계층 확인 |
-                | `get_regulation_article` | 규정명과 조문 번호로 정확한 승인 조문 조회 |
-                | `get_regulation_references` | 현재 규정이 인용하거나 현재 규정을 인용한 규정 확인 |
-                | `list_regulation_reference_cycles` | 규정끼리 서로 순환 인용하는 관계 확인 |
-                | `search` | 질문과 관련된 승인 조문 후보 탐색 |
-                | `fetch` | 후보 ID의 승인 원문과 출처 확인 |
-
-                **연결 방식의 차이**
-
-                - **로컬 STDIO:** 같은 PC의 Claude Code·Codex·Claude Desktop이 생성된 명령으로 MCP 서버를 직접 실행합니다.
-                - **원격 HTTPS:** ChatGPT나 원격 Claude가 배포된 `/mcp` 주소로 접속합니다. 승인 데이터를 허용된 서버에 별도로 배포해야 합니다.
-                - 파일 묶음을 만든 것만으로 연결이 끝나지 않습니다. 앱 등록 → 앱 재시작/새 대화 → 연결 진단 → 실제 도구 호출을 모두 확인해야 합니다.
-                """
-            )
-            principle_confirmed = st.checkbox(
-                "승인된 조문이 계층 색인과 MCP 도구로 변환되는 원리를 확인했습니다.",
-                key=principle_confirmation_key,
-                help="설명을 읽은 뒤 선택하세요. 원문 전체나 미승인 청크가 MCP에 자동 공개되는 것은 아닙니다.",
-            )
-            if not principle_confirmed:
-                st.info("위 원리를 확인하면 MCP에 넣을 규정 범위 선택이 열립니다.")
-                return
+            # Informational progress only; this is never approval or publication consent.
+            st.session_state[_beginner_guide_mcp_principle_confirmed_key(document_id)] = True
+        st.caption("승인한 규정만 연결합니다. ChatGPT·Claude 원격 연결은 이 화면에서 Vercel에 배포하고 주소를 받습니다.")
         if mcp_connection_ready:
             st.caption(
                 "현재 승인된 조문은 색인되어 있습니다. 아래에서 선택한 MCP 범위에 검토가 남아 있는지도 함께 확인합니다."
@@ -14004,18 +14010,19 @@ def _page_connect(
                 "이 규정은 모든 활성 청크가 명시적으로 반려되어 MCP에서 제외됩니다. "
                 "출처 메타데이터 보완과 재색인 대상에도 포함하지 않습니다."
             )
-        status_cols = st.columns(4)
-        status_cols[0].metric("승인 청크", int(mcp_connection_gate.get("approved_count") or 0))
-        status_cols[1].metric("MCP 노출 기록", int(mcp_connection_gate.get("mcp_visible_count") or 0))
-        status_cols[2].metric("색인 상태", str(mcp_connection_gate.get("indexing_status") or "-"))
-        status_cols[3].metric("오래된 기록", int(mcp_connection_gate.get("stale_count") or 0))
-        st.caption(
-            "아래 버튼을 누르면 Claude Code, Codex CLI·IDE, Claude Desktop, "
-            "ChatGPT 웹 원격 MCP 또는 Claude HTTPS 연결 파일 묶음이 생성됩니다."
-        )
+        with st.expander("현재 규정 승인·색인 상세", expanded=False):
+            status_cols = st.columns(4)
+            status_cols[0].metric("승인 청크", int(mcp_connection_gate.get("approved_count") or 0))
+            status_cols[1].metric("MCP 노출 기록", int(mcp_connection_gate.get("mcp_visible_count") or 0))
+            status_cols[2].metric("색인 상태", str(mcp_connection_gate.get("indexing_status") or "-"))
+            status_cols[3].metric("오래된 기록", int(mcp_connection_gate.get("stale_count") or 0))
+            st.caption(
+                "아래 버튼을 누르면 Claude Code, Codex CLI·IDE, Claude Desktop, "
+                "ChatGPT 웹 원격 MCP 또는 Claude HTTPS 연결 파일 묶음이 생성됩니다."
+            )
         scope_key = f"mcp-data-scope-{document_id}"
         if scope_key not in st.session_state and mcp_beginner_mode:
-            st.session_state[scope_key] = "current_document"
+            st.session_state[scope_key] = "selected_documents" if len(selected_document_ids) > 1 else "current_document"
         mcp_scope = st.radio(
             "MCP 데이터 범위",
             ["selected_documents", "current_document", "selected_institution"],
@@ -14062,7 +14069,7 @@ def _page_connect(
                     4,
                     "MCP에 넣을 규정 범위를 확인하세요",
                     "현재 규정만, 선택한 규정, 기관 전체 중 원하는 범위가 맞는지 확인한 뒤 아래 확인란을 선택하세요.",
-                    control_key_prefix=scope_confirmation_key,
+                    control_keys=(scope_key, scope_confirmation_key),
                     substep=2,
                 )
             beginner_scope_confirmed = st.checkbox(
@@ -14094,155 +14101,157 @@ def _page_connect(
             sorted(visible_scope_document_ids),
             command=kordoc_command,
         )
-        if kordoc_preflight["required_document_count"]:
-            st.markdown("#### Kordoc 표 파싱 사전 점검")
-            st.caption(
-                "공식 MCP 파일 묶음에는 PDF·HWP·HWPX·DOCX 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다. "
-                "Kordoc 미설치 상태에서 처리한 문서는 새 초안으로 재전처리·검수·승인해야 합니다."
-            )
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "document_id": item.get("document_id"),
-                            "file_type": item.get("file_type"),
-                            "required": item.get("required"),
-                            "status": item.get("status") or "missing",
-                            "parser": item.get("parser") or "missing",
-                            "table_count": item.get("table_count", 0),
-                        }
-                        for item in kordoc_preflight["documents"]
-                    ]
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-            if kordoc_preflight["ready"]:
-                st.success(
-                    "Kordoc 표 파싱 증거가 모두 확인되었습니다. "
-                    f"{kordoc_preflight['parsed_document_count']:,}/"
-                    f"{kordoc_preflight['required_document_count']:,} 문서"
+        with st.expander("문서 파싱 품질 확인", expanded=not kordoc_preflight["ready"]):
+            if kordoc_preflight["required_document_count"]:
+                st.markdown("#### Kordoc 표 파싱 사전 점검")
+                st.caption(
+                    "공식 MCP 파일 묶음에는 PDF·HWP·HWPX·DOCX 네 형식 모두 Kordoc 표 파싱 품질 증거가 필요합니다. "
+                    "Kordoc 미설치 상태에서 처리한 문서는 새 초안으로 재전처리·검수·승인해야 합니다."
                 )
-            else:
-                command_status = kordoc_preflight["command_status"]
-                command_label = str(command_status.get("label") or "kordoc")
-                missing_document_ids = [
-                    str(item.get("document_id") or "").strip()
-                    for item in kordoc_preflight["missing"]
-                    if str(item.get("document_id") or "").strip()
-                ]
-                if command_status.get("available"):
-                    version = str(command_status.get("version") or "unknown")
-                    st.warning(
-                        "설치된 Kordoc으로 증거가 없는 원본을 새 초안에서 재전처리합니다. "
-                        f"기존 승인본·승인 기록·색인은 그대로 보존됩니다 (명령={command_label}, 버전={version})."
-                    )
-                    institution_history_scope = mcp_scope == "selected_institution"
-                    single_reprocess = len(missing_document_ids) == 1 and not institution_history_scope
-                    retry_trigger = False
-                    if institution_history_scope:
-                        st.info(
-                            "기관 전체 범위에는 과거 superseded 이력도 포함됩니다. "
-                            "먼저 '현재 연 규정만' 또는 '선택한 규정' 범위에서 각 규정을 안전 재전처리·승인·색인해 주세요."
-                        )
-                    else:
-                        retry_trigger = st.button(
-                            (
-                                "설치된 Kordoc으로 안전 재전처리 다시 실행"
-                                if single_reprocess
-                                else f"증거 없는 규정 {len(missing_document_ids):,}개 안전 재전처리"
-                            ),
-                            key=f"kordoc-safe-reprocess-{document_id}-{mcp_scope}",
-                            type="primary",
-                            help="기존 문서를 덮어쓰지 않고 새 draft 문서 ID에서 처리합니다.",
-                        )
-                    if retry_trigger:
-                        try:
-                            with _long_operation_status(
-                                "Kordoc 안전 재전처리 중…",
-                                failure_stage="Kordoc 재전처리·증거 검증",
-                                failure_regulation=(
-                                    _workflow_document_label(scope_documents[0])
-                                    if len(scope_documents) == 1
-                                    else f"선택한 {len(missing_document_ids):,}개 규정"
-                                ),
-                                failure_policy="실패한 규정을 건너뛰지 않고 재전처리를 중단합니다. 기존 승인본은 유지됩니다.",
-                            ) as reprocess_status:
-                                reprocess_progress = st.progress(0, text="새 초안 준비 · 0%")
-                                reprocess_detail = st.empty()
-                                reprocess_results = _run_background_operation_with_progress(
-                                    lambda report: _safe_kordoc_reprocess_documents(
-                                        settings,
-                                        repository,
-                                        missing_document_ids,
-                                        quality_profile=quality_profile_config,
-                                        progress_callback=report,
-                                    ),
-                                    progress_bar=reprocess_progress,
-                                    detail_box=reprocess_detail,
-                                    start_percent=0,
-                                    end_percent=100,
-                                    label="Kordoc 재전처리·증거 검증",
-                                    estimated_seconds=max(60.0, 120.0 * len(missing_document_ids)),
-                                )
-                                reprocess_status.update(
-                                    label="Kordoc 재전처리와 증거 검증 완료",
-                                    state="complete",
-                                )
-                            for result in reprocess_results:
-                                _replace_workflow_document_id(
-                                    result.source_document_id,
-                                    result.draft_document_id,
-                                )
-                            st.session_state[KORDOC_REPROCESS_NOTICE_KEY] = {
-                                "document_id": str(st.session_state.get("document_id") or ""),
-                                "count": len(reprocess_results),
-                                "draft_document_ids": [result.draft_document_id for result in reprocess_results],
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "document_id": item.get("document_id"),
+                                "file_type": item.get("file_type"),
+                                "required": item.get("required"),
+                                "status": item.get("status") or "missing",
+                                "parser": item.get("parser") or "missing",
+                                "table_count": item.get("table_count", 0),
                             }
-                            _go(NAV_RESULTS)
-                            st.rerun()
-                        except KordocReprocessingError as exc:
-                            st.error(_safe_ui_error(exc))
-                            if exc.draft_document_id:
-                                st.caption(
-                                    f"실패한 새 초안 {exc.draft_document_id}은 승인·색인되지 않았으며 기존 문서는 변경되지 않았습니다."
-                                )
-                        except (FileNotFoundError, KeyError, ValueError) as exc:
-                            st.error(_safe_ui_error(exc))
-                            _render_workflow_next_button(
-                                "같은 원본 다시 올려 전처리하기",
-                                NAV_PREPROCESS,
-                                key=f"kordoc-recovery-upload-{document_id}-{mcp_scope}",
-                            )
-                        except Exception as exc:
-                            st.error(_safe_ui_error(exc))
-                            st.info("기존 승인본은 변경되지 않았습니다. 원본과 Kordoc 상태를 확인한 뒤 다시 시도해 주세요.")
+                            for item in kordoc_preflight["documents"]
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+                if kordoc_preflight["ready"]:
+                    st.success(
+                        "Kordoc 표 파싱 증거가 모두 확인되었습니다. "
+                        f"{kordoc_preflight['parsed_document_count']:,}/"
+                        f"{kordoc_preflight['required_document_count']:,} 문서"
+                    )
                 else:
-                    st.error(
-                        f"Kordoc 명령({command_label})을 현재 실행 환경에서 찾을 수 없습니다. "
-                        "Node.js LTS/npm을 확인한 뒤, 아래 설치 버튼에 동의하면 준비할 수 있습니다."
-                    )
-                    if st.button(
-                        "Kordoc 설치·검증 다시 실행",
-                        key=f"kordoc-install-run-{document_id}-{mcp_scope}",
-                        help="Node.js/npm이 설치된 Windows PC에서 Kordoc을 설치하고 사용자 PATH를 확인합니다.",
-                    ):
-                        with st.spinner("Kordoc 설치·검증 중..."):
-                            install_result = _run_kordoc_installer()
-                        if install_result.get("ok") is True:
-                            kordoc_table_command_status.cache_clear()
-                        _render_kordoc_install_feedback(install_result)
-                missing_ids = ", ".join(missing_document_ids[:10])
-                if missing_ids:
-                    st.info(
-                        f"Kordoc 증거가 없는 문서: {missing_ids}. "
-                        "기존 approved chunk를 직접 수정하거나 게이트를 끄지 마세요."
-                    )
+                    command_status = kordoc_preflight["command_status"]
+                    command_label = str(command_status.get("label") or "kordoc")
+                    missing_document_ids = [
+                        str(item.get("document_id") or "").strip()
+                        for item in kordoc_preflight["missing"]
+                        if str(item.get("document_id") or "").strip()
+                    ]
+                    if command_status.get("available"):
+                        version = str(command_status.get("version") or "unknown")
+                        st.warning(
+                            "설치된 Kordoc으로 증거가 없는 원본을 새 초안에서 재전처리합니다. "
+                            f"기존 승인본·승인 기록·색인은 그대로 보존됩니다 (명령={command_label}, 버전={version})."
+                        )
+                        institution_history_scope = mcp_scope == "selected_institution"
+                        single_reprocess = len(missing_document_ids) == 1 and not institution_history_scope
+                        retry_trigger = False
+                        if institution_history_scope:
+                            st.info(
+                                "기관 전체 범위에는 과거 superseded 이력도 포함됩니다. "
+                                "먼저 '현재 연 규정만' 또는 '선택한 규정' 범위에서 각 규정을 안전 재전처리·승인·색인해 주세요."
+                            )
+                        else:
+                            retry_trigger = st.button(
+                                (
+                                    "설치된 Kordoc으로 안전 재전처리 다시 실행"
+                                    if single_reprocess
+                                    else f"증거 없는 규정 {len(missing_document_ids):,}개 안전 재전처리"
+                                ),
+                                key=f"kordoc-safe-reprocess-{document_id}-{mcp_scope}",
+                                type="primary",
+                                help="기존 문서를 덮어쓰지 않고 새 draft 문서 ID에서 처리합니다.",
+                            )
+                        if retry_trigger:
+                            try:
+                                with _long_operation_status(
+                                    "Kordoc 안전 재전처리 중…",
+                                    failure_stage="Kordoc 재전처리·증거 검증",
+                                    failure_regulation=(
+                                        _workflow_document_label(scope_documents[0])
+                                        if len(scope_documents) == 1
+                                        else f"선택한 {len(missing_document_ids):,}개 규정"
+                                    ),
+                                    failure_policy="실패한 규정을 건너뛰지 않고 재전처리를 중단합니다. 기존 승인본은 유지됩니다.",
+                                ) as reprocess_status:
+                                    reprocess_progress = st.progress(0, text="새 초안 준비 · 0%")
+                                    reprocess_detail = st.empty()
+                                    reprocess_results = _run_background_operation_with_progress(
+                                        lambda report: _safe_kordoc_reprocess_documents(
+                                            settings,
+                                            repository,
+                                            missing_document_ids,
+                                            quality_profile=quality_profile_config,
+                                            progress_callback=report,
+                                        ),
+                                        progress_bar=reprocess_progress,
+                                        detail_box=reprocess_detail,
+                                        start_percent=0,
+                                        end_percent=100,
+                                        label="Kordoc 재전처리·증거 검증",
+                                        estimated_seconds=max(60.0, 120.0 * len(missing_document_ids)),
+                                    )
+                                    reprocess_status.update(
+                                        label="Kordoc 재전처리와 증거 검증 완료",
+                                        state="complete",
+                                    )
+                                for result in reprocess_results:
+                                    _replace_workflow_document_id(
+                                        result.source_document_id,
+                                        result.draft_document_id,
+                                    )
+                                st.session_state[KORDOC_REPROCESS_NOTICE_KEY] = {
+                                    "document_id": str(st.session_state.get("document_id") or ""),
+                                    "count": len(reprocess_results),
+                                    "draft_document_ids": [result.draft_document_id for result in reprocess_results],
+                                }
+                                _go(NAV_RESULTS)
+                                st.rerun()
+                            except KordocReprocessingError as exc:
+                                st.error(_safe_ui_error(exc))
+                                if exc.draft_document_id:
+                                    st.caption(
+                                        f"실패한 새 초안 {exc.draft_document_id}은 승인·색인되지 않았으며 기존 문서는 변경되지 않았습니다."
+                                    )
+                            except (FileNotFoundError, KeyError, ValueError) as exc:
+                                st.error(_safe_ui_error(exc))
+                                _render_workflow_next_button(
+                                    "같은 원본 다시 올려 전처리하기",
+                                    NAV_PREPROCESS,
+                                    key=f"kordoc-recovery-upload-{document_id}-{mcp_scope}",
+                                )
+                            except Exception as exc:
+                                st.error(_safe_ui_error(exc))
+                                st.info("기존 승인본은 변경되지 않았습니다. 원본과 Kordoc 상태를 확인한 뒤 다시 시도해 주세요.")
+                    else:
+                        st.error(
+                            f"Kordoc 명령({command_label})을 현재 실행 환경에서 찾을 수 없습니다. "
+                            "Node.js LTS/npm을 확인한 뒤, 아래 설치 버튼에 동의하면 준비할 수 있습니다."
+                        )
+                        if st.button(
+                            "Kordoc 설치·검증 다시 실행",
+                            key=f"kordoc-install-run-{document_id}-{mcp_scope}",
+                            help="Node.js/npm이 설치된 Windows PC에서 Kordoc을 설치하고 사용자 PATH를 확인합니다.",
+                        ):
+                            with st.spinner("Kordoc 설치·검증 중..."):
+                                install_result = _run_kordoc_installer()
+                            if install_result.get("ok") is True:
+                                kordoc_table_command_status.cache_clear()
+                            _render_kordoc_install_feedback(install_result)
+                    missing_ids = ", ".join(missing_document_ids[:10])
+                    if missing_ids:
+                        st.info(
+                            f"Kordoc 증거가 없는 문서: {missing_ids}. "
+                            "기존 approved chunk를 직접 수정하거나 게이트를 끄지 마세요."
+                        )
         mcp_export_document_id = document_id if mcp_scope == "current_document" else None
         mcp_export_document_ids = selected_document_ids if mcp_scope == "selected_documents" else None
         if mcp_scope in {"selected_documents", "selected_institution"}:
             st.markdown("#### 선택 규정 MCP 준비 상태")
-            st.dataframe(pd.DataFrame(scope_gate["rows"]), width="stretch", hide_index=True)
+            with st.expander("규정별 승인·색인 상세", expanded=not scope_gate["ready"]):
+                st.dataframe(pd.DataFrame(scope_gate["rows"]), width="stretch", hide_index=True)
             if (
                 not scope_gate["ready"]
                 and not scope_gate.get("blocking_document_ids")
@@ -14387,6 +14396,23 @@ def _page_connect(
         if mcp_connection_target is None:
             st.info("위에서 실제 사용할 AI 앱을 하나 선택하면 MCP 이름과 저장 위치 설정이 나타납니다.")
             return
+        if mcp_connection_target in {"chatgpt-remote", "claude-api"} and mcp_bundle_ready and not mcp_profile_scope_mismatch:
+            remote_candidates = _matching_mcp_bundle_state_candidates(document_id, mcp_scope)
+            if remote_candidates and _mcp_bundle_created(ctx, scope=mcp_scope):
+                if not st.checkbox("MCP 파일 묶음 설정을 바꾸거나 다시 생성", key=f"remote-rebuild-{document_id}-{mcp_scope}"):
+                    remote_bundle = remote_candidates[0][1]
+                    st.caption("승인 규정 파일 준비 완료 · Vercel 배포 상태는 아래에서 확인하세요.")
+                    _render_mcp_completion_connection_course(
+                        target=mcp_connection_target,
+                        server_name=str(remote_bundle.get("server_name") or "regulation-mcp"),
+                        bundle_dir=str(remote_bundle.get("bundle_dir") or ""),
+                        runtime_data_dir=str(remote_bundle.get("runtime_data_dir") or ""),
+                        connection_display_value=str(remote_bundle.get("connection_display_value") or ""),
+                    )
+                    with st.expander("AI 앱 등록 후 실제 사용 확인 기록", expanded=False):
+                        st.caption("AI 앱의 새 대화에서 search·fetch를 직접 확인한 뒤 기록하세요.")
+                        _render_beginner_connection_confirmation(document_id, scope=mcp_scope)
+                    return
         if mcp_beginner_mode:
             beginner_target_paths = {
                 "claude-code": (
@@ -14403,11 +14429,11 @@ def _page_connect(
                 ),
                 "chatgpt-remote": (
                     "ChatGPT 원격 HTTPS 연결",
-                    "Vercel 배포 준비 묶음 생성 → 배포 → HTTPS /mcp 주소 입력 후 묶음 재생성 → ChatGPT 커넥터 등록 → 새 대화에서 도구 호출 확인",
+                    "MCP 묶음 생성 → 이 화면에서 Vercel 로그인·배포 → 자동 연결 검사 → 주소 복사 → ChatGPT 앱 등록",
                 ),
                 "claude-api": (
                     "Claude 원격 HTTPS 연결",
-                    "Vercel 배포 준비 묶음 생성 → 배포 → HTTPS /mcp 주소 입력 후 묶음 재생성 → Claude 원격 연결 등록 → 새 대화에서 도구 호출 확인",
+                    "MCP 묶음 생성 → 이 화면에서 Vercel 로그인·배포 → 자동 연결 검사 → 주소 복사 → Claude 커넥터 등록",
                 ),
             }
             target_path_title, target_path_steps = beginner_target_paths[
@@ -14433,9 +14459,8 @@ def _page_connect(
         st.caption(f"선택된 연결 방식: {mcp_mode_labels[mcp_mode]}")
         if mcp_mode == "http":
             st.info(
-                "MCP HTTP는 아래에서 접속 URL을 자동으로 만든 뒤 연결 설정에 포함합니다. 외부 AI에서 연결하려면 "
-                "Vercel 또는 기관 서버에 배포하고 접근 가능한 HTTPS /mcp 주소를 사용해야 합니다. GitHub에는 소스와 배포 산출물을 올릴 수 있지만, "
-                "실제 답변에는 승인된 색인 데이터가 배포 서버에도 있어야 합니다."
+                "먼저 아래에서 MCP 파일 묶음을 만드세요. 완료되면 **Vercel에 배포하고 AI에 연결하기**에서 "
+                "로그인·배포·연결 검사를 진행할 수 있습니다. 주소는 배포 후 자동으로 표시됩니다."
             )
             mcp_profile_options = ["bundle", "chatgpt-remote", "claude-remote", "claude-code"]
             mcp_transport = "streamable-http"
@@ -14464,47 +14489,42 @@ def _page_connect(
         mcp_public_url_input = ""
         mcp_target_ready = True
         if mcp_mode == "http":
-            st.markdown("#### Vercel MCP HTTPS 주소")
-            if mcp_connection_target == "chatgpt-remote":
-                st.info(
-                    "ChatGPT는 웹의 Developer mode에서 원격 MCP 앱을 등록합니다. "
-                    "Pro는 개발자 모드에서 read/fetch 도구 연결이 가능하고, full MCP는 "
-                    "Business·Enterprise·Edu에서 제공됩니다. 워크스페이스 관리자 승인과 "
-                    "권한 설정에 따라 메뉴가 보이지 않을 수 있습니다. ChatGPT는 로컬 MCP에 "
-                    "직접 연결하지 않으며, 사설망 서버에는 Secure MCP Tunnel이 필요합니다."
+            with st.expander("고급: 이미 배포한 HTTPS 주소 직접 입력", expanded=False):
+                st.markdown("#### Vercel MCP HTTPS 주소")
+                if mcp_connection_target == "chatgpt-remote":
+                    st.info(
+                        "ChatGPT의 Plugins에서 사용자 지정 MCP 서버를 추가합니다. "
+                        "계정에 따라 앱·개발자 모드 메뉴로 표시될 수 있으며 워크스페이스 권한이 필요합니다. "
+                        "접속 가능한 HTTPS 주소를 사용하고, 사설망 서버는 Secure MCP Tunnel 안내를 확인하세요."
+                    )
+                    _link_button(
+                        "OpenAI 공식 ChatGPT MCP 지원 범위",
+                        "https://developers.openai.com/plugins/quickstart",
+                        key=f"openai-chatgpt-mcp-help-{document_id}",
+                    )
+                    _link_button(
+                        "OpenAI Secure MCP Tunnel 안내",
+                        "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
+                        key=f"openai-secure-mcp-tunnel-{document_id}",
+                    )
+                mcp_public_url_input = st.text_input(
+                    "배포된 Vercel HTTPS `/mcp` 주소 (첫 배포 전에는 비워도 됨)",
+                    value="",
+                    placeholder="https://your-project.vercel.app/mcp",
+                    key=f"mcp-public-url-{document_id}",
                 )
-                _link_button(
-                    "OpenAI 공식 ChatGPT MCP 지원 범위",
-                    "https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta",
-                    key=f"openai-chatgpt-mcp-help-{document_id}",
+                mcp_http_url = _build_mcp_http_url(
+                    host=mcp_host,
+                    port=int(mcp_port),
+                    public_url=mcp_public_url_input,
                 )
-                _link_button(
-                    "OpenAI Secure MCP Tunnel 안내",
-                    "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
-                    key=f"openai-secure-mcp-tunnel-{document_id}",
-                )
-            mcp_public_url_input = st.text_input(
-                "배포된 Vercel HTTPS `/mcp` 주소 (첫 배포 전에는 비워도 됨)",
-                value="",
-                placeholder="https://your-project.vercel.app/mcp",
-                key=f"mcp-public-url-{document_id}",
-            )
-            mcp_http_url = _build_mcp_http_url(
-                host=mcp_host,
-                port=int(mcp_port),
-                public_url=mcp_public_url_input,
-            )
-            st.markdown("**생성된 MCP HTTP URL**")
-            if mcp_http_url.startswith("https://"):
-                st.code(mcp_http_url, language=None)
-                st.success("공개 HTTPS MCP URL이 연결 설정과 생성 파일에 포함됩니다.")
-            else:
-                st.code("아직 없음 — 배포 준비 묶음부터 생성하세요.", language=None)
-                st.warning(
-                    "아직 HTTPS 주소가 없습니다. 아래에서 **배포 준비용 MCP 묶음**을 먼저 "
-                    "만든 뒤 Vercel에 배포하세요. 고정 `https://.../mcp` 주소가 생기면 "
-                    "이 화면으로 돌아와 주소를 넣고 묶음을 다시 만들어야 실제 연결할 수 있습니다."
-                )
+                st.markdown("**생성된 MCP HTTP URL**")
+                if mcp_http_url.startswith("https://"):
+                    st.code(mcp_http_url, language=None)
+                    st.success("공개 HTTPS MCP URL이 연결 설정과 생성 파일에 포함됩니다.")
+                else:
+                    st.code("아직 없음 — 배포 준비 묶음부터 생성하세요.", language=None)
+                    st.caption("처음 배포할 때는 비워 두세요. 묶음 생성 후 배포 버튼을 누르면 주소를 자동으로 확인합니다.")
         else:
             mcp_http_url = ""
             st.markdown("#### 2. MCP 로컬 연결")
@@ -14528,62 +14548,67 @@ def _page_connect(
         mcp_bundle_dir_key = f"mcp-bundle-dir-{document_id}"
         if mcp_bundle_dir_key not in st.session_state:
             st.session_state[mcp_bundle_dir_key] = _default_mcp_bundle_directory()
-        st.button(
-            "Windows 탐색기에서 저장 폴더 선택",
-            key=f"select-mcp-bundle-dir-{document_id}",
-            on_click=_select_windows_output_directory,
-            args=(mcp_bundle_dir_key, st.session_state[mcp_bundle_dir_key]),
-        )
-        picker_error = st.session_state.get(f"{mcp_bundle_dir_key}:picker_error")
-        if picker_error:
-            st.error(picker_error)
-        if not str(st.session_state.get(mcp_bundle_dir_key) or "").strip():
-            st.session_state[mcp_bundle_dir_key] = _default_mcp_bundle_directory()
-        mcp_bundle_dir = st.text_input(
-            "MCP 파일 묶음을 만들 폴더",
-            key=mcp_bundle_dir_key,
-        )
-        mcp_bundle_output_dir = _resolve_operator_output_path(mcp_bundle_dir)
-        mcp_save_mode = st.radio(
-            "저장 방식",
-            ["folder-and-zip", "folder-only"],
-            format_func=lambda value: {
-                "folder-and-zip": "폴더 + 전달용 ZIP (권장)",
-                "folder-only": "이 PC에 폴더만 저장",
-            }[value],
-            key=f"mcp-save-mode-{document_id}",
-            horizontal=True,
-            help=(
-                "AI 앱 연결은 생성된 폴더를 사용합니다. ZIP은 다른 PC나 담당자에게 전달할 때만 "
-                "필요하며, 다른 PC에서 로컬 STDIO로 실행하려면 그 PC에 Python 3.11 이상이 필요합니다."
-            ),
-        )
-        if mcp_save_mode == "folder-and-zip" and mcp_mode == "stdio":
-            st.info(
-                "전달용 ZIP을 다른 Windows PC에서 로컬 STDIO로 실행하려면 대상 PC에 "
-                "Python 3.11 이상을 설치해야 합니다. 'Python 설치 불필요'는 이 PC에 있는 "
-                "Windows 실행판과 생성 폴더를 함께 사용하는 경우에만 해당합니다."
+        remote_deployment = mcp_connection_target in {"chatgpt-remote", "claude-api"}
+        save_mode_key = f"mcp-save-mode-{document_id}"
+        if save_mode_key not in st.session_state and remote_deployment:
+            st.session_state[save_mode_key] = "folder-only"
+        with st.expander("고급: 저장 폴더·전달용 ZIP", expanded=not remote_deployment):
+            st.button(
+                "Windows 탐색기에서 저장 폴더 선택",
+                key=f"select-mcp-bundle-dir-{document_id}",
+                on_click=_select_windows_output_directory,
+                args=(mcp_bundle_dir_key, st.session_state[mcp_bundle_dir_key]),
             )
-        mcp_handoff_wheel_path = _operator_handoff_wheel_path()
-        if mcp_save_mode == "folder-and-zip" and mcp_handoff_wheel_path is None:
-            mcp_target_ready = False
-            st.warning(
-                "다른 PC에서 설치할 wheel 파일이 없어 전달용 ZIP을 만들 수 없습니다. "
-                "소스 실행은 먼저 `python -m build --wheel`을 실행하고, Windows 실행판은 "
-                "공식 portable ZIP을 다시 받아 주세요. 이 PC에서만 쓸 경우 '폴더만 저장'을 선택할 수 있습니다."
+            picker_error = st.session_state.get(f"{mcp_bundle_dir_key}:picker_error")
+            if picker_error:
+                st.error(picker_error)
+            if not str(st.session_state.get(mcp_bundle_dir_key) or "").strip():
+                st.session_state[mcp_bundle_dir_key] = _default_mcp_bundle_directory()
+            mcp_bundle_dir = st.text_input(
+                "MCP 파일 묶음을 만들 폴더",
+                key=mcp_bundle_dir_key,
             )
-        if st.button("Windows 탐색기에서 현재 저장 폴더 열기", key=f"open-mcp-bundle-dir-{document_id}"):
-            try:
-                _open_directory_in_explorer(mcp_bundle_output_dir)
-                st.success(f"MCP 저장 폴더를 열었습니다: {mcp_bundle_output_dir}")
-            except OSError as exc:
-                st.error(_safe_ui_error(exc))
-        mcp_runtime_data_dir = mcp_bundle_output_dir / "data"
-        mcp_bundle_zip = _mcp_bundle_zip_output_path(mcp_bundle_output_dir)
-        if mcp_save_mode == "folder-and-zip":
-            st.caption(f"최종 ZIP 저장 위치: {mcp_bundle_zip}")
-        else:
-            st.caption(f"최종 폴더 저장 위치: {mcp_bundle_output_dir}")
+            mcp_bundle_output_dir = _resolve_operator_output_path(mcp_bundle_dir)
+            mcp_save_mode = st.radio(
+                "저장 방식",
+                ["folder-and-zip", "folder-only"],
+                format_func=lambda value: {
+                    "folder-and-zip": "폴더 + 전달용 ZIP (권장)",
+                    "folder-only": "이 PC에 폴더만 저장",
+                }[value],
+                key=f"mcp-save-mode-{document_id}",
+                horizontal=True,
+                help=(
+                    "AI 앱 연결은 생성된 폴더를 사용합니다. ZIP은 다른 PC나 담당자에게 전달할 때만 "
+                    "필요하며, 다른 PC에서 로컬 STDIO로 실행하려면 그 PC에 Python 3.11 이상이 필요합니다."
+                ),
+            )
+            if mcp_save_mode == "folder-and-zip" and mcp_mode == "stdio":
+                st.info(
+                    "전달용 ZIP을 다른 Windows PC에서 로컬 STDIO로 실행하려면 대상 PC에 "
+                    "Python 3.11 이상을 설치해야 합니다. 'Python 설치 불필요'는 이 PC에 있는 "
+                    "Windows 실행판과 생성 폴더를 함께 사용하는 경우에만 해당합니다."
+                )
+            mcp_handoff_wheel_path = _operator_handoff_wheel_path()
+            if mcp_save_mode == "folder-and-zip" and mcp_handoff_wheel_path is None:
+                mcp_target_ready = False
+                st.warning(
+                    "다른 PC에서 설치할 wheel 파일이 없어 전달용 ZIP을 만들 수 없습니다. "
+                    "소스 실행은 먼저 `python -m build --wheel`을 실행하고, Windows 실행판은 "
+                    "공식 portable ZIP을 다시 받아 주세요. 이 PC에서만 쓸 경우 '폴더만 저장'을 선택할 수 있습니다."
+                )
+            if st.button("Windows 탐색기에서 현재 저장 폴더 열기", key=f"open-mcp-bundle-dir-{document_id}"):
+                try:
+                    _open_directory_in_explorer(mcp_bundle_output_dir)
+                    st.success(f"MCP 저장 폴더를 열었습니다: {mcp_bundle_output_dir}")
+                except OSError as exc:
+                    st.error(_safe_ui_error(exc))
+            mcp_runtime_data_dir = mcp_bundle_output_dir / "data"
+            mcp_bundle_zip = _mcp_bundle_zip_output_path(mcp_bundle_output_dir)
+            if mcp_save_mode == "folder-and-zip":
+                st.caption(f"최종 ZIP 저장 위치: {mcp_bundle_zip}")
+            else:
+                st.caption(f"최종 폴더 저장 위치: {mcp_bundle_output_dir}")
         suggested_mcp_server_name = _default_mcp_server_name(mcp_bundle_output_dir, selected_profile_id)
         mcp_server_name_key = f"mcp-server-name-{document_id}"
         current_mcp_server_name = str(
@@ -14646,19 +14671,9 @@ def _page_connect(
                 f"{BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX}:{document_id}:",
                 output_confirmation_key,
             )
-            if not st.session_state.get(output_confirmation_key):
-                _render_beginner_action_marker(
-                    4,
-                    "저장 위치·방식과 MCP 이름을 확인하세요",
-                    "저장 폴더, ZIP 포함 여부, MCP 이름과 연결 대상을 확인한 뒤 아래 확인란을 선택하세요.",
-                    control_key_prefix=output_confirmation_key,
-                    substep=4,
-                )
-            beginner_output_confirmed = st.checkbox(
-                "저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.",
-                key=output_confirmation_key,
-                help="이 값 중 하나를 바꾸면 변경된 설정을 다시 확인해야 합니다.",
-            )
+            # Valid form fields are configuration readiness, not a human approval claim.
+            st.session_state[output_confirmation_key] = True
+            st.caption(f"연결 준비: {mcp_connection_target_labels.get(mcp_connection_target, mcp_connection_target)} · {mcp_server_name}")
         elif mcp_beginner_mode:
             beginner_output_confirmed = False
         if mcp_beginner_mode and not beginner_output_confirmed:
@@ -14731,15 +14746,14 @@ def _page_connect(
             "claude-api": "claude_remote",
         }
         mcp_target_file_key = mcp_target_file_keys.get(mcp_connection_target, "connect")
-        st.markdown("#### 최종 산출물 생성")
+        st.markdown("#### 연결 파일 준비")
         st.caption(
-            "④ MCP 생성·업데이트 한 번으로 선택 범위의 규정 목록·목차·조문 계층 색인과 "
-            "runtime manifest를 자동 생성합니다. 개별 규정 파일 여러 개와 통합 규정집 모두 동일하게 처리됩니다."
+            "선택한 승인 규정을 검색할 수 있도록 준비합니다. 통합 규정집도 한 번에 처리합니다."
         )
         if mcp_mode == "http" and not mcp_public_url:
             st.caption(
-                "지금 버튼은 승인 데이터와 Vercel 배포 준비 파일을 만듭니다. 배포 후 생긴 "
-                "HTTPS `/mcp` 주소를 위에 입력해 다시 생성해야 AI 연결 설정이 완성됩니다."
+                "첫 단계입니다. 묶음 생성이 끝나면 바로 아래의 Vercel 배포 버튼으로 진행하세요. "
+                "배포 후 표시되는 주소를 복사하면 되며, 주소를 넣기 위해 묶음을 다시 만들 필요가 없습니다."
             )
         else:
             st.caption("일반 사용자는 아래 버튼만 누르면 됩니다. JSON과 명령어는 아래 전산 담당자용 영역에 숨겨져 있습니다.")
@@ -15140,7 +15154,12 @@ def _page_connect(
                         generated_file_lines.append(
                             f"- {label}: `{Path(str(generated_path)).name}`"
                         )
-                st.markdown("\n".join(generated_file_lines))
+                with st.expander("생성된 파일 자세히 보기", expanded=False):
+                    st.markdown("\n".join(generated_file_lines))
+                if mcp_connection_target in {"chatgpt-remote", "claude-api"}:
+                    # Remove the now-completed generation form and its tour marker.
+                    # The matching bundle proof opens the deployment wizard on rerun.
+                    st.rerun()
             except Exception as exc:
                 raw_error_text = str(exc)
                 safe_error_text = _safe_ui_error(exc)
@@ -15375,16 +15394,14 @@ def _page_connect(
                     bundle_state.get("connection_display_value") or ""
                 ),
             )
-            st.markdown("### 마지막 확인: 실제 AI 대화에서 검색하기")
-            st.caption(
-                "위의 앱 등록·활성화·연결 진단을 마친 뒤 새 AI 대화를 열어 "
-                "search와 fetch를 차례로 호출하세요. 확인란은 운영자가 직접 확인한 "
-                "결과를 기록하며, 앱이 실제 대화의 도구 실행을 자동 검증한 증거는 아닙니다."
-            )
-            _render_beginner_connection_confirmation(
-                document_id,
-                scope=mcp_scope,
-            )
+            with st.expander("AI 앱 등록 후 실제 사용 확인 기록", expanded=installed_target not in {"chatgpt-remote", "claude-api"}):
+                st.markdown("### 마지막 확인: 실제 AI 대화에서 검색하기")
+                st.caption(
+                    "위의 앱 등록·활성화·연결 진단을 마친 뒤 새 AI 대화를 열어 "
+                    "search와 fetch를 차례로 호출하세요. 확인란은 운영자가 직접 확인한 "
+                    "결과를 기록하며, 앱이 실제 대화의 도구 실행을 자동 검증한 증거는 아닙니다."
+                )
+                _render_beginner_connection_confirmation(document_id, scope=mcp_scope)
         with st.expander("전산 담당자용 JSON/명령어 보기", expanded=False):
             if isinstance(mcp_quickstart, dict):
                 for warning in mcp_quickstart.get("warnings") or []:
@@ -16032,6 +16049,8 @@ def _page_admin() -> None:
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="공공기관 규정 MCP 빌더", layout="wide")
+# The Streamlit Cloud Deploy action is unrelated to this program's Vercel deployment.
+st.set_option("client.toolbarMode", "viewer")
 st.session_state.setdefault(MCP_RUNTIME_INTEGRITY_RENDER_NONCE_KEY, 0)
 
 _apply_ai_connection_overrides()
@@ -16189,7 +16208,7 @@ with st.sidebar:
                 "이 규정은 AI 추가 검수를 쓰지 않아 '② 결과 확인'을 건너뜁니다. "
                 "품질 경고와 상세 정보는 '③ 검수하고 승인' 화면에서 볼 수 있습니다."
             )
-        with st.expander("사용할 AI 변경", expanded=not beginner_sidebar):
+        with st.expander("사용할 AI 변경", expanded=False):
             st.session_state[AI_USAGE_PATH_SIDEBAR_WIDGET_KEY] = _ai_usage_path()
             st.radio(
                 "Qwen 또는 MCP 선택",

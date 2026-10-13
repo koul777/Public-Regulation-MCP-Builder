@@ -25,7 +25,7 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
             "# 이전 업데이트: 2026년 7월 29일~8월 1일",
         )
         prior_heading = prior_headings[-1]
-        product_heading = f"# PR MCP Builder v{__version__}"
+        product_heading = "# PR MCP Builder"
         history_anchor = '<a id="update-history"></a>'
 
         self.assertTrue(readme.startswith('<p align="center">'))
@@ -270,8 +270,8 @@ class BeginnerQuickstartDocsTests(unittest.TestCase):
         rendered_source = re.sub(r"<!--.*?-->", "", readme, flags=re.DOTALL)
 
         self.assertIn("방법 B — Codex CLI / Codex IDE 로컬 STDIO", rendered_source)
-        self.assertIn("ChatGPT 웹의 Developer mode", rendered_source)
-        self.assertIn("ChatGPT는 로컬 MCP 서버에 직접 연결하지 않고", rendered_source)
+        self.assertIn("Add custom MCP server", rendered_source)
+        self.assertIn("프로그램 완료 화면의 `https://…/mcp` 전체 주소", rendered_source)
         self.assertIn("OpenAI Secure MCP Tunnel", rendered_source)
         self.assertNotIn("ChatGPT Desktop 로컬 STDIO", rendered_source)
         self.assertNotIn("ChatGPT Desktop / Codex CLI / Codex IDE", rendered_source)
