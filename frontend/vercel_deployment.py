@@ -61,6 +61,19 @@ def _finish_job(state: dict[str, Any], runtime: Path) -> None:
         state["projects_failed"] = True
     elif kind == "deployment":
         state["deployment"] = service.read_deployment(runtime)
+    if kind == "deployment" and state.get("deployment"):
+        # A successful first upload creates a project that was absent from the
+        # cached list. Refresh before offering another deployment to that target.
+        state["projects"] = {}
+        state.pop("projects_failed", None)
+        shared = dict(st.session_state.get(ACCOUNT_STATE_KEY) or {})
+        shared["projects"] = {}
+        st.session_state[ACCOUNT_STATE_KEY] = shared
+        receipt = state["deployment"]
+        scope = receipt.get("scope")
+        if scope:
+            key = "vercel-wizard-" + service.deployment_identity(runtime)
+            st.session_state[key + "-project-mode-" + scope] = "existing"
     if state.get("error_code") == "login_required":
         state.pop("account", None)
         state.pop("projects", None)
@@ -89,6 +102,15 @@ def _render_result(
     runtime: Path, deployment: dict[str, Any], *, server_name: str, target: str,
     key: str, start: Callable, update_failed: bool,
 ) -> bool:
+    if deployment.get("deployment_url") and not deployment.get("url"):
+        st.warning("업로드 완료 · 배포 상태 확인이 필요합니다.")
+        st.caption("Vercel에 파일을 보냈습니다. 아래 버튼으로 완료 상태와 연결 주소를 확인합니다. 파일을 다시 올리지 않습니다.")
+        if st.button("배포 상태 확인하고 연결 검사", key=key + "-verify", type="primary"):
+            start("deployment", lambda progress: service.verify_deployment(runtime, deployment, progress))
+        st.link_button("Vercel 배포 상태·로그 보기",
+                       f"https://vercel.com/{deployment['scope']}/{deployment['project']}/deployments")
+        st.caption("연결 검사가 끝나면 AI 앱에 등록할 고정 MCP 주소가 나타납니다.")
+        return st.checkbox("설정 변경·다시 배포", key=key + "-again")
     if deployment.get("verified") and not update_failed:
         st.success("배포·검색 검사 완료 — 다음은 AI 앱에 주소 등록입니다.")
     elif update_failed:
@@ -180,6 +202,11 @@ def render_vercel_deployment(
         return
     if state.get("error"):
         st.error(state["error"])
+        if state.get("error_code") == "cli_outdated":
+            hint("Vercel 배포 도구를 업데이트하세요", "업데이트 후 계정을 다시 연결하면 이어서 진행할 수 있습니다.", key + "-install")
+            if st.button("Vercel 배포 도구 업데이트", key=key + "-install", type="primary"):
+                start("tool", service.install_vercel)
+            return
         if state.get("error_code") == "login_required":
             if st.button("Vercel 계정 다시 연결", key=key + "-reauth", type="primary"):
                 start("connection", lambda progress: service.connect_account(runtime.parent, str(previous.get("scope") or ""), progress))

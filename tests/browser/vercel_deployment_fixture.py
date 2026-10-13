@@ -48,7 +48,13 @@ service.read_previous_deployment = lambda runtime: (
     {**receipt, "identity": "older-bundle", "project": "previous-regulations"}
     if st.query_params.get("scenario") == "changed" else {}
 )
-service.verify_deployment = lambda runtime, result, progress: operation(receipt, progress, "검색·본문 조회 검사 중")
+def verify(runtime, result, progress):
+    with (base / "verification_calls.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"pending": bool(result.get("deployment_url") and not result.get("url"))}) + "\n")
+    return operation(receipt, progress, "검색·본문 조회 검사 중")
+
+
+service.verify_deployment = verify
 
 
 def deploy(**kwargs):
@@ -63,12 +69,17 @@ key = "vercel-wizard-" + service.deployment_identity(runtime)
 if st.session_state.get("fixture-scenario") != scenario:
     st.session_state["fixture-scenario"] = scenario
     state = {"deployment": {}}
-    if scenario in {"ready", "complete", "failed", "changed"}:
+    if scenario in {"ready", "complete", "failed", "changed", "pending"}:
         state.update(account=account, projects=projects)
     if scenario in {"complete", "failed"}:
         state["deployment"] = {**receipt, "verified": scenario == "complete"}
         if scenario == "failed":
             state["deployment"].update(diagnosis="connection", checks={})
+    if scenario == "pending":
+        state["deployment"] = {**receipt, "deployment_url": "https://regulation-demo-build123.vercel.app",
+                               "status": "pending", "verified": False}
+        state["deployment"].pop("url")
+        state["deployment"].pop("checks")
     st.session_state[key] = state
 
 st.set_page_config(page_title="규정 MCP 배포 검증", layout="centered")

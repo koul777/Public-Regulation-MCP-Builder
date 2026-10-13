@@ -3575,12 +3575,19 @@ class StreamlitOperatorCompletionRegressionTests(unittest.TestCase):
         namespace = self._namespace()
         ctx = self._ready_context()
         namespace["st"].session_state[f"mcp-connection-target-{ctx['document_id']}"] = "chatgpt-remote"
-        for receipt, expected in (({}, "계정 연결"), ({"verified": False}, "연결 검사"), ({"verified": True}, "주소를 AI 앱에 등록")):
+        for receipt, expected in (
+            ({}, "계정 연결"),
+            ({"deployment_url": "https://build.vercel.app", "verified": False}, "배포 상태 확인하고 연결 검사"),
+            ({"url": "https://demo.vercel.app/mcp", "verified": False}, "연결 검사"),
+            ({"url": "https://demo.vercel.app/mcp", "verified": True}, "주소를 AI 앱에 등록"),
+        ):
             with self.subTest(receipt=receipt):
                 namespace["_current_remote_deployment"] = lambda _ctx: receipt
                 message, page = namespace["_next_action"](ctx)
                 self.assertEqual("use", page)
                 self.assertIn(expected, message)
+                if receipt.get("deployment_url") and not receipt.get("url"):
+                    self.assertNotIn("주소가 생성", message)
                 self.assertFalse(namespace["_workflow_states"](ctx)[-1])
 
     def test_current_client_confirmation_is_reachable_in_advanced_mode(self) -> None:

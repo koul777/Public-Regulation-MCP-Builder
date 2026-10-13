@@ -59,11 +59,16 @@ def vercel_command() -> list[str]:
     raise DeploymentError("Vercel 배포 도구를 설치해야 합니다. 아래 설치 버튼을 누르세요.", code="cli_missing")
 
 
-def _environment() -> dict[str, str]:
+def _environment(cwd: Path | None = None) -> dict[str, str]:
     # Do not inherit a project link, a CI credential or MCP secrets from the builder.
     env = {key: value for key, value in os.environ.items()
-           if not key.upper().startswith(("VERCEL_", "MCP_"))}
+           if not key.upper().startswith(("VERCEL_", "MCP_", "GIT_"))}
     env.update({"NO_COLOR": "1", "VERCEL_TELEMETRY_DISABLED": "1"})
+    if cwd is not None:
+        # `vercel link --yes` can otherwise discover the builder's parent Git
+        # repository and connect its origin automatically. Git ignores a ceiling
+        # equal to its starting directory, so stop traversal at the parent.
+        env["GIT_CEILING_DIRECTORIES"] = str(cwd.resolve().parent)
     return env
 
 
@@ -71,7 +76,7 @@ def _run(args: list[str], *, cwd: Path, timeout: int = 90) -> str:
     try:
         result = subprocess.run(
             [*vercel_command(), *args, "--no-color", "--non-interactive"],
-            cwd=cwd, env=_environment(), stdin=subprocess.DEVNULL,
+            cwd=cwd, env=_environment(cwd), stdin=subprocess.DEVNULL,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -81,6 +86,9 @@ def _run(args: list[str], *, cwd: Path, timeout: int = 90) -> str:
         raise DeploymentError("배포 도구를 실행하지 못했습니다. Node.js와 Vercel 도구 설치 상태를 확인하세요.") from None
     if result.returncode:
         detail = (result.stderr + result.stdout).lower()
+        if any(term in detail for term in ("unknown option", "unknown or unexpected option",
+                                            "unrecognized option", "unexpected option")):
+            raise DeploymentError("Vercel 배포 도구가 이 프로그램의 연결 방식을 지원하지 않습니다. 배포 도구를 업데이트하고 다시 연결하세요.", code="cli_outdated")
         if any(term in detail for term in ("login", "log in", "invalid token", "token expired", "no credentials", "unauthorized")):
             raise DeploymentError("Vercel 로그인이 필요하거나 만료되었습니다. 계정을 다시 연결하세요.", code="login_required")
         if any(term in detail for term in ("enotfound", "econnreset", "etimedout", "network error", "fetch failed")):
@@ -98,7 +106,7 @@ def _json(args: list[str], *, cwd: Path) -> dict[str, Any]:
             raise ValueError
         return result
     except (ValueError, TypeError):
-        raise DeploymentError("Vercel 응답을 읽지 못했습니다. 배포 도구를 설치·업데이트한 뒤 다시 시도하세요.") from None
+        raise DeploymentError("Vercel 응답을 읽지 못했습니다. 배포 도구를 설치·업데이트한 뒤 다시 시도하세요.", code="cli_outdated") from None
 
 
 def install_vercel(progress: Progress) -> dict[str, Any]:
@@ -134,7 +142,7 @@ def _pages(args: list[str], field: str, *, cwd: Path) -> list[dict[str, Any]]:
         page = _json([*args, "--limit", "100", *(["--next", cursor] if cursor else [])], cwd=cwd)
         values = page.get(field)
         if not isinstance(values, list):
-            raise DeploymentError("Vercel 목록 형식이 달라졌습니다. 배포 도구를 업데이트하세요.")
+            raise DeploymentError("Vercel 목록 형식이 달라졌습니다. 배포 도구를 업데이트하세요.", code="cli_outdated")
         items.extend(item for item in values if isinstance(item, dict))
         cursor = str((page.get("pagination") or {}).get("next") or "")
         if not cursor:
@@ -162,7 +170,7 @@ def login(cwd: Path, progress: Progress) -> dict[str, Any]:
     progress("열리는 Vercel 브라우저에서 로그인·승인을 마치세요. 최대 5분 기다립니다.")
     try:
         process = subprocess.Popen(
-            [*vercel_command(), "login", "--no-color"], cwd=cwd, env=_environment(),
+            [*vercel_command(), "login", "--no-color"], cwd=cwd, env=_environment(cwd),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -261,6 +269,8 @@ def read_previous_deployment(runtime: Path) -> dict[str, Any]:
 
 
 def _save_deployment(runtime: Path, result: dict[str, Any]) -> None:
+    if result.get("identity") != deployment_identity(runtime):
+        raise DeploymentError("규정 묶음이 변경됐습니다. 새 묶음을 배포한 뒤 연결을 검사하세요.", code="stale_bundle")
     path = _receipt_path(runtime)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
@@ -294,6 +304,15 @@ def production_mcp_url(inspection: dict[str, Any]) -> str:
 def verify_deployment(runtime: Path, result: dict[str, Any], progress: Progress) -> dict[str, Any]:
     if result.get("identity") != deployment_identity(runtime):
         raise DeploymentError("규정 묶음이 변경됐습니다. 새 묶음을 배포한 뒤 연결을 검사하세요.", code="stale_bundle")
+    if not result.get("url"):
+        # A successful upload is recoverable even when inspection timed out or
+        # the app was closed before the stable Production alias was confirmed.
+        # Never present the deployment-specific URL as an AI connection address.
+        progress("Production 완료 상태와 고정 주소 확인 중")
+        inspection = _json(["inspect", result["deployment_url"], "--scope", _slug(result["scope"])],
+                           cwd=runtime.parent)
+        result = {**result, "url": production_mcp_url(inspection), "status": "ready"}
+        _save_deployment(runtime, result)
     progress("배포 완료 · 원격 MCP 검색과 본문 조회 검사 중")
     report = run_mcp_client_config_smoke(
         server_name=result["server_name"], remote_url=result["url"],
@@ -357,11 +376,11 @@ def deploy_public_runtime(
         urls = re.findall(r"https://[a-zA-Z0-9.-]+\.vercel\.app", output)
         if not urls:
             raise DeploymentError("배포 응답에서 주소를 찾지 못했습니다. Vercel 대시보드에서 배포 결과를 확인하세요.")
-        progress("Production 완료 상태와 고정 주소 확인 중")
-        inspection = _json(["inspect", urls[-1], "--scope", scope], cwd=stage)
         result = {"identity": identity, "server_name": server_name, "scope": scope,
-                  "project": project, "url": production_mcp_url(inspection),
+                  "project": project, "deployment_url": urls[-1], "status": "pending",
                   "verified": False, "deployed_at": time.time()}
+        # Save the remote upload identity before the next network operation, so
+        # a retry/restart only inspects and tests it instead of publishing again.
         _save_deployment(runtime, result)
         return verify_deployment(runtime, result, progress)
     except DeploymentError:

@@ -33,11 +33,12 @@ async function main() {
     const errors=[];
     page.on('pageerror',error=>errors.push(String(error)));
     const measurements=[];
-    for(const scenario of ['first','ready','complete','failed']) {
+    for(const scenario of ['first','ready','complete','failed','pending']) {
       await page.goto(`http://127.0.0.1:${port}/?scenario=${scenario}`);
       await page.getByText('Vercel에 배포하고 AI에 연결하기',{exact:true}).waitFor();
       const finalControl=scenario==='first' ? 'Vercel 계정 연결' : scenario==='ready'
-        ? 'Vercel에 배포하고 연결 검사' : scenario==='complete' ? 'ChatGPT 열기' : '연결 다시 검사';
+        ? 'Vercel에 배포하고 연결 검사' : scenario==='complete' ? 'ChatGPT 열기'
+          : scenario==='pending' ? '배포 상태 확인하고 연결 검사' : '연결 다시 검사';
       await page.getByRole(scenario==='complete' ? 'link' : 'button',{name:finalControl,exact:true}).waitFor();
       await page.getByRole('button',{name:'Stop',exact:true}).waitFor({state:'hidden'});
       await page.getByText('합성 테스트 화면 · 실제 Vercel 업로드 없음',{exact:true}).scrollIntoViewIfNeeded();
@@ -84,6 +85,17 @@ async function main() {
     await page.getByRole('button',{name:'연결 다시 검사',exact:true}).click();
     await page.getByText('배포·검색 검사 완료 — 다음은 AI 앱에 주소 등록입니다.',{exact:true}).waitFor();
     assert.equal(calls().length,1);
+    // A receipt saved after upload can resume inspection without exposing an unstable build URL.
+    await page.goto(`http://127.0.0.1:${port}/?scenario=pending`);
+    await page.getByText('업로드 완료 · 배포 상태 확인이 필요합니다.',{exact:true}).waitFor();
+    assert.equal(await page.locator('code').count(),0);
+    assert.equal(await page.getByRole('button',{name:'HTTPS 연결 설정 다운로드',exact:true}).count(),0);
+    assert.equal(await page.getByText('https://regulation-demo-build123.vercel.app',{exact:false}).count(),0);
+    await page.getByRole('button',{name:'배포 상태 확인하고 연결 검사',exact:true}).click();
+    await page.getByText('배포·검색 검사 완료 — 다음은 AI 앱에 주소 등록입니다.',{exact:true}).waitFor();
+    assert.equal(calls().length,1,'pending receipt recovery repeated an upload');
+    const verifications=fs.readFileSync(path.join(artifact,'verification_calls.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(verifications,[{pending:false},{pending:true}]);
     // A changed bundle recalls its destination, but never old success or public consent.
     await page.goto(`http://127.0.0.1:${port}/?scenario=changed`);
     await page.getByText('새 묶음은 아직 배포하지 않았습니다.',{exact:true}).waitFor();
