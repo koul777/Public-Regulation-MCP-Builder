@@ -718,9 +718,10 @@ class StructureDetectorTests(unittest.TestCase):
             [
                 "시설관리규정",
                 "제1조(목적) 시설 관리 기준을 정한다.",
-                "[별표 1]",
+                "[별표 1] 규정 견본",
                 "보안업무지침",
                 "제1조(목적) 견본 본문이다.",
+                "규정 견본",
                 "개인정보처리지침",
                 "제1조(목적) 두 번째 견본 본문이다.",
             ]
@@ -751,6 +752,116 @@ class StructureDetectorTests(unittest.TestCase):
         self.assertTrue(
             any(node.node_type == "appendix" and node.number == "붙임1" for node in nodes)
         )
+
+    def test_standalone_numbered_heading_and_filename_date_do_not_turn_attachment_samples_into_books(self) -> None:
+        for numbered in (False, True):
+            for document_name in (
+                "시설관리규정",
+                "1-1-1. 시설관리규정",
+                "시설관리규정(2026.1.1.)",
+                "1-1-1. 시설관리규정 (2026. 1. 1.).hwp",
+                "시설관리규정 (2026.1.1. 개정)",
+                "시설관리규정_2026-01-01.pdf",
+            ):
+                with self.subTest(numbered=numbered, document_name=document_name):
+                    heading = ["1-1-1. 시설관리규정", "시설관리규정"] if numbered else ["시설관리규정"]
+                    text = "\n".join(heading + [
+                        "제1조(목적) 시설 관리 기준을 정한다.",
+                        "제2조(범위) 모든 시설에 적용한다.",
+                        "[별표 1] 규정 견본", "보안업무지침", "제1조(목적) 첨부 견본 본문이다.",
+                    ])
+                    parsed = ParsedDocument(
+                        document_id="doc-single-sample", source_file="synthetic.hwp", file_type="hwp",
+                        document_name=document_name,
+                        pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])], raw_text=text,
+                    )
+
+                    nodes = StructureDetector().detect(parsed)
+                    chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+
+                    self.assertEqual(["시설관리규정"], [n.title for n in nodes if n.node_type == "regulation"])
+                    self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+                    self.assertEqual(set(), ambiguous_combined_book_chunk_ids(chunks))
+                    self.assertIn("첨부 견본 본문이다.", "\n".join(c.normalized_text or c.text for c in chunks))
+                    self.assertTrue(all(c.approval_status == "draft" for c in chunks))
+                    self.assertTrue(all(c.metadata.get("regulation_title") == "시설관리규정" for c in chunks))
+
+    def test_standalone_filename_cannot_override_distinct_numbered_units_or_book_front_matter(self) -> None:
+        cases = {
+            "different_number_same_title": [
+                "1-1-1. 시설관리규정", "제1조(목적) 첫 번째 규정.",
+                "1-1-2. 시설관리규정", "제1조(목적) 두 번째 규정.",
+            ],
+            "different_title": [
+                "1-1-1. 시설관리규정", "제1조(목적) 첫 번째 규정.",
+                "1-1-2. 보수규정", "제1조(목적) 두 번째 규정.",
+            ],
+            "book_cover": ["規程集", "시설관리규정", "제1조(목적) 첫 번째 규정."],
+            "numbered_book_cover": ["규정집", "1-1-1. 시설관리규정", "제1조(목적) 첫 번째 규정."],
+            "prefixed_book_cover": ["공공기관 규정집", "시설관리규정", "제1조(목적) 첫 번째 규정."],
+            "dated_hanja_book_cover": ["2026년 공공기관 規程集", "시설관리규정", "제1조(목적) 첫 번째 규정."],
+            "no_cover_or_sample_label": ["1-1-1. 시설관리규정", "제1조(목적) 첫 번째 규정."],
+            "plain_no_cover_or_sample_label": ["시설관리규정", "제1조(목적) 첫 번째 규정."],
+            "plain_numbered_contents": [
+                "목차", "1. 시설관리규정", "2. 보안업무지침",
+                "시설관리규정", "제1조(목적) 첫 번째 규정.",
+            ],
+        }
+        for case, leading_lines in cases.items():
+            with self.subTest(case=case):
+                attachment = "[별표 1] 규정 견본" if "book_cover" in case else "[별표 1]\n첨부 내용"
+                text = "\n".join(leading_lines + [
+                    attachment, "보안업무지침", "제1조(목적) 경계가 확인되지 않은 본문.",
+                ])
+                parsed = ParsedDocument(
+                    document_id="doc-renamed-book", source_file="synthetic.hwp", file_type="hwp",
+                    document_name="1-1-1. 시설관리규정 (2026.1.1.)",
+                    pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])], raw_text=text,
+                )
+                nodes = StructureDetector().detect(parsed)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+
+                self.assertEqual("ambiguous_combined_book_boundary_after_attachment",
+                                 parsed.metadata.get("structure_boundary_diagnostic"))
+                self.assertEqual(1, parsed.metadata["structure_boundary_candidate_count"])
+                self.assertEqual("보안업무지침", parsed.metadata["structure_boundary_candidates"][0]["title"])
+                self.assertEqual(1, parsed.metadata["structure_boundary_candidates"][0]["page"])
+                self.assertEqual({c.chunk_id for c in chunks}, ambiguous_combined_book_chunk_ids(chunks))
+                with self.assertRaises(ReviewWorkflowError):
+                    validate_approval_preconditions(chunks=chunks, chunk_ids=[chunks[0].chunk_id],
+                                                    review_flags_acknowledged=True,
+                                                    approval_override_reason="synthetic override")
+
+    def test_standalone_sample_exception_requires_direct_explicit_caption(self) -> None:
+        for caption in ("신청서식 목록", "예시 없음", "첨부 내용", "다음은 견본이 아님"):
+            with self.subTest(caption=caption):
+                text = ("1-1-1. 시설관리규정\n제1조(목적) 첫 규정.\n[별표 1]\n"
+                        f"{caption}\n보수규정\n제1조(목적) 두 번째 규정.")
+                parsed = ParsedDocument(
+                    document_id="doc-false-sample", source_file="synthetic.hwp", file_type="hwp",
+                    document_name="1-1-1. 시설관리규정_2026-01-01",
+                    pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])], raw_text=text,
+                )
+                nodes = StructureDetector().detect(parsed)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                self.assertTrue(chunks)
+                self.assertEqual({chunk.chunk_id for chunk in chunks}, ambiguous_combined_book_chunk_ids(chunks))
+
+    def test_boundary_diagnostic_evidence_is_cleared_before_redetection(self) -> None:
+        text = "시설관리규정\n제1조(목적) 시설 관리 기준."
+        parsed = ParsedDocument(
+            document_id="doc-redetect", source_file="synthetic.hwp", file_type="hwp",
+            document_name="시설관리규정", pages=[ParsedPage(page_no=1, blocks=[ParsedBlock(text=text)])],
+            metadata={
+                "structure_boundary_diagnostic": "ambiguous_combined_book_boundary_after_attachment",
+                "structure_boundary_candidates": [{"title": "stale", "page": 99, "line": 999}],
+                "structure_boundary_candidate_count": 10,
+            },
+        )
+        StructureDetector().detect(parsed)
+        self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+        self.assertNotIn("structure_boundary_candidates", parsed.metadata)
+        self.assertNotIn("structure_boundary_candidate_count", parsed.metadata)
 
     def test_ambiguous_regulation_after_attachment_does_not_publish_partial_book(self) -> None:
         text = "\n".join(
@@ -956,6 +1067,162 @@ class StructureDetectorTests(unittest.TestCase):
             "ambiguous_combined_book_boundary_after_attachment",
             parsed.metadata.get("structure_boundary_diagnostic"),
         )
+
+    @staticmethod
+    def _simple_contents_book(*, wrapped: bool = False, annotated: bool = False) -> ParsedDocument:
+        titles = ["공공시설법", "공공시설법 시행령", "교육‧연구 운영지침"]
+        contents = ["가상기관 규정집", "규정집 목차"] + [
+            f"{index}. {title} {'�' * 5} {index * 10}-1"
+            for index, title in enumerate(titles, start=1)
+        ]
+        # Some books repeat their first section's contents before its cover.
+        contents += [f"1. {titles[0]} ..... 10-1"]
+        pages = [ParsedPage(page_no=1, blocks=[ParsedBlock(text="\n".join(contents))])]
+        for index, title in enumerate(titles, start=2):
+            title_lines = [title]
+            if wrapped and index == 4:
+                title_lines = ["교육‧연구", "운영지침"]
+            if annotated and index == 4:
+                title_lines = [title + "[제명 개정 2025. 2. 3.]"]
+            blocks = [ParsedBlock(text="제1편 공통사항", bbox=(30, 50, 260, 59),
+                                  metadata={"font_size_median": 9})]
+            blocks += [ParsedBlock(text=text, bbox=(90, 90 + i * 24, 390, 106 + i * 24),
+                                   metadata={"font_size_median": 12 if annotated and index == 4 else 16})
+                       for i, text in enumerate(title_lines)]
+            blocks += [
+                ParsedBlock(text="[▲위로]", bbox=(30, 142, 100, 152)),
+                ParsedBlock(text="타법개정 2025. 2. 3.", bbox=(300, 160, 500, 172)),
+                ParsedBlock(text=f"제1조(목적) {index}번 규정의 고유 본문.", bbox=(30, 200, 500, 212),
+                            metadata={"font_size_median": 12}),
+                ParsedBlock(text=f"제2조(범위) {index}번 적용 범위.", bbox=(30, 230, 500, 242)),
+                ParsedBlock(text=f"[별표 1] {index}번 부속 자료", bbox=(30, 280, 500, 292)),
+            ]
+            pages.append(ParsedPage(page_no=index, blocks=blocks))
+        return ParsedDocument(document_id="doc-simple-contents", source_file="synthetic.pdf",
+                              document_name="교육‧연구 운영지침_2026-01-01", file_type="pdf", pages=pages)
+
+    def test_simple_contents_recovers_every_typeset_unit_despite_standalone_filename(self) -> None:
+        for wrapped, annotated in ((False, False), (True, False), (False, True)):
+            with self.subTest(wrapped=wrapped, annotated=annotated):
+                parsed = self._simple_contents_book(wrapped=wrapped, annotated=annotated)
+                nodes = StructureDetector().detect(parsed)
+                regulations = [node for node in nodes if node.node_type == "regulation"]
+                self.assertEqual(["공공시설법", "공공시설법 시행령", "교육‧연구 운영지침"],
+                                 [node.title for node in regulations])
+                self.assertEqual([2, 3, 4], [node.page_start for node in regulations])
+                self.assertEqual([1, 2, 3], [node.metadata["contents_position"] for node in regulations])
+                self.assertTrue(all(node.number is None for node in regulations))
+                self.assertNotIn("structure_boundary_diagnostic", parsed.metadata)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                self.assertEqual(set(), ambiguous_combined_book_chunk_ids(chunks))
+                self.assertTrue(all(chunk.approval_status == "draft" for chunk in chunks))
+                for chunk in chunks:
+                    self.assertEqual(regulations[chunk.source_page_start - 2].title, chunk.metadata["regulation_title"])
+                    self.assertNotIn("규정집 목차", chunk.text)
+                    self.assertNotIn("제1편 공통사항", chunk.text)
+
+    def test_simple_contents_requires_complete_unique_ordered_body_evidence(self) -> None:
+        for defect in ("missing_body", "wrong_order", "duplicate_opening", "missing_revision", "article_two",
+                       "missing_layout", "small_title", "intervening_attachment", "duplicate_contents_title"):
+            with self.subTest(defect=defect):
+                parsed = self._simple_contents_book()
+                if defect == "missing_body":
+                    parsed.pages.pop()
+                elif defect == "wrong_order":
+                    parsed.pages[2].blocks, parsed.pages[3].blocks = parsed.pages[3].blocks, parsed.pages[2].blocks
+                elif defect == "duplicate_opening":
+                    duplicate = parsed.pages[-1].model_copy(deep=True)
+                    duplicate.page_no = 5
+                    parsed.pages.append(duplicate)
+                elif defect == "missing_revision":
+                    parsed.pages[-1].blocks[3].text = "참고 내용"
+                elif defect == "article_two":
+                    parsed.pages[-1].blocks[4].text = "제2조(범위) 본문"
+                elif defect == "missing_layout":
+                    parsed.pages[-1].blocks[1].metadata.clear()
+                elif defect == "small_title":
+                    parsed.pages[-1].blocks[1].metadata["font_size_median"] = 12
+                elif defect == "intervening_attachment":
+                    parsed.pages[-1].blocks.insert(4, ParsedBlock(text="[별표 2] 견본"))
+                elif defect == "duplicate_contents_title":
+                    parsed.pages[0].blocks[0].text += "\n4. 교육‧연구 운영지침 ..... 99"
+                nodes = StructureDetector().detect(parsed)
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                self.assertTrue(chunks)
+                self.assertEqual("ambiguous_combined_book_boundary_after_attachment",
+                                 parsed.metadata.get("structure_boundary_diagnostic"))
+                self.assertEqual({chunk.chunk_id for chunk in chunks}, ambiguous_combined_book_chunk_ids(chunks))
+                with self.assertRaises(ReviewWorkflowError):
+                    validate_approval_preconditions(chunks=chunks, chunk_ids=[chunks[0].chunk_id],
+                                                    review_flags_acknowledged=True,
+                                                    approval_override_reason="synthetic override")
+
+    def test_concatenated_typeset_documents_without_contents_recover_all_units(self) -> None:
+        for headers, wrapped, annotated, academic in ((True, False, False, False), (False, False, False, False),
+                                                       (True, True, False, False), (False, False, True, False),
+                                                       (True, False, False, True)):
+            with self.subTest(headers=headers, wrapped=wrapped, annotated=annotated, academic=academic):
+                parsed = self._simple_contents_book(wrapped=wrapped, annotated=annotated)
+                parsed.pages.pop(0)
+                last_title = "학습운영학칙" if academic else "교육‧연구 운영지침"
+                if academic:
+                    parsed.pages[-1].blocks[1].text = last_title
+                if not headers:
+                    for page in parsed.pages:
+                        page.blocks.pop(0)
+                nodes = StructureDetector().detect(parsed)
+                regulations = [node for node in nodes if node.node_type == "regulation"]
+                self.assertEqual(["공공시설법", "공공시설법 시행령", last_title],
+                                 [node.title for node in regulations])
+                self.assertTrue(all(node.metadata["regulation_boundary_source"] ==
+                                    "typeset_title_revision_and_article_restart_without_contents"
+                                    for node in regulations))
+                self.assertTrue(all("contents_position" not in node.metadata for node in regulations))
+                chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                self.assertEqual(set(), ambiguous_combined_book_chunk_ids(chunks))
+                self.assertTrue(all(chunk.approval_status == "draft" for chunk in chunks))
+                self.assertEqual({node.title for node in regulations}, {chunk.metadata["regulation_title"] for chunk in chunks})
+
+    def test_typeset_recovery_rejects_unproven_additional_revision_with_same_title(self) -> None:
+        for with_contents in (False, True):
+            for title in ("공공시설법", "공공시설법 시행령", "학습운영학칙", "교육‧연구 운영지침"):
+                with self.subTest(with_contents=with_contents, title=title):
+                    parsed = self._simple_contents_book()
+                    if not with_contents:
+                        parsed.pages.pop(0)
+                    for page in parsed.pages:
+                        if len(page.blocks) > 1:
+                            page.blocks.pop()  # no attachment before the extra title
+                    parsed.pages.append(ParsedPage(page_no=5, blocks=[ParsedBlock(
+                        text=f"{title}\n제정 2020. 1. 1.\n제1조(목적) 누락된 개정판.\n제2조(범위) 옛 본문.",
+                    )]))
+                    nodes = StructureDetector().detect(parsed)
+                    chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                    self.assertTrue(chunks)
+                    self.assertEqual({chunk.chunk_id for chunk in chunks}, ambiguous_combined_book_chunk_ids(chunks))
+
+    def test_simple_contents_cannot_hide_unlisted_typeset_or_text_only_regulation(self) -> None:
+        for position in (1, 2, 4):
+            for typeset in (False, True, "no_attachment"):
+                with self.subTest(position=position, typeset=typeset):
+                    parsed = self._simple_contents_book()
+                    extra = parsed.pages[-1].model_copy(deep=True)
+                    extra.blocks[1].text = "재산관리규정"
+                    if not typeset or typeset == "no_attachment":
+                        # An unlisted title after a bare attachment is still
+                        # ambiguous even if its original layout was lost.
+                        extra.blocks = [ParsedBlock(text="[별표 2]\n재산관리규정\n제1조(목적) 미등재 규정.")]
+                    if typeset == "no_attachment":
+                        for page in parsed.pages[1:]:
+                            page.blocks.pop()
+                        extra.blocks[0].text = "재산관리규정\n제정 2024. 1. 1.\n제1조(목적) 미등재 규정."
+                    parsed.pages.insert(position, extra)
+                    for page_no, page in enumerate(parsed.pages, start=1):
+                        page.page_no = page_no
+                    nodes = StructureDetector().detect(parsed)
+                    chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(enable_agent_review=False))
+                    self.assertTrue(chunks)
+                    self.assertEqual({chunk.chunk_id for chunk in chunks}, ambiguous_combined_book_chunk_ids(chunks))
 
     @staticmethod
     def _typeset_book(*, typo: bool = False, early_header: bool = False) -> ParsedDocument:
@@ -1260,7 +1527,7 @@ class StructureDetectorTests(unittest.TestCase):
                     page_no=1,
                     blocks=[
                         ParsedBlock(
-                            text="시설관리규정\n제1조(목적) 시설 관리 기준을 정한다.\n[별표 1]"
+                            text="시설관리규정\n제1조(목적) 시설 관리 기준을 정한다.\n[별표 1] 규정 견본"
                         )
                     ],
                 ),

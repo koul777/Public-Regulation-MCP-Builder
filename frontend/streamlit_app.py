@@ -95,6 +95,7 @@ from app.processors.quality_gate import (
 from app.schemas.chunk import ChunkOptions
 from app.services.document_purge_service import DocumentPurgeService
 from app.services.document_service import DocumentService
+from app.services.boundary_reprocessing_service import BoundaryReprocessingError, BoundaryReprocessingService
 from app.services.institution_purge_service import (
     InstitutionPurgePlan,
     InstitutionPurgeResult,
@@ -5597,19 +5598,19 @@ def _mcp_gate_guidance_items(
         ),
         "document_not_indexed": (
             "승인된 문서가 아직 AI 검색용으로 색인되지 않았습니다.",
-            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'를 누르세요. 선택한 승인 규정을 한 번에 색인할 수 있습니다.",
+            "③ 검수하고 승인 상단의 '선택한 규정 전체 승인·색인'을 누르세요. 선택한 승인 규정을 한 번에 색인할 수 있습니다.",
         ),
         "visible_record_count_mismatch": (
             "승인된 조문 수와 AI 검색에 등록된 조문 수가 일치하지 않습니다.",
-            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'에서 선택한 승인 규정을 다시 색인하세요.",
+            "③ 검수하고 승인 상단의 '선택한 규정 전체 승인·색인'에서 선택한 승인 규정을 다시 색인하세요.",
         ),
         "stale_vector_records": (
             "이전 색인 기록이 남아 있어 최신 승인 내용과 일치하지 않습니다.",
-            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'에서 최신 승인 내용으로 다시 색인하세요.",
+            "③ 검수하고 승인 상단의 '선택한 규정 전체 승인·색인'에서 최신 승인 내용으로 다시 색인하세요.",
         ),
         "index_validation_error": (
             "색인 결과 검증을 통과하지 못했습니다.",
-            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'에서 승인 상태를 확인하고 색인을 다시 실행하세요.",
+            "③ 검수하고 승인 상단의 '선택한 규정 전체 승인·색인'에서 승인 상태를 확인하고 색인을 다시 실행하세요.",
         ),
         "not_ready": (
             "MCP에 사용할 승인·색인 상태를 아직 확인하지 못했습니다.",
@@ -6628,6 +6629,7 @@ def _bulk_approval_blocker(
     requested_ids = set(candidate_chunk_ids) if candidate_chunk_ids is not None else None
     blocked_count = 0
     blocked_documents = 0
+    blocked_details: list[str] = []
     for ctx in contexts:
         chunks = list(ctx.get("chunks") or [])
         target_ids = (
@@ -6639,14 +6641,33 @@ def _bulk_approval_blocker(
         if blocked_ids:
             blocked_count += len(blocked_ids)
             blocked_documents += 1
+            if len(blocked_details) < 5:
+                document = ctx.get("document")
+                title = " ".join(str(getattr(document, "document_name", "") or "").split())[:80]
+                filename = str(getattr(document, "filename", "") or "").replace("\\", "/").rsplit("/", 1)[-1]
+                filename = " ".join(filename.split())[:80]
+                document_id = " ".join(str(
+                    ctx.get("document_id") or getattr(document, "document_id", "") or ""
+                ).split())[:12]
+                identity = [title or filename or "대상 문서"]
+                if filename and filename != title:
+                    identity.append(f"파일: {filename}")
+                if document_id:
+                    identity.append(f"문서 ID: {document_id}")
+                blocked_details.append(
+                    "- " + " · ".join(identity) + f" · 영향 조항 {len(blocked_ids):,}개"
+                )
     if not blocked_count:
         return ""
+    if blocked_documents > len(blocked_details):
+        blocked_details.append(f"- 그 밖의 영향 문서 {blocked_documents - len(blocked_details):,}개")
     return (
-        f"승인 차단: 문서 {blocked_documents:,}개에서 조항 {blocked_count:,}개의 규정 경계가 불명확합니다. "
-        "별표 뒤에 다른 규정이 섞였을 수 있어 확인 생략 사유로도 승인할 수 없습니다. "
-        "최신 파서가 적용된 앱에서 같은 원본 파일을 ① 문서 올려서 전처리에 다시 올려 "
-        "새 초안으로 분석하세요. 기존 원본·승인본은 유지됩니다. "
-        "다시 분석해도 불명확하면 규정별로 나눈 파일을 따로 올린 뒤 검수하세요. "
+        f"승인 차단: 문서 {blocked_documents:,}개에서 조항 {blocked_count:,}개의 규정 경계 확인이 필요합니다. "
+        "이 수는 경계 판정의 영향을 받은 조항 수이며, 각각 별도의 오류라는 뜻은 아닙니다.\n\n"
+        + "\n".join(blocked_details)
+        + "\n\n통합 규정집과 개별 규정 파일 모두 지원합니다. 원본을 나누지 않고 새 초안에서 다시 분석할 수 있습니다. "
+        "기존 원본·승인본을 유지한 채 새 초안을 만든 뒤 분석 결과를 확인하세요. "
+        "경계 확인이 끝나기 전에는 확인 생략 사유로도 승인할 수 없습니다. "
         "수정 내용 저장·승인·색인은 실행하지 않았습니다."
     )
 
@@ -6661,8 +6682,53 @@ def _require_bulk_approval_preflight(
         raise ValueError(message)
 
 
-def _render_bulk_approval_recovery(message: str, *, key: str) -> None:
+def _render_bulk_approval_recovery(message: str, *, key: str, contexts: list[dict] | None = None) -> None:
     st.error(message)
+    targets = [context for context in contexts or []
+               if ambiguous_combined_book_chunk_ids(context.get("chunks") or [])]
+    if targets:
+        st.caption("저장된 원본을 최신 파서로 다시 읽습니다. 기존 원본·승인본은 유지하고 새 초안만 만들며, AI 검수·승인·색인은 실행하지 않습니다.")
+        if st.button("저장된 원본으로 새 초안 복구", key=key + "-recover", type="primary"):
+            try:
+                tenant_id = _local_operator_tenant_id()
+                selected_profile_id = _selected_institution_profile_id()
+                if any(
+                    str(getattr(context["local_auth"], "tenant_id", "")) != str(tenant_id)
+                    or (selected_profile_id and not _document_belongs_to_institution_profile(context["document"], selected_profile_id))
+                    for context in targets
+                ):
+                    raise BoundaryReprocessingError("현재 기관의 문서만 복구할 수 있습니다. 선택 범위를 다시 확인하세요.")
+                service = BoundaryReprocessingService(settings, repository, quality_profile_config=quality_profile_config)
+                with _long_operation_status(
+                    "저장된 원본으로 새 초안 복구 중…", failure_stage="규정 경계 재분석",
+                    failure_regulation=f"선택한 {len(targets):,}개 문서",
+                    failure_policy="기존 원본·승인본을 유지합니다. 새 초안도 자동 승인하지 않습니다.",
+                ) as status:
+                    progress = st.progress(0, text="새 초안 준비 · 0%")
+                    detail = st.empty()
+                    for index, context in enumerate(targets):
+                        source_document_id = str(context["document_id"])
+                        result = _run_background_operation_with_progress(
+                            lambda report, source_id=source_document_id, profile_id=str(context["document"].profile_id or ""): service.recover(
+                                source_id, tenant_id=tenant_id, profile_id=profile_id, progress_callback=report,
+                            ),
+                            progress_bar=progress, detail_box=detail,
+                            start_percent=int(index * 100 / len(targets)),
+                            end_percent=int((index + 1) * 100 / len(targets)),
+                            label="최신 파서로 새 초안 분석", estimated_seconds=120.0,
+                        )
+                        _replace_workflow_document_id(result.source_document_id, result.draft_document_id)
+                        if str(st.session_state.get("document_id") or "") == result.draft_document_id:
+                            st.session_state[WORKFLOW_OPENED_DOCUMENT_KEY] = result.draft_document_id
+                    status.update(label="새 초안 복구 완료 · 검수 후 승인하세요", state="complete")
+                _queue_workflow_navigation(NAV_APPROVAL)
+                st.rerun()
+            except BoundaryReprocessingError as exc:
+                st.error(_safe_ui_error(exc))
+                if exc.draft_document_id:
+                    st.caption(f"확인이 필요한 새 초안: {exc.draft_document_id} · 승인·색인하지 않았습니다.")
+            except Exception as exc:
+                st.error(_safe_ui_error(exc))
     _render_workflow_next_button(
         "같은 원본 다시 올려 전처리하기",
         NAV_PREPROCESS,
@@ -7989,9 +8055,9 @@ def _safe_kordoc_reprocess_documents(
             raise ValueError(
                 f"재전처리 결과의 조항 {len(blocked_ids):,}개에 규정 경계 차단이 남아 있습니다. "
                 "이전 초안이 재사용되었을 수 있어 해결 완료로 처리하지 않습니다. "
-                "기존 원본·승인본은 유지됩니다. 최신 파서가 적용된 앱의 "
-                "① 문서 올려서 전처리에서 같은 원본을 다시 올려 새 초안으로 분석하세요. "
-                "다시 분석해도 불명확하면 규정별로 나눈 파일을 따로 올린 뒤 검수하세요."
+                "기존 원본·승인본은 유지됩니다. 최신 앱의 ③ 검수 화면에서 "
+                "'저장된 원본으로 새 초안 복구'를 실행하면 같은 원본을 다시 분석할 수 있습니다. "
+                "복구 후에도 확인이 필요한 부분은 해당 위치의 원문과 대조해 주세요."
             )
         results.append(result)
     return results
@@ -10776,7 +10842,7 @@ def _page_results(ctx: dict | None) -> None:
     )
     if beginner_reviews_one_document:
         st.info(
-            f"선택한 파일 {len(selected_document_ids):,}개를 ③ 상단의 '전체 규정 한꺼번에 처리'에서 함께 승인·색인할 수 있습니다. "
+            f"선택한 파일 {len(selected_document_ids):,}개를 ③ 상단의 '선택한 규정 전체 승인·색인'에서 함께 승인·색인할 수 있습니다. "
             "원문을 자세히 살펴보려면 현재 규정부터 한 개씩 검수하는 방법도 선택할 수 있습니다."
         )
     beginner_results_confirmation_shown = bool(
@@ -11899,7 +11965,8 @@ def _render_selected_approval_batch(
 
     if workflow_approval_blocker:
         _render_bulk_approval_recovery(
-            workflow_approval_blocker, key=f"workflow-boundary-upload-{document_id}"
+            workflow_approval_blocker, key=f"workflow-boundary-upload-{document_id}",
+            contexts=selected_approval_contexts,
         )
     elif unreviewed_acknowledged and (workflow_pending_count or workflow_index_document_count):
         _render_beginner_action_marker(
@@ -11915,7 +11982,7 @@ def _render_selected_approval_batch(
             if workflow_pending_count == 0 and workflow_index_document_count == 0
             else f"선택한 승인 규정 {workflow_index_document_count:,}개 한꺼번에 색인"
             if workflow_pending_count == 0
-            else f"전체 규정 최종 확정 · 선택한 {len(selected_document_ids):,}개 승인·색인"
+            else "선택한 규정 전체 승인·색인"
         ),
         type="primary",
         key=f"workflow-approve-index-{document_id}",
@@ -12097,7 +12164,7 @@ def _render_selected_approval_batch(
     if workflow_ready_count < workflow_pending_count:
         st.info(
             "위 비교 화면에서 사람 검수를 계속할 수 있습니다. 검수를 생략하고 최종 확정하면 "
-            "기본 미검수 사유와 approved_without_review 감사 이벤트가 자동 기록됩니다."
+            "감사 기록에 미검수 승인 사실과 사유가 자동으로 남습니다."
         )
     selection_states = [
         _mcp_scope_document_state(list(item.get("chunks") or []), item.get("mcp_connection_gate"))
@@ -12166,7 +12233,7 @@ def _page_approval(ctx: dict | None) -> None:
         if st.button("한 조항씩 검수로 돌아가기", key=f"approval-batch-exit-{document_id}"):
             st.session_state[batch_active_key] = False
             st.rerun()
-        st.markdown("### 전체 규정 한꺼번에 처리")
+        st.markdown("### 선택한 규정 전체 승인·색인")
         st.info(
             "선택한 파일 전체를 대상으로 합니다. 통합 규정집에서 열어 둔 규정 한 개로 범위를 좁히지 않습니다. "
             "미승인 조항은 아래 최종 버튼으로 승인하고, 이미 승인된 내용은 필요한 색인만 처리합니다."
@@ -12188,7 +12255,7 @@ def _page_approval(ctx: dict | None) -> None:
         )
         return
     if st.button(
-        "전체 규정 한꺼번에 처리",
+        "선택한 규정 전체 승인·색인",
         key=f"approval-batch-entry-{document_id}",
         type="primary",
         disabled=not selected_document_ids,
@@ -12708,68 +12775,14 @@ def _page_approval(ctx: dict | None) -> None:
     document_approval_blocker = _bulk_approval_blocker([ctx])
     if document_approval_blocker:
         _render_bulk_approval_recovery(
-            document_approval_blocker, key=f"approval-boundary-upload-{document_id}"
+            document_approval_blocker, key=f"approval-boundary-upload-{document_id}", contexts=[ctx],
         )
 
     if beginner_incomplete_ids:
-        # 초보자 화면은 한 조항씩 확인하는 흐름이 기본이다. 그래도 "미검수 일괄 승인"을
-        # 택할 수 있어야 하므로, 사람 검수를 권하는 안내와 함께 한 번에 끝내는 길을 접어 둔다.
-        # 누르면 일반 모드의 최종 확정과 같은 절차(저장 → 승인 → 색인)를 타고, 미검수 사실은
-        # 기본 사유로 감사 기록에 남는다. 확인 완료 전에는 '승인하고 AI 질문 준비하기'를 보이지 않는다.
-        shortcut_whole_file = (
-            len(regulation_units) > 1
-            and len(document_pending_review_entries) > len(pending_review_entries)
+        st.caption(
+            "한 조항씩 확인을 이어가거나, 화면 상단의 '선택한 규정 전체 승인·색인'을 누르세요. "
+            "선택 범위와 미검수 조항을 확인한 뒤 같은 화면에서 최종 실행합니다."
         )
-        shortcut_entries = document_pending_review_entries if shortcut_whole_file else pending_review_entries
-        shortcut_label = (
-            f"이 파일의 규정 {len(regulation_units):,}개 · 남은 조항 {len(shortcut_entries):,}개"
-            if shortcut_whole_file
-            else f"남은 조항 {len(shortcut_entries):,}개"
-        )
-        with st.expander(f"⏩ {shortcut_label}를 한 번에 승인하기 (선택)", expanded=False):
-            ai_status_label, ai_status_message, _ai_executed = _ai_review_status_text(agent_review_summary)
-            st.caption(f"이 규정의 실행 기록: {ai_status_label} · {ai_status_message}")
-            st.warning(
-                "⚠️ 사람이 마지막은 직접 검수하는 것을 추천드립니다. AI 검수는 볼 곳을 짚어 줄 뿐 "
-                "승인 판단을 대신하지 않습니다. 확인하지 않은 조항을 지금 한 번에 승인하면 "
-                "'미검수 일괄 승인'으로 감사 기록에 남고, 그 조항은 사람이 원문을 대조하지 않은 채 "
-                "AI 검색에 노출됩니다."
-            )
-            st.caption(
-                "추천: 위에서 '내용이 맞아요 · 다음'으로 한 조항씩 확인을 이어가세요. "
-                "그래도 지금 한 번에 끝내려면 아래 확인란을 켜고 버튼을 누르세요."
-            )
-            if operation_error:
-                st.error(f"승인·검색 등록을 끝내지 못했습니다. {operation_error}")
-            shortcut_ready = True
-            if not mcp_connection_gate.get("ready"):
-                shortcut_ready = _render_indexing_preparation(
-                    document_id,
-                    guide_substep=0,
-                    recovering=bool(operation_error),
-                )
-            shortcut_acknowledged = st.checkbox(
-                "확인하지 않은 조항이 포함된 일괄 승인임을 이해했습니다.",
-                key=f"approval-bulk-finish-ack-{document_id}",
-            )
-            if st.button(
-                f"{shortcut_label} 한 번에 승인하고 AI 질문 준비하기",
-                key=f"approval-bulk-finish-{document_id}",
-                type="primary",
-                disabled=not (shortcut_acknowledged and shortcut_ready) or bool(
-                    document_approval_blocker if shortcut_whole_file else current_approval_blocker
-                ),
-                width="stretch",
-                help="고친 내용 저장 → 승인 → AI 등록(색인)을 한 번에 실행합니다. 보고 있는 조항만이 아니라 남은 조항 전부가 대상입니다.",
-            ):
-                try:
-                    _execute_final_approval(
-                        shortcut_entries,
-                        vector_sync_batch_suffix="beginner-bulk-finish",
-                        override_reason_text=_approval_override_reason_for_entries(shortcut_entries),
-                    )
-                except Exception as exc:
-                    _refresh_after_approval_failure(document_id, exc)
         return
 
     if pending_compare_ids and not _beginner_focus_review():
@@ -12918,16 +12931,18 @@ def _page_approval(ctx: dict | None) -> None:
         _render_beginner_action_marker(
             3,
             "승인된 내용을 AI 검색에 등록하세요",
-            "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
-            control_key_prefix="quick-index-only-",
+            "승인은 끝났지만 검색 등록이 남았습니다. 상단의 '선택한 규정 전체 승인·색인'에서 필요한 색인만 처리하세요."
+            if beginner_mode_active else "승인은 끝났지만 검색 등록이 남았습니다. 바로 아래 'AI에 등록만 실행' 버튼을 누르세요.",
+            control_key_prefix="approval-batch-entry-" if beginner_mode_active else "quick-index-only-",
             substep=4,
         )
     elif indexing_packages_ready and approved_count < total_chunks and approve_enabled:
         _render_beginner_action_marker(
             3,
-            "마지막으로 승인해 주세요",
-            "아래 버튼을 누르면 확인한 내용을 저장하고 승인합니다. 이어서 AI가 이 내용에서 답을 찾도록 준비해요.",
-            control_keys=(approve_index_button_key,),
+            "전체 승인·색인을 준비하세요" if beginner_mode_active else "마지막으로 승인해 주세요",
+            "상단의 '선택한 규정 전체 승인·색인'에서 범위를 확인하고 실행하세요. 방금 확인한 검수 내용도 함께 반영됩니다."
+            if beginner_mode_active else "아래 버튼을 누르면 확인한 내용을 저장하고 승인합니다. 이어서 AI가 이 내용에서 답을 찾도록 준비해요.",
+            control_keys=(f"approval-batch-entry-{document_id}" if beginner_mode_active else approve_index_button_key,),
             substep=3,
         )
 
@@ -12937,7 +12952,11 @@ def _page_approval(ctx: dict | None) -> None:
     if show_approve_all:
         approve_col, approve_all_col, index_col = st.columns([2, 2, 2])
     else:
-        approve_col, index_col = st.columns([2, 2])
+        action_container = (
+            st.expander("고급: 현재 규정만 승인·색인", expanded=False)
+            if beginner_mode_active else st.container()
+        )
+        approve_col, index_col = action_container.columns([2, 2])
         approve_all_col = None
 
     override_reason_text = _approval_override_reason_for_entries(
@@ -12949,7 +12968,7 @@ def _page_approval(ctx: dict | None) -> None:
 
     if (not _beginner_focus_review() or (can_approve and approved_count < total_chunks)) and approve_col.button(
         "승인하고 AI 질문 준비하기" if _beginner_focus_review() else "이 규정 최종 확정 · 승인하고 색인",
-        type="primary",
+        type="secondary" if beginner_mode_active else "primary",
         key=approve_index_button_key,
         disabled=not can_approve or approved_count >= total_chunks or bool(current_approval_blocker),
         help=(
@@ -13132,7 +13151,7 @@ def _page_approval(ctx: dict | None) -> None:
             _render_beginner_action_marker(
                 3,
                 "전체 규정을 처리하거나 개별 검수를 이어가세요",
-                f"이 화면 상단의 '전체 규정 한꺼번에 처리'로 남은 파일을 함께 처리할 수 있습니다. 자세히 검수하려면 아래 '{next_document_label}'을 여세요.",
+                f"이 화면 상단의 '선택한 규정 전체 승인·색인'으로 남은 파일을 함께 처리할 수 있습니다. 자세히 검수하려면 아래 '{next_document_label}'을 여세요.",
                 control_keys=(f"approval-batch-entry-{document_id}",),
                 substep=5,
             )

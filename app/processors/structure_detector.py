@@ -159,6 +159,8 @@ HWPX_SOURCE_LIST_METADATA_KEYS = (
 )
 
 STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
+STRUCTURE_BOUNDARY_CANDIDATES_METADATA_KEY = "structure_boundary_candidates"
+STRUCTURE_BOUNDARY_CANDIDATE_COUNT_METADATA_KEY = "structure_boundary_candidate_count"
 AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
     "ambiguous_combined_book_boundary_after_attachment"
 )
@@ -187,6 +189,8 @@ class StructureDetector:
         """
 
         parsed.metadata.pop(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY, None)
+        parsed.metadata.pop(STRUCTURE_BOUNDARY_CANDIDATES_METADATA_KEY, None)
+        parsed.metadata.pop(STRUCTURE_BOUNDARY_CANDIDATE_COUNT_METADATA_KEY, None)
         lines = self._extract_lines(parsed)
         line_total = len(lines)
         report = progress_callback or (lambda _phase, _current, _total: None)
@@ -205,7 +209,12 @@ class StructureDetector:
             parsed.document_id,
             detected_lines,
         )
+        typeset_navigation_indexes: set[int] = set()
         if not title_only_regulation_boundaries:
+            title_only_regulation_boundaries, typeset_navigation_indexes = self._typeset_contents_boundaries(
+                lines, parsed.document_id, detected_lines, parsed.metadata,
+            )
+        if not title_only_regulation_boundaries and not parsed.metadata.get(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY):
             title_only_regulation_boundaries = self._implicit_title_only_regulation_boundaries(
                 lines,
                 parsed.document_id,
@@ -220,6 +229,7 @@ class StructureDetector:
             title_only_regulation_boundaries,
         )
         navigation_line_indexes.update(recovered_header_indexes)
+        navigation_line_indexes.update(typeset_navigation_indexes)
         nodes: list[StructureNode] = []
         pending_orphan_lines: list[SourceLine] = []
         current: dict[str, StructureNode | None] = {
@@ -846,6 +856,229 @@ class StructureDetector:
             and header_box[3] < title_box[1] < title_box[3] < article_box[1]
         )
 
+    def _typeset_contents_boundaries(
+        self,
+        lines: list[SourceLine],
+        document_id: str,
+        detected_lines: list[StructureNode | None],
+        document_metadata: dict,
+    ) -> tuple[dict[int, StructureNode], set[int]]:
+        """Reconcile simple numbered contents with independently typeset openings.
+
+        Contents enumeration is not a regulation code. Require every listed
+        title, in order, to have exactly one large body heading followed by
+        dated revision history and Article 1. Neither a filename nor a title
+        alone can close an attachment or make a partially recovered book safe.
+        """
+        article_indexes = [i for i, node in enumerate(detected_lines)
+                           if node is not None and node.node_type == "article"]
+        if not article_indexes:
+            return {}, set()
+        first_article = article_indexes[0]
+        front = lines[:first_article]
+        has_contents_marker = any(
+            re.sub(r"\s+", "", line.text).casefold().endswith(("목차", "차례", "contents"))
+            for line in front
+        )
+        entry_pattern = re.compile(
+            r"^\s*(\d+)\s*[.．]\s+(.{1,120}?)\s*"
+            r"[.·‧ㆍ․‥…⋯\ufffd]{2,}\s*(\d+(?:-\d+)?)\s*$"
+        )
+        entries: list[tuple[int, str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for index, line in enumerate(front):
+            match = entry_pattern.fullmatch(line.text)
+            if line.block_type == "table" or match is None:
+                continue
+            title, printed_page = match.group(2).strip(), match.group(3)
+            identity = self._regulation_title_identity(title)
+            key = (identity, printed_page)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append((index, title, identity, printed_page))
+        if len(entries) < 2 and (entries or has_contents_marker):
+            return {}, set()
+        has_numbered_contents = bool(entries)
+        identities = {identity for _index, _title, identity, _page in entries}
+        # Repeated versions with the same title need explicit disambiguation;
+        # do not collapse distinct contents entries into a single regulation.
+        duplicate_titles = len(identities) != len(entries)
+        first_by_page: dict[int, int] = {}
+        for index, line in enumerate(lines):
+            if line.page_no is not None and line.block_type == "text":
+                first_by_page.setdefault(line.page_no, index)
+        candidates: dict[str, list[tuple[int, int, int]]] = {identity: [] for identity in identities}
+        unlisted_openings: list[tuple[int, str, str]] = []
+        unlisted_evidence: dict[int, tuple[int, int, int]] = {}
+        title_label = re.compile(
+            r"\s*\[\s*제명\s*(?:변경|개정)\s*\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s*\]\s*$"
+        )
+        revision_marker = r"(?:제정|(?:일부|전부|전문|일괄|타법|타규정|타세칙)?개정|시행)"
+        revision_date = r"\d{4}\s*[.년]\s*\d{1,2}\s*[.월]\s*\d{1,2}(?:\s*[.일]|\s|$)"
+        revision = re.compile(rf"^(?:{revision_marker}\s*{revision_date}|{revision_date}\s*{revision_marker}(?:\s|$))")
+        for index, line in enumerate(lines):
+            if (entries and index <= entries[-1][0]) or line.block_type != "text":
+                continue
+            title_end = index
+            title_text = title_label.sub("", line.text)
+            identity = self._regulation_title_identity(title_text)
+            if identity not in identities and index + 1 < len(lines):
+                continuation = lines[index + 1]
+                if continuation.page_no == line.page_no and continuation.block_type == "text":
+                    joined_text = title_text + continuation.text
+                    joined = self._regulation_title_identity(joined_text)
+                    if joined in identities:
+                        identity, title_end = joined, index + 1
+                    elif (not has_numbered_contents
+                          and not self._looks_like_implicit_regulation_title(title_text.replace("‧", "·"))
+                          and self._looks_like_plain_regulation_title(joined_text.replace("‧", "·"))
+                          and (self._looks_like_implicit_regulation_title(joined_text.replace("‧", "·"))
+                               or re.search(r"(?:법|시행령|학칙)$", joined))):
+                        identity, title_end, title_text = joined, index + 1, title_text + " " + continuation.text
+            if identity not in identities and not self._looks_like_plain_regulation_title(title_text.replace("‧", "·")):
+                continue
+            header_index = first_by_page.get(line.page_no)
+            # A running header may precede the opening, but intervening body
+            # text, an attachment label, or a quotation is not an opening.
+            if header_index is None or index not in {header_index, header_index + 1}:
+                continue
+            position = bisect_right(article_indexes, title_end)
+            if position >= len(article_indexes):
+                continue
+            article_index = article_indexes[position]
+            article = detected_lines[article_index]
+            if article is None or article.number != "제1조" or lines[article_index].page_no != line.page_no:
+                continue
+            if not self._contents_opening_layout(lines[header_index] if header_index != index else None,
+                                                lines[index:title_end + 1], lines[article_index],
+                                                annotated=bool(title_label.search(line.text))):
+                continue
+            has_revision = False
+            valid_intro = True
+            for intro_index in range(title_end + 1, article_index):
+                intro = lines[intro_index]
+                node = detected_lines[intro_index]
+                if revision.match(intro.text):
+                    has_revision = True
+                elif re.fullmatch(r"\s*\[\s*[▲△]?\s*(?:위로|개정)\s*\]\s*", intro.text):
+                    pass
+                elif node is not None and node.node_type in {"part", "chapter", "section"}:
+                    pass
+                else:
+                    valid_intro = False
+                    break
+            if has_revision and valid_intro:
+                if identity in identities:
+                    candidates[identity].append((index, title_end, article_index))
+                else:
+                    unlisted_openings.append((index, title_text, identity))
+                    unlisted_evidence[index] = (index, title_end, article_index)
+        if not has_numbered_contents:
+            # A simple concatenation has no contents to consult. At least two
+            # independent typeset openings establish the units; the same
+            # residual ambiguity check below still rejects unsupported ones.
+            if len(unlisted_openings) < 2:
+                return {}, set()
+            entries = [(index, title, identity, "") for index, title, identity in unlisted_openings]
+            identities = {identity for _index, _title, identity, _page in entries}
+            duplicate_titles = len(identities) != len(entries)
+            candidates = {identity: [] for identity in identities}
+            for index, _title, identity in unlisted_openings:
+                candidates[identity].append(unlisted_evidence[index])
+            unlisted_openings = []
+        unresolved = [(index, title, identity) for index, title, identity, _page in entries
+                      if len(candidates[identity]) != 1]
+        unresolved.extend(unlisted_openings)
+        positions = [candidates[identity][0][0] for _index, _title, identity, _page in entries
+                     if len(candidates[identity]) == 1]
+        if (duplicate_titles or unresolved or positions != sorted(set(positions))
+                or (positions and first_article < positions[0])):
+            document_metadata[STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY] = AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC
+            unresolved = unresolved or [(index, title, identity) for index, title, identity, _page in entries]
+            document_metadata[STRUCTURE_BOUNDARY_CANDIDATE_COUNT_METADATA_KEY] = len(unresolved)
+            document_metadata[STRUCTURE_BOUNDARY_CANDIDATES_METADATA_KEY] = [
+                {"title": title, "page": lines[index].page_no, "line": index + 1,
+                 "reason": "contents_body_opening_not_unique"}
+                for index, title, _identity in unresolved[:50]
+            ]
+            return {}, set()
+        boundaries: dict[int, StructureNode] = {}
+        navigation_indexes = set(range(min(positions)))
+        for contents_position, (_toc_index, title, identity, printed_page) in enumerate(entries, start=1):
+            index, title_end, _article_index = candidates[identity][0]
+            node = self._node(document_id, "regulation", None, title,
+                              "\n".join(line.text for line in lines[index:title_end + 1]),
+                              lines[index].page_no, 0, lines[index].metadata)
+            node.confidence = 0.96
+            node.warnings.append(RECOVERED_TYPESET_BOUNDARY_WARNING)
+            node.metadata["regulation_boundary_source"] = (
+                "contents_typeset_title_revision_and_article_restart" if has_numbered_contents
+                else "typeset_title_revision_and_article_restart_without_contents"
+            )
+            if has_numbered_contents:
+                node.metadata.update(contents_position=contents_position, contents_printed_page=printed_page)
+            boundaries[index] = node
+            navigation_indexes.update(range(index + 1, title_end + 1))
+        # Repeated small page-top running headers are navigation. Suppress only
+        # identities established at actual openings and the same small layout.
+        header_identities = {self._regulation_title_identity(lines[first_by_page[lines[index].page_no]].text)
+                             for index in boundaries}
+        for page, index in first_by_page.items():
+            if index in boundaries or self._regulation_title_identity(lines[index].text) not in header_identities:
+                continue
+            metadata = lines[index].metadata or {}
+            bbox = metadata.get("source_bbox") or []
+            size = metadata.get("font_size_median") or 0
+            if len(bbox) == 4 and 0 < size <= 10 and bbox[3] <= 90:
+                navigation_indexes.add(index)
+        # Contents may be incomplete. Re-run the conservative ambiguity check
+        # with the proven openings installed, so a text-only unlisted title
+        # after an attachment cannot silently inherit a listed unit's owner.
+        probe_lines = [SourceLine("", line.page_no) if index in navigation_indexes else line
+                       for index, line in enumerate(lines)]
+        probe_nodes = list(detected_lines)
+        for index, node in boundaries.items():
+            probe_nodes[index] = node
+        probe_metadata: dict = {}
+        self._implicit_title_only_regulation_boundaries(
+            probe_lines, document_id, probe_nodes, document_name="", document_metadata=probe_metadata,
+            reject_unlisted_candidates=True,
+        )
+        if probe_metadata.get(STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY):
+            document_metadata.update(probe_metadata)
+            return {}, set()
+        return boundaries, navigation_indexes
+
+    @staticmethod
+    def _contents_opening_layout(header: SourceLine | None, title_lines: list[SourceLine], article: SourceLine,
+                                 *, annotated: bool = False) -> bool:
+        """Require independent PDF typography, including a bounded title wrap."""
+        try:
+            all_lines = ([header] if header is not None else []) + [*title_lines, article]
+            sizes = [float((line.metadata or {}).get("font_size_median", 0)) for line in all_lines]
+            boxes = [tuple(float(value) for value in (line.metadata or {}).get("source_bbox", ()))
+                     for line in all_lines]
+        except (TypeError, ValueError):
+            return False
+        if (not all(isfinite(size) and size > 0 for size in sizes)
+                or not all(len(box) == 4 and all(isfinite(value) for value in box) for box in boxes)):
+            return False
+        title_offset = 1 if header is not None else 0
+        title_size = min(sizes[title_offset:-1])
+        # A small inline revision label can lower the median font; the line's
+        # glyph box still independently records the taller title glyphs.
+        header_smaller = header is None or title_size >= sizes[0] * 1.25
+        prominent = header_smaller and title_size >= sizes[-1] * 1.15
+        if annotated and len(title_lines) == 1:
+            prominent = prominent or (title_size >= sizes[-1]
+                                       and boxes[title_offset][3] - boxes[title_offset][1]
+                                       >= (boxes[-1][3] - boxes[-1][1]) * 1.2 and header_smaller)
+        return bool(prominent and (header is None or boxes[0][3] <= 90) and boxes[title_offset][1] <= 180
+                    and all(before[3] < after[1] for before, after in zip(boxes, boxes[1:]))
+                    and (len(title_lines) == 1
+                         or boxes[title_offset + 1][1] - boxes[title_offset][3] <= title_size * 1.5))
+
     def _title_only_regulation_boundaries(
         self,
         lines: list[SourceLine],
@@ -1014,6 +1247,7 @@ class StructureDetector:
         *,
         document_name: str,
         document_metadata: dict | None = None,
+        reject_unlisted_candidates: bool = False,
     ) -> dict[int, StructureNode]:
         """Infer a title-only combined book when no numbered contents exists.
 
@@ -1032,7 +1266,11 @@ class StructureDetector:
             for index, line in enumerate(lines)
             if line.block_type != "table"
             and detected_lines[index] is None
-            and self._looks_like_implicit_regulation_title(line.text)
+            and (self._looks_like_implicit_regulation_title(line.text)
+                 or (reject_unlisted_candidates
+                     and self._looks_like_plain_regulation_title(line.text.replace("‧", "·"))
+                     and (self._looks_like_implicit_regulation_title(line.text.replace("‧", "·"))
+                          or re.search(r"(?:법|시행령|학칙)$", self._regulation_title_identity(line.text)))))
             and not self._repeats_explicit_regulation_title(index, lines, detected_lines)
         ]
         if not raw_candidates:
@@ -1132,25 +1370,76 @@ class StructureDetector:
                 continue
             valid_candidates.append(candidate)
 
+        if reject_unlisted_candidates:
+            # Even a known title may be another revision. Proven title lines
+            # are already installed as regulation nodes and excluded above;
+            # every remaining Article 1 opening needs independent resolution.
+            unlisted = [(index, title) for index, title, _identity in [*valid_candidates, *ambiguous_candidates]]
+            if unlisted and document_metadata is not None:
+                document_metadata[STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY] = AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC
+                document_metadata[STRUCTURE_BOUNDARY_CANDIDATE_COUNT_METADATA_KEY] = len(unlisted)
+                document_metadata[STRUCTURE_BOUNDARY_CANDIDATES_METADATA_KEY] = [
+                    {"title": title, "page": lines[index].page_no, "line": index + 1,
+                     "reason": "unlisted_body_title_and_article_restart"}
+                    for index, title in unlisted[:50]
+                ]
+                return {}
+
         valid_identities = {identity for _index, _title, identity in valid_candidates}
         has_distinct_ambiguous_candidate = any(
             identity not in valid_identities
             for _index, _title, identity in ambiguous_candidates
         )
         candidates = valid_candidates
-        normalized_document_name = re.sub(
-            r"\.(?:pdf|hwp|hwpx|docx)$",
-            "",
-            str(document_name or "").strip(),
-            flags=re.IGNORECASE,
+        document_title_identity = self._standalone_document_title_identity(document_name)
+        has_book_front_matter = self._has_combined_book_front_matter(
+            lines, articles[0][0] if articles else len(lines),
         )
-        document_title_identity = self._regulation_title_identity(normalized_document_name)
+        explicit_identities = {
+            (detected_lines[index].number, self._regulation_title_identity(detected_lines[index].title or ""))
+            for index in explicit_boundary_indexes
+        }
         single_document_title_match = bool(
             len(candidates) == 1
+            and not has_book_front_matter
             and document_title_identity
             and candidates[0][2] == document_title_identity
+            and (
+                not explicit_identities
+                or (
+                    len(explicit_identities) == 1
+                    and next(iter(explicit_identities))[1] == document_title_identity
+                )
+            )
         )
-        if has_distinct_ambiguous_candidate and not single_document_title_match:
+        # A numbered heading can establish the same standalone identity as a
+        # plain title. Its adjacent repeated title was deliberately excluded
+        # above, so valid_candidates can be empty even for a clear single rule.
+        # Require its own Article 1 before any attachment, a matching document
+        # name, and one number/title identity across the entire source. Another
+        # regulation number (even with the same title) remains a combined book.
+        numbered_standalone_match = bool(
+            len(explicit_identities) == 1
+            and not has_book_front_matter
+            and document_title_identity
+            and next(iter(explicit_identities))[1] == document_title_identity
+            and valid_identities.issubset({document_title_identity})
+            and articles
+            and articles[0][1].number == "제1조"
+            and min(explicit_boundary_indexes) < articles[0][0]
+            and (not attachment_indexes or articles[0][0] < attachment_indexes[0])
+        )
+        # A matching upload name cannot prove that a later Article 1 is a
+        # sample. Require an explicit sample/form/quotation label attached to
+        # every otherwise ambiguous candidate before using either exception.
+        samples_are_explicit = all(
+            self._has_explicit_embedded_sample_label(lines, index, attachment_indexes)
+            for index, _title, identity in ambiguous_candidates
+            if identity not in valid_identities
+        )
+        single_document_title_match = single_document_title_match and samples_are_explicit
+        numbered_standalone_match = numbered_standalone_match and samples_are_explicit
+        if has_distinct_ambiguous_candidate and not (single_document_title_match or numbered_standalone_match):
             # A title followed by an Article 1 restart after an attachment may
             # be a real regulation whose page/preamble boundary evidence was
             # lost. A bare attachment label such as "지급기준" without an
@@ -1160,6 +1449,16 @@ class StructureDetector:
                 document_metadata[STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY] = (
                     AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC
                 )
+                unresolved = [
+                    (index, title)
+                    for index, title, identity in ambiguous_candidates
+                    if identity not in valid_identities
+                ]
+                document_metadata[STRUCTURE_BOUNDARY_CANDIDATE_COUNT_METADATA_KEY] = len(unresolved)
+                document_metadata[STRUCTURE_BOUNDARY_CANDIDATES_METADATA_KEY] = [
+                    {"title": title, "page": lines[index].page_no, "line": index + 1}
+                    for index, title in unresolved[:50]
+                ]
             return {}
         if len(candidates) < 2 and not single_document_title_match:
             return {}
@@ -1500,6 +1799,64 @@ class StructureDetector:
 
     def _regulation_title_identity(self, title: str) -> str:
         return re.sub(r"\s+", "", self._regulation_title_for_matching(title)).casefold()
+
+    def _standalone_document_title_identity(self, document_name: str | None) -> str:
+        """Compare a file label with a body title using only known wrappers.
+
+        Do not loosen body-heading detection or strip arbitrary numeric text.
+        A numbered file label uses the same grammar as a numbered heading;
+        a parenthesized bare date is only a filename/version annotation here.
+        """
+
+        candidate = re.sub(
+            r"\.(?:pdf|hwp|hwpx|docx)$", "", str(document_name or "").strip(), flags=re.IGNORECASE,
+        )
+        numbered = PATTERNS["regulation"].fullmatch(candidate)
+        if numbered:
+            candidate = numbered.group(2).strip()
+        candidate = re.sub(r"_\d{4}-\d{2}-\d{2}$", "", candidate)
+        candidate = re.sub(
+            r"\s*[\(（]\s*\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s*[\)）]\s*$",
+            "",
+            candidate,
+        )
+        return self._regulation_title_identity(candidate)
+
+    def _has_combined_book_front_matter(self, lines: list[SourceLine], first_article_index: int) -> bool:
+        """A filename cannot override an explicit book cover or multi-rule TOC."""
+
+        front_lines = lines[:first_article_index]
+        compact_lines = {re.sub(r"\s+", "", line.text).casefold() for line in front_lines}
+        if any(re.fullmatch(r".{0,60}(?:규정집|規程集|規定集)", text) for text in compact_lines):
+            return True
+        if not compact_lines & {"목차", "차례", "contents"}:
+            return False
+        title_identities: set[str] = set()
+        for line in front_lines:
+            title = re.sub(r"^\s*\d+\s*[.)．]\s*", "", self._navigation_regulation_title(line.text))
+            if self._looks_like_implicit_regulation_title(title):
+                title_identities.add(self._regulation_title_identity(title))
+        return len(title_identities) > 1
+
+    @staticmethod
+    def _has_explicit_embedded_sample_label(lines: list[SourceLine], candidate_index: int,
+                                          attachment_indexes: list[int]) -> bool:
+        position = bisect_right(attachment_indexes, candidate_index - 1) - 1
+        if position < 0:
+            return False
+        start = attachment_indexes[position]
+        # The directly preceding caption must expressly designate this title
+        # as a sample. A substring in prose ("예시 없음", "신청서식 목록") or a
+        # sample earlier in the attachment cannot prove the next boundary.
+        if candidate_index - start > 4:
+            return False
+        caption = lines[candidate_index - 1].text.strip()
+        if candidate_index - 1 == start:
+            label = PATTERNS["appendix"].match(caption) or PATTERNS["form"].match(caption)
+            if label:
+                caption = label.group(2).lstrip(" .．:：")
+        caption = caption.strip("()（）[]【】 ")
+        return bool(re.fullmatch(r"(?:(?:규정|규정문|조문|작성)\s*)?(?:견본|예시|샘플|작성례|인용문|서식)", caption))
 
     def _regulation_title_for_matching(self, title: str) -> str:
         """Normalize display wrappers and trailing revision labels for identity only."""

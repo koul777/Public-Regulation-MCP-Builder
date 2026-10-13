@@ -20,6 +20,7 @@ from app.retrieval.hierarchical_index import (
 )
 from app.schemas.chunk import ChunkOptions
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
+from app.services.review_workflow_service import ambiguous_combined_book_chunk_ids
 
 
 TENANT_ID = "tenant-packaging-parity"
@@ -36,6 +37,59 @@ class _RuntimeBundle:
 
 
 class InputPackagingParityTests(unittest.TestCase):
+    def test_numbered_contents_and_typeset_body_book_match_separate_file_search_and_articles(self) -> None:
+        combined_document = _flat_contents_typeset_combined_document()
+        nodes = StructureDetector().detect(combined_document)
+        chunks = Chunker().build_chunks(nodes, combined_document, ChunkOptions(include_context_header=False))
+        self.assertEqual({"인사규정", "보수규정"}, {node.title for node in nodes if node.node_type == "regulation"})
+        self.assertFalse(ambiguous_combined_book_chunk_ids(chunks))
+        self.assertNotIn("structure_boundary_diagnostic", combined_document.metadata)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            separate = _build_runtime_bundle(root / "separate", _separate_documents())
+            combined = _build_runtime_bundle(root / "typeset-book", [_flat_contents_typeset_combined_document()])
+            separate_catalog = _catalog_projection(separate.index_path)
+            combined_catalog = _catalog_projection(combined.index_path)
+            self.assertEqual(separate_catalog, combined_catalog)
+            self.assertEqual({"인사규정", "보수규정"}, set(combined_catalog))
+            self.assertEqual(separate.logical_corpus_sha256, combined.logical_corpus_sha256)
+
+            for title in sorted(separate_catalog):
+                unit_id = separate_catalog[title]["regulation_unit_id"]
+                self.assertEqual(unit_id, combined_catalog[title]["regulation_unit_id"])
+                self.assertEqual(
+                    _public_toc_projection(regulation_toc(separate.index_path, regulation_unit_id=unit_id)),
+                    _public_toc_projection(regulation_toc(combined.index_path, regulation_unit_id=unit_id)),
+                )
+                for article_no in ("제1조", "제2조"):
+                    separate_articles = load_article_records(
+                        separate.index_path, separate.vector_path, regulation_unit_id=unit_id, article_no=article_no,
+                    )
+                    combined_articles = load_article_records(
+                        combined.index_path, combined.vector_path, regulation_unit_id=unit_id, article_no=article_no,
+                    )
+                    self.assertTrue(separate_articles, (title, article_no))
+                    self.assertEqual(_article_projection(separate_articles), _article_projection(combined_articles))
+
+            for query in (
+                "인사규정 제2조 모든 직원",
+                "보수규정 제2조 매월 25일",
+                "인사 평가 A 90",
+                "직급 1급 월 보수 100",
+                "보수 변경 신청서 홍길동 10",
+            ):
+                separate_results, _ = search_hierarchical_records(
+                    separate.index_path, separate.vector_path, query=query, top_k=4,
+                    profile_id=PROFILE_ID, rerank_index=separate.bm25_index,
+                )
+                combined_results, _ = search_hierarchical_records(
+                    combined.index_path, combined.vector_path, query=query, top_k=4,
+                    profile_id=PROFILE_ID, rerank_index=combined.bm25_index,
+                )
+                self.assertTrue(separate_results, query)
+                self.assertEqual(_search_projection(separate_results), _search_projection(combined_results), query)
+
     def test_separate_files_and_combined_book_have_same_public_logical_results(self) -> None:
         separate_documents = _separate_documents()
         combined_document = _combined_document()
@@ -357,6 +411,43 @@ def _combined_document(*, include_contents: bool = True) -> ParsedDocument:
         file_type="pdf",
         pages=pages,
         raw_text=raw_text,
+        metadata={
+            "profile_id": PROFILE_ID,
+            "institution_name": "포장 동등성 테스트기관",
+            "pdf_table_regions": [_pay_table_region(page_no=20)],
+        },
+    )
+
+
+def _flat_contents_typeset_combined_document() -> ParsedDocument:
+    """Use plain numbered contents and a small header above each large title."""
+    contents = "목차\n1. 인사규정 ........................ 10\n2. 보수규정 ........................ 20"
+    pages = [ParsedPage(page_no=1, blocks=[ParsedBlock(text=contents)])]
+    for page_no, document in zip((10, 20), _separate_documents()):
+        lines = document.pages[0].blocks[0].text.splitlines()
+
+        def styled(text: str, top: float, font_size: float) -> ParsedBlock:
+            bbox = (40.0, top, 500.0, top + font_size)
+            return ParsedBlock(text=text, bbox=bbox, metadata={
+                "font_size_median": font_size, "source_bbox": list(bbox),
+            })
+
+        blocks = [
+            styled("규정집", 50, 9),
+            styled(lines[0], 90, 16),
+            styled(lines[1], 140, 10),
+            styled(lines[2], 175, 12),
+            *(styled(line, 200 + index * 30, 12) for index, line in enumerate(lines[3:])),
+            *[block.model_copy(deep=True) for block in document.pages[0].blocks[1:]],
+        ]
+        pages.append(ParsedPage(page_no=page_no, blocks=blocks))
+    return ParsedDocument(
+        document_id="doc-typeset-flat-contents-book",
+        source_file="synthetic-typeset-book.pdf",
+        document_name="합성 통합 규정집",
+        file_type="pdf",
+        pages=pages,
+        raw_text="\n".join(block.text for page in pages for block in page.blocks),
         metadata={
             "profile_id": PROFILE_ID,
             "institution_name": "포장 동등성 테스트기관",

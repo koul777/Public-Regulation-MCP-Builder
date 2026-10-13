@@ -16,6 +16,40 @@ from app.storage.repository import JsonRepository
 
 
 class DocumentMetadataTests(unittest.TestCase):
+    def test_reprocessing_draft_records_reason_without_changing_source_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(data_dir=Path(tmp))
+            repository = JsonRepository(settings)
+            service = DocumentService(settings, repository)
+            source = service.upload(
+                "synthetic-rule.pdf", b"%PDF-1.4\nsynthetic source",
+                document_name="Synthetic Rule", institution_name="Example Institution",
+                tenant_id="tenant-a", profile_id="profile-a", regulation_id="rule-a",
+                regulation_version="2026-01", effective_from="2026-01-01",
+                source_system="public_portal", source_url="https://example.test/rule",
+            )
+            source = source.model_copy(update={"regulation_status": "approved"})
+            repository.upsert_document(source)
+            source_before = source.model_dump(mode="json")
+            for reason in (None, "structure_boundary_recovery"):
+                with self.subTest(reason=reason):
+                    draft = service.clone_as_reprocessing_draft(
+                        source.document_id, **({"reason": reason} if reason else {}),
+                    )
+                    self.assertNotEqual(source.document_id, draft.document_id)
+                    self.assertEqual(reason or "kordoc_evidence_recovery", draft.reprocessing_reason)
+                    self.assertEqual(source.document_id, draft.reprocessing_source_document_id)
+                    self.assertEqual(source.document_id, draft.supersedes_document_id)
+                    self.assertEqual("draft", draft.regulation_status)
+                    for field in ("tenant_id", "profile_id", "regulation_id", "regulation_version",
+                                  "effective_from", "source_system", "source_url", "file_hash"):
+                        self.assertEqual(getattr(source, field), getattr(draft, field), field)
+                    self.assertEqual(service.path_for(source).read_bytes(), service.path_for(draft).read_bytes())
+                    self.assertEqual([], repository.get_chunks(draft.document_id))
+                    self.assertEqual([], repository.list_approval_records(draft.document_id))
+                    self.assertEqual([], repository.list_indexing_jobs(draft.document_id))
+            self.assertEqual(source_before, repository.get_document(source.document_id).model_dump(mode="json"))
+
     def test_upload_stores_public_institution_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp))
