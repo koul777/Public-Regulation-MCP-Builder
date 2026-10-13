@@ -256,8 +256,9 @@ async function main() {
       await output.press('Enter');
       assert.equal(await output.inputValue(),path.join(runtime,'bundle'));
       const serverName=page.getByRole('textbox',{name:'생성할 MCP 이름 (필수 입력)',exact:true});
+      // Submitting must commit a pending name edit without requiring Enter.
+      assert.equal(await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).isEnabled(),true);
       await serverName.fill('synthetic-mcp');
-      await serverName.press('Enter');
       assert.equal(await output.inputValue(),path.join(runtime,'bundle'));
       await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).click();
       await page.getByRole('button',{name:'Vercel 계정 연결',exact:true}).waitFor({timeout:240000});
