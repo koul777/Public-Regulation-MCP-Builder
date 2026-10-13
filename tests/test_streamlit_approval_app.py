@@ -1777,10 +1777,6 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             app.session_state["workflow-document-selected-doc_streamlit_service"] = True
             # 디렉터리에서 연 규정만 상세 렌더링되고, 전체 규정 상태는 명시적으로 불러온 뒤에만 집계된다.
             app.session_state["workflow_opened_document_id"] = "doc_streamlit_approval"
-            # '전체 규정 확인'을 켠 뒤에만 일괄 검수·확정 화면이 열린다.
-            app.session_state["approval-bulk-open-doc_streamlit_approval"] = True
-            app.session_state["approval-batch-loaded-doc_streamlit_approval"] = True
-            app.session_state["approval-bulk-sheet-doc_streamlit_approval"] = True
             app.session_state["nav_page"] = "③ 검수하고 승인"
             app.session_state["ai_connection_overrides"] = {
                 "data_dir": settings.data_dir,
@@ -1788,11 +1784,16 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             }
             app.run()
 
-            approve = next(
-                button
-                for button in app.button
-                if button.label == "전체 규정 최종 확정 · 선택한 2개 승인·색인"
-            )
+            entry = app.button(key="approval-batch-entry-doc_streamlit_approval")
+            self.assertEqual("선택한 규정 전체 승인·색인", entry.label)
+            entry.click().run()
+            self.assertFalse(app.exception)
+            repository = JsonRepository(settings)
+            for selected_document_id in ("doc_streamlit_approval", "doc_streamlit_service"):
+                self.assertEqual([], repository.list_approval_records(selected_document_id))
+                self.assertEqual([], repository.list_indexing_jobs(selected_document_id))
+            approve = app.button(key="workflow-approve-index-doc_streamlit_approval")
+            self.assertEqual("선택한 규정 전체 승인·색인", approve.label)
             self.assertFalse(approve.disabled)
             fake_embedding = SimpleNamespace(
                 encode_documents=lambda texts: [[0.0] * 384 for _ in texts]
@@ -2034,11 +2035,12 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             )
             service_area.set_value(edited).run()
             _confirm_rendered_approval_rows(app)
-            next(
-                button
-                for button in app.button
-                if button.label == "전체 규정 최종 확정 · 선택한 2개 승인·색인"
-            ).click().run()
+            app.button(key="approval-batch-entry-doc_streamlit_approval").click().run()
+            self.assertFalse(app.exception)
+            approve = app.button(key="workflow-approve-index-doc_streamlit_approval")
+            self.assertEqual("선택한 규정 전체 승인·색인", approve.label)
+            self.assertFalse(approve.disabled)
+            approve.click().run()
 
             repository = JsonRepository(settings)
             service_chunks = repository.get_chunks("doc_streamlit_service")
