@@ -1803,7 +1803,7 @@ def _queue_workflow_navigation(page: str, *, label: str | None = None) -> None:
             )
     if document_id and page in DOCUMENT_CONTEXT_NAV_PAGES:
         st.session_state[WORKFLOW_TRANSITION_STATE_KEY] = {
-            "label": label or page,
+            "label": label or _primary_nav_display_label(page),
             "target": page,
             "document_id": document_id,
         }
@@ -1819,7 +1819,7 @@ def _go(page: str) -> None:
 def _render_workflow_transition_dialog() -> None:
     transition = dict(st.session_state.get(WORKFLOW_TRANSITION_STATE_KEY) or {})
     target = str(transition.get("target") or NAV_HOME)
-    label = str(transition.get("label") or target)
+    label = str(transition.get("label") or _primary_nav_display_label(target))
     document_id = str(transition.get("document_id") or st.session_state.get("document_id") or "").strip()
     progress = st.progress(3, text=f"{label} 준비 · 3%")
     message = st.empty()
@@ -8994,7 +8994,7 @@ def _page_home(ctx: dict | None) -> None:
 
     message, target = _next_action(ctx)
     st.markdown(f'<div class="rr-next-box">👉 <b>지금 할 일:</b> {message}</div>', unsafe_allow_html=True)
-    _render_workflow_next_button(f"바로가기: {target}", target, key="home-next-action")
+    _render_workflow_next_button(f"바로가기: {_primary_nav_display_label(target)}", target, key="home-next-action")
 
     st.markdown("### 전처리 진행 방식")
     st.caption("처리 흐름: 파서 초안 → (선택) AI 추가 검수 → 사람 승인.")
@@ -11672,7 +11672,7 @@ def _page_approval(ctx: dict | None) -> None:
             3,
             ctx=ctx,
             purpose="왼쪽 원문과 오른쪽 정리 결과를 한 조항씩 비교하고, 맞는 내용만 최종 승인합니다.",
-            finish="선택한 규정의 승인·색인이 끝나면 ④ Qwen 규정 챗봇·AI 연결로 넘어갑니다.",
+            finish=f"선택한 규정의 승인·색인이 끝나면 {_connect_nav_display_label()}로 넘어갑니다.",
         )
     if not _require_document_context(ctx):
         return
@@ -12938,7 +12938,7 @@ def _page_approval(ctx: dict | None) -> None:
         )
         if beginner_current_document_incomplete:
             st.info(
-                "현재 규정은 최종 승인·색인을 완료해야 다음 규정이나 Qwen 챗봇·MCP 단계로 이동할 수 있습니다. 사람 검수 결정은 권고되지만 최종 버튼을 막지 않습니다."
+                f"현재 규정은 최종 승인·색인을 완료해야 다음 규정이나 {_connect_nav_display_label()} 단계로 이동할 수 있습니다. 사람 검수 결정은 권고되지만 최종 버튼을 막지 않습니다."
             )
         elif beginner_selected_documents_incomplete:
             pending_labels = [
@@ -12953,7 +12953,7 @@ def _page_approval(ctx: dict | None) -> None:
             )
             st.info(
                 f"초보자 안내 모드에서는 선택한 {len(selected_document_ids):,}개 규정이 "
-                "승인·색인되거나 명시적으로 반려되어 처리 방향이 모두 결정되어야 Qwen 챗봇·MCP 단계로 넘어갈 수 있습니다. "
+                f"승인·색인되거나 명시적으로 반려되어 처리 방향이 모두 결정되어야 {_connect_nav_display_label()} 단계로 넘어갈 수 있습니다. "
                 f"아직 {len(selected_pending_document_ids):,}개 규정이 남았습니다.{pending_note}"
             )
             next_document_id = str(selected_pending_document_ids[0])
@@ -12994,7 +12994,7 @@ def _page_approval(ctx: dict | None) -> None:
         else:
             _render_beginner_action_marker(
                 3,
-                "승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요",
+                f"승인·색인을 마쳤다면 {_connect_nav_display_label()}로 이동하세요",
                 "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
                 control_key_prefix="approval-goto-connect-simple",
                 substep=6,
@@ -13014,7 +13014,7 @@ def _page_approval(ctx: dict | None) -> None:
             )
         if not _beginner_focus_review() or not beginner_approval_incomplete:
             _render_workflow_next_button(
-                "④ Qwen 규정 챗봇·AI 연결로 이동",
+                f"{_connect_nav_display_label()}로 이동",
                 NAV_MCP,
                 key="approval-goto-connect-simple",
                 disabled=beginner_approval_incomplete,
@@ -13309,13 +13309,13 @@ def _page_approval(ctx: dict | None) -> None:
     st.divider()
     _render_beginner_action_marker(
         3,
-        "승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요",
+        f"승인·색인을 마쳤다면 {_connect_nav_display_label()}로 이동하세요",
         "바로 아래 버튼을 눌러 마지막 ④ 단계로 이동하세요.",
         control_key_prefix="approval-goto-connect",
         substep=6,
     )
     _render_workflow_next_button(
-        f"선택한 {len(selected_document_ids):,}개 규정을 ④ Qwen 규정 챗봇·AI 연결로 이동",
+        f"선택한 {len(selected_document_ids):,}개 규정을 {_connect_nav_display_label()}로 이동",
         NAV_MCP,
         key="approval-goto-connect",
         disabled=not selected_document_ids,
@@ -13795,7 +13795,7 @@ def _render_ai_connection_settings(settings_snapshot) -> None:
               `ENABLE_AGENT_REVIEW`, `LLM_PROVIDER`, `AGENT_REVIEW_MODEL`, `AGENT_REVIEW_API_BASE_URL`,
               `OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
               `ANTHROPIC_API_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`.
-            - 승인된 규정은 '④ Qwen 규정 챗봇·AI 연결'에서 로컬 Qwen에 바로 질문할 수 있습니다. 외부 범용 AI가 필요할 때만 같은 화면의 MCP 탭을 사용합니다.
+            - 승인된 규정은 ④ 단계에서 선택한 방식으로 사용합니다. 로컬 Qwen 챗봇을 열거나 외부 AI용 MCP를 연결할 수 있습니다.
             """
         )
 
@@ -13812,6 +13812,11 @@ def _dismiss_api_key_setup_dialog() -> None:
 def _render_api_key_setup_dialog() -> None:
     """Show provider, model, key, and API address without leaving the current page."""
     _render_ai_connection_settings(settings)
+
+
+def _set_mcp_form_value(key: str, value: str) -> None:
+    """Apply an explicit form choice before Streamlit recreates its widgets."""
+    st.session_state[key] = value
 
 
 def _page_connect(
@@ -14489,7 +14494,7 @@ def _page_connect(
         mcp_host = "127.0.0.1"
         mcp_port = 8000
         mcp_public_url_input = ""
-        mcp_target_ready = True
+        mcp_configuration_issues: list[str] = []
         if mcp_mode == "http":
             with st.expander("고급: 이미 배포한 HTTPS 주소 직접 입력", expanded=False):
                 st.markdown("#### Vercel MCP HTTPS 주소")
@@ -14575,8 +14580,8 @@ def _page_connect(
                 "저장 방식",
                 ["folder-and-zip", "folder-only"],
                 format_func=lambda value: {
-                    "folder-and-zip": "폴더 + 전달용 ZIP (권장)",
-                    "folder-only": "이 PC에 폴더만 저장",
+                    "folder-and-zip": "폴더 + 전달용 ZIP" if remote_deployment else "폴더 + 전달용 ZIP (권장)",
+                    "folder-only": "폴더만 저장 · Vercel 배포용 (권장)" if remote_deployment else "이 PC에 폴더만 저장",
                 }[value],
                 key=f"mcp-save-mode-{document_id}",
                 horizontal=True,
@@ -14585,7 +14590,7 @@ def _page_connect(
                     "필요하며, 다른 PC에서 로컬 STDIO로 실행하려면 그 PC에 Python 3.11 이상이 필요합니다."
                 ),
             )
-            if mcp_save_mode == "folder-and-zip" and mcp_mode == "stdio":
+            if mcp_save_mode == "folder-and-zip" and mcp_mode == "local":
                 st.info(
                     "전달용 ZIP을 다른 Windows PC에서 로컬 STDIO로 실행하려면 대상 PC에 "
                     "Python 3.11 이상을 설치해야 합니다. 'Python 설치 불필요'는 이 PC에 있는 "
@@ -14593,7 +14598,9 @@ def _page_connect(
                 )
             mcp_handoff_wheel_path = _operator_handoff_wheel_path()
             if mcp_save_mode == "folder-and-zip" and mcp_handoff_wheel_path is None:
-                mcp_target_ready = False
+                mcp_configuration_issues.append(
+                    "전달용 ZIP에 필요한 설치 파일이 없습니다. 아래 'ZIP 없이 계속하기'를 누르면 폴더만 만들 수 있습니다."
+                )
                 st.warning(
                     "다른 PC에서 설치할 wheel 파일이 없어 전달용 ZIP을 만들 수 없습니다. "
                     "소스 실행은 먼저 `python -m build --wheel`을 실행하고, Windows 실행판은 "
@@ -14639,12 +14646,18 @@ def _page_connect(
             placeholder=f"예: {suggested_mcp_server_name}",
             help="사용자가 입력한 이름만 AI 앱에 등록됩니다. 예시는 자동으로 적용되지 않습니다.",
         ).strip()
+        st.caption("이름을 입력한 뒤 아래 'MCP로 쓸 파일 묶음 만들기'를 누르세요. 입력 내용도 함께 확인합니다.")
+        st.button(
+            f"추천 이름 사용: {suggested_mcp_server_name}",
+            key=f"mcp-use-suggested-name-{document_id}",
+            on_click=_set_mcp_form_value,
+            args=(mcp_server_name_key, suggested_mcp_server_name),
+        )
         normalized_mcp_server_name = _normalize_mcp_server_name(mcp_server_name)
         if not mcp_server_name:
-            mcp_target_ready = False
-            st.info("MCP 이름을 직접 입력해야 파일 묶음과 연결 설정을 생성할 수 있습니다.")
+            mcp_configuration_issues.append("MCP 이름을 입력하거나 위의 '추천 이름 사용'을 누르세요.")
         elif not normalized_mcp_server_name or normalized_mcp_server_name != mcp_server_name:
-            mcp_target_ready = False
+            mcp_configuration_issues.append("MCP 이름을 영문 소문자·숫자·하이픈·밑줄·점으로 수정하세요.")
             st.error("MCP 이름에는 영문 소문자, 숫자, 하이픈, 밑줄, 점만 사용할 수 있습니다.")
         config_server_name = (
             mcp_server_name
@@ -14679,7 +14692,9 @@ def _page_connect(
         elif mcp_beginner_mode:
             beginner_output_confirmed = False
         if mcp_beginner_mode and not beginner_output_confirmed:
-            mcp_target_ready = False
+            if not mcp_configuration_issues:
+                mcp_configuration_issues.append("위에서 규정 범위와 연결할 AI 앱을 확인하세요.")
+        mcp_target_ready = not mcp_configuration_issues
         mcp_config = _direct_python_mcp_config(
             build_mcp_client_config(
                 server_name=config_server_name,
@@ -14771,16 +14786,39 @@ def _page_connect(
             else:
                 _render_beginner_action_marker(
                     4,
-                    "MCP 생성 조건을 먼저 확인하세요",
-                    "바로 위 경고의 미완료 항목을 해결하면 MCP 파일 묶음 만들기 버튼이 활성화됩니다.",
+                    "아래 항목을 확인하고 파일 묶음을 만드세요",
+                    "입력한 이름은 만들기 버튼을 누를 때 함께 확인합니다. 남은 준비 항목은 버튼 바로 위에 표시됩니다.",
                     substep=5,
                 )
+        mcp_bundle_blockers = list(mcp_configuration_issues)
+        if mcp_profile_scope_mismatch:
+            mcp_bundle_blockers.append("선택한 기관과 문서의 기관이 다릅니다. 문서에 맞는 기관을 선택하세요.")
+        if not scope_documents:
+            mcp_bundle_blockers.append("MCP에 넣을 규정이 없습니다. 위의 'MCP 데이터 범위'에서 규정을 선택하세요.")
+        else:
+            if not kordoc_preflight["ready"]:
+                mcp_bundle_blockers.append("표 파싱 품질 확인이 남아 있습니다. 위의 'Kordoc 표 파싱 사전 점검'에서 처리할 문서를 확인하세요.")
+            if not scope_gate["ready"]:
+                mcp_bundle_blockers.append("검토·승인·색인이 끝나지 않은 규정이 있습니다. ③ 검수하고 승인에서 남은 규정을 처리하세요.")
+        if mcp_bundle_blockers:
+            st.warning("**파일 묶음을 만들기 전에 확인할 항목**\n\n" + "\n".join(f"- {issue}" for issue in mcp_bundle_blockers))
+        if mcp_save_mode == "folder-and-zip" and mcp_handoff_wheel_path is None:
+            st.button(
+                "ZIP 없이 계속하기 · Vercel 배포용 폴더 사용" if remote_deployment else "ZIP 없이 계속하기 · 이 PC에 폴더만 저장",
+                key=f"mcp-bundle-use-folder-only-{document_id}",
+                on_click=_set_mcp_form_value,
+                args=(save_mode_key, "folder-only"),
+            )
         if st.button(
             "MCP로 쓸 파일 묶음 만들기",
             key=f"write-mcp-bundle-{document_id}",
             type="primary",
-            disabled=not mcp_bundle_ready or mcp_profile_scope_mismatch or not mcp_target_ready,
         ):
+            # Keep submission available so a click also commits a pending name
+            # edit. Validate before touching files or previous completion proof.
+            if not mcp_bundle_ready or mcp_profile_scope_mismatch or not mcp_target_ready:
+                st.error("아직 파일 묶음을 만들 수 없습니다. 바로 위 '확인할 항목'을 해결한 뒤 다시 눌러 주세요.")
+                return
             # A regeneration attempt invalidates the previous completion proof
             # immediately.  Only the final successful stage writes fresh state.
             _clear_mcp_bundle_states(document_id, mcp_scope)
@@ -16198,12 +16236,13 @@ with st.sidebar:
         )
         if stored_primary_page != desired_primary_page:
             st.session_state["primary_nav_page"] = desired_primary_page
+        primary_nav_labels = {page: _primary_nav_display_label(page) for page in primary_nav_pages}
         st.radio(
             "기본 작업 순서",
             primary_nav_pages,
             key="primary_nav_page",
             on_change=_go_primary_nav,
-            format_func=_primary_nav_display_label,
+            format_func=primary_nav_labels.get,
         )
         if NAV_RESULTS not in primary_nav_pages and not beginner_sidebar:
             st.caption(
@@ -16257,7 +16296,7 @@ with st.sidebar:
                 )
                 st.info(
                     f"지금 할 일: {next_message}\n\n"
-                    f"이동 위치: {next_target}"
+                    f"이동 위치: {_primary_nav_display_label(next_target)}"
                 )
             quality_report = ctx["quality_report"]
             st.markdown("**현재 작업 중인 문서**")

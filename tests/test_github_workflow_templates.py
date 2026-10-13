@@ -186,6 +186,7 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
             "test_authoring_service", "test_authoring_official_isolation",
             "test_streamlit_setup", "test_streamlit_authoring",
             "test_streamlit_approval_app",
+            "test_streamlit_mcp_bundle_form",
             "test_ai_review_display",
         ):
             self.assertIn(f"tests.{module}", fast_step)

@@ -506,7 +506,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('index=None if beginner_target_choice_required else 0', source)
         self.assertIn('[data-testid="stRadio"]', source)
         self.assertIn('[data-testid="stLinkButton"]', source)
-        self.assertIn("승인·색인을 마쳤다면 Qwen 챗봇으로 이동하세요", source)
+        self.assertIn("승인·색인을 마쳤다면 {_connect_nav_display_label()}로 이동하세요", source)
         # Definition plus the mutually exclusive resumed-remote and newly-built paths.
         self.assertEqual(3, source.count("_render_beginner_connection_confirmation("))
         registration_course = source.index("_render_mcp_completion_connection_course(", 8000)
@@ -1149,9 +1149,9 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         self.assertIn('st.session_state[save_mode_key] = "folder-only"', page_source)
         self.assertIn("BEGINNER_GUIDE_MCP_SCOPE_CONFIRMED_PREFIX", page_source)
         self.assertIn("BEGINNER_GUIDE_MCP_OUTPUT_CONFIRMED_PREFIX", page_source)
-        self.assertIn("mcp_target_ready = False", page_source)
+        self.assertIn("mcp_target_ready = not mcp_configuration_issues", page_source)
         self.assertIn(
-            "disabled=not mcp_bundle_ready or mcp_profile_scope_mismatch or not mcp_target_ready",
+            "if not mcp_bundle_ready or mcp_profile_scope_mismatch or not mcp_target_ready:",
             page_source,
         )
 
