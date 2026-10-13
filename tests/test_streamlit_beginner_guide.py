@@ -2606,15 +2606,15 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             page_source.index("_safe_kordoc_reprocess_documents("),
         )
 
-    def test_multi_document_results_explain_beginner_one_by_one_scope(self) -> None:
+    def test_multi_document_results_offer_batch_and_optional_individual_review(self) -> None:
         source, module = _source_and_module()
         page = _function(module, "_page_results")
         page_source = "\n".join(source.splitlines()[page.lineno - 1 : page.end_lineno])
 
         self.assertIn("beginner_reviews_one_document", page_source)
-        self.assertIn("현재 화면의 규정부터 1개씩 검수합니다", page_source)
-        self.assertIn("현재 규정 ③ 검수·승인으로 이동", page_source)
-        self.assertIn("문서 목록에서 다음 규정을 선택", page_source)
+        self.assertIn("전체 규정 한꺼번에 처리", page_source)
+        self.assertIn("선택한 {len(selected_document_ids):,}개 규정 ③ 검수·승인으로 이동", page_source)
+        self.assertIn("한 개씩 검수하는 방법도 선택할 수 있습니다", page_source)
 
     def test_beginner_approval_recommends_results_without_blocking_and_opens_next_one(self) -> None:
         source, module = _source_and_module()
@@ -2627,8 +2627,8 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             "현재 규정의 결과 두 곳 확인을 권고합니다",
             "현재 규정의 결과 두 곳 확인하러 가기",
             "이 권고는 진행을 막지 않으며",
-            "다음 미완료 규정을 하나씩 계속 확인하세요",
-            "결과 확인 두 곳부터 원본·전처리·AI 검수 의견 비교, 승인 또는 반려, 색인까지",
+            "전체 규정을 처리하거나 개별 검수를 이어가세요",
+            "전체 규정 한꺼번에 처리",
             "다음 미완료 규정 결과 확인",
         ):
             self.assertIn(text, page_source)
@@ -2662,14 +2662,16 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
         source, module = _source_and_module()
         page = _function(module, "_page_approval")
         page_source = "\n".join(source.splitlines()[page.lineno - 1 : page.end_lineno])
+        page_source += ast.get_source_segment(source, _function(module, "_render_selected_approval_batch")) or ""
 
-        # 초보/일반 모드 모두 권고 경고를 보여 주되 추가 동의 체크 없이
-        # 같은 최종 버튼 한 번으로 미검수 승인·색인을 실행한다.
+        # Both modes expose batching. The new beginner shortcut retains explicit
+        # acknowledgment of unreviewed approval; index-only needs no acknowledgment.
         self.assertIn("사람 검수를 권장합니다", page_source)
         self.assertIn("지금 최종 확정해도 진행되며", page_source)
         self.assertIn("approved_without_review", page_source)
         self.assertNotIn("workflow-beginner-bulk-ack", page_source)
         self.assertNotIn("beginner_bulk_review_disabled", page_source)
+        self.assertIn("require_unreviewed_ack and workflow_pending_count > workflow_ready_count", page_source)
         self.assertIn("not workflow_contexts_complete", page_source)
         self.assertIn("disabled=beginner_mode_active", page_source)
         self.assertIn("show_advanced_approval = False", page_source)
@@ -3131,7 +3133,7 @@ class StreamlitBeginnerGuideTests(unittest.TestCase):
             kordoc_ready=False,
         )
         self.assertEqual("승인된 문서가 아직 AI 검색용으로 색인되지 않았습니다.", index_guidance[0]["cause"])
-        self.assertIn("'이미 승인된 내용 AI에 등록만 실행'", index_guidance[0]["action"])
+        self.assertIn("'전체 규정 한꺼번에 처리'", index_guidance[0]["action"])
         self.assertIn("PDF·HWP·HWPX·DOCX 문서의 Kordoc 표 파싱 품질 증거", index_guidance[1]["cause"])
         self.assertIn("안전 재전처리", index_guidance[1]["action"])
         self.assertNotIn("document_not_indexed", source[source.index("def _render_mcp_bundle_blocking_guidance"):])
@@ -3457,7 +3459,7 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         self.assertFalse(any(button.key == "approval-goto-connect-simple" for button in self.app.button))
         self.assertTrue(self.app.button(key="beginner-guide-next").disabled)
         self.assertIn(
-            "다음 미완료 규정을 하나씩 계속 확인하세요",
+            "전체 규정을 처리하거나 개별 검수를 이어가세요",
             "\n".join(str(item.value) for item in self.app.markdown),
         )
         before = self._file_snapshot()
@@ -3604,6 +3606,7 @@ class StreamlitOperatorCompletionRegressionTests(unittest.TestCase):
     def test_bulk_approval_labels_execution_and_preserves_acknowledgement_and_audit(self) -> None:
         source, module = _source_and_module()
         page_source = ast.get_source_segment(source, _function(module, "_page_approval")) or ""
+        page_source += ast.get_source_segment(source, _function(module, "_render_selected_approval_batch")) or ""
         self.assertNotIn("를 AI 검수 결과대로 한 번에 승인하기", page_source)
         self.assertIn("_ai_review_status_text(agent_review_summary)", page_source)
         self.assertIn('_ai_review_status_text(approval_ctx.get("agent_review_summary"))', page_source)
@@ -3615,7 +3618,7 @@ class StreamlitOperatorCompletionRegressionTests(unittest.TestCase):
 
     def test_bulk_opinion_confirmation_does_not_count_rows_without_opinions(self) -> None:
         _source, module = _source_and_module()
-        page = _function(module, "_page_approval")
+        page = _function(module, "_render_selected_approval_batch")
         assignments = [
             node for node in ast.walk(page)
             if isinstance(node, ast.Assign)

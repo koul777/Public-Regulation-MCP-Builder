@@ -3092,7 +3092,11 @@ def _render_beginner_action_marker(
     # leads fast preprocessing directly to the upload action.
     if int(step) == 1 and int(substep) == 2:
         tour_attributes = ""
-    tour_priority = 100 if control_key_prefix == "preprocess-goto-results" else 0
+    tour_priority = 100 if (
+        control_key_prefix == "preprocess-goto-results"
+        or control_key_prefix == "workflow-approve-index-"
+        or any(key.startswith("approval-batch-") for key in control_keys)
+    ) else 0
     tour_current = str(
         int(st.session_state.get(BEGINNER_GUIDE_SUBSTEP_KEY) or 0) == int(substep)
     ).lower()
@@ -5593,19 +5597,19 @@ def _mcp_gate_guidance_items(
         ),
         "document_not_indexed": (
             "승인된 문서가 아직 AI 검색용으로 색인되지 않았습니다.",
-            "③ 검수하고 승인 화면에서 '이미 승인된 내용 AI에 등록만 실행' 버튼을 누르세요.",
+            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'를 누르세요. 선택한 승인 규정을 한 번에 색인할 수 있습니다.",
         ),
         "visible_record_count_mismatch": (
             "승인된 조문 수와 AI 검색에 등록된 조문 수가 일치하지 않습니다.",
-            "③ 검수하고 승인 화면에서 '이미 승인된 내용 AI에 등록만 실행' 버튼으로 다시 색인하세요.",
+            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'에서 선택한 승인 규정을 다시 색인하세요.",
         ),
         "stale_vector_records": (
             "이전 색인 기록이 남아 있어 최신 승인 내용과 일치하지 않습니다.",
-            "③ 검수하고 승인 화면에서 '이미 승인된 내용 AI에 등록만 실행' 버튼으로 최신 내용으로 다시 색인하세요.",
+            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'에서 최신 승인 내용으로 다시 색인하세요.",
         ),
         "index_validation_error": (
             "색인 결과 검증을 통과하지 못했습니다.",
-            "③ 검수하고 승인 화면에서 승인 상태를 확인한 뒤 '이미 승인된 내용 AI에 등록만 실행' 버튼을 다시 누르세요.",
+            "③ 검수하고 승인 상단의 '전체 규정 한꺼번에 처리'에서 승인 상태를 확인하고 색인을 다시 실행하세요.",
         ),
         "not_ready": (
             "MCP에 사용할 승인·색인 상태를 아직 확인하지 못했습니다.",
@@ -7107,6 +7111,11 @@ def _prepare_reviewed_document_approval_plan(
         "local_auth": ctx["local_auth"],
         "approval_requests": approval_requests,
         "pending_vector_sync_batch_ids": pending_vector_sync_batch_ids,
+        "index_required": (
+            any(_approval_status(chunk) == "approved" for chunk in chunks)
+            and isinstance(ctx.get("mcp_connection_gate"), dict)
+            and not bool(ctx["mcp_connection_gate"].get("ready"))
+        ),
         "pending_chunk_count": len(pending_entries),
         "edited_chunk_count": edited_chunk_total,
         "approval_override_reason": effective_override_reason,
@@ -7128,8 +7137,8 @@ def _prepare_reviewed_document_approval_plans(
 
 
 def _approval_plan_requires_work(plan: dict[str, object]) -> bool:
-    """Return whether approval or a durable deferred-sync recovery is actually pending."""
-    if plan.get("approval_requests"):
+    """Include approved files whose search index is missing or inconsistent."""
+    if plan.get("approval_requests") or plan.get("index_required"):
         return True
     return any(
         str(batch_id or "").strip()
@@ -7145,7 +7154,7 @@ def _execute_reviewed_document_approval_plan(
 ) -> dict[str, object]:
     document_id = str(plan["document_id"])
     local_auth = plan["local_auth"]
-    has_pending_work = bool(plan.get("approval_requests")) or any(
+    has_pending_work = bool(plan.get("approval_requests") or plan.get("index_required")) or any(
         str(batch_id or "").strip()
         for batch_id in (plan.get("pending_vector_sync_batch_ids") or [])
     )
@@ -7184,12 +7193,13 @@ def _execute_reviewed_document_approval_plan(
             if approval_requests
             else pending_vector_sync_batch_ids[0]
             if pending_vector_sync_batch_ids
-            else f"streamlit-{document_id}-approval-batch"
+            else ""
         )
     )[:200]
     document = plan.get("document")
-    can_defer_index = defer_index and not bool(
-        str(getattr(document, "supersedes_document_id", "") or "").strip()
+    can_defer_index = defer_index and (
+        not approval_requests
+        or not bool(str(getattr(document, "supersedes_document_id", "") or "").strip())
     )
     approval_index_result: dict[str, object] | None = None
     for request_index, approval_request in enumerate(approval_requests, start=1):
@@ -7223,7 +7233,7 @@ def _execute_reviewed_document_approval_plan(
     index_deferred = (
         approval_index_result is None
         and can_defer_index
-        and bool(approval_requests or pending_vector_sync_batch_ids)
+        and bool(approval_requests or pending_vector_sync_batch_ids or plan.get("index_required"))
     )
     if approval_index_result is None and not index_deferred:
         if progress_callback is not None:
@@ -10766,8 +10776,8 @@ def _page_results(ctx: dict | None) -> None:
     )
     if beginner_reviews_one_document:
         st.info(
-            f"초보자 안내에서는 선택한 {len(selected_document_ids):,}개 규정을 현재 화면의 규정부터 1개씩 검수합니다. "
-            "이 규정을 승인한 뒤 문서 목록에서 다음 규정을 선택하면 같은 순서로 이어갈 수 있습니다."
+            f"선택한 파일 {len(selected_document_ids):,}개를 ③ 상단의 '전체 규정 한꺼번에 처리'에서 함께 승인·색인할 수 있습니다. "
+            "원문을 자세히 살펴보려면 현재 규정부터 한 개씩 검수하는 방법도 선택할 수 있습니다."
         )
     beginner_results_confirmation_shown = bool(
         st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)
@@ -10837,7 +10847,7 @@ def _page_results(ctx: dict | None) -> None:
     )
     _render_workflow_next_button(
         (
-            f"현재 규정 ③ 검수·승인으로 이동 (선택 {len(selected_document_ids):,}개 중 1개씩 진행)"
+            f"선택한 {len(selected_document_ids):,}개 규정 ③ 검수·승인으로 이동"
             if beginner_reviews_one_document
             else f"선택한 {len(selected_document_ids):,}개 규정을 ③ 검수하고 승인으로 이동"
         ),
@@ -11662,6 +11672,465 @@ def _render_approval_screen_guide() -> None:
     )
 
 
+def _render_selected_approval_batch(
+    ctx: dict,
+    selected_document_ids: list[str],
+    selected_approval_contexts: list[dict],
+    *,
+    require_unreviewed_ack: bool = False,
+) -> None:
+    """Render the existing approval and shared-index workflow for the chosen files."""
+    document_id = str(ctx["document_id"])
+    local_auth = ctx["local_auth"]
+    bulk_sheet_key = f"approval-bulk-sheet-{document_id}"
+    requested_ids = {str(value) for value in selected_document_ids}
+    loaded_ids = {str(item.get("document_id") or "") for item in selected_approval_contexts}
+    selected_profile_id = _selected_institution_profile_id()
+    if not requested_ids or requested_ids != loaded_ids:
+        st.error("선택한 파일의 상태를 모두 불러오지 못했습니다. 규정 목록에서 선택 범위를 확인한 뒤 다시 시도하세요.")
+        return
+    if any(
+        str(getattr(item.get("local_auth"), "tenant_id", "")) != str(local_auth.tenant_id)
+        or (
+            selected_profile_id
+            and not _document_belongs_to_institution_profile(item["document"], selected_profile_id)
+        )
+        for item in selected_approval_contexts
+    ):
+        st.error("선택한 파일의 기관이 현재 기관과 다릅니다. 같은 기관의 규정만 선택해 주세요. 승인·색인은 실행하지 않았습니다.")
+        return
+    st.caption(
+        "선택한 파일을 한 번에 처리합니다. 각 규정의 이름과 조문 구조는 유지됩니다."
+    )
+    workflow_review_entries: list[tuple[dict, list[dict[str, object]]]] = []
+    workflow_review_rows: list[dict[str, object]] = []
+    workflow_deferred_sync_by_document: dict[str, list[str]] = {}
+    workflow_index_required_ids: set[str] = set()
+    workflow_sync_events = repository.list_maintenance_events(
+        "approval_vector_sync_outcome"
+    )
+    for approval_ctx in selected_approval_contexts:
+        pending_entries = _approval_pending_entries(approval_ctx)
+        approval_ctx_document_id = str(approval_ctx["document_id"])
+        pending_sync_batch_ids = pending_deferred_vector_sync_batch_ids(
+            repository,
+            approval_ctx_document_id,
+            maintenance_events=workflow_sync_events,
+        )
+        approval_ctx["pending_vector_sync_batch_ids"] = pending_sync_batch_ids
+        if pending_sync_batch_ids:
+            workflow_deferred_sync_by_document[approval_ctx_document_id] = (
+                pending_sync_batch_ids
+            )
+        workflow_review_entries.append((approval_ctx, pending_entries))
+        opinion_target_count = sum(bool(entry.get("item_ids")) for entry in pending_entries)
+        ai_complete = sum(
+            bool(entry.get("item_ids")) and bool(dict(entry["state"]).get("ai_confirmed"))
+            for entry in pending_entries
+        )
+        human_complete = sum(bool(entry.get("human_confirmed")) for entry in pending_entries)
+        ready_count = sum(bool(dict(entry["state"]).get("approve_enabled")) for entry in pending_entries)
+        approval_ctx_chunks = list(approval_ctx["chunks"])
+        approved_chunks = sum(1 for chunk in approval_ctx_chunks if _approval_status(chunk) == "approved")
+        if approved_chunks and not bool(dict(approval_ctx.get("mcp_connection_gate") or {}).get("ready")):
+            workflow_index_required_ids.add(approval_ctx_document_id)
+        approval_scope_state = _mcp_scope_document_state(
+            approval_ctx_chunks,
+            {"ready": approved_chunks > 0},
+        )
+        workflow_review_rows.append(
+            {
+                "규정": _workflow_document_label(approval_ctx["document"]),
+                "전체 청크": len(approval_ctx_chunks),
+                "미승인": len(pending_entries),
+                "AI 검수 실행": _ai_review_status_text(approval_ctx.get("agent_review_summary"))[0],
+                "검수 의견 확인": f"{ai_complete}/{opinion_target_count}",
+                "사람 확인": f"{human_complete}/{len(pending_entries)}",
+                "검수 주의": len(dict(approval_ctx.get("review_attention") or {})),
+                "승인 청크": approved_chunks,
+                "상태": (
+                    "명시적으로 반려되어 MCP에서 제외됨"
+                    if approval_scope_state["state"] == "terminal-excluded"
+                    else "규정 경계 재검토 필요"
+                    if _bulk_approval_blocker([approval_ctx])
+                    else "색인 복구 대기"
+                    if pending_sync_batch_ids
+                    else "승인 완료 · 색인 필요"
+                    if not pending_entries and approval_ctx_document_id in workflow_index_required_ids
+                    else (
+                        "승인·색인 완료"
+                        if not pending_entries and approved_chunks > 0
+                        else "승인·색인 가능"
+                        if pending_entries and ready_count == len(pending_entries)
+                        else "검수 권고"
+                    )
+                ),
+            }
+        )
+    st.dataframe(pd.DataFrame(workflow_review_rows), width="stretch", hide_index=True)
+    terminal_excluded_count = sum(
+        1
+        for row in workflow_review_rows
+        if row["상태"] == "명시적으로 반려되어 MCP에서 제외됨"
+    )
+    if terminal_excluded_count:
+        st.info(
+            f"선택한 규정 중 {terminal_excluded_count:,}개는 모든 활성 청크가 명시적으로 반려되어 "
+            "MCP에서 제외됩니다. 이는 검토 미완료가 아니며, 승인·색인된 다른 규정이 있으면 함께 MCP를 만들 수 있습니다."
+        )
+
+    workflow_pending_count = sum(len(entries) for _, entries in workflow_review_entries)
+    workflow_ready_count = sum(
+        bool(dict(entry["state"]).get("approve_enabled"))
+        for _, entries in workflow_review_entries
+        for entry in entries
+    )
+    workflow_deferred_sync_count = len(workflow_deferred_sync_by_document)
+    workflow_index_document_count = len(workflow_index_required_ids | set(workflow_deferred_sync_by_document))
+    workflow_contexts_complete = len(selected_approval_contexts) == len(selected_document_ids) and all(
+        approval_ctx.get("chunks") for approval_ctx in selected_approval_contexts
+    )
+
+    # 규정을 하나씩 열지 않고도 선택한 규정 전체의 미승인 조항을 이어서 볼 수 있어야 한다.
+    # 규정 경계는 유지한 채(규정명 표시) 규정 순서대로 이어 붙인다.
+    if st.checkbox(
+        "선택한 모든 규정의 미승인 조항을 이어서 비교하기 (원본 · 전처리본 · AI 검수 의견)",
+        key=bulk_sheet_key,
+        help="규정별 조항을 한 화면에서 순서대로 확인하고 고칠 수 있습니다. 고친 내용은 아래 최종 확정에서 함께 저장됩니다.",
+    ):
+        workflow_sheet_rows = [
+            _approval_compare_row(
+                approval_ctx["document"],
+                entry["chunk"],
+                attention=str(entry["chunk_id"])
+                in {str(cid) for cid in (approval_ctx.get("review_attention") or {})},
+                document_label=_workflow_document_label(approval_ctx["document"]),
+                review_reasons=list(
+                    (approval_ctx.get("review_attention") or {}).get(
+                        str(entry["chunk_id"]),
+                        [],
+                    )
+                ),
+                agent_review_summary=dict(
+                    approval_ctx.get("agent_review_summary") or {}
+                ),
+            )
+            for approval_ctx, pending_entries in workflow_review_entries
+            for entry in pending_entries
+        ]
+        if workflow_sheet_rows:
+            st.caption(
+                f"선택한 규정 {len(selected_approval_contexts):,}개의 미승인 조항 "
+                f"{len(workflow_sheet_rows):,}개를 규정 순서대로 보여줍니다."
+            )
+            # 규정마다 AI 검수 선정 목록이 따로 있으므로 합쳐서 넘긴다.
+            workflow_ai_selected_chunk_ids: set[str] = set()
+            workflow_ai_reviewed_chunk_ids: set[str] = set()
+            for approval_ctx, _pending_entries in workflow_review_entries:
+                workflow_ai_selected_chunk_ids |= _agent_review_selected_chunk_ids(
+                    approval_ctx.get("agent_review_summary")
+                )
+                workflow_ai_reviewed_chunk_ids |= _agent_review_reviewed_chunk_ids(
+                    approval_ctx.get("agent_review_summary")
+                )
+            _render_approval_compare_sheet(
+                rows=workflow_sheet_rows,
+                page_state_key=f"approval-bulk-sheet-page-{document_id}",
+                show_document_label=True,
+                ai_selected_chunk_ids=workflow_ai_selected_chunk_ids,
+                ai_reviewed_chunk_ids=workflow_ai_reviewed_chunk_ids,
+                # 행마다 해당 문서의 summary가 이미 들어 있다. 상단에서는 한
+                # 문서의 상태를 전체 선택의 상태처럼 단정하지 않는다.
+                agent_review_summary=None,
+            )
+        else:
+            st.success("선택한 규정에는 검수할 미승인 조항이 없습니다.")
+
+    workflow_security_level = st.selectbox(
+        "선택 규정 일괄 보안 등급",
+        ["internal", "public", "sensitive", "confidential"],
+        key=f"workflow-security-level-{document_id}",
+        format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
+    )
+    workflow_approval_blocker = _bulk_approval_blocker(selected_approval_contexts)
+    # The beginner shortcut requires an explicit acknowledgment for unreviewed
+    # approval. The existing detailed workflow keeps its established policy.
+    if workflow_pending_count > workflow_ready_count and not workflow_approval_blocker:
+        st.warning(
+            f"⚠️ 사람 검수를 권장합니다. 선택한 규정 {len(selected_document_ids):,}개의 "
+            f"미승인 조항 {workflow_pending_count:,}개 중 "
+            f"{workflow_pending_count - workflow_ready_count:,}개는 명시적 확인이 끝나지 않았습니다. "
+            "미검수 조항은 감사 기록에 구분해 남으며, 확인했다고 대신 기록하지 않습니다."
+        )
+    elif workflow_pending_count and not workflow_approval_blocker:
+        st.caption(
+            "선택한 모든 미승인 조항의 AI 판단과 사람 확인이 완료됐습니다."
+        )
+
+    unreviewed_acknowledged = True
+    if require_unreviewed_ack and workflow_pending_count > workflow_ready_count:
+        ack_key = f"approval-batch-unreviewed-ack-{document_id}"
+        ack_scope_key = f"{ack_key}:scope"
+        ack_scope = tuple(
+            (target_id, _document_context_revision(target_id))
+            for target_id in sorted(requested_ids)
+        )
+        if st.session_state.get(ack_scope_key) != ack_scope:
+            st.session_state[ack_key] = False
+            st.session_state[ack_scope_key] = ack_scope
+        if not st.session_state.get(ack_key):
+            _render_beginner_action_marker(
+                3,
+                "전체 범위의 일괄 승인을 확인하세요",
+                "선택한 파일 전체의 미승인 조항이 대상입니다. 확인하지 않은 조항이 포함됨을 이해한 뒤 아래 확인란을 선택하세요.",
+                control_keys=(ack_key,),
+                substep=3,
+            )
+        unreviewed_acknowledged = st.checkbox(
+            "선택한 파일 전체에 확인하지 않은 조항이 포함된 일괄 승인임을 이해했습니다.",
+            key=ack_key,
+            help="미검수 승인 사실과 사유를 감사 기록에 남깁니다. 반려된 조항은 승인하거나 색인하지 않습니다.",
+        )
+    if not workflow_pending_count and workflow_index_document_count:
+        st.info(
+            f"승인은 완료되어 있습니다. 색인이 필요한 파일 {workflow_index_document_count:,}개를 한꺼번에 등록합니다. "
+            "기존 승인 기록은 그대로 유지합니다."
+        )
+
+    if workflow_approval_blocker:
+        _render_bulk_approval_recovery(
+            workflow_approval_blocker, key=f"workflow-boundary-upload-{document_id}"
+        )
+    elif unreviewed_acknowledged and (workflow_pending_count or workflow_index_document_count):
+        _render_beginner_action_marker(
+            3,
+            "선택한 규정을 한꺼번에 처리하세요",
+            "아래 버튼 한 번으로 선택한 파일 전체를 처리합니다. 이미 승인된 내용은 필요한 색인만 실행합니다.",
+            control_key_prefix="workflow-approve-index-",
+            substep=4,
+        )
+    if st.button(
+        (
+            "추가로 승인·색인할 규정이 없습니다"
+            if workflow_pending_count == 0 and workflow_index_document_count == 0
+            else f"선택한 승인 규정 {workflow_index_document_count:,}개 한꺼번에 색인"
+            if workflow_pending_count == 0
+            else f"전체 규정 최종 확정 · 선택한 {len(selected_document_ids):,}개 승인·색인"
+        ),
+        type="primary",
+        key=f"workflow-approve-index-{document_id}",
+        disabled=(
+            not workflow_contexts_complete
+            or bool(workflow_approval_blocker)
+            or not unreviewed_acknowledged
+            or (
+                workflow_pending_count == 0
+                and workflow_deferred_sync_count == 0
+                and not workflow_index_required_ids
+            )
+        ),
+        width="stretch",
+    ):
+        batch_results: list[dict[str, object]] = []
+        batch_status = st.status("선택한 규정별 승인·색인 중…", expanded=True)
+        batch_progress = st.progress(0, text="규정별 승인·색인 준비 0%")
+        batch_detail = st.empty()
+        failed_stage = "승인·색인 계획 생성"
+        failed_regulation = f"선택한 {len(selected_document_ids):,}개 규정"
+        try:
+            prepared_plans = _prepare_reviewed_document_approval_plans(
+                [approval_ctx for approval_ctx, _ in workflow_review_entries],
+                security_level=workflow_security_level,
+            )
+            plans = [
+                plan
+                for plan in prepared_plans
+                if _approval_plan_requires_work(plan)
+            ]
+            skipped_plan_count = len(prepared_plans) - len(plans)
+            batch_detail.caption(
+                f"실제 승인·복구 대상 {len(plans):,}개 · 변경 없는 색인 생략 {skipped_plan_count:,}개"
+            )
+            approval_end_percent = 60
+            for plan_index, plan in enumerate(plans, start=1):
+                segment_start = int((plan_index - 1) * approval_end_percent / max(len(plans), 1))
+                segment_end = int(plan_index * approval_end_percent / max(len(plans), 1))
+                document_label = _workflow_document_label(plan["document"])
+                failed_stage = "승인 데이터 저장"
+                failed_regulation = document_label
+                batch_status.update(
+                    label=f"{plan_index:,}/{len(plans):,} · {document_label} 승인",
+                    state="running",
+                )
+                result = _run_background_operation_with_progress(
+                    lambda report, approval_plan=plan: _execute_reviewed_document_approval_plan(
+                        approval_plan,
+                        progress_callback=report,
+                        defer_index=True,
+                    ),
+                    progress_bar=batch_progress,
+                    detail_box=batch_detail,
+                    status_box=batch_status,
+                    start_percent=segment_start,
+                    end_percent=segment_end,
+                    label=f"{document_label} 승인",
+                    estimated_seconds=max(8.0, int(plan["pending_chunk_count"]) / 60.0),
+                )
+                batch_results.append(result)
+                _invalidate_document_context_cache(str(plan["document_id"]))
+            deferred_document_ids = [
+                str(result["document_id"])
+                for result in batch_results
+                if bool(result.get("index_deferred"))
+            ]
+            if deferred_document_ids:
+                deferred_batch_ids = {
+                    str(result["document_id"]): str(result.get("vector_sync_batch_id") or "")
+                    for result in batch_results
+                    if bool(result.get("index_deferred"))
+                    and str(result.get("vector_sync_batch_id") or "").strip()
+                }
+                failed_stage = "공유 검색 인덱스 일괄 생성"
+                failed_regulation = f"승인·복구 대상 {len(deferred_document_ids):,}개 규정"
+                batch_status.update(
+                    label=(
+                        f"승인 완료 · {len(deferred_document_ids):,}개 규정 "
+                        "공유 검색 인덱스 일괄 생성"
+                    ),
+                    state="running",
+                )
+                batch_index_result = _run_background_operation_with_progress(
+                    lambda report: index_documents_batch(
+                        deferred_document_ids,
+                        IndexRequest(
+                            target_type="local-jsonl",
+                            embedding_dimensions=384,
+                            embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                        ),
+                        local_auth,
+                        progress_callback=report,
+                        vector_sync_batch_ids=deferred_batch_ids,
+                    ),
+                    progress_bar=batch_progress,
+                    detail_box=batch_detail,
+                    status_box=batch_status,
+                    start_percent=approval_end_percent,
+                    end_percent=100,
+                    label=f"{len(deferred_document_ids):,}개 규정 일괄 색인",
+                    estimated_seconds=max(12.0, len(deferred_document_ids) * 2.0),
+                )
+                record_count_by_document = {
+                    str(job.get("document_id") or ""): int(job.get("record_count") or 0)
+                    for job in batch_index_result.get("jobs") or []
+                    if isinstance(job, dict)
+                }
+                for result in batch_results:
+                    result_document_id = str(result.get("document_id") or "")
+                    if result_document_id in record_count_by_document:
+                        result["indexed_record_count"] = record_count_by_document[result_document_id]
+                        result["index_deferred"] = False
+                for indexed_document_id in deferred_document_ids:
+                    _invalidate_document_context_cache(indexed_document_id)
+            else:
+                batch_progress.progress(100, text="실제 변경·복구 대상 처리 완료 · 100%")
+            batch_status.update(label="선택한 규정 승인·색인 처리 완료", state="complete")
+            st.success(
+                f"실제 승인·복구 대상 규정 {len(batch_results):,}개를 처리했습니다. "
+                f"변경 없는 규정 {skipped_plan_count:,}개는 색인을 생략했습니다. "
+                "MCP에는 규정별 계층과 청크가 분리되어 포함됩니다."
+            )
+            st.rerun()
+        except Exception as exc:
+            _update_long_operation_error(
+                batch_status,
+                stage=failed_stage,
+                regulation=failed_regulation,
+                error=exc,
+                failure_policy=(
+                    "실패 규정을 건너뛰지 않고 전체 일괄 작업을 중단했습니다. "
+                    "이미 승인된 규정은 보상 색인을 시도하고, 미완료 배치 ID는 복구용으로 보존합니다."
+                ),
+                detail_box=batch_detail,
+            )
+            deferred_results = [
+                result
+                for result in batch_results
+                if bool(result.get("index_deferred"))
+            ]
+            if deferred_results:
+                recovery_document_ids = [
+                    str(result["document_id"])
+                    for result in deferred_results
+                ]
+                recovery_batch_ids = {
+                    str(result["document_id"]): str(result.get("vector_sync_batch_id") or "")
+                    for result in deferred_results
+                    if str(result.get("vector_sync_batch_id") or "").strip()
+                }
+                try:
+                    recovery = index_documents_batch(
+                        recovery_document_ids,
+                        IndexRequest(
+                            target_type="local-jsonl",
+                            embedding_dimensions=384,
+                            embedding_model="Qwen/Qwen3-Embedding-0.6B",
+                        ),
+                        local_auth,
+                        vector_sync_batch_ids=recovery_batch_ids,
+                    )
+                    for recovery_document_id in recovery_document_ids:
+                        _invalidate_document_context_cache(recovery_document_id)
+                    st.warning(
+                        "일괄 승인 도중 오류가 발생했지만, 그 전에 승인된 "
+                        f"{len(recovery_document_ids):,}개 규정은 보상 색인을 완료했습니다 "
+                        f"(AI 등록 {int(recovery.get('record_count') or 0):,}개). "
+                        "남은 규정은 원인을 확인한 뒤 같은 버튼을 다시 실행할 수 있습니다."
+                    )
+                except Exception as recovery_exc:
+                    st.error(
+                        "일괄 승인 실패 후 보상 색인도 완료되지 않았습니다. "
+                        "승인 기록의 배치 ID가 보존되어 재실행할 수 있습니다. "
+                        f"대상 규정: {', '.join(recovery_document_ids)} · "
+                        f"보상 색인 오류: {_brief_long_operation_error(recovery_exc)}"
+                    )
+            st.error(_brief_long_operation_error(exc))
+    if workflow_ready_count < workflow_pending_count:
+        st.info(
+            "위 비교 화면에서 사람 검수를 계속할 수 있습니다. 검수를 생략하고 최종 확정하면 "
+            "기본 미검수 사유와 approved_without_review 감사 이벤트가 자동 기록됩니다."
+        )
+    selection_states = [
+        _mcp_scope_document_state(list(item.get("chunks") or []), item.get("mcp_connection_gate"))
+        for item in selected_approval_contexts
+    ]
+    selection_ready = (
+        workflow_contexts_complete
+        and any(item["state"] == "visible-ready" for item in selection_states)
+        and all(item["state"] in {"visible-ready", "terminal-excluded"} for item in selection_states)
+    )
+    if selection_ready:
+        st.success(f"선택한 파일 {len(selected_document_ids):,}개의 승인·색인이 끝났습니다. 이제 AI에 연결할 수 있습니다.")
+        _render_beginner_action_marker(
+            3,
+            f"{_connect_nav_display_label()}로 이동하세요",
+            "선택한 파일 전체의 처리가 끝났습니다. 아래 버튼을 누르면 같은 범위로 마지막 연결 단계를 엽니다.",
+            control_keys=(f"approval-batch-goto-connect-{document_id}",),
+            substep=6,
+        )
+        if st.button(
+            f"{_connect_nav_display_label()}로 이동",
+            key=f"approval-batch-goto-connect-{document_id}",
+            type="primary",
+            width="stretch",
+        ):
+            st.session_state[f"mcp-data-scope-{document_id}"] = (
+                "selected_documents" if len(selected_document_ids) > 1 else "current_document"
+            )
+            _queue_workflow_navigation(NAV_MCP)
+            st.rerun()
+
+
+
 def _page_approval(ctx: dict | None) -> None:
     st.markdown("## ③ 검수하고 승인")
     _render_operator_project_controls(NAV_APPROVAL)
@@ -11683,6 +12152,51 @@ def _page_approval(ctx: dict | None) -> None:
     with st.expander("규정 목록·다른 규정 선택", expanded=False) if _beginner_focus_review() else nullcontext():
         selected_document_ids = _render_workflow_document_directory(page_key="approval")
     document_id = ctx["document_id"]
+    batch_active_key = f"approval-batch-active-{document_id}"
+    current_file_units = _document_regulation_units(list(ctx.get("chunks") or []))
+    st.caption(
+        f"한꺼번에 처리할 범위: 선택한 파일 {len(selected_document_ids):,}개 전체. "
+        + (
+            f"현재 통합 규정집은 내부 규정 {len(current_file_units):,}개를 모두 포함합니다."
+            if len(current_file_units) > 1
+            else "파일에 들어 있는 모든 조항을 포함합니다."
+        )
+    )
+    if st.session_state.get(batch_active_key):
+        if st.button("한 조항씩 검수로 돌아가기", key=f"approval-batch-exit-{document_id}"):
+            st.session_state[batch_active_key] = False
+            st.rerun()
+        st.markdown("### 전체 규정 한꺼번에 처리")
+        st.info(
+            "선택한 파일 전체를 대상으로 합니다. 통합 규정집에서 열어 둔 규정 한 개로 범위를 좁히지 않습니다. "
+            "미승인 조항은 아래 최종 버튼으로 승인하고, 이미 승인된 내용은 필요한 색인만 처리합니다."
+        )
+        _render_quality_banner(ctx.get("quality_report"), at_review=True)
+        batch_contexts = _selected_approval_contexts(selected_document_ids, ctx)
+        batch_needs_index = any(
+            not bool(dict(item.get("mcp_connection_gate") or {}).get("ready"))
+            and any(_approval_status(chunk) != "rejected" for chunk in item.get("chunks") or [])
+            for item in batch_contexts
+        )
+        if batch_needs_index and not _render_indexing_preparation(document_id, guide_substep=0, recovering=False):
+            return
+        _render_selected_approval_batch(
+            ctx,
+            selected_document_ids,
+            batch_contexts,
+            require_unreviewed_ack=bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY)),
+        )
+        return
+    if st.button(
+        "전체 규정 한꺼번에 처리",
+        key=f"approval-batch-entry-{document_id}",
+        type="primary",
+        disabled=not selected_document_ids,
+        width="stretch",
+        help="먼저 선택한 파일 전체의 상태를 확인합니다. 이 버튼만으로 승인하거나 색인하지 않습니다.",
+    ):
+        st.session_state[batch_active_key] = True
+        st.rerun()
     if not _workflow_document_opened(document_id):
         _render_beginner_action_marker(
             3,
@@ -12546,357 +13060,7 @@ def _page_approval(ctx: dict | None) -> None:
         st.divider()
 
     if bulk_review_requested and batch_loaded:
-        st.caption(
-            "청크를 한 문서로 합치지 않습니다. 규정별 문서 ID·규정 ID·목차 계층을 유지한 채 "
-            "각 규정을 차례로 검수·승인·색인합니다."
-        )
-        workflow_review_entries: list[tuple[dict, list[dict[str, object]]]] = []
-        workflow_review_rows: list[dict[str, object]] = []
-        workflow_deferred_sync_by_document: dict[str, list[str]] = {}
-        workflow_sync_events = repository.list_maintenance_events(
-            "approval_vector_sync_outcome"
-        )
-        for approval_ctx in selected_approval_contexts:
-            pending_entries = _approval_pending_entries(approval_ctx)
-            approval_ctx_document_id = str(approval_ctx["document_id"])
-            pending_sync_batch_ids = pending_deferred_vector_sync_batch_ids(
-                repository,
-                approval_ctx_document_id,
-                maintenance_events=workflow_sync_events,
-            )
-            approval_ctx["pending_vector_sync_batch_ids"] = pending_sync_batch_ids
-            if pending_sync_batch_ids:
-                workflow_deferred_sync_by_document[approval_ctx_document_id] = (
-                    pending_sync_batch_ids
-                )
-            workflow_review_entries.append((approval_ctx, pending_entries))
-            opinion_target_count = sum(bool(entry.get("item_ids")) for entry in pending_entries)
-            ai_complete = sum(
-                bool(entry.get("item_ids")) and bool(dict(entry["state"]).get("ai_confirmed"))
-                for entry in pending_entries
-            )
-            human_complete = sum(bool(entry.get("human_confirmed")) for entry in pending_entries)
-            ready_count = sum(bool(dict(entry["state"]).get("approve_enabled")) for entry in pending_entries)
-            approval_ctx_chunks = list(approval_ctx["chunks"])
-            approved_chunks = sum(1 for chunk in approval_ctx_chunks if _approval_status(chunk) == "approved")
-            approval_scope_state = _mcp_scope_document_state(
-                approval_ctx_chunks,
-                {"ready": approved_chunks > 0},
-            )
-            workflow_review_rows.append(
-                {
-                    "규정": _workflow_document_label(approval_ctx["document"]),
-                    "전체 청크": len(approval_ctx_chunks),
-                    "미승인": len(pending_entries),
-                    "AI 검수 실행": _ai_review_status_text(approval_ctx.get("agent_review_summary"))[0],
-                    "검수 의견 확인": f"{ai_complete}/{opinion_target_count}",
-                    "사람 확인": f"{human_complete}/{len(pending_entries)}",
-                    "승인 청크": approved_chunks,
-                    "상태": (
-                        "명시적으로 반려되어 MCP에서 제외됨"
-                        if approval_scope_state["state"] == "terminal-excluded"
-                        else "규정 경계 재검토 필요"
-                        if _bulk_approval_blocker([approval_ctx])
-                        else "색인 복구 대기"
-                        if pending_sync_batch_ids
-                        else (
-                            "승인 완료"
-                            if approval_ctx_chunks and approved_chunks == len(approval_ctx_chunks)
-                            else "승인·색인 가능"
-                            if pending_entries and ready_count == len(pending_entries)
-                            else "검수 권고"
-                        )
-                    ),
-                }
-            )
-        st.dataframe(pd.DataFrame(workflow_review_rows), width="stretch", hide_index=True)
-        terminal_excluded_count = sum(
-            1
-            for row in workflow_review_rows
-            if row["상태"] == "명시적으로 반려되어 MCP에서 제외됨"
-        )
-        if terminal_excluded_count:
-            st.info(
-                f"선택한 규정 중 {terminal_excluded_count:,}개는 모든 활성 청크가 명시적으로 반려되어 "
-                "MCP에서 제외됩니다. 이는 검토 미완료가 아니며, 승인·색인된 다른 규정이 있으면 함께 MCP를 만들 수 있습니다."
-            )
-
-        workflow_pending_count = sum(len(entries) for _, entries in workflow_review_entries)
-        workflow_ready_count = sum(
-            bool(dict(entry["state"]).get("approve_enabled"))
-            for _, entries in workflow_review_entries
-            for entry in entries
-        )
-        workflow_deferred_sync_count = len(workflow_deferred_sync_by_document)
-        workflow_contexts_complete = len(selected_approval_contexts) == len(selected_document_ids) and all(
-            approval_ctx.get("chunks") for approval_ctx in selected_approval_contexts
-        )
-
-        # 규정을 하나씩 열지 않고도 선택한 규정 전체의 미승인 조항을 이어서 볼 수 있어야 한다.
-        # 규정 경계는 유지한 채(규정명 표시) 규정 순서대로 이어 붙인다.
-        if st.checkbox(
-            "선택한 모든 규정의 미승인 조항을 이어서 비교하기 (원본 · 전처리본 · AI 검수 의견)",
-            key=bulk_sheet_key,
-            help="규정별 조항을 한 화면에서 순서대로 확인하고 고칠 수 있습니다. 고친 내용은 아래 최종 확정에서 함께 저장됩니다.",
-        ):
-            workflow_sheet_rows = [
-                _approval_compare_row(
-                    approval_ctx["document"],
-                    entry["chunk"],
-                    attention=str(entry["chunk_id"])
-                    in {str(cid) for cid in (approval_ctx.get("review_attention") or {})},
-                    document_label=_workflow_document_label(approval_ctx["document"]),
-                    review_reasons=list(
-                        (approval_ctx.get("review_attention") or {}).get(
-                            str(entry["chunk_id"]),
-                            [],
-                        )
-                    ),
-                    agent_review_summary=dict(
-                        approval_ctx.get("agent_review_summary") or {}
-                    ),
-                )
-                for approval_ctx, pending_entries in workflow_review_entries
-                for entry in pending_entries
-            ]
-            if workflow_sheet_rows:
-                st.caption(
-                    f"선택한 규정 {len(selected_approval_contexts):,}개의 미승인 조항 "
-                    f"{len(workflow_sheet_rows):,}개를 규정 순서대로 보여줍니다."
-                )
-                # 규정마다 AI 검수 선정 목록이 따로 있으므로 합쳐서 넘긴다.
-                workflow_ai_selected_chunk_ids: set[str] = set()
-                workflow_ai_reviewed_chunk_ids: set[str] = set()
-                for approval_ctx, _pending_entries in workflow_review_entries:
-                    workflow_ai_selected_chunk_ids |= _agent_review_selected_chunk_ids(
-                        approval_ctx.get("agent_review_summary")
-                    )
-                    workflow_ai_reviewed_chunk_ids |= _agent_review_reviewed_chunk_ids(
-                        approval_ctx.get("agent_review_summary")
-                    )
-                _render_approval_compare_sheet(
-                    rows=workflow_sheet_rows,
-                    page_state_key=f"approval-bulk-sheet-page-{document_id}",
-                    show_document_label=True,
-                    ai_selected_chunk_ids=workflow_ai_selected_chunk_ids,
-                    ai_reviewed_chunk_ids=workflow_ai_reviewed_chunk_ids,
-                    # 행마다 해당 문서의 summary가 이미 들어 있다. 상단에서는 한
-                    # 문서의 상태를 전체 선택의 상태처럼 단정하지 않는다.
-                    agent_review_summary=None,
-                )
-            else:
-                st.success("선택한 규정에는 검수할 미승인 조항이 없습니다.")
-
-        workflow_security_level = st.selectbox(
-            "선택 규정 일괄 보안 등급",
-            ["internal", "public", "sensitive", "confidential"],
-            key=f"workflow-security-level-{document_id}",
-            format_func=lambda value: SECURITY_LEVEL_LABELS.get(value, value),
-        )
-        workflow_approval_blocker = _bulk_approval_blocker(selected_approval_contexts)
-        # 초보자/일반 모드 모두 같은 정책이다. 사람 검수를 권고하되 추가 체크박스로
-        # 버튼을 막지 않는다. 미완료 조항은 규정별 승인 요청에서 기본 우회 사유와
-        # approved_without_review 이벤트를 남겨, 검수가 끝난 것처럼 가장하지 않는다.
-        if workflow_pending_count > workflow_ready_count and not workflow_approval_blocker:
-            st.warning(
-                f"⚠️ 사람 검수를 권장합니다. 선택한 규정 {len(selected_document_ids):,}개의 "
-                f"미승인 조항 {workflow_pending_count:,}개 중 "
-                f"{workflow_pending_count - workflow_ready_count:,}개는 명시적 확인이 끝나지 않았습니다. "
-                "지금 최종 확정해도 진행되며, 미검수 조항은 감사 기록에 구분해 남습니다."
-            )
-        elif not workflow_approval_blocker:
-            st.caption(
-                "선택한 모든 미승인 조항의 AI 판단과 사람 확인이 완료됐습니다."
-            )
-
-        if workflow_approval_blocker:
-            _render_bulk_approval_recovery(
-                workflow_approval_blocker, key=f"workflow-boundary-upload-{document_id}"
-            )
-        if st.button(
-            (
-                f"색인 복구 {workflow_deferred_sync_count:,}개 실행"
-                if workflow_pending_count == 0 and workflow_deferred_sync_count
-                else f"전체 규정 최종 확정 · 선택한 {len(selected_document_ids):,}개 승인·색인"
-            ),
-            type="primary",
-            key=f"workflow-approve-index-{document_id}",
-            disabled=(
-                not workflow_contexts_complete
-                or bool(workflow_approval_blocker)
-                or (
-                    workflow_pending_count == 0
-                    and workflow_deferred_sync_count == 0
-                )
-            ),
-            width="stretch",
-        ):
-            batch_results: list[dict[str, object]] = []
-            batch_status = st.status("선택한 규정별 승인·색인 중…", expanded=True)
-            batch_progress = st.progress(0, text="규정별 승인·색인 준비 0%")
-            batch_detail = st.empty()
-            failed_stage = "승인·색인 계획 생성"
-            failed_regulation = f"선택한 {len(selected_document_ids):,}개 규정"
-            try:
-                prepared_plans = _prepare_reviewed_document_approval_plans(
-                    [approval_ctx for approval_ctx, _ in workflow_review_entries],
-                    security_level=workflow_security_level,
-                )
-                plans = [
-                    plan
-                    for plan in prepared_plans
-                    if _approval_plan_requires_work(plan)
-                ]
-                skipped_plan_count = len(prepared_plans) - len(plans)
-                batch_detail.caption(
-                    f"실제 승인·복구 대상 {len(plans):,}개 · 변경 없는 색인 생략 {skipped_plan_count:,}개"
-                )
-                approval_end_percent = 60
-                for plan_index, plan in enumerate(plans, start=1):
-                    segment_start = int((plan_index - 1) * approval_end_percent / max(len(plans), 1))
-                    segment_end = int(plan_index * approval_end_percent / max(len(plans), 1))
-                    document_label = _workflow_document_label(plan["document"])
-                    failed_stage = "승인 데이터 저장"
-                    failed_regulation = document_label
-                    batch_status.update(
-                        label=f"{plan_index:,}/{len(plans):,} · {document_label} 승인",
-                        state="running",
-                    )
-                    result = _run_background_operation_with_progress(
-                        lambda report, approval_plan=plan: _execute_reviewed_document_approval_plan(
-                            approval_plan,
-                            progress_callback=report,
-                            defer_index=True,
-                        ),
-                        progress_bar=batch_progress,
-                        detail_box=batch_detail,
-                        status_box=batch_status,
-                        start_percent=segment_start,
-                        end_percent=segment_end,
-                        label=f"{document_label} 승인",
-                        estimated_seconds=max(8.0, int(plan["pending_chunk_count"]) / 60.0),
-                    )
-                    batch_results.append(result)
-                    _invalidate_document_context_cache(str(plan["document_id"]))
-                deferred_document_ids = [
-                    str(result["document_id"])
-                    for result in batch_results
-                    if bool(result.get("index_deferred"))
-                ]
-                if deferred_document_ids:
-                    deferred_batch_ids = {
-                        str(result["document_id"]): str(result.get("vector_sync_batch_id") or "")
-                        for result in batch_results
-                        if bool(result.get("index_deferred"))
-                        and str(result.get("vector_sync_batch_id") or "").strip()
-                    }
-                    failed_stage = "공유 검색 인덱스 일괄 생성"
-                    failed_regulation = f"승인·복구 대상 {len(deferred_document_ids):,}개 규정"
-                    batch_status.update(
-                        label=(
-                            f"승인 완료 · {len(deferred_document_ids):,}개 규정 "
-                            "공유 검색 인덱스 일괄 생성"
-                        ),
-                        state="running",
-                    )
-                    batch_index_result = _run_background_operation_with_progress(
-                        lambda report: index_documents_batch(
-                            deferred_document_ids,
-                            IndexRequest(
-                                target_type="local-jsonl",
-                                embedding_dimensions=384,
-                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
-                            ),
-                            local_auth,
-                            progress_callback=report,
-                            vector_sync_batch_ids=deferred_batch_ids,
-                        ),
-                        progress_bar=batch_progress,
-                        detail_box=batch_detail,
-                        status_box=batch_status,
-                        start_percent=approval_end_percent,
-                        end_percent=100,
-                        label=f"{len(deferred_document_ids):,}개 규정 일괄 색인",
-                        estimated_seconds=max(12.0, len(deferred_document_ids) * 2.0),
-                    )
-                    record_count_by_document = {
-                        str(job.get("document_id") or ""): int(job.get("record_count") or 0)
-                        for job in batch_index_result.get("jobs") or []
-                        if isinstance(job, dict)
-                    }
-                    for result in batch_results:
-                        result_document_id = str(result.get("document_id") or "")
-                        if result_document_id in record_count_by_document:
-                            result["indexed_record_count"] = record_count_by_document[result_document_id]
-                            result["index_deferred"] = False
-                else:
-                    batch_progress.progress(100, text="실제 변경·복구 대상 처리 완료 · 100%")
-                batch_status.update(label="선택한 규정 승인·색인 처리 완료", state="complete")
-                st.success(
-                    f"실제 승인·복구 대상 규정 {len(batch_results):,}개를 처리했습니다. "
-                    f"변경 없는 규정 {skipped_plan_count:,}개는 색인을 생략했습니다. "
-                    "MCP에는 규정별 계층과 청크가 분리되어 포함됩니다."
-                )
-                st.rerun()
-            except Exception as exc:
-                _update_long_operation_error(
-                    batch_status,
-                    stage=failed_stage,
-                    regulation=failed_regulation,
-                    error=exc,
-                    failure_policy=(
-                        "실패 규정을 건너뛰지 않고 전체 일괄 작업을 중단했습니다. "
-                        "이미 승인된 규정은 보상 색인을 시도하고, 미완료 배치 ID는 복구용으로 보존합니다."
-                    ),
-                    detail_box=batch_detail,
-                )
-                deferred_results = [
-                    result
-                    for result in batch_results
-                    if bool(result.get("index_deferred"))
-                ]
-                if deferred_results:
-                    recovery_document_ids = [
-                        str(result["document_id"])
-                        for result in deferred_results
-                    ]
-                    recovery_batch_ids = {
-                        str(result["document_id"]): str(result.get("vector_sync_batch_id") or "")
-                        for result in deferred_results
-                        if str(result.get("vector_sync_batch_id") or "").strip()
-                    }
-                    try:
-                        recovery = index_documents_batch(
-                            recovery_document_ids,
-                            IndexRequest(
-                                target_type="local-jsonl",
-                                embedding_dimensions=384,
-                                embedding_model="Qwen/Qwen3-Embedding-0.6B",
-                            ),
-                            local_auth,
-                            vector_sync_batch_ids=recovery_batch_ids,
-                        )
-                        for recovery_document_id in recovery_document_ids:
-                            _invalidate_document_context_cache(recovery_document_id)
-                        st.warning(
-                            "일괄 승인 도중 오류가 발생했지만, 그 전에 승인된 "
-                            f"{len(recovery_document_ids):,}개 규정은 보상 색인을 완료했습니다 "
-                            f"(AI 등록 {int(recovery.get('record_count') or 0):,}개). "
-                            "남은 규정은 원인을 확인한 뒤 같은 버튼을 다시 실행할 수 있습니다."
-                        )
-                    except Exception as recovery_exc:
-                        st.error(
-                            "일괄 승인 실패 후 보상 색인도 완료되지 않았습니다. "
-                            "승인 기록의 배치 ID가 보존되어 재실행할 수 있습니다. "
-                            f"대상 규정: {', '.join(recovery_document_ids)} · "
-                            f"보상 색인 오류: {_brief_long_operation_error(recovery_exc)}"
-                        )
-                st.error(_brief_long_operation_error(exc))
-        if workflow_ready_count < workflow_pending_count:
-            st.info(
-                "위 비교 화면에서 사람 검수를 계속할 수 있습니다. 검수를 생략하고 최종 확정하면 "
-                "기본 미검수 사유와 approved_without_review 감사 이벤트가 자동 기록됩니다."
-            )
+        _render_selected_approval_batch(ctx, selected_document_ids, selected_approval_contexts)
 
     st.divider()
     beginner_mode_active = bool(st.session_state.get(BEGINNER_GUIDE_ENABLED_KEY))
@@ -12967,9 +13131,9 @@ def _page_approval(ctx: dict | None) -> None:
             )
             _render_beginner_action_marker(
                 3,
-                "다음 미완료 규정을 하나씩 계속 확인하세요",
-                f"바로 아래 '{next_document_label}' 버튼을 누르세요. 결과 확인 두 곳부터 원본·전처리·AI 검수 의견 비교, 승인 또는 반려, 색인까지 같은 순서로 반복합니다.",
-                control_keys=(next_document_button_key,),
+                "전체 규정을 처리하거나 개별 검수를 이어가세요",
+                f"이 화면 상단의 '전체 규정 한꺼번에 처리'로 남은 파일을 함께 처리할 수 있습니다. 자세히 검수하려면 아래 '{next_document_label}'을 여세요.",
+                control_keys=(f"approval-batch-entry-{document_id}",),
                 substep=5,
             )
             if st.button(

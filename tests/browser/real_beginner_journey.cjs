@@ -178,6 +178,38 @@ async function main() {
     assert.equal(document.approval_journal_count,0);
     assert.deepEqual(document.indexing_jobs,[]);
     assert.deepEqual(before.vector_files,[]);
+    if(process.env.RR_BULK_APPROVAL_JOURNEY==='1') {
+      assert.equal(process.env.RR_COMPLETE_MCP_JOURNEY,'1','bulk journey requires deterministic indexing fixture');
+      await page.getByRole('button',{name:'전체 규정 한꺼번에 처리',exact:true}).click();
+      const batch=page.locator(`div[class~="st-key-workflow-approve-index-${document.document_id}"] button`);
+      await batch.waitFor();
+      assert.equal(await batch.isEnabled(),false,'unreviewed batch approval requires explicit acknowledgement');
+      const prepared=await snapshot();
+      assert.equal(prepared.documents[0].approval_journal_count,0,'opening the batch panel approved data');
+      assert.deepEqual(prepared.vector_files,[]);
+      await page.screenshot({path:path.join(runtime,'bulk-approval-ready.png'),fullPage:true});
+      await page.locator(`div[class~="st-key-approval-batch-unreviewed-ack-${document.document_id}"] label`).click();
+      await batch.click();
+      const go=page.locator(`div[class~="st-key-approval-batch-goto-connect-${document.document_id}"] button`);
+      await go.waitFor({timeout:180000});
+      await page.waitForFunction(id=>{
+        const button=document.querySelector(`div[class~="st-key-approval-batch-goto-connect-${id}"] button`);
+        return button && !button.disabled;
+      },document.document_id,{timeout:180000});
+      const completed=await snapshot();
+      assert(completed.documents[0].chunks.every(chunk=>chunk.approval_status==='approved'));
+      assert(completed.documents[0].approval_journal_count>0);
+      assert(completed.vector_files.length>0);
+      assert(completed.documents[0].indexing_jobs.some(job=>job.status==='indexed'));
+      await page.screenshot({path:path.join(runtime,'bulk-approval-complete.png'),fullPage:true});
+      assert.deepEqual(errors,[]);
+      assert.equal(await page.locator('[data-testid="stException"]').count(),0);
+      console.log(JSON.stringify({status:'PASS',journey:'beginner-bulk-approval',
+        runtime:path.relative(root,runtime).replaceAll('\\','/'),chunks:completed.documents[0].chunks.length,
+        approvalJournal:completed.documents[0].approval_journal_count,individualRowConfirmations:0,
+        vectorFiles:completed.vector_files,externalDeployment:false}));
+      return;
+    }
     const first=await activeMarker(page);
     assert.equal(first?.title,'주의할 점을 보고 버튼을 골라 주세요');
     assert.equal(await page.getByRole('button',{name:'내용이 맞아요 · 다음',exact:true}).count(),0,
