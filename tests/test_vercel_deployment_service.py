@@ -204,7 +204,7 @@ class VercelDeploymentServiceTests(unittest.TestCase):
                  patch.object(staging, "_compress_oversized_runtime_files") as compress:
                 with self.assertRaisesRegex(ValueError, "changed copy"):
                     staging.prepare_vercel_mcp_deployment(runtime_data_dir=runtime, out_dir=Path(temp) / "stage", verify_sealed_runtime=True)
-            self.assertEqual(Path(temp) / "stage/mcp_runtime", verify.call_args.args[0])
+            self.assertEqual((Path(temp) / "stage/mcp_runtime").resolve(), verify.call_args.args[0])
             compress.assert_not_called()
 
 
