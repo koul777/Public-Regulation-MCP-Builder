@@ -8537,6 +8537,8 @@ def _next_action(ctx: dict | None) -> tuple[str, str]:
                 deployment = _current_remote_deployment(ctx)
                 if not deployment:
                     return ("규정 파일 준비가 끝났습니다. ④ 화면에서 Vercel 계정 연결 후 배포 버튼을 누르세요.", NAV_MCP)
+                if deployment.get("deployment_url") and not deployment.get("url"):
+                    return ("Vercel 업로드가 끝났습니다. ④ 화면에서 '배포 상태 확인하고 연결 검사'를 눌러 이어서 확인하세요.", NAV_MCP)
                 if not deployment.get("verified"):
                     return ("Vercel 주소가 생성됐습니다. ④ 화면에서 연결 검사를 마친 뒤 AI 앱에 등록하세요.", NAV_MCP)
                 return ("Vercel 배포·검색 검사가 끝났습니다. ④ 화면의 주소를 AI 앱에 등록하고 새 대화에서 search·fetch를 확인하세요.", NAV_MCP)

@@ -112,6 +112,24 @@ class StreamlitVercelDeploymentTests(unittest.TestCase):
         self.assertIn("Vercel 계정 다시 연결", [button.label for button in app.button])
         self.assertNotIn("Vercel에 배포하고 연결 검사", [button.label for button in app.button])
 
+    def test_outdated_cli_can_be_updated_before_account_connection(self):
+        state = {"error": "배포 도구를 업데이트하세요.", "error_code": "cli_outdated"}
+        job = Mock(message="배포 도구 업데이트 중", login_url="", started=0)
+        job.done.is_set.return_value = False
+        with patch.object(service, "DeploymentJob", return_value=job) as start, \
+                patch.object(service, "install_vercel", return_value={"installed": True}) as install:
+            app = self.app(state).run()
+            self.assertFalse(app.exception)
+            self.assertIn("Vercel 배포 도구 업데이트", [button.label for button in app.button])
+            self.assertNotIn("Vercel 계정 연결", [button.label for button in app.button])
+            self.assertNotIn("Vercel에 배포하고 연결 검사", [button.label for button in app.button])
+            next(button for button in app.button if button.label == "Vercel 배포 도구 업데이트").click().run()
+            self.assertFalse(app.exception)
+            start.assert_called_once_with(install)
+            progress = Mock()
+            start.call_args.args[0](progress)
+            install.assert_called_once_with(progress)
+
     def test_changed_account_cannot_keep_an_inaccessible_team_widget(self):
         state = self.ready_state()
         state["account"]["scopes"].append({"slug": "second-team", "name": "Second"})
@@ -155,6 +173,61 @@ class StreamlitVercelDeploymentTests(unittest.TestCase):
         self.assertFalse(app.success)
         self.assertIn("연결 다시 검사", [button.label for button in app.button])
         self.assertEqual("https://demo.vercel.app/mcp", app.code[0].value)
+
+    def test_uploaded_pending_deployment_resumes_inspection_without_showing_temporary_url(self):
+        receipt = {"identity": "test", "scope": "team", "project": "demo", "server_name": "demo",
+                   "deployment_url": "https://demo-build123.vercel.app", "verified": False, "status": "pending"}
+        job = Mock(message="배포 확인 중", login_url="", started=0)
+        job.done.is_set.return_value = False
+        with patch.object(service, "DeploymentJob", return_value=job) as start, \
+                patch.object(service, "verify_deployment", return_value={}) as verify, \
+                patch.object(service, "deploy_public_runtime") as upload:
+            app = self.app({"deployment": receipt}).run()
+            self.assertFalse(app.exception)
+            self.assertFalse(app.code)
+            self.assertFalse(app.get("download_button"))
+            self.assertTrue(any("업로드 완료" in item.value for item in app.warning))
+            self.assertNotIn("Vercel에 배포하고 연결 검사", [button.label for button in app.button])
+            next(button for button in app.button if button.label == "배포 상태 확인하고 연결 검사").click().run()
+            self.assertFalse(app.exception)
+            start.assert_called_once()
+            progress = Mock()
+            start.call_args.args[0](progress)
+            self.assertEqual(receipt, verify.call_args.args[1])
+            upload.assert_not_called()
+
+    def test_first_successful_deployment_refreshes_projects_before_update(self):
+        from frontend.vercel_deployment import ACCOUNT_STATE_KEY
+
+        receipt = {"identity": "test", "scope": "demo-team", "project": "demo", "server_name": "demo",
+                   "url": "https://demo.vercel.app/mcp", "verified": True}
+        completed = Mock(error="", error_code="", result=receipt)
+        completed.done.is_set.return_value = True
+        state = {**self.ready_state(), "job": completed, "job_kind": "deployment"}
+        fresh_projects = {"scope": "demo-team", "projects": [{"id": "p2", "name": "demo"}]}
+
+        def finish_immediately(operation):
+            job = Mock(error="", error_code="", result=operation(Mock()))
+            job.done.is_set.return_value = True
+            return job
+
+        with patch.object(service, "read_previous_deployment", return_value=receipt), \
+                patch.object(service, "load_projects", return_value=fresh_projects) as load, \
+                patch.object(service, "DeploymentJob", side_effect=finish_immediately), \
+                patch.object(service, "deploy_public_runtime") as upload:
+            app = self.app(state)
+            app.session_state[ACCOUNT_STATE_KEY] = self.ready_state()
+            app.session_state["vercel-wizard-test-project-mode-demo-team"] = "new"
+            app.run()
+            self.assertFalse(app.exception)
+            self.assertFalse(app.session_state["vercel-wizard-test"]["projects"])
+            next(checkbox for checkbox in app.checkbox if checkbox.label == "설정 변경·다시 배포").check().run()
+            self.assertFalse(app.exception)
+            load.assert_called_once()
+            self.assertEqual("existing", app.radio[0].value)
+            self.assertEqual("demo", app.selectbox[0].value)
+            self.assertFalse(next(checkbox for checkbox in app.checkbox if "기존 서비스" in checkbox.label).value)
+            upload.assert_not_called()
 
     def test_expired_login_removes_cached_account_and_project_controls(self):
         job = Mock(error="로그인이 만료되었습니다.", result=None)
