@@ -11,13 +11,43 @@
   <a href="#실행-방법-한눈에"><strong>실행 방법 바로 보기</strong></a>
 </p>
 
-# PR MCP Builder v1.3.2
+# PR MCP Builder
 
 최신 Kordoc **4.16.0** 연동과 설치 도구를 반영했습니다(2026년 9월 29일 확인).
 홍보 영상은 기능 소개이며, 아래 영상은 실제 앱의 클릭 과정을 녹화한 시연입니다.
 홍보 영상 속 규정과 질문은 가상 예시입니다. AI 검수 의견 장면만 합성 규정에 실제 `gpt-4.1-mini` 검수를 돌린 결과입니다.
 
-## 최근 업데이트 — 2026-10-12
+## 프로그램에서 Vercel 배포까지
+
+**④ 화면에서 파일 준비 → Vercel 계정 연결 → 배포 → URL 복사까지 진행합니다.** 배포에는 AI 모델이나 AI API 키가 필요하지 않습니다.
+
+1. **① 문서 올려서 전처리** 후 **③ 검수하고 승인**에서 사용할 규정을 승인·색인합니다. 여러 규정은 화면 위의 **전체 규정 한꺼번에 처리**로 진행합니다. AI 추가 검수를 켠 문서는 ② 결과도 확인합니다.
+2. 사용할 AI를 **ChatGPT·Claude·Codex에 MCP로 연결**로 선택하고 ④로 갑니다.
+3. 규정 범위를 확인하고 **ChatGPT · Vercel HTTPS MCP** 또는 **Claude · Vercel HTTPS MCP**를 선택합니다. MCP 이름을 입력하고 **MCP로 쓸 파일 묶음 만들기**를 누릅니다.
+4. **Vercel 계정 연결**을 누릅니다. 처음에는 브라우저에서 로그인·승인합니다. Node.js가 필요하며 배포 도구가 없으면 화면에서 설치할 수 있습니다.
+5. 새 프로젝트 또는 기존 주소 업데이트를 선택하고 **이 규정을 인터넷에 공개해도 됩니다**에 동의한 뒤 **Vercel에 배포하고 연결 검사**를 누릅니다.
+6. **배포·검색 검사 완료**가 나오면 표시된 `https://…/mcp` 주소를 복사해 AI 앱에 등록합니다. 새 대화에서 `search`와 `fetch`를 호출해 원문과 출처를 확인합니다.
+
+저장 폴더·전달용 ZIP·수동 명령은 고급 메뉴에 있습니다. 첫 배포 전에 URL을 입력하거나, 배포 후 URL을 넣기 위해 파일 묶음을 다시 만들 필요가 없습니다.
+
+MCP 이름을 입력하거나 **추천 이름 사용**을 누른 뒤 바로 파일 묶음을 만들 수 있습니다. 준비가 덜 된 항목은 생성 버튼 바로 위에 표시됩니다. 이전 ZIP 설정 때문에 막히면 **ZIP 없이 계속하기 · Vercel 배포용 폴더 사용**을 누르세요. 검토·승인·색인과 표 파싱 품질 확인을 마친 규정만 생성됩니다. MCP를 선택한 경우 이동 버튼과 현재 위치에도 **④ MCP 생성·외부 AI 연결**이 표시됩니다.
+
+공개 MCP는 **URL을 아는 누구나 로그인 없이 조회**할 수 있습니다. 공개 목록은 만들지 않고 검색엔진에 색인 제외를 요청하지만, URL 자체가 비밀번호나 접근 제한은 아닙니다. 기관 내부·비공개 규정은 [인증 배포 안내](docs/vercel_https_mcp_ko.md)를 따르세요.
+
+![프로그램의 Vercel 프로젝트 선택과 공개 동의 화면 — 합성 계정으로 검증한 화면](https://raw.githubusercontent.com/koul777/Public-Regulation-MCP-Builder/main/docs/assets/vercel-deployment-wizard.png)
+
+화면은 합성 계정·프로젝트를 사용한 브라우저 검증 캡처입니다. 외부 배포 성공의 증거는 별도 실제 서버의 프로토콜 검사로 확인합니다.
+
+## 최근 업데이트 — 2026-10-13
+
+- **프로그램 안에서 Vercel 배포:** 계정 연결, 팀·프로젝트 조회, 승인 데이터 업로드, Production 주소 확인과 `search` → `fetch` 검사를 이어서 실행합니다.
+- **다음 행동이 보이는 화면:** 통과한 품질·색인 상세와 저장 설정을 접고, 원리 설명·저장 설정의 중복 확인란을 줄였습니다. 초보자 안내도 계정 연결·공개 동의·배포 버튼으로 이어집니다.
+- **기존 주소 업데이트와 복구:** 같은 기관의 새 묶음에는 이전 배포 대상을 불러옵니다. 새 데이터가 아직 배포되지 않았음을 표시하고 공개 동의를 다시 받습니다. 업로드가 끝난 뒤 주소 확인이나 검색 검사만 실패했으면 프로그램을 다시 열어도 재업로드 없이 이어서 확인할 수 있습니다. 첫 배포 후에는 방금 만든 프로젝트를 업데이트 대상으로 선택합니다.
+- **대용량 승인 데이터 배포:** 전송 파일을 압축하고 서버 시작 시 원래 바이트로 복원합니다. 승인 manifest의 SHA-256을 확인한 데이터만 검색에 사용합니다.
+
+파싱·검수·승인 판정은 변경하지 않았습니다. 수정된 소스로 프로그램을 다시 실행하면 적용됩니다. 실행판은 [최신 Releases](https://github.com/koul777/Public-Regulation-MCP-Builder/releases/latest)의 반영 여부를 확인하세요.
+
+## 이전 업데이트 — 2026-10-12
 
 ### HWP 통합 규정집의 반복 승인 차단 수정 ([PR #121](https://github.com/koul777/Public-Regulation-MCP-Builder/pull/121))
 
@@ -257,17 +287,20 @@ AI 검수가 안 보이면 `data\exports\<문서ID>.agent_review_plan.json`의 `
 키·모델 설정 문제입니다. 본문에 로컬 경로 모양 문자열이 든 조항은 **그 조항만** 전송하지 않고
 나머지는 정상 검수되며, 요약에 "AI 검수 일부 완료"로 표시됩니다.
 
-### 한 번에 승인하기
+### 여러 규정을 한꺼번에 승인·색인하기
 
-- **일반 모드:** `③ 검수하고 승인` 아래쪽의 **이 규정 최종 확정 · 승인하고 색인**이 그 규정의 남은 조항
-  전부를 한 번에 저장·승인·색인합니다. 파일에 규정이 여러 개면 옆의 **이 파일의 전체 규정 N개 최종
-  확정** 버튼으로 파일 전체를 한 번에 끝낼 수 있습니다.
-- **초보자 안내 모드:** 기본은 한 조항씩 **내용이 맞아요 · 다음**으로 확인하는 흐름입니다. 조항을 다
-  확인하지 않은 상태에서도 **⏩ 남은 조항 N개를 AI 검수 결과대로 한 번에 승인하기 (선택)**를 펼치면
-  한 번에 끝낼 수 있습니다. 이때 화면은 **사람이 마지막은 직접 검수하는 것을 추천**한다고 안내하고,
-  확인란을 켠 뒤에야 버튼이 열립니다.
-- 어느 모드든 확인하지 않은 조항을 승인하면 **미검수 일괄 승인**으로 감사 기록에 남습니다. AI 검수는
-  볼 곳을 짚어 줄 뿐 승인 판단을 대신하지 않습니다.
+초보자·일반 모드 모두 **③ 검수하고 승인** 위쪽의 **전체 규정 한꺼번에 처리**를 누릅니다.
+선택한 파일 전체가 대상이며, 통합 규정집은 그 파일 안의 모든 규정을 포함합니다.
+규정 목록에서 내부 규정 하나를 열어 두었어도 이 버튼의 범위는 파일 전체입니다.
+
+- **아직 승인하지 않은 내용이 있으면:** 대상과 검수 상태를 확인한 뒤 **전체 규정 최종 확정**을 누릅니다.
+  초보자 모드에서 미검수 조항을 포함하면 일괄 승인 확인란을 먼저 켭니다. 명시적 최종 승인 후 선택한 규정을 함께 색인합니다.
+- **승인은 끝났고 색인만 남았으면:** **선택한 승인 규정 N개 한꺼번에 색인**을 누릅니다.
+  승인 기록을 다시 만들지 않으며, 이미 정상 색인된 규정은 건너뜁니다.
+- **조항을 직접 비교하려면:** 한 조항씩 검수하는 화면으로 돌아갈 수 있습니다.
+
+확인하지 않은 조항을 승인하면 **미검수 일괄 승인**으로 감사 기록에 남습니다. 규정 경계가 불명확하거나
+다른 기관의 문서가 섞인 경우에는 일괄 승인을 차단합니다. 규정별 문서·조문 구조와 승인 기록은 유지됩니다.
 
 v1.2.21에서는 독립 Qwen 챗봇이 기본적으로 빠른 승인 BM25/lexical 검색을 사용합니다.
 질문을 보내면 검색·답변·인용 검증의 실제 진행률과 경과 시간이 계속 보이고, 승인·색인이
@@ -615,7 +648,7 @@ Windows 실행판 설치
 - 회색 명령 상자 오른쪽 위에 복사 버튼이 보이면 눌러서 복사합니다.
 - **Claude Desktop 로컬 연결에서는 서버 이름이나 Python 경로를 다시 타이핑하지
   않습니다.** Builder가 만든 JSON 복사 상자를 사용합니다.
-- Vercel 주소도 예시를 고쳐 쓰지 않습니다. 배포가 끝난 뒤 PowerShell의 `Aliased:`
+- Vercel 주소는 프로그램의 배포 완료 화면에서 복사합니다. 수동 배포는 PowerShell의 `Aliased:`
   줄에 나온 실제 주소를 복사합니다.
 - `C:\MCP-Bundles\...`는 설명용 예시입니다. 생성 완료 화면이나 내 파일 탐색기의 실제
   경로를 복사합니다.
@@ -1019,50 +1052,34 @@ Claude 에이전트는 구현 파일을 직접 수정하지 않습니다. 에이
 
 ### 방법 D — ChatGPT · Vercel HTTPS MCP
 
-Vercel 주소가 아직 없어도 D를 선택하고 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저
-만들 수 있습니다. 실제 ChatGPT 연결은 검증된 `https://.../mcp` 주소를 넣어 묶음을
-다시 만든 뒤 완료됩니다.
+Vercel 주소가 아직 없어도 D를 선택하고 **배포 준비용 MCP 묶음**을 만들 수 있습니다.
 
-1. Builder에서 `ChatGPT · Vercel HTTPS MCP`를 선택하고 배포 준비용 묶음을 만든 뒤
-   [Vercel 공통 준비 V-1~V-7](#vercel-common)을
-   따라 Production 배포와 검증을 끝냅니다.
-2. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 V-7을 통과한 전체 주소를 붙여 넣습니다.
-3. 묶음을 다시 만든 뒤 ChatGPT 웹에서
-   **Settings > Apps > Advanced settings > Developer mode**를 켭니다.
-4. Apps 설정에서 새 앱을 만들고 같은 `/mcp` 주소와 승인된 인증을 등록합니다.
-5. 새 대화에서 앱을 선택하고 `search`와 `fetch`를 차례로 호출합니다.
+1. ④에서 `ChatGPT · Vercel HTTPS MCP`를 선택하고 MCP 이름을 입력한 뒤 묶음을 만듭니다.
+2. 바로 아래 **Vercel 계정 연결**에서 계정을 연결하고 새 프로젝트 또는 기존 주소 업데이트를 선택합니다.
+3. 공개 동의 후 **Vercel에 배포하고 연결 검사**를 누릅니다. 완료 화면의 주소를 복사합니다.
+4. ChatGPT **Plugins → + → Add custom MCP server**에서 이름·주소를 입력하고 **No authentication**으로 만듭니다.
+5. 개인 플러그인 목록에서 설치한 뒤 **Work** 새 대화에서 `@`로 선택하고 `search` → `fetch`를 확인합니다.
 
-[방법 D의 정확한 URL 입력 칸 보기](#method-d)
-
-**성공 신호:** Production `/mcp` URL의 원격 smoke가 통과하고 ChatGPT에 일곱 개의
-읽기 도구가 보입니다. **막히면:** Preview URL이 아니라 `Aliased:` Production
-주소인지, 끝에 `/mcp`가 있는지 확인합니다.
+묶음을 다시 만들 필요가 없습니다. 메뉴는 계정·워크스페이스에 따라 다를 수 있습니다.
+[OpenAI 공식 연결 안내](https://developers.openai.com/plugins/quickstart)와 [주소 입력 상세](#method-d)를 참고하세요.
 
 ### 방법 E — Claude · Vercel HTTPS MCP
 
-**언제 선택하나요?** Vercel에 배포한 하나의 HTTPS 주소를 Claude의 원격
-Connector로 사용할 때 선택합니다.
+1. ④에서 `Claude · Vercel HTTPS MCP`를 선택하고 이름을 입력해 묶음을 만듭니다.
+2. **Vercel 계정 연결 → 공개 동의 → Vercel에 배포하고 연결 검사**를 차례로 진행합니다.
+3. 완료 화면의 주소를 Claude **Customize > Connectors > Add custom connector**에 등록합니다. 공개 MCP는 별도 인증이 없습니다.
+4. 새 대화에서 커넥터를 켜고 `search` → `fetch`로 원문과 출처를 확인합니다.
 
-1. Builder에서 `Claude · Vercel HTTPS MCP` 왼쪽 동그라미를 누릅니다.
-2. 주소가 아직 없다면 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저 만들고
-   [Vercel 공통 준비 V-1~V-7](#vercel-common)을 끝냅니다.
-3. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 V-7을 통과한 전체 주소를
-   붙여 넣고 묶음을 다시 만듭니다.
-4. Claude에서 **설정 또는 Customize > Connectors > 사용자 지정 커넥터 추가**를
-   누릅니다.
-5. 이름을 넣고 URL 칸에 같은 `/mcp` 주소를 붙여 넣어 저장합니다.
-6. 새 대화에서 `search`와 `fetch`를 차례로 호출합니다.
-
-[방법 E의 정확한 Connector 입력 칸 보기](#method-e)
-
-**성공 신호:** Connector가 활성화되고 목록·목차·조문 또는 `search`·`fetch` 호출이
-성공합니다. **막히면:** 로컬 `command`를 입력하지 않았는지와 인증 방식을 확인합니다.
+조직 계정은 관리자가 커넥터를 추가해야 할 수 있습니다.
+[Claude 공식 연결 안내](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)와 [입력 상세](#method-e)를 참고하세요.
 
 <a id="생성-완료-화면-읽는-법"></a>
 <details>
 <summary><strong>생성 완료 화면의 각 항목이 궁금하면 펼치기</strong></summary>
 
 ### 생성 완료 화면 읽는 법
+
+아래는 **로컬 STDIO·고급 수동 배포의 기존 화면 설명**입니다. 새 Vercel 버튼 배포는 이 문서 위의 “프로그램에서 Vercel 배포까지”를 따르세요.
 
 `MCP 파일 묶음 생성 완료`가 나오면 아래의 **직접 MCP 연결 및 최종 확인**까지 내려갑니다.
 이 영역은 두 방식을 항상 비교해 보여 주고, 이번에 선택한 방식에는 실제 다음 명령과 등록
@@ -1679,13 +1696,13 @@ Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw | ConvertFrom-
 <a id="vercel-common"></a>
 
 <details>
-<summary><strong>Vercel HTTPS 배포 V-1~V-7 전체 절차 펼치기</strong></summary>
+<summary><strong>고급: Vercel HTTPS 수동 배포 V-1~V-7 펼치기</strong></summary>
 
 ## 방법 D·E 공통 준비: Vercel HTTPS 배포와 검증
 
 Vercel HTTPS는 승인된 MCP runtime을 인터넷에서 접속 가능한 서버로 배포하는 방법입니다.
-Vercel 홈페이지는 계정·환경변수·로그를 관리하고, 처음 배포할 파일 준비와 업로드는 내
-PC의 PowerShell에서 진행합니다.
+공개 규정은 프로그램의 **Vercel 계정 연결 → 배포** 버튼을 사용하면 됩니다.
+아래 V-1~V-7은 비공개 인증이나 직접 운영이 필요한 담당자를 위한 **고급 수동 절차**입니다.
 
 처음이라면 Builder에서 원문 검수·승인·색인과 규정 조회를 먼저 확인하세요. Codex나
 Claude를 함께 쓴다면 방법 A, B 또는 C의 로컬 `search`와 `fetch`까지 성공한 뒤 진행하는
@@ -1961,74 +1978,32 @@ Vercel 항목을 먼저 처리합니다.
 
 ## 방법 D 상세: ChatGPT · Vercel HTTPS MCP 연결
 
-> [!IMPORTANT]
-> ChatGPT는 로컬 MCP 서버에 직접 연결하지 않고 원격 MCP 서버에 연결합니다. 이 절차는
-> **ChatGPT 웹**의 Developer mode를 사용합니다. 현재 공식 안내상 Pro는 개발자 모드에서
-> read/fetch 도구를 연결할 수 있고, full MCP는 Business·Enterprise·Edu에서 제공됩니다.
-> 워크스페이스 관리자 승인·RBAC 설정에 따라 메뉴가 보이지 않을 수 있습니다.
->
-> - [OpenAI 공식 ChatGPT Developer mode·MCP 지원 안내](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)
-> - [로컬·사설망 서버용 OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
-
-1. Builder의 `④ Qwen 규정 챗봇·AI 연결`에서 `ChatGPT · Vercel HTTPS MCP`를 선택합니다.
-2. 첫 배포 전이라 HTTPS 주소가 없으면 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저
-   만듭니다. 화면에 표시되는 staging·Vercel 배포 절차를 완료합니다.
-3. V-7의 네 가지 검증값이 모두 성공했는지 확인합니다.
-4. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 검증한 전체 URL을 붙여
-   넣고 묶음을 다시 만듭니다.
-5. **생성된 MCP HTTP URL**에도 같은 주소가 보이는지 확인합니다.
-6. ChatGPT 웹에서 **Settings > Apps > Advanced settings > Developer mode**를 켭니다.
-7. Apps 설정에서 새 앱을 만들고 검증한 원격 MCP URL을 등록합니다.
+④의 **배포·검색 검사 완료** 화면에서 주소를 복사합니다. 서버 파일 준비와 실제 배포는 별도 상태이며, URL이 생긴 것만으로 검사가 통과한 것은 아닙니다.
 
 ### D-1. ChatGPT 웹에 원격 MCP 앱 등록
 
-ChatGPT 웹의 Developer mode에서 **Apps** 설정을 열고 새 앱을 만듭니다. 화면 이름은
-플랜과 워크스페이스 정책에 따라 조금 다를 수 있습니다. 메뉴가 없으면 먼저 플랜과 관리자
-권한을 확인하세요.
-
-초보자 기준으로는 아래 순서만 그대로 따라가면 됩니다.
-
-1. **이름** 칸에 알아보기 쉬운 서버 이름을 넣습니다.
-2. MCP 서버 URL 칸에 `https://.../mcp` 전체 주소를 넣습니다.
-3. 비공개 endpoint라면 워크스페이스가 승인한 OAuth 인증 절차를 완료합니다.
-4. 이 화면에는 `python.exe`, `powershell.exe`, `-m`, `PYTHONPATH`를 넣지 않습니다.
+1. [ChatGPT Plugins](https://chatgpt.com/plugins)에서 **+ → Add custom MCP server**를 선택합니다.
+2. 이름과 MCP 주소를 입력하고 공개 MCP는 **No authentication**으로 선택합니다.
+3. 표시되는 연결 권한을 확인하고 **Create as a plugin**을 누릅니다.
+4. 개인 플러그인 목록에서 해당 플러그인을 설치합니다.
 
 | ChatGPT 웹 앱 설정 | 넣을 값 |
 | --- | --- |
-| **이름 (Name)** | 사용자가 알아볼 이름. 예: `기관 규정 MCP` |
-| **URL (MCP URL / Server URL)** | Vercel의 고정 `Aliased` 주소 끝에 `/mcp`를 붙인 전체 URL |
-| **인증** | 공개가 승인된 read-only endpoint는 별도 인증 없음. 비공개 endpoint는 워크스페이스가 승인한 OAuth |
+| **이름 (Name)** | 알아보기 쉬운 이름 |
+| **URL (MCP URL / Server URL)** | 프로그램 완료 화면의 `https://…/mcp` 전체 주소 |
+| **인증** | 이번 공개 배포는 No authentication. 비공개 서버는 별도 인증 구성이 필요함 |
 | **로컬 Command / Arguments / Working directory** | 넣지 않음 |
 
-화면의 예시 URL은 복사하지 마세요. V-6에서 복사하고 V-7에서 검증한 실제 Vercel
-주소만 URL 칸에 붙여 넣습니다. 비밀 토큰 문자열 자체를 README나 URL 칸에 붙여 넣으면
-안 됩니다.
+이전 UI에서는 **Settings > Apps > Advanced settings > Developer mode**로 표시될 수 있습니다. 메뉴가 없으면 워크스페이스 관리자 권한을 확인하세요. 특정 플랜에서 모든 메뉴가 보인다고 가정하지 않습니다.
 
-예를 들어 Vercel `Aliased` 주소가 다음이라면
-
-```text
-https://my-regulation-mcp.vercel.app
-```
-
-MCP URL 칸에는 정확히 다음을 넣습니다.
-
-```text
-https://my-regulation-mcp.vercel.app/mcp
-```
-
-`https://`를 빼거나, 끝의 `/mcp`를 빼거나, 배포 staging 폴더의 `C:\...` 경로를
-넣으면 연결되지 않습니다.
+[OpenAI 공식 연결 안내](https://developers.openai.com/plugins/quickstart) (2026-10-13 확인).
+사설망 서버는 [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)을 참고하세요.
 
 ### D-2. 저장하고 실제 도구 확인
 
-1. 이름과 설명을 입력합니다.
-2. URL 칸에 V-7에서 검증한 전체 주소가 들어 있는지 확인합니다.
-3. 공개 read-only endpoint라면 별도 인증값을 넣지 않습니다. 비공개 endpoint는 승인된
-   OAuth 또는 워크스페이스 인증 정책을 따릅니다.
-4. 저장한 뒤 새 ChatGPT 웹 대화를 엽니다.
-5. 새로 만든 앱을 현재 대화에서 사용할 수 있도록 선택합니다.
-6. [3장](#3-search와-fetch로-최종-확인하기)의 문장을 보내 `search`와 `fetch`를
-   실제로 호출합니다.
+ChatGPT 홈에서 **Work**를 선택하고 새 대화에서 `@`로 설치한 플러그인을 고릅니다.
+아래 [최종 확인 질문](#3-search와-fetch로-최종-확인하기)으로 `search`와 `fetch`를 호출합니다.
+프로그램의 서버 검사 결과와 실제 AI 대화의 도구 실행 결과를 각각 확인해야 합니다.
 
 </details>
 
@@ -2039,23 +2014,13 @@ https://my-regulation-mcp.vercel.app/mcp
 
 ## 방법 E 상세: Claude · Vercel HTTPS MCP 연결
 
-1. Builder의 `④ Qwen 규정 챗봇·AI 연결`에서 `Claude · Vercel HTTPS MCP` 왼쪽 동그라미를
-   누릅니다.
-2. 첫 배포 전이라 HTTPS 주소가 없으면 URL을 비운 채 **배포 준비용 MCP 묶음**을 먼저
-   만들고 [Vercel 공통 준비 V-1~V-7](#vercel-common)을 완료합니다.
-3. V-7의 네 가지 검증값이 모두 성공했는지 확인합니다.
-4. Builder로 돌아와 **배포된 Vercel HTTPS `/mcp` 주소** 칸에 검증한 전체 URL을 붙여
-   넣고 묶음을 다시 만듭니다.
-5. **생성된 MCP HTTP URL**에도 같은 주소가 보이는지 확인합니다.
-6. Claude 웹 또는 Desktop을 엽니다.
-7. **설정 > 커넥터(Connectors)** 또는 **Customize > Connectors**를 엽니다.
-8. **사용자 지정 커넥터 추가(Add custom connector)**를 누릅니다.
-9. 이름에는 알아보기 쉬운 MCP 이름을 입력합니다.
-10. URL에는 V-7을 통과한 같은 `/mcp` 전체 주소를 붙여 넣습니다.
-11. 공개 read-only 배포는 별도 토큰을 입력하지 않습니다.
-12. 저장한 뒤 새 대화에서 커넥터를 활성화합니다.
-13. 커넥터가 목록에 보이면 [3장](#3-search와-fetch로-최종-확인하기)의 문장을 그대로
-   보내 실제 도구 호출을 확인합니다.
+1. ④에서 `Claude · Vercel HTTPS MCP`를 선택해 묶음을 만들고 프로그램 안에서 Vercel에 배포합니다.
+2. **배포·검색 검사 완료** 화면의 전체 `/mcp` 주소를 복사합니다.
+3. Claude의 **Customize > Connectors > Add custom connector**를 엽니다. 조직 계정은 관리자의 커넥터 설정이 필요할 수 있습니다.
+4. 이름과 URL을 입력합니다. 이 공개 배포는 별도 인증 없이 조회하므로 **No sign in**을 선택합니다.
+5. 새 대화에서 커넥터를 켜고 [최종 확인 질문](#3-search와-fetch로-최종-확인하기)으로 `search`와 `fetch`를 호출합니다.
+
+[Claude 공식 연결 안내](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp) (2026-10-13 확인).
 
 이 화면은 로컬 STDIO 화면과 다릅니다. 아래 항목은 넣지 않습니다.
 

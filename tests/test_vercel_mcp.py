@@ -238,10 +238,8 @@ class PrepareVercelMcpDeploymentTests(unittest.TestCase):
             self.assertTrue(report["stateless_http"])
             vercel_config = json.loads((target / "vercel.json").read_text(encoding="utf-8"))
             self.assertIn("api/index.py", vercel_config["functions"])
-            self.assertEqual(
-                [{"source": "/mcp", "destination": "/api/index"}],
-                vercel_config["rewrites"],
-            )
+            self.assertEqual("fastapi", vercel_config["framework"])
+            self.assertNotIn("rewrites", vercel_config)
             vercel_ignore = (target / ".vercelignore").read_text(encoding="utf-8")
             self.assertIn(".env*", vercel_ignore)
             self.assertIn(".vercel", vercel_ignore)
@@ -249,7 +247,7 @@ class PrepareVercelMcpDeploymentTests(unittest.TestCase):
                 (target / "deployment_report.json").read_text(encoding="utf-8")
             )
             self.assertEqual(".", deployment_report["out_dir"])
-            self.assertEqual("vercel --prod --cwd .", deployment_report["production_deploy_command"])
+            self.assertEqual("vercel --prod --archive=tgz --cwd .", deployment_report["production_deploy_command"])
 
     def test_compresses_oversized_json_runtime_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

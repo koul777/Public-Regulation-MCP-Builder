@@ -45,6 +45,7 @@ def _configure_runtime() -> tuple[Path, Path]:
     os.environ.setdefault("PYTHONUTF8", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    os.environ.setdefault("STREAMLIT_CLIENT_TOOLBAR_MODE", "viewer")
     if getattr(sys, "frozen", False):
         os.environ.setdefault("REG_RAG_PACKAGED_EXE", str(Path(sys.executable).resolve()))
 

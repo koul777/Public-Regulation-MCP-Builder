@@ -1179,6 +1179,26 @@ class StreamlitApprovalAppTests(unittest.TestCase):
         self.assertNotIn("workflow_transition_state", app.session_state)
         self.assertFalse(app.exception)
 
+    def test_approval_next_button_follows_selected_ai_path_and_opens_mcp_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _settings = self._recovery_app(Path(tmp))
+            for selected, label in (
+                ("mcp", "④ MCP 생성·외부 AI 연결로 이동"),
+                ("qwen", "④ Qwen 규정 챗봇·AI 연결로 이동"),
+                ("mcp", "④ MCP 생성·외부 AI 연결로 이동"),
+            ):
+                with self.subTest(selected=selected):
+                    app.session_state["ai_usage_path"] = selected
+                    app.run()
+                    self.assertFalse(app.exception)
+                    next_button = app.button(key="approval-goto-connect-simple")
+                    self.assertEqual(label, next_button.label)
+            next_button.click().run()
+            self.assertFalse(app.exception)
+            # The route identifier remains compatible with saved sessions.
+            self.assertEqual("④ Qwen 규정 챗봇·AI 연결", app.session_state["nav_page"])
+            self.assertTrue(any(item.value == "## ④ MCP 생성·외부 AI 연결" for item in app.markdown))
+
     def test_beginner_results_checkboxes_do_not_block_approval_navigation(self) -> None:
         if AppTest is None:
             self.skipTest("streamlit.testing.v1.AppTest is not available")

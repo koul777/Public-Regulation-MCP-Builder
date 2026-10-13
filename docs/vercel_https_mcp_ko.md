@@ -13,6 +13,45 @@ stateless HTTP와 JSON 응답을 사용한다.
 
 ## 배포 디렉터리 준비
 
+### 프로그램에서 바로 배포 (공개 규정)
+
+④ 화면에서 MCP 파일 묶음을 만든 뒤 **Vercel에 배포하고 AI에 연결하기**를 사용한다.
+
+1. **Vercel 계정 연결**을 누른다. 저장된 로그인을 확인하고, 처음이라면 브라우저에서 로그인·승인한다.
+2. 팀이 여러 개일 때만 팀을 선택한다. 프로젝트 목록은 자동으로 불러온다. **새 MCP 주소 만들기** 또는 **기존 주소 업데이트**를 선택한다.
+3. 규정의 인터넷 공개 허용 여부를 확인하고 **Vercel에 배포하고 연결 검사**를 누른다. 기존 프로젝트는 Production 서비스를 교체하므로 별도의 교체 확인이 필요하다.
+4. 프로그램이 승인 묶음과 복사본을 검증하고 새 staging 폴더에서 업로드한다. Production Ready 상태와 고정 주소를 확인한 뒤 `search` → `fetch` 검사를 수행한다.
+5. 완료 화면의 HTTPS `/mcp` 주소를 복사하여 선택한 AI 앱에 등록한다. 주소를 얻기 위해 묶음을 재생성할 필요는 없다. HTTPS 연결 설정도 별도로 다운로드할 수 있다.
+
+Node.js가 필요하며, Vercel CLI가 없으면 화면의 **Vercel 배포 도구 설치**에서 프로그램 전용 폴더에 설치할 수 있다.
+이미 설치된 CLI가 필요한 명령·응답 형식을 지원하지 않으면, 계정 연결 전에도 **Vercel 배포 도구 업데이트** 버튼으로 복구할 수 있다.
+기본 저장 방식은 작업 폴더만 사용한다. 다른 PC에 넘길 ZIP과 wheel은 버튼 배포의 필수 준비물이 아니다.
+AI 모델과 AI API 키는 사용하지 않는다. 인증은 Vercel 공식 CLI의 브라우저 로그인으로 처리한다.
+배포 중에는 단계와 경과 시간이 표시되고, 중복 배포는 차단된다. 서버 검증 실패 시 주소는 유지되며 **연결 다시 검사**로 재시도한다.
+업로드는 끝났지만 Production 상태·고정 주소 확인에 실패한 경우에는 **업로드 완료 · 배포 상태 확인이 필요합니다**로 표시한다.
+**배포 상태 확인하고 연결 검사**를 누르면 파일을 다시 올리지 않고 기존 배포의 상태 조회와 검색 검사를 이어간다. 이 기록은 프로그램을 다시 열어도 유지된다.
+완료 상태를 확인하기 전에는 임시 배포 URL을 AI 연결 주소로 표시하지 않는다. 업로드 명령 자체가 시간 초과로 끝났거나 프로그램이 업로드 도중 종료됐다면, Vercel 배포 관리에서 결과를 먼저 확인한다.
+처음 만든 프로젝트에 다시 배포할 때는 목록을 새로 조회하고 **기존 주소 업데이트**로 전환한다. 기존 서비스 교체 확인은 다시 필요하다.
+배포 기록은 로컬 `.vercel-deployments/`에 묶음별로 보관한다. 같은 기관의 새 묶음에는 이전 배포 대상을 제안하지만 이전 성공 상태나 공개 동의를 재사용하지 않는다.
+계정 연결은 같은 프로그램 세션의 여러 묶음에서 재사용한다. 입력 폼은 주기적으로 새로고침하지 않고, 작업 중 상태 영역만 갱신한다.
+큰 검색 데이터 파일도 전송할 수 있도록 프로그램 전용 Vercel CLI 62.1.0의 `--archive=tgz`를 사용한다.
+이 버전의 `tgz`는 분할 압축 업로드를 사용한다. 승인 벡터 파일은 그대로 유지하며, 함수 실행 용량·요금제 제한은 별도로 적용된다.
+관련 배경은 [Vercel 공식 압축 업로드 안내](https://vercel.com/changelog/cli-archive-deployments-are-now-up-to-30-faster-with-split-tgz-archive)를 참고한다.
+배포 CLI는 staging 상위 폴더의 Git 저장소를 탐색하지 못하게 실행한다. 프로그램 소스의 GitHub 저장소가 새 Vercel 프로젝트에 자동 연결되지 않도록 하기 위한 경계다.
+함수 크기 제한을 맞추기 위해 배포 파일은 압축한다. 서버가 시작할 때 임시 실행 폴더에
+원래 파일 이름과 바이트로 복원하고 승인 묶음의 SHA-256과 대조한 뒤 사용한다.
+복원 전 압축 파일을 승인 데이터로 조회하지 않으며, 해시 검증 실패 시 서버를 시작하지 않는다.
+
+생성한 배포 설정은 FastAPI 프레임워크가 `/mcp` 경로를 ASGI 앱에 그대로 전달하도록 한다.
+`/api/index`로 다시 쓰면 MCP 경로가 바뀌어 404가 발생하므로 별도 rewrite를 추가하지 않는다.
+또한 `X-Robots-Tag: noindex, nofollow`를 보내 검색엔진에 색인 제외를 요청한다.
+이는 접근 제어가 아니며, 인증 없는 공개 MCP는 URL을 아는 누구나 조회할 수 있다.
+
+버튼 배포는 **인터넷 공개가 허용된 읽기 전용 규정**에 한정한다. 비공개 규정의 인증 구성은 아래 수동 절차를 사용한다.
+기존 파일 묶음과 ZIP은 원래 생성 시점의 설정을 유지한다. 배포 후 AI 등록에는 완료 화면의 주소 또는 새로 다운로드한 HTTPS 설정을 사용한다.
+
+### 고급: 수동 배포
+
 승인 runtime bundle의 `data/` 폴더를 입력으로 지정한다.
 
 ```powershell
@@ -27,8 +66,8 @@ python scripts\prepare_vercel_mcp_deployment.py `
 ## 처음 배포하는 사람: 홈페이지와 명령창의 역할
 
 Vercel 홈페이지에서는 계정 가입, 프로젝트 확인, 환경 변수와 로그 확인을 한다. 로컬 PC에
-있는 승인 runtime을 처음 올릴 때는 PowerShell에서 Vercel CLI를 사용하는 것이 가장
-단순하다. GitHub 저장소 전체나 원본 `data/` 폴더를 Vercel 홈페이지에 직접 업로드하지
+있는 승인 runtime은 위 프로그램 내 배포 버튼으로 올릴 수 있다. 수동 배포가 필요하면
+아래 PowerShell 절차를 사용한다. GitHub 저장소 전체나 원본 `data/` 폴더를 Vercel 홈페이지에 직접 업로드하지
 않는다.
 
 ![승인 번들을 Vercel에 배포하고 Claude 커넥터에 등록한 뒤 search와 fetch로 검증하는 순서](assets/readme-vercel-claude-connection.svg)
@@ -84,8 +123,8 @@ staging 도구가 자동 수행하지 않으며, Developer mode·플랜·관리�
 ## 배포와 확인
 
 ```powershell
-vercel --cwd vercel-mcp-stage
-vercel --prod --cwd vercel-mcp-stage
+vercel --archive=tgz --cwd vercel-mcp-stage
+vercel --prod --archive=tgz --cwd vercel-mcp-stage
 ```
 
 명령 마지막의 `Aliased https://<프로젝트-이름>.vercel.app`이 고정 Production 주소다.
@@ -98,9 +137,12 @@ https://<production-host>/mcp
 ```
 
 이 endpoint 하나를 ChatGPT 웹·Codex와 Claude에서 공통으로 사용할 수 있다. 클라이언트별
-Vercel 프로젝트를 따로 만들 필요는 없다. ChatGPT 웹은 Developer mode의 Apps 설정에서
-원격 MCP 앱을 만들고, Codex는 `config.toml`, Claude는 해당 Connector 등록 화면에 같은
-URL을 등록한다. ChatGPT는 로컬 MCP에 직접 연결하지 않는다.
+Vercel 프로젝트를 따로 만들 필요는 없다. ChatGPT는 **Plugins → + → Add custom MCP server**에서
+등록하고 개인 플러그인 목록에서 설치한 뒤 Work 새 대화에서 사용한다.
+[OpenAI 공식 연결 안내](https://developers.openai.com/plugins/quickstart) (2026-10-13 확인).
+Codex는 `config.toml`, Claude는 **Customize > Connectors**에 같은 URL을 등록한다.
+[Claude 공식 연결 안내](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
+이전 ChatGPT UI는 Apps·Developer mode로 표시될 수 있고 워크스페이스 권한이 필요하다.
 
 Codex 원격 설정 예시:
 

@@ -178,6 +178,38 @@ async function main() {
     assert.equal(document.approval_journal_count,0);
     assert.deepEqual(document.indexing_jobs,[]);
     assert.deepEqual(before.vector_files,[]);
+    if(process.env.RR_BULK_APPROVAL_JOURNEY==='1') {
+      assert.equal(process.env.RR_COMPLETE_MCP_JOURNEY,'1','bulk journey requires deterministic indexing fixture');
+      await page.getByRole('button',{name:'전체 규정 한꺼번에 처리',exact:true}).click();
+      const batch=page.locator(`div[class~="st-key-workflow-approve-index-${document.document_id}"] button`);
+      await batch.waitFor();
+      assert.equal(await batch.isEnabled(),false,'unreviewed batch approval requires explicit acknowledgement');
+      const prepared=await snapshot();
+      assert.equal(prepared.documents[0].approval_journal_count,0,'opening the batch panel approved data');
+      assert.deepEqual(prepared.vector_files,[]);
+      await page.screenshot({path:path.join(runtime,'bulk-approval-ready.png'),fullPage:true});
+      await page.locator(`div[class~="st-key-approval-batch-unreviewed-ack-${document.document_id}"] label`).click();
+      await batch.click();
+      const go=page.locator(`div[class~="st-key-approval-batch-goto-connect-${document.document_id}"] button`);
+      await go.waitFor({timeout:180000});
+      await page.waitForFunction(id=>{
+        const button=document.querySelector(`div[class~="st-key-approval-batch-goto-connect-${id}"] button`);
+        return button && !button.disabled;
+      },document.document_id,{timeout:180000});
+      const completed=await snapshot();
+      assert(completed.documents[0].chunks.every(chunk=>chunk.approval_status==='approved'));
+      assert(completed.documents[0].approval_journal_count>0);
+      assert(completed.vector_files.length>0);
+      assert(completed.documents[0].indexing_jobs.some(job=>job.status==='indexed'));
+      await page.screenshot({path:path.join(runtime,'bulk-approval-complete.png'),fullPage:true});
+      assert.deepEqual(errors,[]);
+      assert.equal(await page.locator('[data-testid="stException"]').count(),0);
+      console.log(JSON.stringify({status:'PASS',journey:'beginner-bulk-approval',
+        runtime:path.relative(root,runtime).replaceAll('\\','/'),chunks:completed.documents[0].chunks.length,
+        approvalJournal:completed.documents[0].approval_journal_count,individualRowConfirmations:0,
+        vectorFiles:completed.vector_files,externalDeployment:false}));
+      return;
+    }
     const first=await activeMarker(page);
     assert.equal(first?.title,'주의할 점을 보고 버튼을 골라 주세요');
     assert.equal(await page.getByRole('button',{name:'내용이 맞아요 · 다음',exact:true}).count(),0,
@@ -223,6 +255,56 @@ async function main() {
     assert.equal(after.documents[0].approval_journal_count,0);
     assert.deepEqual(after.documents[0].indexing_jobs,[]);
     assert.deepEqual(after.vector_files,[]);
+    if(process.env.RR_COMPLETE_MCP_JOURNEY==='1') {
+      const approve=page.getByRole('button',{name:/^(승인하고 AI 질문 준비하기|이 규정 최종 확정 · 승인하고 색인)$/});
+      for(let row=0;row<document.chunks.length+2;row++) {
+        if(await approve.count() && await approve.isEnabled()) break;
+        const marker=await eventuallyMarker(page,m=>!!markerChunk(m,document),'remaining review row');
+        const resolved=await resolveFocusedWarnings(page,marker);
+        await page.locator(resolved.marker.selector).getByRole('button',{name:'내용이 맞아요 · 다음',exact:true}).click();
+        for(let attempt=0;attempt<100;attempt++) {
+          if(await approve.count() && await approve.isEnabled()) break;
+          const next=await activeMarker(page);
+          if(next && next.selector!==resolved.marker.selector) break;
+          await page.waitForTimeout(200);
+          if(attempt===99) throw new Error('review did not advance after confirmation');
+        }
+      }
+      await approve.click();
+      const go=page.locator('div[class*="st-key-approval-goto-connect-simple"] button');
+      await go.waitFor({timeout:180000});
+      const approvedState=await snapshot();
+      assert(approvedState.documents[0].chunks.every(chunk=>chunk.approval_status==='approved'));
+      assert(approvedState.documents[0].approval_journal_count>0);
+      assert(approvedState.vector_files.length>0);
+      await go.click();
+      const scope=page.getByRole('checkbox',{name:'MCP에 포함할 규정 범위를 확인했습니다.',exact:true});
+      await scope.waitFor();
+      await page.locator('div[class*="st-key-beginner_guide_mcp_scope_confirmed"] label').click();
+      await page.getByText('ChatGPT · Vercel HTTPS MCP',{exact:true}).click();
+      await page.getByText('고급: 저장 폴더·전달용 ZIP',{exact:true}).click();
+      const output=page.getByRole('textbox',{name:'MCP 파일 묶음을 만들 폴더',exact:true});
+      await output.fill(path.join(runtime,'bundle'));
+      await output.press('Enter');
+      assert.equal(await output.inputValue(),path.join(runtime,'bundle'));
+      const serverName=page.getByRole('textbox',{name:'생성할 MCP 이름 (필수 입력)',exact:true});
+      // Submitting must commit a pending name edit without requiring Enter.
+      assert.equal(await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).isEnabled(),true);
+      await serverName.fill('synthetic-mcp');
+      assert.equal(await output.inputValue(),path.join(runtime,'bundle'));
+      await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).click();
+      await page.getByRole('button',{name:'Vercel 계정 연결',exact:true}).waitFor({timeout:240000});
+      assert(fs.existsSync(path.join(runtime,'bundle','data','mcp_runtime_manifest.json')));
+      assert.equal(fs.existsSync(path.join(runtime,'bundle','mcp_connection_bundle.zip')),false,'remote default unexpectedly created a ZIP');
+      assert.equal(await page.getByRole('checkbox',{name:'저장 위치·방식, 연결 대상과 MCP 이름을 확인했습니다.',exact:true}).count(),0);
+      assert.equal(await page.getByRole('button',{name:'MCP로 쓸 파일 묶음 만들기',exact:true}).count(),0,'completed generation form remained above deployment');
+      await page.getByText('Vercel에 배포하고 AI에 연결하기',{exact:true}).scrollIntoViewIfNeeded();
+      const deploymentMarker=await eventuallyMarker(page,m=>m?.title==='Vercel 계정을 연결하세요','Vercel account connection');
+      assert.equal(deploymentMarker.substep,5);
+      await page.screenshot({path:path.join(runtime,'approved-to-vercel.png'),fullPage:true});
+      fs.writeFileSync(path.join(runtime,'completion.json'),JSON.stringify({approvalJournal:approvedState.documents[0].approval_journal_count,
+        vectorFiles:approvedState.vector_files,bundleCreated:true,vercelButtonReached:true,externalDeployment:false},null,2));
+    }
     assert.equal(await page.locator('#rr-tour-root').count(),1,'rerun leaked tour controller');
     assert.deepEqual(errors,[]);
     assert.equal(await page.locator('[data-testid="stException"]').count(),0);

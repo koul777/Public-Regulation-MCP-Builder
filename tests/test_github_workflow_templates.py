@@ -160,6 +160,15 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         self.assertIn("tests.test_hidden_process", text)
         self.assertIn("tests.test_local_http", text)
         self.assertIn("tests.test_ollama_runtime", text)
+        for module in (
+            "test_streamlit_beginner_guide", "test_streamlit_vercel_deployment",
+            "test_streamlit_protected_guard_execution",
+            "test_packaging_entrypoints",
+            "test_vercel_deployment_service", "test_vercel_runtime",
+            "test_vercel_mcp", "test_vercel_mcp_end_to_end",
+        ):
+            self.assertIn(f"tests.{module}", text)
+            self.assertTrue((REPO_ROOT / "tests" / f"{module}.py").is_file())
         self.assertIn("python -m build --sdist --wheel", text)
         self.assertIn("--include-source-path-scan", text)
 
@@ -177,6 +186,8 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
             "test_authoring_service", "test_authoring_official_isolation",
             "test_streamlit_setup", "test_streamlit_authoring",
             "test_streamlit_approval_app",
+            "test_streamlit_mcp_bundle_form",
+            "test_streamlit_bulk_index_app",
             "test_ai_review_display",
         ):
             self.assertIn(f"tests.{module}", fast_step)
