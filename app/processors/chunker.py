@@ -45,7 +45,7 @@ HWPX_SOURCE_LIST_METADATA_KEYS = (
     "source_hwpx_xml_block_indices",
 )
 
-CHUNKER_VERSION = "0.1.12"
+CHUNKER_VERSION = "0.1.13"
 PDF_TABLE_REGION_DUPLICATE_COVERAGE = 0.8
 STRUCTURE_BOUNDARY_DIAGNOSTIC_METADATA_KEY = "structure_boundary_diagnostic"
 AMBIGUOUS_COMBINED_BOOK_BOUNDARY_DIAGNOSTIC = (
@@ -141,6 +141,7 @@ class Chunker:
             if node.node_type in {"article", "appendix", "form", "supplementary", "table"}
             or (node.node_type in {"paragraph", "item", "subitem"} and not node.parent_id)
             or (node.node_type in {"paragraph", "item", "subitem"} and self._is_direct_child_of_type(node, lookup, {"supplementary"}))
+            or self._is_uncovered_table_child(node, lookup)
             or self._container_has_orphan_body(node)
         ]
 
@@ -1012,6 +1013,25 @@ class Chunker:
             return False
         lines = [line.strip() for line in node.text.splitlines() if line.strip()]
         return len(lines) > 1
+
+    def _is_uncovered_table_child(
+        self,
+        node: StructureNode,
+        lookup: dict[str, StructureNode],
+    ) -> bool:
+        if node.node_type not in {"paragraph", "item", "subitem"}:
+            return False
+        if not self._is_direct_child_of_type(node, lookup, {"table"}):
+            return False
+        # A native table can precede ordinary bullet paragraphs. The detector
+        # retains them as table children, but table chunks contain only the
+        # table itself. Preserve those paragraphs separately unless an article
+        # or another recursive container already includes their text.
+        recursive_containers = {"article", "appendix", "form", "paragraph", "item", "subitem"}
+        return not any(
+            ancestor.node_type in recursive_containers
+            for ancestor in self._ancestors(node, lookup)
+        )
 
     def _is_direct_child_of_type(
         self,
