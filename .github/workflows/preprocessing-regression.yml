@@ -51,6 +51,7 @@ jobs:
           python -m unittest -v \
             tests.test_preprocessing_change_guard \
             tests.test_github_workflow_templates \
+            tests.test_packaging_entrypoints \
             tests.test_deployment_defaults \
             tests.test_docx_parser \
             tests.test_hwp_parser \
