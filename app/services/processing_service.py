@@ -23,6 +23,7 @@ from app.pipelines.definitions import PREPROCESSING_PIPELINE_ID, PipelineStageTr
 from app.processors.chunker import Chunker
 from app.processors.exporter import Exporter
 from app.processors.kordoc_table_parser import KordocTableParser
+from app.processors.metadata_extractor import MetadataExtractor
 from app.processors.normalizer import TextNormalizer
 from app.processors.quality_gate import (
     QualityGate,
@@ -701,8 +702,44 @@ class ProcessingService:
                 options,
                 regulation_progress_callback=_regulation_progress,
             )
+            chunk_document_metadata = dict(document_metadata)
+            regulation_opening_dates: dict[str, dict] = {}
+            if regulation_total > 1:
+                # A binder's filename or document-wide date is not evidence of
+                # every contained regulation's lifecycle. The chunker already
+                # propagates dates within each regulation's own scope. Preserve
+                # those dates, including explicit unknowns, without filling the
+                # gaps from another regulation in the same uploaded file.
+                for field in ("revision_date", "effective_from", "effective_to", "repealed_at"):
+                    chunk_document_metadata.pop(field, None)
+                extractor = MetadataExtractor()
+                regulation_opening_dates = {
+                    node.node_id: extractor.extract(node.text)
+                    for node in regulation_nodes
+                }
+            regulation_node_ids = {node.node_id for node in regulation_nodes}
             for chunk in chunks:
-                chunk.metadata = {**document_metadata, **dict(chunk.metadata or {})}
+                chunk_metadata = dict(chunk.metadata or {})
+                if regulation_total > 1 and chunk_metadata.get("regulation_node_id") in regulation_node_ids:
+                    regulation_node_id = chunk_metadata["regulation_node_id"]
+                    opening_dates = regulation_opening_dates[regulation_node_id]
+                    inherited_fields = []
+                    for field in ("revision_date", "effective_date", "valid_from"):
+                        if not chunk_metadata.get(field) and opening_dates.get(field):
+                            chunk_metadata[field] = opening_dates[field]
+                            inherited_fields.append(field)
+                    if inherited_fields:
+                        chunk_metadata["regulation_opening_date_source_node_id"] = regulation_node_id
+                        chunk_metadata["regulation_opening_date_inherited_fields"] = inherited_fields
+                    chunk.metadata = {
+                        **chunk_document_metadata,
+                        **chunk_metadata,
+                        "document_lifecycle_dates_not_inherited": True,
+                    }
+                else:
+                    # Unmapped tables remain document-level source material;
+                    # absent page/unit evidence must not create an ownership.
+                    chunk.metadata = {**document_metadata, **chunk_metadata}
             set_role_status(
                 "chunk_generate",
                 "chunk_builder",

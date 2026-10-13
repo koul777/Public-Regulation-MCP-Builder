@@ -210,6 +210,7 @@ class DocumentService:
         self,
         document_id: str,
         *,
+        reason: str = "kordoc_evidence_recovery",
         progress_callback: Callable[[int, int | None], None] | None = None,
     ) -> Document:
         """Copy a stored source into a new draft without mutating prior results.
@@ -255,7 +256,7 @@ class DocumentService:
                 regulation_status="draft",
                 supersedes_document_id=intended_supersedes_document_id,
                 reprocessing_source_document_id=source_document.document_id,
-                reprocessing_reason="kordoc_evidence_recovery",
+                reprocessing_reason=reason,
                 tenant_id=source_document.tenant_id,
                 expected_size=source_path.stat().st_size,
                 expected_sha256=source_document.file_hash,

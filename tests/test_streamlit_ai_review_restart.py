@@ -127,24 +127,25 @@ class BeginnerBulkFinishChoiceTests(unittest.TestCase):
         app.session_state["beginner_guide_choice_made"] = True
         return app
 
-    def test_unreviewed_beginner_sees_recommendation_and_can_finish_in_one_click(self) -> None:
+    def test_unreviewed_beginner_uses_one_batch_entry_and_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app, settings = self._beginner_app(Path(tmp))
             app.run()
             self.assertFalse(app.exception)
             repository = JsonRepository(settings)
-            # 확인 전에는 기본 승인 버튼이 없고, 선택지는 접힌 상태로만 보인다.
+            # 개별 검수와 전체 승인 진입만 보이며, 중복 미검수 승인 버튼은 없다.
             self.assertFalse(any(b.label in FINAL_BUTTONS for b in app.button))
-            shortcut = next(e for e in app.expander if "한 번에 승인하기 (선택)" in e.label)
-            self.assertIn("남은 조항 2개", shortcut.label)
-            self.assertTrue(any("사람이 마지막은 직접 검수하는 것을 추천" in w.value for w in app.warning))
-            bulk_button = app.button(key="approval-bulk-finish-doc_streamlit_approval")
+            self.assertFalse(any(b.key and b.key.startswith("approval-bulk-finish-") for b in app.button))
+            app.button(key="approval-batch-entry-doc_streamlit_approval").click().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any("사람 검수를 권장" in w.value for w in app.warning))
+            bulk_button = app.button(key="workflow-approve-index-doc_streamlit_approval")
             self.assertTrue(bulk_button.disabled)
             self.assertFalse(repository.list_approval_records("doc_streamlit_approval"))
 
-            app.checkbox(key="approval-bulk-finish-ack-doc_streamlit_approval").check().run()
+            app.checkbox(key="approval-batch-unreviewed-ack-doc_streamlit_approval").check().run()
             self.assertFalse(app.exception)
-            bulk_button = app.button(key="approval-bulk-finish-doc_streamlit_approval")
+            bulk_button = app.button(key="workflow-approve-index-doc_streamlit_approval")
             self.assertFalse(bulk_button.disabled)
             bulk_button.click().run()
             self.assertFalse(app.exception)
@@ -162,7 +163,7 @@ class BeginnerBulkFinishChoiceTests(unittest.TestCase):
                 ),
                 records,
             )
-            self.assertTrue(any("승인이 끝났어요" in item.value for item in app.success))
+            self.assertTrue(repository.list_indexing_jobs("doc_streamlit_approval"))
             # 새로 연 화면에서는 남은 조항이 없으므로 선택지도 사라져야 한다.
             reopened = self._fresh_app(settings)
             reopened.run()

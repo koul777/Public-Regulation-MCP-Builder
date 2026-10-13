@@ -78,8 +78,7 @@ async function activeMarker(page) {
 }
 
 async function waitTitle(page,title) {
-  await page.waitForFunction(value=>document.querySelector('#rr-tour-title')?.textContent===value
-    && !document.querySelector('.rr-tour-card')?.hidden,title);
+  await eventuallyMarker(page,marker=>marker?.title===title,title);
 }
 
 async function eventuallyMarker(page,predicate,description) {
@@ -149,10 +148,15 @@ async function main() {
     page.on('pageerror',error=>errors.push(String(error)));
     await page.goto(url);
     await page.getByRole('button',{name:'초보자 안내 시작',exact:true}).click();
-    await waitTitle(page,'처음이라면, 한 단계씩 같이 해요');
-    await page.locator('.rr-tour-primary').click();
-    await page.locator('.rr-tour-primary').click();
     const institution=page.getByRole('textbox',{name:'기관명',exact:true});
+    await institution.waitFor();
+    // A fresh operator can land directly on institution registration. The
+    // optional welcome overlay is not a prerequisite for the real workflow.
+    const welcomeTitle=page.locator('#rr-tour-title');
+    if(await welcomeTitle.count() && await welcomeTitle.textContent()==='처음이라면, 한 단계씩 같이 해요') {
+      await page.locator('.rr-tour-primary').click();
+      await page.locator('.rr-tour-primary').click();
+    }
     await institution.click();
     await institution.fill('공개 합성 브라우저 기관');
     await page.getByRole('button',{name:'기관 생성',exact:true}).click();
@@ -178,9 +182,13 @@ async function main() {
     assert.equal(document.approval_journal_count,0);
     assert.deepEqual(document.indexing_jobs,[]);
     assert.deepEqual(before.vector_files,[]);
+    assert.equal(await page.getByRole('button',{name:'선택한 규정 전체 승인·색인',exact:true}).count(),1,
+      'beginner approval must have one shared batch entry');
+    assert.equal(await page.locator('div[class*="st-key-approval-bulk-finish-"] button').count(),0,
+      'duplicate unreviewed approval shortcut must not be rendered');
     if(process.env.RR_BULK_APPROVAL_JOURNEY==='1') {
       assert.equal(process.env.RR_COMPLETE_MCP_JOURNEY,'1','bulk journey requires deterministic indexing fixture');
-      await page.getByRole('button',{name:'전체 규정 한꺼번에 처리',exact:true}).click();
+      await page.getByRole('button',{name:'선택한 규정 전체 승인·색인',exact:true}).click();
       const batch=page.locator(`div[class~="st-key-workflow-approve-index-${document.document_id}"] button`);
       await batch.waitFor();
       assert.equal(await batch.isEnabled(),false,'unreviewed batch approval requires explicit acknowledgement');
@@ -270,8 +278,12 @@ async function main() {
           if(attempt===99) throw new Error('review did not advance after confirmation');
         }
       }
-      await approve.click();
-      const go=page.locator('div[class*="st-key-approval-goto-connect-simple"] button');
+      await page.getByRole('button',{name:'선택한 규정 전체 승인·색인',exact:true}).click();
+      const batch=page.locator(`div[class~="st-key-workflow-approve-index-${document.document_id}"] button`);
+      await batch.waitFor();
+      assert.equal(await batch.isEnabled(),true,'reviewed rows should pass straight to shared final approval');
+      await batch.click();
+      const go=page.locator(`div[class~="st-key-approval-batch-goto-connect-${document.document_id}"] button`);
       await go.waitFor({timeout:180000});
       const approvedState=await snapshot();
       assert(approvedState.documents[0].chunks.every(chunk=>chunk.approval_status==='approved'));

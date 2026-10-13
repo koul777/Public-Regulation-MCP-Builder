@@ -110,9 +110,54 @@ class StreamlitApprovalPreflightTests(unittest.TestCase):
         ]
         message = streamlit_app._bulk_approval_blocker([{"chunks": chunks}])
         self.assertIn("조항 1,200개", message)
-        self.assertIn("규정별로 나눈 파일", message)
+        self.assertIn("영향 조항 1,200개", message)
+        self.assertIn("각각 별도의 오류라는 뜻은 아닙니다", message)
+        self.assertIn("통합 규정집과 개별 규정 파일 모두 지원", message)
+        self.assertIn("원본을 나누지 않고 새 초안", message)
         self.assertNotIn("synthetic-long-id", message)
         self.assertLess(len(message), 400)
+
+    def test_message_names_only_affected_documents_and_counts_their_affected_articles(self) -> None:
+        contexts = [
+            {
+                "document_id": "doc-synthetic-old-combined",
+                "document": SimpleNamespace(document_name="합성 통합 규정집", filename="synthetic-combined.pdf"),
+                "chunks": [self._chunk(f"old-{index}", metadata={"ambiguous_combined_book_boundary": True}) for index in range(3)],
+            },
+            {
+                "document_id": "doc-synthetic-new-single",
+                "document": SimpleNamespace(document_name="합성 개별 규정", filename="synthetic-single.pdf"),
+                "chunks": [self._chunk("new")],
+            },
+        ]
+        message = streamlit_app._bulk_approval_blocker(contexts)
+        self.assertIn("문서 1개에서 조항 3개", message)
+        self.assertIn("합성 통합 규정집 · 파일: synthetic-combined.pdf", message)
+        self.assertIn("문서 ID: doc-syntheti", message)
+        self.assertIn("영향 조항 3개", message)
+        self.assertNotIn("합성 개별 규정", message)
+        self.assertNotIn("synthetic-single.pdf", message)
+        self.assertNotIn("doc-synthetic-old-combined", message)
+        self.assertEqual("", streamlit_app._bulk_approval_blocker(contexts[1:]))
+
+    def test_message_limits_document_details_and_strips_file_directories(self) -> None:
+        contexts = [
+            {
+                "document_id": f"synthetic-{index:02d}-" + "x" * 100,
+                "document": SimpleNamespace(
+                    document_name="합성" * 100,
+                    filename="C:\\synthetic-private-directory\\" + "f" * 120 + ".pdf",
+                ),
+                "chunks": [self._chunk(f"chunk-{index}", metadata={"ambiguous_combined_book_boundary": True})],
+            }
+            for index in range(8)
+        ]
+        message = streamlit_app._bulk_approval_blocker(contexts)
+        self.assertEqual(5, message.count("문서 ID:"))
+        self.assertIn("그 밖의 영향 문서 3개", message)
+        self.assertNotIn("synthetic-private-directory", message)
+        self.assertNotIn("f" * 81, message)
+        self.assertLess(len(message), 1500)
 
     def test_scope_does_not_silently_drop_blocked_targets_or_overblock_other_regulations(self) -> None:
         normal = self._chunk("normal")

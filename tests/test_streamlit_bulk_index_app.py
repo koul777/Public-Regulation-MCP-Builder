@@ -76,10 +76,14 @@ class StreamlitBulkIndexAppTests(unittest.TestCase):
         app.run()
         self.assertFalse(app.exception)
         entry = app.button(key=f"approval-batch-entry-{document_ids[0]}")
-        self.assertEqual("전체 규정 한꺼번에 처리", entry.label)
+        self.assertEqual("선택한 규정 전체 승인·색인", entry.label)
+        self.assertEqual(1, len([button for button in app.button if button.label == entry.label]))
+        self.assertFalse(any(button.key and button.key.startswith("approval-bulk-finish-") for button in app.button))
         entry.click().run()
         self.assertFalse(app.exception)
         self.assertTrue(app.session_state[f"approval-batch-active-{document_ids[0]}"])
+        self.assertFalse(any(button.key and button.key.startswith("approval-batch-entry-") for button in app.button))
+        self.assertFalse(any(button.key and button.key.startswith("approval-approve-index-") for button in app.button))
         self.assertEqual(before, self._snapshot(document_ids), "Opening the batch panel must not approve or index.")
 
     def _acknowledge_unreviewed(self, app, document_ids: list[str]) -> None:
@@ -145,6 +149,31 @@ class StreamlitBulkIndexAppTests(unittest.TestCase):
             ["reg-personnel", "reg-service"],
             [self.repository.get_document(document_id).regulation_id for document_id in self.document_ids],
         )
+
+    def test_individual_review_keeps_one_primary_batch_action_and_collapses_local_actions(self) -> None:
+        _seed_streamlit_multi_approval_documents(self.settings)
+        app = self._app(self.document_ids)
+        before = self._snapshot(self.document_ids)
+        app.run()
+        approval_support._confirm_rendered_approval_rows(app)
+        self.assertFalse(app.exception)
+        self.assertEqual(before, self._snapshot(self.document_ids))
+
+        advanced = next(item for item in app.expander if item.label == "고급: 현재 규정만 승인·색인")
+        self.assertFalse(advanced.proto.expanded)
+        local_button = advanced.button(key=f"approval-approve-index-{self.document_ids[0]}")
+        self.assertEqual("secondary", local_button.proto.type)
+        approval_primaries = [button for button in app.button
+                              if button.proto.type == "primary" and "승인" in button.label]
+        self.assertEqual([f"approval-batch-entry-{self.document_ids[0]}"], [button.key for button in approval_primaries])
+
+        self._enter_batch(app, self.document_ids)
+        self._acknowledge_unreviewed(app, self.document_ids)
+        self._finish_batch(app, self.document_ids[0], self.document_ids)
+        self.assertTrue(all(record.get("human_review_confirmed")
+                            for record in self.repository.list_approval_records(self.document_ids[0])))
+        self.assertTrue(all(not record.get("human_review_confirmed")
+                            for record in self.repository.list_approval_records(self.document_ids[1])))
 
     def test_beginner_combined_file_includes_all_regulations_when_one_is_open(self) -> None:
         _seed_streamlit_regulation_bundle_document(self.settings)

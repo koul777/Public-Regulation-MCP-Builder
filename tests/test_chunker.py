@@ -8,6 +8,7 @@ from app.core.config import Settings
 from app.processors.answer_profile import ANSWER_PROFILE_MARKER, build_answer_profile
 from app.processors.chunker import CHUNKER_VERSION, Chunker, REFERENCE_SECTION_MARKER
 from app.processors.exporter import Exporter
+from app.processors.quality_gate import QualityGate
 from app.processors.structure_detector import StructureDetector
 from app.schemas.chunk import Chunk, ChunkOptions
 from app.schemas.parsed import ParsedBlock, ParsedDocument, ParsedPage
@@ -35,6 +36,65 @@ def parsed_fixture() -> ParsedDocument:
 
 
 class ChunkerTests(unittest.TestCase):
+    def test_bullet_body_after_standalone_native_table_remains_retrievable(self) -> None:
+        paragraphs = [
+            "□ 깃발의 제작\n- 깃발의 바탕은 연한 초록색으로 제작한다.\n- 가로와 세로의 비율은 별도 도안에 따른다.",
+            "□ 사용 장소\n- 안내실과 행사장에 깃발을 설치할 수 있다.",
+            "□ 관리 방법\n- 훼손된 깃발은 관리 담당자가 교체한다.",
+        ]
+        blocks = [
+            ParsedBlock(text="공공기관 깃발 사용 지침"),
+            ParsedBlock(type="table", text="이 지침은 기관 깃발의 제작과 관리를 정한다."),
+            *(ParsedBlock(text=text) for text in paragraphs),
+            ParsedBlock(text="부칙\n이 지침은 공표한 날부터 시행한다."),
+        ]
+        parsed = ParsedDocument(
+            document_id="doc_flag_guidance",
+            source_file="flag_guidance.hwpx",
+            document_name="깃발 사용 지침",
+            file_type="hwpx",
+            pages=[ParsedPage(page_no=1, blocks=blocks)],
+            raw_text="\n".join(block.text for block in blocks),
+        )
+        nodes = StructureDetector().detect(parsed)
+        table = next(node for node in nodes if node.node_type == "table")
+        body_nodes = [node for node in nodes if node.parent_id == table.node_id]
+        self.assertEqual(3, len(body_nodes))
+
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+        body = "\n".join(chunk.normalized_text or chunk.text for chunk in chunks)
+        for paragraph in paragraphs:
+            self.assertEqual(1, body.count(paragraph))
+        self.assertEqual([], QualityGate()._missing_source_lines(parsed.raw_text, chunks))
+        table_chunk = next(chunk for chunk in chunks if chunk.chunk_type == "table")
+        self.assertNotIn("깃발의 바탕", table_chunk.text)
+        self.assertEqual({node.node_id for node in body_nodes}, {
+            node_id for chunk in chunks if chunk.chunk_type == "paragraph"
+            for node_id in chunk.source_node_ids if node_id in {node.node_id for node in body_nodes}
+        })
+
+    def test_table_child_body_already_in_article_is_not_emitted_twice(self) -> None:
+        blocks = [
+            ParsedBlock(text="제1조(관리) 깃발의 관리 기준을 정한다."),
+            ParsedBlock(type="table", text="구분 | 담당\n관리 | 총무 담당자"),
+            ParsedBlock(text="□ 교체 절차\n- 담당자는 낡은 깃발을 새 깃발로 교체한다."),
+        ]
+        parsed = ParsedDocument(
+            document_id="doc_nested_table_body",
+            source_file="flag_rule.hwpx",
+            document_name="깃발 관리 규정",
+            file_type="hwpx",
+            pages=[ParsedPage(page_no=1, blocks=blocks)],
+            raw_text="\n".join(block.text for block in blocks),
+        )
+        nodes = StructureDetector().detect(parsed)
+        chunks = Chunker().build_chunks(nodes, parsed, ChunkOptions(include_context_header=False))
+
+        body = "\n".join(chunk.normalized_text or chunk.text for chunk in chunks)
+        self.assertEqual(1, body.count("담당자는 낡은 깃발을 새 깃발로 교체한다."))
+        self.assertFalse(any(chunk.chunk_type == "paragraph" for chunk in chunks))
+        self.assertEqual([], QualityGate()._missing_source_lines(parsed.raw_text, chunks))
+
     def test_split_parts_reuse_node_static_context_with_isolated_metadata(self) -> None:
         parsed = ParsedDocument(
             document_id="doc_cached_context",

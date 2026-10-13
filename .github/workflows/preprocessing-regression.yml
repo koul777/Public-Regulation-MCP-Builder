@@ -75,6 +75,10 @@ jobs:
             tests.test_quality_gate \
             tests.test_pipeline \
             tests.test_processing_service \
+            tests.test_processing_temporal_scope \
+            tests.test_document_metadata \
+            tests.test_boundary_reprocessing_service \
+            tests.test_streamlit_bulk_approval_blocker_app \
             tests.test_article_validity \
             tests.test_generate_mcp_client_config \
             tests.test_run_mcp_client_config_smoke \
