@@ -7,11 +7,13 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +22,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingEntrypointTests(unittest.TestCase):
+    def test_portable_resources_support_ui_and_vercel_staging_without_checkout(self) -> None:
+        from scripts import prepare_vercel_mcp_deployment as staging
+
+        source = (ROOT / "packaging/PR-MCP-Builder.spec").read_text(encoding="utf-8")
+        hooks = types.ModuleType("PyInstaller.utils.hooks")
+        hooks.collect_all = lambda name: ([], [], [])
+        hooks.collect_submodules = lambda name: [name + ".discovered"]
+        with tempfile.TemporaryDirectory() as temp:
+            temporary = Path(temp)
+            version = temporary / "version.txt"
+            version.write_text("synthetic version", encoding="utf-8")
+            namespace = {"SPECPATH": str(ROOT / "packaging")}
+            with mock.patch.dict(sys.modules, {"PyInstaller.utils.hooks": hooks}), \
+                 mock.patch.dict(os.environ, {"PR_MCP_BUILDER_VERSION_FILE": str(version)}):
+                exec(compile(source[:source.index("a = Analysis(")], "portable_resources", "exec"), namespace)
+            self.assertIn("frontend.discovered", namespace["hiddenimports"])
+            bundle = temporary / "frozen-bundle"
+            for original, destination in namespace["datas"]:
+                source_path = Path(original)
+                target = bundle / destination / source_path.name if source_path.is_file() else bundle / destination
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source_path.is_dir():
+                    shutil.copytree(source_path, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(source_path, target)
+            for name in ("frontend/vercel_deployment.py", "frontend/beginner_tour.py",
+                         "frontend/assets/beginner_tour.js", "frontend/assets/beginner_tour.css"):
+                self.assertTrue((bundle / name).is_file(), name)
+            runtime = temporary / "synthetic-runtime"
+            runtime.mkdir()
+            (runtime / "mcp_runtime_manifest.json").write_text('{"tenant_id":"synthetic"}', encoding="utf-8")
+            stage = temporary / "stage"
+            with mock.patch.object(staging, "PROJECT_ROOT", bundle):
+                staging.prepare_vercel_mcp_deployment(runtime_data_dir=runtime, out_dir=stage)
+            for name in ("app/mcp_server/vercel_app.py", "app/mcp_server/vercel_runtime.py"):
+                self.assertEqual((ROOT / name).read_bytes(), (stage / name).read_bytes())
+            self.assertFalse((stage / "frontend").exists())
+
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell is required")
     def test_portable_hash_works_without_powershell_utility_module_discovery(self) -> None:
         build_script = (ROOT / "scripts" / "build_windows_portable.ps1").read_text(encoding="utf-8-sig")

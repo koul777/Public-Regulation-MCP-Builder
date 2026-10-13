@@ -163,6 +163,7 @@ class GitHubWorkflowTemplatesTests(unittest.TestCase):
         for module in (
             "test_streamlit_beginner_guide", "test_streamlit_vercel_deployment",
             "test_streamlit_protected_guard_execution",
+            "test_packaging_entrypoints",
             "test_vercel_deployment_service", "test_vercel_runtime",
             "test_vercel_mcp", "test_vercel_mcp_end_to_end",
         ):

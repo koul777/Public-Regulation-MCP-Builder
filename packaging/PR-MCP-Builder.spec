@@ -14,6 +14,7 @@ if not version_file or not Path(version_file).is_file():
 streamlit_datas, streamlit_binaries, streamlit_hidden = collect_all("streamlit")
 hiddenimports = list(streamlit_hidden)
 hiddenimports += collect_submodules("app")
+hiddenimports += collect_submodules("frontend")
 hiddenimports += [
     "scripts.analyze_regulation_corpus",
     "scripts.generate_mcp_client_config",
@@ -23,13 +24,24 @@ hiddenimports += [
     "scripts.find_available_ui_port",
     "scripts.run_qwen_chat",
     "scripts.run_regulation_mcp",
+    "scripts.prepare_vercel_mcp_deployment",
+    "scripts.run_mcp_client_config_smoke",
 ]
 
 datas = list(streamlit_datas)
 datas += [
     (str(project_root / "frontend" / "streamlit_app.py"), "frontend"),
     (str(project_root / "frontend" / "qwen_chat_app.py"), "frontend"),
+    (str(project_root / "frontend" / "assets"), "frontend/assets"),
 ]
+# Streamlit reads UI modules/assets from disk, and Vercel staging copies the
+# server's Python source. A PYZ-only app package cannot supply that source.
+# Restrict copied package trees to Python source, never operator/runtime files.
+for package in ("app", "frontend"):
+    for source in sorted((project_root / package).rglob("*.py")):
+        if package == "frontend" and source.name in {"streamlit_app.py", "qwen_chat_app.py"}:
+            continue
+        datas.append((str(source), source.parent.relative_to(project_root).as_posix()))
 
 a = Analysis(
     [str(project_root / "packaging" / "windows_launcher.py")],
