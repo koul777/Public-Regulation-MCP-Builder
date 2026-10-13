@@ -83,6 +83,7 @@ jobs:
             tests.test_qwen_chat_app \
             tests.test_streamlit_ai_usage_path \
             tests.test_streamlit_operator_mode \
+            tests.test_streamlit_protected_guard_execution \
             tests.test_streamlit_beginner_guide \
             tests.test_streamlit_vercel_deployment \
             tests.test_vercel_deployment_service \
