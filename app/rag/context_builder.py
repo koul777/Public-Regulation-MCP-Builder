@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 APPROVED_STATUS = "approved"
@@ -18,6 +18,16 @@ INJECTION_SIGNAL = re.compile(
     r"이전\s*(?:모든\s*)?지시|시스템\s*프롬프트|개발자\s*메시지)",
     flags=re.IGNORECASE,
 )
+
+
+class SourceBodySpan(BaseModel):
+    """Visible offsets derived from an already authorized source body."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence_id: str = Field(min_length=1, strict=True)
+    start: int = Field(ge=0, strict=True)
+    end: int = Field(gt=0, strict=True)
 
 
 class ContextEvidence(BaseModel):
@@ -41,6 +51,31 @@ class ContextEvidence(BaseModel):
     score: float = 0.0
     injection_signal_detected: bool = False
     truncated: bool = False
+    # None preserves legacy serialization. Explicit malformed/empty provenance
+    # must never acquire the more permissive legacy interpretation.
+    source_body_spans: tuple[SourceBodySpan, ...] | None = None
+
+    @model_validator(mode="after")
+    def validate_source_body_spans(self) -> "ContextEvidence":
+        _validated_source_body_ranges(self)
+        return self
+
+
+def _validated_source_body_ranges(item: ContextEvidence) -> tuple[tuple[int, int], ...] | None:
+    """Revalidate even model_copy bypasses; this metadata grants no approval."""
+    spans = item.source_body_spans
+    if spans is None:
+        return None
+    if type(spans) is not tuple or not spans:
+        raise ValueError("source_body_spans_invalid")
+    ranges = []
+    for span in spans:
+        if (not isinstance(span, SourceBodySpan) or type(span.start) is not int or type(span.end) is not int
+                or not 0 <= span.start < span.end <= len(item.text)
+                or type(span.evidence_id) is not str or span.evidence_id not in item.evidence_ids):
+            raise ValueError("source_body_spans_invalid")
+        ranges.append((span.start, span.end))
+    return tuple(ranges)
 
 
 class GroundingContext(BaseModel):
@@ -81,9 +116,12 @@ class ContextBuilder:
             if remaining < 160:
                 break
             text = str(group["text"])
+            visible_end = len(text)
             truncated = len(text) > remaining
             if truncated:
-                text = text[: max(0, remaining - 18)].rstrip() + "\n[문맥 예산으로 생략]"
+                prefix = _clip_source_prefix(text, max(0, remaining - 18))
+                visible_end = len(prefix)
+                text = prefix + "\n[문맥 예산으로 생략]"
                 truncated_any = True
             item = ContextEvidence(
                 context_id=f"E{len(selected) + 1}",
@@ -104,6 +142,9 @@ class ContextBuilder:
                 score=float(group["score"]),
                 injection_signal_detected=bool(group["injection_signal_detected"]),
                 truncated=truncated,
+                source_body_spans=tuple(SourceBodySpan(
+                    evidence_id=span.evidence_id, start=span.start, end=min(span.end, visible_end))
+                    for span in group["source_body_spans"] if span.start < min(span.end, visible_end)),
             )
             selected.append(item)
             consumed_chars += len(text)
@@ -193,11 +234,14 @@ def _merge_article_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
                 "evidence_ids": [record["evidence_id"]],
                 "approval_ids": [record["approval_id"]] if record["approval_id"] else [],
                 "content_hashes": [record["content_hash"]] if record["content_hash"] else [],
+                "source_body_spans": [SourceBodySpan(evidence_id=record["evidence_id"], start=0, end=len(record["text"]))],
             }
             by_key[key] = group
             groups.append(group)
             continue
-        group["text"] = _append_without_overlap(str(group["text"]), str(record["text"]))
+        text, start, end = _append_source_body(str(group["text"]), str(record["text"]))
+        group["text"] = text
+        group["source_body_spans"].append(SourceBodySpan(evidence_id=record["evidence_id"], start=start, end=end))
         group["evidence_ids"].append(record["evidence_id"])
         if record["approval_id"] and record["approval_id"] not in group["approval_ids"]:
             group["approval_ids"].append(record["approval_id"])
@@ -249,17 +293,38 @@ def _prioritize_title_matches(groups: list[dict[str, Any]], query: str) -> list[
     return matched + others
 
 
+def _clip_source_prefix(text: str, limit: int) -> str:
+    """Never expose an incomplete synthetic replacement as original source."""
+    end = min(len(text), max(0, limit))
+    for marker in ("[문맥 예산으로 생략]", "[모델 제어 토큰 제거]"):
+        start = text.rfind(marker, max(0, end - len(marker) + 1), end + len(marker))
+        if start >= 0 and start < end < start + len(marker):
+            end = start
+    return text[:end].rstrip()
+
+
 def _append_without_overlap(left: str, right: str) -> str:
-    if right in left:
-        return left
+    return _append_source_body(left, right)[0]
+
+
+def _append_source_body(left: str, right: str) -> tuple[str, int, int]:
+    """Deduplicate visible text while retaining the full new body's offsets."""
+    contained = left.find(right)
+    if contained >= 0:
+        return left, contained, contained + len(right)
     maximum = min(len(left), len(right), 500)
     overlap = 0
     for size in range(maximum, 39, -1):
         if left[-size:] == right[:size]:
             overlap = size
             break
-    suffix = right[overlap:].lstrip()
-    return left.rstrip() + ("\n" + suffix if suffix else "")
+    if overlap:
+        # Keep exact original whitespace: both overlapping bodies must remain
+        # continuous slices, not merely their normalized fragments.
+        start = len(left) - overlap
+        return left + right[overlap:], start, start + len(right)
+    start = len(left) + 2
+    return left + "\n\n" + right, start, start + len(right)
 
 
 def _render_prompt_context(items: list[ContextEvidence]) -> str:

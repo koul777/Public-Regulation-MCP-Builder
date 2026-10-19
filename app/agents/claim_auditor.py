@@ -12,7 +12,12 @@ from app.agents.base import AgentResult, BaseAgent
 from app.agents.grounded_qa import GroundedAnswerDraft
 from app.agents.model_router import QWEN3_REVIEW_MODEL, get_model_profile
 from app.agents.ollama_runtime import OllamaRuntime
-from app.rag.context_builder import ContextEvidence, GroundingContext
+from app.rag.context_builder import ContextEvidence, GroundingContext, _validated_source_body_ranges
+
+
+_SYNTHETIC_CONTEXT_MARKERS = ("[문맥 예산으로 생략]", "[모델 제어 토큰 제거]")
+_SYNTHETIC_CONTEXT_PATTERN = re.compile("|".join(map(re.escape, _SYNTHETIC_CONTEXT_MARKERS)))
+_QUOTE_BREAK_PATTERN = re.compile(_SYNTHETIC_CONTEXT_PATTERN.pattern + r"|\r?\n[^\S\r\n]*\r?\n")
 
 
 class ClaimFinding(BaseModel):
@@ -160,6 +165,9 @@ def _deterministic_preflight(
     draft: GroundedAnswerDraft,
     context: GroundingContext,
 ) -> ClaimAuditResult | None:
+    source_preflight = _source_span_preflight(context)
+    if source_preflight is not None:
+        return source_preflight
     known = {item.context_id for item in context.items}
     rejected: list[ClaimFinding] = []
     for claim in draft.claims:
@@ -199,6 +207,9 @@ def _bind_model_audit(
     model_draft: _ModelAuditDraft,
     duration_ms: float,
 ) -> ClaimAuditResult:
+    source_preflight = _source_span_preflight(context, duration_ms)
+    if source_preflight is not None:
+        return source_preflight
     claim_by_id = {claim.claim_id: claim for claim in draft.claims}
     context_by_id = {item.context_id: item for item in context.items}
     raw_by_claim: dict[str, _ModelFinding] = {}
@@ -231,7 +242,8 @@ def _bind_model_audit(
             return _audit_review_required(draft, "model_evidence_set_mismatch", duration_ms)
         quote = " ".join(raw.support_quote.split())
         matching_items = [context_by_id[context_id] for context_id in cited]
-        quote_item = next((item for item in matching_items if _quote_is_exact(quote, item.text)), None)
+        quote_item = next((item for item in matching_items if _quote_is_exact(
+            quote, item.text, source_ranges=_validated_source_body_ranges(item))), None)
         if quote_item is None:
             return _audit_review_required(draft, "support_quote_not_exact", duration_ms)
         findings.append(
@@ -282,10 +294,32 @@ def _audit_review_required(
     )
 
 
-def _quote_is_exact(quote: str, evidence_text: str) -> bool:
+def _source_span_preflight(context: GroundingContext, duration_ms: float = 0.0) -> ClaimAuditResult | None:
+    try:
+        for item in context.items:
+            _validated_source_body_ranges(item)
+    except (AttributeError, TypeError, ValueError):
+        return ClaimAuditResult(status="review_required", audit_mode="deterministic_gate",
+                                reason_code="source_body_spans_invalid", duration_ms=duration_ms)
+    return None
+
+
+def _quote_is_exact(quote: str, evidence_text: str, *,
+                    source_ranges: tuple[tuple[int, int], ...] | None = None) -> bool:
     if len(quote) < 4:
         return False
-    return _normalized_text(quote) in _normalized_text(evidence_text)
+    normalized = _normalized_text(quote)
+    if source_ranges is None:
+        # Legacy contexts have no body-origin proof. Preserve conservative
+        # boundaries, including CRLF and Unicode horizontal blank-line space.
+        return any(normalized in _normalized_text(segment)
+                   for segment in _QUOTE_BREAK_PATTERN.split(evidence_text))
+    for start, end in source_ranges:
+        if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(evidence_text):
+            return False
+    return any(normalized in _normalized_text(segment)
+               for start, end in source_ranges
+               for segment in _SYNTHETIC_CONTEXT_PATTERN.split(evidence_text[start:end]))
 
 
 def _normalized_text(value: str) -> str:
