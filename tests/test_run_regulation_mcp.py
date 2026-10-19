@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import unittest
 from unittest.mock import patch
 
 from app.mcp_server.regulation_server import create_regulation_mcp_server
-from scripts.run_regulation_mcp import _resolve_http_bearer_token, _validate_http_auth_posture, parse_args
+from scripts.run_regulation_mcp import _resolve_http_bearer_token, _validate_http_auth_posture, main, parse_args
 
 
 class RunRegulationMcpTests(unittest.TestCase):
@@ -131,6 +132,65 @@ class RunRegulationMcpTests(unittest.TestCase):
             },
             server._reg_rag_warmup_status,
         )
+
+
+    def test_cli_preserves_default_and_no_warm_cache_tokenizer_behavior(self) -> None:
+        for options, warm_cache in (([], True), (["--no-warm-cache"], False)):
+            with self.subTest(options=options), patch("sys.argv", ["run_regulation_mcp.py", *options]), patch(
+                "scripts.run_regulation_mcp.create_regulation_mcp_server"
+            ) as create:
+                self.assertEqual(0, main())
+                self.assertEqual(warm_cache, create.call_args.kwargs["warm_cache"])
+                self.assertTrue(create.call_args.kwargs["background_tokenizer_warmup"])
+                create.return_value.run.assert_called_once_with(transport="stdio")
+
+    def test_cli_background_opt_out_requires_no_warm_cache(self) -> None:
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr), patch("sys.argv", ["run_regulation_mcp.py", "--no-background-tokenizer-warmup"]), patch(
+            "scripts.run_regulation_mcp.create_regulation_mcp_server"
+        ) as create:
+            with self.assertRaises(SystemExit) as raised:
+                main()
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn("--no-background-tokenizer-warmup requires --no-warm-cache", stderr.getvalue())
+            create.assert_not_called()
+
+    def test_cli_background_opt_out_preserves_scope_and_transport(self) -> None:
+        arguments = ["run_regulation_mcp.py", "--no-warm-cache", "--no-background-tokenizer-warmup",
+                     "--tenant-id", "synthetic-tenant", "--profile-id", "synthetic-profile",
+                     "--tenant-storage-isolation", "--department-id", "synthetic-department",
+                     "--actor", "synthetic-reader", "--role", "viewer"]
+        with patch("sys.argv", arguments), patch("scripts.run_regulation_mcp.create_regulation_mcp_server") as create:
+            self.assertEqual(0, main())
+        kwargs = create.call_args.kwargs
+        self.assertFalse(kwargs["warm_cache"])
+        self.assertFalse(kwargs["background_tokenizer_warmup"])
+        self.assertEqual("synthetic-tenant", kwargs["tenant_id"])
+        self.assertEqual("synthetic-profile", kwargs["profile_id"])
+        self.assertTrue(kwargs["tenant_storage_isolation"])
+        self.assertEqual(["synthetic-department"], kwargs["department_ids"])
+        self.assertEqual("synthetic-reader", kwargs["actor"])
+        self.assertEqual("viewer", kwargs["role"])
+        create.return_value.run.assert_called_once_with(transport="stdio")
+
+    def test_cli_background_opt_out_keeps_non_loopback_auth_gate(self) -> None:
+        arguments = ["run_regulation_mcp.py", "--no-warm-cache", "--no-background-tokenizer-warmup",
+                     "--transport", "streamable-http", "--host", "0.0.0.0"]
+        with patch("sys.argv", arguments), patch("scripts.run_regulation_mcp.create_regulation_mcp_server") as create:
+            with self.assertRaises(SystemExit) as raised:
+                main()
+            self.assertIn("unauthenticated MCP HTTP/SSE", str(raised.exception))
+            create.assert_not_called()
+
+    def test_cli_background_opt_out_keeps_protected_storage_gate(self) -> None:
+        arguments = ["run_regulation_mcp.py", "--no-warm-cache", "--no-background-tokenizer-warmup", "--flat-storage"]
+        with patch.dict(os.environ, {"APP_ENV": "production"}), patch("sys.argv", arguments), patch(
+            "scripts.run_regulation_mcp.create_regulation_mcp_server"
+        ) as create:
+            with self.assertRaises(SystemExit) as raised:
+                main()
+            self.assertIn("protected environment", str(raised.exception))
+            create.assert_not_called()
 
 
 if __name__ == "__main__":

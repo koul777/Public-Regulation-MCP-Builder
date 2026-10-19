@@ -7,10 +7,12 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
+from threading import Lock
 from typing import Any
 
 
 LOGGER = logging.getLogger(__name__)
+_KIWI_INIT_LOCK = Lock()
 TOKENIZER_MODEL = "kiwi-tokenizer-v1"
 FALLBACK_TOKENIZER_MODEL = "regex-ko-tokenizer-v1"
 
@@ -176,7 +178,7 @@ def kiwi_is_ready() -> bool:
 
 
 @lru_cache(maxsize=1)
-def _kiwi() -> Any | None:
+def _cached_kiwi() -> Any | None:
     try:
         from kiwipiepy import Kiwi  # type: ignore
     except Exception as exc:  # pragma: no cover - environment-dependent branch
@@ -187,6 +189,26 @@ def _kiwi() -> Any | None:
     except Exception as exc:  # pragma: no cover - environment-dependent branch
         LOGGER.warning("kiwipiepy initialization failed; falling back to regex Korean tokenizer: %s", exc)
         return None
+
+
+def _kiwi() -> Any | None:
+    # Cover the cache lookup as well as creation: lru_cache alone can run
+    # concurrent cold misses. Token analysis happens after this gate is released.
+    with _KIWI_INIT_LOCK:
+        return _cached_kiwi()
+
+
+def _clear_kiwi_cache() -> None:
+    with _KIWI_INIT_LOCK:
+        _cached_kiwi.cache_clear()
+
+
+# Readiness inspection remains nonblocking during initialization. Keep the
+# existing cache interfaces, including the intentional uncached diagnostic path.
+_kiwi.cache_info = _cached_kiwi.cache_info  # type: ignore[attr-defined]
+_kiwi.cache_clear = _clear_kiwi_cache  # type: ignore[attr-defined]
+_kiwi.cache_parameters = _cached_kiwi.cache_parameters  # type: ignore[attr-defined]
+_kiwi.__wrapped__ = _cached_kiwi.__wrapped__  # type: ignore[attr-defined]
 
 
 def _kiwi_tokens(kiwi: Any, text: str) -> list[str]:
