@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
 
 from pydantic import ValidationError
 
-from app.agents.claim_auditor import ClaimAuditAgent
+from app.agents.claim_auditor import ClaimAuditAgent, _ModelAuditDraft, _ModelFinding, _ModelSentence
 from app.agents.grounded_qa import AnswerClaim, GroundedAnswerDraft
 from app.rag.context_builder import ContextBuilder, ContextEvidence, GroundingContext
 
@@ -27,7 +28,17 @@ def _overlap() -> tuple[str, str, str]:
     return "Left-only source. " + shared, shared + " Right-only source.", shared
 
 
+def _prompt_json(prompt: str, label: str):
+    return json.loads(next(line.split(": ", 1)[1] for line in prompt.splitlines() if line.startswith(label + ": ")))
+
+
 class _Runtime:
+    """Returns a stored older-shape draft: a free quote and no quote id.
+
+    model_construct bypasses the required support_quote_id, which keeps the retained
+    exact-copy gate for such payloads under test. Every prompted sentence is supported.
+    """
+
     def __init__(self, quote: str):
         self.quote = quote
         self.calls = 0
@@ -37,14 +48,20 @@ class _Runtime:
 
     def generate_json(self, **kwargs):
         self.calls += 1
-        return {"answer_supported": True, "findings": [{"claim_id": "C1", "supported": True, "evidence_context_ids": ["E1"],
-                              "support_quote": self.quote}]}, SimpleNamespace(duration_ms=1.0)
+        quotes = _prompt_json(kwargs["prompt"], "승인 근거의 원문 연속구간")
+        quote_id = quotes[0]["quote_id"] if quotes else ""
+        sentences = [_ModelSentence(sentence_id=item["sentence_id"], support_quote_id=quote_id, supported=True)
+                     for item in _prompt_json(kwargs["prompt"], "감사 대상 답변 문장")]
+        finding = _ModelFinding.model_construct(claim_id="C1", supported=True, evidence_context_ids=["E1"],
+                                                support_quote=self.quote)
+        return _ModelAuditDraft.model_construct(findings=[finding], sentences=sentences), SimpleNamespace(duration_ms=1.0)
 
 
 def _audit(context: GroundingContext, quote: str):
     runtime = _Runtime(quote)
-    draft = GroundedAnswerDraft(answer="Synthetic claim. [E1]", answer_mode="grounded_local",
-        claims=(AnswerClaim(claim_id="C1", text="Synthetic claim.", evidence_context_ids=("E1",)),))
+    # The regulation title carries both words, so the lexical answer gate passes.
+    draft = GroundedAnswerDraft(answer="Synthetic rule [E1]", answer_mode="grounded_local",
+        claims=(AnswerClaim(claim_id="C1", text="Synthetic rule", evidence_context_ids=("E1",)),))
     return ClaimAuditAgent(runtime).audit(draft=draft, context=context), runtime
 
 
@@ -294,11 +311,12 @@ class CatalogSpanTests(unittest.TestCase):
         first, second, _ = _overlap()
         context = _context(first, second)
         candidates = _audit_quote_candidates(context, {"E1"})
-        draft = GroundedAnswerDraft(answer="Synthetic claim. [E1]", answer_mode="grounded_local",
-            claims=(AnswerClaim(claim_id="C1", text="Synthetic claim.", evidence_context_ids=("E1",)),))
-        verdict = _ModelAuditDraft.model_validate({"answer_supported": True,
+        draft = GroundedAnswerDraft(answer="Synthetic rule [E1]", answer_mode="grounded_local",
+            claims=(AnswerClaim(claim_id="C1", text="Synthetic rule", evidence_context_ids=("E1",)),))
+        verdict = _ModelAuditDraft.model_validate({
             "findings": [{"claim_id": "C1", "supported": True, "evidence_context_ids": ["E1"],
-                          "support_quote_id": candidates[1].quote_id}]})
+                          "support_quote_id": candidates[1].quote_id}],
+            "sentences": [{"sentence_id": "S1", "support_quote_id": candidates[1].quote_id, "supported": True}]})
         self.assertEqual("verified", _bind_model_audit(draft, context, verdict, 0, quote_candidates=candidates).status)
         item = context.items[0]
         bridge = _AuditQuote(candidates[1].quote_id, "E1", 0, len(item.text), item.text)

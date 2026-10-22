@@ -353,22 +353,26 @@ class GroundedQATests(unittest.TestCase):
         )
         runtime = _Runtime(
             {
-                "answer_supported": True,
                 "findings": [
                     {
                         "claim_id": "C1",
                         "supported": True,
                         "evidence_context_ids": ["E1"],
-                        "support_quote": "접근권한을 분기마다 검토하여야 한다.",
+                        "support_quote_id": "E1Q1",
                         "reason_code": "",
                     }
-                ]
+                ],
+                "sentences": [{"sentence_id": "S1", "support_quote_id": "E1Q1", "supported": True}],
             }
         )
 
         result = ClaimAuditAgent(runtime=runtime).audit(draft=draft, context=_context())
 
         self.assertEqual("verified", result.status)
+        self.assertEqual(
+            "제2조(권한관리) 정보시스템 관리자는 접근권한을 분기마다 검토하여야 한다.",
+            result.citations[0].support_quote,
+        )
         self.assertEqual("qwen3:4b", result.model)
         self.assertEqual(16_384, runtime.last_kwargs["context_window"])
         self.assertEqual(45, runtime.last_kwargs["timeout_seconds"])
@@ -393,23 +397,24 @@ class GroundedQATests(unittest.TestCase):
         )
         runtime = _Runtime(
             {
-                "answer_supported": True,
                 "findings": [
                     {
                         "claim_id": "C1",
                         "supported": True,
                         "evidence_context_ids": ["E1"],
+                        "support_quote_id": "E1Q1",
                         "support_quote": "원문에 없는 인용",
                         "reason_code": "",
                     }
-                ]
+                ],
+                "sentences": [{"sentence_id": "S1", "support_quote_id": "E1Q1", "supported": True}],
             }
         )
 
         result = ClaimAuditAgent(runtime=runtime).audit(draft=draft, context=_context())
 
         self.assertEqual("review_required", result.status)
-        self.assertEqual("support_quote_not_exact", result.reason_code)
+        self.assertEqual("model_quote_reference_conflict", result.reason_code)
 
     def test_claim_auditor_rejects_answer_missing_marker_before_model(self) -> None:
         draft = GroundedAnswerDraft(
