@@ -723,7 +723,8 @@ def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
 
     if transport_error:
         add("execution_error", "llm_transport_error")
-        if case.get("error_type") in TIMEOUT_ERROR_TYPES:
+        chain = case.get("error_chain_types") if isinstance(case.get("error_chain_types"), list) else []
+        if case.get("error_type") in TIMEOUT_ERROR_TYPES or any(name in TIMEOUT_ERROR_TYPES for name in chain):
             add("execution_error", "llm_transport_timeout")
     if not _answerable(case):
         exposed = (answer_present is True and not abstained) or (

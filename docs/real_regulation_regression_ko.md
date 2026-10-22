@@ -350,7 +350,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 | --- | --- | --- |
 | `llm_backend_failed` | 서버 메시지 `Local LLM backend request failed: <예외 이름>`, 또는 `Multi-model local QA execution failed: <예외 이름>`에서 예외 이름이 `TimeoutError`, `URLError`, `OllamaRuntimeError`, `ConnectionError`, `ConnectionResetError`, `ConnectionRefusedError`, `ConnectionAbortedError`, `BrokenPipeError`, `RemoteDisconnected`, `IncompleteRead` | 지연 |
 | `llm_backend_unavailable` | `Configured local LLM backend is not available.` 또는 `Local LLM backend request failed: backend unavailable` | 지연 |
-| `llm_transport_timeout` | 평가기 전송 오류가 `TimeoutError`, `ReadTimeout`, `ConnectTimeout` | 지연 |
+| `llm_transport_timeout` | 평가기 전송 오류 또는 그 예외 연쇄(`error_chain_types`, 클래스 이름만 기록)에 `TimeoutError`, `ReadTimeout`, `ConnectTimeout`이 있음. 시간 초과 뒤 관찰기가 `RuntimeError`를 내도 시간 초과로 셈 | 지연 |
 | `llm_output_invalid` | `Multi-model local QA execution failed: <예외 이름>`에서 예외 이름이 `ValueError`, `ValidationError`, `JSONDecodeError` (모델 출력을 답변·감사 검사가 거절, 예: 모델이 알 수 없는 문맥 번호를 인용) | 근거는 맞지만 답변이 틀림 |
 | `llm_runtime_failed` | `Multi-model local QA execution failed: <예외 이름>`에서 예외 이름이 `RuntimeError` (필요한 모델 미설치 등), `HTTPException` (빠른 경로의 내부 HTTP 오류) | 승인 가시성·번들 결함 |
 | `evidence_identity_verification_failed` | `Final evidence identity verification failed` 또는 `Fast chat evidence identity verification failed` | 승인 가시성·번들 결함 |

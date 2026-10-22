@@ -196,10 +196,12 @@ def _build_scenarios() -> list[dict]:
     def http_500(report):
         _put_llm(report, _scored(A, response={}, status=500, events=[]))
 
-    def transport(error_type: str):
+    def transport(error_type: str, chain: list[str] | None = None):
         def mutate(report):
             case = _scored(A, response={}, status=0, events=[])
             case["error_type"] = error_type
+            if chain is not None:
+                case["error_chain_types"] = chain
             _put_llm(report, case)
         return mutate
 
@@ -340,6 +342,10 @@ def _build_scenarios() -> list[dict]:
         S("execution_error", "unrecognized 503 message", A, server_error("something the server never says"),
           ["execution_error"], {"execution_error": ["unexpected_http_status"]}),
         S("execution_error", "transport timeout", A, transport("TimeoutError"), ["execution_error"],
+          {"execution_error": ["llm_transport_error", "llm_transport_timeout", "unexpected_http_status"]},
+          branch=LATENCY),
+        S("execution_error", "timeout hidden by observer error", A,
+          transport("RuntimeError", ["RuntimeError", "TimeoutError"]), ["execution_error"],
           {"execution_error": ["llm_transport_error", "llm_transport_timeout", "unexpected_http_status"]},
           branch=LATENCY),
         S("execution_error", "transport reset", A, transport("ConnectionResetError"), ["execution_error"],

@@ -826,6 +826,7 @@ def _run_live_case(*, endpoint: str, spec: Mapping[str, Any], payload: Mapping[s
     case_id = str(spec["id"])
     started = time.perf_counter()
     error_type = None
+    error_chain: list[str] = []
     try:
         with observer.case(case_id):
             status, response = _read_json(endpoint + "/api/rag/chat", payload=payload,
@@ -833,6 +834,12 @@ def _run_live_case(*, endpoint: str, spec: Mapping[str, Any], payload: Mapping[s
                                           timeout=timeout_seconds)
     except Exception as exc:
         status, response, error_type = 0, {}, type(exc).__name__
+        # The observer may raise while unwinding a request timeout; keep the
+        # original class names (identifiers only) so a timeout stays visible.
+        current: BaseException | None = exc
+        while current is not None and len(error_chain) < 5:
+            error_chain.append(type(current).__name__)
+            current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     elapsed = (time.perf_counter() - started) * 1000
     events = observer.events_for(case_id)
     result = score_case(spec, response, http_status=status, events=events, duration_ms=elapsed)
@@ -841,6 +848,7 @@ def _run_live_case(*, endpoint: str, spec: Mapping[str, Any], payload: Mapping[s
     result.update(dict(extra or {}))
     if error_type:
         result["error_type"] = error_type
+        result["error_chain_types"] = error_chain
     private_payload = {"request": payload, "response": response, "result": result}
     # Never allow user-supplied case identifiers to become filesystem paths.
     artifact = _write_private_json(directory, filename, private_payload)

@@ -395,6 +395,32 @@ class LiveLocalLlmSafetyTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertNotIn("synthetic secret", json.dumps(report))
 
+    def test_observer_error_after_timeout_keeps_the_timeout_in_the_class_chain(self) -> None:
+        class StuckObserver:
+            @contextmanager
+            def case(self, _case_id):
+                try:
+                    yield
+                finally:
+                    raise RuntimeError("observer_call_still_running")
+
+            def events_for(self, _case_id):
+                return []
+
+            def provenance(self):
+                return {"observer": "synthetic-unit-test"}
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "scripts.evaluate_live_local_llm._read_json", side_effect=TimeoutError("synthetic secret")
+        ):
+            report = evaluate_live_local_llm(api_endpoint="http://127.0.0.1:123", query_spec=[_spec()],
+                                             observer=StuckObserver(), output_dir=Path(temp))
+        case = report["cases"][0]
+        self.assertEqual("RuntimeError", case["error_type"])
+        self.assertEqual(["RuntimeError", "TimeoutError"], case["error_chain_types"])
+        self.assertNotIn("synthetic secret", json.dumps(report))
+        self.assertNotIn("observer_call_still_running", json.dumps(report))
+
     def test_repeated_server_failures_stop_but_success_resets_counter(self) -> None:
         class FakeObserver:
             @contextmanager
