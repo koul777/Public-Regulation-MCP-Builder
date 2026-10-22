@@ -208,7 +208,7 @@ python scripts/run_real_regulation_e2e.py --config "$env:REG_RAG_EVAL_CONFIG" --
 | `core_run_count`, `expected_core_run_count` | 끝난 대표 문항 실행 수(본 실행 포함)와 계획 수 |
 | `cases[].run_count`, `complete` | 문항별 실행 수와 계획 수 충족 여부 |
 | `cases[].statuses`, `all_passed` | 실행 순서별 `passed`·`failed`와 전부 통과 여부 |
-| `cases[].distinct_answer_digests` | 최종 답변 정규화 해시의 종류 수. 1이면 답변 문장이 매번 같음. 답변 본문은 보고서에 넣지 않음 |
+| `cases[].distinct_answer_digests` | 결과 종류 수: 최종 답변 정규화 해시의 종류에 "답변 없음"을 한 가지로 더해 셈. 1이면 답변 문장이 매번 같거나 매번 답변이 없음. 일부 실행만 답변했으면 2 이상임. 답변 본문은 보고서에 넣지 않음 |
 | `cases[].runs_without_answer` | 답변이 없는 실행 수 |
 | `cases[].latency_classes`, `duration_ms` | 실행 순서별 cold/warm 구분(답변 모델 기준)과 전체 대기 시간 |
 | `p50_duration_ms`, `p95_duration_ms` | 모든 대표 문항 실행의 분위수 |
@@ -314,7 +314,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
   | `all_cases` | 각 보고서의 모든 LLM 문항. 시간 초과·5xx로 모델 호출이 끝나지 못한 문항 포함 | 항상 계산. 이전과 같음 |
   | `warm_only` | 두 보고서에서 모두 `warm`인 문항(문항 ID로 짝지음)의 시간 | 두 보고서의 모든 LLM 문항에 `latency_class`가 있고 ID가 중복되지 않으며, 짝지은 warm 문항이 `MIN_PAIRED_WARM_CASES`(10) 이상 |
 
-  행의 `all_cases`, `warm_only` 블록에 비율, 양쪽 p95, 표본 수가 나오고 `warm_only.paired_case_count`와 `min_paired_case_count`로 짝지은 수를 확인함. `warm_only.evaluated`가 `false`이면 warm 비율을 쓰지 않은 것임. `basis`는 `value`를 만든 비율(`all_cases` 또는 `warm_only`, 같으면 `all_cases`)이고 행 최상위의 `baseline_p95_ms`, `candidate_p95_ms`, `baseline_sample_count`, `candidate_sample_count`도 그 비율의 값임. 이전 보고서의 `generation_events`에서 라벨을 다시 만들지 않으므로, 라벨이 없는 기준선과는 `all_cases`만으로 비교함. `repetitions`는 넣지 않음. 경합 통제와 차단 전환 기준이 정해지지 않았으므로 계속 참고용임.
+  행의 `all_cases`, `warm_only` 블록에 비율, 양쪽 p95, 표본 수가 나오고 `warm_only.paired_case_count`와 `min_paired_case_count`로 짝지은 수를 확인함. `warm_only.evaluated`가 `false`이면 warm 비율을 쓰지 않은 것임. 정책 최대값(1.10)과는 반올림하지 않은 비율(Decimal)을 비교하고, 반올림한 `value`(소수 6자리)는 표시용임. 반올림 전 값은 `value_exact`(문자열)에 있어 1.1000004는 `value`가 1.1로 보여도 `advisory_exceeded`임. `basis`는 `value`를 만든 비율(`all_cases` 또는 `warm_only`, 같으면 `all_cases`)이고 행 최상위의 `baseline_p95_ms`, `candidate_p95_ms`, `baseline_sample_count`, `candidate_sample_count`도 그 비율의 값임. 이전 보고서의 `generation_events`에서 라벨을 다시 만들지 않으므로, 라벨이 없는 기준선과는 `all_cases`만으로 비교함. `repetitions`는 넣지 않음. 경합 통제와 차단 전환 기준이 정해지지 않았으므로 계속 참고용임.
 
 ### 기준 완화 방지
 
@@ -404,7 +404,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
   | 필드 | 내용 |
   | --- | --- |
   | `status_disagreement_case_ids` | 실행 사이에 `passed`·`failed`가 갈린 문항 |
-  | `answer_disagreement_case_ids` | 최종 답변 해시가 2종 이상인 문항 |
+  | `answer_disagreement_case_ids` | 결과 종류가 2 이상인 문항. 일부 실행만 답변이 있는 경우(`runs_without_answer`가 0도 전체도 아님)도 포함 |
   | `unstable_case_ids`, `unstable_cases` | 위 두 목록의 합집합과 문항별 상태·해시 종류 수 |
   | `incomplete_case_ids` | 계획한 횟수를 다 채우지 못한 문항 |
   | `not_all_passed_case_ids` | 실행 중 하나라도 `passed`가 아닌 문항. 매번 같게 실패한 문항도 포함 |
