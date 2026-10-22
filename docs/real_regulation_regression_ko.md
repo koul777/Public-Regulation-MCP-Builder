@@ -150,6 +150,69 @@ python scripts/run_real_regulation_e2e.py --config "$env:REG_RAG_EVAL_CONFIG" --
 
 `--check-only`는 설정과 원본 해시만 확인한다. 전처리·검색·MCP·모델 실행 성공을 뜻하지 않는다. 실제 실행은 문항의 대상 PDF 전체를 재전처리한다. 대형 통합 규정집은 시간이 걸릴 수 있다. 개별 corpus probe의 기본 표본 선택과 달리, 관련 없는 작은 PDF만 처리하고 문항의 원본을 검증한 것으로 집계하지 않는다.
 
+### 대표 문항 반복 측정과 cold/warm 구분
+
+계획서 §6의 "대표 문항 3회 반복, 결과 변동과 p50/p95 기록"을 위한 선택 설정임. 실행 설정에 `core_repeat`를 넣으면 지정한 문항을 본 실행이 끝난 뒤 추가로 실행함. 키가 없으면 반복하지 않음. 키가 있어도 `report.json`의 `configuration`은 바뀌지 않음.
+
+```json
+{
+  "core_repeat": {
+    "case_ids": ["<query spec 문항 ID 1>", "<query spec 문항 ID 2>"],
+    "extra_runs": 2
+  }
+}
+```
+
+`extra_runs`는 본 실행에 더하는 횟수임. 2이면 문항마다 총 3회 실행함. `--check-only`도 같은 검사를 하며 위반하면 아래 코드로 종료 코드 2를 냄.
+
+| 항목 | 규칙 | 오류 코드 |
+| --- | --- | --- |
+| `core_repeat` | JSON 객체. 설정에 `null`을 쓰면 키가 없는 것으로 처리 | `core_repeat_must_be_object` |
+| 필드 | `case_ids`, `extra_runs`만 허용 | `core_repeat_unknown_field` |
+| `case_ids` | 비어 있지 않은 문자열 목록, 빈 문자열·중복 없음. 기록할 때는 정렬함 | `core_repeat_case_ids_invalid` |
+| `case_ids` | 모든 값이 query spec 문항 `id`에 있음 | `core_repeat_case_not_in_query_spec` |
+| `extra_runs` | 1~4 정수. 불리언·문자열·소수 불가 | `core_repeat_extra_runs_invalid` |
+
+실행 방식.
+
+- 본 실행이 중단 없이 끝난 뒤에만 반복함. 문항을 query spec 순서로 한 번에 하나씩, 1회차 전체, 2회차 전체 순서로 실행하고 본 실행과 같은 `score_case`로 채점함.
+- 반복 결과는 `live_llm` 단계 결과의 `repetitions`에만 있음. `cases`, `aggregate`, `not_run_count`, `passed`에는 들어가지 않으므로 문항 ID 집합 검사와 coverage는 본 실행 기준 그대로임. 반복 문항이 실패해도 `passed`는 바뀌지 않으며, 변동은 `repetition_summary`와 가드레일의 `stability`에서 확인함.
+- 비공개 산출물 이름은 `repeat-<문항 순번>-r<회차>-<문항 ID 해시 앞 12자>.json`임. 본 실행의 `case-*.json`과 겹치지 않고, 문항 ID는 파일 이름에 들어가지 않음. 결과 폴더에 `repeat-*.json`이 이미 있으면 폴더 재사용을 거절함.
+- 반복 중 전송 오류가 나거나 서버 오류(HTTP 5xx)가 연속 2회 나면 남은 반복을 멈추고 `repetitions_interrupted_reason`에 `transport_or_observer_failure` 또는 `consecutive_server_failures`를 기록함. 연속 횟수는 본 실행에서 이어서 셈. 본 실행이 중단됐으면 반복하지 않고 `main_pass_interrupted`를 기록함. 미실행 수는 `repetitions_not_run_count`임.
+- 반복 단계에서 예기치 않은 예외가 나면(예: `repeat-*.json` 쓰기 실패) 사유를 `repeat_phase_error`로, 예외 형식 이름을 `repetitions_error_type`에 기록함. 예외 메시지는 기록하지 않음. 이 경우에도 본 실행 결과는 `live-local-llm-report.json`에 그대로 저장됨.
+- 반복 계획은 `configuration`이 아니라 `report.json` 최상위 `core_repeat`와 `live_llm` 결과의 `repetition_plan`에 문항 ID를 정렬해 기록함. `configuration`은 기준선 비교 조건이므로 반복 요청 여부가 비교 가능성에 영향을 주지 않음. 반복이 있는 실행과 없는 실행도 비교할 수 있으며, 비교에는 양쪽의 본 실행 문항만 쓰임.
+
+`repetition_summary`(대표 문항 단위).
+
+| 필드 | 내용 |
+| --- | --- |
+| `case_ids`, `planned_extra_runs`, `planned_runs_per_case` | 요청한 반복 계획. `case_ids`는 정렬된 목록 |
+| `core_run_count`, `expected_core_run_count` | 끝난 대표 문항 실행 수(본 실행 포함)와 계획 수 |
+| `cases[].run_count`, `complete` | 문항별 실행 수와 계획 수 충족 여부 |
+| `cases[].statuses`, `all_passed` | 실행 순서별 `passed`·`failed`와 전부 통과 여부 |
+| `cases[].distinct_answer_digests` | 최종 답변 정규화 해시의 종류 수. 1이면 답변 문장이 매번 같음. 답변 본문은 보고서에 넣지 않음 |
+| `cases[].runs_without_answer` | 답변이 없는 실행 수 |
+| `cases[].latency_classes`, `duration_ms` | 실행 순서별 cold/warm 구분(답변 모델 기준)과 전체 대기 시간 |
+| `p50_duration_ms`, `p95_duration_ms` | 모든 대표 문항 실행의 분위수 |
+| `cold_run_count`, `warm_run_count`, `warm_p50_duration_ms`, `warm_p95_duration_ms` | cold/warm 구분 집계 |
+
+분위수는 `ceil(n × q)`번째 값을 쓰는 순위 방식임. 문항당 3회 반복의 p95는 사실상 최댓값임.
+
+cold/warm 구분. 문항 실행마다 `latency_class`가 기록되며, 판정은 답변 모델의 모델 적재 시간만 사용함. 답변 모델은 응답의 `orchestration.answer_model`이고, 없으면 최종 답변 문장과 같은 출력을 낸 단일 모델임. 알 수 없거나 둘 이상이면 `unclassified`임.
+
+| 값 | 조건 |
+| --- | --- |
+| `cold` | 답변 모델의 완료된 생성 중 하나라도 Ollama `load_duration`이 1초(`COLD_LOAD_DURATION_NS` = 1,000,000,000 ns)를 넘음 |
+| `warm` | 답변 모델의 완료된 생성이 1건 이상이고 모두 `load_duration`이 1초 이하임. 정확히 1초는 warm |
+| `unclassified` | 답변 모델을 알 수 없음, 답변 모델의 완료된 생성이 없음(기권·차단·전송 오류·실패), 또는 적재 시간이 기록되지 않은 생성이 있음. warm으로 가정하지 않음 |
+
+- 문항 결과의 `latency_info`에 모델별 적재 시간이 기록됨. `models`는 모델 이름마다 `completed_generation_count`, `load_reported_count`, `load_duration_ns_sum`(합), `load_duration_ns_max`(최댓값)를 가짐. 적재 시간이 보고되지 않은 모델의 합과 최댓값은 0이 아니라 `null`임. 답변 모델 이외의 적재 시간은 기록만 하고 `latency_class`를 바꾸지 않음.
+- 다중 모델 경로는 문항마다 질문 분석(`qwen3:1.7b`), 답변(`qwen3:8b`), 주장 감사(`qwen3:4b`)를 호출함(`app/agents/model_router.py`의 현재 프로필). Ollama 요청의 `keep_alive`는 2분이므로(`app/agents/ollama_runtime.py`) 문항 간격이 길거나 메모리가 모자라 모델이 내려가면 다음 문항에서 다시 적재됨. 모델 세 개가 함께 상주하기 어려운 CPU 환경에서는 문항 대부분이 어떤 모델이든 다시 적재하는 것이 예상 범위임. 답변 모델 기준으로 판정해도 cold 문항이 많을 수 있으며, 그만큼 warm 문항이 적어 p95 비교는 `all_cases`로 대체됨.
+- `aggregate`에 `cold_case_count`, `warm_case_count`, `unclassified_latency_case_count`(세 값의 합은 `case_count`), `warm_p50_duration_ms`, `warm_p95_duration_ms`가 추가됨. 기존 `p50_duration_ms`, `p95_duration_ms`는 모든 문항 기준 그대로임.
+- 1초는 상주 모델과 디스크 적재를 구분하는 경험적 경계값이며 KPI 정책 파일의 기준이 아님. keep-alive 만료나 다른 프로그램의 메모리 압박으로 답변 모델이 다시 적재된 경우도 cold로 기록됨.
+- 시간은 비스트리밍 요청의 전체 대기 시간임. 첫 토큰 시간은 측정하지 않으며 `timing_policy.first_token_latency_measured`는 `false`임. `latency_class`는 모델 적재 상태 표시이고 첫 토큰 지연이 아님.
+- CPU/GPU 경합 중 측정한 값은 통제된 성능 개선 근거로 쓰지 않음. 반복은 변동 폭을 보여 주지만 경합을 없애지 못함. 같은 시간대에 다른 모델·빌드·테스트가 실행 중이었는지 실행 기록과 함께 확인한 뒤 해석함.
+
 ## 보고서 해석
 
 검색 순위 계산에는 기존 검색용 텍스트를 사용하고, API·MCP의 답변 근거에는 검증된 청크 본문을 전달한다. `source_text_status`의 `verified_plain`은 래퍼가 없는 승인 레코드, `verified_reconstruction`은 저장된 본문과 검증된 메타데이터로 검색 문자열 전체를 정확히 재구성한 경우다. `unavailable`이면 인용 가능한 본문을 제공하지 않으며 검색용 문구로 대체하지 않는다. 이 상태는 저장 형식과 본문 사이의 일치 검사이며 PDF의 사람 검토 완료를 뜻하지 않는다. 기존 `content_hash`와 `approved_content_hash`는 해당 레코드·승인 identity를 유지하므로 응답 본문만 다시 해시한 값으로 해석하지 않는다.
@@ -225,7 +288,15 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 - 권한·tenant 경계의 거절(HTTP 403) 시험은 통합 실행이 아니라 개별 live helper로 실행하므로, 이 가드레일의 `negative_cases`는 기권과 차단 문항을 합쳐 셈.
 - 기준선 비교 조건: report 형식, query spec 해시, corpus, runtime fingerprint, runtime 범위, `configuration` 전체, `label_provenance`, 실제 호출된 모든 모델의 Ollama digest, 기준선 자체의 `coverage` 통과(문항 ID 중복·누락 없음). 하나라도 다르거나 모델 호출 기록이 없으면 비교하지 않음.
 - 기준선과 후보는 현재 정책 하나로 다시 판정함. 두 실행의 정책 해시 일치는 요구하지 않음.
-- LLM 문항 새 실패와 p95 비율은 cold/warm 구분과 반복 측정이 없어 참고로만 보고함.
+- LLM 문항 새 실패와 p95 비율은 참고로만 보고하고 차단하지 않음. 정책 파일과 판정 규칙은 그대로임.
+- p95 비율(`regressions`의 `llm_p95_duration_ratio`)은 두 보고서의 본 실행 문항으로 계산함. 모든 문항 비율은 항상 계산하고, 조건을 채우면 warm 문항 비율을 더해 둘 중 큰 값을 `value`로 씀. 느리거나 실패한 문항이 warm 표본에서 빠져 회귀가 가려지는 일을 막기 위함임.
+
+  | 비율 | 대상 | 조건 |
+  | --- | --- | --- |
+  | `all_cases` | 각 보고서의 모든 LLM 문항. 시간 초과·5xx로 모델 호출이 끝나지 못한 문항 포함 | 항상 계산. 이전과 같음 |
+  | `warm_only` | 두 보고서에서 모두 `warm`인 문항(문항 ID로 짝지음)의 시간 | 두 보고서의 모든 LLM 문항에 `latency_class`가 있고 ID가 중복되지 않으며, 짝지은 warm 문항이 `MIN_PAIRED_WARM_CASES`(10) 이상 |
+
+  행의 `all_cases`, `warm_only` 블록에 비율, 양쪽 p95, 표본 수가 나오고 `warm_only.paired_case_count`와 `min_paired_case_count`로 짝지은 수를 확인함. `warm_only.evaluated`가 `false`이면 warm 비율을 쓰지 않은 것임. `basis`는 `value`를 만든 비율(`all_cases` 또는 `warm_only`, 같으면 `all_cases`)이고 행 최상위의 `baseline_p95_ms`, `candidate_p95_ms`, `baseline_sample_count`, `candidate_sample_count`도 그 비율의 값임. 이전 보고서의 `generation_events`에서 라벨을 다시 만들지 않으므로, 라벨이 없는 기준선과는 `all_cases`만으로 비교함. `repetitions`는 넣지 않음. 경합 통제와 차단 전환 기준이 정해지지 않았으므로 계속 참고용임.
 
 ### 기준 완화 방지
 
@@ -302,6 +373,27 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 - 단계 전체 또는 해당 문항의 자료가 없으면 `unknown`과 사유(`retrieval_stage_missing`, `mcp_case_missing`, `llm_case_not_run`, `retrieval_recall_not_recorded`, `gold_facts_unlabeled`, `unmapped_error:<코드>` 등)를 기록함. 다른 원인이 이미 있는 문항에서는 사유만 `unknown_reasons`에 남고 주원인은 바뀌지 않음.
 - §7의 첫 분기(원문 손실·경계 오류)는 이 분류로 판별하지 못함. `retrieval_miss`와 `answer_incomplete` 문항은 원문과 청크 경계를 직접 확인해야 함.
 - CLI 표준 출력에는 `failure_breakdown.dominant_cause`와 원인별 주원인 건수만 나옴. 문항 ID와 코드는 `--output` 파일에만 있음.
+
+### 반복 안정성 (`stability`)
+
+`core_repeat`로 실행한 보고서에 `repetition_summary`가 있으면 가드레일 결과에 `stability`가 추가됨. 반복이 없는 보고서에서는 이 항목이 없음.
+
+- 진단용 출력임. `verdict`, `passed`, hard·target·regression 행, 종료 코드에 영향을 주지 않음. 계산이 실패해도 판정은 그대로이고 이 항목만 `status: "error"`(요약 형식이 깨졌으면 `malformed`)가 됨.
+- 대표 문항별 실행들이 서로 다른 결과를 냈는지 보여 줌.
+
+  | 필드 | 내용 |
+  | --- | --- |
+  | `status_disagreement_case_ids` | 실행 사이에 `passed`·`failed`가 갈린 문항 |
+  | `answer_disagreement_case_ids` | 최종 답변 해시가 2종 이상인 문항 |
+  | `unstable_case_ids`, `unstable_cases` | 위 두 목록의 합집합과 문항별 상태·해시 종류 수 |
+  | `incomplete_case_ids` | 계획한 횟수를 다 채우지 못한 문항 |
+  | `not_all_passed_case_ids` | 실행 중 하나라도 `passed`가 아닌 문항. 매번 같게 실패한 문항도 포함 |
+  | `all_stable` | 대표 문항이 있고, 모두 횟수를 채웠으며, 불안정한 문항이 없음 |
+  | `repetitions_interrupted_reason`, `repetitions_error_type`, `core_run_count`, `expected_core_run_count` | 반복 중단 사유(`repeat_phase_error`이면 예외 형식 이름 포함)와 실행 수 |
+  | `p50_duration_ms`, `p95_duration_ms`, `warm_p95_duration_ms`, `cold_run_count`, `warm_run_count` | `repetition_summary`에서 가져온 시간 요약 |
+
+- 답변 해시가 다르다는 것은 문장이 달랐다는 뜻이며 사실 오류를 뜻하지 않음. 상태가 같아도 해시가 다를 수 있고, 반대도 가능함. 문항 상태는 `statuses`와 개별 `repeat-*.json` 산출물로 확인함.
+- CLI 표준 출력에는 `stability`의 `all_stable`, 불안정 문항 수, 미완료 문항 수만 나옴. 문항 ID는 `--output` 파일에만 있음.
 
 ### 라벨 작성 규칙
 
