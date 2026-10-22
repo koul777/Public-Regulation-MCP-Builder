@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.holdout_spec_guard import refuse_holdout_spec
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 from scripts.report_metadata import (
     capture_mcp_performance_source_state,
     current_repo_commit,
@@ -1355,7 +1355,11 @@ def run(
 
     if not args.query and not args.query_spec_json:
         parser.error("one of --query or --query-spec-json is required")
-    query_specs = load_query_specs(Path(args.query_spec_json)) if args.query_spec_json else None
+    try:
+        query_specs = load_query_specs(Path(args.query_spec_json)) if args.query_spec_json else None
+    except HoldoutSpecRefused as exc:
+        stdout.write(json.dumps({"passed": False, "reason_code": str(exc)}) + "\n")
+        return 2
     tenant_storage_isolation = None
     if args.tenant_storage_isolation:
         tenant_storage_isolation = True

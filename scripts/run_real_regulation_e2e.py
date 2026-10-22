@@ -305,9 +305,10 @@ def parse_holdout_ledger(raw: bytes) -> list[dict[str, Any]]:
                 or record["event"] not in _LEDGER_EVENTS or _ledger_hash(record.get("query_spec_sha256")) is None):
             raise EvidenceError("holdout_ledger_corrupt")
         records.append(record)
-    ids = {record.get("ledger_id") for record in records}
-    if records and (len(ids) != 1 or not isinstance(next(iter(ids)), str)
-                    or not re.fullmatch(r"[0-9a-f]{32}", next(iter(ids)))):
+    # Compare as a list: an unhashable value (a list or object) must be corrupt, not a TypeError.
+    ids = [record.get("ledger_id") for record in records]
+    if records and (any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value) for value in ids)
+                    or len(set(ids)) != 1):
         raise EvidenceError("holdout_ledger_corrupt")
     return records
 

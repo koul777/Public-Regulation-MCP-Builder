@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.mcp_server.regulation_tools import fetch_regulation, mcp_auth_context, search_regulations, settings_for_mcp_project  # noqa: E402
 from app.rag.extractive_answer import build_structured_extractive_answer, select_supporting_answer_results  # noqa: E402
-from scripts.holdout_spec_guard import refuse_holdout_spec
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 from scripts.export_mcp_demo_answers import REQUIRED_CITATION_FIELDS, normalize_query_specs, query_spec_fingerprint  # noqa: E402
 from scripts.report_metadata import current_repo_commit  # noqa: E402
 
@@ -646,7 +646,11 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         tenant_storage_isolation = True
     if args.flat_storage:
         tenant_storage_isolation = False
-    query_specs = load_query_specs(Path(args.query_spec_json)) if args.query_spec_json else None
+    try:
+        query_specs = load_query_specs(Path(args.query_spec_json)) if args.query_spec_json else None
+    except HoldoutSpecRefused as exc:
+        stdout.write(json.dumps({"passed": False, "reason_code": str(exc)}) + "\n")
+        return 2
     query_spec_source = Path(args.query_spec_json) if args.query_spec_json else None
     report = compare_rag_mcp_accuracy(
         data_dir=Path(args.data_dir),

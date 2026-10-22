@@ -65,7 +65,7 @@ python scripts/seal_real_regulation_holdout.py --development "<개발 spec 절�
 {"event": "rerun_authorized", "ledger_id": "<ledger 첫 줄의 ledger_id>", "query_spec_sha256": "<보류 spec SHA-256>", "recorded_at": "<UTC 시각>", "reason": "<재실행 사유>"}
 ```
 
-단계별 CLI는 보류 spec 파일을 받지 않음. `evaluate_mcp_retrieval_quality`, `real_regulation_mcp_probe`, `evaluate_live_local_llm`, `benchmark_mcp_queries`, `benchmark_mcp_concurrent_queries`, `benchmark_mcp_first_query`, `compare_rag_mcp_accuracy`, `export_mcp_demo_answers`, `evaluate_rag_retrieval`은 `scripts/holdout_spec_guard.py`로 spec 파일을 검사하고, `split`이 `holdout`이면 `holdout_spec_requires_integrated_runner`로 거절함. `split`이 없거나 `development`인 spec은 그대로 처리함. 통합 실행기는 파싱된 문항을 같은 프로세스의 단계 함수에 넘기므로 이 검사를 거치지 않음.
+단계별 CLI는 보류 spec 파일을 받지 않음. `evaluate_mcp_retrieval_quality`, `real_regulation_mcp_probe`, `evaluate_live_local_llm`, `benchmark_mcp_queries`, `benchmark_mcp_concurrent_queries`, `benchmark_mcp_first_query`, `compare_rag_mcp_accuracy`, `export_mcp_demo_answers`, `evaluate_rag_retrieval`, `run_combined_book_e2e_regression`(`--ground-truth` 파일)은 `scripts/holdout_spec_guard.py`로 spec 파일을 검사하고, `split`이 `holdout`이면 `holdout_spec_requires_integrated_runner`로 거절함. 각 CLI는 `{"passed": false, "reason_code": "..."}`를 출력하고 종료 코드 2로 끝나며 단계는 시작하지 않음. `split`이 없거나 `development`인 spec은 그대로 처리함. 통합 실행기는 파싱된 문항을 같은 프로세스의 단계 함수에 넘기므로 이 검사를 거치지 않음.
 
 | 사유 코드 | 발생 조건 |
 | --- | --- |
@@ -87,12 +87,20 @@ python scripts/seal_real_regulation_holdout.py --development "<개발 spec 절�
 | `ollama_preflight_unreachable` | `/api/tags`가 응답하지 않거나 상태 코드·본문이 올바르지 않음 |
 | `ollama_preflight_model_missing` | 설정한 모델이 `/api/tags` 목록에 없음 |
 | `holdout_spec_requires_integrated_runner` | 단계별 CLI에 `split: holdout` spec 파일을 넣음 |
+| `holdout_ledger_id_unexpected` | KPI 검사기에서 고정한 `ledger_id`와 보고서의 `ledger_id`가 다르거나 없음 |
+| `expected_holdout_ledger_id_invalid` | `--expected-holdout-ledger-id`가 소문자 16진수 32자가 아님 |
 
 KPI 검사기의 `holdout_protocol`은 `query_split`이 `holdout`인 보고서에 `event`가 `opened`이고 `query_spec_sha256`이 보고서와 같으며 `ledger_id`가 있는 `holdout_ledger_record`가 있는지 확인함. 가드레일 결과의 `candidate`에 `query_split`, `holdout_ledger_id`, `authorized_rerun`이 기록되며, 재실행 승인으로 연 결과는 `authorized_rerun`이 `true`로 보임. 보류셋 보고서를 `--baseline`으로 쓰면 비교 불가 사유에 `baseline_is_holdout`이 추가되어 verdict가 `not_comparable`임.
 
+검토자는 첫 봉인 때 봉인 명령이 출력한 `ledger_id`를 보고서와 별도로 보관하고, 최종 판정 때 `--expected-holdout-ledger-id`로 고정함. 고정값을 주면 그 ledger를 거친 `holdout` 보고서만 `holdout_protocol`을 통과하고, 다른 `ledger_id`의 보고서, `ledger_id`가 없는 보고서, 라벨이 `holdout`이 아닌 보고서는 `holdout_ledger_id_unexpected`로 실패함. 값은 소문자 16진수 32자여야 하며 아니면 `expected_holdout_ledger_id_invalid`로 종료 코드 2임. 고정값은 결과의 `candidate.expected_holdout_ledger_id`에 기록됨.
+
+```powershell
+python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EVAL_OUTPUT\report.json" --expected-holdout-ledger-id "<첫 봉인의 ledger_id>" --output "<새 비공개 경로>\kpi-guardrails.json"
+```
+
 한계.
 
-- 새 ledger 파일은 새 이력으로 시작함. 같은 보류 spec을 새 ledger 파일에 다시 봉인하면 `opened` 기록이 없는 처음 상태로 보임. 보류 spec마다 ledger 하나만 유지하고, 검토자는 보고서와 가드레일 결과의 `ledger_id`가 그 ledger 파일의 `ledger_id`와 같은지, 해당 보류 spec 해시의 `opened` 기록이 한 번(`rerun_authorized`가 있으면 승인 횟수만큼)인지 비교해야 함.
+- 새 ledger 파일은 새 이력으로 시작함. 같은 보류 spec을 새 ledger 파일에 다시 봉인하면 `opened` 기록이 없는 처음 상태로 보임. 보류 spec마다 ledger 하나만 유지하고, 검토자는 보고서와 가드레일 결과의 `ledger_id`가 첫 봉인의 `ledger_id`와 같은지(`--expected-holdout-ledger-id`), 해당 보류 spec 해시의 `opened` 기록이 한 번(`rerun_authorized`가 있으면 승인 횟수만큼)인지 비교해야 함.
 - ledger는 사람이 편집할 수 있는 파일이라 변조 방지가 아님. 실수로 반복 실행하는 일을 막고 열린 이력을 남기는 장치임.
 - 겹침 검사는 봉인 시점의 두 spec만 비교함. 봉인 뒤 개발 spec에 보류 문항을 옮겨 넣는 경우는 검사하지 않음.
 - 해시는 spec 파일 바이트 기준임. 보류 spec을 한 글자라도 고치면 새 해시가 되어 다시 봉인해야 함. 보류 문항 사본의 라벨만 `development`로 바꾸는 우회는 사람이 검토해야 함.

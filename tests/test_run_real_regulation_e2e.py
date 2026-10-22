@@ -621,7 +621,14 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
                 ("id_differs_on_later_record", good + json.dumps({
                     "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": "0" * 32}).encode() + b"\n"),
                 ("id_not_hex", good.replace(self._ledger_id().encode(), b"not-a-ledger-id")),
-                ("id_only_missing", json.dumps({"event": "sealed", "query_spec_sha256": sha}).encode() + b"\n")):
+                ("id_only_missing", json.dumps({"event": "sealed", "query_spec_sha256": sha}).encode() + b"\n"),
+                ("id_is_list", json.dumps({"event": "sealed", "query_spec_sha256": sha, "ledger_id": ["x"]}).encode() + b"\n"),
+                ("id_is_object_on_later_record", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": {"a": 1}}).encode() + b"\n"),
+                ("id_is_number", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": 7}).encode() + b"\n"),
+                ("id_is_null", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": None}).encode() + b"\n")):
             self.ledger.write_bytes(content)
             with self.subTest(content=name), self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
                 validate_options(self.options)

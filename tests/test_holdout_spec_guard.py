@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from scripts import (
     evaluate_rag_retrieval,
     export_mcp_demo_answers,
     real_regulation_mcp_probe,
+    run_combined_book_e2e_regression,
 )
 from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 
@@ -102,44 +104,68 @@ class StageCliRefusalTests(unittest.TestCase):
         observer.assert_not_called()
         evaluate.assert_not_called()
 
+    def run_stdout_cli(self, function, patched: str) -> None:
+        """A run(argv, stdout=...) CLI prints the fixed refusal as JSON, exits 2, and starts no work."""
+        stream = io.StringIO()
+        with patch(patched) as work:
+            code = function(["--query-spec-json", str(self.spec)], stdout=stream)
+        self.assert_reported_refusal(code, stream.getvalue())
+        work.assert_not_called()
+
     def test_benchmark_queries_cli(self) -> None:
-        with patch("scripts.benchmark_mcp_queries.benchmark_mcp_queries") as benchmark:
-            with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
-                benchmark_mcp_queries.run(["--query-spec-json", str(self.spec)], stdout=io.StringIO())
-        benchmark.assert_not_called()
+        self.run_stdout_cli(benchmark_mcp_queries.run, "scripts.benchmark_mcp_queries.benchmark_mcp_queries")
         self.assertEqual(1, len(benchmark_mcp_queries.load_query_specs(self.write_spec({"split": "development", "queries": [CASE]}, "dev.json"))))
 
     def test_benchmark_concurrent_queries_cli(self) -> None:
-        with patch("scripts.benchmark_mcp_concurrent_queries.benchmark_mcp_concurrent_queries") as benchmark:
-            with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
-                benchmark_mcp_concurrent_queries.run(["--query-spec-json", str(self.spec)], stdout=io.StringIO())
-        benchmark.assert_not_called()
+        self.run_stdout_cli(benchmark_mcp_concurrent_queries.run,
+                            "scripts.benchmark_mcp_concurrent_queries.benchmark_mcp_concurrent_queries")
 
     def test_benchmark_first_query_cli(self) -> None:
-        with patch("scripts.benchmark_mcp_first_query.benchmark_mcp_first_query") as benchmark:
-            with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
-                benchmark_mcp_first_query.run(["--query-spec-json", str(self.spec)], stdout=io.StringIO())
-        benchmark.assert_not_called()
+        self.run_stdout_cli(benchmark_mcp_first_query.run, "scripts.benchmark_mcp_first_query.benchmark_mcp_first_query")
         self.assertEqual(1, len(benchmark_mcp_first_query.load_query_specs(self.write_spec({"queries": [CASE]}, "plain.json"))))
 
     def test_compare_rag_mcp_accuracy_cli(self) -> None:
-        with patch("scripts.compare_rag_mcp_accuracy.compare_rag_mcp_accuracy") as compare:
-            with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
-                compare_rag_mcp_accuracy.run(["--query-spec-json", str(self.spec)], stdout=io.StringIO())
-        compare.assert_not_called()
+        self.run_stdout_cli(compare_rag_mcp_accuracy.run, "scripts.compare_rag_mcp_accuracy.compare_rag_mcp_accuracy")
         self.assertEqual(1, len(compare_rag_mcp_accuracy.load_query_specs(self.write_spec({"queries": [CASE]}, "plain.json"))))
 
     def test_export_mcp_demo_answers_cli(self) -> None:
-        with patch("scripts.export_mcp_demo_answers.export_mcp_demo_answers") as export:
-            with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
-                export_mcp_demo_answers.run(["--query-spec-json", str(self.spec)], stdout=io.StringIO())
-        export.assert_not_called()
+        self.run_stdout_cli(export_mcp_demo_answers.run, "scripts.export_mcp_demo_answers.export_mcp_demo_answers")
         self.assertEqual(1, len(export_mcp_demo_answers.load_query_specs(self.write_spec({"queries": [CASE]}, "plain.json"))))
 
-    def test_rag_retrieval_evaluation_query_file(self) -> None:
+    def test_rag_retrieval_evaluation_cli(self) -> None:
         with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
             evaluate_rag_retrieval.load_queries(self.spec)
         self.assertEqual(1, len(evaluate_rag_retrieval.load_queries(self.write_spec({"queries": [CASE]}, "plain.json"))))
+        argv = ["evaluate_rag_retrieval", "--batch-report", str(self.root / "batch.json"),
+                "--queries-json", str(self.spec), "--out-json", str(self.root / "out.json")]
+        stream = io.StringIO()
+        with patch.object(sys, "argv", argv), redirect_stdout(stream), patch(
+                "scripts.evaluate_rag_retrieval.load_batch_chunks_from_reports", return_value=([], [])), patch(
+                "scripts.evaluate_rag_retrieval.evaluate_retrieval") as evaluate:
+            code = evaluate_rag_retrieval.main()
+        self.assert_reported_refusal(code, stream.getvalue())
+        evaluate.assert_not_called()
+        self.assertFalse((self.root / "out.json").exists())
+
+    def test_combined_book_regression_cli_and_function(self) -> None:
+        truth = self.write_spec({"split": "holdout", "book_title": "synthetic", "regulations": [], "queries": [CASE]}, "truth.json")
+        for runs in ("1", "2"):
+            stream = io.StringIO()
+            with patch("scripts.run_combined_book_e2e_regression.run_combined_book_e2e") as run, patch(
+                    "scripts.run_combined_book_e2e_regression.subprocess.run") as child, redirect_stdout(stream):
+                code = run_combined_book_e2e_regression.main(
+                    ["--input", str(self.root / "book.docx"), "--ground-truth", str(truth), "--runs", runs])
+            with self.subTest(runs=runs):
+                self.assert_reported_refusal(code, stream.getvalue())
+                run.assert_not_called()
+                child.assert_not_called()
+        with self.assertRaisesRegex(HoldoutSpecRefused, REFUSAL):
+            run_combined_book_e2e_regression.run_combined_book_e2e(
+                input_path=self.root / "book.docx", ground_truth_path=truth, work_dir=self.root / "work")
+        self.assertFalse((self.root / "work").exists())
+        # A development or unlabeled ground truth is not refused by the guard.
+        for payload in ({"split": "development", "queries": [CASE]}, {"queries": [CASE]}):
+            refuse_holdout_spec(payload)
 
     def test_integrated_runner_still_passes_parsed_queries_to_the_stages(self) -> None:
         # In-process stages take parsed queries, not a spec file, so the guard never sees a holdout label.
