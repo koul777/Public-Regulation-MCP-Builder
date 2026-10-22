@@ -383,7 +383,7 @@ class GroundedQATests(unittest.TestCase):
         self.assertEqual(14, result.citations[0].source_page_start)
         self.assertEqual(("chunk-1",), result.citations[0].evidence_ids)
 
-    def test_claim_auditor_requires_exact_support_quote(self) -> None:
+    def test_claim_auditor_rejects_free_quote_that_conflicts_with_selected_span(self) -> None:
         draft = GroundedAnswerDraft(
             answer="접근권한을 검토합니다. [E1]",
             claims=(

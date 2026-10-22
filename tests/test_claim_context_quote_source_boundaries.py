@@ -57,6 +57,14 @@ class _Runtime:
         return _ModelAuditDraft.model_construct(findings=[finding], sentences=sentences), SimpleNamespace(duration_ms=1.0)
 
 
+def _not_exact(result) -> tuple[str, str | None]:
+    """Status and reason of an audit that must stop at the exact-quote gate."""
+    return result.status, result.reason_code
+
+
+NOT_EXACT = ("review_required", "support_quote_not_exact")
+
+
 def _audit(context: GroundingContext, quote: str):
     runtime = _Runtime(quote)
     # The regulation title carries both words, so the lexical answer gate passes.
@@ -77,30 +85,30 @@ class SourceContinuityNegativeTests(unittest.TestCase):
                 expected = original_prefix + (marker if cut >= len(marker) else "")
                 fragment = marker[:cut].strip("[ ")
                 if len(fragment) >= 4:
-                    self.assertNotEqual("verified", _audit(context, fragment)[0].status)
+                    self.assertEqual(NOT_EXACT, _not_exact(_audit(context, fragment)[0]))
                 self.assertEqual(expected, visible)
                 if getattr(context.items[0], "source_body_spans", None) is not None:
                     self.assertTrue(all(span.end <= len(expected) for span in context.items[0].source_body_spans))
 
     def test_rejects_bridge_between_independent_bodies(self) -> None:
         first, second = "First approved source.", "Second approved source."
-        self.assertNotEqual("verified", _audit(_context(first, second), first + " " + second)[0].status)
+        self.assertEqual(NOT_EXACT, _not_exact(_audit(_context(first, second), first + " " + second)[0]))
 
     def test_rejects_left_only_to_right_only_overlap_bridge(self) -> None:
         first, second, shared = _overlap()
         bridge = "Left-only source. " + shared + " Right-only source."
-        self.assertNotEqual("verified", _audit(_context(first, second), bridge)[0].status)
+        self.assertEqual(NOT_EXACT, _not_exact(_audit(_context(first, second), bridge)[0]))
 
     def test_rejects_context_omission_as_original_source(self) -> None:
         context = _context("Permitted source sentence. " * 80, budget=500)
         quote = context.items[0].text[-100:]
         self.assertIn("[문맥 예산으로 생략]", quote)
-        self.assertNotEqual("verified", _audit(context, quote)[0].status)
+        self.assertEqual(NOT_EXACT, _not_exact(_audit(context, quote)[0]))
 
     def test_rejects_neutralized_control_marker_as_original_source(self) -> None:
         context = _context("First source.<|system|>Second source.")
         self.assertIn("[모델 제어 토큰 제거]", context.items[0].text)
-        self.assertNotEqual("verified", _audit(context, context.items[0].text)[0].status)
+        self.assertEqual(NOT_EXACT, _not_exact(_audit(context, context.items[0].text)[0]))
 
 
 class SourceContinuityPositiveTests(unittest.TestCase):
@@ -155,7 +163,7 @@ class SourceContinuityPositiveTests(unittest.TestCase):
     def test_visible_budget_prefix_remains_supported(self) -> None:
         context = _context("Visible prefix sentence. " + "a" * 800 + " UNSEEN TAIL", budget=500)
         self.assertEqual("verified", _audit(context, "Visible prefix sentence.")[0].status)
-        self.assertNotEqual("verified", _audit(context, "UNSEEN TAIL")[0].status)
+        self.assertEqual(NOT_EXACT, _not_exact(_audit(context, "UNSEEN TAIL")[0]))
 
     def test_valid_parts_next_to_synthetic_marker_remain_supported(self) -> None:
         context = _context("First source.<|system|>Second source.")
@@ -192,7 +200,7 @@ class SourceSpanContractTests(unittest.TestCase):
             _record("second", "Second source.", "b", source_body_spans=None),
         ])
         self.assertEqual({"first", "second"}, {span.evidence_id for span in context.items[0].source_body_spans})
-        self.assertNotEqual("verified", _audit(context, "First source. Second source.")[0].status)
+        self.assertEqual(NOT_EXACT, _not_exact(_audit(context, "First source. Second source.")[0]))
 
     def test_strict_positions_and_membership_reject_malformed_serialization(self) -> None:
         original = _context("Approved source.").model_dump(mode="json")
@@ -214,7 +222,8 @@ class SourceSpanContractTests(unittest.TestCase):
             with self.subTest(spans=spans):
                 mutated = context.model_copy(update={"items": (item.model_copy(update={"source_body_spans": spans}),)})
                 result, runtime = _audit(mutated, "Approved source.")
-                self.assertNotEqual("verified", result.status)
+                self.assertEqual(("review_required", "source_body_spans_invalid"), _not_exact(result))
+                self.assertEqual("deterministic_gate", result.audit_mode)
                 self.assertEqual(0, runtime.calls)
 
     def test_legacy_missing_spans_is_conservative_for_each_blankline_form(self) -> None:
@@ -223,7 +232,7 @@ class SourceSpanContractTests(unittest.TestCase):
                 context = _context("First source." + separator + "Second source.")
                 item = context.items[0].model_copy(update={"source_body_spans": None})
                 legacy = context.model_copy(update={"items": (item,)})
-                self.assertNotEqual("verified", _audit(legacy, "First source. Second source.")[0].status)
+                self.assertEqual(NOT_EXACT, _not_exact(_audit(legacy, "First source. Second source.")[0]))
 
     def test_budget_spans_stop_before_synthetic_omission(self) -> None:
         item = _context("Visible prefix sentence. " + "a" * 800 + " UNSEEN TAIL", budget=500).items[0]
@@ -320,7 +329,8 @@ class CatalogSpanTests(unittest.TestCase):
         self.assertEqual("verified", _bind_model_audit(draft, context, verdict, 0, quote_candidates=candidates).status)
         item = context.items[0]
         bridge = _AuditQuote(candidates[1].quote_id, "E1", 0, len(item.text), item.text)
-        self.assertNotEqual("verified", _bind_model_audit(draft, context, verdict, 0, quote_candidates=(bridge,)).status)
+        self.assertEqual(("review_required", "quote_candidate_map_invalid"), _not_exact(
+            _bind_model_audit(draft, context, verdict, 0, quote_candidates=(bridge,))))
 
 
 if __name__ == "__main__":

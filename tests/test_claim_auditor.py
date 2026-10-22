@@ -9,8 +9,9 @@ from unittest.mock import patch
 from pydantic import ValidationError
 
 from app.agents.claim_auditor import (
-    ClaimAuditAgent, _ModelAuditDraft, _ModelFinding, _ModelSentence, _answer_sentences, _audit_prompt,
-    _audit_quote_candidates, _bind_model_audit, _quote_is_exact, _validated_quote_map,
+    ClaimAuditAgent, _ModelAuditDraft, _ModelFinding, _ModelSentence, _answer_has_number_outside_evidence,
+    _answer_sentences, _audit_prompt, _audit_quote_candidates, _bind_model_audit, _gate_text, _quote_is_exact,
+    _validated_quote_map,
 )
 from app.agents.grounded_qa import (
     AnswerClaim, GroundedAnswerDraft, TABLE_STRUCTURE_REVIEW_REASON,
@@ -426,18 +427,28 @@ class CompleteAnswerAuditTests(unittest.TestCase):
                     self.assertEqual("support_quote_not_exact", result.reason_code)
                     self.assertEqual((), result.citations)
         self.assertTrue(_quote_is_exact("First wrapped source line.", "First wrapped\nsource line."))
-    def test_prompt_lists_numbered_answer_sentences_without_changing_unicode_or_whitespace(self) -> None:
+
+    def test_prompt_has_full_answer_then_numbered_sentences_without_changing_unicode_or_whitespace(self) -> None:
         answer = '첫 줄\n  둘째 줄: "인용" \\ 내용 [E1]'
         draft = _draft().model_copy(update={"answer": answer})
         prompt = _audit_prompt(draft, _context("Synthetic exact source."))
+        self.assertEqual(answer.encode("utf-8"),
+                         _prompt_json(prompt, "감사 대상 최종 답변(전체)").encode("utf-8"))
         self.assertEqual([{"sentence_id": "S1", "text": "첫 줄"},
                           {"sentence_id": "S2", "text": '둘째 줄: "인용" \\ 내용 [E1]'}],
                          _prompt_json(prompt, "감사 대상 답변 문장"))
         positions = [prompt.index(label + ": ") for label in (
-            "감사 대상 답변 문장", "감사 대상 주장", "승인 근거 위치", "승인 근거의 원문 연속구간")]
+            "감사 대상 최종 답변(전체)", "감사 대상 답변 문장", "감사 대상 주장", "승인 근거 위치",
+            "승인 근거의 원문 연속구간")]
         self.assertEqual(sorted(positions), positions)
         self.assertNotIn("answer_supported", prompt)
-        self.assertNotIn("최종 답변(전체)", prompt)
+
+    def test_prompt_does_not_exempt_article_number_and_title_mentions(self) -> None:
+        prompt = _audit_prompt(_draft(), _context("Synthetic exact source."))
+        self.assertNotIn("조문 번호", prompt)
+        self.assertNotIn("제목 언급", prompt)
+        for kept in ("뜻이 같은 바꿔쓰기", "표 행을 문장으로 옮긴 것", "문장을 잇는 표현"):
+            self.assertIn(kept, prompt)
 
     def test_schema_requires_findings_then_sentences_and_required_quote_fields(self) -> None:
         schema = _ModelAuditDraft.model_json_schema()
@@ -659,15 +670,14 @@ class KoreanAnswerGateTests(unittest.TestCase):
         self.assertEqual(0, runtime.calls)
         self.assertEqual("answer_number_not_in_evidence", result.reason_code)
 
-    def test_changed_decimal_is_stopped_by_lexical_gate(self) -> None:
-        # The number gate skips decimals, so the lexical gate checks them with digit boundaries.
+    def test_changed_decimal_is_rejected_by_number_gate(self) -> None:
         text = "휴가는 1.5일이다."
         same, same_runtime = self._audit("휴가는 1.5일이다. [E1]", text)
         changed, changed_runtime = self._audit("휴가는 2.5일이다. [E1]", text)
         self.assertEqual("verified", same.status)
         self.assertEqual(1, same_runtime.calls)
         self.assertEqual("rejected", changed.status)
-        self.assertEqual("answer_sentence_terms_not_in_evidence", changed.reason_code)
+        self.assertEqual("answer_number_not_in_evidence", changed.reason_code)
         self.assertEqual(0, changed_runtime.calls)
 
 
@@ -707,13 +717,18 @@ class AnalyzerAvailabilityTests(unittest.TestCase):
         self.assertEqual("answer_number_not_in_evidence", result.reason_code)
         self.assertEqual(0, runtime.calls)
 
-    def test_answer_without_sentences_needs_no_analyzer(self) -> None:
-        draft = _draft().model_copy(update={"answer": "[E1]"})
-        runtime = _Runtime([_finding()], sentences=[])
-        with patch("app.agents.claim_auditor._kiwi", return_value=None):
-            result = ClaimAuditAgent(runtime).audit(draft=draft, context=_context("Synthetic exact source."))
-        self.assertEqual("verified", result.status)
-        self.assertEqual(1, runtime.calls)
+    def test_unexpected_gate_failure_is_reported_like_other_audit_failures(self) -> None:
+        context = _context("Synthetic exact source.")
+        runtime = _Runtime([_finding()])
+        with patch("app.agents.claim_auditor._answer_gate", side_effect=RuntimeError("gate failed")):
+            result = ClaimAuditAgent(runtime).audit(draft=_draft(), context=context)
+            self.assertEqual("review_required", result.status)
+            self.assertEqual("model_RuntimeError", result.reason_code)
+            self.assertEqual("deterministic_gate", result.audit_mode)
+            self.assertEqual((), result.citations)
+            with self.assertRaises(RuntimeError):
+                ClaimAuditAgent(runtime).audit(draft=_draft(), context=context, strict_model=True)
+        self.assertEqual(0, runtime.calls)
 
 
 class AnswerSentenceTests(unittest.TestCase):
@@ -732,10 +747,28 @@ class AnswerSentenceTests(unittest.TestCase):
         self.assertEqual((("S1", "신청서를 냅니다. [E1]"), ("S2", "기한은 7일입니다. [E2] [E3]")),
                          _answer_sentences("신청서를 냅니다.\n[E1]\n기한은 7일입니다. [E2]\n[E3]"))
         self.assertEqual((), _answer_sentences("[E1]"))
+        self.assertEqual((), _answer_sentences("... [E1]"))
 
-    def test_decimals_and_short_pieces_do_not_split_or_count(self) -> None:
+    def test_decimals_and_dotted_dates_do_not_split(self) -> None:
         self.assertEqual((("S1", "휴가는 1.5일입니다. [E1]"),), _answer_sentences("휴가는 1.5일입니다. [E1]"))
-        self.assertEqual((("S1", "신청서를 냅니다."),), _answer_sentences("가. 신청서를 냅니다."))
+        self.assertEqual((("S1", "시행일은 2018. 8. 31이다."), ("S2", "다음 문장이다.")),
+                         _answer_sentences("시행일은 2018. 8. 31이다. 다음 문장이다."))
+        self.assertEqual((("S1", "시행일은 2018. 8. 31."),), _answer_sentences("시행일은 2018. 8. 31."))
+        self.assertEqual((("S1", "항목 1."), ("S2", "항목 둘이다.")), _answer_sentences("항목 1. 항목 둘이다."))
+
+    def test_full_width_ends_and_ellipsis_split(self) -> None:
+        self.assertEqual(("첫째 문장입니다．", "둘째 문장입니까？", "셋째 문장입니다！", "넷째 문장입니다…", "다섯째 문장입니다"),
+                         tuple(text for _, text in _answer_sentences(
+                             "첫째 문장입니다． 둘째 문장입니까？ 셋째 문장입니다！ 넷째 문장입니다… 다섯째 문장입니다")))
+
+    def test_fragments_with_one_word_character_are_kept_and_joined_to_a_neighbor(self) -> None:
+        self.assertEqual((("S1", "7. [E1]"),), _answer_sentences("7. [E1]"))
+        self.assertEqual((("S1", "예 [E1]"),), _answer_sentences("예 [E1]"))
+        self.assertEqual((("S1", "O. [E1]"),), _answer_sentences("O. [E1]"))
+        # A leading fragment joins the following sentence, a trailing one the previous sentence.
+        self.assertEqual((("S1", "네. 신청서를 냅니다. [E1]"),), _answer_sentences("네. 신청서를 냅니다. [E1]"))
+        self.assertEqual((("S1", "가. 나. 신청서를 냅니다."),), _answer_sentences("가. 나. 신청서를 냅니다."))
+        self.assertEqual((("S1", "신청서를 냅니다. 예"),), _answer_sentences("신청서를 냅니다. 예"))
         self.assertEqual((("S1", "7일 [E1]"),), _answer_sentences("7일 [E1]"))
 
     def test_sentence_limit_needs_review_before_model(self) -> None:
@@ -814,6 +847,210 @@ class SentenceBindingTests(unittest.TestCase):
             self.assertEqual(("C1",), value.verified_claim_ids)
             self.assertEqual(source, value.citations[0].support_quote)
             self.assertEqual("local_model", value.audit_mode)
+
+    def test_sentence_quote_must_belong_to_its_own_markers_or_any_cited_context(self) -> None:
+        context = _context("First synthetic source.", "Second synthetic source.")
+        draft = GroundedAnswerDraft(
+            answer="First synthetic source. [E1] Second synthetic source. [E2]\nSynthetic rule",
+            answer_mode="grounded_local", claims=(
+                AnswerClaim(claim_id="C1", text="First synthetic source.", evidence_context_ids=("E1",)),
+                AnswerClaim(claim_id="C2", text="Second synthetic source.", evidence_context_ids=("E2",))))
+        findings = [_finding(), _finding(claim_id="C2", evidence_context_ids=["E2"], support_quote_id="E2Q1")]
+
+        def verdicts(*quote_ids):
+            return [{"sentence_id": f"S{index}", "support_quote_id": quote_id, "supported": True}
+                    for index, quote_id in enumerate(quote_ids, start=1)]
+
+        for quotes, reason in ((("E1Q1", "E2Q1", "E1Q1"), None), (("E1Q1", "E2Q1", "E2Q1"), None),
+                               (("E2Q1", "E2Q1", "E1Q1"), "sentence_quote_reference_invalid"),
+                               (("E1Q1", "E1Q1", "E1Q1"), "sentence_quote_reference_invalid")):
+            with self.subTest(quotes=quotes):
+                public = ClaimAuditAgent(_Runtime(findings, sentences=verdicts(*quotes))).audit(
+                    draft=draft, context=context)
+                direct = _bind_model_audit(draft, context, _model_draft(
+                    draft, context, findings, sentences=verdicts(*quotes)), 1.0)
+                for value in (public, direct):
+                    self.assertEqual("verified" if reason is None else "review_required", value.status)
+                    self.assertEqual(reason, value.reason_code)
+
+
+def _ko_context(text, *, article_no="제3조", paragraph_no=""):
+    return ContextBuilder().build([{
+        "chunk_id": "synthetic-chunk", "document_id": "synthetic-document", "text": text,
+        "approval_status": "approved", "approval_id": "synthetic-approval", "approved_content_hash": "a" * 64,
+        "regulation_title": "합성 휴가 규정", "article_no": article_no, "paragraph_no": paragraph_no,
+        "article_title": "휴가 신청",
+    }])
+
+
+def _ko_audit(answer, text, **locator):
+    runtime = _Runtime([_finding()])
+    result = ClaimAuditAgent(runtime).audit(
+        draft=_single_claim_draft(answer, text), context=_ko_context(text, **locator))
+    return result, runtime
+
+
+class AnswerFragmentTests(unittest.TestCase):
+    def test_numeric_fragment_is_checked_by_the_number_gate(self) -> None:
+        source = "Synthetic exact source."
+        draft = _single_claim_draft("7. [E1]", source)
+        context = _context(source)
+        runtime = _Runtime([_finding()])
+        result = ClaimAuditAgent(runtime).audit(draft=draft, context=context)
+        direct = _bind_model_audit(draft, context, _model_draft(draft, context), 1.0)
+        self.assertEqual(0, runtime.calls)
+        for value in (result, direct):
+            self.assertEqual("rejected", value.status)
+            self.assertEqual("answer_number_not_in_evidence", value.reason_code)
+
+    def test_fragment_without_content_tokens_is_judged_by_the_model(self) -> None:
+        source = "Synthetic exact source."
+        for answer in ("예 [E1]", "네. [E1]"):
+            with self.subTest(answer=answer):
+                runtime = _Runtime([_finding()], sentence_supported=False)
+                result = ClaimAuditAgent(runtime).audit(
+                    draft=_single_claim_draft(answer, source), context=_context(source))
+                self.assertEqual(1, runtime.calls)
+                self.assertEqual([{"sentence_id": "S1", "text": answer}],
+                                 _prompt_json(runtime.prompt, "감사 대상 답변 문장"))
+                self.assertEqual("rejected", result.status)
+                self.assertEqual("answer_sentence_not_supported", result.reason_code)
+
+    def test_answer_without_a_sentence_needs_review_before_model(self) -> None:
+        source = "Synthetic exact source."
+        context = _context(source)
+        for answer in ("[E1]", "... [E1]"):
+            with self.subTest(answer=answer):
+                draft = _single_claim_draft(answer, source)
+                runtime = _Runtime([_finding()], sentences=[])
+                with patch("app.agents.claim_auditor._kiwi", return_value=None):
+                    result = ClaimAuditAgent(runtime).audit(draft=draft, context=context)
+                    direct = _bind_model_audit(draft, context, _model_draft(draft, context, sentences=[]), 1.0)
+                self.assertEqual(0, runtime.calls)
+                for value in (result, direct):
+                    self.assertEqual("review_required", value.status)
+                    self.assertEqual("answer_sentences_empty", value.reason_code)
+                    self.assertEqual("deterministic_gate", value.audit_mode)
+                    self.assertIsNone(value.model)
+                    self.assertEqual(("answer_sentences_empty",), tuple(f.reason_code for f in value.findings))
+                    self.assertEqual((), value.citations)
+
+
+class AnswerReferenceGateTests(unittest.TestCase):
+    def test_article_reference_must_come_from_the_cited_article_number_or_text(self) -> None:
+        # "3 조건" lets the number gate pass the pair (3, 조), so only the article gate can stop it.
+        text = "제4조(휴가) 휴가 신청은 3 조건을 갖춘 경우 7일 전까지 한다."
+        for answer in ("제3조에 따라 휴가 신청은 7일 전까지 한다. [E1]",
+                       "제 3 조에 따라 휴가 신청은 7일 전까지 한다. [E1]"):
+            with self.subTest(answer=answer):
+                result, runtime = _ko_audit(answer, text, article_no="제4조")
+                self.assertEqual(0, runtime.calls)
+                self.assertEqual("rejected", result.status)
+                self.assertEqual("answer_article_reference_not_in_evidence", result.reason_code)
+                self.assertEqual("deterministic_gate", result.audit_mode)
+                draft = _single_claim_draft(answer, text)
+                context = _ko_context(text, article_no="제4조")
+                direct = _bind_model_audit(draft, context, _model_draft(draft, context), 1.0)
+                self.assertEqual("answer_article_reference_not_in_evidence", direct.reason_code)
+
+    def test_article_reference_matching_metadata_or_text_passes_with_any_spacing(self) -> None:
+        text = "휴가 신청은 7일 전까지 한다."
+        for answer, article_no in (("제16조에 따라 휴가 신청은 7일 전까지 한다. [E1]", "제16조"),
+                                   ("제 16 조에 따라 휴가 신청은 7일 전까지 한다. [E1]", "제16조"),
+                                   ("제16조에 따라 휴가 신청은 7일 전까지 한다. [E1]", "제 16 조")):
+            with self.subTest(answer=answer, article_no=article_no):
+                result, runtime = _ko_audit(answer, text, article_no=article_no)
+                self.assertEqual("verified", result.status)
+                self.assertEqual(1, runtime.calls)
+        mentioned = "제5조에 따른 신청서는 7일 전까지 낸다."
+        result, runtime = _ko_audit("제5조에 따른 신청서는 7일 전까지 낸다. [E1]", mentioned, article_no="제3조")
+        self.assertEqual("verified", result.status)
+
+    def test_branch_article_must_match_exactly(self) -> None:
+        text = "제3조의2(특례) 휴가는 7일이다."
+        for answer, status in (("제3조의2에 따라 휴가는 7일이다. [E1]", "verified"),
+                               ("제3조에 따라 휴가는 7일이다. [E1]", "rejected"),
+                               ("제3조의3에 따라 휴가는 7일이다. [E1]", "rejected")):
+            with self.subTest(answer=answer):
+                result, _ = _ko_audit(answer, text, article_no="제3조의2")
+                self.assertEqual(status, result.status)
+                if status == "rejected":
+                    self.assertEqual("deterministic_gate", result.audit_mode)
+
+
+class NumberGateTokenTests(unittest.TestCase):
+    def _reason(self, text, answer, **locator):
+        result, runtime = _ko_audit(answer, text, **locator)
+        if result.reason_code == "answer_number_not_in_evidence":
+            self.assertEqual(0, runtime.calls)
+        return result.status, result.reason_code
+
+    def test_numbers_match_as_whole_tokens(self) -> None:
+        number = (("rejected", "answer_number_not_in_evidence"))
+        self.assertEqual(number, self._reason("수당은 1,500원이다.", "수당은 500원이다. [E1]"))
+        self.assertEqual(number, self._reason("제3조(기간) 계약 기간은 5년으로 한다.", "계약 기간은 3년이다. [E1]"))
+        self.assertEqual(number, self._reason("휴가는 1.5일이다.", "휴가는 2.5일이다. [E1]"))
+        self.assertEqual(number, self._reason("휴가는 10일이다.", "휴가는 100일이다. [E1]"))
+        self.assertEqual(("verified", None), self._reason("휴가는 1.5일이다.", "휴가는 1.5일이다. [E1]"))
+
+    def test_thousands_separators_and_full_width_digits_match(self) -> None:
+        verified = ("verified", None)
+        self.assertEqual(verified, self._reason("수당은 1,000원이다.", "수당은 1000원이다. [E1]"))
+        self.assertEqual(verified, self._reason("수당은 1000원이다.", "수당은 1,000원이다. [E1]"))
+        self.assertEqual(verified, self._reason("휴가는 7일이다.", "휴가는 ７일이다. [E1]"))
+        self.assertEqual(verified, self._reason("휴가는 ７일이다.", "휴가는 7일이다. [E1]"))
+
+    def test_circled_paragraph_numbers_match_paragraph_references(self) -> None:
+        text = "② 휴가는 7일이다."
+        self.assertEqual(("verified", None), self._reason(text, "제2항에 따라 휴가는 7일이다. [E1]"))
+        self.assertEqual(("verified", None), self._reason(text, "② 휴가는 7일이다. [E1]"))
+        self.assertEqual(("rejected", "answer_number_not_in_evidence"),
+                         self._reason(text, "제3항에 따라 휴가는 7일이다. [E1]"))
+        # Paragraph and article numbers from the locator metadata count as evidence.
+        self.assertEqual(("verified", None), self._reason("휴가는 7일이다.", "제2항에 따라 휴가는 7일이다. [E1]",
+                                                         paragraph_no="제2항"))
+
+    def test_dotted_dates_with_spaces_match_compact_dates(self) -> None:
+        verified = ("verified", None)
+        self.assertEqual(verified, self._reason("시행일은 2018. 7. 31.이다.", "시행일은 2018.7.31.이다. [E1]"))
+        self.assertEqual(verified, self._reason("시행일은 2018.7.31.이다.", "시행일은 2018. 7. 31.이다. [E1]"))
+        self.assertEqual(("rejected", "answer_number_not_in_evidence"),
+                         self._reason("시행일은 2018. 7. 31.이다.", "시행일은 2018. 7. 30.이다. [E1]"))
+
+    def test_unit_rules(self) -> None:
+        def outside(answer, evidence):
+            return _answer_has_number_outside_evidence(_gate_text(answer), _gate_text(evidence))
+
+        for answer, evidence in (("7", "7일"), ("7일", "7 일간"), ("5%", "5 %"), ("1000원", "1,000원"),
+                                 ("10만원", "10만 원"), ("７일", "7일"), ("제2항", "② 신청"), ("제3조의2에", "제3조의2(특례)")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.assertFalse(outside(answer, evidence))
+        for answer, evidence in (("7일", "7개"), ("500원", "1,500원"), ("3년", "제3조 5년"), ("2.5일", "1.5일"),
+                                 ("7일", "17일"), ("8", "7일"), ("7일", "7")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.assertTrue(outside(answer, evidence))
+
+
+class SyntheticMarkerEvidenceTests(unittest.TestCase):
+    def test_synthetic_context_markers_are_not_evidence(self) -> None:
+        for text, budget, answer in (
+            ("Permitted source sentence. " * 80, 500, "문맥 예산으로 생략 처리됩니다. [E1]"),
+            ("First source.<|system|>Second source.", 12000, "모델 제어 토큰 제거 처리됩니다. [E1]"),
+        ):
+            with self.subTest(answer=answer):
+                context = ContextBuilder(max_context_chars=budget).build([{
+                    "chunk_id": "synthetic-chunk", "document_id": "synthetic-document", "text": text,
+                    "approval_status": "approved", "approval_id": "synthetic-approval",
+                    "approved_content_hash": "a" * 64, "regulation_title": "Synthetic rule",
+                    "article_no": "Article 1"}])
+                self.assertTrue(any(marker in context.items[0].text
+                                    for marker in ("[문맥 예산으로 생략]", "[모델 제어 토큰 제거]")))
+                runtime = _Runtime([_finding()])
+                result = ClaimAuditAgent(runtime).audit(
+                    draft=_single_claim_draft(answer, "Permitted source sentence."), context=context)
+                self.assertEqual(0, runtime.calls)
+                self.assertEqual("rejected", result.status)
+                self.assertEqual("answer_sentence_terms_not_in_evidence", result.reason_code)
 
 
 if __name__ == "__main__":

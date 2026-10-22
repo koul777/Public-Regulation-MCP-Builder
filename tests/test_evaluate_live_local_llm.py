@@ -109,6 +109,18 @@ class LiveLocalLlmScoringTests(unittest.TestCase):
         self.assertEqual(1, result["model_request_attempt_count"])
         self.assertFalse(result["actual_model_called"])
 
+    def test_claim_audit_reason_is_recorded_next_to_the_status_without_changing_the_verdict(self) -> None:
+        self.assertIsNone(_score()["claim_audit_reason"])
+        response = _response()
+        response["orchestration"].update(claim_audit_status="rejected",
+                                          claim_audit_reason="answer_number_not_in_evidence")
+        result = _score(response=response)
+        self.assertEqual("rejected", result["claim_audit_status"])
+        self.assertEqual("answer_number_not_in_evidence", result["claim_audit_reason"])
+        self.assertIn("claim_audit_not_accepted", result["errors"])
+        response["orchestration"].update(claim_audit_status="verified")
+        self.assertEqual("passed", _score(response=response)["status"])
+
     def test_fallback_after_real_model_call_is_separately_counted(self) -> None:
         response = _response()
         response["orchestration"].update(answer_mode="grounded_extractive", answer_model=None,

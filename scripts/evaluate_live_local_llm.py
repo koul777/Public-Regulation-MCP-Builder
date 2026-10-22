@@ -649,6 +649,7 @@ def score_case(spec: Mapping[str, Any], response: Mapping[str, Any], *, http_sta
             "latency_info": {"label_basis": "answer_model_load_duration", "answer_model": latency_model,
                              "models": model_load_summary(completed)},
             "claim_audit_status": orchestration.get("claim_audit_status"),
+            "claim_audit_reason": orchestration.get("claim_audit_reason"),
             "citation_verification_status": orchestration.get("citation_verification_status"),
             "answer_citation_context": context_check, "verification_limitations": limitations,
             "correctness": correctness, "citation_checks": citation_checks,
