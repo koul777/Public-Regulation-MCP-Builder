@@ -253,6 +253,71 @@ class HoldoutSealTests(unittest.TestCase):
         self.assert_refused("holdout_ledger_hard_linked")
         self.assertEqual(self.ledger.read_bytes(), alias.read_bytes())
 
+    def write_ledger(self, *records: dict) -> None:
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_bytes(b"".join(json.dumps(record).encode("utf-8") + b"\n" for record in records))
+
+    def assert_ledger_corrupt(self, *records: dict) -> None:
+        self.write_ledger(*records)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
+            check_holdout_gate(self.ledger, self.sha(self.holdout))
+
+    def tool_records(self) -> tuple[dict, dict, dict]:
+        """The sealed record the CLI writes, the opened record the runner writes, and a complete manual rerun record."""
+        self.assertEqual(0, self.seal()[0])
+        (sealed,) = self.ledger_records()
+        open_holdout(self.ledger, self.sha(self.holdout), query_count=1)
+        opened = self.ledger_records()[1]
+        rerun = {"event": "rerun_authorized", "schema_version": 1, "ledger_id": sealed["ledger_id"],
+                 "query_spec_sha256": self.sha(self.holdout), "recorded_at": "2026-01-01T00:00:00+00:00",
+                 "reason": "synthetic authorization"}
+        return sealed, opened, rerun
+
+    def test_tool_written_records_are_accepted_and_minimal_hand_written_ones_are_not(self) -> None:
+        sealed, opened, rerun = self.tool_records()
+        sha = self.sha(self.holdout)
+        self.write_ledger(sealed)
+        self.assertEqual({"authorized_rerun": False, "ledger_id": sealed["ledger_id"]}, check_holdout_gate(self.ledger, sha))
+        self.write_ledger(sealed, opened)
+        with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+            check_holdout_gate(self.ledger, sha)
+        self.write_ledger(sealed, opened, rerun)
+        self.assertEqual({"authorized_rerun": True, "ledger_id": sealed["ledger_id"]}, check_holdout_gate(self.ledger, sha))
+
+        minimal_sealed = {"event": "sealed", "ledger_id": sealed["ledger_id"], "query_spec_sha256": sha}
+        self.assert_ledger_corrupt(minimal_sealed)
+        minimal_rerun = {"event": "rerun_authorized", "ledger_id": sealed["ledger_id"], "query_spec_sha256": sha}
+        self.assert_ledger_corrupt(sealed, opened, minimal_rerun)
+        self.assert_ledger_corrupt(sealed, opened, {key: value for key, value in rerun.items() if key != "reason"})
+        for reason in ("", "   ", 5, None, ["x"]):
+            with self.subTest(reason=reason):
+                self.assert_ledger_corrupt(sealed, opened, {**rerun, "reason": reason})
+
+    def test_every_field_of_a_record_is_required_and_typed(self) -> None:
+        sealed, opened, rerun = self.tool_records()
+        cases = {"sealed": ((), sealed), "opened": ((sealed,), opened), "rerun_authorized": ((sealed, opened), rerun)}
+        wrong_values = {
+            "event": ("other", None, 5), "schema_version": (2, "1", True, None),
+            "ledger_id": ("A" * 32, "1" * 31, 7, None, ["x"]),
+            "recorded_at": ("yesterday", "2026-01-01T00:00:00", 5, None),
+            "query_spec_sha256": ("A" * 64, "a" * 63, 5, None),
+            "query_count": (0, -1, "1", True, 1.0, None), "development_query_count": (0, "1", True, None),
+            "development_spec_sha256": ("A" * 64, "short", None), "open_id": ("0" * 15, "G" * 16, 5, None),
+            "authorized_rerun": ("false", 0, None), "reason": ("", "   ", 5, None, ["x"]),
+        }
+        for event, (before, record) in cases.items():
+            self.assert_ledger_corrupt(*before, {**record, "note": "hand added"})
+            for field in record:
+                with self.subTest(event=event, field=field, problem="missing"):
+                    self.assert_ledger_corrupt(*before, {key: value for key, value in record.items() if key != field})
+                for value in wrong_values[field]:
+                    with self.subTest(event=event, field=field, value=value):
+                        self.assert_ledger_corrupt(*before, {**record, field: value})
+        # Valid fields that disagree with the sealed record are not written by the tools either.
+        self.assert_ledger_corrupt(sealed, {**opened, "query_count": opened["query_count"] + 1})
+        self.write_ledger(sealed, opened, rerun)
+        check_holdout_gate(self.ledger, self.sha(self.holdout))
+
 
 if __name__ == "__main__":
     unittest.main()

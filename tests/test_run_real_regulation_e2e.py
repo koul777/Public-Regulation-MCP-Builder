@@ -439,7 +439,13 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
         return json.loads(self.ledger.read_text(encoding="utf-8").splitlines()[0])["ledger_id"]
 
     def _append_ledger_line(self, record: dict) -> None:
-        record = {"ledger_id": self._ledger_id(), **record}
+        # Fill every field the event requires, so a test sets only what it is about.
+        defaults = {"schema_version": 1, "ledger_id": self._ledger_id(), "recorded_at": "2026-01-01T00:00:00+00:00"}
+        if record["event"] == "opened":
+            defaults.update(query_count=1, open_id="0" * 16, authorized_rerun=False)
+        elif record["event"] == "rerun_authorized":
+            defaults.update(reason="synthetic authorization")
+        record = {**defaults, **record}
         with self.ledger.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(record) + "\n")
 
