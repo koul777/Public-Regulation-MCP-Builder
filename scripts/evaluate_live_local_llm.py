@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Iterator, Mapping
+from typing import Any, Collection, Iterable, Iterator, Mapping
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request
@@ -49,6 +49,13 @@ _NUMERIC_OPTIONS = frozenset({"temperature", "seed", "num_predict", "num_ctx", "
                               "top_p", "repeat_penalty", "num_gpu", "num_thread"})
 _STRUCTURED_FIELDS = frozenset({"answer", "claims", "abstained", "evidence_context_ids", "findings",
                                 "intent", "locators", "search_queries", "query", "normalized_query"})
+# A case run is cold when a completed generation reported a model load longer than this
+# (Ollama load_duration, nanoseconds). A resident model reports milliseconds; a load from
+# disk takes seconds. The bound is strict: exactly 1 second is still warm. A measurement
+# taken while the CPU or GPU is contended is not controlled performance evidence.
+COLD_LOAD_DURATION_NS = 1_000_000_000
+LATENCY_CLASSES = ("cold", "warm", "unclassified")
+MAX_CORE_EXTRA_RUNS = 4
 
 
 def _now() -> str:
@@ -181,6 +188,27 @@ def generation_observation(request: Mapping[str, Any], response: Mapping[str, An
 
 def _number(value: Any) -> int | float | None:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
+
+
+def classify_latency(generation_events: Iterable[Mapping[str, Any]]) -> str:
+    """Label one case run ``cold``, ``warm`` or ``unclassified`` from observed model loads.
+
+    Cold: any completed generation reported ``load_duration_ns`` above
+    ``COLD_LOAD_DURATION_NS``. Warm: at least one completed generation and every one
+    reported a load duration within that bound. A run with no completed generation
+    (abstention, rejection, transport error) or with an unreported load duration has
+    no evidence of either state, so it is ``unclassified`` rather than assumed warm.
+    This labels model residency only; it never measures first-token latency.
+    """
+    completed = [event for event in generation_events
+                 if isinstance(event, Mapping) and event.get("route") == "/api/generate"
+                 and event.get("generation_completed") is True]
+    loads = [_number(event.get("load_duration_ns")) for event in completed]
+    if any(load is not None and load > COLD_LOAD_DURATION_NS for load in loads):
+        return "cold"
+    if completed and all(load is not None for load in loads):
+        return "warm"
+    return "unclassified"
 
 
 class LocalOllamaObserver:
@@ -520,6 +548,8 @@ def score_case(spec: Mapping[str, Any], response: Mapping[str, Any], *, http_sta
             "answer_matches_observed_generation": answer_matches, "answer_model": model,
             "answer_mode": mode, "fallback": fallback, "abstained": abstained,
             "answer_present": bool(answer.strip()),
+            "answer_sha256": answer_digest if answer.strip() else None,
+            "latency_class": classify_latency(completed),
             "claim_audit_status": orchestration.get("claim_audit_status"),
             "citation_verification_status": orchestration.get("citation_verification_status"),
             "answer_citation_context": context_check, "verification_limitations": limitations,
@@ -589,7 +619,8 @@ def _require_fresh_result_directory(directory: Path) -> None:
     reports = ("live-local-llm-report.json", "mcp-fetch-llm-bridge-report.json")
     if any((directory / name).exists() or (directory / name).is_symlink() for name in reports):
         raise ValueError("result_destination_already_contains_evidence")
-    if any(directory.glob("case-*.json")) or any(directory.glob("bridge-*.json")):
+    if (any(directory.glob("case-*.json")) or any(directory.glob("bridge-*.json"))
+            or any(directory.glob("repeat-*.json"))):
         raise ValueError("result_destination_already_contains_evidence")
 
 
@@ -599,6 +630,8 @@ def summarize_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
     durations = [float(case["duration_ms"]) for case in cases]
     fact_count = sum(case["correctness"]["required_count"] for case in answerable)
     matched = sum(case["correctness"]["matched_count"] for case in answerable)
+    classes = [case.get("latency_class") for case in cases]
+    warm_durations = [duration for duration, label in zip(durations, classes) if label == "warm"]
     return {"case_count": len(cases), "passed_count": sum(case["status"] == "passed" for case in cases),
             "failed_count": sum(case["status"] != "passed" for case in cases),
             "answerable_count": len(answerable), "negative_count": len(negative),
@@ -612,7 +645,109 @@ def summarize_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "required_fact_match_rate": matched / fact_count if fact_count else None,
             "citation_count": sum(case["citation_checks"]["citation_count"] for case in cases),
             "verified_citation_count": sum(case["citation_checks"]["verified_count"] for case in cases),
-            "p50_duration_ms": _percentile(durations, .5), "p95_duration_ms": _percentile(durations, .95)}
+            "p50_duration_ms": _percentile(durations, .5), "p95_duration_ms": _percentile(durations, .95),
+            # Cold/warm split of the same case durations (see classify_latency). A case with no
+            # completed generation is neither, so the three counts always add up to case_count.
+            "cold_case_count": classes.count("cold"), "warm_case_count": len(warm_durations),
+            "unclassified_latency_case_count": len(cases) - classes.count("cold") - len(warm_durations),
+            "warm_p50_duration_ms": _percentile(warm_durations, .5),
+            "warm_p95_duration_ms": _percentile(warm_durations, .95)}
+
+
+def validate_core_repeat(core_repeat: Any, known_case_ids: Collection[str]) -> dict[str, Any]:
+    """Return a normalized ``{"case_ids", "extra_runs"}`` plan or raise a fixed ValueError code.
+
+    ``extra_runs`` counts runs in addition to the main pass, so a case listed with
+    ``extra_runs=2`` is measured three times in total.
+    """
+    if not isinstance(core_repeat, Mapping):
+        raise ValueError("core_repeat_must_be_object")
+    if set(core_repeat) - {"case_ids", "extra_runs"}:
+        raise ValueError("core_repeat_unknown_field")
+    case_ids = core_repeat.get("case_ids")
+    if (not isinstance(case_ids, (list, tuple)) or not case_ids
+            or any(not isinstance(value, str) or not value for value in case_ids)
+            or len(set(case_ids)) != len(case_ids)):
+        raise ValueError("core_repeat_case_ids_invalid")
+    if not set(case_ids) <= set(known_case_ids):
+        raise ValueError("core_repeat_case_not_in_query_spec")
+    extra_runs = core_repeat.get("extra_runs")
+    if type(extra_runs) is not int or not 1 <= extra_runs <= MAX_CORE_EXTRA_RUNS:
+        raise ValueError("core_repeat_extra_runs_invalid")
+    return {"case_ids": list(case_ids), "extra_runs": extra_runs}
+
+
+def summarize_repetitions(cases: list[dict[str, Any]], repetitions: list[dict[str, Any]], *,
+                          case_ids: list[str], extra_runs: int) -> dict[str, Any]:
+    """Per core case: all runs (main pass first, then repeats), statuses, answer stability, durations.
+
+    Durations are case wall times of non-streaming calls; no first-token latency is
+    measured. ``distinct_answer_digests`` counts distinct final-answer hashes, so 1
+    means the same normalized answer text on every run that produced an answer.
+    """
+    expected_runs = extra_runs + 1
+    rows: list[dict[str, Any]] = []
+    all_runs: list[dict[str, Any]] = []
+    for case_id in case_ids:
+        runs = [case for case in cases if case.get("id") == case_id]
+        runs += [case for case in repetitions if case.get("id") == case_id]
+        all_runs += runs
+        digests = [run.get("answer_sha256") for run in runs]
+        rows.append({
+            "id": case_id, "run_count": len(runs), "expected_run_count": expected_runs,
+            "complete": len(runs) == expected_runs,
+            "statuses": [run.get("status") for run in runs],
+            "all_passed": bool(runs) and all(run.get("status") == "passed" for run in runs),
+            "distinct_answer_digests": len({digest for digest in digests if digest}),
+            "runs_without_answer": sum(1 for digest in digests if not digest),
+            "latency_classes": [run.get("latency_class") for run in runs],
+            "duration_ms": [float(run["duration_ms"]) for run in runs],
+        })
+    durations = [float(run["duration_ms"]) for run in all_runs]
+    warm = [float(run["duration_ms"]) for run in all_runs if run.get("latency_class") == "warm"]
+    return {
+        "schema_version": 1, "case_ids": list(case_ids), "planned_extra_runs": extra_runs,
+        "planned_runs_per_case": expected_runs,
+        "core_run_count": len(all_runs), "expected_core_run_count": len(case_ids) * expected_runs,
+        "duration_basis": "case_wall_time_including_http_and_observer_drain",
+        "p50_duration_ms": _percentile(durations, .5), "p95_duration_ms": _percentile(durations, .95),
+        "cold_run_count": sum(1 for run in all_runs if run.get("latency_class") == "cold"),
+        "warm_run_count": len(warm),
+        "warm_p50_duration_ms": _percentile(warm, .5), "warm_p95_duration_ms": _percentile(warm, .95),
+        "cases": rows,
+    }
+
+
+def _run_live_case(*, endpoint: str, spec: Mapping[str, Any], payload: Mapping[str, Any],
+                   observer: LocalOllamaObserver, headers: Mapping[str, str] | None,
+                   case_headers: Mapping[str, Mapping[str, str]] | None, directory: Path,
+                   filename: str, timeout_seconds: float,
+                   extra: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], int, str | None]:
+    """Send one case, score it and write its private artifact. Returns (result, status, error_type)."""
+    case_id = str(spec["id"])
+    started = time.perf_counter()
+    error_type = None
+    try:
+        with observer.case(case_id):
+            status, response = _read_json(endpoint + "/api/rag/chat", payload=payload,
+                                          headers={**dict(headers or {}), **dict((case_headers or {}).get(case_id, {}))},
+                                          timeout=timeout_seconds)
+    except Exception as exc:
+        status, response, error_type = 0, {}, type(exc).__name__
+    elapsed = (time.perf_counter() - started) * 1000
+    events = observer.events_for(case_id)
+    result = score_case(spec, response, http_status=status, events=events, duration_ms=elapsed)
+    result["request_modes"] = {key: payload.get(key) for key in
+                               ("llm_backend", "orchestration_mode", "retrieval_mode", "claim_audit_mode")}
+    result.update(dict(extra or {}))
+    if error_type:
+        result["error_type"] = error_type
+    private_payload = {"request": payload, "response": response, "result": result}
+    # Never allow user-supplied case identifiers to become filesystem paths.
+    artifact = _write_private_json(directory, filename, private_payload)
+    result["artifact_name"] = filename
+    result["artifact_sha256"] = _sha(artifact.read_bytes())
+    return result, status, error_type
 
 
 def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] | list[dict[str, Any]],
@@ -620,14 +755,22 @@ def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] 
                             request_defaults: Mapping[str, Any] | None = None,
                             headers: Mapping[str, str] | None = None,
                             case_headers: Mapping[str, Mapping[str, str]] | None = None,
-                            timeout_seconds: float = 600) -> dict[str, Any]:
+                            timeout_seconds: float = 600,
+                            core_repeat: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Call a dedicated real HTTP API serially and save private evidence.
 
     ``case_headers`` permits explicit tenant-bound test identities without storing
     tokens in query specifications or reports. No headers are ever serialized.
+
+    ``core_repeat`` (``{"case_ids": [...], "extra_runs": 1..4}``) re-runs the listed
+    cases serially after an uninterrupted main pass. Those runs are kept in
+    ``repetitions`` and ``repetition_summary`` and never enter ``cases`` or
+    ``aggregate``, so coverage, the case-ID set and ``passed`` stay those of the main
+    pass. Without it the report has no repetition keys.
     """
     endpoint = validate_loopback_endpoint(api_endpoint)
     specs = _query_specs(query_spec)
+    plan = None if core_repeat is None else validate_core_repeat(core_repeat, {str(spec["id"]) for spec in specs})
     defaults = dict(request_defaults or {})
     requests = [_request_payload(spec, defaults) for spec in specs]
     directory = private_output_directory(output_dir)
@@ -639,33 +782,17 @@ def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] 
                               "provenance": observer.provenance(), "request_defaults": defaults,
                               "timing_policy": {"duration_ms": "case_wall_time_including_http_and_observer_drain",
                                                 "generation_duration_ms": "upstream_nonstream_request_wall_time",
-                                                "first_token_latency_measured": False},
+                                                "first_token_latency_measured": False,
+                                                "latency_class": "cold_if_any_completed_generation_load_duration_above_threshold",
+                                                "cold_load_threshold_ns": COLD_LOAD_DURATION_NS},
                               "cases": []}
     consecutive_server_failures = 0
     for index, (spec, payload) in enumerate(zip(specs, requests), start=1):
         case_id = str(spec["id"])
-        started = time.perf_counter()
-        error_type = None
-        try:
-            with observer.case(case_id):
-                status, response = _read_json(endpoint + "/api/rag/chat", payload=payload,
-                                              headers={**dict(headers or {}), **dict((case_headers or {}).get(case_id, {}))},
-                                              timeout=timeout_seconds)
-        except Exception as exc:
-            status, response, error_type = 0, {}, type(exc).__name__
-        elapsed = (time.perf_counter() - started) * 1000
-        events = observer.events_for(case_id)
-        result = score_case(spec, response, http_status=status, events=events, duration_ms=elapsed)
-        result["request_modes"] = {key: payload.get(key) for key in
-                                   ("llm_backend", "orchestration_mode", "retrieval_mode", "claim_audit_mode")}
-        if error_type:
-            result["error_type"] = error_type
-        filename = f"case-{index:04d}-{_sha(case_id)[:12]}.json"
-        private_payload = {"request": payload, "response": response, "result": result}
-        # Never allow user-supplied case identifiers to become filesystem paths.
-        artifact = _write_private_json(directory, filename, private_payload)
-        result["artifact_name"] = filename
-        result["artifact_sha256"] = _sha(artifact.read_bytes())
+        result, status, error_type = _run_live_case(
+            endpoint=endpoint, spec=spec, payload=payload, observer=observer, headers=headers,
+            case_headers=case_headers, directory=directory,
+            filename=f"case-{index:04d}-{_sha(case_id)[:12]}.json", timeout_seconds=timeout_seconds)
         report["cases"].append(result)
         # The server may still be computing after an HTTP timeout. Do not queue
         # another case on top of it; the process owner must reap that API.
@@ -676,6 +803,38 @@ def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] 
         if consecutive_server_failures >= _MAX_CONSECUTIVE_SERVER_FAILURES:
             report["interrupted_reason"] = "consecutive_server_failures"
             break
+    if plan is not None:
+        # Repeats follow the same stop rules, and an interrupted main pass runs none.
+        report["repetition_plan"] = plan
+        report["repetitions"] = []
+        if report.get("interrupted_reason"):
+            report["repetitions_interrupted_reason"] = "main_pass_interrupted"
+        else:
+            selected = [(index, spec, payload) for index, (spec, payload) in enumerate(zip(specs, requests), start=1)
+                        if str(spec["id"]) in plan["case_ids"]]
+            for repeat_index in range(1, plan["extra_runs"] + 1):
+                for index, spec, payload in selected:
+                    case_id = str(spec["id"])
+                    result, status, error_type = _run_live_case(
+                        endpoint=endpoint, spec=spec, payload=payload, observer=observer, headers=headers,
+                        case_headers=case_headers, directory=directory,
+                        filename=f"repeat-{index:04d}-r{repeat_index:02d}-{_sha(case_id)[:12]}.json",
+                        timeout_seconds=timeout_seconds, extra={"repeat_index": repeat_index})
+                    report["repetitions"].append(result)
+                    if error_type is not None:
+                        report["repetitions_interrupted_reason"] = "transport_or_observer_failure"
+                        break
+                    # The counter carries over from the main pass: it is one request sequence.
+                    consecutive_server_failures = consecutive_server_failures + 1 if status >= 500 else 0
+                    if consecutive_server_failures >= _MAX_CONSECUTIVE_SERVER_FAILURES:
+                        report["repetitions_interrupted_reason"] = "consecutive_server_failures"
+                        break
+                if report.get("repetitions_interrupted_reason"):
+                    break
+        report["repetitions_expected_count"] = len(plan["case_ids"]) * plan["extra_runs"]
+        report["repetitions_not_run_count"] = report["repetitions_expected_count"] - len(report["repetitions"])
+        report["repetition_summary"] = summarize_repetitions(
+            report["cases"], report["repetitions"], case_ids=plan["case_ids"], extra_runs=plan["extra_runs"])
     report["aggregate"] = summarize_cases(report["cases"])
     report["not_run_count"] = len(specs) - len(report["cases"])
     report["not_run_case_ids"] = [str(spec["id"]) for spec in specs[len(report["cases"]):]]

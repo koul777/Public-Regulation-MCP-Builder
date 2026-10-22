@@ -49,6 +49,8 @@ class RunOptions:
     request_defaults: dict[str, Any] = field(default_factory=dict)
     preprocessing_document_ids: tuple[str, ...] = ()
     holdout_ledger: Path | None = None
+    # Optional {"case_ids": [...], "extra_runs": 1..4}; None means no repeated runs.
+    core_repeat: dict[str, Any] | None = None
 
 
 class EvidenceError(ValueError):
@@ -466,6 +468,14 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
     ids = [case.get("id") for case in cases if isinstance(case, dict)]
     if len(ids) != len(cases) or any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
         raise EvidenceError("query_ids_must_be_unique_nonempty_strings")
+    core_repeat = None
+    if options.core_repeat is not None:
+        # Same rules the evaluator enforces; its fixed codes become EvidenceError codes.
+        from scripts.evaluate_live_local_llm import validate_core_repeat
+        try:
+            core_repeat = validate_core_repeat(options.core_repeat, set(ids))
+        except ValueError as exc:
+            raise EvidenceError(str(exc)) from None
     expected_scope = {"tenant_id": options.tenant_id, "profile_id": options.profile_id,
                       "tenant_storage_isolation": options.tenant_storage_isolation}
 
@@ -525,8 +535,11 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
             requested_document_ids.add(case["target_document_id"])
     if not requested_document_ids.issubset(known_document_ids):
         raise EvidenceError("query_or_preprocessing_document_missing_from_corpus")
-    return {"corpus": corpus_report, "query_count": len(cases), "query_spec_sha256": spec_sha256,
-            "query_split": split}
+    validation = {"corpus": corpus_report, "query_count": len(cases), "query_spec_sha256": spec_sha256,
+                  "query_split": split}
+    if core_repeat is not None:
+        validation["core_repeat"] = core_repeat
+    return validation
 
 
 @contextmanager
@@ -653,6 +666,10 @@ def run_real_regulation_e2e(options: RunOptions) -> dict[str, Any]:
         "human_approval_created": False,
         "kpi_policy": {key: kpi_policy[key] for key in ("policy_id", "policy_version", "sha256")},
     }
+    if "core_repeat" in validation:
+        # Only recorded when requested, so reports without repeats keep the same configuration
+        # and stay comparable with existing baselines.
+        report["configuration"]["core_repeat"] = validation["core_repeat"]
     if validation["query_split"] == "holdout":
         # Recorded before any stage, so an aborted run still counts as opened.
         report["holdout_ledger_record"] = open_holdout(
@@ -701,7 +718,8 @@ def run_real_regulation_e2e(options: RunOptions) -> dict[str, Any]:
                                  timeout_seconds=options.timeout_seconds) as observer:
             with managed_local_api(options, runtime=runtime, endpoint=observer.endpoint) as (api_url, headers):
                 return evaluate_live_local_llm(api_endpoint=api_url, query_spec=query_payload, observer=observer,
-                    output_dir=options.output_dir / "llm", request_defaults=defaults, headers=headers, timeout_seconds=options.timeout_seconds)
+                    output_dir=options.output_dir / "llm", request_defaults=defaults, headers=headers, timeout_seconds=options.timeout_seconds,
+                    core_repeat=validation.get("core_repeat"))
 
     for name, operation in (("preprocessing", preprocessing), ("retrieval", retrieval), ("mcp", mcp), ("live_llm", live_llm)):
         _record_stage(report, name, operation)
@@ -743,6 +761,9 @@ def options_from_config(config: Mapping[str, Any], output_dir: Path) -> RunOptio
     ledger = config.get("holdout_ledger")
     if ledger is not None and (not isinstance(ledger, str) or not ledger.strip()):
         raise EvidenceError("holdout_ledger_path_invalid")
+    core_repeat = config.get("core_repeat")
+    if core_repeat is not None and not isinstance(core_repeat, dict):
+        raise EvidenceError("core_repeat_must_be_object")
     return RunOptions(runtime_source=Path(config["runtime_source"]), corpus_manifest=Path(config["corpus_manifest"]),
         query_spec=Path(config["query_spec"]), output_dir=output_dir, tenant_id=config["tenant_id"],
         profile_id=config.get("profile_id"), tenant_storage_isolation=config.get("tenant_storage_isolation", False),
@@ -752,7 +773,8 @@ def options_from_config(config: Mapping[str, Any], output_dir: Path) -> RunOptio
         enable_kordoc_table_parser=config.get("enable_kordoc_table_parser", True),
         request_defaults=dict(config.get("request_defaults", {})),
         preprocessing_document_ids=tuple(document_ids),
-        holdout_ledger=None if ledger is None else Path(ledger))
+        holdout_ledger=None if ledger is None else Path(ledger),
+        core_repeat=None if core_repeat is None else dict(core_repeat))
 
 
 def main(argv: Sequence[str] | None = None) -> int:

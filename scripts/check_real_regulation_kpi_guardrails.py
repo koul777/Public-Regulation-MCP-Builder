@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.evaluate_live_local_llm import _percentile  # noqa: E402
+from scripts.evaluate_live_local_llm import LATENCY_CLASSES, _percentile  # noqa: E402
 from scripts.run_real_regulation_e2e import EvidenceError, require_private_path  # noqa: E402
 
 
@@ -469,14 +469,30 @@ def evaluate_regressions(candidate: Mapping[str, Any], baseline: Mapping[str, An
             case_id for case_id, item in old.items() if passed(item) and not passed(new.get(case_id) or {}))
         rows.append(_regression(regression_id, policy, None if failures is None else len(failures), case_ids=failures))
 
-    def p95(report: Mapping[str, Any]) -> float | None:
-        cases = _items(report, "live_llm", "cases") or []
-        return _percentile([_float(case.get("duration_ms")) for case in cases], .95)
-
-    old_p95, new_p95 = p95(baseline), p95(candidate)
+    old_all, old_warm = _latency_sample(baseline)
+    new_all, new_warm = _latency_sample(candidate)
+    # Warm-only needs cold/warm labels in both reports and a warm case in each; a report from
+    # before the labels existed (or with no warm case) falls back to every case, as before.
+    warm_only = bool(old_warm) and bool(new_warm)
+    old_sample, new_sample = (old_warm, new_warm) if warm_only else (old_all, new_all)
+    old_p95, new_p95 = _percentile(old_sample, .95), _percentile(new_sample, .95)
     ratio = round(new_p95 / old_p95, 6) if old_p95 and new_p95 is not None else None
-    rows.append(_regression("llm_p95_duration_ratio", policy, ratio, baseline_p95_ms=old_p95, candidate_p95_ms=new_p95))
+    rows.append(_regression("llm_p95_duration_ratio", policy, ratio,
+                            basis="warm_only" if warm_only else "all_cases",
+                            baseline_p95_ms=old_p95, candidate_p95_ms=new_p95,
+                            baseline_sample_count=len(old_sample), candidate_sample_count=len(new_sample)))
     return rows
+
+
+def _latency_sample(report: Mapping[str, Any]) -> tuple[list[float], list[float]]:
+    """Return (all case durations, warm-case durations). The warm list is empty unless
+    every case carries a known ``latency_class`` label, so an unlabeled report never
+    yields a partial warm sample."""
+    cases = _items(report, "live_llm", "cases") or []
+    durations = [_float(case.get("duration_ms")) for case in cases]
+    labeled = bool(cases) and all(case.get("latency_class") in LATENCY_CLASSES for case in cases)
+    warm = [duration for case, duration in zip(cases, durations) if case.get("latency_class") == "warm"] if labeled else []
+    return durations, warm
 
 
 # --- Failure-cause breakdown (diagnostic only) ---------------------------------------------
@@ -778,6 +794,85 @@ def failure_breakdown_summary(breakdown: Mapping[str, Any]) -> dict[str, Any]:
             "counts": {cause: count for cause, count in (primary or {}).items() if count}}
 
 
+# --- Repetition stability (diagnostic only) ------------------------------------------------
+# Built from the evaluator's repetition_summary, which exists only when the run config asked
+# for core_repeat. Like failure_breakdown it never feeds verdict, passed, any row or exit code.
+def _count_or_none(value: Any) -> int | float | None:
+    return value if _is_number(value) else None
+
+
+def _build_stability(report: Mapping[str, Any]) -> dict[str, Any] | None:
+    llm = _llm_result(report)
+    summary = llm.get("repetition_summary")
+    if not isinstance(summary, dict):
+        return None
+    base = {"schema_version": 1, "diagnostic_only": True}
+    rows = summary.get("cases")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return {**base, "status": "malformed", "reason": "repetition_summary_cases_invalid"}
+    status_disagreement: list[str] = []
+    answer_disagreement: list[str] = []
+    incomplete: list[str] = []
+    not_all_passed: list[str] = []
+    unstable_cases: list[dict[str, Any]] = []
+    for row in rows:
+        case_id = str(row.get("id") or "")
+        statuses = [str(item) for item in row.get("statuses")] if isinstance(row.get("statuses"), list) else []
+        digests = row.get("distinct_answer_digests")
+        status_differs = len(set(statuses)) > 1
+        answer_differs = _is_int(digests) and digests > 1
+        if status_differs:
+            status_disagreement.append(case_id)
+        if answer_differs:
+            answer_disagreement.append(case_id)
+        if row.get("complete") is not True:
+            incomplete.append(case_id)
+        if row.get("all_passed") is not True:
+            not_all_passed.append(case_id)
+        if status_differs or answer_differs:
+            unstable_cases.append({"id": case_id, "run_count": _count_or_none(row.get("run_count")),
+                                   "statuses": statuses, "distinct_answer_digests": _count_or_none(digests)})
+    unstable = sorted(set(status_disagreement) | set(answer_disagreement))
+    return {
+        **base, "status": "ok",
+        "planned_extra_runs": _count_or_none(summary.get("planned_extra_runs")),
+        "core_case_count": len(rows),
+        "core_run_count": _count_or_none(summary.get("core_run_count")),
+        "expected_core_run_count": _count_or_none(summary.get("expected_core_run_count")),
+        "repetitions_interrupted_reason": llm.get("repetitions_interrupted_reason"),
+        # Stable means every core case ran all planned runs and the runs agree.
+        "all_stable": bool(rows) and not unstable and not incomplete,
+        "status_disagreement_case_ids": sorted(status_disagreement),
+        "answer_disagreement_case_ids": sorted(answer_disagreement),
+        "unstable_case_ids": unstable, "incomplete_case_ids": sorted(incomplete),
+        "not_all_passed_case_ids": sorted(not_all_passed),
+        "unstable_cases": unstable_cases,
+        "cold_run_count": _count_or_none(summary.get("cold_run_count")),
+        "warm_run_count": _count_or_none(summary.get("warm_run_count")),
+        "p50_duration_ms": _count_or_none(summary.get("p50_duration_ms")),
+        "p95_duration_ms": _count_or_none(summary.get("p95_duration_ms")),
+        "warm_p95_duration_ms": _count_or_none(summary.get("warm_p95_duration_ms")),
+    }
+
+
+def build_stability(report: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Repeat-run agreement per core case, or None when the run requested no repeats.
+    Diagnostic only: it must never change a verdict or exit code."""
+    try:
+        return _build_stability(report)
+    except Exception as exc:  # a diagnostic bug must not turn a judged run into an input error
+        return {"schema_version": 1, "diagnostic_only": True, "status": "error", "reason": type(exc).__name__}
+
+
+def stability_summary(stability: Mapping[str, Any]) -> dict[str, Any]:
+    """Short stdout form: counts only, no case ids."""
+    if stability.get("status") != "ok":
+        return {"status": stability.get("status")}
+    return {"all_stable": stability.get("all_stable"),
+            "unstable_case_count": len(stability.get("unstable_case_ids") or []),
+            "incomplete_case_count": len(stability.get("incomplete_case_ids") or [])}
+
+
 def _require_report(report: Any, policy: Mapping[str, Any]) -> Mapping[str, Any]:
     if (not isinstance(report, dict) or report.get("report_type") != policy["report_type"]
             or report.get("schema_version") not in policy["report_schema_versions"]):
@@ -824,7 +919,7 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         limitations.append("some_citations_verified_without_context_or_content_hash")
     if baseline is not None:
         limitations.append("latency_regression_is_advisory_without_controlled_repeats")
-    return {
+    result = {
         "report_type": "real_regulation_kpi_guardrails", "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "policy": {"policy_id": policy["policy_id"], "policy_version": policy["policy_version"],
@@ -849,6 +944,10 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         "limitations": limitations,
         "failure_breakdown": build_failure_breakdown(report),
     }
+    stability = build_stability(report)
+    if stability is not None:
+        result["stability"] = stability
+    return result
 
 
 def _load_report(path: Path) -> tuple[Any, str]:
@@ -881,10 +980,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         reason = str(exc) if isinstance(exc, (GuardrailInputError, EvidenceError)) else type(exc).__name__
         print(json.dumps({"passed": False, "reason_code": reason}))
         return 2
-    print(json.dumps({"verdict": result["verdict"], "passed": result["passed"], "hard_passed": result["hard_passed"],
-                      "targets_met": result["targets_met"], "regression_passed": result["regression_passed"],
-                      "legacy_report_passed": result["candidate"]["legacy_report_passed"],
-                      "failure_breakdown": failure_breakdown_summary(result["failure_breakdown"])}))
+    summary = {"verdict": result["verdict"], "passed": result["passed"], "hard_passed": result["hard_passed"],
+               "targets_met": result["targets_met"], "regression_passed": result["regression_passed"],
+               "legacy_report_passed": result["candidate"]["legacy_report_passed"],
+               "failure_breakdown": failure_breakdown_summary(result["failure_breakdown"])}
+    if "stability" in result:
+        summary["stability"] = stability_summary(result["stability"])
+    print(json.dumps(summary))
     if result["verdict"] == "not_comparable":
         return 2
     return 0 if result["passed"] else 1
