@@ -26,6 +26,7 @@ from scripts.evaluate_live_local_llm import (
     classify_latency,
     evaluate_live_local_llm,
     generation_observation,
+    model_load_summary,
     score_case,
     summarize_cases,
     validate_core_repeat,
@@ -35,16 +36,21 @@ from scripts.run_real_regulation_e2e import (
     RunOptions,
     options_from_config,
     run_real_regulation_e2e,
+    seal_holdout,
     validate_options,
 )
 from tests.test_evaluate_live_local_llm import _response, _spec
 from tests.test_real_regulation_kpi_guardrails import _cases, _report, _row
 
 
-def _event_with_load(load_ns: int | None, answer: str | None = None, *, completed: bool = True) -> dict:
-    request = {"model": "synthetic-model", "prompt": "synthetic-private-prompt", "stream": False,
+ANSWER_MODEL = "synthetic-model"
+
+
+def _event_with_load(load_ns: int | None, answer: str | None = None, *, completed: bool = True,
+                     model: str = ANSWER_MODEL) -> dict:
+    request = {"model": model, "prompt": "synthetic-private-prompt", "stream": False,
                "options": {"temperature": 0, "seed": 0, "num_predict": 200}}
-    payload = {"model": "synthetic-model", "done": True, "done_reason": "stop",
+    payload = {"model": model, "done": True, "done_reason": "stop",
                "eval_count": 10 if completed else 0,
                "response": json.dumps({"answer": answer or _response()["answer"], "claims": []})}
     if load_ns is not None:
@@ -116,7 +122,9 @@ class CoreRepeatLoopTests(unittest.TestCase):
         self.assertEqual(["a", "c", "a", "c"], [row["id"] for row in report["repetitions"]])
         self.assertEqual([1, 1, 2, 2], [row["repeat_index"] for row in report["repetitions"]])
         self.assertNotIn("repeat_index", report["cases"][0])
-        self.assertEqual({"case_ids": ["c", "a"], "extra_runs": 2}, report["repetition_plan"])
+        # The plan is recorded sorted whatever order the config listed.
+        self.assertEqual({"case_ids": ["a", "c"], "extra_runs": 2}, report["repetition_plan"])
+        self.assertEqual(["a", "c"], report["repetition_summary"]["case_ids"])
         self.assertEqual((4, 0), (report["repetitions_expected_count"], report["repetitions_not_run_count"]))
         self.assertNotIn("repetitions_interrupted_reason", report)
         self.assertEqual(1, repeat_artifact["result"]["repeat_index"])
@@ -233,6 +241,53 @@ class CoreRepeatLoopTests(unittest.TestCase):
         self.assertEqual((1, 0), (rows["a"]["run_count"], rows["b"]["run_count"]))
         self.assertFalse(report["passed"])
 
+    def test_repeat_artifact_write_failure_is_recorded_and_the_main_pass_report_is_still_written(self) -> None:
+        from scripts import evaluate_live_local_llm as module
+        real_write = module._write_private_json
+        for prefix, repetitions_kept in (("repeat-0001-", 0), ("repeat-0002-", 1)):
+            def failing_write(directory, filename, payload, _prefix=prefix):
+                if filename.startswith(_prefix):
+                    raise OSError("synthetic secret disk path")
+                return real_write(directory, filename, payload)
+
+            with self.subTest(failing=prefix):
+                scenario = _Scenario([{}, {}, {}, {}])
+                with tempfile.TemporaryDirectory() as temp, patch(
+                    "scripts.evaluate_live_local_llm._write_private_json", side_effect=failing_write
+                ):
+                    report = _evaluate(scenario, _specs("a", "b"), temp,
+                                       core_repeat={"case_ids": ["a", "b"], "extra_runs": 1})
+                    written = json.loads((Path(temp) / "live-local-llm-report.json").read_text(encoding="utf-8"))
+                self.assertEqual("repeat_phase_error", report["repetitions_interrupted_reason"])
+                self.assertEqual("OSError", report["repetitions_error_type"])
+                self.assertEqual(repetitions_kept, len(report["repetitions"]))
+                self.assertEqual(2 - repetitions_kept, report["repetitions_not_run_count"])
+                # The main pass is complete, scored and persisted regardless.
+                self.assertEqual(["a", "b"], [case["id"] for case in report["cases"]])
+                self.assertTrue(report["passed"])
+                self.assertEqual(0, report["not_run_count"])
+                self.assertNotIn("interrupted_reason", report)
+                self.assertEqual(("repeat_phase_error", "OSError", 2),
+                                 (written["repetitions_interrupted_reason"], written["repetitions_error_type"],
+                                  len(written["cases"])))
+                self.assertNotIn("synthetic secret", json.dumps(written))
+                self.assertIn("repetition_summary", written)
+
+    def test_repeat_summary_failure_is_recorded_without_losing_the_main_pass_report(self) -> None:
+        scenario = _Scenario([{}, {}])
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "scripts.evaluate_live_local_llm.summarize_repetitions", side_effect=ValueError("synthetic secret")
+        ):
+            report = _evaluate(scenario, _specs("a"), temp, core_repeat={"case_ids": ["a"], "extra_runs": 1})
+            written = json.loads((Path(temp) / "live-local-llm-report.json").read_text(encoding="utf-8"))
+        self.assertEqual(("repeat_phase_error", "ValueError"),
+                         (report["repetitions_interrupted_reason"], report["repetitions_error_type"]))
+        self.assertNotIn("repetition_summary", report)
+        self.assertEqual(1, len(report["repetitions"]))
+        self.assertTrue(report["passed"])
+        self.assertEqual("ValueError", written["repetitions_error_type"])
+        self.assertNotIn("synthetic secret", json.dumps(written))
+
     def test_absent_core_repeat_leaves_the_report_without_repetition_keys(self) -> None:
         scenario = _Scenario([{}, {}])
         with tempfile.TemporaryDirectory() as temp:
@@ -295,29 +350,91 @@ class ColdWarmClassificationTests(unittest.TestCase):
         for load, expected in ((0, "warm"), (COLD_LOAD_DURATION_NS - 1, "warm"), (COLD_LOAD_DURATION_NS, "warm"),
                                (COLD_LOAD_DURATION_NS + 1, "cold"), (30_000_000_000, "cold")):
             with self.subTest(load=load):
-                self.assertEqual(expected, classify_latency([_event_with_load(load)]))
+                self.assertEqual(expected, classify_latency([_event_with_load(load)], ANSWER_MODEL))
 
     def test_any_cold_completed_generation_makes_the_case_cold(self) -> None:
         events = [_event_with_load(5_000_000), _event_with_load(COLD_LOAD_DURATION_NS + 1), _event_with_load(0)]
-        self.assertEqual("cold", classify_latency(events))
-        self.assertEqual("warm", classify_latency([_event_with_load(5_000_000), _event_with_load(0)]))
+        self.assertEqual("cold", classify_latency(events, ANSWER_MODEL))
+        self.assertEqual("warm", classify_latency([_event_with_load(5_000_000), _event_with_load(0)], ANSWER_MODEL))
 
     def test_no_completed_generation_or_unreported_load_is_not_assumed_warm(self) -> None:
-        self.assertEqual("unclassified", classify_latency([]))
-        self.assertEqual("unclassified", classify_latency([_event_with_load(None)]))
+        self.assertEqual("unclassified", classify_latency([], ANSWER_MODEL))
+        self.assertEqual("unclassified", classify_latency([_event_with_load(None)], ANSWER_MODEL))
         # A warm event beside an event without a load figure is still unproven.
-        self.assertEqual("unclassified", classify_latency([_event_with_load(0), _event_with_load(None)]))
+        self.assertEqual("unclassified", classify_latency([_event_with_load(0), _event_with_load(None)], ANSWER_MODEL))
         # An incomplete generation does not count, even with a huge load duration.
-        self.assertEqual("unclassified", classify_latency([_event_with_load(9_000_000_000, completed=False)]))
-        self.assertEqual("warm", classify_latency([_event_with_load(0), _event_with_load(9_000_000_000, completed=False)]))
-        self.assertEqual("unclassified", classify_latency([{"route": "/api/tags", "load_duration_ns": 0}]))
+        self.assertEqual("unclassified", classify_latency([_event_with_load(9_000_000_000, completed=False)], ANSWER_MODEL))
+        self.assertEqual("warm", classify_latency(
+            [_event_with_load(0), _event_with_load(9_000_000_000, completed=False)], ANSWER_MODEL))
+        self.assertEqual("unclassified", classify_latency([{"route": "/api/tags", "load_duration_ns": 0}], ANSWER_MODEL))
 
     def test_invalid_load_values_are_treated_as_unreported(self) -> None:
         for bad in (-1, float("nan"), float("inf"), True, "7"):
             event = _event_with_load(0)
             event["load_duration_ns"] = bad
             with self.subTest(value=bad):
-                self.assertEqual("unclassified", classify_latency([event]))
+                self.assertEqual("unclassified", classify_latency([event], ANSWER_MODEL))
+
+    def test_unknown_answer_model_is_unclassified(self) -> None:
+        for model in (None, "", 7):
+            with self.subTest(model=model):
+                self.assertEqual("unclassified", classify_latency([_event_with_load(0)], model))
+
+    def test_only_the_answer_model_decides_the_label(self) -> None:
+        # Query model and audit model reload on every case under a short keep-alive; the answer model is resident.
+        events = [_event_with_load(9_000_000_000, "query analysis", model="qwen3:1.7b"),
+                  _event_with_load(5_000_000, model="qwen3:8b"),
+                  _event_with_load(9_000_000_000, "audit verdict", model="qwen3:4b")]
+        self.assertEqual("warm", classify_latency(events, "qwen3:8b"))
+        self.assertEqual("cold", classify_latency(events, "qwen3:4b"))
+        # No completed generation of the answer model: other models' loads prove nothing about it.
+        self.assertEqual("unclassified", classify_latency(events[:1] + events[2:], "qwen3:8b"))
+
+    def test_model_load_summary_sums_and_maxes_per_model_without_reading_missing_as_zero(self) -> None:
+        events = [_event_with_load(2_000_000_000, "first", model="qwen3:8b"),
+                  _event_with_load(3_000_000_000, "second", model="qwen3:8b"),
+                  _event_with_load(None, "audit", model="qwen3:4b"),
+                  _event_with_load(7_000_000_000, "ignored", completed=False, model="qwen3:1.7b")]
+        self.assertEqual({
+            "qwen3:4b": {"completed_generation_count": 1, "load_reported_count": 0,
+                         "load_duration_ns_sum": None, "load_duration_ns_max": None},
+            "qwen3:8b": {"completed_generation_count": 2, "load_reported_count": 2,
+                         "load_duration_ns_sum": 5_000_000_000, "load_duration_ns_max": 3_000_000_000},
+        }, model_load_summary(events))
+        self.assertEqual({}, model_load_summary([]))
+
+    def test_score_case_records_every_models_load_but_labels_by_the_answer_model(self) -> None:
+        response = {**_response(), "orchestration": {**_response()["orchestration"], "answer_model": "qwen3:8b"}}
+        events = [_event_with_load(9_000_000_000, "query analysis", model="qwen3:1.7b"),
+                  _event_with_load(1, response["answer"], model="qwen3:8b"),
+                  _event_with_load(9_000_000_000, "audit verdict", model="qwen3:4b")]
+        result = score_case(_spec(), response, http_status=200, events=events, duration_ms=10)
+        self.assertEqual("warm", result["latency_class"])
+        info = result["latency_info"]
+        self.assertEqual(("answer_model_load_duration", "qwen3:8b"), (info["label_basis"], info["answer_model"]))
+        self.assertEqual(["qwen3:1.7b", "qwen3:4b", "qwen3:8b"], list(info["models"]))
+        self.assertEqual(9_000_000_000, info["models"]["qwen3:4b"]["load_duration_ns_sum"])
+        self.assertEqual(1, info["models"]["qwen3:8b"]["load_duration_ns_max"])
+        # A cold answer model makes the case cold even when the helper models are warm.
+        events[1] = _event_with_load(COLD_LOAD_DURATION_NS + 1, response["answer"], model="qwen3:8b")
+        events[0] = _event_with_load(0, "query analysis", model="qwen3:1.7b")
+        self.assertEqual("cold", score_case(_spec(), response, http_status=200, events=events,
+                                            duration_ms=10)["latency_class"])
+
+    def test_answer_model_falls_back_to_the_single_model_whose_output_is_the_final_answer(self) -> None:
+        response = {**_response(), "orchestration": {"answer_mode": "grounded_local", "claim_audit_status": "verified",
+                                                     "citation_verification_status": "verified"}}
+        helper = _event_with_load(9_000_000_000, "query analysis", model="qwen3:1.7b")
+        answer = _event_with_load(1, response["answer"], model="qwen3:8b")
+        result = score_case(_spec(), response, http_status=200, events=[helper, answer], duration_ms=10)
+        self.assertEqual(("warm", "qwen3:8b"), (result["latency_class"], result["latency_info"]["answer_model"]))
+        # Two models producing the identical final text leave the answer model ambiguous.
+        twin = _event_with_load(1, response["answer"], model="qwen3:4b")
+        ambiguous = score_case(_spec(), response, http_status=200, events=[answer, twin], duration_ms=10)
+        self.assertEqual(("unclassified", None), (ambiguous["latency_class"], ambiguous["latency_info"]["answer_model"]))
+        # No event produced the final text: unknown, not guessed.
+        unmatched = score_case(_spec(), response, http_status=200, events=[helper], duration_ms=10)
+        self.assertEqual("unclassified", unmatched["latency_class"])
 
     def test_score_case_labels_each_run_and_keeps_the_answer_digest_only(self) -> None:
         cold = score_case(_spec(), _response(), http_status=200, duration_ms=10,
@@ -394,21 +511,29 @@ class _E2eBase(unittest.TestCase):
 
 
 class CoreRepeatConfigurationTests(_E2eBase):
+    def _stages(self, stack: ExitStack) -> dict:
+        stack.enter_context(patch("scripts.report_metadata.capture_mcp_performance_source_state", return_value={}))
+        stack.enter_context(patch("scripts.report_metadata.finalize_mcp_performance_source_state", return_value={"stable": True}))
+        stack.enter_context(patch("scripts.report_metadata.current_repo_commit", return_value="synthetic"))
+        mocks = {
+            "probe": stack.enter_context(patch("scripts.real_regulation_corpus_probe.run_corpus_probe", return_value={
+                "passed": True, "results": [{"source_document_id": "synthetic-document", "passed": True}]})),
+            "retrieval": stack.enter_context(patch("scripts.evaluate_mcp_retrieval_quality.evaluate_mcp_retrieval_quality",
+                                                   return_value={"passed": True})),
+            "mcp": stack.enter_context(patch("scripts.real_regulation_mcp_probe.run_mcp_probe", return_value={"passed": True})),
+            "live": stack.enter_context(patch("scripts.evaluate_live_local_llm.evaluate_live_local_llm",
+                                              return_value={"passed": True})),
+        }
+        stack.enter_context(patch("scripts.evaluate_live_local_llm.LocalOllamaObserver"))
+        stack.enter_context(patch("scripts.run_real_regulation_e2e.managed_local_api",
+                                  return_value=nullcontext(("http://127.0.0.1:1", {}))))
+        return mocks
+
     def _run(self, options: RunOptions):
         with ExitStack() as stack:
-            stack.enter_context(patch("scripts.report_metadata.capture_mcp_performance_source_state", return_value={}))
-            stack.enter_context(patch("scripts.report_metadata.finalize_mcp_performance_source_state", return_value={"stable": True}))
-            stack.enter_context(patch("scripts.report_metadata.current_repo_commit", return_value="synthetic"))
-            stack.enter_context(patch("scripts.real_regulation_corpus_probe.run_corpus_probe", return_value={
-                "passed": True, "results": [{"source_document_id": "synthetic-document", "passed": True}]}))
-            stack.enter_context(patch("scripts.evaluate_mcp_retrieval_quality.evaluate_mcp_retrieval_quality", return_value={"passed": True}))
-            stack.enter_context(patch("scripts.real_regulation_mcp_probe.run_mcp_probe", return_value={"passed": True}))
-            stack.enter_context(patch("scripts.evaluate_live_local_llm.LocalOllamaObserver"))
-            live = stack.enter_context(patch("scripts.evaluate_live_local_llm.evaluate_live_local_llm", return_value={"passed": True}))
-            stack.enter_context(patch("scripts.run_real_regulation_e2e.managed_local_api",
-                                      return_value=nullcontext(("http://127.0.0.1:1", {}))))
+            mocks = self._stages(stack)
             report = run_real_regulation_e2e(options)
-        return report, live
+        return report, mocks["live"]
 
     def test_absent_key_keeps_configuration_and_validation_unchanged(self) -> None:
         self.assertNotIn("core_repeat", validate_options(self.options))
@@ -418,14 +543,74 @@ class CoreRepeatConfigurationTests(_E2eBase):
                          set(report["configuration"]))
         self.assertIsNone(live.call_args.kwargs["core_repeat"])
 
-    def test_requested_repeat_is_recorded_and_passed_to_the_evaluator(self) -> None:
-        plan = {"case_ids": ["case-b"], "extra_runs": 3}
-        options = replace(self.options, core_repeat=plan)
-        self.assertEqual(plan, validate_options(options)["core_repeat"])
+    def test_requested_repeat_is_recorded_outside_configuration_and_passed_sorted_to_the_evaluator(self) -> None:
+        plain, _ = self._run(self.options)
+        self.assertNotIn("core_repeat", plain)
+        plan = {"case_ids": ["case-b", "case-a"], "extra_runs": 3}
+        options = replace(self.options, core_repeat=plan, output_dir=self.root / "repeated-run")
+        normalized = {"case_ids": ["case-a", "case-b"], "extra_runs": 3}
+        self.assertEqual(normalized, validate_options(options)["core_repeat"])
         report, live = self._run(options)
-        self.assertEqual(plan, report["configuration"]["core_repeat"])
-        self.assertEqual(plan, live.call_args.kwargs["core_repeat"])
+        # configuration is a baseline-comparison field; it must read exactly as without repeats.
+        self.assertNotIn("core_repeat", report["configuration"])
+        self.assertEqual(plain["configuration"], report["configuration"])
+        self.assertEqual(normalized, report["core_repeat"])
+        self.assertEqual(normalized, live.call_args.kwargs["core_repeat"])
         self.assertTrue(report["passed"])
+        saved = json.loads((options.output_dir / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(normalized, saved["core_repeat"])
+
+    def _seal_holdout_spec(self) -> tuple[str, Path]:
+        cases = [{"id": f"case-{name}", "query": f"synthetic holdout question {name}",
+                  "target_document_ids": ["synthetic-document"]} for name in ("a", "b")]
+        self.query_spec.write_text(json.dumps({"split": "holdout", "queries": cases}), encoding="utf-8")
+        sha = hashlib.sha256(self.query_spec.read_bytes()).hexdigest()
+        ledger = self.root / "ledger" / "holdout.jsonl"
+        seal_holdout(ledger, development_sha256="d" * 64, holdout_sha256=sha,
+                     development_query_count=1, holdout_query_count=2)
+        return sha, ledger
+
+    @staticmethod
+    def _ledger_events(ledger: Path) -> list[str]:
+        return [json.loads(line)["event"] for line in ledger.read_text(encoding="utf-8").splitlines()]
+
+    def test_holdout_run_with_repeats_writes_exactly_one_opened_record(self) -> None:
+        sha, ledger = self._seal_holdout_spec()
+        plan = {"case_ids": ["case-a", "case-b"], "extra_runs": 4}
+        options = replace(self.options, holdout_ledger=ledger, core_repeat=plan)
+        # --check-only validates the plan and the gate without writing the ledger.
+        before = ledger.read_bytes()
+        validate_options(options)
+        self.assertEqual(before, ledger.read_bytes())
+
+        report, live = self._run(options)
+        self.assertEqual(["sealed", "opened"], self._ledger_events(ledger))
+        self.assertEqual(1, live.call_count)
+        self.assertEqual(plan, live.call_args.kwargs["core_repeat"])
+        record = report["holdout_ledger_record"]
+        self.assertEqual(("opened", sha), (record["event"], record["query_spec_sha256"]))
+        # The repeats belong to this one opening; they do not buy or need another.
+        after = ledger.read_bytes()
+        with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+            self._run(replace(options, output_dir=self.root / "second-run"))
+        self.assertEqual(after, ledger.read_bytes())
+
+    def test_invalid_plan_on_a_holdout_run_leaves_the_ledger_and_stages_untouched(self) -> None:
+        _, ledger = self._seal_holdout_spec()
+        before = ledger.read_bytes()
+        for plan in ({"case_ids": ["case-a", "missing"], "extra_runs": 2},
+                     {"case_ids": ["case-a"], "extra_runs": 9},
+                     {"case_ids": ["case-a"]}):
+            options = replace(self.options, holdout_ledger=ledger, core_repeat=plan)
+            with self.subTest(plan=plan), ExitStack() as stack:
+                mocks = self._stages(stack)
+                with self.assertRaisesRegex(EvidenceError, "^core_repeat_"):
+                    run_real_regulation_e2e(options)
+                for mock in mocks.values():
+                    mock.assert_not_called()
+            self.assertEqual(before, ledger.read_bytes())
+            self.assertEqual(["sealed"], self._ledger_events(ledger))
+            self.assertFalse(options.output_dir.exists())
 
     def test_invalid_plan_is_refused_with_a_fixed_code_before_any_output(self) -> None:
         cases = (
@@ -463,21 +648,31 @@ class CoreRepeatConfigurationTests(_E2eBase):
                 options_from_config({**base, "core_repeat": bad}, self.root / "out")
 
 
-def _label(report: dict, labels: dict[str, tuple[str, float]]) -> None:
+def _latency_report(spec, *, answerable: int = 20) -> dict:
+    """KPI fixture whose answerable cases take (class, duration_ms[, http_status]) from spec(index).
+
+    Abstention cases are unclassified. A third element marks a request that was attempted but
+    did not complete (timeout or 5xx): failed, no answer, never warm."""
+    report = _report(answerable=answerable)
     for case in _cases(report):
-        if case["id"] in labels:
-            case["latency_class"], case["duration_ms"] = labels[case["id"]]
-        elif case["expected_abstain"]:
+        if case["expected_abstain"]:
             case["latency_class"] = "unclassified"
+            continue
+        label, duration, *failure = spec(int(case["id"].rsplit("-", 1)[1]))
+        case["latency_class"], case["duration_ms"] = label, float(duration)
+        if failure:
+            case.update(http_status=failure[0], status="failed", answer_present=False, final_model_answer=False)
+    return report
 
 
-def _labeled_pair(*, candidate_scale: float = 1.05, cold_candidate: float = 20000.0) -> tuple[dict, dict]:
-    """Three slow cold cases and 17 warm cases; the cold cases decide the all-case p95."""
-    baseline, candidate = _report(), _report()
-    for report, scale, cold in ((baseline, 1.0, 5000.0), (candidate, candidate_scale, cold_candidate)):
-        labels = {f"answer-{index:02d}": ("cold", cold) if index < 3 else ("warm", 100.0 * scale)
-                  for index in range(20)}
-        _label(report, labels)
+def _warm_on(indexes, warm_ms, other=("cold", 5000)):
+    return lambda index: ("warm", warm_ms(index)) if index in indexes else other
+
+
+def _cold_tail_pair(*, candidate_scale: float = 1.05) -> tuple[dict, dict]:
+    """Three slow cold cases and 17 warm cases in both reports; the cold tail is the all-case p95."""
+    baseline = _latency_report(lambda i: ("cold", 5000) if i < 3 else ("warm", 100))
+    candidate = _latency_report(lambda i: ("cold", 20000) if i < 3 else ("warm", 100 * candidate_scale))
     return candidate, baseline
 
 
@@ -485,38 +680,90 @@ class WarmOnlyLatencyRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = load_policy()
 
+    def evaluate(self, candidate: dict, baseline: dict) -> dict:
+        return evaluate_kpi_guardrails(candidate, self.policy, baseline=baseline)
+
     def latency(self, candidate: dict, baseline: dict) -> dict:
-        return _row(evaluate_kpi_guardrails(candidate, self.policy, baseline=baseline), "regressions",
-                    "llm_p95_duration_ratio")
+        return _row(self.evaluate(candidate, baseline), "regressions", "llm_p95_duration_ratio")
 
-    def test_labeled_reports_compare_warm_only_p95_and_ignore_cold_loads(self) -> None:
-        candidate, baseline = _labeled_pair()
+    def test_value_is_the_larger_ratio_and_both_are_reported(self) -> None:
+        candidate, baseline = _cold_tail_pair()
         row = self.latency(candidate, baseline)
-        self.assertEqual("warm_only", row["basis"])
-        self.assertEqual((100.0, 105.0, 1.05), (row["baseline_p95_ms"], row["candidate_p95_ms"], row["value"]))
-        self.assertEqual((17, 17), (row["baseline_sample_count"], row["candidate_sample_count"]))
-        self.assertEqual("passed", row["status"])
+        self.assertEqual((4.0, "all_cases", "advisory_exceeded"), (row["value"], row["basis"], row["status"]))
+        self.assertEqual(4.0, row["all_cases"]["ratio"])
+        warm = row["warm_only"]
+        self.assertEqual((True, 17, 10), (warm["evaluated"], warm["paired_case_count"], warm["min_paired_case_count"]))
+        self.assertEqual((1.05, 100.0, 105.0), (warm["ratio"], warm["baseline_p95_ms"], warm["candidate_p95_ms"]))
+        self.assertEqual((28, 28), (row["all_cases"]["baseline_sample_count"], row["all_cases"]["candidate_sample_count"]))
 
-    def test_same_reports_without_labels_use_all_cases_and_exceed_the_advisory_limit(self) -> None:
-        candidate, baseline = _labeled_pair()
-        for report in (candidate, baseline):
-            for case in _cases(report):
-                case.pop("latency_class")
-        row = self.latency(candidate, baseline)
-        self.assertEqual("all_cases", row["basis"])
-        self.assertEqual((5000.0, 20000.0, 4.0), (row["baseline_p95_ms"], row["candidate_p95_ms"], row["value"]))
-        self.assertEqual(28, row["candidate_sample_count"])
-        self.assertEqual("advisory_exceeded", row["status"])
-
-    def test_warm_only_regression_stays_advisory_and_does_not_change_verdict_or_exit(self) -> None:
-        candidate, baseline = _labeled_pair(candidate_scale=2.0)
-        result = evaluate_kpi_guardrails(candidate, self.policy, baseline=baseline)
+    def test_warm_regression_behind_an_unchanged_cold_tail_is_reported_and_stays_advisory(self) -> None:
+        baseline = _latency_report(_warm_on(range(8, 20), lambda i: 100))
+        candidate = _latency_report(_warm_on(range(8, 20), lambda i: 200))
+        result = self.evaluate(candidate, baseline)
         row = _row(result, "regressions", "llm_p95_duration_ratio")
-        self.assertEqual(("warm_only", "advisory_exceeded", 2.0), (row["basis"], row["status"], row["value"]))
+        self.assertEqual(1.0, row["all_cases"]["ratio"])
+        self.assertEqual(("warm_only", 2.0, "advisory_exceeded"), (row["basis"], row["value"], row["status"]))
+        self.assertEqual((100.0, 200.0, 12, 12), (row["baseline_p95_ms"], row["candidate_p95_ms"],
+                                                  row["baseline_sample_count"], row["candidate_sample_count"]))
         self.assertFalse(row["blocking"])
         self.assertEqual(("passed", True, True), (result["verdict"], result["passed"], result["regression_passed"]))
 
-    def test_fallback_to_all_cases_when_a_report_lacks_labels_or_a_warm_case(self) -> None:
+    def test_slow_failed_requests_cannot_hide_behind_a_smaller_warm_sample(self) -> None:
+        # Reviewer's case: 17 warm cases against 7 warm plus 10 slow 503s. The old rule compared
+        # the 7 warm cases against the 17 and reported a ratio of 1.0.
+        baseline = _latency_report(lambda i: ("warm", 100), answerable=17)
+        candidate = _latency_report(lambda i: ("warm", 100) if i < 7 else ("unclassified", 5000, 503), answerable=17)
+        result = self.evaluate(candidate, baseline)
+        row = _row(result, "regressions", "llm_p95_duration_ratio")
+        self.assertEqual(("all_cases", 50.0, "advisory_exceeded"), (row["basis"], row["value"], row["status"]))
+        self.assertEqual((False, 7), (row["warm_only"]["evaluated"], row["warm_only"]["paired_case_count"]))
+        self.assertIsNone(row["warm_only"]["ratio"])
+        # The failed requests stay in the all-case sample: 17 answerable plus 8 abstention cases.
+        self.assertEqual(25, row["all_cases"]["candidate_sample_count"])
+        self.assertEqual(10, _row(result, "regressions", "llm_new_case_failures")["value"])
+        # Advisory: it is reported, and the regression group does not fail on it.
+        self.assertFalse(row["blocking"])
+        self.assertIs(True, result["regression_passed"])
+
+    def test_enough_paired_warm_cases_do_not_hide_failed_ones(self) -> None:
+        baseline = _latency_report(lambda i: ("warm", 100))
+        candidate = _latency_report(lambda i: ("warm", 100) if i < 10 else ("unclassified", 5000, 503))
+        row = self.latency(candidate, baseline)
+        self.assertEqual((True, 10, 1.0), (row["warm_only"]["evaluated"], row["warm_only"]["paired_case_count"],
+                                           row["warm_only"]["ratio"]))
+        self.assertEqual(("all_cases", 50.0), (row["basis"], row["value"]))
+
+    def test_a_tiny_warm_sample_is_not_trusted(self) -> None:
+        # Three warm cases doubled in time, everything else cold and unchanged.
+        baseline = _latency_report(_warm_on(range(3), lambda i: 100))
+        candidate = _latency_report(_warm_on(range(3), lambda i: 200))
+        row = self.latency(candidate, baseline)
+        self.assertEqual((False, 3), (row["warm_only"]["evaluated"], row["warm_only"]["paired_case_count"]))
+        self.assertEqual(("all_cases", 1.0, "passed"), (row["basis"], row["value"], row["status"]))
+        self.assertEqual((28, 28), (row["baseline_sample_count"], row["candidate_sample_count"]))
+
+    def test_warm_cases_are_paired_by_id_with_a_minimum_of_ten(self) -> None:
+        cases = (
+            # (name, baseline warm indexes, candidate warm indexes, expected paired, evaluated)
+            ("disjoint_but_large", range(0, 12), range(8, 20), 4, False),
+            ("nine_paired", range(0, 12), range(3, 15), 9, False),
+            ("ten_paired", range(0, 12), range(2, 14), 10, True),
+            ("all_paired", range(0, 20), range(0, 20), 20, True),
+        )
+        for name, old_warm, new_warm, paired, evaluated in cases:
+            with self.subTest(name):
+                baseline = _latency_report(_warm_on(set(old_warm), lambda i: 100))
+                # Candidate-only warm cases are slower, so including them would move the warm p95.
+                candidate = _latency_report(_warm_on(set(new_warm), lambda i: 100 if i in old_warm else 150))
+                warm = self.latency(candidate, baseline)["warm_only"]
+                self.assertEqual((paired, evaluated), (warm["paired_case_count"], warm["evaluated"]))
+                if evaluated:
+                    self.assertEqual((1.0, paired, paired), (warm["ratio"], warm["baseline_sample_count"],
+                                                             warm["candidate_sample_count"]))
+                else:
+                    self.assertIsNone(warm["ratio"])
+
+    def test_fallback_to_all_cases_when_labels_are_missing_partial_unknown_or_ambiguous(self) -> None:
         def unlabeled(report: dict) -> None:
             for case in _cases(report):
                 case.pop("latency_class")
@@ -529,22 +776,24 @@ class WarmOnlyLatencyRegressionTests(unittest.TestCase):
                 if case.get("latency_class") == "warm":
                     case["latency_class"] = "unclassified"
 
-        variants = {"baseline_unlabeled": ("baseline", unlabeled), "candidate_unlabeled": ("candidate", unlabeled),
-                    "baseline_partly_labeled": ("baseline", partly_labeled),
-                    "candidate_partly_labeled": ("candidate", partly_labeled),
-                    "baseline_no_warm": ("baseline", no_warm), "candidate_no_warm": ("candidate", no_warm)}
-        for name, (side, mutate) in variants.items():
-            with self.subTest(name):
-                candidate, baseline = _labeled_pair()
-                mutate(candidate if side == "candidate" else baseline)
-                row = self.latency(candidate, baseline)
-                self.assertEqual("all_cases", row["basis"])
-                self.assertEqual((28, 28), (row["baseline_sample_count"], row["candidate_sample_count"]))
+        def unknown_label(report: dict) -> None:
+            _cases(report)[4]["latency_class"] = "hot"
 
-    def test_unknown_label_values_are_not_trusted(self) -> None:
-        candidate, baseline = _labeled_pair()
-        _cases(candidate)[4]["latency_class"] = "hot"
-        self.assertEqual("all_cases", self.latency(candidate, baseline)["basis"])
+        def duplicate_ids(report: dict) -> None:
+            _cases(report)[5]["id"] = _cases(report)[4]["id"]
+
+        mutations = {"unlabeled": unlabeled, "partly_labeled": partly_labeled, "no_warm": no_warm,
+                     "unknown_label": unknown_label, "duplicate_ids": duplicate_ids}
+        for name, mutate in mutations.items():
+            # A baseline with duplicate ids fails its own coverage and is not comparable at all.
+            for side in (("candidate",) if name == "duplicate_ids" else ("baseline", "candidate")):
+                with self.subTest(name, side=side):
+                    candidate, baseline = _cold_tail_pair()
+                    mutate(candidate if side == "candidate" else baseline)
+                    row = self.latency(candidate, baseline)
+                    self.assertEqual("all_cases", row["basis"])
+                    self.assertFalse(row["warm_only"]["evaluated"])
+                    self.assertEqual((28, 28), (row["baseline_sample_count"], row["candidate_sample_count"]))
 
     def test_fixture_reports_from_before_the_labels_keep_the_previous_all_case_result(self) -> None:
         candidate, baseline = _report(), _report()
@@ -555,6 +804,7 @@ class WarmOnlyLatencyRegressionTests(unittest.TestCase):
             case["duration_ms"] = case["duration_ms"] * 2
         row = self.latency(candidate, baseline)
         self.assertEqual(("all_cases", 2.0, "advisory_exceeded"), (row["basis"], row["value"], row["status"]))
+        self.assertFalse(row["warm_only"]["evaluated"])
 
     def test_without_a_baseline_the_row_is_not_evaluated_and_has_no_basis(self) -> None:
         row = _row(evaluate_kpi_guardrails(_report(), self.policy), "regressions", "llm_p95_duration_ratio")
@@ -666,6 +916,40 @@ class StabilityDiagnosticTests(unittest.TestCase):
         self.assertEqual([], stability["status_disagreement_case_ids"])
         self.assertEqual([], stability["incomplete_case_ids"])
         self.assertEqual(4, stability["core_run_count"])
+
+    def test_failing_repeat_does_not_change_coverage_breakdown_regressions_or_verdict(self) -> None:
+        bad = {**_response(), "answer": "Submit within thirty days. [E1]"}
+        scenario = _Scenario([{}, {}, {"response": bad}, {}])
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation = _evaluate(scenario, _specs("answer-00", "answer-01"), temp,
+                                   core_repeat={"case_ids": ["answer-00", "answer-01"], "extra_runs": 1})
+        self.assertEqual("failed", evaluation["repetitions"][0]["status"])
+        baseline, plain, repeated = _report(), _report(), _report()
+        repeated["stages"]["live_llm"]["result"].update(
+            repetitions=evaluation["repetitions"], repetition_summary=evaluation["repetition_summary"],
+            repetition_plan=evaluation["repetition_plan"],
+            repetitions_interrupted_reason="repeat_phase_error", repetitions_error_type="OSError")
+        without = self.evaluate(plain, baseline=baseline)
+        with_repeats = self.evaluate(repeated, baseline=baseline)
+        self.assertEqual(self.judged(without), self.judged(with_repeats))
+        self.assertEqual(without["failure_breakdown"], with_repeats["failure_breakdown"])
+        self.assertEqual(0, with_repeats["failure_breakdown"]["failed_case_count"])
+        self.assertEqual("passed", _row(with_repeats, "hard", "coverage")["status"])
+        self.assertEqual("passed", with_repeats["verdict"])
+        self.assertEqual(without["regressions"], with_repeats["regressions"])
+        stability = with_repeats["stability"]
+        self.assertEqual(["answer-00"], stability["not_all_passed_case_ids"])
+        self.assertEqual(("repeat_phase_error", "OSError"), (stability["repetitions_interrupted_reason"],
+                                                             stability["repetitions_error_type"]))
+
+    def test_requesting_repeats_does_not_make_a_run_incomparable_with_a_baseline_without_them(self) -> None:
+        candidate = _with_summary(_report(), [_summary_row("answer-00", ["passed"] * 3, 1)])
+        candidate["core_repeat"] = {"case_ids": ["answer-00"], "extra_runs": 2}
+        result = self.evaluate(candidate, baseline=_report())
+        self.assertTrue(result["comparability"]["comparable"])
+        self.assertEqual("passed", result["verdict"])
+        # Only the main pass is compared, so repeats cannot enter the latency or failure rows.
+        self.assertEqual(28, _row(result, "regressions", "llm_p95_duration_ratio")["all_cases"]["candidate_sample_count"])
 
     def test_cli_prints_counts_only_when_repeats_exist_and_exit_code_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

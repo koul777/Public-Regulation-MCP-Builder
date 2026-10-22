@@ -667,9 +667,9 @@ def run_real_regulation_e2e(options: RunOptions) -> dict[str, Any]:
         "kpi_policy": {key: kpi_policy[key] for key in ("policy_id", "policy_version", "sha256")},
     }
     if "core_repeat" in validation:
-        # Only recorded when requested, so reports without repeats keep the same configuration
-        # and stay comparable with existing baselines.
-        report["configuration"]["core_repeat"] = validation["core_repeat"]
+        # Recorded beside, not inside, "configuration": the KPI checker compares configuration
+        # for baseline comparability, and repeating core cases must not make runs incomparable.
+        report["core_repeat"] = validation["core_repeat"]
     if validation["query_split"] == "holdout":
         # Recorded before any stage, so an aborted run still counts as opened.
         report["holdout_ledger_record"] = open_holdout(

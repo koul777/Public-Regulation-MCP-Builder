@@ -190,25 +190,69 @@ def _number(value: Any) -> int | float | None:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
 
 
-def classify_latency(generation_events: Iterable[Mapping[str, Any]]) -> str:
-    """Label one case run ``cold``, ``warm`` or ``unclassified`` from observed model loads.
+def _completed_generations(generation_events: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [event for event in generation_events
+            if isinstance(event, Mapping) and event.get("route") == "/api/generate"
+            and event.get("generation_completed") is True]
 
-    Cold: any completed generation reported ``load_duration_ns`` above
+
+def classify_latency(generation_events: Iterable[Mapping[str, Any]], answer_model: str | None) -> str:
+    """Label one case run ``cold``, ``warm`` or ``unclassified`` from the ANSWER model's load.
+
+    A multi-model case also calls a query and an audit model, and with a short
+    keep-alive on a CPU host those reload from case to case. Their loads are recorded
+    by ``model_load_summary`` but do not decide the label: only completed generations
+    of ``answer_model`` do. Cold: one of them reported ``load_duration_ns`` above
     ``COLD_LOAD_DURATION_NS``. Warm: at least one completed generation and every one
-    reported a load duration within that bound. A run with no completed generation
-    (abstention, rejection, transport error) or with an unreported load duration has
-    no evidence of either state, so it is ``unclassified`` rather than assumed warm.
-    This labels model residency only; it never measures first-token latency.
+    reported a load duration within that bound. An unknown answer model, no completed
+    generation of it (abstention, rejection, transport error) or an unreported load
+    duration is ``unclassified``, never assumed warm. This labels model residency
+    only; it never measures first-token latency.
     """
-    completed = [event for event in generation_events
-                 if isinstance(event, Mapping) and event.get("route") == "/api/generate"
-                 and event.get("generation_completed") is True]
+    if not isinstance(answer_model, str) or not answer_model:
+        return "unclassified"
+    completed = [event for event in _completed_generations(generation_events)
+                 if event.get("model") == answer_model]
     loads = [_number(event.get("load_duration_ns")) for event in completed]
     if any(load is not None and load > COLD_LOAD_DURATION_NS for load in loads):
         return "cold"
     if completed and all(load is not None for load in loads):
         return "warm"
     return "unclassified"
+
+
+def model_load_summary(generation_events: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per model name: completed generations and the summed and largest reported load duration.
+
+    ``load_duration_ns_sum`` and ``_max`` are ``None`` when no completed generation of
+    that model reported a load duration, so an absent figure is not read as zero.
+    """
+    models: dict[str, dict[str, Any]] = {}
+    for event in _completed_generations(generation_events):
+        name = str(event.get("model") or "")
+        if not name:
+            continue
+        row = models.setdefault(name, {"completed_generation_count": 0, "load_reported_count": 0,
+                                       "load_duration_ns_sum": None, "load_duration_ns_max": None})
+        row["completed_generation_count"] += 1
+        load = _number(event.get("load_duration_ns"))
+        if load is not None:
+            row["load_reported_count"] += 1
+            row["load_duration_ns_sum"] = (row["load_duration_ns_sum"] or 0) + load
+            row["load_duration_ns_max"] = max(row["load_duration_ns_max"] or 0, load)
+    return dict(sorted(models.items()))
+
+
+def _answer_model_for_latency(orchestration_model: Any, completed: list[Mapping[str, Any]],
+                              answer_digest: str, answer_text: str) -> str | None:
+    """The reported answer model, else the one model whose output text is the final answer."""
+    if isinstance(orchestration_model, str) and orchestration_model:
+        return orchestration_model
+    if not answer_text.strip():
+        return None
+    matching = {str(event["model"]) for event in completed
+                if event.get("candidate_answer_sha256") == answer_digest and event.get("model")}
+    return next(iter(matching)) if len(matching) == 1 else None
 
 
 class LocalOllamaObserver:
@@ -479,6 +523,7 @@ def score_case(spec: Mapping[str, Any], response: Mapping[str, Any], *, http_sta
     model = orchestration.get("answer_model")
     answer_matches = any(event.get("model") == model and event.get("candidate_answer_sha256") == answer_digest
                          for event in completed)
+    latency_model = _answer_model_for_latency(model, completed, answer_digest, answer)
     final_model_answer = (http_status == 200 and mode == "grounded_local" and model_called
                           and answer_matches and bool(answer.strip()) and not abstained and not fallback
                           and audit_accepted and citation_accepted)
@@ -549,7 +594,10 @@ def score_case(spec: Mapping[str, Any], response: Mapping[str, Any], *, http_sta
             "answer_mode": mode, "fallback": fallback, "abstained": abstained,
             "answer_present": bool(answer.strip()),
             "answer_sha256": answer_digest if answer.strip() else None,
-            "latency_class": classify_latency(completed),
+            "latency_class": classify_latency(completed, latency_model),
+            # Per-model load figures; only the answer model's decides latency_class.
+            "latency_info": {"label_basis": "answer_model_load_duration", "answer_model": latency_model,
+                             "models": model_load_summary(completed)},
             "claim_audit_status": orchestration.get("claim_audit_status"),
             "citation_verification_status": orchestration.get("citation_verification_status"),
             "answer_citation_context": context_check, "verification_limitations": limitations,
@@ -674,7 +722,8 @@ def validate_core_repeat(core_repeat: Any, known_case_ids: Collection[str]) -> d
     extra_runs = core_repeat.get("extra_runs")
     if type(extra_runs) is not int or not 1 <= extra_runs <= MAX_CORE_EXTRA_RUNS:
         raise ValueError("core_repeat_extra_runs_invalid")
-    return {"case_ids": list(case_ids), "extra_runs": extra_runs}
+    # Sorted wherever recorded, so the same plan always reads the same.
+    return {"case_ids": sorted(case_ids), "extra_runs": extra_runs}
 
 
 def summarize_repetitions(cases: list[dict[str, Any]], repetitions: list[dict[str, Any]], *,
@@ -766,7 +815,9 @@ def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] 
     cases serially after an uninterrupted main pass. Those runs are kept in
     ``repetitions`` and ``repetition_summary`` and never enter ``cases`` or
     ``aggregate``, so coverage, the case-ID set and ``passed`` stay those of the main
-    pass. Without it the report has no repetition keys.
+    pass. Without it the report has no repetition keys. An exception in the repeat phase
+    is recorded as ``repetitions_interrupted_reason="repeat_phase_error"`` with
+    ``repetitions_error_type`` and never prevents the main-pass report from being written.
     """
     endpoint = validate_loopback_endpoint(api_endpoint)
     specs = _query_specs(query_spec)
@@ -783,7 +834,7 @@ def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] 
                               "timing_policy": {"duration_ms": "case_wall_time_including_http_and_observer_drain",
                                                 "generation_duration_ms": "upstream_nonstream_request_wall_time",
                                                 "first_token_latency_measured": False,
-                                                "latency_class": "cold_if_any_completed_generation_load_duration_above_threshold",
+                                                "latency_class": "cold_if_answer_model_completed_generation_load_duration_above_threshold",
                                                 "cold_load_threshold_ns": COLD_LOAD_DURATION_NS},
                               "cases": []}
     consecutive_server_failures = 0
@@ -807,34 +858,44 @@ def evaluate_live_local_llm(*, api_endpoint: str, query_spec: Mapping[str, Any] 
         # Repeats follow the same stop rules, and an interrupted main pass runs none.
         report["repetition_plan"] = plan
         report["repetitions"] = []
-        if report.get("interrupted_reason"):
-            report["repetitions_interrupted_reason"] = "main_pass_interrupted"
-        else:
-            selected = [(index, spec, payload) for index, (spec, payload) in enumerate(zip(specs, requests), start=1)
-                        if str(spec["id"]) in plan["case_ids"]]
-            for repeat_index in range(1, plan["extra_runs"] + 1):
-                for index, spec, payload in selected:
-                    case_id = str(spec["id"])
-                    result, status, error_type = _run_live_case(
-                        endpoint=endpoint, spec=spec, payload=payload, observer=observer, headers=headers,
-                        case_headers=case_headers, directory=directory,
-                        filename=f"repeat-{index:04d}-r{repeat_index:02d}-{_sha(case_id)[:12]}.json",
-                        timeout_seconds=timeout_seconds, extra={"repeat_index": repeat_index})
-                    report["repetitions"].append(result)
-                    if error_type is not None:
-                        report["repetitions_interrupted_reason"] = "transport_or_observer_failure"
+        try:
+            if report.get("interrupted_reason"):
+                report["repetitions_interrupted_reason"] = "main_pass_interrupted"
+            else:
+                selected = [(index, spec, payload) for index, (spec, payload) in enumerate(zip(specs, requests), start=1)
+                            if str(spec["id"]) in plan["case_ids"]]
+                for repeat_index in range(1, plan["extra_runs"] + 1):
+                    for index, spec, payload in selected:
+                        case_id = str(spec["id"])
+                        result, status, error_type = _run_live_case(
+                            endpoint=endpoint, spec=spec, payload=payload, observer=observer, headers=headers,
+                            case_headers=case_headers, directory=directory,
+                            filename=f"repeat-{index:04d}-r{repeat_index:02d}-{_sha(case_id)[:12]}.json",
+                            timeout_seconds=timeout_seconds, extra={"repeat_index": repeat_index})
+                        report["repetitions"].append(result)
+                        if error_type is not None:
+                            report["repetitions_interrupted_reason"] = "transport_or_observer_failure"
+                            break
+                        # The counter carries over from the main pass: it is one request sequence.
+                        consecutive_server_failures = consecutive_server_failures + 1 if status >= 500 else 0
+                        if consecutive_server_failures >= _MAX_CONSECUTIVE_SERVER_FAILURES:
+                            report["repetitions_interrupted_reason"] = "consecutive_server_failures"
+                            break
+                    if report.get("repetitions_interrupted_reason"):
                         break
-                    # The counter carries over from the main pass: it is one request sequence.
-                    consecutive_server_failures = consecutive_server_failures + 1 if status >= 500 else 0
-                    if consecutive_server_failures >= _MAX_CONSECUTIVE_SERVER_FAILURES:
-                        report["repetitions_interrupted_reason"] = "consecutive_server_failures"
-                        break
-                if report.get("repetitions_interrupted_reason"):
-                    break
+        except Exception as exc:
+            # Whatever fails here (a repeat artifact write, say), the finished main pass is still
+            # reported and written below; only the exception type is kept, never its message.
+            report["repetitions_interrupted_reason"] = "repeat_phase_error"
+            report["repetitions_error_type"] = type(exc).__name__
         report["repetitions_expected_count"] = len(plan["case_ids"]) * plan["extra_runs"]
         report["repetitions_not_run_count"] = report["repetitions_expected_count"] - len(report["repetitions"])
-        report["repetition_summary"] = summarize_repetitions(
-            report["cases"], report["repetitions"], case_ids=plan["case_ids"], extra_runs=plan["extra_runs"])
+        try:
+            report["repetition_summary"] = summarize_repetitions(
+                report["cases"], report["repetitions"], case_ids=plan["case_ids"], extra_runs=plan["extra_runs"])
+        except Exception as exc:
+            report.setdefault("repetitions_interrupted_reason", "repeat_phase_error")
+            report.setdefault("repetitions_error_type", type(exc).__name__)
     report["aggregate"] = summarize_cases(report["cases"])
     report["not_run_count"] = len(specs) - len(report["cases"])
     report["not_run_case_ids"] = [str(spec["id"]) for spec in specs[len(report["cases"]):]]

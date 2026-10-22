@@ -40,6 +40,9 @@ HARD_CHECKS = ("coverage", "integrity", "no_auto_approval", "mcp_contract", "req
 TARGETS = ("retrieval_recall_at_5", "retrieval_mrr", "final_model_answer_rate",
            "required_fact_match_rate", "case_fact_pass_rate")
 REGRESSIONS = ("retrieval_new_misses", "mcp_new_failures", "llm_new_case_failures", "llm_p95_duration_ratio")
+# A warm-only p95 needs this many cases that are warm in both reports; fewer is too thin a
+# sample to say anything, so the comparison stays on every case.
+MIN_PAIRED_WARM_CASES = 10
 COMPARABLE_FIELDS = ("report_type", "schema_version", "query_spec_sha256", "corpus", "runtime_source_fingerprint",
                      "runtime_scope", "configuration", "label_provenance")
 PASSED, FAILED, UNAVAILABLE = "passed", "failed", "unavailable"
@@ -469,30 +472,63 @@ def evaluate_regressions(candidate: Mapping[str, Any], baseline: Mapping[str, An
             case_id for case_id, item in old.items() if passed(item) and not passed(new.get(case_id) or {}))
         rows.append(_regression(regression_id, policy, None if failures is None else len(failures), case_ids=failures))
 
-    old_all, old_warm = _latency_sample(baseline)
-    new_all, new_warm = _latency_sample(candidate)
-    # Warm-only needs cold/warm labels in both reports and a warm case in each; a report from
-    # before the labels existed (or with no warm case) falls back to every case, as before.
-    warm_only = bool(old_warm) and bool(new_warm)
-    old_sample, new_sample = (old_warm, new_warm) if warm_only else (old_all, new_all)
-    old_p95, new_p95 = _percentile(old_sample, .95), _percentile(new_sample, .95)
-    ratio = round(new_p95 / old_p95, 6) if old_p95 and new_p95 is not None else None
-    rows.append(_regression("llm_p95_duration_ratio", policy, ratio,
-                            basis="warm_only" if warm_only else "all_cases",
-                            baseline_p95_ms=old_p95, candidate_p95_ms=new_p95,
-                            baseline_sample_count=len(old_sample), candidate_sample_count=len(new_sample)))
+    rows.append(_latency_regression(candidate, baseline, policy))
     return rows
 
 
-def _latency_sample(report: Mapping[str, Any]) -> tuple[list[float], list[float]]:
-    """Return (all case durations, warm-case durations). The warm list is empty unless
-    every case carries a known ``latency_class`` label, so an unlabeled report never
-    yields a partial warm sample."""
+def _case_latency(report: Mapping[str, Any]) -> tuple[list[float], dict[str, float]]:
+    """Return (durations of every live case, durations of warm cases by id).
+
+    Every case counts in the first list, including ones that attempted the model but did
+    not complete (timeouts, 5xx). The warm map is empty unless every case carries a known
+    ``latency_class`` and ids are unique, so an unlabeled or ambiguous report never yields
+    a partial or mispaired warm sample."""
     cases = _items(report, "live_llm", "cases") or []
     durations = [_float(case.get("duration_ms")) for case in cases]
+    ids = [str(case.get("id") or "") for case in cases]
     labeled = bool(cases) and all(case.get("latency_class") in LATENCY_CLASSES for case in cases)
-    warm = [duration for case, duration in zip(cases, durations) if case.get("latency_class") == "warm"] if labeled else []
-    return durations, warm
+    if not labeled or not all(ids) or len(set(ids)) != len(ids):
+        return durations, {}
+    return durations, {case_id: duration for case_id, duration, case in zip(ids, durations, cases)
+                       if case.get("latency_class") == "warm"}
+
+
+def _p95_ratio(old: list[float], new: list[float]) -> dict[str, Any]:
+    old_p95, new_p95 = _percentile(old, .95), _percentile(new, .95)
+    ratio = round(new_p95 / old_p95, 6) if old_p95 and new_p95 is not None else None
+    return {"ratio": ratio, "baseline_p95_ms": old_p95, "candidate_p95_ms": new_p95,
+            "baseline_sample_count": len(old), "candidate_sample_count": len(new)}
+
+
+def _latency_regression(candidate: Mapping[str, Any], baseline: Mapping[str, Any],
+                        policy: Mapping[str, Any]) -> dict[str, Any]:
+    """p95 duration ratio over both reports' main-pass cases. Advisory per policy.
+
+    The all-case ratio is always computed. A warm-only ratio is added when at least
+    ``MIN_PAIRED_WARM_CASES`` cases are warm in BOTH reports, and it uses only those
+    paired cases. The row's value is the larger of the two, so a slow or failed case that
+    left the warm sample cannot hide a regression."""
+    old_all, old_warm = _case_latency(baseline)
+    new_all, new_warm = _case_latency(candidate)
+    overall = _p95_ratio(old_all, new_all)
+    paired = sorted(set(old_warm) & set(new_warm))
+    warm = (_p95_ratio([old_warm[case_id] for case_id in paired], [new_warm[case_id] for case_id in paired])
+            if len(paired) >= MIN_PAIRED_WARM_CASES else None)
+    ratios = [value for value in (overall["ratio"], None if warm is None else warm["ratio"]) if value is not None]
+    value = max(ratios) if ratios else None
+    # The basis names the sample that produced the value; a tie goes to the all-case sample.
+    use_warm = warm is not None and warm["ratio"] is not None and (
+        overall["ratio"] is None or warm["ratio"] > overall["ratio"])
+    chosen = warm if use_warm else overall
+    return _regression(
+        "llm_p95_duration_ratio", policy, value, basis="warm_only" if use_warm else "all_cases",
+        baseline_p95_ms=chosen["baseline_p95_ms"], candidate_p95_ms=chosen["candidate_p95_ms"],
+        baseline_sample_count=chosen["baseline_sample_count"], candidate_sample_count=chosen["candidate_sample_count"],
+        all_cases=overall,
+        warm_only={"evaluated": warm is not None, "paired_case_count": len(paired),
+                   "min_paired_case_count": MIN_PAIRED_WARM_CASES,
+                   **(warm or {"ratio": None, "baseline_p95_ms": None, "candidate_p95_ms": None,
+                               "baseline_sample_count": 0, "candidate_sample_count": 0})})
 
 
 # --- Failure-cause breakdown (diagnostic only) ---------------------------------------------
@@ -840,6 +876,8 @@ def _build_stability(report: Mapping[str, Any]) -> dict[str, Any] | None:
         "core_run_count": _count_or_none(summary.get("core_run_count")),
         "expected_core_run_count": _count_or_none(summary.get("expected_core_run_count")),
         "repetitions_interrupted_reason": llm.get("repetitions_interrupted_reason"),
+        "repetitions_error_type": llm.get("repetitions_error_type")
+        if isinstance(llm.get("repetitions_error_type"), str) else None,
         # Stable means every core case ran all planned runs and the runs agree.
         "all_stable": bool(rows) and not unstable and not incomplete,
         "status_disagreement_case_ids": sorted(status_disagreement),
