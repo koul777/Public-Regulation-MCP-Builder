@@ -152,6 +152,32 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 - 기존 `passed`는 LLM 문항 하나나 검색 하한 하나만 미달해도 `false`라서 target보다 엄격함. 가드레일 결과의 `candidate.legacy_report_passed`에 그대로 기록함.
 - 통합 실행기의 검색 단계 하한(Recall@5, MRR)은 같은 정책 파일에서 읽고, `report.json`의 `kpi_policy`에 정책 ID·버전·해시를 기록함.
 
+### 실패 원인 분류 (`failure_breakdown`)
+
+계획서 [§7 측정 결과에 따른 개발 분기](real_regulation_mcp_local_llm_10hour_plan_ko.md)는 가장 많은 실패 원인을 기준으로 다음 수정 대상을 고름. 가드레일 결과의 `failure_breakdown`이 문항별 원인을 미리 모아 줌.
+
+- 진단용 출력임. `verdict`, `passed`, hard·target·regression 행, 종료 코드에 영향을 주지 않음. 분류 계산이 실패해도 판정은 그대로이고 이 항목만 `status: "error"`가 됨.
+- 검색 결과, MCP 문항, LLM 문항을 문항 ID로 합쳐 어느 단계에서든 실패한 문항마다 주원인(`primary_cause`), 해당하는 모든 원인(`causes`), 원인별 코드(`codes`)를 기록함. 주원인은 아래 표의 위쪽 원인이 우선함.
+- 이 분류는 기록된 필드에 규칙을 적용한 결과이며 원인 확정이 아님. 근거 코드는 `scripts/check_real_regulation_kpi_guardrails.py`의 `FAILURE_CAUSES`와 `LLM_ERROR_CODE_CAUSES`에 있고, 테스트가 이 표와 `score_case`의 오류 코드가 일치하는지 확인함.
+
+| 순위 | 원인 | 판정 근거 | §7 분기 |
+| ---: | --- | --- | --- |
+| 1 | `security_leak` | 기권·차단 기대 문항이 답변·인용을 내보냄, 금지 사실이 나옴, 차단 기대 문항이 2xx로 응답. 코드: `blocked_case_exposed_answer_or_called_model`, `forbidden_fact_exposed`, `expected_clean_abstention`, `expected_client_rejection` | §7에 직접 항목 없음. 승인 가시성·번들 결함 분기로 분류하며, 기준을 낮춰 통과시키지 않음 |
+| 2 | `fabricated_citation` | 실질 답변(HTTP 200, 답변 있음, 기권 아님)의 인용이 없음·미확인·답변의 근거 번호 불일치·형식 오류·서버 거절·알 수 없는 제한 사유. `citation_trace` hard 검사와 같은 기준. 코드: `missing_citation`, `citation_not_verified`, `answer_citation_context_not_verified`, `invalid_citations_shape`, `citation_verification_not_accepted`, `unknown_verification_limitation` | 근거는 맞지만 답변이 틀림 (인용 불일치) |
+| 3 | `critical_fact` | 답변 가능 문항의 답변에 금지 사실이 나옴. 코드: `forbidden_fact_exposed` | 근거는 맞지만 답변이 틀림 (수치·단위 변형) |
+| 4 | `retrieval_miss` | 답변 가능 문항의 `recall_at_5`가 1.0 미만, 또는 MCP 문항이 대상 근거를 찾지 못함. 코드: `recall_at_5_below_1`, `mcp_target_evidence_not_retrieved`, `mcp_case_not_passed` (MCP 문항에 단계 정보가 없을 때) | 검색 누락 |
+| 5 | `retrieval_false_positive` | 근거 없음 질의가 검색 또는 MCP에서 결과를 반환. 코드: `no_evidence_query_returned_results`, `mcp_unexpected_evidence`. 요청 목록에 없던 원인이며, 검색 단계의 실패라서 같은 분기에 둠 | 검색 누락 |
+| 6 | `execution_error` | HTTP 상태 불일치, 전송 오류, 감사·인용 상태 누락, 검색 오류, 질의 명세 오류, MCP 검색·조회 실패. 코드: `llm_transport_error`, `unexpected_http_status`, `claim_audit_status_missing`, `citation_verification_status_missing`, `invalid_citations_shape`, `expected_clean_abstention` (빈 응답), `retrieval_search_error`, `retrieval_query_spec_invalid`, `mcp_search_failed`, `mcp_fetch_failed`, `mcp_case_incomplete` | 승인 가시성·번들 결함. 전송 오류가 `TimeoutError`이면 지연 분기도 확인 |
+| 7 | `generation_fallback` | 답변 가능 문항에 검증된 최종 모델 답변이 없음 (대체 응답, 기권, 감사 미수락). 코드: `final_model_generation_not_verified`, `claim_audit_not_accepted`, `citation_verification_not_accepted`, `answer_mode_fallback`, `answer_abstained`, `final_model_answer_false` | 지연 (모델 시간 초과·적재 지연). 감사 거절이 사유이면 근거는 맞지만 답변이 틀림 분기도 확인. 기록된 필드로 두 사유를 구분하지 못함 |
+| 8 | `answer_incomplete` | 검증된 최종 모델 답변이지만 필수 사실 일부가 빠짐. 코드: `gold_facts_failed` | 근거는 맞지만 답변이 틀림 (조건·예외 누락) |
+| 9 | `unknown` | 단계 자료 누락 또는 분류 불가. 사유는 `unknown_reasons`에 기록 | 없음 |
+
+- 출력 필드: `counts`와 `case_ids`는 각각 `primary`(주원인 기준)와 `any`(해당 원인이 하나라도 있는 문항 기준)를 가짐. `dominant_cause`는 주원인 건수가 가장 많은 원인이고, 동수이면 표에서 위쪽 원인임. `dominant_plan_branch`는 그 원인의 §7 분기임. `critical_case_ids`는 1~3순위 원인이 하나라도 있는 문항 ID의 합집합임.
+- 결과가 없는 HTTP·전송 오류 문항에는 답변에서 파생되는 원인(인용, 대체 응답, 사실 미충족)을 기록하지 않음. 최종 모델 답변이 아닌 문항의 사실 미충족은 `answer_incomplete`가 아니라 `generation_fallback`으로만 셈.
+- 단계 전체 또는 해당 문항의 자료가 없으면 `unknown`과 사유(`retrieval_stage_missing`, `mcp_case_missing`, `llm_case_not_run`, `retrieval_recall_not_recorded`, `gold_facts_unlabeled`, `unmapped_error:<코드>` 등)를 기록함. 다른 원인이 이미 있는 문항에서는 사유만 `unknown_reasons`에 남고 주원인은 바뀌지 않음.
+- §7의 첫 분기(원문 손실·경계 오류)는 이 분류로 판별하지 못함. `retrieval_miss`와 `answer_incomplete` 문항은 원문과 청크 경계를 직접 확인해야 함.
+- CLI 표준 출력에는 `failure_breakdown.dominant_cause`와 원인별 주원인 건수만 나옴. 문항 ID와 코드는 `--output` 파일에만 있음.
+
 ### 라벨 작성 규칙
 
 - `forbidden_facts`에는 문맥과 상관없이 답변에 나오면 안 되는 정확한 문자열만 넣음. 문자열 비교라서 "30일이 아니라 7일" 같은 부정문도 위반으로 집계됨.

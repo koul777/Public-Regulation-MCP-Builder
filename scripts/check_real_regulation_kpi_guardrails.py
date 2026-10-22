@@ -458,6 +458,305 @@ def evaluate_regressions(candidate: Mapping[str, Any], baseline: Mapping[str, An
     return rows
 
 
+# --- Failure-cause breakdown (diagnostic only) ---------------------------------------------
+# The guardrail rows say pass or fail per KPI. The plan (section 7 of
+# docs/real_regulation_mcp_local_llm_10hour_plan_ko.md) picks the next fix by the
+# dominant failure cause, so each failed case gets one primary cause plus the full
+# list. Nothing here feeds verdict, passed, hard/target/regression rows or exit codes.
+BRANCH_APPROVAL_BUNDLE = "승인 가시성·번들 결함"
+BRANCH_RETRIEVAL = "검색 누락"
+BRANCH_ANSWER = "근거는 맞지만 답변이 틀림"
+BRANCH_LATENCY = "지연"
+# Insertion order is the precedence: the first cause that applies is the primary one.
+# `codes` lists every code the cause can put in a case record; tests keep it exact.
+FAILURE_CAUSES: dict[str, dict[str, Any]] = {
+    # No section 7 bullet names a leak. Gates must not be relaxed to pass, so it points at
+    # the "fix approval and bundle first" branch (plan section 6: isolation and abstention 100%).
+    "security_leak": {"plan_branch": BRANCH_APPROVAL_BUNDLE,
+                      "codes": ("blocked_case_exposed_answer_or_called_model", "forbidden_fact_exposed",
+                                "expected_clean_abstention", "expected_client_rejection")},
+    "fabricated_citation": {"plan_branch": BRANCH_ANSWER,
+                            "codes": ("missing_citation", "citation_not_verified",
+                                      "answer_citation_context_not_verified", "invalid_citations_shape",
+                                      "citation_verification_not_accepted", "unknown_verification_limitation")},
+    "critical_fact": {"plan_branch": BRANCH_ANSWER, "codes": ("forbidden_fact_exposed",)},
+    "retrieval_miss": {"plan_branch": BRANCH_RETRIEVAL,
+                       "codes": ("recall_at_5_below_1", "mcp_target_evidence_not_retrieved", "mcp_case_not_passed")},
+    # Not in the brief's list: a no-evidence query that returned results is a retrieval-stage
+    # failure that is neither a miss nor a model leak, so it gets its own cause.
+    "retrieval_false_positive": {"plan_branch": BRANCH_RETRIEVAL,
+                                 "codes": ("no_evidence_query_returned_results", "mcp_unexpected_evidence")},
+    "execution_error": {"plan_branch": BRANCH_APPROVAL_BUNDLE,
+                        "codes": ("llm_transport_error", "unexpected_http_status", "claim_audit_status_missing",
+                                  "citation_verification_status_missing", "invalid_citations_shape",
+                                  "expected_clean_abstention", "retrieval_query_spec_invalid",
+                                  "retrieval_search_error", "mcp_search_failed", "mcp_fetch_failed",
+                                  "mcp_case_incomplete")},
+    # A fallback caused by a role timeout belongs to the latency branch; one caused by a
+    # rejected audit belongs to the answer branch. The recorded fields cannot tell them apart.
+    "generation_fallback": {"plan_branch": BRANCH_LATENCY,
+                            "codes": ("final_model_generation_not_verified", "claim_audit_not_accepted",
+                                      "citation_verification_not_accepted", "answer_mode_fallback",
+                                      "answer_abstained", "final_model_answer_false")},
+    "answer_incomplete": {"plan_branch": BRANCH_ANSWER, "codes": ("gold_facts_failed",)},
+    # Stage data is missing or a failure cannot be classified. `reasons` carry the details.
+    "unknown": {"plan_branch": None, "codes": ()},
+}
+CAUSE_PRECEDENCE = tuple(FAILURE_CAUSES)
+CRITICAL_CAUSES = CAUSE_PRECEDENCE[:3]
+# Every error code evaluate_live_local_llm.score_case can emit, with the causes it can feed.
+LLM_ERROR_CODE_CAUSES: dict[str, tuple[str, ...]] = {
+    "unexpected_http_status": ("execution_error",),
+    "claim_audit_status_missing": ("execution_error",),
+    "citation_verification_status_missing": ("execution_error",),
+    "claim_audit_not_accepted": ("generation_fallback",),
+    "citation_verification_not_accepted": ("fabricated_citation", "generation_fallback"),
+    "final_model_generation_not_verified": ("generation_fallback",),
+    "gold_facts_failed": ("answer_incomplete", "critical_fact"),
+    "gold_facts_unverified": ("unknown",),
+    "citation_not_verified": ("fabricated_citation",),
+    "answer_citation_context_not_verified": ("fabricated_citation",),
+    "invalid_citations_shape": ("fabricated_citation", "execution_error"),
+    "expected_client_rejection": ("security_leak",),
+    "blocked_case_exposed_answer_or_called_model": ("security_leak",),
+    "expected_clean_abstention": ("security_leak", "execution_error"),
+    "forbidden_fact_exposed": ("security_leak",),
+}
+Finding = tuple[str, str]  # (cause, code)
+
+
+def _error_codes(case: Mapping[str, Any]) -> list[str]:
+    errors = case.get("errors")
+    return [item for item in errors if isinstance(item, str)] if isinstance(errors, list) else []
+
+
+def _retrieval_findings(item: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
+    if item.get("query_spec_valid", True) is not True:
+        return [("execution_error", "retrieval_query_spec_invalid")], []
+    if item.get("search_succeeded") is not True:
+        return [("execution_error", "retrieval_search_error")], []
+    if item.get("expect_no_evidence") is True:
+        returned = item.get("no_evidence_false_positive") is not False or item.get("no_evidence_abstained") is not True
+        return ([("retrieval_false_positive", "no_evidence_query_returned_results")] if returned else []), []
+    recall = item.get("recall_at_5")
+    if not _is_number(recall):
+        return [], ["retrieval_recall_not_recorded"]
+    return ([("retrieval_miss", "recall_at_5_below_1")] if recall < 1.0 else []), []
+
+
+def _mcp_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
+    if case.get("passed") is True:
+        return [], []
+    protocol, retrieval = case.get("search_protocol_passed"), case.get("retrieval_passed")
+    if protocol is False:
+        return [("execution_error", "mcp_search_failed")], []
+    if protocol is True and retrieval is False:
+        if case.get("expect_no_evidence") is True:
+            return [("retrieval_false_positive", "mcp_unexpected_evidence")], []
+        return [("retrieval_miss", "mcp_target_evidence_not_retrieved")], []
+    if protocol is True and retrieval is True:
+        fetch = case.get("fetch")
+        fetch_failed = isinstance(fetch, list) and any(
+            isinstance(row, dict) and row.get("passed") is not True for row in fetch)
+        return [("execution_error", "mcp_fetch_failed" if fetch_failed else "mcp_case_incomplete")], []
+    # The case record has no stage detail; "not passed" is all that is known.
+    return [("retrieval_miss", "mcp_case_not_passed")], []
+
+
+def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
+    findings: list[Finding] = []
+    unknown: list[str] = []
+    errors = _error_codes(case)
+    http_status = case.get("http_status")
+    status_2xx = _is_int(http_status) and 200 <= http_status < 300
+    answer_present = case.get("answer_present")
+    abstained = case.get("abstained") is True
+    substantive = http_status == 200 and answer_present is True and not abstained
+    citations = case.get("citation_checks") if isinstance(case.get("citation_checks"), dict) else {}
+    context = case.get("answer_citation_context") if isinstance(case.get("answer_citation_context"), dict) else {}
+    correctness = case.get("correctness") if isinstance(case.get("correctness"), dict) else None
+    forbidden = (correctness or {}).get("forbidden_match_indices")
+    forbidden_hit = isinstance(forbidden, list) and bool(forbidden)
+    transport_error = bool(case.get("error_type"))
+
+    def add(cause: str, code: str) -> None:
+        findings.append((cause, code))
+
+    if transport_error:
+        add("execution_error", "llm_transport_error")
+    if not _answerable(case):
+        exposed = (answer_present is True and not abstained) or (
+            _is_int(citations.get("citation_count")) and citations["citation_count"] > 0)
+        if "blocked_case_exposed_answer_or_called_model" in errors:
+            add("security_leak", "blocked_case_exposed_answer_or_called_model")
+        if forbidden_hit or "forbidden_fact_exposed" in errors:
+            add("security_leak", "forbidden_fact_exposed")
+        # A non-2xx status is already reported as unexpected_http_status.
+        if "expected_clean_abstention" in errors and status_2xx:
+            add("security_leak" if exposed else "execution_error", "expected_clean_abstention")
+        if "expected_client_rejection" in errors and status_2xx:
+            add("security_leak", "expected_client_rejection")
+        if "unexpected_http_status" in errors and not (case.get("expected_block") is True and status_2xx):
+            add("execution_error", "unexpected_http_status")
+        if "invalid_citations_shape" in errors:
+            add("execution_error", "invalid_citations_shape")
+    else:
+        if "unexpected_http_status" in errors:
+            add("execution_error", "unexpected_http_status")
+        # Without a usable HTTP answer every answer-derived cause would only repeat this one.
+        if not transport_error and "unexpected_http_status" not in errors:
+            for code in ("claim_audit_status_missing", "citation_verification_status_missing"):
+                if code in errors:
+                    add("execution_error", code)
+            if not isinstance(answer_present, bool):
+                unknown.append("answer_presence_not_recorded")
+            if forbidden_hit:
+                add("critical_fact", "forbidden_fact_exposed")
+            if substantive:
+                count = citations.get("citation_count")
+                if not _is_int(count) or count < 1:
+                    add("fabricated_citation", "missing_citation")
+                elif citations.get("all_verified") is not True:
+                    add("fabricated_citation", "citation_not_verified")
+                if context.get("passed") is not True:
+                    add("fabricated_citation", "answer_citation_context_not_verified")
+                if "invalid_citations_shape" in errors:
+                    add("fabricated_citation", "invalid_citations_shape")
+                if "citation_verification_not_accepted" in errors and "citation_verification_status_missing" not in errors:
+                    add("fabricated_citation", "citation_verification_not_accepted")
+                limitations = case.get("verification_limitations")
+                if not (isinstance(limitations, list) and all(isinstance(item, str) for item in limitations)
+                        and set(limitations) <= KNOWN_TRACE_LIMITATIONS):
+                    add("fabricated_citation", "unknown_verification_limitation")
+            elif "invalid_citations_shape" in errors:
+                add("execution_error", "invalid_citations_shape")
+            final = case.get("final_model_answer")
+            if "final_model_generation_not_verified" in errors:
+                add("generation_fallback", "final_model_generation_not_verified")
+            if "claim_audit_not_accepted" in errors and "claim_audit_status_missing" not in errors:
+                add("generation_fallback", "claim_audit_not_accepted")
+            if (not substantive and "citation_verification_not_accepted" in errors
+                    and "citation_verification_status_missing" not in errors):
+                add("generation_fallback", "citation_verification_not_accepted")
+            if case.get("fallback") is True:
+                add("generation_fallback", "answer_mode_fallback")
+            if abstained:
+                add("generation_fallback", "answer_abstained")
+            if final is False and not any(cause == "generation_fallback" for cause, _ in findings):
+                add("generation_fallback", "final_model_answer_false")
+            if not isinstance(final, bool) and not any(cause == "generation_fallback" for cause, _ in findings):
+                unknown.append("final_model_answer_not_recorded")
+            if final is True:
+                required = (correctness or {}).get("required_count")
+                matched = (correctness or {}).get("matched_count")
+                if not (_is_int(required) and _is_int(matched)):
+                    unknown.append("correctness_not_recorded")
+                elif required == 0:
+                    if not forbidden_hit:
+                        unknown.append("gold_facts_unlabeled")
+                elif matched < required:
+                    add("answer_incomplete", "gold_facts_failed")
+    unknown.extend("unmapped_error:" + code[:60] for code in errors if code not in LLM_ERROR_CODE_CAUSES)
+    if case.get("status") != "passed" and not findings and not unknown:
+        unknown.append("llm_case_failed_unclassified")
+    return findings, unknown
+
+
+_BREAKDOWN_STAGES = (("retrieval", "results", "retrieval", _retrieval_findings),
+                     ("mcp", "cases", "mcp", _mcp_findings),
+                     ("live_llm", "cases", "llm", _llm_findings))
+
+
+def _group_by_id(items: list[dict[str, Any]] | None) -> tuple[dict[str, list[dict[str, Any]]] | None, int]:
+    if items is None:
+        return None, 0
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        case_id = str(item.get("id") or "")
+        if case_id:
+            grouped.setdefault(case_id, []).append(item)
+    return grouped, len(items) - sum(len(rows) for rows in grouped.values())
+
+
+def _build_failure_breakdown(report: Mapping[str, Any]) -> dict[str, Any]:
+    groups, unjoinable = [], 0
+    for stage, key, _label, _judge in _BREAKDOWN_STAGES:
+        grouped, without_id = _group_by_id(_items(report, stage, key))
+        groups.append(grouped)
+        unjoinable += without_id
+    raw_not_run = _llm_result(report).get("not_run_case_ids")
+    not_run = {item for item in raw_not_run if isinstance(item, str) and item} if isinstance(raw_not_run, list) else set()
+    case_ids = sorted(set().union(not_run, *(grouped.keys() for grouped in groups if grouped is not None)))
+    cases: list[dict[str, Any]] = []
+    for case_id in case_ids:
+        findings: list[tuple[str, str, str]] = []  # (stage, cause, code)
+        unknown: list[tuple[str, str]] = []  # (stage, reason)
+        for (stage, _key, label, judge), grouped in zip(_BREAKDOWN_STAGES, groups):
+            if grouped is None:
+                unknown.append((stage, f"{label}_stage_missing"))
+            elif case_id not in grouped:
+                unknown.append((stage, "llm_case_not_run" if stage == "live_llm" and case_id in not_run
+                                else f"{label}_case_missing"))
+            else:
+                for record in grouped[case_id]:
+                    stage_findings, stage_unknown = judge(record)
+                    findings.extend((stage, cause, code) for cause, code in stage_findings)
+                    unknown.extend((stage, reason) for reason in stage_unknown)
+        causes = [cause for cause in CAUSE_PRECEDENCE if any(item[1] == cause for item in findings)]
+        if not causes and unknown:
+            causes = ["unknown"]
+        if not causes:
+            continue
+        cases.append({
+            "id": case_id, "primary_cause": causes[0], "causes": causes,
+            "codes": {cause: sorted({code for _, found, code in findings if found == cause}) for cause in causes
+                      if cause != "unknown"},
+            "unknown_reasons": sorted({reason for _, reason in unknown}),
+            "failed_stages": [stage for stage, *_ in _BREAKDOWN_STAGES
+                              if any(item[0] == stage for item in findings) or any(item[0] == stage for item in unknown)],
+        })
+    primary = {cause: [case["id"] for case in cases if case["primary_cause"] == cause] for cause in CAUSE_PRECEDENCE}
+    anywhere = {cause: [case["id"] for case in cases if cause in case["causes"]] for cause in CAUSE_PRECEDENCE}
+    # max() keeps the first of equal counts, so ties go to the earlier cause in the precedence.
+    present = [cause for cause in CAUSE_PRECEDENCE if primary[cause]]
+    dominant = max(present, key=lambda cause: len(primary[cause])) if present else None
+    reason_counts: dict[str, int] = {}
+    for case in cases:
+        for reason in case["unknown_reasons"]:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        "schema_version": 1, "diagnostic_only": True, "status": "ok" if case_ids else "no_case_data",
+        "case_count": len(case_ids), "failed_case_count": len(cases), "unjoinable_record_count": unjoinable,
+        "cause_precedence": list(CAUSE_PRECEDENCE),
+        "plan_branches": {cause: FAILURE_CAUSES[cause]["plan_branch"] for cause in CAUSE_PRECEDENCE},
+        "dominant_cause": dominant,
+        "dominant_plan_branch": None if dominant is None else FAILURE_CAUSES[dominant]["plan_branch"],
+        "counts": {"primary": {cause: len(ids) for cause, ids in primary.items()},
+                   "any": {cause: len(ids) for cause, ids in anywhere.items()}},
+        "case_ids": {"primary": primary, "any": anywhere},
+        "critical_case_ids": sorted({case_id for cause in CRITICAL_CAUSES for case_id in anywhere[cause]}),
+        "unknown_reason_counts": dict(sorted(reason_counts.items())),
+        "cases": cases,
+    }
+
+
+def build_failure_breakdown(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify failed cases by cause. Diagnostic only: it must never change a verdict or exit code."""
+    try:
+        return _build_failure_breakdown(report)
+    except Exception as exc:  # a diagnostic bug must not turn a judged run into an input error
+        return {"schema_version": 1, "diagnostic_only": True, "status": "error", "reason": type(exc).__name__,
+                "dominant_cause": None, "counts": {"primary": {}, "any": {}}}
+
+
+def failure_breakdown_summary(breakdown: Mapping[str, Any]) -> dict[str, Any]:
+    """Short stdout form: the dominant cause and non-zero primary counts, no case ids."""
+    counts = breakdown.get("counts")
+    primary = counts.get("primary") if isinstance(counts, dict) else None
+    return {"dominant_cause": breakdown.get("dominant_cause"),
+            "counts": {cause: count for cause, count in (primary or {}).items() if count}}
+
+
 def _require_report(report: Any, policy: Mapping[str, Any]) -> Mapping[str, Any]:
     if (not isinstance(report, dict) or report.get("report_type") != policy["report_type"]
             or report.get("schema_version") not in policy["report_schema_versions"]):
@@ -525,6 +824,7 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         "legacy_verdict_note": "The run report's own passed flag fails on any single LLM case or retrieval "
                                "threshold miss, so it is stricter than these targets and is reported unchanged.",
         "limitations": limitations,
+        "failure_breakdown": build_failure_breakdown(report),
     }
 
 
@@ -560,7 +860,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     print(json.dumps({"verdict": result["verdict"], "passed": result["passed"], "hard_passed": result["hard_passed"],
                       "targets_met": result["targets_met"], "regression_passed": result["regression_passed"],
-                      "legacy_report_passed": result["candidate"]["legacy_report_passed"]}))
+                      "legacy_report_passed": result["candidate"]["legacy_report_passed"],
+                      "failure_breakdown": failure_breakdown_summary(result["failure_breakdown"])}))
     if result["verdict"] == "not_comparable":
         return 2
     return 0 if result["passed"] else 1
