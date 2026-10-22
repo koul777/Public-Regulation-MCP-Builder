@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, nullcontext, redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -14,7 +15,12 @@ from scripts.run_real_regulation_e2e import (
     EvidenceError,
     RunOptions,
     active_runtime_integrity,
+    check_holdout_gate,
+    main,
     managed_local_api,
+    open_holdout,
+    seal_holdout,
+    _ledger_lock,
     _record_stage,
     options_from_config,
     require_private_path,
@@ -23,6 +29,10 @@ from scripts.run_real_regulation_e2e import (
     validate_options,
     verify_corpus,
 )
+
+
+class _AbortRun(BaseException):
+    """Stands in for an interrupt that Exception handlers do not catch."""
 
 
 class RealRegulationE2eEvidenceTests(unittest.TestCase):
@@ -307,18 +317,22 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
         lock.write_bytes(b"unexpected contents")
         self.assertFalse(self._active_integrity(before)["passed"])
 
-    def _run_synthetic_stages(self, *, mcp_effect=None):
+    def _patch_synthetic_stages(self, stack, *, mcp_effect=None, probe_effect=None):
+        stack.enter_context(patch("scripts.report_metadata.capture_mcp_performance_source_state", return_value={}))
+        stack.enter_context(patch("scripts.report_metadata.finalize_mcp_performance_source_state", return_value={"stable": True}))
+        stack.enter_context(patch("scripts.report_metadata.current_repo_commit", return_value="synthetic"))
+        probe = stack.enter_context(patch("scripts.real_regulation_corpus_probe.run_corpus_probe", side_effect=probe_effect, return_value={
+            "passed": True, "results": [{"source_document_id": "synthetic-document", "passed": True}]}))
+        retrieval = stack.enter_context(patch("scripts.evaluate_mcp_retrieval_quality.evaluate_mcp_retrieval_quality", return_value={"passed": True}))
+        mcp = stack.enter_context(patch("scripts.real_regulation_mcp_probe.run_mcp_probe", side_effect=mcp_effect, return_value={"passed": True}))
+        stack.enter_context(patch("scripts.evaluate_live_local_llm.LocalOllamaObserver"))
+        live = stack.enter_context(patch("scripts.evaluate_live_local_llm.evaluate_live_local_llm", return_value={"passed": True}))
+        stack.enter_context(patch("scripts.run_real_regulation_e2e.managed_local_api", return_value=nullcontext(("http://127.0.0.1:1", {}))))
+        return probe, retrieval, mcp, live
+
+    def _run_synthetic_stages(self, *, mcp_effect=None, probe_effect=None):
         with ExitStack() as stack:
-            stack.enter_context(patch("scripts.report_metadata.capture_mcp_performance_source_state", return_value={}))
-            stack.enter_context(patch("scripts.report_metadata.finalize_mcp_performance_source_state", return_value={"stable": True}))
-            stack.enter_context(patch("scripts.report_metadata.current_repo_commit", return_value="synthetic"))
-            stack.enter_context(patch("scripts.real_regulation_corpus_probe.run_corpus_probe", return_value={
-                "passed": True, "results": [{"source_document_id": "synthetic-document", "passed": True}]}))
-            retrieval = stack.enter_context(patch("scripts.evaluate_mcp_retrieval_quality.evaluate_mcp_retrieval_quality", return_value={"passed": True}))
-            mcp = stack.enter_context(patch("scripts.real_regulation_mcp_probe.run_mcp_probe", side_effect=mcp_effect, return_value={"passed": True}))
-            stack.enter_context(patch("scripts.evaluate_live_local_llm.LocalOllamaObserver"))
-            live = stack.enter_context(patch("scripts.evaluate_live_local_llm.evaluate_live_local_llm", return_value={"passed": True}))
-            stack.enter_context(patch("scripts.run_real_regulation_e2e.managed_local_api", return_value=nullcontext(("http://127.0.0.1:1", {}))))
+            _, retrieval, mcp, live = self._patch_synthetic_stages(stack, mcp_effect=mcp_effect, probe_effect=probe_effect)
             report = run_real_regulation_e2e(self.options)
         return report, retrieval, mcp, live
 
@@ -381,6 +395,247 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
         self.assertEqual("failed", result["status"])
         self.assertEqual("RuntimeError", result["error_type"])
         self.assertNotIn("raw provider", json.dumps(result))
+
+    # Development/holdout split and the once-only holdout ledger.
+
+    def _write_spec(self, **extra) -> str:
+        case = {"id": "synthetic-case", "query": "synthetic question", "target_document_ids": ["synthetic-document"]}
+        self.query_spec.write_text(json.dumps({**extra, "queries": [case]}), encoding="utf-8")
+        return hashlib.sha256(self.query_spec.read_bytes()).hexdigest()
+
+    def _holdout_options(self, *, sealed: bool = True) -> str:
+        sha = self._write_spec(split="holdout")
+        self.ledger = self.root / "ledger" / "holdout.jsonl"
+        if sealed:
+            seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256=sha,
+                         development_query_count=1, holdout_query_count=1)
+        self.options = replace(self.options, holdout_ledger=self.ledger)
+        return sha
+
+    def _next_run(self) -> None:
+        self._run_index = getattr(self, "_run_index", 0) + 1
+        self.options = replace(self.options, output_dir=self.root / f"run-{self._run_index}")
+
+    def _ledger_events(self) -> list[str]:
+        if not self.ledger.exists():
+            return []
+        return [json.loads(line)["event"] for line in self.ledger.read_text(encoding="utf-8").splitlines()]
+
+    def _append_ledger_line(self, record: dict) -> None:
+        with self.ledger.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record) + "\n")
+
+    def _assert_no_stage_ran(self, *mocks) -> None:
+        for mock in mocks:
+            mock.assert_not_called()
+
+    def test_split_label_is_validated_and_recorded_in_the_report(self) -> None:
+        self._write_spec()
+        self.assertEqual("unspecified", validate_options(self.options)["query_split"])
+        for value in ("dev", "Holdout", "unspecified", "", None, ["holdout"], 1):
+            self._write_spec(split=value)
+            with self.subTest(split=value), self.assertRaisesRegex(EvidenceError, "query_split_invalid"):
+                validate_options(self.options)
+        self.query_spec.write_text(json.dumps({"queries": [{"id": "case", "query": "question", "split": "holdout"}]}), encoding="utf-8")
+        with self.assertRaisesRegex(EvidenceError, "case_level_split_not_supported"):
+            validate_options(self.options)
+
+        for label, spec in (("development", {"split": "development"}), ("unspecified", {})):
+            self._write_spec(**spec)
+            self._next_run()
+            report, *_ = self._run_synthetic_stages()
+            with self.subTest(split=label):
+                self.assertEqual(label, report["query_split"])
+                self.assertNotIn("holdout_ledger_record", report)
+
+    def test_development_run_never_touches_a_configured_ledger(self) -> None:
+        self._write_spec(split="development")
+        self.ledger = self.root / "ledger" / "holdout.jsonl"
+        self.options = replace(self.options, holdout_ledger=self.ledger)
+        report, *_ = self._run_synthetic_stages()
+        self.assertTrue(report["passed"])
+        self.assertFalse(self.ledger.parent.exists())
+
+    def test_holdout_requires_a_configured_ledger(self) -> None:
+        self._write_spec(split="holdout")
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_required"):
+                run_real_regulation_e2e(self.options)
+            self._assert_no_stage_ran(*mocks)
+        self.assertFalse(self.options.output_dir.exists())
+
+    def test_holdout_run_is_refused_without_a_seal_for_this_spec_hash(self) -> None:
+        sha = self._holdout_options(sealed=False)
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_missing"):
+                run_real_regulation_e2e(self.options)
+            seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256="e" * 64,
+                         development_query_count=1, holdout_query_count=1)
+            self._append_ledger_line({"event": "opened", "query_spec_sha256": sha})
+            before = self.ledger.read_bytes()
+            with self.assertRaisesRegex(EvidenceError, "holdout_not_sealed"):
+                run_real_regulation_e2e(self.options)
+            self.assertEqual(before, self.ledger.read_bytes())
+            self._assert_no_stage_ran(*mocks)
+        self.assertFalse(self.options.output_dir.exists())
+
+    def test_sealed_holdout_opens_once_and_embeds_the_record(self) -> None:
+        sha = self._holdout_options()
+        report, *_ = self._run_synthetic_stages()
+        record = report["holdout_ledger_record"]
+        self.assertTrue(report["passed"])
+        self.assertEqual("holdout", report["query_split"])
+        self.assertEqual(("opened", sha, False), (record["event"], record["query_spec_sha256"], record["authorized_rerun"]))
+        self.assertEqual(["sealed", "opened"], self._ledger_events())
+        self.assertEqual(record, json.loads(self.ledger.read_text(encoding="utf-8").splitlines()[-1]))
+        saved = json.loads((self.options.output_dir / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(record, saved["holdout_ledger_record"])
+
+        self._next_run()
+        before = self.ledger.read_bytes()
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+                run_real_regulation_e2e(self.options)
+            self._assert_no_stage_ran(*mocks)
+        self.assertEqual(before, self.ledger.read_bytes())
+        self.assertFalse(self.options.output_dir.exists())
+
+    def test_rerun_authorization_covers_exactly_one_more_opening(self) -> None:
+        sha = self._holdout_options()
+        self._run_synthetic_stages()
+
+        self._append_ledger_line({"event": "rerun_authorized", "query_spec_sha256": "f" * 64})
+        self._next_run()
+        with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+            validate_options(self.options)
+
+        self._append_ledger_line({"event": "rerun_authorized", "query_spec_sha256": sha})
+        report, *_ = self._run_synthetic_stages()
+        self.assertTrue(report["holdout_ledger_record"]["authorized_rerun"])
+        self.assertEqual(["sealed", "opened", "rerun_authorized", "rerun_authorized", "opened"], self._ledger_events())
+
+        self._next_run()
+        with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+            validate_options(self.options)
+
+    def test_check_only_validates_the_gate_without_writing(self) -> None:
+        sha = self._holdout_options()
+        config = self.root / "config.json"
+        config.write_text(json.dumps({
+            "runtime_source": str(self.runtime), "corpus_manifest": str(self.manifest), "query_spec": str(self.query_spec),
+            "tenant_id": "synthetic-tenant", "holdout_ledger": str(self.ledger)}), encoding="utf-8")
+
+        def check_only() -> tuple[int, dict]:
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                code = main(["--config", str(config), "--output-dir", str(self.options.output_dir), "--check-only"])
+            return code, json.loads(stream.getvalue())
+
+        sealed_bytes = self.ledger.read_bytes()
+        listing = sorted(path.name for path in self.ledger.parent.iterdir())
+        code, summary = check_only()
+        self.assertEqual((0, "holdout", False), (code, summary["query_split"], summary["execution_performed"]))
+        self.assertEqual(sealed_bytes, self.ledger.read_bytes())
+        self.assertEqual(listing, sorted(path.name for path in self.ledger.parent.iterdir()))
+        self.assertFalse(self.options.output_dir.exists())
+
+        opened = open_holdout(self.ledger, sha, query_count=1)
+        opened_bytes = self.ledger.read_bytes()
+        code, summary = check_only()
+        self.assertEqual((2, "holdout_already_opened"), (code, summary["reason_code"]))
+        self.assertEqual(opened_bytes, self.ledger.read_bytes())
+        self.assertEqual("opened", opened["event"])
+
+    def test_opened_record_is_written_before_any_stage_even_if_a_stage_fails(self) -> None:
+        sha = self._holdout_options()
+        seen: list[list[str]] = []
+
+        def failing_probe(**kwargs):
+            seen.append(self._ledger_events())
+            raise RuntimeError("private detail must not escape")
+
+        report, *_ = self._run_synthetic_stages(probe_effect=failing_probe)
+        self.assertEqual([["sealed", "opened"]], seen)
+        self.assertEqual("failed", report["stages"]["preprocessing"]["status"])
+        self.assertFalse(report["passed"])
+        self.assertEqual(sha, report["holdout_ledger_record"]["query_spec_sha256"])
+        self.assertEqual(["sealed", "opened"], self._ledger_events())
+
+    def test_interrupted_holdout_run_still_counts_as_opened(self) -> None:
+        self._holdout_options()
+
+        def interrupted_probe(**kwargs):
+            raise _AbortRun()
+
+        with self.assertRaises(_AbortRun):
+            self._run_synthetic_stages(probe_effect=interrupted_probe)
+        self.assertEqual(["sealed", "opened"], self._ledger_events())
+        self._next_run()
+        with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+            validate_options(self.options)
+
+    def test_ledger_write_failure_stops_the_run_before_any_stage(self) -> None:
+        self._holdout_options()
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            stack.enter_context(patch("scripts.run_real_regulation_e2e.os.fsync", side_effect=OSError("disk")))
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_write_failed"):
+                run_real_regulation_e2e(self.options)
+            self._assert_no_stage_ran(*mocks)
+
+    def test_unreadable_or_misplaced_ledger_fails_closed(self) -> None:
+        sha = self._holdout_options()
+        good = self.ledger.read_bytes()
+        valid_line = json.dumps({"event": "sealed", "query_spec_sha256": sha})
+        for name, content in (
+                ("not_json", b"not json\n"),
+                ("no_hash", b'{"event": "sealed"}\n'),
+                ("unknown_event", json.dumps({"event": "reset", "query_spec_sha256": sha}).encode() + b"\n"),
+                ("list_event", json.dumps({"event": ["sealed"], "query_spec_sha256": sha}).encode() + b"\n"),
+                ("duplicate_key", b'{"event": "sealed", "event": "sealed", "query_spec_sha256": "' + sha.encode() + b'"}\n'),
+                ("truncated_last_line", good + valid_line.encode()),
+                ("blank_line", good + b"\n")):
+            self.ledger.write_bytes(content)
+            with self.subTest(content=name), self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
+                validate_options(self.options)
+        self.ledger.unlink()
+        self.ledger.mkdir()
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_path_invalid"):
+            validate_options(self.options)
+        self.ledger.rmdir()
+        for name, location in (("runtime", self.runtime / "ledger.jsonl"), ("output", self.options.output_dir / "ledger.jsonl"),
+                               ("query_spec", self.query_spec), ("corpus", self.manifest)):
+            with self.subTest(location=name), self.assertRaisesRegex(EvidenceError, "holdout_ledger_overlaps_run_paths"):
+                validate_options(replace(self.options, holdout_ledger=location))
+
+    def test_concurrent_open_or_seal_is_refused_while_the_ledger_is_locked(self) -> None:
+        sha = self._holdout_options()
+        before = self.ledger.read_bytes()
+        with _ledger_lock(self.ledger):
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_locked"):
+                open_holdout(self.ledger, sha, query_count=1)
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_locked"):
+                seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256="a" * 64,
+                             development_query_count=1, holdout_query_count=1)
+        self.assertEqual(before, self.ledger.read_bytes())
+        self.assertEqual({"authorized_rerun": False}, check_holdout_gate(self.ledger, sha))
+        open_holdout(self.ledger, sha, query_count=1)
+        self.assertEqual(["sealed", "opened"], self._ledger_events())
+
+    def test_holdout_ledger_configuration_types(self) -> None:
+        config = {"runtime_source": str(self.runtime), "corpus_manifest": str(self.manifest),
+                  "query_spec": str(self.query_spec), "tenant_id": "synthetic-tenant"}
+        self.assertIsNone(options_from_config(config, self.options.output_dir).holdout_ledger)
+        ledger = self.root / "ledger.jsonl"
+        self.assertEqual(ledger, options_from_config({**config, "holdout_ledger": str(ledger)}, self.options.output_dir).holdout_ledger)
+        for value in (5, "", "  ", ["x"], True):
+            with self.subTest(value=value), self.assertRaisesRegex(EvidenceError, "holdout_ledger_path_invalid"):
+                options_from_config({**config, "holdout_ledger": value}, self.options.output_dir)
+        with self.assertRaisesRegex(EvidenceError, "private_path_must_be_absolute"):
+            validate_options(replace(self.options, holdout_ledger=Path("ledger.jsonl")))
 
 
 if __name__ == "__main__":

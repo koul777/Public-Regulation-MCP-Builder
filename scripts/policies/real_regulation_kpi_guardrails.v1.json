@@ -25,7 +25,8 @@
     "retrieval_no_evidence",
     "negative_cases",
     "forbidden_facts",
-    "citation_trace"
+    "citation_trace",
+    "holdout_protocol"
   ],
   "coverage_profiles": {
     "full": {"min_answerable_cases": 20, "min_negative_cases": 8, "min_no_evidence_queries": 4},

@@ -19,6 +19,53 @@ Query spec은 `queries` 배열이며 각 문항에 고유 `id`, `query`, `target
 
 각 실행은 tenant/profile 하나에 고정한다. 전체 `scope`, 문항 `scope`, `request_overrides.profile_id`도 이 범위와 일치해야 한다. 다른 범위를 시험하려면 별도의 실행과 보고서를 사용한다. 기존 runtime이 평면 저장인지 tenant별 저장인지 `tenant_storage_isolation`으로 명시한다.
 
+### 개발/보류 평가셋 봉인
+
+계획서 §4의 개발/보류 구분을 spec 라벨, 봉인 기록, 실행 검사로 강제함. 보류셋은 최종 후보를 정한 뒤 한 번만 실행함.
+
+- query spec 최상위에 `"split": "development"` 또는 `"split": "holdout"`을 둠. 생략하면 `unspecified`로 처리함. 그 밖의 값(대소문자 차이 포함)은 `query_split_invalid`, 문항 단위 `split`은 `case_level_split_not_supported`로 거절함.
+- 실행 보고서에 `query_split`이 기록됨.
+- 기록 파일(ledger)은 공개 checkout 밖에 두는 추가 전용 JSONL임. 경로는 실행 설정의 `holdout_ledger`(절대 경로)로 지정하며, runtime·출력 디렉터리·입력 파일과 겹치면 `holdout_ledger_overlaps_run_paths`로 거절함.
+
+| ledger 이벤트 | 기록 주체 | 의미 |
+| --- | --- | --- |
+| `sealed` | 봉인 명령 | 개발/보류 spec이 겹치지 않음을 확인하고 두 spec의 SHA-256, 문항 수, 시각을 기록 |
+| `opened` | 통합 실행기 | 보류셋 실행 시작. 첫 단계 전에 기록하므로 중단된 실행도 연 것으로 셈 |
+| `rerun_authorized` | 사람이 직접 추가 | 해당 spec 해시의 가장 최근 기록일 때 한 번 더 열 수 있음 |
+
+봉인은 두 spec이 확정된 뒤 한 번 실행함.
+
+```powershell
+python scripts/seal_real_regulation_holdout.py --development "<개발 spec 절대 경로>" --holdout "<보류 spec 절대 경로>" --ledger "<비공개 ledger 절대 경로>"
+```
+
+봉인 명령의 검사와 기록.
+
+- 개발 spec은 `split: development`, 보류 spec은 `split: holdout`이어야 함. 아니면 `development_spec_split_mismatch`, `holdout_spec_split_mismatch`로 거절함.
+- 두 spec이 같은 `id`, 같은 질문 문장(공백·대소문자 차이 무시), 같은 청크를 공유하면 거절함. 청크는 `target_chunk_id(s)`와 `allowed_citations`의 `chunk_id`·`evidence_id(s)`를 비교함.
+- 같은 보류 spec 해시는 한 번만 봉인함(`holdout_already_sealed`). 열린 보류셋을 다시 봉인해 기록을 되돌릴 수 없음.
+- ledger에는 해시, 문항 수, 시각만 씀. 질문, 답변, ID, 경로는 쓰지 않음.
+- 기존 ledger 줄이 손상됐으면 줄을 추가하지 않고 `holdout_ledger_corrupt`로 종료함.
+
+`split: holdout` 실행의 규칙.
+
+- `--check-only`를 포함해 단계 실행 전에 `holdout_ledger` 설정, 같은 spec 해시의 `sealed` 기록, `opened` 기록 없음을 확인함. 위반하면 `holdout_ledger_required`, `holdout_ledger_missing`, `holdout_not_sealed`, `holdout_already_opened`, `holdout_ledger_corrupt` 중 하나를 출력하고 종료 코드 2로 끝남.
+- 실제 실행은 첫 단계 전에 `opened` 기록을 추가하고 같은 기록을 `report.json`의 `holdout_ledger_record`에 넣음. `--check-only`는 ledger에 쓰지 않음.
+- 기록을 쓰지 못하면 `holdout_ledger_write_failed`로 단계 실행 없이 끝남. ledger 옆의 `.lock` 파일로 동시 실행을 막으며, 다른 실행이 잠금을 걸어 둔 상태면 기다리지 않고 `holdout_ledger_locked`로 거절함.
+- 이미 열린 보류셋은 해당 해시의 가장 최근 기록이 `rerun_authorized`일 때만 한 번 더 열림. 새 `opened`가 뒤따르면 다시 막힘. 이 기록은 사람이 아래 형식으로 직접 한 줄 추가하며, 에이전트와 자동화는 쓰지 않음.
+
+```json
+{"event": "rerun_authorized", "query_spec_sha256": "<보류 spec SHA-256>", "recorded_at": "<UTC 시각>", "reason": "<재실행 사유>"}
+```
+
+KPI 검사기의 `holdout_protocol`은 `query_split`이 `holdout`인 보고서에 `event`가 `opened`이고 `query_spec_sha256`이 보고서와 같은 `holdout_ledger_record`가 있는지 확인함. 가드레일 결과의 `candidate.query_split`에 분할 라벨이 기록됨.
+
+한계.
+
+- ledger는 사람이 편집할 수 있는 파일이라 변조 방지가 아님. 실수로 반복 실행하는 일을 막고 열린 이력을 남기는 장치임.
+- 겹침 검사는 봉인 시점의 두 spec만 비교함. 봉인 뒤 개발 spec에 보류 문항을 옮겨 넣는 경우는 검사하지 않음.
+- 해시는 spec 파일 바이트 기준임. 보류 spec을 한 글자라도 고치면 새 해시가 되어 다시 봉인해야 함. 보류 문항 사본의 라벨만 `development`로 바꾸는 우회는 사람이 검토해야 함.
+
 ## 통합 실행
 
 비공개 JSON 설정에 아래 값을 채운다. 경로·tenant·profile 값은 자신의 비공개 입력으로 바꾼다.
@@ -101,7 +148,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 
 | 등급 | 판정 | 항목 |
 | --- | --- | --- |
-| hard | 위반 1건 또는 근거 누락이면 실패 | 아래 9개 |
+| hard | 위반 1건 또는 근거 누락이면 실패 | 아래 10개 |
 | target | 최소 문항 수를 채웠을 때 하한과 비교 | Recall@5 ≥ 0.95, MRR ≥ 0.85, 최종 모델 답변률 ≥ 0.95, 사실 앵커 충족률 ≥ 0.90, 문항 단위 사실 충족률 ≥ 0.90 |
 | regression | `--baseline`을 줬을 때만 | 차단: 검색 새 누락 0건, MCP 새 실패 0건. 참고: LLM 문항 새 실패, LLM p95 시간 비율 ≤ 1.10 |
 
@@ -116,6 +163,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 | `negative_cases` | 기권·차단 기대 문항이 1개 이상이고 모두 통과 |
 | `forbidden_facts` | 어느 문항에서도 금지 사실 앵커가 나오지 않음 |
 | `citation_trace` | 답변 가능 문항의 실질 답변마다 인용 1개 이상, 인용 신원·인용문 확인, 답변의 근거 번호 일치. 계약상 context ID·해시가 없는 대체 답변 인용(`deterministic_citation_omits_context_and_hash`, `content_hash_not_available_in_gold`)은 실패로 세지 않고 `limited_trace_case_ids`에 따로 표시. 그 밖의 제한 사유는 실패 |
+| `holdout_protocol` | `query_split`이 `holdout`이면 `holdout_ledger_record`가 있고 `event`가 `opened`이며 `query_spec_sha256`이 보고서와 같음. `development`·`unspecified`는 통과, 그 밖의 값은 실패 |
 
 `retrieval_no_evidence`와 `negative_cases`는 위반이 없어도 문항 수가 coverage profile 최소치보다 적으면 `insufficient_sample`. 위반이 있으면 문항 수와 상관없이 `failed`.
 

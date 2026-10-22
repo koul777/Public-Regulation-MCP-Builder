@@ -434,6 +434,89 @@ class KpiRegressionTests(unittest.TestCase):
         self.assertIn("baseline_coverage_failed", result["comparability"]["differences"])
 
 
+class KpiHoldoutProtocolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = load_policy()
+
+    def holdout_report(self) -> dict:
+        report = _report()
+        report["query_spec_sha256"] = "a" * 64
+        report["query_split"] = "holdout"
+        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64}
+        return report
+
+    def evaluate(self, report: dict) -> dict:
+        return evaluate_kpi_guardrails(report, self.policy)
+
+    def test_policy_requires_the_holdout_check(self) -> None:
+        self.assertIn("holdout_protocol", HARD_CHECKS)
+        self.assertIn("holdout_protocol", self.policy["hard_checks"])
+        raw = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        raw["hard_checks"].remove("holdout_protocol")
+        with self.assertRaisesRegex(GuardrailInputError, "invalid_kpi_policy"):
+            validate_policy(raw)
+
+    def test_non_holdout_splits_pass_and_are_recorded(self) -> None:
+        for split, report in (("unspecified", _report()),
+                              ("unspecified", {**_report(), "query_split": "unspecified"}),
+                              ("development", {**_report(), "query_split": "development"})):
+            with self.subTest(split=split):
+                result = self.evaluate(report)
+                row = _row(result, "hard", "holdout_protocol")
+                self.assertEqual(("passed", split), (row["status"], row["split"]))
+                self.assertEqual(split, result["candidate"]["query_split"])
+                self.assertEqual("passed", result["verdict"])
+
+    def test_opened_holdout_record_with_matching_hash_passes(self) -> None:
+        result = self.evaluate(self.holdout_report())
+        row = _row(result, "hard", "holdout_protocol")
+        self.assertEqual(("passed", "holdout", []), (row["status"], row["split"], row["reasons"]))
+        self.assertEqual("holdout", result["candidate"]["query_split"])
+        self.assertEqual("passed", result["verdict"])
+
+    def test_holdout_report_without_a_valid_opened_record_fails(self) -> None:
+        def missing(report: dict) -> None:
+            del report["holdout_ledger_record"]
+
+        def not_a_record(report: dict) -> None:
+            report["holdout_ledger_record"] = "opened"
+
+        def sealed_only(report: dict) -> None:
+            report["holdout_ledger_record"]["event"] = "sealed"
+
+        def other_spec(report: dict) -> None:
+            report["holdout_ledger_record"]["query_spec_sha256"] = "b" * 64
+
+        def record_without_hash(report: dict) -> None:
+            del report["holdout_ledger_record"]["query_spec_sha256"]
+
+        def both_hashes_empty(report: dict) -> None:
+            report["query_spec_sha256"] = ""
+            report["holdout_ledger_record"]["query_spec_sha256"] = ""
+
+        for expected, mutate in (("holdout_ledger_record_missing", missing), ("holdout_ledger_record_missing", not_a_record),
+                                 ("holdout_ledger_record_not_opened", sealed_only),
+                                 ("holdout_ledger_record_spec_mismatch", other_spec),
+                                 ("holdout_ledger_record_spec_mismatch", record_without_hash),
+                                 ("holdout_ledger_record_spec_mismatch", both_hashes_empty)):
+            with self.subTest(mutation=mutate.__name__):
+                report = self.holdout_report()
+                mutate(report)
+                result = self.evaluate(report)
+                row = _row(result, "hard", "holdout_protocol")
+                self.assertEqual("failed", row["status"])
+                self.assertIn(expected, row["reasons"])
+                self.assertEqual(("failed", False), (result["verdict"], result["passed"]))
+
+    def test_unknown_split_value_cannot_skip_the_holdout_check(self) -> None:
+        for value in ("Holdout", "holdout ", "test", "", None, ["holdout"], 1):
+            with self.subTest(split=value):
+                report = _report()
+                report["query_split"] = value
+                row = _row(self.evaluate(report), "hard", "holdout_protocol")
+                self.assertEqual(("failed", ["query_split_invalid"]), (row["status"], row["reasons"]))
+
+
 class KpiGuardrailCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="kpi_guardrail_test_")

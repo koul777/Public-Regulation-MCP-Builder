@@ -35,7 +35,8 @@ REQUIRED_REQUEST_MODE_KEYS = ("llm_backend", "claim_audit_mode")
 KNOWN_TRACE_LIMITATIONS = frozenset({"deterministic_citation_omits_context_and_hash",
                                      "content_hash_not_available_in_gold"})
 HARD_CHECKS = ("coverage", "integrity", "no_auto_approval", "mcp_contract", "request_modes",
-               "retrieval_no_evidence", "negative_cases", "forbidden_facts", "citation_trace")
+               "retrieval_no_evidence", "negative_cases", "forbidden_facts", "citation_trace",
+               "holdout_protocol")
 TARGETS = ("retrieval_recall_at_5", "retrieval_mrr", "final_model_answer_rate",
            "required_fact_match_rate", "case_fact_pass_rate")
 REGRESSIONS = ("retrieval_new_misses", "mcp_new_failures", "llm_new_case_failures", "llm_p95_duration_ratio")
@@ -312,6 +313,26 @@ def check_citation_trace(report: Mapping[str, Any]) -> dict[str, Any]:
                   limited_trace_case_ids=limited)
 
 
+def check_holdout_protocol(report: Mapping[str, Any]) -> dict[str, Any]:
+    """A holdout report must carry the ledger record written when the holdout was opened."""
+    split = report.get("query_split", "unspecified")
+    if split in ("development", "unspecified"):
+        return _check("holdout_protocol", [], split=split)
+    if split != "holdout":
+        return _check("holdout_protocol", ["query_split_invalid"], split=str(split))
+    record = report.get("holdout_ledger_record")
+    reasons = []
+    if not isinstance(record, dict):
+        reasons.append("holdout_ledger_record_missing")
+    else:
+        if record.get("event") != "opened":
+            reasons.append("holdout_ledger_record_not_opened")
+        record_hash = record.get("query_spec_sha256")
+        if not isinstance(record_hash, str) or not record_hash or record_hash != report.get("query_spec_sha256"):
+            reasons.append("holdout_ledger_record_spec_mismatch")
+    return _check("holdout_protocol", reasons, split=split)
+
+
 def _rate_target(target_id: str, minimum: float, successes: int, denominator: int, *,
                  sample_size: int, min_sample_size: int, **details: Any) -> dict[str, Any]:
     required = int((Decimal(str(minimum)) * denominator).to_integral_value(rounding=ROUND_CEILING))
@@ -480,7 +501,8 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         raise GuardrailInputError("coverage_profile_not_allowed_for_query_count")
     hard = [check_coverage(report, policy), check_integrity(report), check_no_auto_approval(report),
             check_mcp_contract(report), check_request_modes(report, policy), check_retrieval_no_evidence(report, profile),
-            check_negative_cases(report, profile), check_forbidden_facts(report), check_citation_trace(report)]
+            check_negative_cases(report, profile), check_forbidden_facts(report), check_citation_trace(report),
+            check_holdout_protocol(report)]
     targets = evaluate_targets(report, policy, profile)
     comparability = None if baseline is None else check_comparability(report, baseline, policy)
     regressions = (evaluate_regressions(report, baseline, policy)
@@ -511,6 +533,7 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         "coverage_profile": coverage_profile,
         "candidate": {"repo_commit": report.get("repo_commit"), "query_count": report.get("query_count"),
                       "query_spec_sha256": report.get("query_spec_sha256"),
+                      "query_split": report.get("query_split", "unspecified"),
                       "label_provenance": report.get("label_provenance"),
                       "legacy_report_passed": report.get("passed") is True},
         "baseline": None if baseline is None else {"repo_commit": baseline.get("repo_commit"),
