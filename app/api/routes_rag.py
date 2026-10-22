@@ -2862,8 +2862,9 @@ def _fallback_citations_with_context_identity(
     come only from the approved records; a missing hash stays missing, and no
     source text is added. An ambiguous binding is never guessed: when one
     evidence ID maps to several supporting records or context items, or the
-    record's approval ID disagrees with the citation's own, the citation keeps
-    only its original keys and the evaluator then reports it as unverified.
+    record's approval ID is missing or disagrees with the citation's own, the
+    citation keeps only its original keys and the evaluator then reports it as
+    unverified. The approval ID is taken only from the approved record.
     """
 
     context_ids_by_evidence_id: dict[str, set[str]] = defaultdict(set)
@@ -2889,15 +2890,18 @@ def _fallback_citations_with_context_identity(
             bound.append(payload)
             continue
         record = records[0]
+        # The approval ID comes only from the approved record. A record without
+        # one cannot verify the binding, and the citation's own value is never
+        # promoted in its place.
         record_approval_id = _approved_record_value(record, "approval_id")
         citation_approval_id = str(payload.get("approval_id") or "").strip()
-        if record_approval_id and citation_approval_id and record_approval_id != citation_approval_id:
+        if not record_approval_id or (
+            citation_approval_id and record_approval_id != citation_approval_id
+        ):
             bound.append(payload)
             continue
         payload["context_id"] = next(iter(context_ids))
-        approval_id = record_approval_id or citation_approval_id
-        if approval_id:
-            payload["approval_ids"] = [approval_id]
+        payload["approval_ids"] = [record_approval_id]
         content_hash = _approved_record_value(
             record, "approved_content_hash"
         ) or _approved_record_value(record, "content_hash")

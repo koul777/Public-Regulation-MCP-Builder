@@ -1062,6 +1062,42 @@ class OrchestratedRagTests(unittest.TestCase):
                 if bound_expected:
                     self.assertEqual(["approval-1"], bound["approval_ids"])
 
+    def test_fallback_citation_never_promotes_its_own_approval_id_over_an_idless_record(self) -> None:
+        query = "접근권한 검토 주기는?"
+        shapes = {
+            "key_absent": lambda record: record.pop("approval_id"),
+            "empty_top_level": lambda record: record.update(approval_id=""),
+            "empty_top_level_and_metadata": lambda record: record.update(approval_id="", metadata={"approval_id": ""}),
+        }
+        for shape, strip_approval in shapes.items():
+            record = _fallback_results()[0]
+            strip_approval(record)
+            context = ContextBuilder().build([record], query=query)
+            for citation_approval in ("foreign-id", ""):
+                with self.subTest(record=shape, citation_approval=citation_approval):
+                    citation = {"evidence_id": "chunk-1", "chunk_id": "chunk-1", "approval_id": citation_approval}
+
+                    bound = routes_rag._fallback_citations_with_context_identity(
+                        [citation], context=context, supporting_context_ids={"E1"}, supporting_results=[record],
+                    )[0]
+
+                    for key in ("context_id", "approval_ids", "content_hashes"):
+                        self.assertNotIn(key, bound)
+                    self.assertEqual(["chunk-1"], bound["evidence_ids"])
+                    self.assertEqual(citation_approval, bound["approval_id"])
+
+    def test_fallback_answer_leaves_citation_unbound_when_approved_record_has_no_approval_id(self) -> None:
+        results = _fallback_results()
+        del results[0]["approval_id"]
+
+        result = _run_rejected_audit_fallback("접근권한 검토 주기는?", results)
+
+        citations = {item["chunk_id"]: item for item in result["citations"]}
+        for key in ("context_id", "approval_ids", "content_hashes"):
+            self.assertNotIn(key, citations["chunk-1"])
+        self.assertEqual(["approval-2"], citations["chunk-2"]["approval_ids"])
+        self.assertIn("context_id", citations["chunk-2"])
+
     def test_fallback_hash_follows_context_builder_precedence_for_every_record_shape(self) -> None:
         query = "접근권한 검토 주기는?"
         approved, projected = "e" * 64, "f" * 64
