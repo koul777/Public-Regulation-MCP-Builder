@@ -527,6 +527,8 @@ class CoreRepeatConfigurationTests(_E2eBase):
         stack.enter_context(patch("scripts.evaluate_live_local_llm.LocalOllamaObserver"))
         stack.enter_context(patch("scripts.run_real_regulation_e2e.managed_local_api",
                                   return_value=nullcontext(("http://127.0.0.1:1", {}))))
+        # Holdout runs check the model inventory first; never reach a real Ollama in tests.
+        mocks["preflight"] = stack.enter_context(patch("scripts.run_real_regulation_e2e.preflight_ollama_model"))
         return mocks
 
     def _run(self, options: RunOptions):
