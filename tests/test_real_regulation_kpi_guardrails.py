@@ -434,20 +434,30 @@ class KpiRegressionTests(unittest.TestCase):
         self.assertIn("baseline_coverage_failed", result["comparability"]["differences"])
 
 
+def holdout_record(report: dict, **overrides) -> dict:
+    """The record the runner writes into report.json when it opens a holdout."""
+    record = {"event": "opened", "schema_version": 1, "ledger_id": "1" * 32,
+              "recorded_at": "2026-01-01T00:00:00+00:00", "query_spec_sha256": report["query_spec_sha256"],
+              "query_count": report["query_count"], "open_id": "0123456789abcdef", "authorized_rerun": False}
+    return {**record, **overrides}
+
+
 class KpiHoldoutProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = load_policy()
+
+    PIN = "1" * 32
 
     def holdout_report(self) -> dict:
         report = _report()
         report["query_spec_sha256"] = "a" * 64
         report["query_split"] = "holdout"
-        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64,
-                                           "ledger_id": "1" * 32, "authorized_rerun": False}
+        report["holdout_ledger_record"] = holdout_record(report)
         return report
 
-    def evaluate(self, report: dict) -> dict:
-        return evaluate_kpi_guardrails(report, self.policy)
+    def evaluate(self, report: dict, pin: str | None = PIN) -> dict:
+        # A holdout report is only judged against a reviewer-supplied ledger_id.
+        return evaluate_kpi_guardrails(report, self.policy, expected_holdout_ledger_id=pin)
 
     def test_policy_requires_the_holdout_check(self) -> None:
         self.assertIn("holdout_protocol", HARD_CHECKS)
@@ -462,7 +472,7 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
                               ("unspecified", {**_report(), "query_split": "unspecified"}),
                               ("development", {**_report(), "query_split": "development"})):
             with self.subTest(split=split):
-                result = self.evaluate(report)
+                result = self.evaluate(report, pin=None)
                 row = _row(result, "hard", "holdout_protocol")
                 self.assertEqual(("passed", split), (row["status"], row["split"]))
                 self.assertEqual(split, result["candidate"]["query_split"])
@@ -498,11 +508,15 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         self.assertEqual(("failed", ["holdout_ledger_id_unexpected"]), (row["status"], row["reasons"]))
         self.assertEqual(("failed", False), (result["verdict"], result["passed"]))
 
-        # Without a pin the same report still passes, and the pin is not recorded.
-        result = self.evaluate(report)
-        self.assertEqual("passed", _row(result, "hard", "holdout_protocol")["status"])
-        self.assertIsNone(result["candidate"]["expected_holdout_ledger_id"])
-        self.assertNotIn("expected_ledger_id", _row(result, "hard", "holdout_protocol"))
+        # Without a pin a holdout report cannot pass, whatever its ledger_id is.
+        for ledger_id in ("2" * 32, "1" * 32):
+            report["holdout_ledger_record"]["ledger_id"] = ledger_id
+            result = self.evaluate(report, pin=None)
+            row = _row(result, "hard", "holdout_protocol")
+            self.assertEqual(("failed", ["expected_holdout_ledger_id_required"]), (row["status"], row["reasons"]))
+            self.assertIsNone(result["candidate"]["expected_holdout_ledger_id"])
+            self.assertNotIn("expected_ledger_id", row)
+            self.assertEqual(("failed", False), (result["verdict"], result["passed"]))
 
     def test_pin_fails_closed_without_a_matching_holdout_record(self) -> None:
         pin = "1" * 32
@@ -564,13 +578,50 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
             report["query_spec_sha256"] = ""
             report["holdout_ledger_record"]["query_spec_sha256"] = ""
 
+        def foreign_query_count(report: dict) -> None:
+            report["holdout_ledger_record"]["query_count"] += 1
+
+        def boolean_query_count(report: dict) -> None:
+            report["holdout_ledger_record"]["query_count"] = True
+
+        def uppercase_ledger_id(report: dict) -> None:
+            report["holdout_ledger_record"]["ledger_id"] = "A" * 32
+
+        def short_ledger_id(report: dict) -> None:
+            report["holdout_ledger_record"]["ledger_id"] = "1" * 31
+
+        def missing_runner_field(report: dict) -> None:
+            del report["holdout_ledger_record"]["open_id"]
+
+        def extra_field(report: dict) -> None:
+            report["holdout_ledger_record"]["note"] = "hand edited"
+
+        def naive_timestamp(report: dict) -> None:
+            report["holdout_ledger_record"]["recorded_at"] = "2026-01-01T00:00:00"
+
+        def wrong_schema_version(report: dict) -> None:
+            report["holdout_ledger_record"]["schema_version"] = 2
+
+        def text_rerun_flag(report: dict) -> None:
+            report["holdout_ledger_record"]["authorized_rerun"] = "false"
+
         for expected, mutate in (("holdout_ledger_record_missing", missing), ("holdout_ledger_record_missing", not_a_record),
                                  ("holdout_ledger_record_not_opened", sealed_only),
                                  ("holdout_ledger_record_spec_mismatch", other_spec),
                                  ("holdout_ledger_record_spec_mismatch", record_without_hash),
                                  ("holdout_ledger_record_spec_mismatch", both_hashes_empty),
                                  ("holdout_ledger_id_missing", no_ledger_id),
-                                 ("holdout_ledger_id_missing", empty_ledger_id)):
+                                 ("holdout_ledger_id_missing", empty_ledger_id),
+                                 ("holdout_ledger_id_invalid", uppercase_ledger_id),
+                                 ("holdout_ledger_id_invalid", short_ledger_id),
+                                 ("holdout_ledger_record_query_count_mismatch", foreign_query_count),
+                                 ("holdout_ledger_record_query_count_mismatch", boolean_query_count),
+                                 ("holdout_ledger_record_schema_invalid", boolean_query_count),
+                                 ("holdout_ledger_record_schema_invalid", missing_runner_field),
+                                 ("holdout_ledger_record_schema_invalid", extra_field),
+                                 ("holdout_ledger_record_schema_invalid", naive_timestamp),
+                                 ("holdout_ledger_record_schema_invalid", wrong_schema_version),
+                                 ("holdout_ledger_record_schema_invalid", text_rerun_flag)):
             with self.subTest(mutation=mutate.__name__):
                 report = self.holdout_report()
                 mutate(report)
@@ -632,8 +683,7 @@ class KpiGuardrailCliTests(unittest.TestCase):
         report = _report()
         report["query_spec_sha256"] = "a" * 64
         report["query_split"] = "holdout"
-        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64,
-                                           "ledger_id": "1" * 32, "authorized_rerun": False}
+        report["holdout_ledger_record"] = holdout_record(report)
         path = self.write("holdout.json", report)
         code, summary = self.run_main("--report", str(path), "--expected-holdout-ledger-id", "1" * 32,
                                       "--output", str(self.root / "pinned-ok.json"))
@@ -644,6 +694,12 @@ class KpiGuardrailCliTests(unittest.TestCase):
         code, summary = self.run_main("--report", str(path), "--expected-holdout-ledger-id", "2" * 32,
                                       "--output", str(self.root / "pinned-bad.json"))
         self.assertEqual((1, "failed"), (code, summary["verdict"]))
+
+        code, summary = self.run_main("--report", str(path), "--output", str(self.root / "unpinned.json"))
+        self.assertEqual((1, "failed"), (code, summary["verdict"]))
+        unpinned = json.loads((self.root / "unpinned.json").read_text(encoding="utf-8"))
+        row = next(row for row in unpinned["hard"] if row["id"] == "holdout_protocol")
+        self.assertEqual(["expected_holdout_ledger_id_required"], row["reasons"])
 
         code, summary = self.run_main("--report", str(path), "--expected-holdout-ledger-id", "not-hex",
                                       "--output", str(self.root / "pinned-invalid.json"))

@@ -59,7 +59,14 @@ class EvidenceError(ValueError):
 
 QUERY_SPLITS = ("development", "holdout")
 HOLDOUT_LEDGER_SCHEMA_VERSION = 1
-_LEDGER_EVENTS = frozenset({"sealed", "opened", "rerun_authorized"})
+_LEDGER_COMMON_FIELDS = frozenset({"event", "schema_version", "ledger_id", "recorded_at", "query_spec_sha256"})
+# Exactly the fields the seal command and the runner write. A hand-written line must carry them all.
+_LEDGER_FIELDS = {
+    "sealed": _LEDGER_COMMON_FIELDS | {"query_count", "development_spec_sha256", "development_query_count"},
+    "opened": _LEDGER_COMMON_FIELDS | {"query_count", "open_id", "authorized_rerun"},
+    "rerun_authorized": _LEDGER_COMMON_FIELDS | {"reason"},
+}
+_LEDGER_EVENTS = frozenset(_LEDGER_FIELDS)
 
 
 def _sha256(path: Path) -> str:
@@ -289,11 +296,47 @@ def _ledger_hash(value: Any) -> str | None:
     return None
 
 
+def _is_count(value: Any) -> bool:
+    return type(value) is int and value >= 1
+
+
+def _is_utc_offset_timestamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def holdout_record_is_valid(record: Any) -> bool:
+    """True only for a record with exactly the fields and types its event requires."""
+    event = record.get("event") if isinstance(record, dict) else None
+    if not isinstance(event, str) or event not in _LEDGER_FIELDS or set(record) != _LEDGER_FIELDS[event]:
+        return False
+    if (type(record["schema_version"]) is not int or record["schema_version"] != HOLDOUT_LEDGER_SCHEMA_VERSION
+            or not isinstance(record["ledger_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", record["ledger_id"])
+            or not _is_utc_offset_timestamp(record["recorded_at"])
+            or not isinstance(record["query_spec_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", record["query_spec_sha256"])):
+        return False
+    if event == "sealed":
+        return (_is_count(record["query_count"]) and _is_count(record["development_query_count"])
+                and isinstance(record["development_spec_sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", record["development_spec_sha256"]) is not None)
+    if event == "opened":
+        return (_is_count(record["query_count"]) and isinstance(record["open_id"], str)
+                and re.fullmatch(r"[0-9a-f]{16}", record["open_id"]) is not None
+                and type(record["authorized_rerun"]) is bool)
+    return isinstance(record["reason"], str) and bool(record["reason"].strip())
+
+
 def parse_holdout_ledger(raw: bytes) -> list[dict[str, Any]]:
     """Parse every line; one malformed record makes the whole ledger unusable.
 
-    Every record must carry the same ledger_id, which the first record of the file
-    created. A record without it, or with another one, was not written for this file.
+    Each record needs exactly the fields of its event, with the right types. All of
+    them must carry the same ledger_id, which the first record of the file created.
+    A record without it, or with another one, was not written for this file.
     """
     if raw and not raw.endswith(b"\n"):
         raise EvidenceError("holdout_ledger_corrupt")
@@ -303,8 +346,7 @@ def parse_holdout_ledger(raw: bytes) -> list[dict[str, Any]]:
             record = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_json_object)
         except (ValueError, UnicodeError):
             raise EvidenceError("holdout_ledger_corrupt") from None
-        if (not isinstance(record, dict) or not isinstance(record.get("event"), str)
-                or record["event"] not in _LEDGER_EVENTS or _ledger_hash(record.get("query_spec_sha256")) is None):
+        if not holdout_record_is_valid(record):
             raise EvidenceError("holdout_ledger_corrupt")
         records.append(record)
     # Compare as a list: an unhashable value (a list or object) must be corrupt, not a TypeError.
@@ -340,6 +382,9 @@ def holdout_standing(records: Sequence[Mapping[str, Any]], spec_sha256: str) -> 
     mine = [record for record in records if _ledger_hash(record["query_spec_sha256"]) == wanted]
     if not any(record["event"] == "sealed" for record in mine):
         raise EvidenceError("holdout_not_sealed")
+    # The same spec bytes always have the same number of queries; a different count was not written by the tools.
+    if len({record["query_count"] for record in mine if record["event"] in ("sealed", "opened")}) != 1:
+        raise EvidenceError("holdout_ledger_corrupt")
     opened = any(record["event"] == "opened" for record in mine)
     authorized = mine[-1]["event"] == "rerun_authorized"
     if opened and not authorized:

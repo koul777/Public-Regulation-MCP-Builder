@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.evaluate_live_local_llm import HTTP_ERROR_CODES, LATENCY_CLASSES, _percentile  # noqa: E402
-from scripts.run_real_regulation_e2e import EvidenceError, require_private_path  # noqa: E402
+from scripts.run_real_regulation_e2e import EvidenceError, holdout_record_is_valid, require_private_path  # noqa: E402
 
 
 POLICY_PATH = Path(__file__).resolve().parent / "policies" / "real_regulation_kpi_guardrails.v1.json"
@@ -320,8 +320,10 @@ def check_citation_trace(report: Mapping[str, Any]) -> dict[str, Any]:
 def check_holdout_protocol(report: Mapping[str, Any], expected_ledger_id: str | None = None) -> dict[str, Any]:
     """A holdout report must carry the ledger record written when the holdout was opened.
 
-    A reviewer who kept the ledger_id printed by the first seal can pin it. Then only
-    a holdout report from that ledger passes, so a report from a fresh ledger fails.
+    The reviewer must pin the ledger_id printed by the first seal. Only a holdout
+    report whose opened record has exactly the runner's fields, this ledger_id, and
+    the report's own spec hash and query count passes. A report from a fresh ledger
+    fails, and so does any holdout report judged without a pin.
     """
     pinned = {} if expected_ledger_id is None else {"expected_ledger_id": expected_ledger_id}
     split = report.get("query_split", "unspecified")
@@ -332,16 +334,26 @@ def check_holdout_protocol(report: Mapping[str, Any], expected_ledger_id: str | 
         return _check("holdout_protocol", ["query_split_invalid"], split=str(split), **pinned)
     record = report.get("holdout_ledger_record")
     reasons = []
+    if expected_ledger_id is None:
+        reasons.append("expected_holdout_ledger_id_required")
     if not isinstance(record, dict):
         reasons.append("holdout_ledger_record_missing")
     else:
         if record.get("event") != "opened":
             reasons.append("holdout_ledger_record_not_opened")
+        elif not holdout_record_is_valid(record):
+            reasons.append("holdout_ledger_record_schema_invalid")
         record_hash = record.get("query_spec_sha256")
         if not isinstance(record_hash, str) or not record_hash or record_hash != report.get("query_spec_sha256"):
             reasons.append("holdout_ledger_record_spec_mismatch")
-        if not isinstance(record.get("ledger_id"), str) or not record["ledger_id"]:
+        record_count = record.get("query_count")
+        if not _is_int(record_count) or record_count != report.get("query_count"):
+            reasons.append("holdout_ledger_record_query_count_mismatch")
+        ledger_id = record.get("ledger_id")
+        if not isinstance(ledger_id, str) or not ledger_id:
             reasons.append("holdout_ledger_id_missing")
+        elif not re.fullmatch(r"[0-9a-f]{32}", ledger_id):
+            reasons.append("holdout_ledger_id_invalid")
     if expected_ledger_id is not None and (not isinstance(record, dict) or record.get("ledger_id") != expected_ledger_id):
         reasons.append("holdout_ledger_id_unexpected")
     return _check("holdout_protocol", reasons, split=split, **pinned)
