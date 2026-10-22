@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import socket
@@ -47,10 +48,16 @@ class RunOptions:
     enable_kordoc_table_parser: bool = True
     request_defaults: dict[str, Any] = field(default_factory=dict)
     preprocessing_document_ids: tuple[str, ...] = ()
+    holdout_ledger: Path | None = None
 
 
 class EvidenceError(ValueError):
     """A fixed, path-free evidence or configuration failure."""
+
+
+QUERY_SPLITS = ("development", "holdout")
+HOLDOUT_LEDGER_SCHEMA_VERSION = 1
+_LEDGER_EVENTS = frozenset({"sealed", "opened", "rerun_authorized"})
 
 
 def _sha256(path: Path) -> str:
@@ -255,6 +262,164 @@ def verify_corpus(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def query_split(payload: Mapping[str, Any]) -> str:
+    """Return the declared evaluation split; a missing label means unspecified."""
+    if "split" not in payload:
+        return "unspecified"
+    value = payload["split"]
+    if not isinstance(value, str) or value not in QUERY_SPLITS:
+        raise EvidenceError("query_split_invalid")
+    return value
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate ledger JSON key")
+        result[key] = value
+    return result
+
+
+def _ledger_hash(value: Any) -> str | None:
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        return value.lower()
+    return None
+
+
+def parse_holdout_ledger(raw: bytes) -> list[dict[str, Any]]:
+    """Parse every line; one malformed record makes the whole ledger unusable."""
+    if raw and not raw.endswith(b"\n"):
+        raise EvidenceError("holdout_ledger_corrupt")
+    records: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        try:
+            record = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        except (ValueError, UnicodeError):
+            raise EvidenceError("holdout_ledger_corrupt") from None
+        if (not isinstance(record, dict) or not isinstance(record.get("event"), str)
+                or record["event"] not in _LEDGER_EVENTS or _ledger_hash(record.get("query_spec_sha256")) is None):
+            raise EvidenceError("holdout_ledger_corrupt")
+        records.append(record)
+    return records
+
+
+def _read_holdout_ledger(ledger: Path) -> list[dict[str, Any]]:
+    try:
+        raw = ledger.read_bytes()
+    except FileNotFoundError:
+        raise EvidenceError("holdout_ledger_missing") from None
+    except OSError:
+        raise EvidenceError("holdout_ledger_unreadable") from None
+    return parse_holdout_ledger(raw)
+
+
+def holdout_standing(records: Sequence[Mapping[str, Any]], spec_sha256: str) -> dict[str, Any]:
+    """Decide whether this exact spec hash may be opened now.
+
+    A sealed record must exist. An earlier opened record blocks the run unless the
+    most recent record for the hash is a manually written rerun_authorized, which
+    covers exactly one more opening because the new opened record follows it.
+    """
+    wanted = spec_sha256.lower()
+    mine = [record for record in records if _ledger_hash(record["query_spec_sha256"]) == wanted]
+    if not any(record["event"] == "sealed" for record in mine):
+        raise EvidenceError("holdout_not_sealed")
+    opened = any(record["event"] == "opened" for record in mine)
+    authorized = mine[-1]["event"] == "rerun_authorized"
+    if opened and not authorized:
+        raise EvidenceError("holdout_already_opened")
+    return {"authorized_rerun": opened and authorized}
+
+
+def check_holdout_gate(ledger: Path | None, spec_sha256: str) -> dict[str, Any]:
+    """Read-only holdout check; never creates or appends to the ledger."""
+    if ledger is None:
+        raise EvidenceError("holdout_ledger_required")
+    return holdout_standing(_read_holdout_ledger(ledger), spec_sha256)
+
+
+def _validated_holdout_ledger(options: RunOptions, split: str, *, protected: Sequence[Path]) -> Path | None:
+    configured = options.holdout_ledger
+    if configured is None:
+        if split == "holdout":
+            raise EvidenceError("holdout_ledger_required")
+        return None
+    if not isinstance(configured, Path):
+        raise EvidenceError("holdout_ledger_path_invalid")
+    ledger = require_private_path(configured)
+    lock = ledger.with_name(ledger.name + ".lock")
+    # Appending must never change the runtime, output or input files being fingerprinted.
+    if any(_overlap(path, target) for path in (ledger, lock) for target in protected):
+        raise EvidenceError("holdout_ledger_overlaps_run_paths")
+    if ledger.exists() and not ledger.is_file():
+        raise EvidenceError("holdout_ledger_path_invalid")
+    return ledger
+
+
+@contextmanager
+def _ledger_lock(ledger: Path) -> Iterator[None]:
+    """Serialize check-and-append across processes through a sidecar lock; never waits."""
+    try:
+        stream = ledger.with_name(ledger.name + ".lock").open("a+b")
+    except OSError:
+        raise EvidenceError("holdout_ledger_write_failed") from None
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise EvidenceError("holdout_ledger_locked") from None
+        yield
+    finally:
+        stream.close()
+
+
+def _append_ledger_record(ledger: Path, record: Mapping[str, Any]) -> None:
+    line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        with ledger.open("ab") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        raise EvidenceError("holdout_ledger_write_failed") from None
+
+
+def seal_holdout(ledger: Path, *, development_sha256: str, holdout_sha256: str,
+                 development_query_count: int, holdout_query_count: int) -> dict[str, Any]:
+    """Append the sealed record. Hashes, counts and a timestamp only; no text or paths."""
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with _ledger_lock(ledger):
+        records = _read_holdout_ledger(ledger) if ledger.exists() else []
+        if any(_ledger_hash(record["query_spec_sha256"]) == holdout_sha256.lower() for record in records):
+            raise EvidenceError("holdout_already_sealed")
+        record = {"event": "sealed", "schema_version": HOLDOUT_LEDGER_SCHEMA_VERSION,
+                  "recorded_at": datetime.now(timezone.utc).isoformat(),
+                  "query_spec_sha256": holdout_sha256, "query_count": holdout_query_count,
+                  "development_spec_sha256": development_sha256,
+                  "development_query_count": development_query_count}
+        _append_ledger_record(ledger, record)
+    return record
+
+
+def open_holdout(ledger: Path, spec_sha256: str, *, query_count: int) -> dict[str, Any]:
+    """Record the opening under the lock, after re-checking the gate. Call before any stage runs."""
+    with _ledger_lock(ledger):
+        standing = check_holdout_gate(ledger, spec_sha256)
+        record = {"event": "opened", "schema_version": HOLDOUT_LEDGER_SCHEMA_VERSION,
+                  "recorded_at": datetime.now(timezone.utc).isoformat(),
+                  "query_spec_sha256": spec_sha256, "query_count": query_count,
+                  "open_id": secrets.token_hex(8), "authorized_rerun": standing["authorized_rerun"]}
+        _append_ledger_record(ledger, record)
+    return record
+
+
 def validate_options(options: RunOptions) -> dict[str, Any]:
     source = require_private_path(options.runtime_source)
     output = require_private_path(options.output_dir)
@@ -293,6 +458,8 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
             or endpoint.port == 0):
         raise EvidenceError("ollama_endpoint_must_be_loopback")
     payload = _load_object(queries)
+    split = query_split(payload)
+    ledger = _validated_holdout_ledger(options, split, protected=(source, output, corpus, queries))
     cases = payload.get("queries")
     if not isinstance(cases, list) or not cases:
         raise EvidenceError("query_spec_has_no_cases")
@@ -330,6 +497,8 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
             raise EvidenceError("mixed_profile_query_spec_not_supported")
         if not isinstance(case.get("query"), str) or not case["query"].strip():
             raise EvidenceError("query_text_must_be_nonempty_string")
+        if "split" in case:
+            raise EvidenceError("case_level_split_not_supported")
         check_scope(case.get("scope", {}))
         check_overrides(case.get("request_overrides", {}))
         if set(case.get("request_overrides", {})) - {"profile_id"}:
@@ -343,6 +512,10 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
     if (not isinstance(options.preprocessing_document_ids, tuple)
             or any(not isinstance(value, str) or not value for value in options.preprocessing_document_ids)):
         raise EvidenceError("preprocessing_document_ids_must_be_string_sequence")
+    spec_sha256 = _sha256(queries)
+    if split == "holdout":
+        # Read-only here, so --check-only never writes the ledger.
+        check_holdout_gate(ledger, spec_sha256)
     corpus_report = verify_corpus(corpus)
     known_document_ids = {item["document_id"] for item in corpus_report["documents"]}
     requested_document_ids = set(options.preprocessing_document_ids)
@@ -352,7 +525,8 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
             requested_document_ids.add(case["target_document_id"])
     if not requested_document_ids.issubset(known_document_ids):
         raise EvidenceError("query_or_preprocessing_document_missing_from_corpus")
-    return {"corpus": corpus_report, "query_count": len(cases), "query_spec_sha256": _sha256(queries)}
+    return {"corpus": corpus_report, "query_count": len(cases), "query_spec_sha256": spec_sha256,
+            "query_split": split}
 
 
 @contextmanager
@@ -469,6 +643,7 @@ def run_real_regulation_e2e(options: RunOptions) -> dict[str, Any]:
         "runtime_source_fingerprint": original_runtime,
         "corpus": validation["corpus"], "query_spec_sha256": validation["query_spec_sha256"],
         "query_count": len(queries), "label_provenance": query_payload.get("label_provenance", "unspecified"),
+        "query_split": validation["query_split"],
         "runtime_scope": {"tenant_id": options.tenant_id, "profile_id": options.profile_id, "tenant_storage_isolation": options.tenant_storage_isolation},
         "configuration": {"model": options.model, "api_role": options.api_role, "request_defaults": options.request_defaults,
                           "security_levels": list(options.security_levels), "mcp_top_k": 5,
@@ -478,6 +653,10 @@ def run_real_regulation_e2e(options: RunOptions) -> dict[str, Any]:
         "human_approval_created": False,
         "kpi_policy": {key: kpi_policy[key] for key in ("policy_id", "policy_version", "sha256")},
     }
+    if validation["query_split"] == "holdout":
+        # Recorded before any stage, so an aborted run still counts as opened.
+        report["holdout_ledger_record"] = open_holdout(
+            require_private_path(options.holdout_ledger), validation["query_spec_sha256"], query_count=len(queries))
     report_path = options.output_dir / "report.json"
     _write_json(report_path, report)
 
@@ -561,6 +740,9 @@ def options_from_config(config: Mapping[str, Any], output_dir: Path) -> RunOptio
     levels = config.get("security_levels", ["internal"])
     if not isinstance(levels, list):
         raise EvidenceError("security_levels_must_be_unique_operator_levels")
+    ledger = config.get("holdout_ledger")
+    if ledger is not None and (not isinstance(ledger, str) or not ledger.strip()):
+        raise EvidenceError("holdout_ledger_path_invalid")
     return RunOptions(runtime_source=Path(config["runtime_source"]), corpus_manifest=Path(config["corpus_manifest"]),
         query_spec=Path(config["query_spec"]), output_dir=output_dir, tenant_id=config["tenant_id"],
         profile_id=config.get("profile_id"), tenant_storage_isolation=config.get("tenant_storage_isolation", False),
@@ -569,7 +751,8 @@ def options_from_config(config: Mapping[str, Any], output_dir: Path) -> RunOptio
         security_levels=tuple(levels),
         enable_kordoc_table_parser=config.get("enable_kordoc_table_parser", True),
         request_defaults=dict(config.get("request_defaults", {})),
-        preprocessing_document_ids=tuple(document_ids))
+        preprocessing_document_ids=tuple(document_ids),
+        holdout_ledger=None if ledger is None else Path(ledger))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -583,7 +766,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         options = options_from_config(_load_object(config_path), args.output_dir)
         if args.check_only:
             validation = validate_options(options)
-            print(json.dumps({"configuration_valid": True, "query_count": validation["query_count"], "execution_performed": False}))
+            print(json.dumps({"configuration_valid": True, "query_count": validation["query_count"],
+                              "query_split": validation["query_split"], "execution_performed": False}))
             return 0
         report = run_real_regulation_e2e(options)
         print(json.dumps({"passed": report["passed"], "product_release_ready": False, "query_count": report["query_count"],
