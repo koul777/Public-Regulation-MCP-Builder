@@ -430,8 +430,9 @@ def _answer_citation_context(answer: str, citations: list[dict[str, Any]], *,
 
 # Fixed codes for the server's non-2xx messages (app/api/routes_rag.py). Only the exact
 # messages and message prefixes below are recognized; the raw detail text is never stored.
-HTTP_ERROR_CODES = ("llm_backend_failed", "llm_backend_unavailable", "evidence_identity_verification_failed",
-                    "citation_verification_failed", "claim_audit_fallback_unverified", "other")
+HTTP_ERROR_CODES = ("llm_backend_failed", "llm_backend_unavailable", "llm_output_invalid", "llm_runtime_failed",
+                    "evidence_identity_verification_failed", "citation_verification_failed",
+                    "claim_audit_fallback_unverified", "other")
 _HTTP_ERROR_EXACT = {
     "Configured local LLM backend is not available.": "llm_backend_unavailable",
     "Local LLM backend request failed: backend unavailable": "llm_backend_unavailable",
@@ -441,9 +442,23 @@ _HTTP_ERROR_EXACT = {
 }
 _HTTP_ERROR_PREFIX = (
     ("Local LLM backend request failed: ", "llm_backend_failed"),
-    ("Multi-model local QA execution failed: ", "llm_backend_failed"),
     ("Multi-model answer claim audit did not verify: ", "claim_audit_fallback_unverified"),
 )
+# "Multi-model local QA execution failed: <ExcType>" wraps the whole model chain, so the
+# exception class name decides the code. Only the class name is read, and only when it is a
+# bare identifier from this allowlist; any other suffix is "other".
+_MULTI_MODEL_FAILED = re.compile(r"Multi-model local QA execution failed: ([A-Za-z_][A-Za-z0-9_]{0,63})")
+_EXCEPTION_CLASS_CODES = {
+    # Transport and timeout classes raised by app/agents/ollama_runtime.py and urllib.
+    **dict.fromkeys(("TimeoutError", "URLError", "OllamaRuntimeError", "ConnectionError", "ConnectionResetError",
+                     "ConnectionRefusedError", "ConnectionAbortedError", "BrokenPipeError", "RemoteDisconnected",
+                     "IncompleteRead"), "llm_backend_failed"),
+    # The model returned output the answer or audit checks rejected (grounded_qa.py ValueError,
+    # pydantic ValidationError, invalid JSON).
+    **dict.fromkeys(("ValueError", "ValidationError", "JSONDecodeError"), "llm_output_invalid"),
+    # Runtime state: a required model is not installed (RuntimeError), or an inner HTTPException.
+    **dict.fromkeys(("RuntimeError", "HTTPException"), "llm_runtime_failed"),
+}
 
 
 def _http_error_code(http_status: int, response: Mapping[str, Any]) -> str | None:
@@ -455,6 +470,9 @@ def _http_error_code(http_status: int, response: Mapping[str, Any]) -> str | Non
         return "other"
     if detail in _HTTP_ERROR_EXACT:
         return _HTTP_ERROR_EXACT[detail]
+    wrapped = _MULTI_MODEL_FAILED.fullmatch(detail)
+    if wrapped:
+        return _EXCEPTION_CLASS_CODES.get(wrapped.group(1), "other")
     return next((code for prefix, code in _HTTP_ERROR_PREFIX if detail.startswith(prefix)), "other")
 
 

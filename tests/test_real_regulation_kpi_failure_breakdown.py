@@ -26,7 +26,7 @@ from scripts.check_real_regulation_kpi_guardrails import (
     load_policy,
     main,
 )
-from scripts.evaluate_live_local_llm import HTTP_ERROR_CODES, _http_error_code, score_case
+from scripts.evaluate_live_local_llm import HTTP_ERROR_CODES, _EXCEPTION_CLASS_CODES, _http_error_code, score_case
 from tests.test_evaluate_live_local_llm import _event, _response, _spec
 from tests.test_real_regulation_kpi_guardrails import MODES, _cases, _report
 
@@ -301,6 +301,24 @@ def _build_scenarios() -> list[dict]:
         S("execution_error", "single-model backend failed 503", A,
           server_error("Local LLM backend request failed: ConnectionError"), ["execution_error"],
           {"execution_error": ["llm_backend_failed", "unexpected_http_status"]}, branch=LATENCY),
+        S("execution_error", "ollama runtime error 503", A,
+          server_error("Multi-model local QA execution failed: OllamaRuntimeError"), ["execution_error"],
+          {"execution_error": ["llm_backend_failed", "unexpected_http_status"]}, branch=LATENCY),
+        S("execution_error", "model output rejected 503", A,
+          server_error("Multi-model local QA execution failed: ValueError"), ["execution_error"],
+          {"execution_error": ["llm_output_invalid", "unexpected_http_status"]}, branch=ANSWER),
+        S("execution_error", "model output schema 503", A,
+          server_error("Multi-model local QA execution failed: ValidationError"), ["execution_error"],
+          {"execution_error": ["llm_output_invalid", "unexpected_http_status"]}, branch=ANSWER),
+        S("execution_error", "required model missing 503", A,
+          server_error("Multi-model local QA execution failed: RuntimeError"), ["execution_error"],
+          {"execution_error": ["llm_runtime_failed", "unexpected_http_status"]}, branch=APPROVAL),
+        S("execution_error", "inner http error 503", A,
+          server_error("Multi-model local QA execution failed: HTTPException"), ["execution_error"],
+          {"execution_error": ["llm_runtime_failed", "unexpected_http_status"]}, branch=APPROVAL),
+        S("execution_error", "unlisted exception class 503", A,
+          server_error("Multi-model local QA execution failed: KeyError"), ["execution_error"],
+          {"execution_error": ["unexpected_http_status"]}),
         S("execution_error", "backend unavailable 503", A,
           server_error("Configured local LLM backend is not available."), ["execution_error"],
           {"execution_error": ["llm_backend_unavailable", "unexpected_http_status"]}, branch=LATENCY),
@@ -416,11 +434,40 @@ class HttpErrorCodeTests(unittest.TestCase):
         "Local LLM backend request failed: backend unavailable": "llm_backend_unavailable",
         "Local LLM backend request failed: ReadTimeout": "llm_backend_failed",
         "Multi-model local QA execution failed: TimeoutError": "llm_backend_failed",
+        "Multi-model local QA execution failed: ValueError": "llm_output_invalid",
+        "Multi-model local QA execution failed: RuntimeError": "llm_runtime_failed",
         "Final evidence identity verification failed": "evidence_identity_verification_failed",
         "Fast chat evidence identity verification failed": "evidence_identity_verification_failed",
         "Answer citation verification failed": "citation_verification_failed",
         "Multi-model answer claim audit did not verify: rejected": "claim_audit_fallback_unverified",
     }
+
+    CLASS_CODES = {
+        "TimeoutError": "llm_backend_failed", "URLError": "llm_backend_failed",
+        "OllamaRuntimeError": "llm_backend_failed", "ConnectionError": "llm_backend_failed",
+        "ConnectionResetError": "llm_backend_failed", "ConnectionRefusedError": "llm_backend_failed",
+        "ConnectionAbortedError": "llm_backend_failed", "BrokenPipeError": "llm_backend_failed",
+        "RemoteDisconnected": "llm_backend_failed", "IncompleteRead": "llm_backend_failed",
+        "ValueError": "llm_output_invalid", "ValidationError": "llm_output_invalid",
+        "JSONDecodeError": "llm_output_invalid",
+        "RuntimeError": "llm_runtime_failed", "HTTPException": "llm_runtime_failed",
+    }
+
+    def test_multi_model_failures_are_classified_by_exception_class_only(self) -> None:
+        self.assertEqual(self.CLASS_CODES, _EXCEPTION_CLASS_CODES)
+        for name, code in self.CLASS_CODES.items():
+            with self.subTest(exception=name):
+                self.assertEqual(code, _http_error_code(503, {"detail": f"Multi-model local QA execution failed: {name}"}))
+        self.assertTrue(set(_EXCEPTION_CLASS_CODES.values()) <= set(HTTP_ERROR_CODES))
+
+    def test_unlisted_classes_and_non_identifier_suffixes_are_other(self) -> None:
+        prefix = "Multi-model local QA execution failed: "
+        for suffix in ("KeyError", "MemoryError", "timeouterror", "TimeoutError ", "TimeoutError\n", " TimeoutError",
+                       "TimeoutError: details", "model answer cited unknown context evidence",
+                       "required_model_not_installed", "ValueError(secret)", "", "x" * 80):
+            with self.subTest(suffix=suffix):
+                self.assertEqual("other", _http_error_code(503, {"detail": prefix + suffix}))
+        self.assertEqual("other", _http_error_code(503, {"detail": "Multi-model local QA execution failed:TimeoutError"}))
 
     def test_known_messages_map_to_fixed_codes(self) -> None:
         for detail, code in self.EXPECTED.items():
@@ -442,9 +489,18 @@ class HttpErrorCodeTests(unittest.TestCase):
 
     def test_score_case_records_the_code_and_never_the_raw_detail(self) -> None:
         marker = "SECRET-EXCEPTION-TEXT"
-        case = _scored(A, response={"detail": f"Multi-model local QA execution failed: {marker}"}, status=503, events=[])
-        self.assertEqual("llm_backend_failed", case["http_error_code"])
-        self.assertNotIn(marker, json.dumps(case))
+        for detail, code in ((f"Multi-model local QA execution failed: {marker}", "other"),
+                             (f"Multi-model local QA execution failed: TimeoutError {marker}", "other"),
+                             (f"Local LLM backend request failed: {marker}", "llm_backend_failed"),
+                             (f"Multi-model answer claim audit did not verify: {marker}", "claim_audit_fallback_unverified"),
+                             (f"{marker}", "other")):
+            with self.subTest(detail=detail):
+                case = _scored(A, response={"detail": detail}, status=503, events=[])
+                self.assertEqual(code, case["http_error_code"])
+                self.assertNotIn(marker, json.dumps(case))
+        case = _scored(A, response={"detail": "Multi-model local QA execution failed: ValueError"}, status=503, events=[])
+        self.assertEqual("llm_output_invalid", case["http_error_code"])
+        self.assertNotIn("ValueError", json.dumps(case))
         self.assertIsNone(_scored(A)["http_error_code"])
         self.assertEqual("other", _scored(A, response={"detail": "denied"}, status=403, events=[])["http_error_code"])
 
@@ -454,7 +510,7 @@ class HttpErrorCodeTests(unittest.TestCase):
         self.assertGreaterEqual(len(found), 9)
         for message in found:
             with self.subTest(message=message):
-                rendered = re.sub(r"\{[^}]*\}", "SomeError", message)
+                rendered = re.sub(r"\{[^}]*\}", "TimeoutError", message)
                 self.assertNotEqual("other", _http_error_code(503, {"detail": rendered}))
 
 
@@ -636,6 +692,37 @@ class FailureCauseDominanceTests(unittest.TestCase):
         self.assertEqual(1, breakdown["counts"]["primary"]["retrieval_miss"])
         self.assertEqual(1, breakdown["counts"]["primary"]["generation_fallback"])
         self.assertEqual("retrieval_miss", breakdown["dominant_cause"])
+        # The branch is counted over all cases: one retrieval and one answer case tie, and the
+        # tie goes to the branch earlier in the branch precedence (answer before retrieval).
+        self.assertEqual({APPROVAL: 0, ANSWER: 1, RETRIEVAL: 1, LATENCY: 0}, breakdown["plan_branch_counts"])
+        self.assertEqual(ANSWER, breakdown["dominant_plan_branch"])
+
+    def test_dominant_branch_is_the_most_common_branch_across_causes(self) -> None:
+        # Reviewer example: 4 generation_fallback (answer) and 5 execution_error that split
+        # 2 latency, 2 approval and 1 answer. The dominant cause is execution_error, but the
+        # answer branch holds 5 of the 9 failed cases.
+        report = _report()
+        for index in range(4):
+            self.make_fallback(report, index)
+        timeout = "Multi-model local QA execution failed: TimeoutError"
+        identity = "Final evidence identity verification failed"
+        for index, detail in ((4, timeout), (5, timeout), (6, identity), (7, identity),
+                              (8, "Answer citation verification failed")):
+            self.make_backend_failure(report, index, detail)
+        breakdown = build_failure_breakdown(report)
+        self.assertEqual({"generation_fallback": 4, "execution_error": 5},
+                         {cause: count for cause, count in breakdown["counts"]["primary"].items() if count})
+        self.assertEqual("execution_error", breakdown["dominant_cause"])
+        self.assertEqual({APPROVAL: 2, ANSWER: 5, RETRIEVAL: 0, LATENCY: 2}, breakdown["plan_branch_counts"])
+        self.assertEqual(ANSWER, breakdown["dominant_plan_branch"])
+
+    def test_unknown_cases_do_not_count_toward_the_dominant_branch(self) -> None:
+        report = _report()
+        report["stages"]["live_llm"] = {"status": "failed", "error_type": "TimeoutError"}
+        _retrieval(report, A).update(recall_at_5=0.0)
+        breakdown = build_failure_breakdown(report)
+        self.assertEqual(27, breakdown["unknown_case_count"])
+        self.assertEqual({APPROVAL: 0, ANSWER: 0, RETRIEVAL: 1, LATENCY: 0}, breakdown["plan_branch_counts"])
         self.assertEqual(RETRIEVAL, breakdown["dominant_plan_branch"])
 
     def test_a_cause_spanning_branches_reports_its_most_common_branch(self) -> None:

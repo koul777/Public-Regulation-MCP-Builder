@@ -495,8 +495,9 @@ FAILURE_CAUSES: dict[str, dict[str, Any]] = {
                                  "codes": ("no_evidence_query_returned_results", "mcp_unexpected_evidence")},
     "execution_error": {"plan_branch": BRANCH_APPROVAL_BUNDLE,
                         "codes": ("llm_transport_error", "llm_transport_timeout", "unexpected_http_status",
-                                  "llm_backend_failed", "llm_backend_unavailable",
-                                  "evidence_identity_verification_failed", "citation_verification_failed",
+                                  "llm_backend_failed", "llm_backend_unavailable", "llm_output_invalid",
+                                  "llm_runtime_failed", "evidence_identity_verification_failed",
+                                  "citation_verification_failed",
                                   "claim_audit_fallback_unverified", "claim_audit_status_missing",
                                   "citation_verification_status_missing", "invalid_citations_shape",
                                   "expected_clean_abstention", "retrieval_query_spec_invalid",
@@ -517,12 +518,15 @@ FAILURE_CAUSES: dict[str, dict[str, Any]] = {
 CAUSE_PRECEDENCE = tuple(FAILURE_CAUSES)
 CRITICAL_CAUSES = CAUSE_PRECEDENCE[:3]
 # execution_error codes that override its default branch; the first one present wins.
-# Model execution failures are latency; identity failures are approval and bundle defects;
-# a rejected citation or audit is the answer branch. Every other execution_error code
-# (missing statuses, search and MCP failures, malformed bodies) keeps the default.
+# Transport and timeout failures are latency; model output the checks rejected, a rejected
+# citation and a rejected audit are the answer branch; identity failures and runtime state
+# (a missing model, an inner HTTP error) are approval and bundle defects. Every other
+# execution_error code (missing statuses, search and MCP failures, malformed bodies)
+# keeps the default.
 EXECUTION_CODE_BRANCHES = (
     ("llm_backend_failed", BRANCH_LATENCY), ("llm_backend_unavailable", BRANCH_LATENCY),
     ("llm_transport_timeout", BRANCH_LATENCY),
+    ("llm_output_invalid", BRANCH_ANSWER), ("llm_runtime_failed", BRANCH_APPROVAL_BUNDLE),
     ("evidence_identity_verification_failed", BRANCH_APPROVAL_BUNDLE),
     ("citation_verification_failed", BRANCH_ANSWER), ("claim_audit_fallback_unverified", BRANCH_ANSWER),
 )
@@ -794,11 +798,11 @@ def _build_failure_breakdown(report: Mapping[str, Any]) -> dict[str, Any]:
     # counts, so ties go to the earlier cause in the precedence.
     known = [cause for cause in CAUSE_PRECEDENCE if cause != "unknown" and primary[cause]]
     dominant = max(known, key=lambda cause: len(primary[cause])) if known else None
-    # A cause can span branches (execution_error, security_leak), so its branch is the most
-    # common one among its primary cases; ties go to BRANCH_PRECEDENCE.
-    dominant_branches = [case["plan_branch"] for case in cases if case["primary_cause"] == dominant]
-    dominant_branch = (max(BRANCH_PRECEDENCE, key=dominant_branches.count)
-                       if dominant is not None and dominant_branches else None)
+    # Causes can span branches (execution_error, security_leak) and different causes can share
+    # one, so the branch is counted over every classified failed case, not taken from the
+    # dominant cause. Unknown cases have no branch. Ties go to BRANCH_PRECEDENCE.
+    branch_counts = {branch: sum(case["plan_branch"] == branch for case in cases) for branch in BRANCH_PRECEDENCE}
+    dominant_branch = max(BRANCH_PRECEDENCE, key=branch_counts.get) if any(branch_counts.values()) else None
     reason_counts: dict[str, int] = {}
     for case in cases:
         for reason in case["unknown_reasons"]:
@@ -814,8 +818,7 @@ def _build_failure_breakdown(report: Mapping[str, Any]) -> dict[str, Any]:
         "classification_complete": not primary["unknown"] and interrupted is None and not_run_count in {0, None},
         "cause_precedence": list(CAUSE_PRECEDENCE),
         "dominant_cause": dominant, "dominant_plan_branch": dominant_branch,
-        "plan_branch_counts": {branch: sum(case["plan_branch"] == branch for case in cases)
-                               for branch in BRANCH_PRECEDENCE},
+        "plan_branch_counts": branch_counts,
         "counts": {"primary": {cause: len(ids) for cause, ids in primary.items()},
                    "any": {cause: len(ids) for cause, ids in anywhere.items()}},
         "case_ids": {"primary": primary, "any": anywhere},
