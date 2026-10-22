@@ -241,25 +241,63 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 
 ### 실패 원인 분류 (`failure_breakdown`)
 
-계획서 [§7 측정 결과에 따른 개발 분기](real_regulation_mcp_local_llm_10hour_plan_ko.md)는 가장 많은 실패 원인을 기준으로 다음 수정 대상을 고름. 가드레일 결과의 `failure_breakdown`이 문항별 원인을 미리 모아 줌.
+계획서 [§7 측정 결과에 따른 개발 분기](real_regulation_mcp_local_llm_10hour_plan_ko.md)는 가장 많은 실패 원인을 기준으로 다음 수정 대상을 고름. 가드레일 결과의 `failure_breakdown`이 문항별 원인과 §7 분기를 미리 모아 줌.
 
 - 진단용 출력임. `verdict`, `passed`, hard·target·regression 행, 종료 코드에 영향을 주지 않음. 분류 계산이 실패해도 판정은 그대로이고 이 항목만 `status: "error"`가 됨.
-- 검색 결과, MCP 문항, LLM 문항을 문항 ID로 합쳐 어느 단계에서든 실패한 문항마다 주원인(`primary_cause`), 해당하는 모든 원인(`causes`), 원인별 코드(`codes`)를 기록함. 주원인은 아래 표의 위쪽 원인이 우선함.
-- 이 분류는 기록된 필드에 규칙을 적용한 결과이며 원인 확정이 아님. 근거 코드는 `scripts/check_real_regulation_kpi_guardrails.py`의 `FAILURE_CAUSES`와 `LLM_ERROR_CODE_CAUSES`에 있고, 테스트가 이 표와 `score_case`의 오류 코드가 일치하는지 확인함.
+- 검색 결과, MCP 문항, LLM 문항을 문항 ID로 합쳐 어느 단계에서든 실패한 문항마다 주원인(`primary_cause`), 해당하는 모든 원인(`causes`), 원인별 코드(`codes`), §7 분기(`plan_branch`)를 기록함. 주원인은 아래 표의 위쪽 원인이 우선함.
+- 이 분류는 기록된 필드에 규칙을 적용한 결과이며 원인 확정이 아님. 근거 코드는 `scripts/check_real_regulation_kpi_guardrails.py`의 `FAILURE_CAUSES`, `EXECUTION_CODE_BRANCHES`, `LLM_ERROR_CODES`에 있음. 테스트가 `score_case`가 낼 수 있는 오류 코드와 `LLM_ERROR_CODES`의 일치, 선언한 코드와 실제로 기록되는 코드의 일치를 확인함.
 
 | 순위 | 원인 | 판정 근거 | §7 분기 |
 | ---: | --- | --- | --- |
-| 1 | `security_leak` | 기권·차단 기대 문항이 답변·인용을 내보냄, 금지 사실이 나옴, 차단 기대 문항이 2xx로 응답. 코드: `blocked_case_exposed_answer_or_called_model`, `forbidden_fact_exposed`, `expected_clean_abstention`, `expected_client_rejection` | §7에 직접 항목 없음. 승인 가시성·번들 결함 분기로 분류하며, 기준을 낮춰 통과시키지 않음 |
-| 2 | `fabricated_citation` | 실질 답변(HTTP 200, 답변 있음, 기권 아님)의 인용이 없음·미확인·답변의 근거 번호 불일치·형식 오류·서버 거절·알 수 없는 제한 사유. `citation_trace` hard 검사와 같은 기준. 코드: `missing_citation`, `citation_not_verified`, `answer_citation_context_not_verified`, `invalid_citations_shape`, `citation_verification_not_accepted`, `unknown_verification_limitation` | 근거는 맞지만 답변이 틀림 (인용 불일치) |
+| 1 | `security_leak` | 기권·차단 기대 문항에서만 판정. 차단 기대 문항이 답변·인용을 내보내거나 모델을 호출하거나 2xx로 응답, 기권 기대 문항이 HTTP 200에서 답변 또는 인용을 내보냄, 금지 사실이 나옴. 코드: `blocked_case_exposed_answer_or_called_model`, `forbidden_fact_exposed`, `expected_clean_abstention`, `expected_client_rejection` | 차단 기대 문항은 승인 가시성·번들 결함. 기권 기대 문항은 함께 나온 원인의 분기를 따르고 (`retrieval_false_positive`와 함께면 검색 누락), 함께 나온 원인이 없으면 근거는 맞지만 답변이 틀림 (검색은 비었는데 답변·감사 단계가 통과시킨 경우) |
+| 2 | `fabricated_citation` | 실질 답변의 인용 결함. 정의는 아래 목록 | 근거는 맞지만 답변이 틀림 (인용 불일치) |
 | 3 | `critical_fact` | 답변 가능 문항의 답변에 금지 사실이 나옴. 코드: `forbidden_fact_exposed` | 근거는 맞지만 답변이 틀림 (수치·단위 변형) |
 | 4 | `retrieval_miss` | 답변 가능 문항의 `recall_at_5`가 1.0 미만, 또는 MCP 문항이 대상 근거를 찾지 못함. 코드: `recall_at_5_below_1`, `mcp_target_evidence_not_retrieved`, `mcp_case_not_passed` (MCP 문항에 단계 정보가 없을 때) | 검색 누락 |
 | 5 | `retrieval_false_positive` | 근거 없음 질의가 검색 또는 MCP에서 결과를 반환. 코드: `no_evidence_query_returned_results`, `mcp_unexpected_evidence`. 요청 목록에 없던 원인이며, 검색 단계의 실패라서 같은 분기에 둠 | 검색 누락 |
-| 6 | `execution_error` | HTTP 상태 불일치, 전송 오류, 감사·인용 상태 누락, 검색 오류, 질의 명세 오류, MCP 검색·조회 실패. 코드: `llm_transport_error`, `unexpected_http_status`, `claim_audit_status_missing`, `citation_verification_status_missing`, `invalid_citations_shape`, `expected_clean_abstention` (빈 응답), `retrieval_search_error`, `retrieval_query_spec_invalid`, `mcp_search_failed`, `mcp_fetch_failed`, `mcp_case_incomplete` | 승인 가시성·번들 결함. 전송 오류가 `TimeoutError`이면 지연 분기도 확인 |
-| 7 | `generation_fallback` | 답변 가능 문항에 검증된 최종 모델 답변이 없음 (대체 응답, 기권, 감사 미수락). 코드: `final_model_generation_not_verified`, `claim_audit_not_accepted`, `citation_verification_not_accepted`, `answer_mode_fallback`, `answer_abstained`, `final_model_answer_false` | 지연 (모델 시간 초과·적재 지연). 감사 거절이 사유이면 근거는 맞지만 답변이 틀림 분기도 확인. 기록된 필드로 두 사유를 구분하지 못함 |
+| 6 | `execution_error` | HTTP 상태 불일치, 전송 오류, 감사·인용 상태 누락, 검색 오류, 질의 명세 오류, MCP 검색·조회 실패. 코드와 분기는 아래 표 | 코드에 따라 지연, 승인 가시성·번들 결함, 근거는 맞지만 답변이 틀림 |
+| 7 | `generation_fallback` | 답변 가능 문항에 검증된 최종 모델 답변이 없음 (대체 응답, 기권, 감사 미수락). 코드: `final_model_generation_not_verified`, `claim_audit_not_accepted`, `citation_verification_not_accepted`, `answer_mode_fallback`, `answer_abstained`, `final_model_answer_false`, `fallback_citation_without_context_or_hash` | 근거는 맞지만 답변이 틀림 |
 | 8 | `answer_incomplete` | 검증된 최종 모델 답변이지만 필수 사실 일부가 빠짐. 코드: `gold_facts_failed` | 근거는 맞지만 답변이 틀림 (조건·예외 누락) |
 | 9 | `unknown` | 단계 자료 누락 또는 분류 불가. 사유는 `unknown_reasons`에 기록 | 없음 |
 
-- 출력 필드: `counts`와 `case_ids`는 각각 `primary`(주원인 기준)와 `any`(해당 원인이 하나라도 있는 문항 기준)를 가짐. `dominant_cause`는 주원인 건수가 가장 많은 원인이고, 동수이면 표에서 위쪽 원인임. `dominant_plan_branch`는 그 원인의 §7 분기임. `critical_case_ids`는 1~3순위 원인이 하나라도 있는 문항 ID의 합집합임.
+`generation_fallback`의 분기 근거: `claim_audit_mode=model`에서는 답변·감사 단계가 `strict_model=True`로 실행되어 모델·백엔드 실패와 시간 초과가 대체 응답이 아니라 HTTP 503이 됨. 이 경우는 `execution_error`로 분류됨. 대체 응답(`claim_audit_status`가 `fallback_from_<감사 상태>`)과 기권은 감사가 모델 답변을 거절했을 때만 나오므로 답변 분기임.
+
+`fabricated_citation`의 정의 (실질 답변, 즉 HTTP 200이고 답변이 있고 기권이 아닌 응답에서만 판정):
+
+- `missing_citation`: 인용 수가 1 미만.
+- `citation_not_verified`: 인용은 있으나 `citation_checks.all_verified`가 true가 아님.
+- `answer_citation_context_not_verified`: 답변의 근거 번호(`[E1]` 등)와 인용의 context ID가 맞지 않음.
+- `invalid_citations_shape`: `citations`가 목록이 아니거나 객체가 아닌 항목을 포함.
+- `citation_verification_not_accepted`: 서버의 `citation_verification_status`가 `verified`가 아님. 상태 자체가 없으면 `execution_error`의 `citation_verification_status_missing`으로 분류함.
+- `unknown_verification_limitation`: `verification_limitations`가 목록이 아니거나 `deterministic_citation_omits_context_and_hash`, `content_hash_not_available_in_gold` 밖의 값을 포함.
+- `citation_trace` hard 검사와의 차이는 두 가지임. 하나는 `citation_verification_not_accepted`로, 분류에만 있고 hard 검사는 보지 않음. 다른 하나는 아래 대체 응답 인용으로, hard 검사는 위반으로 판정하고 분류는 `fabricated_citation`이 아닌 `generation_fallback`으로 기록함. 그 밖의 위반은 두 쪽이 일치하며 테스트가 확인함.
+
+대체 응답의 인용: 실제 추출형 대체 응답의 인용(`CitationVerifierAgent`)은 구조상 `context_id`, 내용 해시(`content_hash`, `approved_content_hash`), 인용문(`support_quote`)이 없음. `score_case`는 context ID·해시 누락 면제를 빠른 결정적 경로(`deterministic_identity_verified`)에만 적용하므로, `fallback_from_*` 응답은 `citation_not_verified`와 `answer_citation_context_not_verified`를 기록하고 `citation_trace` hard 검사도 위반으로 판정함 (판정은 바꾸지 않음). 분류는 `fallback`이 true이고 인용 결함이 이 두 가지뿐일 때만 `fallback_citation_without_context_or_hash`(`generation_fallback`)로 기록하고, `fabricated_citation`과 `critical_case_ids`에서 제외함. `citation_not_verified`가 있으면 실패한 인용이 모두 `content_hash_status=missing`이고 인용문 검사가 `invalid`가 아니어야 하며(인용문이 없는 `not_provided`는 허용), `answer_citation_context_not_verified`가 있으면 `citation_context_ids`가 비어 있어야 함. 신원 불일치, 잘못된 인용문, 맞지 않는 context ID는 그대로 `fabricated_citation`임. hard 검사는 바꾸지 않았고 계속 엄격함. 한계: 해시 누락과 함께 페이지 범위가 어긋난 경우, 문항이 인용문을 필수로 요구해서(`require_support_quote`) 인용문 부재가 실패 원인인 경우는 `score_case`가 기록하지 않아 구분하지 못함.
+
+`execution_error`의 분기 (표 위쪽 코드가 우선, 해당하는 코드가 없으면 승인 가시성·번들 결함):
+
+| 코드 | 원천 | 분기 |
+| --- | --- | --- |
+| `llm_backend_failed` | 서버 메시지 `Local LLM backend request failed: <예외 이름>`, 또는 `Multi-model local QA execution failed: <예외 이름>`에서 예외 이름이 `TimeoutError`, `URLError`, `OllamaRuntimeError`, `ConnectionError`, `ConnectionResetError`, `ConnectionRefusedError`, `ConnectionAbortedError`, `BrokenPipeError`, `RemoteDisconnected`, `IncompleteRead` | 지연 |
+| `llm_backend_unavailable` | `Configured local LLM backend is not available.` 또는 `Local LLM backend request failed: backend unavailable` | 지연 |
+| `llm_transport_timeout` | 평가기 전송 오류가 `TimeoutError`, `ReadTimeout`, `ConnectTimeout` | 지연 |
+| `llm_output_invalid` | `Multi-model local QA execution failed: <예외 이름>`에서 예외 이름이 `ValueError`, `ValidationError`, `JSONDecodeError` (모델 출력을 답변·감사 검사가 거절, 예: 모델이 알 수 없는 문맥 번호를 인용) | 근거는 맞지만 답변이 틀림 |
+| `llm_runtime_failed` | `Multi-model local QA execution failed: <예외 이름>`에서 예외 이름이 `RuntimeError` (필요한 모델 미설치 등), `HTTPException` (빠른 경로의 내부 HTTP 오류) | 승인 가시성·번들 결함 |
+| `evidence_identity_verification_failed` | `Final evidence identity verification failed` 또는 `Fast chat evidence identity verification failed` | 승인 가시성·번들 결함 |
+| `citation_verification_failed` | `Answer citation verification failed` | 근거는 맞지만 답변이 틀림 |
+| `claim_audit_fallback_unverified` | `Multi-model answer claim audit did not verify: ...` (감사 거절 뒤 대체 답변의 인용 검증 실패) | 근거는 맞지만 답변이 틀림 |
+| 그 밖의 코드 | `unexpected_http_status`만 있는 경우, `llm_transport_error`(시간 초과 아님), 감사·인용 상태 누락, 검색·MCP 실행 오류, 질의 명세 오류, 빈 응답, 형식 오류 | 승인 가시성·번들 결함 |
+
+- 서버 메시지 구분: `score_case`가 `http_error_code` 필드를 기록함. 알려진 서버 메시지와 정확히 일치하거나 알려진 접두어로 시작하면 위 코드(`llm_backend_failed`, `llm_backend_unavailable`, `llm_output_invalid`, `llm_runtime_failed`, `evidence_identity_verification_failed`, `citation_verification_failed`, `claim_audit_fallback_unverified`), 그 밖의 비 2xx 응답은 `other`, 2xx는 `null`. 저장하는 값은 고정 코드뿐이고 메시지 원문은 저장하지 않음. 테스트가 `routes_rag.py`의 모든 503 메시지가 분류되는지 확인함.
+- `Multi-model local QA execution failed: <예외 이름>`은 모델 호출뿐 아니라 모델 출력 검사까지 감싸므로 예외 이름으로 코드를 정함. 읽는 값은 식별자 형태의 예외 이름뿐이고, 허용 목록 밖의 이름이나 식별자가 아닌 접미어는 `other`임. 지연 분기로 분류돼도 시간 초과 확정은 아님. `OllamaRuntimeError`는 Ollama의 HTTP 오류 응답(모델 적재 실패 등)도 포함함.
+- `Local LLM backend request failed: <예외 이름>`(다중 모델 경로가 아닌 기존 답변 경로)은 모델 호출만 감싸므로 예외 이름과 무관하게 `llm_backend_failed`임.
+- `Answer citation verification failed`는 비승인 근거가 들어와 검증기가 예외를 낸 경우와 인용 검증이 거절된 경우를 구분하지 못함.
+
+출력 규칙:
+
+- 필드: `counts`와 `case_ids`는 각각 `primary`(주원인 기준)와 `any`(해당 원인이 하나라도 있는 문항 기준)를 가짐. `plan_branch_counts`는 실패 문항의 문항별 `plan_branch` 건수임. `critical_case_ids`는 1~3순위 원인이 하나라도 있는 문항 ID의 합집합임.
+- `dominant_cause`는 `unknown`을 제외한 원인 중 주원인 건수가 가장 많은 원인이고, 동수이면 표에서 위쪽 원인임. 분류하지 못한 문항 수는 `unknown_case_count`에 따로 셈. `unknown` 문항만 있으면 `dominant_cause`는 `null`임.
+- `dominant_plan_branch`는 `plan_branch_counts`가 가장 큰 분기임. `unknown`을 제외한 분류된 모든 실패 문항을 세므로 `dominant_cause`의 분기와 다를 수 있음. 예: 대체 응답 4건과 `execution_error` 5건(지연 2, 승인 2, 답변 1)이면 `dominant_cause`는 `execution_error`이고 `dominant_plan_branch`는 근거는 맞지만 답변이 틀림(5건)임. 동수이면 승인 가시성·번들 결함, 근거는 맞지만 답변이 틀림, 검색 누락, 지연 순임. §7이 승인 가시성·번들 결함을 먼저 해결하라고 하므로 `plan_branch_counts`의 해당 값이 0이 아니면 최빈 분기와 별개로 먼저 확인함.
+- 중단된 실행: `interrupted_reason`과 `not_run_count`를 LLM 단계 결과에서 그대로 복사함. 실행하지 못한 문항은 `unknown`(`llm_case_not_run`)임. `classification_complete`는 `unknown` 문항, 중단, 미실행이 모두 없을 때만 true임.
 - 결과가 없는 HTTP·전송 오류 문항에는 답변에서 파생되는 원인(인용, 대체 응답, 사실 미충족)을 기록하지 않음. 최종 모델 답변이 아닌 문항의 사실 미충족은 `answer_incomplete`가 아니라 `generation_fallback`으로만 셈.
 - 단계 전체 또는 해당 문항의 자료가 없으면 `unknown`과 사유(`retrieval_stage_missing`, `mcp_case_missing`, `llm_case_not_run`, `retrieval_recall_not_recorded`, `gold_facts_unlabeled`, `unmapped_error:<코드>` 등)를 기록함. 다른 원인이 이미 있는 문항에서는 사유만 `unknown_reasons`에 남고 주원인은 바뀌지 않음.
 - §7의 첫 분기(원문 손실·경계 오류)는 이 분류로 판별하지 못함. `retrieval_miss`와 `answer_incomplete` 문항은 원문과 청크 경계를 직접 확인해야 함.

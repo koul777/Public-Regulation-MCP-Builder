@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.evaluate_live_local_llm import _percentile  # noqa: E402
+from scripts.evaluate_live_local_llm import HTTP_ERROR_CODES, _percentile  # noqa: E402
 from scripts.run_real_regulation_e2e import EvidenceError, require_private_path  # noqa: E402
 
 
@@ -507,11 +507,18 @@ BRANCH_APPROVAL_BUNDLE = "승인 가시성·번들 결함"
 BRANCH_RETRIEVAL = "검색 누락"
 BRANCH_ANSWER = "근거는 맞지만 답변이 틀림"
 BRANCH_LATENCY = "지연"
+# Section 7 says approval and bundle defects are fixed first, so they win branch ties.
+BRANCH_PRECEDENCE = (BRANCH_APPROVAL_BUNDLE, BRANCH_ANSWER, BRANCH_RETRIEVAL, BRANCH_LATENCY)
+TIMEOUT_ERROR_TYPES = frozenset({"TimeoutError", "ReadTimeout", "ConnectTimeout"})
 # Insertion order is the precedence: the first cause that applies is the primary one.
 # `codes` lists every code the cause can put in a case record; tests keep it exact.
+# `plan_branch` is the default section 7 branch; _plan_branch() applies the two exceptions
+# (security_leak by case kind, execution_error by code).
 FAILURE_CAUSES: dict[str, dict[str, Any]] = {
-    # No section 7 bullet names a leak. Gates must not be relaxed to pass, so it points at
-    # the "fix approval and bundle first" branch (plan section 6: isolation and abstention 100%).
+    # No section 7 bullet names a leak. A blocked case that answered is an isolation defect,
+    # so it points at approval and bundle. An abstention case follows the cause that
+    # co-occurs with it (a retrieval false positive points at retrieval); alone, the model
+    # and audit let an unsupported answer through, which is the answer branch.
     "security_leak": {"plan_branch": BRANCH_APPROVAL_BUNDLE,
                       "codes": ("blocked_case_exposed_answer_or_called_model", "forbidden_fact_exposed",
                                 "expected_clean_abstention", "expected_client_rejection")},
@@ -522,46 +529,56 @@ FAILURE_CAUSES: dict[str, dict[str, Any]] = {
     "critical_fact": {"plan_branch": BRANCH_ANSWER, "codes": ("forbidden_fact_exposed",)},
     "retrieval_miss": {"plan_branch": BRANCH_RETRIEVAL,
                        "codes": ("recall_at_5_below_1", "mcp_target_evidence_not_retrieved", "mcp_case_not_passed")},
-    # Not in the brief's list: a no-evidence query that returned results is a retrieval-stage
-    # failure that is neither a miss nor a model leak, so it gets its own cause.
+    # A no-evidence query that returned results is a retrieval-stage failure that is neither
+    # a miss nor a model leak, so it has its own cause.
     "retrieval_false_positive": {"plan_branch": BRANCH_RETRIEVAL,
                                  "codes": ("no_evidence_query_returned_results", "mcp_unexpected_evidence")},
     "execution_error": {"plan_branch": BRANCH_APPROVAL_BUNDLE,
-                        "codes": ("llm_transport_error", "unexpected_http_status", "claim_audit_status_missing",
+                        "codes": ("llm_transport_error", "llm_transport_timeout", "unexpected_http_status",
+                                  "llm_backend_failed", "llm_backend_unavailable", "llm_output_invalid",
+                                  "llm_runtime_failed", "evidence_identity_verification_failed",
+                                  "citation_verification_failed",
+                                  "claim_audit_fallback_unverified", "claim_audit_status_missing",
                                   "citation_verification_status_missing", "invalid_citations_shape",
                                   "expected_clean_abstention", "retrieval_query_spec_invalid",
                                   "retrieval_search_error", "mcp_search_failed", "mcp_fetch_failed",
                                   "mcp_case_incomplete")},
-    # A fallback caused by a role timeout belongs to the latency branch; one caused by a
-    # rejected audit belongs to the answer branch. The recorded fields cannot tell them apart.
-    "generation_fallback": {"plan_branch": BRANCH_LATENCY,
+    # With claim_audit_mode=model a backend failure or timeout is an HTTP 503 (execution_error),
+    # never a fallback. A fallback or abstention on an answerable case happens only when the
+    # audit rejected the model's answer, which is the answer branch.
+    "generation_fallback": {"plan_branch": BRANCH_ANSWER,
                             "codes": ("final_model_generation_not_verified", "claim_audit_not_accepted",
                                       "citation_verification_not_accepted", "answer_mode_fallback",
-                                      "answer_abstained", "final_model_answer_false")},
+                                      "answer_abstained", "final_model_answer_false",
+                                      "fallback_citation_without_context_or_hash")},
     "answer_incomplete": {"plan_branch": BRANCH_ANSWER, "codes": ("gold_facts_failed",)},
-    # Stage data is missing or a failure cannot be classified. `reasons` carry the details.
+    # Stage data is missing or a failure cannot be classified. `unknown_reasons` carry the details.
     "unknown": {"plan_branch": None, "codes": ()},
 }
 CAUSE_PRECEDENCE = tuple(FAILURE_CAUSES)
 CRITICAL_CAUSES = CAUSE_PRECEDENCE[:3]
-# Every error code evaluate_live_local_llm.score_case can emit, with the causes it can feed.
-LLM_ERROR_CODE_CAUSES: dict[str, tuple[str, ...]] = {
-    "unexpected_http_status": ("execution_error",),
-    "claim_audit_status_missing": ("execution_error",),
-    "citation_verification_status_missing": ("execution_error",),
-    "claim_audit_not_accepted": ("generation_fallback",),
-    "citation_verification_not_accepted": ("fabricated_citation", "generation_fallback"),
-    "final_model_generation_not_verified": ("generation_fallback",),
-    "gold_facts_failed": ("answer_incomplete", "critical_fact"),
-    "gold_facts_unverified": ("unknown",),
-    "citation_not_verified": ("fabricated_citation",),
-    "answer_citation_context_not_verified": ("fabricated_citation",),
-    "invalid_citations_shape": ("fabricated_citation", "execution_error"),
-    "expected_client_rejection": ("security_leak",),
-    "blocked_case_exposed_answer_or_called_model": ("security_leak",),
-    "expected_clean_abstention": ("security_leak", "execution_error"),
-    "forbidden_fact_exposed": ("security_leak",),
-}
+# execution_error codes that override its default branch; the first one present wins.
+# Transport and timeout failures are latency; model output the checks rejected, a rejected
+# citation and a rejected audit are the answer branch; identity failures and runtime state
+# (a missing model, an inner HTTP error) are approval and bundle defects. Every other
+# execution_error code (missing statuses, search and MCP failures, malformed bodies)
+# keeps the default.
+EXECUTION_CODE_BRANCHES = (
+    ("llm_backend_failed", BRANCH_LATENCY), ("llm_backend_unavailable", BRANCH_LATENCY),
+    ("llm_transport_timeout", BRANCH_LATENCY),
+    ("llm_output_invalid", BRANCH_ANSWER), ("llm_runtime_failed", BRANCH_APPROVAL_BUNDLE),
+    ("evidence_identity_verification_failed", BRANCH_APPROVAL_BUNDLE),
+    ("citation_verification_failed", BRANCH_ANSWER), ("claim_audit_fallback_unverified", BRANCH_ANSWER),
+)
+# Every error code evaluate_live_local_llm.score_case can emit. A test compares this set with
+# the source, so a new score_case code cannot be skipped silently; unlisted codes become
+# `unknown` with an `unmapped_error:` reason.
+LLM_ERROR_CODES = frozenset({
+    "unexpected_http_status", "claim_audit_status_missing", "citation_verification_status_missing",
+    "claim_audit_not_accepted", "citation_verification_not_accepted", "final_model_generation_not_verified",
+    "gold_facts_failed", "gold_facts_unverified", "citation_not_verified",
+    "answer_citation_context_not_verified", "invalid_citations_shape", "expected_client_rejection",
+    "blocked_case_exposed_answer_or_called_model", "expected_clean_abstention", "forbidden_fact_exposed"})
 Finding = tuple[str, str]  # (cause, code)
 
 
@@ -603,6 +620,29 @@ def _mcp_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
     return [("retrieval_miss", "mcp_case_not_passed")], []
 
 
+def _fallback_citation_gap_only(problems: list[str], citations: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+    """True when an extractive fallback fails only because its citations carry no context ID or hash.
+
+    The real fallback citation (CitationVerifierAgent) has no context_id and no content hash by
+    construction. score_case only exempts that for the fast deterministic path, so it reports
+    citation_not_verified and answer_citation_context_not_verified for fallback_from_* answers.
+    """
+    if not problems or not set(problems) <= {"citation_not_verified", "answer_citation_context_not_verified"}:
+        return False
+    if "citation_not_verified" in problems:
+        checks = citations.get("checks")
+        if not isinstance(checks, list) or not checks or not all(isinstance(check, dict) for check in checks):
+            return False
+        failing = [check for check in checks if check.get("passed") is not True]
+        # A bad quote or an identity mismatch is a real citation problem, not a missing hash.
+        if not failing or any(check.get("content_hash_status") != "missing"
+                              or check.get("support_quote_status") == "invalid" for check in failing):
+            return False
+    if "answer_citation_context_not_verified" in problems and context.get("citation_context_ids") != []:
+        return False
+    return True
+
+
 def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
     findings: list[Finding] = []
     unknown: list[str] = []
@@ -622,8 +662,16 @@ def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
     def add(cause: str, code: str) -> None:
         findings.append((cause, code))
 
+    def add_unexpected_status() -> None:
+        add("execution_error", "unexpected_http_status")
+        http_error = case.get("http_error_code")
+        if http_error in HTTP_ERROR_CODES and http_error != "other":
+            add("execution_error", http_error)
+
     if transport_error:
         add("execution_error", "llm_transport_error")
+        if case.get("error_type") in TIMEOUT_ERROR_TYPES:
+            add("execution_error", "llm_transport_timeout")
     if not _answerable(case):
         exposed = (answer_present is True and not abstained) or (
             _is_int(citations.get("citation_count")) and citations["citation_count"] > 0)
@@ -637,12 +685,12 @@ def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
         if "expected_client_rejection" in errors and status_2xx:
             add("security_leak", "expected_client_rejection")
         if "unexpected_http_status" in errors and not (case.get("expected_block") is True and status_2xx):
-            add("execution_error", "unexpected_http_status")
+            add_unexpected_status()
         if "invalid_citations_shape" in errors:
             add("execution_error", "invalid_citations_shape")
     else:
         if "unexpected_http_status" in errors:
-            add("execution_error", "unexpected_http_status")
+            add_unexpected_status()
         # Without a usable HTTP answer every answer-derived cause would only repeat this one.
         if not transport_error and "unexpected_http_status" not in errors:
             for code in ("claim_audit_status_missing", "citation_verification_status_missing"):
@@ -653,21 +701,27 @@ def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
             if forbidden_hit:
                 add("critical_fact", "forbidden_fact_exposed")
             if substantive:
+                problems: list[str] = []
                 count = citations.get("citation_count")
                 if not _is_int(count) or count < 1:
-                    add("fabricated_citation", "missing_citation")
+                    problems.append("missing_citation")
                 elif citations.get("all_verified") is not True:
-                    add("fabricated_citation", "citation_not_verified")
+                    problems.append("citation_not_verified")
                 if context.get("passed") is not True:
-                    add("fabricated_citation", "answer_citation_context_not_verified")
+                    problems.append("answer_citation_context_not_verified")
                 if "invalid_citations_shape" in errors:
-                    add("fabricated_citation", "invalid_citations_shape")
+                    problems.append("invalid_citations_shape")
                 if "citation_verification_not_accepted" in errors and "citation_verification_status_missing" not in errors:
-                    add("fabricated_citation", "citation_verification_not_accepted")
+                    problems.append("citation_verification_not_accepted")
                 limitations = case.get("verification_limitations")
                 if not (isinstance(limitations, list) and all(isinstance(item, str) for item in limitations)
                         and set(limitations) <= KNOWN_TRACE_LIMITATIONS):
-                    add("fabricated_citation", "unknown_verification_limitation")
+                    problems.append("unknown_verification_limitation")
+                if case.get("fallback") is True and _fallback_citation_gap_only(problems, citations, context):
+                    add("generation_fallback", "fallback_citation_without_context_or_hash")
+                else:
+                    for code in problems:
+                        add("fabricated_citation", code)
             elif "invalid_citations_shape" in errors:
                 add("execution_error", "invalid_citations_shape")
             final = case.get("final_model_answer")
@@ -696,10 +750,28 @@ def _llm_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
                         unknown.append("gold_facts_unlabeled")
                 elif matched < required:
                     add("answer_incomplete", "gold_facts_failed")
-    unknown.extend("unmapped_error:" + code[:60] for code in errors if code not in LLM_ERROR_CODE_CAUSES)
+    unknown.extend("unmapped_error:" + code[:60] for code in errors if code not in LLM_ERROR_CODES)
     if case.get("status") != "passed" and not findings and not unknown:
         unknown.append("llm_case_failed_unclassified")
     return findings, unknown
+
+
+def _plan_branch(cause: str, causes: list[str], codes: Mapping[str, list[str]], expected_block: bool) -> str | None:
+    """The section 7 branch for one failed case, from its primary cause."""
+    if cause == "unknown":
+        return None
+    if cause == "security_leak":
+        if expected_block:
+            return BRANCH_APPROVAL_BUNDLE
+        for other in causes:
+            if other not in {"security_leak", "unknown"}:
+                return _plan_branch(other, causes, codes, expected_block)
+        return BRANCH_ANSWER
+    if cause == "execution_error":
+        present = set(codes.get(cause, ()))
+        return next((branch for code, branch in EXECUTION_CODE_BRANCHES if code in present),
+                    FAILURE_CAUSES[cause]["plan_branch"])
+    return FAILURE_CAUSES[cause]["plan_branch"]
 
 
 _BREAKDOWN_STAGES = (("retrieval", "results", "retrieval", _retrieval_findings),
@@ -719,19 +791,21 @@ def _group_by_id(items: list[dict[str, Any]] | None) -> tuple[dict[str, list[dic
 
 
 def _build_failure_breakdown(report: Mapping[str, Any]) -> dict[str, Any]:
-    groups, unjoinable = [], 0
+    groups: dict[str, dict[str, list[dict[str, Any]]] | None] = {}
+    unjoinable = 0
     for stage, key, _label, _judge in _BREAKDOWN_STAGES:
-        grouped, without_id = _group_by_id(_items(report, stage, key))
-        groups.append(grouped)
+        groups[stage], without_id = _group_by_id(_items(report, stage, key))
         unjoinable += without_id
-    raw_not_run = _llm_result(report).get("not_run_case_ids")
+    llm_result = _llm_result(report)
+    raw_not_run = llm_result.get("not_run_case_ids")
     not_run = {item for item in raw_not_run if isinstance(item, str) and item} if isinstance(raw_not_run, list) else set()
-    case_ids = sorted(set().union(not_run, *(grouped.keys() for grouped in groups if grouped is not None)))
+    case_ids = sorted(set().union(not_run, *(grouped.keys() for grouped in groups.values() if grouped is not None)))
     cases: list[dict[str, Any]] = []
     for case_id in case_ids:
         findings: list[tuple[str, str, str]] = []  # (stage, cause, code)
         unknown: list[tuple[str, str]] = []  # (stage, reason)
-        for (stage, _key, label, judge), grouped in zip(_BREAKDOWN_STAGES, groups):
+        for stage, _key, label, judge in _BREAKDOWN_STAGES:
+            grouped = groups[stage]
             if grouped is None:
                 unknown.append((stage, f"{label}_stage_missing"))
             elif case_id not in grouped:
@@ -747,30 +821,44 @@ def _build_failure_breakdown(report: Mapping[str, Any]) -> dict[str, Any]:
             causes = ["unknown"]
         if not causes:
             continue
+        codes = {cause: sorted({code for _, found, code in findings if found == cause}) for cause in causes
+                 if cause != "unknown"}
+        expected_block = any(row.get("expected_block") is True for row in (groups["live_llm"] or {}).get(case_id, []))
         cases.append({
             "id": case_id, "primary_cause": causes[0], "causes": causes,
-            "codes": {cause: sorted({code for _, found, code in findings if found == cause}) for cause in causes
-                      if cause != "unknown"},
+            "plan_branch": _plan_branch(causes[0], causes, codes, expected_block), "codes": codes,
             "unknown_reasons": sorted({reason for _, reason in unknown}),
             "failed_stages": [stage for stage, *_ in _BREAKDOWN_STAGES
                               if any(item[0] == stage for item in findings) or any(item[0] == stage for item in unknown)],
         })
     primary = {cause: [case["id"] for case in cases if case["primary_cause"] == cause] for cause in CAUSE_PRECEDENCE}
     anywhere = {cause: [case["id"] for case in cases if cause in case["causes"]] for cause in CAUSE_PRECEDENCE}
-    # max() keeps the first of equal counts, so ties go to the earlier cause in the precedence.
-    present = [cause for cause in CAUSE_PRECEDENCE if primary[cause]]
-    dominant = max(present, key=lambda cause: len(primary[cause])) if present else None
+    # `unknown` never wins: a run with many unclassified cases still points at the known causes,
+    # and unknown_case_count says how much is unclassified. max() keeps the first of equal
+    # counts, so ties go to the earlier cause in the precedence.
+    known = [cause for cause in CAUSE_PRECEDENCE if cause != "unknown" and primary[cause]]
+    dominant = max(known, key=lambda cause: len(primary[cause])) if known else None
+    # Causes can span branches (execution_error, security_leak) and different causes can share
+    # one, so the branch is counted over every classified failed case, not taken from the
+    # dominant cause. Unknown cases have no branch. Ties go to BRANCH_PRECEDENCE.
+    branch_counts = {branch: sum(case["plan_branch"] == branch for case in cases) for branch in BRANCH_PRECEDENCE}
+    dominant_branch = max(BRANCH_PRECEDENCE, key=branch_counts.get) if any(branch_counts.values()) else None
     reason_counts: dict[str, int] = {}
     for case in cases:
         for reason in case["unknown_reasons"]:
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    interrupted = llm_result.get("interrupted_reason")
+    interrupted = interrupted if isinstance(interrupted, str) and interrupted else None
+    not_run_count = llm_result.get("not_run_count")
+    not_run_count = not_run_count if _is_int(not_run_count) else None
     return {
         "schema_version": 1, "diagnostic_only": True, "status": "ok" if case_ids else "no_case_data",
-        "case_count": len(case_ids), "failed_case_count": len(cases), "unjoinable_record_count": unjoinable,
+        "case_count": len(case_ids), "failed_case_count": len(cases), "unknown_case_count": len(primary["unknown"]),
+        "unjoinable_record_count": unjoinable, "interrupted_reason": interrupted, "not_run_count": not_run_count,
+        "classification_complete": not primary["unknown"] and interrupted is None and not_run_count in {0, None},
         "cause_precedence": list(CAUSE_PRECEDENCE),
-        "plan_branches": {cause: FAILURE_CAUSES[cause]["plan_branch"] for cause in CAUSE_PRECEDENCE},
-        "dominant_cause": dominant,
-        "dominant_plan_branch": None if dominant is None else FAILURE_CAUSES[dominant]["plan_branch"],
+        "dominant_cause": dominant, "dominant_plan_branch": dominant_branch,
+        "plan_branch_counts": branch_counts,
         "counts": {"primary": {cause: len(ids) for cause, ids in primary.items()},
                    "any": {cause: len(ids) for cause, ids in anywhere.items()}},
         "case_ids": {"primary": primary, "any": anywhere},
