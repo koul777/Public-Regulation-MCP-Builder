@@ -78,8 +78,6 @@ def _identity(payload: dict[str, Any]) -> dict[str, set[str]]:
     ids = [case.get("id") for case in cases]
     if any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
         raise EvidenceError("seal_spec_query_ids_invalid")
-    if any("split" in case for case in cases):
-        raise EvidenceError("case_level_split_not_supported")
     return {"ids": set(ids), "texts": {text for case in cases for text in _texts(case)},
             "chunks": set().union(*(_chunk_ids(case) for case in cases))}
 

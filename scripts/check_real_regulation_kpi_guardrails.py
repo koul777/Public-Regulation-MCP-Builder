@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.evaluate_live_local_llm import HTTP_ERROR_CODES, LATENCY_CLASSES, _percentile  # noqa: E402
+from scripts.holdout_spec_guard import HoldoutSpecRefused, normalize_split_label  # noqa: E402
 from scripts.run_real_regulation_e2e import EvidenceError, holdout_record_is_valid, require_private_path  # noqa: E402
 
 
@@ -317,6 +318,17 @@ def check_citation_trace(report: Mapping[str, Any]) -> dict[str, Any]:
                   limited_trace_case_ids=limited)
 
 
+def _report_split(report: Mapping[str, Any]) -> str:
+    """development, holdout, unspecified or invalid; labels are read like the spec's (scripts/holdout_spec_guard.py)."""
+    value = report.get("query_split", "unspecified")
+    if value == "unspecified":
+        return "unspecified"
+    try:
+        return normalize_split_label(value)
+    except HoldoutSpecRefused:
+        return "invalid"
+
+
 def check_holdout_protocol(report: Mapping[str, Any], expected_ledger_id: str | None = None) -> dict[str, Any]:
     """A holdout report must carry the ledger record written when the holdout was opened.
 
@@ -326,12 +338,12 @@ def check_holdout_protocol(report: Mapping[str, Any], expected_ledger_id: str | 
     fails, and so does any holdout report judged without a pin.
     """
     pinned = {} if expected_ledger_id is None else {"expected_ledger_id": expected_ledger_id}
-    split = report.get("query_split", "unspecified")
+    split = _report_split(report)
     if split in ("development", "unspecified"):
         return _check("holdout_protocol", [] if expected_ledger_id is None else ["holdout_ledger_id_unexpected"],
                       split=split, **pinned)
     if split != "holdout":
-        return _check("holdout_protocol", ["query_split_invalid"], split=str(split), **pinned)
+        return _check("holdout_protocol", ["query_split_invalid"], split=str(report.get("query_split")), **pinned)
     record = report.get("holdout_ledger_record")
     reasons = []
     if expected_ledger_id is None:
@@ -360,7 +372,7 @@ def check_holdout_protocol(report: Mapping[str, Any], expected_ledger_id: str | 
 
 
 def _holdout_record(report: Mapping[str, Any]) -> Mapping[str, Any]:
-    record = report.get("holdout_ledger_record") if report.get("query_split") == "holdout" else None
+    record = report.get("holdout_ledger_record") if _report_split(report) == "holdout" else None
     return record if isinstance(record, dict) else {}
 
 
@@ -454,7 +466,7 @@ def check_comparability(candidate: Mapping[str, Any], baseline: Mapping[str, Any
                         policy: Mapping[str, Any]) -> dict[str, Any]:
     differences = [field for field in COMPARABLE_FIELDS if candidate.get(field) != baseline.get(field)]
     # A holdout result must not steer later development through a baseline comparison.
-    if baseline.get("query_split", "unspecified") not in ("development", "unspecified"):
+    if _report_split(baseline) not in ("development", "unspecified"):
         differences.append("baseline_is_holdout")
     # Case-by-case regressions need unique, complete baseline IDs.
     if check_coverage(baseline, policy)["status"] != PASSED:

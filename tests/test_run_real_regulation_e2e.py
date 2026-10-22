@@ -12,6 +12,7 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
+from tests.holdout_spec_fixtures import real_shaped_cases, real_shaped_spec
 from scripts.run_real_regulation_e2e import (
     EvidenceError,
     RunOptions,
@@ -456,13 +457,15 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
     def test_split_label_is_validated_and_recorded_in_the_report(self) -> None:
         self._write_spec()
         self.assertEqual("unspecified", validate_options(self.options)["query_split"])
-        for value in ("dev", "Holdout", "unspecified", "", None, ["holdout"], 1):
+        for value in ("dev", "unspecified", "", None, ["holdout"], 1):
             self._write_spec(split=value)
             with self.subTest(split=value), self.assertRaisesRegex(EvidenceError, "query_split_invalid"):
                 validate_options(self.options)
-        self.query_spec.write_text(json.dumps({"queries": [{"id": "case", "query": "question", "split": "holdout"}]}), encoding="utf-8")
-        with self.assertRaisesRegex(EvidenceError, "case_level_split_not_supported"):
-            validate_options(self.options)
+        # Any spelling of holdout is holdout, so it needs a ledger like the exact label.
+        for value in ("Holdout", " HOLDOUT ", "ｈｏｌｄｏｕｔ"):
+            self._write_spec(split=value)
+            with self.subTest(split=value), self.assertRaisesRegex(EvidenceError, "holdout_ledger_required"):
+                validate_options(self.options)
 
         for label, spec in (("development", {"split": "development"}), ("unspecified", {})):
             self._write_spec(**spec)
@@ -471,6 +474,113 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
             with self.subTest(split=label):
                 self.assertEqual(label, report["query_split"])
                 self.assertNotIn("holdout_ledger_record", report)
+
+    # Specs shaped like the private goldsets: no top-level split, a split on every query.
+
+    def _write_real_shaped(self, split: str | None, cases: list[dict] | None = None, **top_level) -> str:
+        self.query_spec.write_text(json.dumps(real_shaped_spec(split, cases, **top_level)), encoding="utf-8")
+        return hashlib.sha256(self.query_spec.read_bytes()).hexdigest()
+
+    def _real_shaped_holdout_options(self, *, sealed: bool = True) -> str:
+        sha = self._write_real_shaped("holdout")
+        self.ledger = self.root / "ledger" / "holdout.jsonl"
+        if sealed:
+            seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256=sha,
+                         development_query_count=2, holdout_query_count=2)
+        self.options = replace(self.options, holdout_ledger=self.ledger)
+        return sha
+
+    def test_real_shaped_development_spec_runs_as_development(self) -> None:
+        self._write_real_shaped("development")
+        self.assertEqual("development", validate_options(self.options)["query_split"])
+        self.ledger = self.root / "ledger" / "holdout.jsonl"
+        self.options = replace(self.options, holdout_ledger=self.ledger)
+        report, retrieval, mcp, live = self._run_synthetic_stages()
+        self.assertTrue(report["passed"])
+        self.assertEqual(("development", 2), (report["query_split"], report["query_count"]))
+        self.assertNotIn("holdout_ledger_record", report)
+        self.assertEqual(["development", "development"], [query["split"] for query in retrieval.call_args.kwargs["query_specs"]])
+        self.assertFalse(self.ledger.parent.exists())
+        self._urlopen.assert_not_called()
+
+    def test_real_shaped_holdout_spec_is_gated_like_a_top_level_label(self) -> None:
+        # No ledger configured, then no ledger file, then a ledger that never sealed this spec.
+        self._write_real_shaped("holdout")
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_required"):
+                run_real_regulation_e2e(self.options)
+            sha = self._real_shaped_holdout_options(sealed=False)
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_missing"):
+                run_real_regulation_e2e(self.options)
+            seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256="e" * 64,
+                         development_query_count=2, holdout_query_count=2)
+            with self.assertRaisesRegex(EvidenceError, "holdout_not_sealed"):
+                run_real_regulation_e2e(self.options)
+            self._assert_no_stage_ran(*mocks)
+        seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256=sha,
+                     development_query_count=2, holdout_query_count=2)
+
+        # check-only never writes; a sealed per-case holdout opens once and records the opening first.
+        before = self.ledger.read_bytes()
+        self.assertEqual("holdout", validate_options(self.options)["query_split"])
+        self.assertEqual(before, self.ledger.read_bytes())
+        seen: list[list[str]] = []
+
+        def probe(**kwargs):
+            seen.append(self._ledger_events())
+            return {"passed": True, "results": [{"source_document_id": "synthetic-document", "passed": True}]}
+
+        report, *_ = self._run_synthetic_stages(probe_effect=probe)
+        self.assertEqual("holdout", report["query_split"])
+        self.assertEqual(("opened", sha, 2), (report["holdout_ledger_record"]["event"],
+                                              report["holdout_ledger_record"]["query_spec_sha256"],
+                                              report["holdout_ledger_record"]["query_count"]))
+        self.assertEqual([["sealed", "sealed", "opened"]], seen)
+        self._next_run()
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            with self.assertRaisesRegex(EvidenceError, "holdout_already_opened"):
+                run_real_regulation_e2e(self.options)
+            self._assert_no_stage_ran(*mocks)
+
+    def test_split_labels_may_sit_on_top_on_every_query_or_both(self) -> None:
+        cases = real_shaped_cases("development")
+        accepted = (
+            ("development", real_shaped_spec("development")),
+            ("development", {**real_shaped_spec("development"), "split": "development"}),
+            ("development", {**real_shaped_spec("development"), "split": " Development "}),
+            ("development", {**real_shaped_spec(None, cases), "split": "development"}),
+            ("unspecified", real_shaped_spec(None, cases)),
+            ("holdout", {**real_shaped_spec("holdout"), "split": "HOLDOUT"}),
+        )
+        for expected, payload in accepted:
+            self.query_spec.write_text(json.dumps(payload), encoding="utf-8")
+            with self.subTest(expected=expected, top=payload.get("split")):
+                if expected == "holdout":
+                    with self.assertRaisesRegex(EvidenceError, "holdout_ledger_required"):
+                        validate_options(self.options)
+                else:
+                    self.assertEqual(expected, validate_options(self.options)["query_split"])
+
+    def test_mixed_conflicting_or_invalid_query_labels_are_refused(self) -> None:
+        development, holdout = real_shaped_cases("development"), real_shaped_cases("holdout")
+        unlabeled = real_shaped_cases("development", count=1)[0]
+        variants = (
+            ("query_split_mixed", {"queries": [{**development[0], "split": "development"}, unlabeled]}),
+            ("query_split_mixed", {"queries": [{**development[0], "split": "development"}, {**holdout[0], "split": "holdout"}]}),
+            ("query_split_mixed", {"split": "development", "queries": [{**development[0], "split": "development"}, unlabeled]}),
+            ("query_split_mixed", {"queries": [{**development[0], "split": "development"},
+                                              {**development[1], "split": "development"}, {**holdout[0], "split": "holdout"}]}),
+            ("query_split_conflict", {**real_shaped_spec("holdout"), "split": "development"}),
+            ("query_split_conflict", {**real_shaped_spec("development"), "split": "holdout"}),
+            ("query_split_invalid", {"queries": [{**development[0], "split": "dev"}, {**development[1], "split": "dev"}]}),
+            ("query_split_invalid", {"queries": [{**development[0], "split": None}]}),
+        )
+        for reason, payload in variants:
+            self.query_spec.write_text(json.dumps(payload), encoding="utf-8")
+            with self.subTest(reason=reason, keys=sorted(payload)), self.assertRaisesRegex(EvidenceError, reason):
+                validate_options(self.options)
 
     def test_development_run_never_touches_a_configured_ledger(self) -> None:
         self._write_spec(split="development")

@@ -23,7 +23,9 @@ Query spec은 `queries` 배열이며 각 문항에 고유 `id`, `query`, `target
 
 계획서 §4의 개발/보류 구분을 spec 라벨, 봉인 기록, 실행 검사로 강제함. 보류셋은 최종 후보를 정한 뒤 한 번만 실행함.
 
-- query spec 최상위에 `"split": "development"` 또는 `"split": "holdout"`을 둠. 생략하면 `unspecified`로 처리함. 그 밖의 값(대소문자 차이 포함)은 `query_split_invalid`, 문항 단위 `split`은 `case_level_split_not_supported`로 거절함.
+- 허용하는 라벨 형태는 세 가지임. 최상위 `"split"`만 둔 spec, 모든 문항에 `"split"`을 둔 spec(실제 평가셋의 형태, 최상위 `split` 없음), 둘 다 두되 값이 같은 spec. 라벨은 NFKC 정규화, 공백 제거, 대소문자 무시 뒤 `development` 또는 `holdout`으로 읽으며, holdout은 어떤 표기든 holdout으로 처리함. 라벨이 어디에도 없으면 `unspecified`로 처리함.
+- 한 문항이라도 `split`이 있으면 모든 문항에 있어야 하고 값이 모두 같아야 함. 아니면 `query_split_mixed`로 거절함. 최상위 라벨이 문항 값과 다르면 `query_split_conflict`, 알 수 없는 값(`unspecified`를 직접 쓴 경우 포함)은 `query_split_invalid`임.
+- 통합 실행기, 봉인 명령, 단계별 CLI 검사, KPI 검사기가 `scripts/holdout_spec_guard.py`의 같은 함수로 라벨을 읽음. 문항별 라벨만 있는 보류 spec도 최상위 라벨이 있는 보류 spec과 똑같이 봉인과 `opened` 기록을 요구함.
 - 실행 보고서에 `query_split`이 기록됨.
 - 기록 파일(ledger)은 공개 checkout 밖에 두는 추가 전용 JSONL임. 경로는 실행 설정의 `holdout_ledger`(절대 경로)로 지정하며, runtime·출력 디렉터리·입력 파일과 겹치면 `holdout_ledger_overlaps_run_paths`로 거절함.
 - ledger 파일의 첫 기록이 무작위 `ledger_id`를 만들고, 이후 모든 기록이 같은 `ledger_id`를 가져야 함. 없거나 다르면 `holdout_ledger_corrupt`임. `opened` 기록, `report.json`의 `holdout_ledger_record`, 가드레일 결과의 `candidate.holdout_ledger_id`에 같은 값이 복사됨.
@@ -53,7 +55,7 @@ python scripts/seal_real_regulation_holdout.py --development "<개발 spec 절�
 
 봉인 명령의 검사와 기록.
 
-- 개발 spec은 `split: development`, 보류 spec은 `split: holdout`이어야 함. 아니면 `development_spec_split_mismatch`, `holdout_spec_split_mismatch`로 거절함.
+- 개발 spec의 split은 `development`, 보류 spec의 split은 `holdout`이어야 함(최상위 라벨이나 문항별 라벨 어느 쪽이든 가능). 아니면 `development_spec_split_mismatch`, `holdout_spec_split_mismatch`로 거절하고, 라벨이 섞였거나 충돌하거나 잘못됐으면 위 라벨 코드로 거절함.
 - 두 spec이 같은 `id`, 같은 질문 문장, 같은 청크를 공유하면 거절함(`development_and_holdout_share_query_ids`, `development_and_holdout_share_query_text`, `development_and_holdout_share_target_chunk_ids`).
   - 질문 문장은 `query`와 `question`을 모두 보며, 유니코드 NFKC 정규화 뒤 공백·대소문자 차이를 무시하고 비교함.
   - 청크는 `target_chunk_id(s)`, `expected_chunk_id(s)`, `allowed_citations`의 `chunk_id`·`evidence_id(s)`를 비교함.
@@ -79,8 +81,9 @@ python scripts/seal_real_regulation_holdout.py --development "<개발 spec 절�
 
 | 사유 코드 | 발생 조건 |
 | --- | --- |
-| `query_split_invalid` | 최상위 `split`이 `development`·`holdout` 이외의 값 |
-| `case_level_split_not_supported` | 문항 단위 `split` 키가 있음 |
+| `query_split_invalid` | 최상위 또는 문항별 `split`이 `development`·`holdout`으로 읽히지 않는 값 |
+| `query_split_mixed` | 일부 문항에만 `split`이 있거나, 문항별 `split` 값이 서로 다름 |
+| `query_split_conflict` | 최상위 `split`과 문항별 `split`의 값이 다름 |
 | `holdout_ledger_required` | `split: holdout`인데 `holdout_ledger`가 설정되지 않음 |
 | `holdout_ledger_path_invalid` | `holdout_ledger`가 비어 있거나 문자열 경로가 아님, 또는 가리키는 대상이 파일이 아님 |
 | `holdout_ledger_overlaps_run_paths` | ledger 경로가 runtime·출력 디렉터리·query spec·corpus manifest와 겹침 |
@@ -116,7 +119,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 - 새 ledger 파일은 새 이력으로 시작함. 같은 보류 spec을 새 ledger 파일에 다시 봉인하면 `opened` 기록이 없는 처음 상태로 보임. 보류 spec마다 ledger 하나만 유지하고, 검토자는 보고서와 가드레일 결과의 `ledger_id`가 첫 봉인의 `ledger_id`와 같은지(`--expected-holdout-ledger-id`), 해당 보류 spec 해시의 `opened` 기록이 한 번(`rerun_authorized`가 있으면 승인 횟수만큼)인지 비교해야 함.
 - ledger는 사람이 편집할 수 있는 파일이라 변조 방지가 아님. 실수로 반복 실행하는 일을 막고 열린 이력을 남기는 장치임.
 - ledger 파일을 열기 전에 복사해 두거나 연 뒤에 이전 상태로 되돌리면 같은 `ledger_id`를 가진 두 이력이 생기고, 되돌린 쪽에서는 `opened` 기록이 없는 상태로 보임. 의도적인 복사·되돌리기는 막지 못함. 변조에 견디려면 마지막 ledger 해시를 ledger 밖의 신뢰할 수 있는 기록에 남겨 대조해야 하며, 이는 후속 과제임.
-- 단계별 CLI의 거절은 spec 최상위 `split`에 의존함. `queries` 배열만 꺼내 별도 파일로 저장하거나 `split`을 지우면 검사를 의도적으로 우회할 수 있고, 이를 막지 못함. 위 ledger 한계와 같은 종류의 한계임.
+- 단계별 CLI의 거절은 spec의 `split` 라벨(최상위 또는 문항별)에 의존함. 라벨을 모두 지운 사본, 또는 질문만 옮겨 적은 파일은 검사를 의도적으로 우회할 수 있고, 이를 막지 못함. `queries` 배열만 꺼내도 문항별 라벨이 남아 있으면 거절됨. 위 ledger 한계와 같은 종류의 한계임.
 - 겹침 검사는 봉인 시점의 두 spec만 비교함. 봉인 뒤 개발 spec에 보류 문항을 옮겨 넣는 경우는 검사하지 않음.
 - 해시는 spec 파일 바이트 기준임. 보류 spec을 한 글자라도 고치면 새 해시가 되어 다시 봉인해야 함. 보류 문항 사본의 라벨만 `development`로 바꾸는 우회는 사람이 검토해야 함.
 

@@ -632,12 +632,35 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
                 self.assertEqual(("failed", False), (result["verdict"], result["passed"]))
 
     def test_unknown_split_value_cannot_skip_the_holdout_check(self) -> None:
-        for value in ("Holdout", "holdout ", "test", "", None, ["holdout"], 1):
+        for value in ("dev", "test", "", None, ["holdout"], 1):
             with self.subTest(split=value):
                 report = _report()
                 report["query_split"] = value
                 row = _row(self.evaluate(report), "hard", "holdout_protocol")
                 self.assertEqual(("failed", ["query_split_invalid"]), (row["status"], row["reasons"]))
+
+    def test_any_spelling_of_holdout_gets_the_holdout_checks(self) -> None:
+        # The label is read like a spec label (scripts/holdout_spec_guard.py), so a respelled holdout is still holdout.
+        for value in ("Holdout", "holdout ", " HOLDOUT", "ｈｏｌｄｏｕｔ"):
+            with self.subTest(split=value):
+                report = _report()
+                report["query_split"] = value
+                row = _row(self.evaluate(report), "hard", "holdout_protocol")
+                self.assertEqual("failed", row["status"])
+                self.assertIn("holdout_ledger_record_missing", row["reasons"])
+                self.assertEqual("holdout", row["split"])
+                report = self.holdout_report()
+                report["query_split"] = value
+                result = self.evaluate(report)
+                self.assertEqual(("passed", "holdout"), (_row(result, "hard", "holdout_protocol")["status"],
+                                                         _row(result, "hard", "holdout_protocol")["split"]))
+                self.assertEqual(self.PIN, result["candidate"]["holdout_ledger_id"])
+                baseline = self.holdout_report()
+                baseline["query_split"] = value
+                candidate = _report()
+                candidate["query_spec_sha256"] = baseline["query_spec_sha256"]
+                compared = evaluate_kpi_guardrails(candidate, self.policy, baseline=baseline)
+                self.assertEqual(["baseline_is_holdout"], compared["comparability"]["differences"])
 
 
 class KpiGuardrailCliTests(unittest.TestCase):

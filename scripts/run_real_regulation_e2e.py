@@ -30,6 +30,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.holdout_spec_guard import HoldoutSpecRefused, effective_query_split  # noqa: E402
+
 
 @dataclass(frozen=True)
 class RunOptions:
@@ -57,7 +59,6 @@ class EvidenceError(ValueError):
     """A fixed, path-free evidence or configuration failure."""
 
 
-QUERY_SPLITS = ("development", "holdout")
 HOLDOUT_LEDGER_SCHEMA_VERSION = 1
 _LEDGER_COMMON_FIELDS = frozenset({"event", "schema_version", "ledger_id", "recorded_at", "query_spec_sha256"})
 # Exactly the fields the seal command and the runner write. A hand-written line must carry them all.
@@ -272,13 +273,16 @@ def verify_corpus(manifest_path: Path) -> dict[str, Any]:
 
 
 def query_split(payload: Mapping[str, Any]) -> str:
-    """Return the declared evaluation split; a missing label means unspecified."""
-    if "split" not in payload:
-        return "unspecified"
-    value = payload["split"]
-    if not isinstance(value, str) or value not in QUERY_SPLITS:
-        raise EvidenceError("query_split_invalid")
-    return value
+    """Return the spec's split from its top-level and per-query labels; no label means unspecified.
+
+    The rules live in scripts/holdout_spec_guard.py so the seal command, the stage
+    CLIs and the KPI checker read a spec the same way. Failures keep their fixed
+    codes: query_split_invalid, query_split_mixed, query_split_conflict.
+    """
+    try:
+        return effective_query_split(payload)
+    except HoldoutSpecRefused as exc:
+        raise EvidenceError(str(exc)) from None
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -622,8 +626,6 @@ def validate_options(options: RunOptions) -> dict[str, Any]:
             raise EvidenceError("mixed_profile_query_spec_not_supported")
         if not isinstance(case.get("query"), str) or not case["query"].strip():
             raise EvidenceError("query_text_must_be_nonempty_string")
-        if "split" in case:
-            raise EvidenceError("case_level_split_not_supported")
         check_scope(case.get("scope", {}))
         check_overrides(case.get("request_overrides", {}))
         if set(case.get("request_overrides", {})) - {"profile_id"}:
