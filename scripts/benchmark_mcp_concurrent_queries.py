@@ -24,6 +24,7 @@ from app.mcp_server.regulation_tools import (
 )
 from app.rag.extractive_answer import build_structured_extractive_answer
 from scripts.benchmark_mcp_queries import _stats, load_query_specs
+from scripts.holdout_spec_guard import HoldoutSpecRefused
 from scripts.export_mcp_demo_answers import normalize_query_specs, query_spec_fingerprint
 from scripts.report_metadata import (
     capture_mcp_performance_source_state,
@@ -507,7 +508,11 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         tenant_storage_isolation = True
     if args.flat_storage:
         tenant_storage_isolation = False
-    query_specs = load_query_specs(Path(args.query_spec_json)) if args.query_spec_json else None
+    try:
+        query_specs = load_query_specs(Path(args.query_spec_json)) if args.query_spec_json else None
+    except HoldoutSpecRefused as exc:
+        stdout.write(json.dumps({"passed": False, "reason_code": str(exc)}) + "\n")
+        return 2
     query_spec_source = Path(args.query_spec_json) if args.query_spec_json else None
     report = benchmark_mcp_concurrent_queries(
         data_dir=Path(args.data_dir),

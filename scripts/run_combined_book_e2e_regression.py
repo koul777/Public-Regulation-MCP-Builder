@@ -94,6 +94,7 @@ from app.services.review_workflow_service import ambiguous_combined_book_chunk_i
 from app.storage.repository import JsonRepository  # noqa: E402
 from scripts.build_approval_review_batches import build_approval_review_batches  # noqa: E402
 from scripts.build_approval_worklist import build_approval_worklist  # noqa: E402
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec  # noqa: E402
 from scripts.generate_mcp_client_config import (  # noqa: E402
     build_mcp_client_config,
     write_mcp_runtime_data_bundle,
@@ -1929,6 +1930,8 @@ def run_combined_book_e2e(
 
     source = Path(input_path).resolve()
     truth = json.loads(Path(ground_truth_path).read_text(encoding="utf-8")) if ground_truth_path else None
+    if truth is not None:
+        refuse_holdout_spec(truth)
     if truth is None and not expect_approval_blocked:
         raise ValueError("ground_truth_path is required unless expect_approval_blocked is set.")
     owns_work_dir = work_dir is None
@@ -2657,6 +2660,13 @@ def _console_summary(report: dict[str, Any]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    try:
+        # Checked before any child run starts, so --runs N cannot hide the refusal in a child exit code.
+        if args.ground_truth:
+            refuse_holdout_spec(json.loads(Path(args.ground_truth).read_text(encoding="utf-8")))
+    except HoldoutSpecRefused as exc:
+        print(json.dumps({"passed": False, "reason_code": str(exc)}))
+        return 2
     if args.runs > 1:
         reports: list[dict[str, Any]] = []
         with tempfile.TemporaryDirectory(prefix="combined_book_e2e_runs_") as scratch:

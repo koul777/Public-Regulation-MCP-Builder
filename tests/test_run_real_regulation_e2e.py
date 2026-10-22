@@ -5,6 +5,7 @@ from contextlib import ExitStack, nullcontext, redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import subprocess
@@ -33,6 +34,14 @@ from scripts.run_real_regulation_e2e import (
 
 class _AbortRun(BaseException):
     """Stands in for an interrupt that Exception handlers do not catch."""
+
+
+def _tags_response(*names: str, status: int = 200, body: bytes | None = None):
+    """A stub /api/tags reply for the holdout preflight."""
+    response = Mock(status=status)
+    response.read.return_value = body if body is not None else json.dumps(
+        {"models": [{"name": name} for name in names]}).encode("utf-8")
+    return nullcontext(response)
 
 
 class RealRegulationE2eEvidenceTests(unittest.TestCase):
@@ -317,7 +326,11 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
         lock.write_bytes(b"unexpected contents")
         self.assertFalse(self._active_integrity(before)["passed"])
 
-    def _patch_synthetic_stages(self, stack, *, mcp_effect=None, probe_effect=None):
+    def _patch_synthetic_stages(self, stack, *, mcp_effect=None, probe_effect=None, tags_effect=None):
+        # The holdout preflight asks the configured Ollama for /api/tags; default to the default model.
+        self._urlopen = stack.enter_context(patch(
+            "app.core.local_http.local_urlopen",
+            side_effect=tags_effect or (lambda *args, **kwargs: _tags_response("qwen3:8b"))))
         stack.enter_context(patch("scripts.report_metadata.capture_mcp_performance_source_state", return_value={}))
         stack.enter_context(patch("scripts.report_metadata.finalize_mcp_performance_source_state", return_value={"stable": True}))
         stack.enter_context(patch("scripts.report_metadata.current_repo_commit", return_value="synthetic"))
@@ -330,9 +343,10 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
         stack.enter_context(patch("scripts.run_real_regulation_e2e.managed_local_api", return_value=nullcontext(("http://127.0.0.1:1", {}))))
         return probe, retrieval, mcp, live
 
-    def _run_synthetic_stages(self, *, mcp_effect=None, probe_effect=None):
+    def _run_synthetic_stages(self, *, mcp_effect=None, probe_effect=None, tags_effect=None):
         with ExitStack() as stack:
-            _, retrieval, mcp, live = self._patch_synthetic_stages(stack, mcp_effect=mcp_effect, probe_effect=probe_effect)
+            _, retrieval, mcp, live = self._patch_synthetic_stages(
+                stack, mcp_effect=mcp_effect, probe_effect=probe_effect, tags_effect=tags_effect)
             report = run_real_regulation_e2e(self.options)
         return report, retrieval, mcp, live
 
@@ -421,7 +435,11 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
             return []
         return [json.loads(line)["event"] for line in self.ledger.read_text(encoding="utf-8").splitlines()]
 
+    def _ledger_id(self) -> str:
+        return json.loads(self.ledger.read_text(encoding="utf-8").splitlines()[0])["ledger_id"]
+
     def _append_ledger_line(self, record: dict) -> None:
+        record = {"ledger_id": self._ledger_id(), **record}
         with self.ledger.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(record) + "\n")
 
@@ -490,6 +508,7 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
         self.assertEqual(("opened", sha, False), (record["event"], record["query_spec_sha256"], record["authorized_rerun"]))
         self.assertEqual(["sealed", "opened"], self._ledger_events())
         self.assertEqual(record, json.loads(self.ledger.read_text(encoding="utf-8").splitlines()[-1]))
+        self.assertEqual(self._ledger_id(), record["ledger_id"])
         saved = json.loads((self.options.output_dir / "report.json").read_text(encoding="utf-8"))
         self.assertEqual(record, saved["holdout_ledger_record"])
 
@@ -597,7 +616,19 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
                 ("list_event", json.dumps({"event": ["sealed"], "query_spec_sha256": sha}).encode() + b"\n"),
                 ("duplicate_key", b'{"event": "sealed", "event": "sealed", "query_spec_sha256": "' + sha.encode() + b'"}\n'),
                 ("truncated_last_line", good + valid_line.encode()),
-                ("blank_line", good + b"\n")):
+                ("blank_line", good + b"\n"),
+                ("id_missing_on_later_record", good + valid_line.encode() + b"\n"),
+                ("id_differs_on_later_record", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": "0" * 32}).encode() + b"\n"),
+                ("id_not_hex", good.replace(self._ledger_id().encode(), b"not-a-ledger-id")),
+                ("id_only_missing", json.dumps({"event": "sealed", "query_spec_sha256": sha}).encode() + b"\n"),
+                ("id_is_list", json.dumps({"event": "sealed", "query_spec_sha256": sha, "ledger_id": ["x"]}).encode() + b"\n"),
+                ("id_is_object_on_later_record", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": {"a": 1}}).encode() + b"\n"),
+                ("id_is_number", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": 7}).encode() + b"\n"),
+                ("id_is_null", good + json.dumps({
+                    "event": "rerun_authorized", "query_spec_sha256": sha, "ledger_id": None}).encode() + b"\n")):
             self.ledger.write_bytes(content)
             with self.subTest(content=name), self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
                 validate_options(self.options)
@@ -621,7 +652,7 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
                 seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256="a" * 64,
                              development_query_count=1, holdout_query_count=1)
         self.assertEqual(before, self.ledger.read_bytes())
-        self.assertEqual({"authorized_rerun": False}, check_holdout_gate(self.ledger, sha))
+        self.assertEqual({"authorized_rerun": False, "ledger_id": self._ledger_id()}, check_holdout_gate(self.ledger, sha))
         open_holdout(self.ledger, sha, query_count=1)
         self.assertEqual(["sealed", "opened"], self._ledger_events())
 
@@ -636,6 +667,181 @@ class RealRegulationE2eEvidenceTests(unittest.TestCase):
                 options_from_config({**config, "holdout_ledger": value}, self.options.output_dir)
         with self.assertRaisesRegex(EvidenceError, "private_path_must_be_absolute"):
             validate_options(replace(self.options, holdout_ledger=Path("ledger.jsonl")))
+
+
+    def test_ledger_id_is_created_once_and_shared_by_every_record(self) -> None:
+        sha = self._holdout_options()
+        report, *_ = self._run_synthetic_stages()
+        records = [json.loads(line) for line in self.ledger.read_text(encoding="utf-8").splitlines()]
+        ledger_id = records[0]["ledger_id"]
+        self.assertRegex(ledger_id, "^[0-9a-f]{32}$")
+        self.assertEqual({ledger_id}, {record["ledger_id"] for record in records})
+        self.assertEqual(ledger_id, report["holdout_ledger_record"]["ledger_id"])
+
+        # A new ledger file starts a new identity and a new history for the same spec.
+        other = self.root / "other-ledger" / "holdout.jsonl"
+        seal_holdout(other, development_sha256="d" * 64, holdout_sha256=sha,
+                     development_query_count=1, holdout_query_count=1)
+        other_id = json.loads(other.read_text(encoding="utf-8").splitlines()[0])["ledger_id"]
+        self.assertNotEqual(ledger_id, other_id)
+        self.assertEqual({"authorized_rerun": False, "ledger_id": other_id}, check_holdout_gate(other, sha))
+
+    def test_record_without_this_files_ledger_id_makes_the_ledger_unusable(self) -> None:
+        sha = self._holdout_options()
+        foreign = self.root / "foreign" / "holdout.jsonl"
+        seal_holdout(foreign, development_sha256="d" * 64, holdout_sha256="c" * 64,
+                     development_query_count=1, holdout_query_count=1)
+        foreign_line = foreign.read_bytes()
+        before = self.ledger.read_bytes()
+        with self.ledger.open("ab") as stream:
+            stream.write(foreign_line)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
+            check_holdout_gate(self.ledger, sha)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
+            open_holdout(self.ledger, sha, query_count=1)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_corrupt"):
+            seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256="b" * 64,
+                         development_query_count=1, holdout_query_count=1)
+        self.ledger.write_bytes(before)
+        self.assertEqual({"authorized_rerun": False, "ledger_id": self._ledger_id()}, check_holdout_gate(self.ledger, sha))
+
+    def test_hard_linked_ledger_is_refused_everywhere(self) -> None:
+        sha = self._holdout_options()
+        alias = self.ledger.with_name("alias.jsonl")
+        try:
+            os.link(self.ledger, alias)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("the filesystem refuses hard links")
+        before = self.ledger.read_bytes()
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_hard_linked"):
+            validate_options(self.options)
+        self._write_spec(split="development")
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_hard_linked"):
+            validate_options(self.options)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_hard_linked"):
+            check_holdout_gate(self.ledger, sha)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_hard_linked"):
+            open_holdout(self.ledger, sha, query_count=1)
+        with self.assertRaisesRegex(EvidenceError, "holdout_ledger_hard_linked"):
+            seal_holdout(self.ledger, development_sha256="d" * 64, holdout_sha256="b" * 64,
+                         development_query_count=1, holdout_query_count=1)
+        # A link made after the gate passed is still caught right before the append.
+        with patch("scripts.run_real_regulation_e2e.check_holdout_gate",
+                   return_value={"authorized_rerun": False, "ledger_id": self._ledger_id()}):
+            with self.assertRaisesRegex(EvidenceError, "holdout_ledger_hard_linked"):
+                open_holdout(self.ledger, sha, query_count=1)
+        self.assertEqual(before, self.ledger.read_bytes())
+        self.assertEqual(before, alias.read_bytes())
+        alias.unlink()
+        self.assertEqual({"authorized_rerun": False, "ledger_id": self._ledger_id()}, check_holdout_gate(self.ledger, sha))
+
+    def test_lock_is_released_explicitly_before_the_handle_is_closed(self) -> None:
+        self.ledger = self.root / "ledger" / "holdout.jsonl"
+        self.ledger.parent.mkdir()
+        calls: list[str] = []
+        if os.name == "nt":
+            import msvcrt
+
+            real = msvcrt.locking
+            modes = {msvcrt.LK_NBLCK: "lock", msvcrt.LK_UNLCK: "unlock"}
+            target = patch("msvcrt.locking", side_effect=lambda fd, mode, size: (calls.append(modes[mode]), real(fd, mode, size))[1])
+        else:
+            import fcntl
+
+            real = fcntl.flock
+            modes = {fcntl.LOCK_EX | fcntl.LOCK_NB: "lock", fcntl.LOCK_UN: "unlock"}
+            target = patch("fcntl.flock", side_effect=lambda fd, mode: (calls.append(modes[mode]), real(fd, mode))[1])
+        with target:
+            with _ledger_lock(self.ledger):
+                self.assertEqual(["lock"], calls)
+            self.assertEqual(["lock", "unlock"], calls)
+            with _ledger_lock(self.ledger):
+                pass
+        self.assertEqual(["lock", "unlock", "lock", "unlock"], calls)
+
+    def test_spec_swapped_after_validation_cannot_run_under_the_validated_hash(self) -> None:
+        sha = self._holdout_options()
+
+        def swap_after_validation(options):
+            result = validate_options(options)
+            self.query_spec.write_text(json.dumps({"split": "holdout", "queries": [
+                {"id": "swapped-case", "query": "a different question", "target_document_ids": ["synthetic-document"]}]}),
+                encoding="utf-8")
+            return result
+
+        with ExitStack() as stack:
+            mocks = self._patch_synthetic_stages(stack)
+            stack.enter_context(patch("scripts.run_real_regulation_e2e.validate_options", side_effect=swap_after_validation))
+            with self.assertRaisesRegex(EvidenceError, "query_spec_changed_after_validation"):
+                run_real_regulation_e2e(self.options)
+            self._assert_no_stage_ran(*mocks)
+        self.assertEqual(["sealed"], self._ledger_events())
+        self.assertNotEqual(sha, hashlib.sha256(self.query_spec.read_bytes()).hexdigest())
+
+    def test_spec_swapped_during_a_stage_is_reported_and_stages_keep_the_validated_queries(self) -> None:
+        sha = self._holdout_options()
+
+        def swap_during_stage(**kwargs):
+            self.query_spec.write_text(json.dumps({"split": "development", "queries": [
+                {"id": "swapped-case", "query": "a different question", "target_document_ids": ["synthetic-document"]}]}),
+                encoding="utf-8")
+            return {"passed": True, "results": [{"source_document_id": "synthetic-document", "passed": True}]}
+
+        with ExitStack() as stack:
+            _, retrieval, mcp, live = self._patch_synthetic_stages(stack, probe_effect=swap_during_stage)
+            report = run_real_regulation_e2e(self.options)
+        self.assertEqual("failed", report["stages"]["input_integrity"]["status"])
+        self.assertFalse(report["passed"])
+        self.assertEqual((sha, "holdout"), (report["query_spec_sha256"], report["query_split"]))
+        self.assertEqual("synthetic-case", retrieval.call_args.kwargs["query_specs"][0]["id"])
+        self.assertEqual("synthetic-case", mcp.call_args.kwargs["query_specs"][0]["id"])
+        self.assertEqual("holdout", live.call_args.kwargs["query_spec"]["split"])
+
+    def test_holdout_preflight_failure_does_not_open_the_holdout(self) -> None:
+        self._holdout_options()
+        failures = (
+            ("unreachable", OSError("refused"), "ollama_preflight_unreachable"),
+            ("http_error", _tags_response(status=500, body=b"{}"), "ollama_preflight_unreachable"),
+            ("not_json", _tags_response(body=b"not json"), "ollama_preflight_unreachable"),
+            ("not_an_object", _tags_response(body=b"[]"), "ollama_preflight_unreachable"),
+            ("no_model_list", _tags_response(body=b"{}"), "ollama_preflight_unreachable"),
+            ("empty_inventory", _tags_response(), "ollama_preflight_model_missing"),
+            ("other_model", _tags_response("other-model:8b", "qwen3:4b"), "ollama_preflight_model_missing"),
+        )
+        for name, outcome, reason in failures:
+            def effect(*args, _outcome=outcome, **kwargs):
+                if isinstance(_outcome, Exception):
+                    raise _outcome
+                return _outcome
+
+            with self.subTest(failure=name), ExitStack() as stack:
+                mocks = self._patch_synthetic_stages(stack, tags_effect=effect)
+                with self.assertRaisesRegex(EvidenceError, reason):
+                    run_real_regulation_e2e(self.options)
+                self._assert_no_stage_ran(*mocks)
+            self.assertEqual(["sealed"], self._ledger_events())
+            self.assertFalse(self.options.output_dir.exists())
+        # The same sealed holdout is still available once the endpoint is healthy.
+        report, *_ = self._run_synthetic_stages()
+        self.assertEqual("opened", report["holdout_ledger_record"]["event"])
+
+    def test_holdout_preflight_asks_tags_and_accepts_the_implicit_latest_tag(self) -> None:
+        self._holdout_options()
+        self.options = replace(self.options, model="synthetic-model", ollama_endpoint="http://127.0.0.1:11999/")
+        report, *_ = self._run_synthetic_stages(tags_effect=lambda *args, **kwargs: _tags_response("synthetic-model:latest"))
+        self.assertEqual("opened", report["holdout_ledger_record"]["event"])
+        self.assertEqual("http://127.0.0.1:11999/api/tags", self._urlopen.call_args.args[0])
+        self.assertLessEqual(self._urlopen.call_args.kwargs["timeout"], 10)
+
+    def test_non_holdout_runs_skip_the_preflight(self) -> None:
+        self._write_spec(split="development")
+
+        def unreachable(*args, **kwargs):
+            raise OSError("no endpoint")
+
+        report, *_ = self._run_synthetic_stages(tags_effect=unreachable)
+        self.assertTrue(report["passed"])
+        self._urlopen.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -78,9 +79,10 @@ class HoldoutSealTests(unittest.TestCase):
         self.assertEqual(self.sha(self.holdout), record["query_spec_sha256"])
         self.assertEqual(self.sha(self.development), record["development_spec_sha256"])
         self.assertEqual((1, 2), (record["query_count"], record["development_query_count"]))
-        self.assertEqual({"event", "schema_version", "recorded_at", "query_spec_sha256", "query_count",
+        self.assertEqual({"event", "schema_version", "ledger_id", "recorded_at", "query_spec_sha256", "query_count",
                           "development_spec_sha256", "development_query_count"}, set(record))
-        self.assertEqual(self.sha(self.holdout), summary["holdout_spec_sha256"])
+        self.assertRegex(record["ledger_id"], "^[0-9a-f]{32}$")
+        self.assertEqual((self.sha(self.holdout), record["ledger_id"]), (summary["holdout_spec_sha256"], summary["ledger_id"]))
 
         text = self.ledger.read_text(encoding="utf-8")
         for private in (DEVELOPMENT_QUERY, HOLDOUT_QUERY, "another development question", "chunk-dev-1", "chunk-hold-1",
@@ -89,7 +91,9 @@ class HoldoutSealTests(unittest.TestCase):
 
     def test_run_gate_accepts_the_sealed_hash_and_no_other(self) -> None:
         self.seal()
-        self.assertEqual({"authorized_rerun": False}, check_holdout_gate(self.ledger, self.sha(self.holdout)))
+        ledger_id = self.ledger_records()[0]["ledger_id"]
+        self.assertEqual({"authorized_rerun": False, "ledger_id": ledger_id},
+                         check_holdout_gate(self.ledger, self.sha(self.holdout)))
         for other in (self.sha(self.development), "0" * 64):
             with self.assertRaisesRegex(EvidenceError, "holdout_not_sealed"):
                 check_holdout_gate(self.ledger, other)
@@ -184,6 +188,7 @@ class HoldoutSealTests(unittest.TestCase):
         self.assertTrue(grown.startswith(first))
         self.assertGreater(len(grown), len(first))
         self.assertEqual(["sealed", "sealed"], [record["event"] for record in self.ledger_records()])
+        self.assertEqual(1, len({record["ledger_id"] for record in self.ledger_records()}))
         self.assertEqual(self.sha(self.holdout), self.ledger_records()[-1]["query_spec_sha256"])
 
     def test_resealing_an_opened_holdout_does_not_reset_it(self) -> None:
@@ -203,6 +208,50 @@ class HoldoutSealTests(unittest.TestCase):
         with _ledger_lock(self.ledger):
             self.assert_refused("holdout_ledger_locked")
         self.assertEqual(1, len(self.ledger_records()))
+
+
+    def test_expected_chunk_id_aliases_count_as_shared_chunks(self) -> None:
+        for development_key, holdout_key in (("expected_chunk_ids", "target_chunk_ids"),
+                                             ("target_chunk_ids", "expected_chunk_ids"),
+                                             ("expected_chunk_ids", "expected_chunk_ids"),
+                                             ("expected_chunk_id", "target_chunk_id")):
+            development_case = {"id": "dev-1", "query": DEVELOPMENT_QUERY}
+            holdout_case = {"id": "hold-1", "query": HOLDOUT_QUERY}
+            development_case[development_key] = ["chunk-shared"] if development_key.endswith("ids") else "chunk-shared"
+            holdout_case[holdout_key] = ["chunk-shared"] if holdout_key.endswith("ids") else "chunk-shared"
+            self.write_specs(development={"split": "development", "queries": [development_case]},
+                             holdout={"split": "holdout", "queries": [holdout_case]})
+            with self.subTest(development=development_key, holdout=holdout_key):
+                self.assert_refused("development_and_holdout_share_target_chunk_ids")
+
+    def test_query_text_is_compared_after_unicode_normalization(self) -> None:
+        question = "synthetic test question about leave"
+        variants = (
+            "\uff53\uff59\uff4e\uff54\uff48\uff45\uff54\uff49\uff43\u3000\uff54\uff45\uff53\uff54\u3000\uff51\uff55\uff45\uff53\uff54\uff49\uff4f\uff4e\u3000\uff41\uff42\uff4f\uff55\uff54\u3000\uff4c\uff45\uff41\uff56\uff45",  # full-width forms
+            "Synthetic\u00a0test\tquestion  about\nLEAVE",  # no-break space, tab, newline, case
+            "synthetic test question about leave\u3000",  # ideographic space
+        )
+        for variant in variants:
+            self.write_specs(development={"split": "development", "queries": [_case("dev-1", question, "chunk-dev-1")]},
+                             holdout={"split": "holdout", "queries": [_case("hold-1", variant, "chunk-hold-1")]})
+            with self.subTest(variant=variant.strip()[:12]):
+                self.assert_refused("development_and_holdout_share_query_text")
+
+    def test_question_key_text_is_compared_with_query_text(self) -> None:
+        holdout_case = {"id": "hold-1", "question": DEVELOPMENT_QUERY.upper(), "target_chunk_ids": ["chunk-hold-1"]}
+        self.write_specs(holdout={"split": "holdout", "queries": [holdout_case]})
+        self.assert_refused("development_and_holdout_share_query_text")
+
+    def test_hard_linked_ledger_is_never_extended(self) -> None:
+        self.assertEqual(0, self.seal()[0])
+        alias = self.ledger.with_name("alias.jsonl")
+        try:
+            os.link(self.ledger, alias)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("the filesystem refuses hard links")
+        self.write_specs(holdout={"split": "holdout", "queries": [_case("hold-2", "second holdout question", "chunk-hold-2")]})
+        self.assert_refused("holdout_ledger_hard_linked")
+        self.assertEqual(self.ledger.read_bytes(), alias.read_bytes())
 
 
 if __name__ == "__main__":

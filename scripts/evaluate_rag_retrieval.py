@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.config import Settings
 from app.core.tenant_access import settings_for_tenant, tenant_directory_key
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 from scripts.export_vectordb_ingestion import _iter_batch_chunks, load_json
 
 
@@ -433,6 +434,7 @@ def load_queries(path: Path | None) -> list[dict[str, Any]]:
     if not path:
         return list(DEFAULT_QUERIES)
     payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    refuse_holdout_spec(payload)
     if isinstance(payload, dict):
         payload = payload.get("queries")
     if not isinstance(payload, list):
@@ -654,6 +656,9 @@ def main() -> int:
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         write_markdown(out_md, report)
+    except HoldoutSpecRefused as exc:
+        print(json.dumps({"passed": False, "reason_code": str(exc)}))
+        return 2
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 2

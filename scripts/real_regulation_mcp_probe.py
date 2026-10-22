@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.input_limits import MAX_MCP_TOP_K
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 from scripts.run_mcp_client_config_smoke import _exception_message, _valid_index_status_summary
 
 
@@ -282,6 +283,11 @@ def run(argv: Sequence[str] | None = None) -> int:
     if spec_path.is_relative_to(PROJECT_ROOT.resolve()):
         parser.error("Real query specifications must be outside the source repository.")
     payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    try:
+        refuse_holdout_spec(payload)
+    except HoldoutSpecRefused as exc:
+        print(json.dumps({"passed": False, "reason_code": str(exc)}))
+        return 2
     specs = payload if isinstance(payload, list) else payload.get("queries", payload.get("query_specs"))
     report = run_mcp_probe(data_dir=args.data_dir, query_specs=specs, tenant_id=args.tenant_id,
         profile_id=args.profile_id, tenant_storage_isolation=args.tenant_storage_isolation,

@@ -14,6 +14,7 @@ from decimal import ROUND_CEILING, Decimal
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -313,13 +314,19 @@ def check_citation_trace(report: Mapping[str, Any]) -> dict[str, Any]:
                   limited_trace_case_ids=limited)
 
 
-def check_holdout_protocol(report: Mapping[str, Any]) -> dict[str, Any]:
-    """A holdout report must carry the ledger record written when the holdout was opened."""
+def check_holdout_protocol(report: Mapping[str, Any], expected_ledger_id: str | None = None) -> dict[str, Any]:
+    """A holdout report must carry the ledger record written when the holdout was opened.
+
+    A reviewer who kept the ledger_id printed by the first seal can pin it. Then only
+    a holdout report from that ledger passes, so a report from a fresh ledger fails.
+    """
+    pinned = {} if expected_ledger_id is None else {"expected_ledger_id": expected_ledger_id}
     split = report.get("query_split", "unspecified")
     if split in ("development", "unspecified"):
-        return _check("holdout_protocol", [], split=split)
+        return _check("holdout_protocol", [] if expected_ledger_id is None else ["holdout_ledger_id_unexpected"],
+                      split=split, **pinned)
     if split != "holdout":
-        return _check("holdout_protocol", ["query_split_invalid"], split=str(split))
+        return _check("holdout_protocol", ["query_split_invalid"], split=str(split), **pinned)
     record = report.get("holdout_ledger_record")
     reasons = []
     if not isinstance(record, dict):
@@ -330,7 +337,16 @@ def check_holdout_protocol(report: Mapping[str, Any]) -> dict[str, Any]:
         record_hash = record.get("query_spec_sha256")
         if not isinstance(record_hash, str) or not record_hash or record_hash != report.get("query_spec_sha256"):
             reasons.append("holdout_ledger_record_spec_mismatch")
-    return _check("holdout_protocol", reasons, split=split)
+        if not isinstance(record.get("ledger_id"), str) or not record["ledger_id"]:
+            reasons.append("holdout_ledger_id_missing")
+    if expected_ledger_id is not None and (not isinstance(record, dict) or record.get("ledger_id") != expected_ledger_id):
+        reasons.append("holdout_ledger_id_unexpected")
+    return _check("holdout_protocol", reasons, split=split, **pinned)
+
+
+def _holdout_record(report: Mapping[str, Any]) -> Mapping[str, Any]:
+    record = report.get("holdout_ledger_record") if report.get("query_split") == "holdout" else None
+    return record if isinstance(record, dict) else {}
 
 
 def _rate_target(target_id: str, minimum: float, successes: int, denominator: int, *,
@@ -422,6 +438,9 @@ def _called_model_digests(report: Mapping[str, Any]) -> dict[str, Any] | None:
 def check_comparability(candidate: Mapping[str, Any], baseline: Mapping[str, Any],
                         policy: Mapping[str, Any]) -> dict[str, Any]:
     differences = [field for field in COMPARABLE_FIELDS if candidate.get(field) != baseline.get(field)]
+    # A holdout result must not steer later development through a baseline comparison.
+    if baseline.get("query_split", "unspecified") not in ("development", "unspecified"):
+        differences.append("baseline_is_holdout")
     # Case-by-case regressions need unique, complete baseline IDs.
     if check_coverage(baseline, policy)["status"] != PASSED:
         differences.append("baseline_coverage_failed")
@@ -786,8 +805,12 @@ def _require_report(report: Any, policy: Mapping[str, Any]) -> Mapping[str, Any]
 
 
 def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_profile: str = "full",
-                            baseline: Any = None) -> dict[str, Any]:
+                            baseline: Any = None, expected_holdout_ledger_id: str | None = None) -> dict[str, Any]:
     """Re-judge the candidate (and optional baseline) under one current policy."""
+    if expected_holdout_ledger_id is not None and (
+            not isinstance(expected_holdout_ledger_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", expected_holdout_ledger_id)):
+        raise GuardrailInputError("expected_holdout_ledger_id_invalid")
     report = _require_report(report, policy)
     baseline = None if baseline is None else _require_report(baseline, policy)
     profile = policy["coverage_profiles"].get(coverage_profile)
@@ -801,7 +824,7 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
     hard = [check_coverage(report, policy), check_integrity(report), check_no_auto_approval(report),
             check_mcp_contract(report), check_request_modes(report, policy), check_retrieval_no_evidence(report, profile),
             check_negative_cases(report, profile), check_forbidden_facts(report), check_citation_trace(report),
-            check_holdout_protocol(report)]
+            check_holdout_protocol(report, expected_holdout_ledger_id)]
     targets = evaluate_targets(report, policy, profile)
     comparability = None if baseline is None else check_comparability(report, baseline, policy)
     regressions = (evaluate_regressions(report, baseline, policy)
@@ -833,6 +856,9 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         "candidate": {"repo_commit": report.get("repo_commit"), "query_count": report.get("query_count"),
                       "query_spec_sha256": report.get("query_spec_sha256"),
                       "query_split": report.get("query_split", "unspecified"),
+                      "holdout_ledger_id": _holdout_record(report).get("ledger_id"),
+                      "authorized_rerun": _holdout_record(report).get("authorized_rerun"),
+                      "expected_holdout_ledger_id": expected_holdout_ledger_id,
                       "label_provenance": report.get("label_provenance"),
                       "legacy_report_passed": report.get("passed") is True},
         "baseline": None if baseline is None else {"repo_commit": baseline.get("repo_commit"),
@@ -861,6 +887,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--report", type=Path, required=True, help="Private report.json from run_real_regulation_e2e.py.")
     parser.add_argument("--baseline", type=Path, help="Private baseline report.json from the same inputs and models.")
     parser.add_argument("--coverage-profile", default="full", help="Policy coverage profile: full or compact.")
+    parser.add_argument("--expected-holdout-ledger-id", help="32 hex characters. Pin the ledger_id of the first holdout seal; "
+                        "only a holdout report written through that ledger passes holdout_protocol.")
     parser.add_argument("--output", type=Path, required=True, help="New private JSON path for the guardrail result.")
     args = parser.parse_args(argv)
     try:
@@ -870,7 +898,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         policy = load_policy()
         report, report_sha = _load_report(args.report)
         baseline, baseline_sha = _load_report(args.baseline) if args.baseline else (None, None)
-        result = evaluate_kpi_guardrails(report, policy, coverage_profile=args.coverage_profile, baseline=baseline)
+        result = evaluate_kpi_guardrails(report, policy, coverage_profile=args.coverage_profile, baseline=baseline,
+                                         expected_holdout_ledger_id=args.expected_holdout_ledger_id)
         result["candidate"]["report_sha256"] = report_sha
         if result["baseline"] is not None:
             result["baseline"]["report_sha256"] = baseline_sha

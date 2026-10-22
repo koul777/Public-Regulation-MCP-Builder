@@ -13,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import unicodedata
 from typing import Any, Sequence
 
 
@@ -48,13 +49,26 @@ def _strings(value: Any) -> set[str]:
 
 
 def _chunk_ids(case: dict[str, Any]) -> set[str]:
-    found = _strings(case.get("target_chunk_id")) | _strings(case.get("target_chunk_ids"))
+    # expected_* are the aliases the MCP probe accepts for the same target identifiers.
+    found = set()
+    for key in ("target_chunk_id", "target_chunk_ids", "expected_chunk_id", "expected_chunk_ids"):
+        found |= _strings(case.get(key))
     citations = case.get("allowed_citations")
     for source in citations if isinstance(citations, list) else []:
         if isinstance(source, dict):
             for key in ("chunk_id", "evidence_id", "evidence_ids"):
                 found |= _strings(source.get(key))
     return found
+
+
+def _texts(case: dict[str, Any]) -> set[str]:
+    """Question text under both accepted keys, compared after NFKC and whitespace/case folding."""
+    found = set()
+    for key in ("query", "question"):
+        value = case.get(key)
+        if isinstance(value, str):
+            found.add(" ".join(unicodedata.normalize("NFKC", value).split()).casefold())
+    return found - {""}
 
 
 def _identity(payload: dict[str, Any]) -> dict[str, set[str]]:
@@ -66,8 +80,7 @@ def _identity(payload: dict[str, Any]) -> dict[str, set[str]]:
         raise EvidenceError("seal_spec_query_ids_invalid")
     if any("split" in case for case in cases):
         raise EvidenceError("case_level_split_not_supported")
-    texts = {" ".join(str(case.get("query") or "").split()).casefold() for case in cases}
-    return {"ids": set(ids), "texts": texts - {""},
+    return {"ids": set(ids), "texts": {text for case in cases for text in _texts(case)},
             "chunks": set().union(*(_chunk_ids(case) for case in cases))}
 
 
@@ -102,7 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         reason = str(exc) if isinstance(exc, EvidenceError) else type(exc).__name__
         print(json.dumps({"sealed": False, "reason_code": reason}))
         return 2
-    print(json.dumps({"sealed": True, "holdout_spec_sha256": record["query_spec_sha256"],
+    print(json.dumps({"sealed": True, "ledger_id": record["ledger_id"],
+                      "holdout_spec_sha256": record["query_spec_sha256"],
                       "development_spec_sha256": record["development_spec_sha256"],
                       "holdout_query_count": record["query_count"],
                       "development_query_count": record["development_query_count"]}))

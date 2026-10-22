@@ -442,7 +442,8 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         report = _report()
         report["query_spec_sha256"] = "a" * 64
         report["query_split"] = "holdout"
-        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64}
+        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64,
+                                           "ledger_id": "1" * 32, "authorized_rerun": False}
         return report
 
     def evaluate(self, report: dict) -> dict:
@@ -472,7 +473,70 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         row = _row(result, "hard", "holdout_protocol")
         self.assertEqual(("passed", "holdout", []), (row["status"], row["split"], row["reasons"]))
         self.assertEqual("holdout", result["candidate"]["query_split"])
+        self.assertEqual(("1" * 32, False), (result["candidate"]["holdout_ledger_id"], result["candidate"]["authorized_rerun"]))
         self.assertEqual("passed", result["verdict"])
+
+    def test_candidate_shows_whether_the_holdout_was_an_authorized_rerun(self) -> None:
+        report = self.holdout_report()
+        report["holdout_ledger_record"]["authorized_rerun"] = True
+        self.assertIs(True, self.evaluate(report)["candidate"]["authorized_rerun"])
+        for plain in (_report(), {**_report(), "query_split": "development"}):
+            candidate = self.evaluate(plain)["candidate"]
+            self.assertEqual((None, None), (candidate["holdout_ledger_id"], candidate["authorized_rerun"]))
+
+    def test_pinned_ledger_id_must_match_the_holdout_report(self) -> None:
+        report = self.holdout_report()
+        result = evaluate_kpi_guardrails(report, self.policy, expected_holdout_ledger_id="1" * 32)
+        row = _row(result, "hard", "holdout_protocol")
+        self.assertEqual(("passed", "1" * 32), (row["status"], row["expected_ledger_id"]))
+        self.assertEqual("1" * 32, result["candidate"]["expected_holdout_ledger_id"])
+        self.assertEqual("passed", result["verdict"])
+
+        report["holdout_ledger_record"]["ledger_id"] = "2" * 32
+        result = evaluate_kpi_guardrails(report, self.policy, expected_holdout_ledger_id="1" * 32)
+        row = _row(result, "hard", "holdout_protocol")
+        self.assertEqual(("failed", ["holdout_ledger_id_unexpected"]), (row["status"], row["reasons"]))
+        self.assertEqual(("failed", False), (result["verdict"], result["passed"]))
+
+        # Without a pin the same report still passes, and the pin is not recorded.
+        result = self.evaluate(report)
+        self.assertEqual("passed", _row(result, "hard", "holdout_protocol")["status"])
+        self.assertIsNone(result["candidate"]["expected_holdout_ledger_id"])
+        self.assertNotIn("expected_ledger_id", _row(result, "hard", "holdout_protocol"))
+
+    def test_pin_fails_closed_without_a_matching_holdout_record(self) -> None:
+        pin = "1" * 32
+        missing = self.holdout_report()
+        del missing["holdout_ledger_record"]
+        no_id = self.holdout_report()
+        del no_id["holdout_ledger_record"]["ledger_id"]
+        relabeled = {**self.holdout_report(), "query_split": "development"}
+        for name, report in (("missing_record", missing), ("record_without_id", no_id), ("relabeled_development", relabeled),
+                             ("unlabeled", _report())):
+            with self.subTest(report=name):
+                row = _row(evaluate_kpi_guardrails(report, self.policy, expected_holdout_ledger_id=pin), "hard", "holdout_protocol")
+                self.assertEqual("failed", row["status"])
+                self.assertIn("holdout_ledger_id_unexpected", row["reasons"])
+
+    def test_pinned_ledger_id_must_be_32_lowercase_hex(self) -> None:
+        for value in ("", "1" * 31, "1" * 33, "G" * 32, "A" * 32, 5, ["1" * 32]):
+            with self.subTest(value=value), self.assertRaisesRegex(GuardrailInputError, "expected_holdout_ledger_id_invalid"):
+                evaluate_kpi_guardrails(self.holdout_report(), self.policy, expected_holdout_ledger_id=value)
+
+    def test_holdout_report_cannot_be_a_baseline(self) -> None:
+        candidate = _report()
+        candidate["query_spec_sha256"] = "a" * 64
+        for baseline in (self.holdout_report(), {**self.holdout_report(), "query_split": "Holdout"}):
+            result = evaluate_kpi_guardrails(candidate, self.policy, baseline=baseline)
+            with self.subTest(split=baseline["query_split"]):
+                self.assertEqual("not_comparable", result["verdict"])
+                self.assertEqual(["baseline_is_holdout"], result["comparability"]["differences"])
+                self.assertEqual([], result["regressions"])
+        for allowed in ("development", "unspecified"):
+            result = evaluate_kpi_guardrails(candidate, self.policy, baseline={**_report(), "query_split": allowed,
+                                                                             "query_spec_sha256": "a" * 64})
+            with self.subTest(split=allowed):
+                self.assertTrue(result["comparability"]["comparable"])
 
     def test_holdout_report_without_a_valid_opened_record_fails(self) -> None:
         def missing(report: dict) -> None:
@@ -490,6 +554,12 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         def record_without_hash(report: dict) -> None:
             del report["holdout_ledger_record"]["query_spec_sha256"]
 
+        def no_ledger_id(report: dict) -> None:
+            del report["holdout_ledger_record"]["ledger_id"]
+
+        def empty_ledger_id(report: dict) -> None:
+            report["holdout_ledger_record"]["ledger_id"] = ""
+
         def both_hashes_empty(report: dict) -> None:
             report["query_spec_sha256"] = ""
             report["holdout_ledger_record"]["query_spec_sha256"] = ""
@@ -498,7 +568,9 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
                                  ("holdout_ledger_record_not_opened", sealed_only),
                                  ("holdout_ledger_record_spec_mismatch", other_spec),
                                  ("holdout_ledger_record_spec_mismatch", record_without_hash),
-                                 ("holdout_ledger_record_spec_mismatch", both_hashes_empty)):
+                                 ("holdout_ledger_record_spec_mismatch", both_hashes_empty),
+                                 ("holdout_ledger_id_missing", no_ledger_id),
+                                 ("holdout_ledger_id_missing", empty_ledger_id)):
             with self.subTest(mutation=mutate.__name__):
                 report = self.holdout_report()
                 mutate(report)
@@ -555,6 +627,28 @@ class KpiGuardrailCliTests(unittest.TestCase):
                                       "--output", str(self.root / "compare-out.json"))
         self.assertEqual((2, "not_comparable"), (code, summary["verdict"]))
         self.assertTrue((self.root / "compare-out.json").is_file())
+
+    def test_expected_holdout_ledger_id_option(self) -> None:
+        report = _report()
+        report["query_spec_sha256"] = "a" * 64
+        report["query_split"] = "holdout"
+        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64,
+                                           "ledger_id": "1" * 32, "authorized_rerun": False}
+        path = self.write("holdout.json", report)
+        code, summary = self.run_main("--report", str(path), "--expected-holdout-ledger-id", "1" * 32,
+                                      "--output", str(self.root / "pinned-ok.json"))
+        self.assertEqual((0, "passed"), (code, summary["verdict"]))
+        written = json.loads((self.root / "pinned-ok.json").read_text(encoding="utf-8"))
+        self.assertEqual("1" * 32, written["candidate"]["expected_holdout_ledger_id"])
+
+        code, summary = self.run_main("--report", str(path), "--expected-holdout-ledger-id", "2" * 32,
+                                      "--output", str(self.root / "pinned-bad.json"))
+        self.assertEqual((1, "failed"), (code, summary["verdict"]))
+
+        code, summary = self.run_main("--report", str(path), "--expected-holdout-ledger-id", "not-hex",
+                                      "--output", str(self.root / "pinned-invalid.json"))
+        self.assertEqual((2, "expected_holdout_ledger_id_invalid"), (code, summary["reason_code"]))
+        self.assertFalse((self.root / "pinned-invalid.json").exists())
 
     def test_inputs_errors_and_existing_output_exit_two_without_overwrite(self) -> None:
         report = self.write("report.json", _report())
