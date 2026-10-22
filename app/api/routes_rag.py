@@ -2860,33 +2860,42 @@ def _fallback_citations_with_context_identity(
     context item that owns its chunk, plus list-shaped approval and content
     hash fields under the same names the model-audited citations use. Values
     come only from the approved records; a missing hash stays missing, and no
-    source text is added.
+    source text is added. An ambiguous binding is never guessed: when one
+    evidence ID maps to several supporting records or context items, or the
+    record's approval ID disagrees with the citation's own, the citation keeps
+    only its original keys and the evaluator then reports it as unverified.
     """
 
-    context_id_by_evidence_id: dict[str, str] = {}
+    context_ids_by_evidence_id: dict[str, set[str]] = defaultdict(set)
     for item in context.items:
         if item.context_id not in supporting_context_ids:
             continue
         for evidence_id in item.evidence_ids:
-            context_id_by_evidence_id.setdefault(evidence_id, item.context_id)
-    record_by_evidence_id: dict[str, dict[str, Any]] = {}
+            context_ids_by_evidence_id[evidence_id].add(item.context_id)
+    records_by_evidence_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for result in supporting_results:
         evidence_id = str(result.get("chunk_id") or result.get("document_id") or "").strip()
         if evidence_id:
-            record_by_evidence_id.setdefault(evidence_id, result)
+            records_by_evidence_id[evidence_id].append(result)
     bound: list[dict[str, Any]] = []
     for citation in citations:
         payload = dict(citation)
         evidence_id = str(payload.get("evidence_id") or "").strip()
-        record = record_by_evidence_id.get(evidence_id, {})
-        context_id = context_id_by_evidence_id.get(evidence_id)
-        if context_id:
-            payload["context_id"] = context_id
         if evidence_id:
             payload["evidence_ids"] = [evidence_id]
-        approval_id = _approved_record_value(record, "approval_id") or str(
-            payload.get("approval_id") or ""
-        ).strip()
+        records = records_by_evidence_id.get(evidence_id, [])
+        context_ids = context_ids_by_evidence_id.get(evidence_id, set())
+        if len(records) != 1 or len(context_ids) != 1:
+            bound.append(payload)
+            continue
+        record = records[0]
+        record_approval_id = _approved_record_value(record, "approval_id")
+        citation_approval_id = str(payload.get("approval_id") or "").strip()
+        if record_approval_id and citation_approval_id and record_approval_id != citation_approval_id:
+            bound.append(payload)
+            continue
+        payload["context_id"] = next(iter(context_ids))
+        approval_id = record_approval_id or citation_approval_id
         if approval_id:
             payload["approval_ids"] = [approval_id]
         content_hash = _approved_record_value(
