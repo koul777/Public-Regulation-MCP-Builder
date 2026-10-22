@@ -121,6 +121,49 @@ class LiveLocalLlmFinalVerdictTests(unittest.TestCase):
         self.assertEqual("passed", result["status"])
         self.assertEqual("not_available_in_gold", result["citation_checks"]["checks"][0]["content_hash_status"])
 
+    @staticmethod
+    def _fallback_response() -> dict:
+        """Shape of an extractive-fallback response after the server binds citation identity."""
+        return {
+            "answer": "- Article 1: Applications must be submitted within seven days. [E1]",
+            "citations": [{"citation_id": "citation:synthetic-chunk", "context_id": "E1",
+                           "document_id": "synthetic-document", "chunk_id": "synthetic-chunk",
+                           "document_title": "Synthetic Working Hours Rule", "regulation_version": "1",
+                           "article_no": "Article 1", "article_title": "Deadline",
+                           "source_page_start": 2, "source_page_end": 2,
+                           "evidence_id": "synthetic-chunk", "evidence_ids": ["synthetic-chunk"],
+                           "approval_id": "synthetic-approval", "approval_ids": ["synthetic-approval"],
+                           "content_hashes": ["a" * 64]}],
+            "orchestration": {"answer_model": None, "attempted_answer_model": "synthetic-model",
+                              "answer_mode": "grounded_extractive", "claim_audit_status": "fallback_from_rejected",
+                              "citation_verification_status": "verified"},
+        }
+
+    def test_fallback_citation_with_context_and_approved_hash_passes_trace_checks(self) -> None:
+        result = _score(self._fallback_response(), events=[])
+        self.assertTrue(result["citation_checks"]["all_verified"])
+        self.assertEqual("verified", result["citation_checks"]["checks"][0]["content_hash_status"])
+        self.assertEqual("verified", result["answer_citation_context"]["status"])
+        self.assertNotIn("citation_not_verified", result["errors"])
+        self.assertNotIn("answer_citation_context_not_verified", result["errors"])
+        self.assertNotIn("citation_verification_status_missing", result["errors"])
+        # The fallback itself is still never counted as a verified model answer.
+        self.assertTrue(result["fallback"])
+        self.assertFalse(result["final_model_answer"])
+        self.assertIn("final_model_generation_not_verified", result["errors"])
+        self.assertEqual("failed", result["status"])
+
+    def test_fallback_citation_still_fails_without_context_or_approved_hash(self) -> None:
+        for key, error in (("content_hashes", "citation_not_verified"),
+                           ("context_id", "answer_citation_context_not_verified")):
+            with self.subTest(missing=key):
+                response = self._fallback_response()
+                del response["citations"][0][key]
+                self.assertIn(error, _score(response, events=[])["errors"])
+        wrong = self._fallback_response()
+        wrong["citations"][0]["content_hashes"] = ["b" * 64]
+        self.assertIn("citation_not_verified", _score(wrong, events=[])["errors"])
+
     def test_negative_and_fallback_denominators_remain_separate(self) -> None:
         negative = _score({"answer": NO_EVIDENCE_ANSWER, "citations": [],
                            "orchestration": {"claim_audit_status": "review_required"}},

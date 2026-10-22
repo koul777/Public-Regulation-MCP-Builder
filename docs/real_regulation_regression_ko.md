@@ -194,6 +194,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 - 검사기에는 정책 경로를 바꾸는 옵션이 없음. 정책에서 hard 검사, target, regression 항목을 빼거나 끄면 검증 실패로 종료 코드 2.
 - `tests/test_real_regulation_kpi_guardrails.py`가 계획서 §6 하한을 별도 상수로 고정함. 정책과 이 테스트를 같은 PR에서 함께 낮추는 경우는 Code Owner 검토로 막음.
 - 실제 기준선 report에는 로컬 경로와 문서 ID가 들어 있으므로 저장소에 두지 않고 `--baseline`으로 비공개 경로를 넘김.
+- 모델 감사가 거절해 추출형 대체 답변(`claim_audit_status`가 `fallback_from_*`)이 나가는 경우에도 인용에 `context_id`(답변의 `[E<n>]` 근거 번호), `evidence_ids`, `approval_ids`, `content_hashes`가 들어가고 `orchestration.citation_verification_status`가 반환됨. 해시는 승인 레코드에 있을 때만 넣고, 없으면 비워 두므로 그 인용은 계속 미확인으로 판정됨. 평가기와 `citation_trace` hard 검사는 완화하지 않았고, 대체 답변은 `final_model_generation_not_verified`로 계속 실패 처리됨.
 
 ### `report.json`의 `passed`와 관계
 

@@ -711,6 +711,9 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                     "claim_audit_model": orchestrated.get("claim_audit_model"),
                     "claim_audit_status": orchestrated.get("claim_audit_status"),
                     "claim_audit_reason": orchestrated.get("claim_audit_reason"),
+                    "citation_verification_status": orchestrated.get(
+                        "citation_verification_status"
+                    ),
                     "roles": _qa_orchestration_role_trace(
                         search_trace=search_trace,
                         orchestration=orchestrated,
@@ -2834,6 +2837,67 @@ def _table_structure_review_response(draft: GroundedAnswerDraft) -> dict[str, An
     }
 
 
+def _approved_record_value(record: dict[str, Any], key: str) -> str:
+    """Read one approved-record field with the same precedence as ContextBuilder."""
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    direct = record.get(key)
+    value = direct if direct not in (None, "") else metadata.get(key)
+    return str(value or "").strip()
+
+
+def _fallback_citations_with_context_identity(
+    citations: list[dict[str, Any]],
+    *,
+    context: GroundingContext,
+    supporting_context_ids: set[str],
+    supporting_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind extractive-fallback citations to the answer's context markers.
+
+    The identity verifier builds one public citation per approved chunk. The
+    fallback answer prints [E<n>] markers, so each citation also names the
+    context item that owns its chunk, plus list-shaped approval and content
+    hash fields under the same names the model-audited citations use. Values
+    come only from the approved records; a missing hash stays missing, and no
+    source text is added.
+    """
+
+    context_id_by_evidence_id: dict[str, str] = {}
+    for item in context.items:
+        if item.context_id not in supporting_context_ids:
+            continue
+        for evidence_id in item.evidence_ids:
+            context_id_by_evidence_id.setdefault(evidence_id, item.context_id)
+    record_by_evidence_id: dict[str, dict[str, Any]] = {}
+    for result in supporting_results:
+        evidence_id = str(result.get("chunk_id") or result.get("document_id") or "").strip()
+        if evidence_id:
+            record_by_evidence_id.setdefault(evidence_id, result)
+    bound: list[dict[str, Any]] = []
+    for citation in citations:
+        payload = dict(citation)
+        evidence_id = str(payload.get("evidence_id") or "").strip()
+        record = record_by_evidence_id.get(evidence_id, {})
+        context_id = context_id_by_evidence_id.get(evidence_id)
+        if context_id:
+            payload["context_id"] = context_id
+        if evidence_id:
+            payload["evidence_ids"] = [evidence_id]
+        approval_id = _approved_record_value(record, "approval_id") or str(
+            payload.get("approval_id") or ""
+        ).strip()
+        if approval_id:
+            payload["approval_ids"] = [approval_id]
+        content_hash = _approved_record_value(
+            record, "approved_content_hash"
+        ) or _approved_record_value(record, "content_hash")
+        if content_hash:
+            payload["content_hashes"] = [content_hash]
+        bound.append(payload)
+    return bound
+
+
 def _orchestrated_chat_answer(
     settings: Settings,
     query: str,
@@ -2967,7 +3031,12 @@ def _orchestrated_chat_answer(
             "answer": _sanitize_rag_answer(
                 str(fallback_verification.get("verified_answer") or fallback.answer)
             ),
-            "citations": list(fallback_verification.get("citations") or []),
+            "citations": _fallback_citations_with_context_identity(
+                list(fallback_verification.get("citations") or []),
+                context=context,
+                supporting_context_ids=supporting_context_ids,
+                supporting_results=supporting_results,
+            ),
             "answer_model": fallback.model,
             "attempted_answer_model": draft.model,
             "answer_mode": fallback.answer_mode,
