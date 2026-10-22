@@ -108,6 +108,14 @@ def _mcp_failure(report: dict, case_id: str, **fields: object) -> None:
     _mcp(report, case_id).update(passed=False, **fields)
 
 
+def _bare_mcp_failure(report: dict, case_id: str = A) -> None:
+    """passed=false and nothing else: the real probe always records stage detail, so this is a gap."""
+    case = _mcp(report, case_id)
+    for key in ("search_protocol_passed", "retrieval_passed", "fetch", "expect_no_evidence"):
+        case.pop(key, None)
+    case["passed"] = False
+
+
 def _build_scenarios() -> list[dict]:
     def negative_answered(report):
         _put_llm(report, _scored(N, negative=True, extra={"expected_abstain": True}))
@@ -167,9 +175,6 @@ def _build_scenarios() -> list[dict]:
 
     def mcp_not_retrieved(report):
         _mcp_failure(report, A, search_protocol_passed=True, retrieval_passed=False, expect_no_evidence=False, fetch=[])
-
-    def mcp_bare(report):
-        _mcp_failure(report, A)
 
     def retrieval_and_mcp(report):
         recall_zero(report)
@@ -285,8 +290,6 @@ def _build_scenarios() -> list[dict]:
           {"retrieval_miss": ["recall_at_5_below_1"]}),
         S("retrieval_miss", "mcp target not retrieved", A, mcp_not_retrieved, ["retrieval_miss"],
           {"retrieval_miss": ["mcp_target_evidence_not_retrieved"]}),
-        S("retrieval_miss", "mcp bare failure", A, mcp_bare, ["retrieval_miss"],
-          {"retrieval_miss": ["mcp_case_not_passed"]}),
         S("retrieval_miss", "retrieval and mcp", A, retrieval_and_mcp, ["retrieval_miss"],
           {"retrieval_miss": ["mcp_target_evidence_not_retrieved", "recall_at_5_below_1"]}),
         S("retrieval_false_positive", "retrieval returned results", N, retrieval_false_positive,
@@ -650,7 +653,7 @@ class FailureCausePrecedenceTests(unittest.TestCase):
                 self.assertEqual([case_id], breakdown["case_ids"]["primary"][expected[0]])
 
     def test_failed_stages_name_every_stage_that_contributed(self) -> None:
-        breakdown = self.breakdown_for(self.scenario("recall zero"), self.scenario("mcp bare failure"),
+        breakdown = self.breakdown_for(self.scenario("recall zero"), _bare_mcp_failure,
                                        self.scenario("abstained answerable"))
         self.assertEqual(["retrieval", "mcp", "live_llm"], _record(breakdown, A)["failed_stages"])
 
@@ -880,6 +883,34 @@ class FailureCauseMissingDataTests(unittest.TestCase):
             {case["id"]: case["unknown_reasons"] for case in breakdown["cases"]})
         self.assertEqual({"unknown"}, {case["primary_cause"] for case in breakdown["cases"]})
         self.assertIsNone(breakdown["dominant_cause"])
+
+    def test_mcp_failure_without_stage_detail_is_unknown_not_a_retrieval_miss(self) -> None:
+        report = _report()
+        _bare_mcp_failure(report)
+        breakdown = build_failure_breakdown(report)
+        record = _record(breakdown, A)
+        self.assertEqual((["unknown"], ["mcp_case_failed_unclassified"], {}, None, ["mcp"]), (
+            record["causes"], record["unknown_reasons"], record["codes"], record["plan_branch"],
+            record["failed_stages"]))
+        self.assertEqual(([], None, 1), (breakdown["case_ids"]["any"]["retrieval_miss"],
+                                         breakdown["dominant_cause"], breakdown["unknown_case_count"]))
+        self.assertEqual({"mcp_case_failed_unclassified": 1}, breakdown["unknown_reason_counts"])
+        self.assertFalse(breakdown["classification_complete"])
+        # A known cause from another stage wins, and the gap stays visible.
+        _retrieval(report, A).update(recall_at_5=0.0)
+        known = _record(build_failure_breakdown(report), A)
+        self.assertEqual(("retrieval_miss", ["mcp_case_failed_unclassified"]),
+                         (known["primary_cause"], known["unknown_reasons"]))
+        # Complete stage detail makes the failure classifiable again; partial detail does not.
+        report = _report()
+        _mcp_failure(report, A, search_protocol_passed=True, retrieval_passed=False, expect_no_evidence=False, fetch=[])
+        self.assertEqual("retrieval_miss", _record(build_failure_breakdown(report), A)["primary_cause"])
+        for partial in ({"search_protocol_passed": True}, {"retrieval_passed": False}, {"fetch": []}):
+            with self.subTest(partial=partial):
+                report = _report()
+                _bare_mcp_failure(report)
+                _mcp(report, A).update(partial)
+                self.assertEqual(["unknown"], _record(build_failure_breakdown(report), A)["causes"])
 
     def test_unrecorded_or_unclassifiable_fields_are_unknown(self) -> None:
         report = _report()

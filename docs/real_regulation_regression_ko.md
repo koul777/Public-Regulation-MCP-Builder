@@ -165,7 +165,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 | 1 | `security_leak` | 기권·차단 기대 문항에서만 판정. 차단 기대 문항이 답변·인용을 내보내거나 모델을 호출하거나 2xx로 응답, 기권 기대 문항이 HTTP 200에서 답변 또는 인용을 내보냄, 금지 사실이 나옴. 코드: `blocked_case_exposed_answer_or_called_model`, `forbidden_fact_exposed`, `expected_clean_abstention`, `expected_client_rejection` | 차단 기대 문항은 승인 가시성·번들 결함. 기권 기대 문항은 함께 나온 원인의 분기를 따르고 (`retrieval_false_positive`와 함께면 검색 누락), 함께 나온 원인이 없으면 근거는 맞지만 답변이 틀림 (검색은 비었는데 답변·감사 단계가 통과시킨 경우) |
 | 2 | `fabricated_citation` | 실질 답변의 인용 결함. 정의는 아래 목록 | 근거는 맞지만 답변이 틀림 (인용 불일치) |
 | 3 | `critical_fact` | 답변 가능 문항의 답변에 금지 사실이 나옴. 코드: `forbidden_fact_exposed` | 근거는 맞지만 답변이 틀림 (수치·단위 변형) |
-| 4 | `retrieval_miss` | 답변 가능 문항의 `recall_at_5`가 1.0 미만, 또는 MCP 문항이 대상 근거를 찾지 못함. 코드: `recall_at_5_below_1`, `mcp_target_evidence_not_retrieved`, `mcp_case_not_passed` (MCP 문항에 단계 정보가 없을 때) | 검색 누락 |
+| 4 | `retrieval_miss` | 답변 가능 문항의 `recall_at_5`가 1.0 미만, 또는 MCP 문항이 대상 근거를 찾지 못함. 코드: `recall_at_5_below_1`, `mcp_target_evidence_not_retrieved` | 검색 누락 |
 | 5 | `retrieval_false_positive` | 근거 없음 질의가 검색 또는 MCP에서 결과를 반환. 코드: `no_evidence_query_returned_results`, `mcp_unexpected_evidence`. 요청 목록에 없던 원인이며, 검색 단계의 실패라서 같은 분기에 둠 | 검색 누락 |
 | 6 | `execution_error` | HTTP 상태 불일치, 전송 오류, 감사·인용 상태 누락, 검색 오류, 질의 명세 오류, MCP 검색·조회 실패. 코드와 분기는 아래 표 | 코드에 따라 지연, 승인 가시성·번들 결함, 근거는 맞지만 답변이 틀림 |
 | 7 | `generation_fallback` | 답변 가능 문항에 검증된 최종 모델 답변이 없음 (대체 응답, 기권, 감사 미수락). 코드: `final_model_generation_not_verified`, `claim_audit_not_accepted`, `citation_verification_not_accepted`, `answer_mode_fallback`, `answer_abstained`, `final_model_answer_false`, `fallback_citation_without_context_or_hash` | 근거는 맞지만 답변이 틀림 |
@@ -212,7 +212,7 @@ python scripts/check_real_regulation_kpi_guardrails.py --report "$env:REG_RAG_EV
 - `dominant_plan_branch`는 `plan_branch_counts`가 가장 큰 분기임. `unknown`을 제외한 분류된 모든 실패 문항을 세므로 `dominant_cause`의 분기와 다를 수 있음. 예: 대체 응답 4건과 `execution_error` 5건(지연 2, 승인 2, 답변 1)이면 `dominant_cause`는 `execution_error`이고 `dominant_plan_branch`는 근거는 맞지만 답변이 틀림(5건)임. 동수이면 승인 가시성·번들 결함, 근거는 맞지만 답변이 틀림, 검색 누락, 지연 순임. §7이 승인 가시성·번들 결함을 먼저 해결하라고 하므로 `plan_branch_counts`의 해당 값이 0이 아니면 최빈 분기와 별개로 먼저 확인함.
 - 중단된 실행: `interrupted_reason`과 `not_run_count`를 LLM 단계 결과에서 그대로 복사함. 실행하지 못한 문항은 `unknown`(`llm_case_not_run`)임. `classification_complete`는 `unknown` 문항, 중단, 미실행이 모두 없을 때만 true임.
 - 결과가 없는 HTTP·전송 오류 문항에는 답변에서 파생되는 원인(인용, 대체 응답, 사실 미충족)을 기록하지 않음. 최종 모델 답변이 아닌 문항의 사실 미충족은 `answer_incomplete`가 아니라 `generation_fallback`으로만 셈.
-- 단계 전체 또는 해당 문항의 자료가 없으면 `unknown`과 사유(`retrieval_stage_missing`, `mcp_case_missing`, `llm_case_not_run`, `retrieval_recall_not_recorded`, `gold_facts_unlabeled`, `unmapped_error:<코드>` 등)를 기록함. 다른 원인이 이미 있는 문항에서는 사유만 `unknown_reasons`에 남고 주원인은 바뀌지 않음.
+- 단계 전체 또는 해당 문항의 자료가 없으면 `unknown`과 사유(`retrieval_stage_missing`, `mcp_case_missing`, `mcp_case_failed_unclassified`, `llm_case_not_run`, `retrieval_recall_not_recorded`, `gold_facts_unlabeled`, `unmapped_error:<코드>` 등)를 기록함. `mcp_case_failed_unclassified`는 MCP 문항이 `passed=false`이지만 `search_protocol_passed`와 `retrieval_passed`의 기록으로 원인을 판별할 수 없는 경우(필드 누락 등)임. 원인을 추정하지 않음. 다른 원인이 이미 있는 문항에서는 사유만 `unknown_reasons`에 남고 주원인은 바뀌지 않음.
 - §7의 첫 분기(원문 손실·경계 오류)는 이 분류로 판별하지 못함. `retrieval_miss`와 `answer_incomplete` 문항은 원문과 청크 경계를 직접 확인해야 함.
 - CLI 표준 출력에는 `failure_breakdown.dominant_cause`와 원인별 주원인 건수만 나옴. 문항 ID와 코드는 `--output` 파일에만 있음.
 

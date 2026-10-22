@@ -488,7 +488,7 @@ FAILURE_CAUSES: dict[str, dict[str, Any]] = {
                                       "citation_verification_not_accepted", "unknown_verification_limitation")},
     "critical_fact": {"plan_branch": BRANCH_ANSWER, "codes": ("forbidden_fact_exposed",)},
     "retrieval_miss": {"plan_branch": BRANCH_RETRIEVAL,
-                       "codes": ("recall_at_5_below_1", "mcp_target_evidence_not_retrieved", "mcp_case_not_passed")},
+                       "codes": ("recall_at_5_below_1", "mcp_target_evidence_not_retrieved")},
     # A no-evidence query that returned results is a retrieval-stage failure that is neither
     # a miss nor a model leak, so it has its own cause.
     "retrieval_false_positive": {"plan_branch": BRANCH_RETRIEVAL,
@@ -576,8 +576,9 @@ def _mcp_findings(case: Mapping[str, Any]) -> tuple[list[Finding], list[str]]:
         fetch_failed = isinstance(fetch, list) and any(
             isinstance(row, dict) and row.get("passed") is not True for row in fetch)
         return [("execution_error", "mcp_fetch_failed" if fetch_failed else "mcp_case_incomplete")], []
-    # The case record has no stage detail; "not passed" is all that is known.
-    return [("retrieval_miss", "mcp_case_not_passed")], []
+    # passed=false with no stage detail (no search_protocol_passed, retrieval_passed or fetch
+    # evidence): "not passed" is all that is known, so the cause is not guessed.
+    return [], ["mcp_case_failed_unclassified"]
 
 
 def _fallback_citation_gap_only(problems: list[str], citations: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
