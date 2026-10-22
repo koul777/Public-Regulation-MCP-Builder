@@ -169,6 +169,26 @@ class CoreRepeatLoopTests(unittest.TestCase):
         self.assertIs(False, report["timing_policy"]["first_token_latency_measured"])
         self.assertEqual(COLD_LOAD_DURATION_NS, report["timing_policy"]["cold_load_threshold_ns"])
 
+    def test_a_run_without_an_answer_is_its_own_value_in_the_distinct_count(self) -> None:
+        bad = {**_response(), "answer": "Submit within thirty days. [E1]"}
+        unavailable = {"status": 503, "response": {}}
+        # Three failed runs; only the first produced an answer text.
+        scenario = _Scenario([{"response": bad}, unavailable, unavailable])
+        with tempfile.TemporaryDirectory() as temp:
+            report = _evaluate(scenario, _specs("a"), temp, core_repeat={"case_ids": ["a"], "extra_runs": 2})
+        row = report["repetition_summary"]["cases"][0]
+        self.assertEqual(["failed"] * 3, row["statuses"])
+        self.assertEqual((2, 2, 3), (row["distinct_answer_digests"], row["runs_without_answer"], row["run_count"]))
+
+    def test_distinct_count_stays_one_when_every_run_has_the_same_answer_or_none(self) -> None:
+        unavailable = {"status": 503, "response": {}}
+        for name, steps, expected_without in (("same_answer", [{}, {}], 0),
+                                              ("no_answer_anywhere", [unavailable, unavailable], 2)):
+            with self.subTest(name), tempfile.TemporaryDirectory() as temp:
+                report = _evaluate(_Scenario(steps), _specs("a"), temp, core_repeat={"case_ids": ["a"], "extra_runs": 1})
+                row = report["repetition_summary"]["cases"][0]
+                self.assertEqual((1, expected_without), (row["distinct_answer_digests"], row["runs_without_answer"]))
+
     def test_repeat_failure_is_scored_but_does_not_change_main_pass_or_passed(self) -> None:
         bad = {**_response(), "answer": "Submit within thirty days. [E1]"}
         scenario = _Scenario([{}, {"response": bad}])
@@ -795,6 +815,49 @@ class WarmOnlyLatencyRegressionTests(unittest.TestCase):
                     self.assertFalse(row["warm_only"]["evaluated"])
                     self.assertEqual((28, 28), (row["baseline_sample_count"], row["candidate_sample_count"]))
 
+    @staticmethod
+    def _uniform_duration(report: dict, duration_ms: float) -> dict:
+        for case in _cases(report):
+            case["duration_ms"] = duration_ms
+        return report
+
+    def test_unrounded_ratio_is_compared_with_the_policy_maximum(self) -> None:
+        maximum = self.policy["regressions"]["llm_p95_duration_ratio"]["maximum"]
+        self.assertEqual(1.10, maximum)
+        baseline = self._uniform_duration(_report(), 1_000_000.0)
+        cases = (
+            # (candidate p95 ms, judged exact ratio, shown ratio, status)
+            (1_100_000.4, "1.100000400000", 1.1, "advisory_exceeded"),
+            (1_100_000.0, "1.100000000000", 1.1, "passed"),
+            (1_099_999.9, "1.099999900000", 1.1, "passed"),
+            (1_100_000.001, "1.100000001000", 1.1, "advisory_exceeded"),
+        )
+        for candidate_ms, exact, shown, status in cases:
+            with self.subTest(candidate_ms=candidate_ms):
+                candidate = self._uniform_duration(_report(), candidate_ms)
+                result = self.evaluate(candidate, baseline)
+                row = _row(result, "regressions", "llm_p95_duration_ratio")
+                self.assertEqual((status, shown, exact, "all_cases"),
+                                 (row["status"], row["value"], row["value_exact"], row["basis"]))
+                # The advisory exceedance never changes the verdict or the regression group.
+                self.assertEqual(("passed", True), (result["verdict"], result["regression_passed"]))
+
+    def test_unrounded_ratio_also_decides_the_warm_only_comparison(self) -> None:
+        # A cold tail identical in both reports keeps the all-case ratio at 1.0.
+        tail = ("cold", 9_000_000)
+        baseline = _latency_report(_warm_on(range(8, 20), lambda i: 1_000_000, tail))
+        candidate = _latency_report(_warm_on(range(8, 20), lambda i: 1_100_000.4, tail))
+        row = self.latency(candidate, baseline)
+        self.assertEqual(1.0, row["all_cases"]["ratio"])
+        self.assertEqual(("warm_only", 1.1, "1.100000400000", "advisory_exceeded"),
+                         (row["basis"], row["value"], row["value_exact"], row["status"]))
+        self.assertEqual(1.1, row["warm_only"]["ratio"])
+
+    def test_missing_ratio_has_no_exact_value(self) -> None:
+        baseline = self._uniform_duration(_report(), 0.0)
+        row = self.latency(_report(), baseline)
+        self.assertEqual(("unavailable", None, None), (row["status"], row["value"], row["value_exact"]))
+
     def test_fixture_reports_from_before_the_labels_keep_the_previous_all_case_result(self) -> None:
         candidate, baseline = _report(), _report()
         for report in (candidate, baseline):
@@ -812,10 +875,11 @@ class WarmOnlyLatencyRegressionTests(unittest.TestCase):
         self.assertNotIn("basis", row)
 
 
-def _summary_row(case_id: str, statuses: list[str], digests: int, *, complete: bool = True) -> dict:
+def _summary_row(case_id: str, statuses: list[str], digests: int, *, complete: bool = True,
+                 without_answer: int = 0) -> dict:
     return {"id": case_id, "run_count": len(statuses), "expected_run_count": 3, "complete": complete,
             "statuses": statuses, "all_passed": bool(statuses) and set(statuses) == {"passed"},
-            "distinct_answer_digests": digests, "runs_without_answer": 0,
+            "distinct_answer_digests": digests, "runs_without_answer": without_answer,
             "latency_classes": ["warm"] * len(statuses), "duration_ms": [100.0] * len(statuses)}
 
 
@@ -865,6 +929,38 @@ class StabilityDiagnosticTests(unittest.TestCase):
         self.assertEqual((100.0, 120.0, 110.0), (stability["p50_duration_ms"], stability["p95_duration_ms"],
                                                  stability["warm_p95_duration_ms"]))
         self.assertEqual({"answer-01", "answer-03"}, {row["id"] for row in stability["unstable_cases"]})
+
+    def test_runs_that_answered_only_sometimes_are_answer_disagreement(self) -> None:
+        rows = [
+            # Current evaluator output: no answer counts as a distinct value.
+            _summary_row("answer-00", ["failed"] * 3, 2, without_answer=2),
+            # Summary written when only answers were counted: one digest, two runs without an answer.
+            _summary_row("answer-01", ["failed"] * 3, 1, without_answer=2),
+            # Not a disagreement: every run answered the same, or no run answered.
+            _summary_row("answer-02", ["failed"] * 3, 1, without_answer=0),
+            _summary_row("answer-03", ["failed"] * 3, 1, without_answer=3),
+        ]
+        stability = self.evaluate(_with_summary(_report(), rows))["stability"]
+        self.assertEqual(["answer-00", "answer-01"], stability["answer_disagreement_case_ids"])
+        self.assertEqual([], stability["status_disagreement_case_ids"])
+        self.assertEqual(["answer-00", "answer-01"], stability["unstable_case_ids"])
+        self.assertFalse(stability["all_stable"])
+        self.assertEqual({"answer-00": 2, "answer-01": 2},
+                         {row["id"]: row["runs_without_answer"] for row in stability["unstable_cases"]})
+
+    def test_evaluator_output_with_one_answered_run_is_reported_unstable(self) -> None:
+        bad = {**_response(), "answer": "Submit within thirty days. [E1]"}
+        unavailable = {"status": 503, "response": {}}
+        scenario = _Scenario([{"response": bad}, unavailable, unavailable])
+        with tempfile.TemporaryDirectory() as temp:
+            evaluation = _evaluate(scenario, _specs("answer-00"), temp,
+                                   core_repeat={"case_ids": ["answer-00"], "extra_runs": 2})
+        report = _report()
+        report["stages"]["live_llm"]["result"].update(repetition_summary=evaluation["repetition_summary"])
+        stability = self.evaluate(report)["stability"]
+        self.assertEqual(["answer-00"], stability["answer_disagreement_case_ids"])
+        self.assertEqual([], stability["status_disagreement_case_ids"])
+        self.assertFalse(stability["all_stable"])
 
     def test_agreeing_complete_runs_are_stable(self) -> None:
         report = _with_summary(_report(), [_summary_row("answer-00", ["passed"] * 3, 1),

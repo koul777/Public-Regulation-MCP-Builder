@@ -436,11 +436,13 @@ def check_comparability(candidate: Mapping[str, Any], baseline: Mapping[str, Any
     return {"comparable": not differences, "differences": differences, "called_models": candidate_models}
 
 
-def _regression(regression_id: str, policy: Mapping[str, Any], value: float | int | None, **details: Any) -> dict[str, Any]:
+def _regression(regression_id: str, policy: Mapping[str, Any], value: float | int | None, *,
+                exact: Decimal | None = None, **details: Any) -> dict[str, Any]:
+    """``value`` is what is displayed; ``exact``, when given, is what is judged against the maximum."""
     rule = policy["regressions"][regression_id]
     if value is None:
         status = FAILED if rule["blocking"] else UNAVAILABLE
-    elif value <= rule["maximum"]:
+    elif (exact <= Decimal(str(rule["maximum"]))) if exact is not None else (value <= rule["maximum"]):
         status = PASSED
     else:
         status = FAILED if rule["blocking"] else ADVISORY
@@ -493,11 +495,15 @@ def _case_latency(report: Mapping[str, Any]) -> tuple[list[float], dict[str, flo
                        if case.get("latency_class") == "warm"}
 
 
-def _p95_ratio(old: list[float], new: list[float]) -> dict[str, Any]:
+def _p95_ratio(old: list[float], new: list[float]) -> tuple[dict[str, Any], Decimal | None]:
+    """Return (display block, exact ratio). The display ratio is rounded to 6 places; the
+    exact Decimal ratio is what gets judged, so 1.1000004 cannot pass a 1.10 maximum."""
     old_p95, new_p95 = _percentile(old, .95), _percentile(new, .95)
-    ratio = round(new_p95 / old_p95, 6) if old_p95 and new_p95 is not None else None
-    return {"ratio": ratio, "baseline_p95_ms": old_p95, "candidate_p95_ms": new_p95,
-            "baseline_sample_count": len(old), "candidate_sample_count": len(new)}
+    exact = Decimal(str(new_p95)) / Decimal(str(old_p95)) if old_p95 and new_p95 is not None else None
+    block = {"ratio": None if exact is None else round(float(exact), 6),
+             "baseline_p95_ms": old_p95, "candidate_p95_ms": new_p95,
+             "baseline_sample_count": len(old), "candidate_sample_count": len(new)}
+    return block, exact
 
 
 def _latency_regression(candidate: Mapping[str, Any], baseline: Mapping[str, Any],
@@ -510,18 +516,19 @@ def _latency_regression(candidate: Mapping[str, Any], baseline: Mapping[str, Any
     left the warm sample cannot hide a regression."""
     old_all, old_warm = _case_latency(baseline)
     new_all, new_warm = _case_latency(candidate)
-    overall = _p95_ratio(old_all, new_all)
+    overall, overall_exact = _p95_ratio(old_all, new_all)
     paired = sorted(set(old_warm) & set(new_warm))
-    warm = (_p95_ratio([old_warm[case_id] for case_id in paired], [new_warm[case_id] for case_id in paired])
-            if len(paired) >= MIN_PAIRED_WARM_CASES else None)
-    ratios = [value for value in (overall["ratio"], None if warm is None else warm["ratio"]) if value is not None]
-    value = max(ratios) if ratios else None
+    warm, warm_exact = (_p95_ratio([old_warm[case_id] for case_id in paired], [new_warm[case_id] for case_id in paired])
+                        if len(paired) >= MIN_PAIRED_WARM_CASES else (None, None))
+    exact_ratios = [ratio for ratio in (overall_exact, warm_exact) if ratio is not None]
+    value_exact = max(exact_ratios) if exact_ratios else None
     # The basis names the sample that produced the value; a tie goes to the all-case sample.
-    use_warm = warm is not None and warm["ratio"] is not None and (
-        overall["ratio"] is None or warm["ratio"] > overall["ratio"])
+    use_warm = warm_exact is not None and (overall_exact is None or warm_exact > overall_exact)
     chosen = warm if use_warm else overall
     return _regression(
-        "llm_p95_duration_ratio", policy, value, basis="warm_only" if use_warm else "all_cases",
+        "llm_p95_duration_ratio", policy, None if value_exact is None else round(float(value_exact), 6),
+        exact=value_exact, basis="warm_only" if use_warm else "all_cases",
+        value_exact=None if value_exact is None else format(value_exact.quantize(Decimal("1e-12")), "f"),
         baseline_p95_ms=chosen["baseline_p95_ms"], candidate_p95_ms=chosen["candidate_p95_ms"],
         baseline_sample_count=chosen["baseline_sample_count"], candidate_sample_count=chosen["candidate_sample_count"],
         all_cases=overall,
@@ -855,8 +862,13 @@ def _build_stability(report: Mapping[str, Any]) -> dict[str, Any] | None:
         case_id = str(row.get("id") or "")
         statuses = [str(item) for item in row.get("statuses")] if isinstance(row.get("statuses"), list) else []
         digests = row.get("distinct_answer_digests")
+        without_answer, run_count = row.get("runs_without_answer"), row.get("run_count")
         status_differs = len(set(statuses)) > 1
-        answer_differs = _is_int(digests) and digests > 1
+        # Runs that gave no answer are a value of their own. The mixed-run test also covers a
+        # summary written when only answers were counted as distinct values.
+        answered_on_some_runs_only = (_is_int(without_answer) and _is_int(run_count)
+                                      and 0 < without_answer < run_count)
+        answer_differs = (_is_int(digests) and digests > 1) or answered_on_some_runs_only
         if status_differs:
             status_disagreement.append(case_id)
         if answer_differs:
@@ -866,8 +878,9 @@ def _build_stability(report: Mapping[str, Any]) -> dict[str, Any] | None:
         if row.get("all_passed") is not True:
             not_all_passed.append(case_id)
         if status_differs or answer_differs:
-            unstable_cases.append({"id": case_id, "run_count": _count_or_none(row.get("run_count")),
-                                   "statuses": statuses, "distinct_answer_digests": _count_or_none(digests)})
+            unstable_cases.append({"id": case_id, "run_count": _count_or_none(run_count),
+                                   "statuses": statuses, "distinct_answer_digests": _count_or_none(digests),
+                                   "runs_without_answer": _count_or_none(without_answer)})
     unstable = sorted(set(status_disagreement) | set(answer_disagreement))
     return {
         **base, "status": "ok",

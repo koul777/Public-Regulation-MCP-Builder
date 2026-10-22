@@ -731,8 +731,10 @@ def summarize_repetitions(cases: list[dict[str, Any]], repetitions: list[dict[st
     """Per core case: all runs (main pass first, then repeats), statuses, answer stability, durations.
 
     Durations are case wall times of non-streaming calls; no first-token latency is
-    measured. ``distinct_answer_digests`` counts distinct final-answer hashes, so 1
-    means the same normalized answer text on every run that produced an answer.
+    measured. ``distinct_answer_digests`` counts distinct outcomes: each distinct
+    final-answer hash plus one more value when any run produced no answer. So 1 means
+    every run gave the same normalized answer text, or every run gave none; a case that
+    answered on some runs and not on others always counts 2 or more.
     """
     expected_runs = extra_runs + 1
     rows: list[dict[str, Any]] = []
@@ -747,7 +749,7 @@ def summarize_repetitions(cases: list[dict[str, Any]], repetitions: list[dict[st
             "complete": len(runs) == expected_runs,
             "statuses": [run.get("status") for run in runs],
             "all_passed": bool(runs) and all(run.get("status") == "passed" for run in runs),
-            "distinct_answer_digests": len({digest for digest in digests if digest}),
+            "distinct_answer_digests": len({digest or None for digest in digests}),
             "runs_without_answer": sum(1 for digest in digests if not digest),
             "latency_classes": [run.get("latency_class") for run in runs],
             "duration_ms": [float(run["duration_ms"]) for run in runs],
