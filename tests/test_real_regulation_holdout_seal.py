@@ -16,6 +16,7 @@ from scripts.run_real_regulation_e2e import (
     open_holdout,
 )
 from scripts.seal_real_regulation_holdout import main
+from tests.holdout_spec_fixtures import real_shaped_cases, real_shaped_spec
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -146,7 +147,7 @@ class HoldoutSealTests(unittest.TestCase):
             ("seal_spec_has_no_cases", {**good, "queries": ["not an object"]}),
             ("seal_spec_query_ids_invalid", {**good, "queries": [_case("same", "q1"), _case("same", "q2")]}),
             ("seal_spec_query_ids_invalid", {**good, "queries": [_case("", "q1")]}),
-            ("case_level_split_not_supported", {**good, "queries": [_case("hold-1", HOLDOUT_QUERY, split="development")]}),
+            ("query_split_conflict", {**good, "queries": [_case("hold-1", HOLDOUT_QUERY, split="development")]}),
         )
         for reason, holdout in variants:
             self.write_specs(holdout=holdout)
@@ -317,6 +318,64 @@ class HoldoutSealTests(unittest.TestCase):
         self.assert_ledger_corrupt(sealed, {**opened, "query_count": opened["query_count"] + 1})
         self.write_ledger(sealed, opened, rerun)
         check_holdout_gate(self.ledger, self.sha(self.holdout))
+
+
+    def test_real_shaped_specs_with_a_split_on_every_query_are_sealed(self) -> None:
+        development = real_shaped_spec("development", real_shaped_cases("development", count=3))
+        holdout = real_shaped_spec("holdout", real_shaped_cases("holdout", count=2))
+        self.assertNotIn("split", development)
+        self.assertNotIn("split", holdout)
+        self.write_specs(development=development, holdout=holdout)
+        code, summary = self.seal()
+        self.assertEqual((0, True), (code, summary["sealed"]))
+        (record,) = self.ledger_records()
+        self.assertEqual((self.sha(self.holdout), self.sha(self.development), 2, 3),
+                         (record["query_spec_sha256"], record["development_spec_sha256"],
+                          record["query_count"], record["development_query_count"]))
+        text = self.ledger.read_text(encoding="utf-8")
+        for private in ("synthetic holdout question", "synthetic development question", "holdout-case-0", "chunk-holdout-0"):
+            self.assertNotIn(private, text)
+        self.assertEqual({"authorized_rerun": False, "ledger_id": record["ledger_id"]},
+                         check_holdout_gate(self.ledger, self.sha(self.holdout)))
+        # A top-level label, a label on every query, and both are the same split.
+        both = {**real_shaped_spec("holdout", real_shaped_cases("holdout", count=2)), "split": "Holdout"}
+        self.ledger.unlink()
+        self.write_specs(development=development, holdout=both)
+        self.assertEqual(0, self.seal()[0])
+
+    def test_per_query_labels_are_checked_like_top_level_labels(self) -> None:
+        development = real_shaped_spec("development")
+        holdout = real_shaped_spec("holdout")
+        development_cases, holdout_cases = real_shaped_cases("development"), real_shaped_cases("holdout")
+        variants = (
+            ("development_spec_split_mismatch", real_shaped_spec("holdout", development_cases), holdout),
+            ("development_spec_split_mismatch", real_shaped_spec(None, development_cases), holdout),
+            ("holdout_spec_split_mismatch", development, real_shaped_spec("development", holdout_cases)),
+            ("holdout_spec_split_mismatch", development, real_shaped_spec(None, holdout_cases)),
+            ("query_split_mixed", {**development, "queries": [*development["queries"], development_cases[0] | {"id": "extra"}]}, holdout),
+            ("query_split_mixed", development, {**holdout, "queries": [holdout["queries"][0], {**holdout["queries"][1], "split": "development"}]}),
+            ("query_split_conflict", {**development, "split": "holdout"}, holdout),
+            ("query_split_conflict", development, {**holdout, "split": "development"}),
+            ("query_split_invalid", real_shaped_spec("dev", development_cases), holdout),
+        )
+        for reason, development_spec, holdout_spec in variants:
+            self.write_specs(development=development_spec, holdout=holdout_spec)
+            with self.subTest(reason=reason):
+                self.assert_refused(reason)
+
+    def test_real_shaped_specs_still_may_not_overlap(self) -> None:
+        shared = real_shaped_cases("development", count=1)[0]
+        cases = {
+            "development_and_holdout_share_query_ids": [{**real_shaped_cases("holdout", count=1)[0], "id": shared["id"]}],
+            "development_and_holdout_share_query_text": [{**real_shaped_cases("holdout", count=1)[0], "query": shared["query"]}],
+            "development_and_holdout_share_target_chunk_ids": [
+                {**real_shaped_cases("holdout", count=1)[0], "target_chunk_ids": shared["target_chunk_ids"]}],
+        }
+        for reason, holdout_cases in cases.items():
+            self.write_specs(development=real_shaped_spec("development", [shared]),
+                             holdout=real_shaped_spec("holdout", holdout_cases))
+            with self.subTest(reason=reason):
+                self.assert_refused(reason)
 
 
 if __name__ == "__main__":
