@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.mcp_server.regulation_tools import fetch_regulation, mcp_auth_context, search_regulations, settings_for_mcp_project
 from app.rag.extractive_answer import build_structured_extractive_answer, select_supporting_answer_results
+from scripts.holdout_spec_guard import refuse_holdout_spec
 from scripts.report_metadata import current_repo_commit
 
 
@@ -614,6 +615,7 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
 
 def load_query_specs(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    refuse_holdout_spec(payload)
     if isinstance(payload, dict):
         payload = payload.get("queries") or payload.get("items") or []
     if not isinstance(payload, list):

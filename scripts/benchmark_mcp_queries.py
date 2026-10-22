@@ -30,6 +30,7 @@ from app.retrieval.hierarchical_index import (
     _selected_version_rows,
     load_record_by_chunk,
 )
+from scripts.holdout_spec_guard import refuse_holdout_spec
 from scripts.export_mcp_demo_answers import normalize_query_specs, query_spec_fingerprint
 from scripts.report_metadata import (
     capture_mcp_performance_source_state,
@@ -904,6 +905,7 @@ def _target_ids(spec: dict[str, Any], singular_key: str, plural_key: str) -> lis
 
 def load_query_specs(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    refuse_holdout_spec(payload)
     if isinstance(payload, dict):
         payload = payload.get("queries") or payload.get("items") or []
     if not isinstance(payload, list):

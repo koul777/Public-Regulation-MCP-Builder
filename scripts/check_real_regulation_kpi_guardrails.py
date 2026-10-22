@@ -330,7 +330,14 @@ def check_holdout_protocol(report: Mapping[str, Any]) -> dict[str, Any]:
         record_hash = record.get("query_spec_sha256")
         if not isinstance(record_hash, str) or not record_hash or record_hash != report.get("query_spec_sha256"):
             reasons.append("holdout_ledger_record_spec_mismatch")
+        if not isinstance(record.get("ledger_id"), str) or not record["ledger_id"]:
+            reasons.append("holdout_ledger_id_missing")
     return _check("holdout_protocol", reasons, split=split)
+
+
+def _holdout_record(report: Mapping[str, Any]) -> Mapping[str, Any]:
+    record = report.get("holdout_ledger_record") if report.get("query_split") == "holdout" else None
+    return record if isinstance(record, dict) else {}
 
 
 def _rate_target(target_id: str, minimum: float, successes: int, denominator: int, *,
@@ -422,6 +429,9 @@ def _called_model_digests(report: Mapping[str, Any]) -> dict[str, Any] | None:
 def check_comparability(candidate: Mapping[str, Any], baseline: Mapping[str, Any],
                         policy: Mapping[str, Any]) -> dict[str, Any]:
     differences = [field for field in COMPARABLE_FIELDS if candidate.get(field) != baseline.get(field)]
+    # A holdout result must not steer later development through a baseline comparison.
+    if baseline.get("query_split", "unspecified") not in ("development", "unspecified"):
+        differences.append("baseline_is_holdout")
     # Case-by-case regressions need unique, complete baseline IDs.
     if check_coverage(baseline, policy)["status"] != PASSED:
         differences.append("baseline_coverage_failed")
@@ -534,6 +544,8 @@ def evaluate_kpi_guardrails(report: Any, policy: Mapping[str, Any], *, coverage_
         "candidate": {"repo_commit": report.get("repo_commit"), "query_count": report.get("query_count"),
                       "query_spec_sha256": report.get("query_spec_sha256"),
                       "query_split": report.get("query_split", "unspecified"),
+                      "holdout_ledger_id": _holdout_record(report).get("ledger_id"),
+                      "authorized_rerun": _holdout_record(report).get("authorized_rerun"),
                       "label_provenance": report.get("label_provenance"),
                       "legacy_report_passed": report.get("passed") is True},
         "baseline": None if baseline is None else {"repo_commit": baseline.get("repo_commit"),

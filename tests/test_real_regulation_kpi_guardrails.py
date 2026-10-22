@@ -442,7 +442,8 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         report = _report()
         report["query_spec_sha256"] = "a" * 64
         report["query_split"] = "holdout"
-        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64}
+        report["holdout_ledger_record"] = {"event": "opened", "query_spec_sha256": "a" * 64,
+                                           "ledger_id": "1" * 32, "authorized_rerun": False}
         return report
 
     def evaluate(self, report: dict) -> dict:
@@ -472,7 +473,31 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         row = _row(result, "hard", "holdout_protocol")
         self.assertEqual(("passed", "holdout", []), (row["status"], row["split"], row["reasons"]))
         self.assertEqual("holdout", result["candidate"]["query_split"])
+        self.assertEqual(("1" * 32, False), (result["candidate"]["holdout_ledger_id"], result["candidate"]["authorized_rerun"]))
         self.assertEqual("passed", result["verdict"])
+
+    def test_candidate_shows_whether_the_holdout_was_an_authorized_rerun(self) -> None:
+        report = self.holdout_report()
+        report["holdout_ledger_record"]["authorized_rerun"] = True
+        self.assertIs(True, self.evaluate(report)["candidate"]["authorized_rerun"])
+        for plain in (_report(), {**_report(), "query_split": "development"}):
+            candidate = self.evaluate(plain)["candidate"]
+            self.assertEqual((None, None), (candidate["holdout_ledger_id"], candidate["authorized_rerun"]))
+
+    def test_holdout_report_cannot_be_a_baseline(self) -> None:
+        candidate = _report()
+        candidate["query_spec_sha256"] = "a" * 64
+        for baseline in (self.holdout_report(), {**self.holdout_report(), "query_split": "Holdout"}):
+            result = evaluate_kpi_guardrails(candidate, self.policy, baseline=baseline)
+            with self.subTest(split=baseline["query_split"]):
+                self.assertEqual("not_comparable", result["verdict"])
+                self.assertEqual(["baseline_is_holdout"], result["comparability"]["differences"])
+                self.assertEqual([], result["regressions"])
+        for allowed in ("development", "unspecified"):
+            result = evaluate_kpi_guardrails(candidate, self.policy, baseline={**_report(), "query_split": allowed,
+                                                                             "query_spec_sha256": "a" * 64})
+            with self.subTest(split=allowed):
+                self.assertTrue(result["comparability"]["comparable"])
 
     def test_holdout_report_without_a_valid_opened_record_fails(self) -> None:
         def missing(report: dict) -> None:
@@ -490,6 +515,12 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
         def record_without_hash(report: dict) -> None:
             del report["holdout_ledger_record"]["query_spec_sha256"]
 
+        def no_ledger_id(report: dict) -> None:
+            del report["holdout_ledger_record"]["ledger_id"]
+
+        def empty_ledger_id(report: dict) -> None:
+            report["holdout_ledger_record"]["ledger_id"] = ""
+
         def both_hashes_empty(report: dict) -> None:
             report["query_spec_sha256"] = ""
             report["holdout_ledger_record"]["query_spec_sha256"] = ""
@@ -498,7 +529,9 @@ class KpiHoldoutProtocolTests(unittest.TestCase):
                                  ("holdout_ledger_record_not_opened", sealed_only),
                                  ("holdout_ledger_record_spec_mismatch", other_spec),
                                  ("holdout_ledger_record_spec_mismatch", record_without_hash),
-                                 ("holdout_ledger_record_spec_mismatch", both_hashes_empty)):
+                                 ("holdout_ledger_record_spec_mismatch", both_hashes_empty),
+                                 ("holdout_ledger_id_missing", no_ledger_id),
+                                 ("holdout_ledger_id_missing", empty_ledger_id)):
             with self.subTest(mutation=mutate.__name__):
                 report = self.holdout_report()
                 mutate(report)

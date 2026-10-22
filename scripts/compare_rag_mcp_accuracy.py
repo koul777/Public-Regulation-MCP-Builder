@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.mcp_server.regulation_tools import fetch_regulation, mcp_auth_context, search_regulations, settings_for_mcp_project  # noqa: E402
 from app.rag.extractive_answer import build_structured_extractive_answer, select_supporting_answer_results  # noqa: E402
+from scripts.holdout_spec_guard import refuse_holdout_spec
 from scripts.export_mcp_demo_answers import REQUIRED_CITATION_FIELDS, normalize_query_specs, query_spec_fingerprint  # noqa: E402
 from scripts.report_metadata import current_repo_commit  # noqa: E402
 
@@ -611,6 +612,7 @@ def _md_cell(value: Any) -> str:
 
 def load_query_specs(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    refuse_holdout_spec(payload)
     if isinstance(payload, dict):
         payload = payload.get("queries") or payload.get("items") or []
     if not isinstance(payload, list):

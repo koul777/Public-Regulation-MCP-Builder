@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.local_http import local_urlopen
 from app.rag.extractive_answer import NO_EVIDENCE_ANSWER
 from app.rag.output_filter import sanitize_rag_answer
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 
 
 SCHEMA_VERSION = "live-local-llm-evaluation-v1"
@@ -833,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         spec = json.loads(args.query_spec.read_text(encoding="utf-8"))
+        refuse_holdout_spec(spec)
         token = os.environ.get(args.auth_token_env, "")
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         if args.tenant_id:
@@ -843,6 +845,9 @@ def main(argv: list[str] | None = None) -> int:
                                             headers=headers,
                                             request_defaults={"llm_backend": "ollama", "orchestration_mode": "multi_model",
                                                               "retrieval_mode": args.retrieval_mode, "claim_audit_mode": args.claim_audit_mode})
+    except HoldoutSpecRefused as exc:
+        print(json.dumps({"passed": False, "reason_code": str(exc)}))
+        return 2
     except Exception as exc:
         print(json.dumps({"passed": False, "error_type": type(exc).__name__}))
         return 2

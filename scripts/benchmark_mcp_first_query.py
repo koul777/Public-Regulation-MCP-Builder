@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.holdout_spec_guard import refuse_holdout_spec
 from scripts.report_metadata import (
     capture_mcp_performance_source_state,
     current_repo_commit,
@@ -254,6 +255,7 @@ def normalize_query_specs(
 
 def load_query_specs(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    refuse_holdout_spec(payload)
     if isinstance(payload, dict):
         if "queries" in payload or "items" in payload:
             payload = payload.get("queries") or payload.get("items") or []
