@@ -520,8 +520,10 @@ def _number_unit_pairs(value: str) -> list[tuple[str, str]]:
 def _answer_has_number_outside_evidence(answer_view: str, evidence_view: str) -> bool:
     evidence_pairs = set(_number_unit_pairs(evidence_view))
     evidence_numbers = {number for number, _ in evidence_pairs}
-    # Whole number tokens only: 500 is not 1,500 and 3년 is not the 3 of 제3조.
-    return any((number, unit) not in evidence_pairs if unit else number not in evidence_numbers
+    # Whole number tokens only: 500 is not 1,500 and 3년 is not the 3 of 제3조. An evidence
+    # number without a unit (a table cell) cannot contradict the unit the answer adds.
+    return any((number, unit) not in evidence_pairs and (number, "") not in evidence_pairs if unit
+               else number not in evidence_numbers
                for number, unit in _number_unit_pairs(answer_view))
 
 

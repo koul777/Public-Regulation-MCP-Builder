@@ -1022,13 +1022,36 @@ class NumberGateTokenTests(unittest.TestCase):
             return _answer_has_number_outside_evidence(_gate_text(answer), _gate_text(evidence))
 
         for answer, evidence in (("7", "7일"), ("7일", "7 일간"), ("5%", "5 %"), ("1000원", "1,000원"),
-                                 ("10만원", "10만 원"), ("７일", "7일"), ("제2항", "② 신청"), ("제3조의2에", "제3조의2(특례)")):
+                                 ("10만원", "10만 원"), ("７일", "7일"), ("제2항", "② 신청"), ("제3조의2에", "제3조의2(특례)"),
+                                 # An evidence number without a unit also covers the answer's unit.
+                                 ("7일", "7"), ("80000원", "합계 80,000"), ("1박", "1 (참고)")):
             with self.subTest(answer=answer, evidence=evidence):
                 self.assertFalse(outside(answer, evidence))
-        for answer, evidence in (("7일", "7개"), ("500원", "1,500원"), ("3년", "제3조 5년"), ("2.5일", "1.5일"),
-                                 ("7일", "17일"), ("8", "7일"), ("7일", "7")):
+        for answer, evidence in (("7일", "7개"), ("500원", "1,500원"), ("500원", "1,500"), ("3년", "제3조 5년"),
+                                 ("2.5일", "1.5일"), ("7일", "17일"), ("8", "7일"), ("8일", "7")):
             with self.subTest(answer=answer, evidence=evidence):
                 self.assertTrue(outside(answer, evidence))
+
+    def test_evidence_number_without_unit_covers_answer_unit_but_not_other_numbers(self) -> None:
+        # A table cell has no unit, so the answer's "원" cannot contradict it.
+        table = "제5조(일비) 국내 출장 일비 기준표\n구분 금액\n일비 80,000"
+        result, runtime = _ko_audit("국내 출장 일비는 80000원이다. [E1]", table, article_no="제5조")
+        self.assertEqual("verified", result.status)
+        self.assertEqual(1, runtime.calls)
+        result, runtime = _ko_audit("국내 출장 일비는 8000원이다. [E1]", table, article_no="제5조")
+        self.assertEqual(("rejected", "answer_number_not_in_evidence"), (result.status, result.reason_code))
+        self.assertEqual(0, runtime.calls)
+
+    def test_article_number_does_not_cover_another_unit(self) -> None:
+        # 제3조 only supplies (3, 조); the answer's 3년 stays unsupported.
+        result, runtime = _ko_audit("징계 시효는 3년이다. [E1]", "제3조(징계 시효) 징계 시효는 5년으로 한다.")
+        self.assertEqual(("rejected", "answer_number_not_in_evidence"), (result.status, result.reason_code))
+        self.assertEqual(0, runtime.calls)
+
+    def test_larger_number_with_a_thousands_separator_does_not_cover_a_smaller_one(self) -> None:
+        result, runtime = _ko_audit("수당은 500원이다. [E1]", "수당은 1,500원이다.")
+        self.assertEqual(("rejected", "answer_number_not_in_evidence"), (result.status, result.reason_code))
+        self.assertEqual(0, runtime.calls)
 
 
 class SyntheticMarkerEvidenceTests(unittest.TestCase):
