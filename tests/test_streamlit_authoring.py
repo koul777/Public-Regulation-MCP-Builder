@@ -1348,9 +1348,17 @@ for severity in AuthoringLintSeverity:
                 )
             except KeyError:
                 selected_after_abandon = ""
+            # Streamlit 1.66 wraps AppTest state in an iterable mapping view;
+            # older SafeSessionState is not iterable but has filtered_state.
+            session_state = app.session_state
+            session_keys = (
+                session_state.keys()
+                if callable(getattr(type(session_state), "keys", None))
+                else session_state.filtered_state
+            )
             abandoned_editor_keys = [
                 str(key)
-                for key in app.session_state.filtered_state
+                for key in session_keys
                 if str(key).startswith(
                     (
                         f"authoring-v2-editor:default:test-profile:{project_id}:",
