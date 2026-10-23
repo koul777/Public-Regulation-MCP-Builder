@@ -11,7 +11,9 @@ dependencies = [
   "python-multipart>=0.0.9",
   "streamlit>=1.37",
   "pandas>=2.0",
-  "pymupdf>=1.24",
+  # Portable builds with PyMuPDF 2.0 failed the frozen PDF self-check
+  # (release runs of 2026-10-23). Keep 1.x until 2.x is verified there.
+  "pymupdf>=1.24,<2",
   "python-docx>=1.1",
   "olefile>=0.47",
   "mcp>=1.26,<2",
