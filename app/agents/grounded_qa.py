@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -12,11 +13,13 @@ from app.agents.base import AgentResult, BaseAgent
 from app.agents.model_router import QWEN3_ANSWER_MODEL, get_model_profile
 from app.agents.ollama_runtime import OllamaRuntime
 from app.rag.context_builder import GroundingContext
+from app.rag.evidence_quality import requires_table_structure_review
 from app.rag.extractive_answer import NO_EVIDENCE_ANSWER
 from app.rag.output_filter import sanitize_rag_answer
 
 
 _CONTEXT_ID = re.compile(r"^E\d+$")
+TABLE_STRUCTURE_REVIEW_REASON = "table_structure_review_required"
 # A lack-of-information response is an abstention, even when the model
 # incorrectly attaches an existing E identifier and sets abstained=false.
 # Deliberately exclude policy negatives such as '징수하지 않는다': those
@@ -117,6 +120,8 @@ class GroundedQwenAnswerAgent(BaseAgent):
                 abstained=True,
                 answer_mode="abstained",
             )
+        if all(requires_table_structure_review(item) for item in context.items):
+            return _table_structure_abstention()
         fallback = _extractive_draft(context)
         if not prefer_model:
             return fallback
@@ -130,13 +135,15 @@ class GroundedQwenAnswerAgent(BaseAgent):
                 timeout_seconds=self.profile.timeout_seconds,
                 temperature=float(self.profile.temperature or 0.0),
                 max_output_tokens=1800,
+                context_window=self.profile.max_input_units,
             )
             model_draft = _ModelAnswerDraft.model_validate(payload)
             return _validated_model_draft(model_draft, context, generation.duration_ms)
         except Exception as exc:
             if strict_model:
                 raise
-            return fallback.model_copy(update={"fallback_reason": _safe_failure_reason(exc)})
+            reason = fallback.fallback_reason if fallback.abstained and fallback.fallback_reason else _safe_failure_reason(exc)
+            return fallback.model_copy(update={"fallback_reason": reason})
 
     def run(self, payload: dict) -> AgentResult:
         raw_context = payload.get("context")
@@ -170,6 +177,8 @@ class GroundedQwenAnswerAgent(BaseAgent):
                 abstained=True,
                 answer_mode="abstained",
             )
+        if all(requires_table_structure_review(item) for item in context.items):
+            return _table_structure_abstention()
         fallback = _extractive_draft(context)
         try:
             if not self.runtime.model_available(self.profile.model):
@@ -181,13 +190,27 @@ class GroundedQwenAnswerAgent(BaseAgent):
                 timeout_seconds=self.profile.timeout_seconds,
                 temperature=float(self.profile.temperature or 0.0),
                 max_output_tokens=420,
+                context_window=self.profile.max_input_units,
             )
             model_draft = _FastModelAnswerDraft.model_validate(payload)
             return _validated_fast_model_draft(model_draft, context, generation.duration_ms)
         except Exception as exc:
             if strict_model:
                 raise
-            return fallback.model_copy(update={"fallback_reason": _safe_failure_reason(exc)})
+            reason = fallback.fallback_reason if fallback.abstained and fallback.fallback_reason else _safe_failure_reason(exc)
+            return fallback.model_copy(update={"fallback_reason": reason})
+
+
+def _bound_table_requires_review(context: GroundingContext, context_ids: Iterable[str]) -> bool:
+    referenced = set(context_ids)
+    return any(item.context_id in referenced and requires_table_structure_review(item) for item in context.items)
+
+
+def _table_structure_abstention(*, model: str | None = None, duration_ms: float = 0.0) -> GroundedAnswerDraft:
+    return GroundedAnswerDraft(
+        answer=NO_EVIDENCE_ANSWER, abstained=True, answer_mode="abstained",
+        model=model, fallback_reason=TABLE_STRUCTURE_REVIEW_REASON, duration_ms=duration_ms,
+    )
 
 
 def _validated_model_draft(
@@ -224,6 +247,12 @@ def _validated_model_draft(
             raise ValueError("model answer cited unknown context evidence")
         if not any(f"[{context_id}]" in answer for context_id in claim.evidence_context_ids):
             raise ValueError("model answer text omitted required evidence marker")
+    bound_ids = {context_id for claim in validated_claims for context_id in claim.evidence_context_ids}
+    answer_markers = set(re.findall(r"\[(E\d+)\]", answer))
+    if _bound_table_requires_review(context, bound_ids | answer_markers):
+        return _table_structure_abstention(model=QWEN3_ANSWER_MODEL, duration_ms=duration_ms)
+    if answer_markers != bound_ids:
+        raise ValueError("model answer evidence markers do not match declared claim evidence")
     return GroundedAnswerDraft(
         answer=answer,
         claims=validated_claims,
@@ -255,6 +284,8 @@ def _validated_fast_model_draft(
     answer_markers = set(re.findall(r"\[(E\d+)\]", answer))
     if answer_markers != set(context_ids):
         raise ValueError("fast model answer evidence markers do not match declared evidence")
+    if _bound_table_requires_review(context, context_ids):
+        return _table_structure_abstention(model=QWEN3_ANSWER_MODEL, duration_ms=duration_ms)
     claim_text = re.sub(r"\[E\d+\]", "", answer).strip()[:1200]
     if not claim_text:
         raise ValueError("fast model answer omitted claim text")
@@ -302,7 +333,8 @@ def _extractive_excerpt(text: str) -> str:
 def _extractive_draft(context: GroundingContext) -> GroundedAnswerDraft:
     claims: list[AnswerClaim] = []
     lines: list[str] = []
-    for index, item in enumerate(context.items[:3], start=1):
+    safe_items = [item for item in context.items if not requires_table_structure_review(item)]
+    for index, item in enumerate(safe_items[:3], start=1):
         text = " ".join(item.text.split())
         sentence = _extractive_excerpt(text)
         if not sentence:
@@ -317,6 +349,8 @@ def _extractive_draft(context: GroundingContext) -> GroundedAnswerDraft:
         prefix = f"{locator}: " if locator else ""
         lines.append(f"- {prefix}{sentence} [{item.context_id}]")
     if not claims:
+        if len(safe_items) != len(context.items):
+            return _table_structure_abstention()
         return GroundedAnswerDraft(
             answer=NO_EVIDENCE_ANSWER,
             abstained=True,

@@ -305,18 +305,18 @@ class OrchestratedRagTests(unittest.TestCase):
         score.assert_not_called()
         reranker.assert_not_called()
 
-    def test_cached_reranker_reuses_one_loaded_adapter(self) -> None:
+    def test_cached_reranker_reuses_lightweight_isolated_adapter(self) -> None:
         routes_rag._cached_qwen3_reranker.cache_clear()
         adapter = object()
         try:
-            with patch.object(routes_rag, "Qwen3RerankerAdapter", return_value=adapter) as factory:
+            with patch.object(routes_rag, "IsolatedQwen3RerankerAdapter", return_value=adapter) as factory:
                 first = routes_rag._cached_qwen3_reranker("")
                 second = routes_rag._cached_qwen3_reranker("")
         finally:
             routes_rag._cached_qwen3_reranker.cache_clear()
 
         self.assertIs(first, second)
-        factory.assert_called_once()
+        factory.assert_called_once_with(device="cpu", local_files_only=True, model_path=None)
 
     def test_general_query_reranks_only_a_bounded_candidate_set(self) -> None:
         records = [

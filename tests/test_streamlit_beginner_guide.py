@@ -3339,6 +3339,9 @@ class StreamlitBeginnerJourneyExecutionTests(unittest.TestCase):
         self.assertTrue(chunks)
         self.assertTrue(all(chunk.approval_status != "approved" for chunk in chunks))
         self.assertEqual([], repository.list_approval_journal_records(document_id))
+        # AppTest 1.50 may still expose upload widgets removed by the rerun.
+        # Refresh from Session State without resubmitting the deleted controls.
+        self.app._run()
         next_button = self.app.button(key="preprocess-goto-results")
         self.assertEqual("③ 검수하고 승인으로 이동", next_button.label)
 

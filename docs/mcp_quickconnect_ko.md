@@ -19,6 +19,11 @@ PR MCP Builder가 지원하는 공식 연결 방식은 로컬 stdio와 공개 HT
 - `validate_mcp_smoke.ps1`: MCP transport 검증
 - `data/`: 승인 runtime data
 
+전달 ZIP의 생성·압축 해제는 같은 용량 제한을 적용합니다. 최대 2,048개 항목,
+개별 파일 256 MiB, 압축 해제 후 전체 512 MiB이며 초과하면 생성 단계에서 거부합니다.
+압축률이 높아도 이 한도는 늘어나지 않습니다. 경로 이탈, 심볼릭 링크, 중복 항목과
+허용하지 않은 runtime 파일도 계속 차단합니다.
+
 ## 2. 로컬 stdio
 
 stdio MCP는 디렉터리를 스캔하거나 폴더명만 등록하는 방식이 아닙니다. 클라이언트에 다음 실행 계약을 모두 등록해야 합니다.
@@ -140,6 +145,12 @@ ZIP/wheel을 쓰는 경우에는 같은 자리에 `run_mcp_stdio_server.ps1`을 
 ZIP에 포함된 정확한 wheel을 설치한 다음에만 `run_mcp_stdio_server.ps1`과 앱 등록·진단을
 실행합니다. wheel 파일만으로는 Python 실행 환경이 생기지 않습니다. Python이 없는 PC라면
 portable 실행판 전체를 옮겨 그 PC에서 MCP 묶음을 다시 생성하는 방법을 사용하세요.
+
+소스 checkout에서 이동한 ZIP을 개발 검증할 때는 `REG_RAG_PYTHON`과
+`REG_RAG_PYTHON_PROJECT_ROOT`를 함께 명시할 수 있습니다. 두 값은 실행할 Python과
+절대경로 소스 루트를 한 쌍으로 지정하며, 소스가 없거나 import 검사가 실패하면 중단합니다.
+잘못된 소스 경로를 다른 설치 패키지로 자동 대체하지 않습니다. 기존 `runtime_python.json`이
+있으면 그 파일의 검증된 실행 환경이 우선합니다.
 
 연결 후 새 대화에서 다음처럼 확인합니다.
 

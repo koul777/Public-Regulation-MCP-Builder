@@ -91,8 +91,21 @@ MODEL_PROFILE_REGISTRY: dict[str, ModelProfileSpec] = {
         model=QWEN3_ANSWER_MODEL,
         endpoint="http://127.0.0.1:11434",
         max_input_units=16_384,
-        timeout_seconds=60,
+        # Long approved contexts on partially offloaded local 8B models can
+        # exceed a minute even with a concise, valid structured response.
+        timeout_seconds=180,
         temperature=0.1,
+    ),
+    "claim-audit-qwen3-4b": ModelProfileSpec(
+        profile_id="claim-audit-qwen3-4b",
+        level="L2",
+        capability="grounded_claim_audit",
+        runtime="ollama",
+        model=QWEN3_REVIEW_MODEL,
+        endpoint="http://127.0.0.1:11434",
+        max_input_units=16_384,
+        timeout_seconds=45,
+        temperature=0.0,
     ),
 }
 
@@ -106,7 +119,7 @@ ROLE_MODEL_PROFILES: dict[str, str] = {
     "query_rewriter": "query-qwen3-1.7b",
     "reranker": "reranker-qwen3-0.6b",
     "grounded_answerer": "answer-qwen3-8b",
-    "claim_auditor": "review-qwen3-4b",
+    "claim_auditor": "claim-audit-qwen3-4b",
 }
 
 

@@ -13,7 +13,10 @@ import stat as stat_module
 from pathlib import Path
 import re
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.services.approved_source_text import SourceText
 
 if os.name == "nt":
     import ctypes
@@ -2639,12 +2642,38 @@ def load_visible_records(
     return visible_records
 
 
+def approved_source_text_for_record(
+    record: dict[str, Any],
+    *,
+    settings: Any,
+    auth: AuthContext,
+) -> SourceText:
+    """Resolve a bounded, identity-cached witness after the visibility gate."""
+    from app.services.approved_source_witness import source_text_from_current_witness
+
+    return source_text_from_current_witness(settings=settings, auth=auth, record=record)
+
+
 def public_search_result(
     record: dict[str, Any],
     score: float,
     *,
     related_records: list[dict[str, Any]] | None = None,
+    source_text_result: SourceText | None = None,
 ) -> dict[str, Any]:
+    from app.services.approved_source_text import SourceText, SOURCE_UNAVAILABLE, looks_like_augmented_text
+    from app.rag.evidence_quality import table_review_metadata
+
+    # Only an explicit, typed boundary result can replace stored text. Never
+    # trust a similarly named field supplied by a vector-store record.
+    if not isinstance(source_text_result, SourceText):
+        raw_text = str(record.get("text") or "")
+        source_text_result = (
+            SOURCE_UNAVAILABLE if looks_like_augmented_text(raw_text)
+            else SourceText(raw_text, "")
+        )
+    elif source_text_result.status not in ("verified_plain", "verified_reconstruction"):
+        source_text_result = SOURCE_UNAVAILABLE
     metadata_value = record.get("metadata")
     metadata = metadata_value if isinstance(metadata_value, dict) else {}
     governing_article = governing_article_for_reference_chunk(
@@ -2657,7 +2686,9 @@ def public_search_result(
         or metadata.get("document_id")
         or "",
         "chunk_id": record.get("chunk_id") or metadata.get("chunk_id") or "",
-        "text": str(record.get("text") or ""),
+        "text": source_text_result.text,
+        "source_text_status": source_text_result.status,
+        **table_review_metadata(metadata),
         "document_name": metadata.get("document_name") or "",
         "institution_name": metadata.get("institution_name") or "",
         "apba_id": metadata.get("apba_id") or "",

@@ -19,6 +19,19 @@ from scripts.run_mcp_bundle_zip_extract_smoke import (
 
 
 class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
+    def test_rejects_total_size_before_writing_any_archive_member(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "bundle.zip"
+            destination = root / "extracted"
+            destination.mkdir()
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("README.md", "12345678")
+                archive.writestr("README.ko.md", "12345678")
+            with self.assertRaisesRegex(ValueError, "uncompressed size limit"):
+                _extract_archive_safely(archive_path, destination, max_total_bytes=15)
+            self.assertEqual([], list(destination.iterdir()))
+
     def test_relative_paths_are_resolved_before_powershell_changes_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -83,6 +96,46 @@ class RunMcpBundleZipExtractSmokeTests(unittest.TestCase):
             child_env["REG_RAG_PYTHON_PROJECT_ROOT"],
         )
         self.assertTrue(report["passed"])
+
+    def test_installed_wheel_does_not_claim_site_packages_is_a_source_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            installed_root = root / "site-packages"
+            (installed_root / "scripts").mkdir(parents=True)
+            (installed_root / "scripts" / "run_regulation_mcp.py").write_text("", encoding="utf-8")
+            source = root / "source"
+            source.mkdir()
+            extracted = root / "extracted"
+            _write_client_configs(source, launcher=extracted / "run_mcp_stdio_server.ps1", data_dir=extracted / "data")
+            for name in ("validate_client_config_smoke.ps1", "run_mcp_stdio_server.ps1"):
+                (source / name).write_text("exit 0\n", encoding="utf-8")
+            (source / "mcp_client_config_smoke.json").write_text('{"passed": true}\n', encoding="utf-8")
+            bundle_zip = root / "bundle.zip"
+            with zipfile.ZipFile(bundle_zip, "w") as archive:
+                for path in source.iterdir():
+                    archive.write(path, arcname=path.name)
+                archive.writestr("data/.keep", "")
+
+            with (
+                mock.patch.object(bundle_zip_extract_smoke, "PROJECT_ROOT", installed_root),
+                mock.patch.object(bundle_zip_extract_smoke, "_powershell_command", return_value="powershell.exe"),
+                mock.patch.object(bundle_zip_extract_smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run_mock,
+                mock.patch.object(bundle_zip_extract_smoke, "current_repo_commit", return_value=None),
+                mock.patch.object(bundle_zip_extract_smoke.shutil, "which", return_value=None),
+                mock.patch.dict(os.environ, {
+                    "REG_RAG_PYTHON": str(root / "stale-python.exe"),
+                    "REG_RAG_PYTHON_PROJECT_ROOT": str(root / "other-checkout"),
+                    "PYTHONPATH": str(root / "other-checkout"),
+                }),
+            ):
+                report = run_mcp_bundle_zip_extract_smoke(bundle_zip=bundle_zip, extract_dir=extracted, server_name="govreg-local")
+
+            child_env = run_mock.call_args.kwargs["env"]
+            self.assertEqual(str(Path(os.sys.executable).resolve()), child_env["REG_RAG_PYTHON"])
+            self.assertNotIn("REG_RAG_PYTHON_PROJECT_ROOT", child_env)
+            self.assertNotIn("PYTHONPATH", child_env)
+            self.assertEqual("1", child_env["PYTHONSAFEPATH"])
+            self.assertTrue(report["passed"])
 
     def test_require_console_scripts_reports_environment_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

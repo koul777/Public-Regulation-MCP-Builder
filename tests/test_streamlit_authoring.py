@@ -1350,7 +1350,7 @@ for severity in AuthoringLintSeverity:
                 selected_after_abandon = ""
             abandoned_editor_keys = [
                 str(key)
-                for key in app.session_state
+                for key in app.session_state.filtered_state
                 if str(key).startswith(
                     (
                         f"authoring-v2-editor:default:test-profile:{project_id}:",

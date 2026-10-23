@@ -314,7 +314,7 @@ AGENT_ROLE_REGISTRY: dict[str, AgentRoleSpec] = {
         forbidden_actions=("approve_answer", "approve_chunks", "invent_evidence", "change_citation", "use_external_api"),
         failure_policy="미검증 주장이 있으면 deterministic citation verifier가 제거 또는 abstain한다.",
         primary_model=QWEN3_REVIEW_MODEL,
-        model_profile="review-qwen3-4b",
+        model_profile="claim-audit-qwen3-4b",
     ),
     "citation_verifier": AgentRoleSpec(
         role_id="citation_verifier",

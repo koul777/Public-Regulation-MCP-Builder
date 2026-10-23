@@ -53,7 +53,10 @@ LOGIC_FILES = {
     "scripts/verify_real_parser_regression_fixtures.py",
 }
 BASELINE_PREFIXES = ("tests/fixtures/regression/",)
-BASELINE_FILES = {"config/quality_profiles.example.json"}
+BASELINE_FILES = {
+    "config/quality_profiles.example.json",
+    "scripts/policies/real_regulation_kpi_guardrails.v1.json",
+}
 GOVERNANCE_FILES = {
     ".github/CODEOWNERS",
     ".github/PULL_REQUEST_TEMPLATE.md",

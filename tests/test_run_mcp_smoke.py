@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -26,6 +27,9 @@ class RunMcpSmokeTests(unittest.TestCase):
             manifest_path = Path(settings.data_dir) / "mcp_runtime_manifest.json"
             seen["manifest_exists"] = manifest_path.exists()
             seen["manifest"] = json.loads(manifest_path.read_text(encoding="utf-8"))
+            sidecar = Path(settings.data_dir) / "repository" / "approval_snapshot.json"
+            seen["approval_snapshot_exists"] = sidecar.is_file()
+            seen["approval_snapshot_sha256"] = hashlib.sha256(sidecar.read_bytes()).hexdigest()
             raise _StopAfterManifestCheck
 
         with patch(
@@ -43,6 +47,11 @@ class RunMcpSmokeTests(unittest.TestCase):
         self.assertEqual("mcp_runtime_data_bundle", manifest["report_type"])
         self.assertEqual("ready", manifest["hierarchical_index_status"])
         self.assertEqual(SYNTHETIC_SMOKE_PROFILE_ID, manifest["profile_id"])
+        self.assertTrue(seen["approval_snapshot_exists"])
+        self.assertEqual(
+            seen["approval_snapshot_sha256"],
+            manifest["runtime_data_reuse"]["file_sha256"]["repository/approval_snapshot.json"],
+        )
 
     def test_run_mcp_smoke_passes_with_synthetic_data(self) -> None:
         report = run_mcp_smoke(
@@ -70,6 +79,35 @@ class RunMcpSmokeTests(unittest.TestCase):
         )
         self.assertEqual(report["evidence_summary"]["approval_vector_sync_failure_count"], 0)
         self.assertEqual(report["evidence_summary"]["approval_vector_sync_failure_samples"], [])
+
+    def test_pinned_snapshot_supports_flat_synthetic_runtime(self) -> None:
+        report = run_mcp_smoke(
+            tenant_id="tenant-mcp-smoke", tenant_storage_isolation=False,
+        )
+        self.assertTrue(report["passed"])
+        self.assertGreaterEqual(report["table_count"], 1)
+        self.assertTrue(report["evidence_summary"]["passed"])
+
+    def test_missing_or_tampered_snapshot_keeps_smoke_table_gate_closed(self) -> None:
+        from app.mcp_server.regulation_tools import get_table as real_get_table
+
+        for mutation in ("missing", "tampered"):
+            with self.subTest(mutation=mutation):
+                def mutate_and_read(*, settings, **kwargs):
+                    sidecar = Path(settings.data_dir) / "repository" / "approval_snapshot.json"
+                    if mutation == "missing":
+                        sidecar.unlink()
+                    else:
+                        sidecar.write_bytes(sidecar.read_bytes() + b" ")
+                    return real_get_table(settings=settings, **kwargs)
+
+                with patch("scripts.run_mcp_smoke.get_table", side_effect=mutate_and_read):
+                    report = run_mcp_smoke(
+                        tenant_id="tenant-mcp-smoke", tenant_storage_isolation=True,
+                    )
+                self.assertFalse(report["passed"])
+                self.assertEqual(0, report["table_count"])
+                self.assertTrue(report["fetch_has_text"])
 
     def test_run_mcp_smoke_refuses_explicit_empty_runtime_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,0 +1,48 @@
+{
+  "policy_id": "real_regulation_e2e_kpi_guardrails",
+  "policy_version": 1,
+  "source": "docs/real_regulation_mcp_local_llm_10hour_plan_ko.md section 6",
+  "report_type": "real_regulation_e2e",
+  "report_schema_versions": [1],
+  "required_stages": [
+    "preprocessing",
+    "retrieval",
+    "mcp",
+    "live_llm",
+    "input_integrity",
+    "active_runtime_integrity"
+  ],
+  "required_request_modes": {
+    "llm_backend": "ollama",
+    "claim_audit_mode": "model"
+  },
+  "hard_checks": [
+    "coverage",
+    "integrity",
+    "no_auto_approval",
+    "mcp_contract",
+    "request_modes",
+    "retrieval_no_evidence",
+    "negative_cases",
+    "forbidden_facts",
+    "citation_trace"
+  ],
+  "coverage_profiles": {
+    "full": {"min_answerable_cases": 20, "min_negative_cases": 8, "min_no_evidence_queries": 4},
+    "compact": {"min_answerable_cases": 10, "min_negative_cases": 4, "min_no_evidence_queries": 2,
+                "max_query_count": 30}
+  },
+  "targets": {
+    "retrieval_recall_at_5": {"minimum": 0.95},
+    "retrieval_mrr": {"minimum": 0.85},
+    "final_model_answer_rate": {"minimum": 0.95},
+    "required_fact_match_rate": {"minimum": 0.90},
+    "case_fact_pass_rate": {"minimum": 0.90}
+  },
+  "regressions": {
+    "retrieval_new_misses": {"maximum": 0, "blocking": true},
+    "mcp_new_failures": {"maximum": 0, "blocking": true},
+    "llm_new_case_failures": {"maximum": 0, "blocking": false},
+    "llm_p95_duration_ratio": {"maximum": 1.10, "blocking": false}
+  }
+}

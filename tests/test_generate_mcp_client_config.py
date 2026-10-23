@@ -54,6 +54,7 @@ from scripts.generate_mcp_client_config import (
 )
 from scripts.mcp_bundle_contract import (
     REQUIRED_SETUP_BUNDLE_FILES,
+    validate_bundle_archive_sizes,
 )
 
 
@@ -444,6 +445,65 @@ def _run_claude_code_transaction_failure(
 
 
 class GenerateMcpClientConfigTests(unittest.TestCase):
+    def test_zip_rejects_oversized_member_before_replacing_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "README.md").write_text("123456789", encoding="utf-8")
+            archive = root / "bundle.zip"
+            archive.write_bytes(b"previous verified archive")
+            with patch("scripts.generate_mcp_client_config.validate_bundle_archive_sizes",
+                       side_effect=lambda members: validate_bundle_archive_sizes(members, max_entry_bytes=8)):
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    write_mcp_setup_bundle_zip(source, archive)
+            self.assertEqual(b"previous verified archive", archive.read_bytes())
+            self.assertEqual([], list(root.glob(".*.tmp")))
+
+    def test_zip_rechecks_actual_portable_payload_size_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "README.md").write_text("x", encoding="utf-8")
+            archive = root / "bundle.zip"
+            archive.write_bytes(b"previous verified archive")
+            with patch("scripts.generate_mcp_client_config.validate_bundle_archive_sizes",
+                       side_effect=lambda members: validate_bundle_archive_sizes(members, max_entry_bytes=8)):
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    write_mcp_setup_bundle_zip(source, archive)
+            self.assertEqual(b"previous verified archive", archive.read_bytes())
+            self.assertEqual([], list(root.glob(".*.tmp")))
+
+    @unittest.skipUnless(os.name == "nt", "Generated source launchers use PowerShell.")
+    def test_portable_stdio_launcher_honors_explicit_source_pair_and_rejects_invalid_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "selected-source"
+            (source / "scripts").mkdir(parents=True)
+            (source / "pyproject.toml").write_text("", encoding="utf-8")
+            (source / "scripts" / "__init__.py").write_text("", encoding="utf-8")
+            (source / "scripts" / "run_regulation_mcp.py").write_text(
+                'if __name__ == "__main__":\n    print("explicit-source-selected")\n', encoding="utf-8")
+            bundle = root / "moved-bundle"
+            (bundle / "data").mkdir(parents=True)
+            launcher = bundle / "run_mcp_stdio_server.ps1"
+            launcher.write_text(_powershell_stdio_launcher_script([], preferred_python=sys.executable,
+                preferred_project_root=source), encoding="utf-8-sig")
+            env = dict(os.environ, REG_RAG_PYTHON=sys.executable, REG_RAG_PYTHON_PROJECT_ROOT=str(source))
+            powershell = str(Path(env.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+            command = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(launcher)]
+            successful = subprocess.run(command, cwd=bundle, env=env, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace", timeout=30)
+            self.assertEqual(0, successful.returncode, successful.stdout + successful.stderr)
+            self.assertIn("explicit-source-selected", successful.stdout)
+            env["REG_RAG_PYTHON_PROJECT_ROOT"] = str(root / "missing-source")
+            invalid = subprocess.run(command, cwd=bundle, env=env, capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", timeout=30)
+            self.assertNotEqual(0, invalid.returncode)
+            self.assertNotIn("explicit-source-selected", invalid.stdout)
+            self.assertIn("Explicit source runtime", invalid.stderr)
+
     def test_claude_source_runtime_candidate_priority_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

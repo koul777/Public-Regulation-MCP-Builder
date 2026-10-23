@@ -1,5 +1,38 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
+
+# The producer and extractor share one bounded handoff capacity. Combined
+# regulation books can exceed 64 MiB in an approved chunk artifact alone.
+MAX_BUNDLE_ARCHIVE_ENTRIES = 2048
+MAX_BUNDLE_ARCHIVE_ENTRY_BYTES = 256 * 1024 * 1024
+MAX_BUNDLE_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
+
+
+def validate_bundle_archive_sizes(
+    members: Iterable[tuple[str, int]],
+    *,
+    max_entries: int = MAX_BUNDLE_ARCHIVE_ENTRIES,
+    max_entry_bytes: int = MAX_BUNDLE_ARCHIVE_ENTRY_BYTES,
+    max_total_bytes: int = MAX_BUNDLE_ARCHIVE_TOTAL_BYTES,
+) -> None:
+    """Reject oversized or malformed archive metadata before publishing/extracting."""
+    for value in (max_entries, max_entry_bytes, max_total_bytes):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("Bundle archive limits must be positive integers.")
+    total_bytes = 0
+    for count, (name, size) in enumerate(members, start=1):
+        if count > max_entries:
+            raise ValueError(f"Bundle archive has too many entries: {count} > {max_entries}.")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"Bundle archive member has an invalid size: {name}.")
+        if size > max_entry_bytes:
+            raise ValueError(f"Bundle archive member is too large: {name} ({size} bytes).")
+        total_bytes += size
+        if total_bytes > max_total_bytes:
+            raise ValueError(f"Bundle archive exceeds the uncompressed size limit ({max_total_bytes} bytes).")
+
 
 SETUP_BUNDLE_FILES = {
     "manifest": "manifest.json",

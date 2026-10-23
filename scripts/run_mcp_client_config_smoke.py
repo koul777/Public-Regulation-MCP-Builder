@@ -724,6 +724,16 @@ async def _run_client_entry(
     process_env = dict(env)
     if runtime_python and "REG_RAG_PYTHON" not in process_env:
         process_env["REG_RAG_PYTHON"] = runtime_python
+    # The source root belongs to this selected interpreter. Do not attach a
+    # parent-process source root to a different interpreter configured by a client.
+    runtime_project_root = os.getenv("REG_RAG_PYTHON_PROJECT_ROOT", "").strip()
+    if (
+        runtime_python
+        and runtime_project_root
+        and process_env.get("REG_RAG_PYTHON") == runtime_python
+        and "REG_RAG_PYTHON_PROJECT_ROOT" not in process_env
+    ):
+        process_env["REG_RAG_PYTHON_PROJECT_ROOT"] = runtime_project_root
     params = StdioServerParameters(
         command=command,
         args=args,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from app.agents.model_router import QWEN3_EMBEDDING_MODEL, QWEN3_RERANKER_MODEL
 from app.ingestion.embedding_adapter import embed_vector_record
@@ -244,6 +244,85 @@ class SemanticModelTests(unittest.TestCase):
         self.assertEqual("a", reranked[0][1]["id"])
         self.assertEqual(0.8, reranked[0][1]["retrieval_score"])
         self.assertEqual(QWEN3_RERANKER_MODEL, reranked[0][1]["reranker_model"])
+
+    def test_reranker_requests_only_last_token_logits_without_generation_cache(self) -> None:
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [1]
+        tokenizer.convert_tokens_to_ids.side_effect = lambda token: {"no": 0, "yes": 1}[token]
+        tokenizer.return_value = {"input_ids": [[2, 3], [4, 5]]}
+        input_ids, mask = Mock(), Mock()
+        input_ids.to.return_value, mask.to.return_value = input_ids, mask
+        tokenizer.pad.return_value = {"input_ids": input_ids, "attention_mask": mask}
+        logits = MagicMock()
+        model = Mock(return_value=SimpleNamespace(logits=logits))
+        probabilities = MagicMock()
+        probabilities.__getitem__.return_value.detach.return_value.cpu.return_value.tolist.return_value = [.25, .75]
+        torch = SimpleNamespace(no_grad=MagicMock(), stack=Mock(),
+                                nn=SimpleNamespace(functional=SimpleNamespace(softmax=Mock(return_value=probabilities))))
+        with patch.dict("sys.modules", {"torch": torch}):
+            scores = Qwen3RerankerAdapter(tokenizer=tokenizer, model=model).score(
+                "Synthetic question", ["Synthetic first passage", "Synthetic second passage"],
+            )
+        self.assertEqual([.25, .75], scores)
+        model.assert_called_once_with(input_ids=input_ids, attention_mask=mask,
+                                      logits_to_keep=1, use_cache=False)
+        self.assertEqual([1, 2, 3, 1], tokenizer.pad.call_args.args[0]["input_ids"][0])
+        self.assertEqual([1, 4, 5, 1], tokenizer.pad.call_args.args[0]["input_ids"][1])
+
+    def test_non_finite_reranker_probabilities_are_rejected_before_clamping(self) -> None:
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [1]
+        tokenizer.convert_tokens_to_ids.side_effect = lambda token: {"no": 0, "yes": 1}[token]
+        tokenizer.return_value = {"input_ids": [[2, 3]]}
+        input_ids, mask = Mock(), Mock()
+        input_ids.to.return_value, mask.to.return_value = input_ids, mask
+        tokenizer.pad.return_value = {"input_ids": input_ids, "attention_mask": mask}
+        model = Mock(return_value=SimpleNamespace(logits=MagicMock()))
+        probabilities = MagicMock()
+        torch = SimpleNamespace(no_grad=MagicMock(), stack=Mock(),
+                                nn=SimpleNamespace(functional=SimpleNamespace(softmax=Mock(return_value=probabilities))))
+        for value in (float("nan"), float("inf"), -float("inf")):
+            probabilities.__getitem__.return_value.detach.return_value.cpu.return_value.tolist.return_value = [value]
+            with self.subTest(value=value), patch.dict("sys.modules", {"torch": torch}), \
+                    self.assertRaisesRegex(RuntimeError, "non-finite"):
+                Qwen3RerankerAdapter(tokenizer=tokenizer, model=model).score("Synthetic query", ["Synthetic passage"])
+
+    def test_reranker_cpu_dtype_is_scoped_to_verified_avx2_without_native_bf16(self) -> None:
+        for device, capability, bf16, amx, expected_fp32 in (
+            ("cpu", "AVX2", False, False, True),
+            ("cpu:0", "AVX2", False, False, True),
+            ("cpu", "AVX2", True, False, False),
+            ("cpu", "AVX2", False, True, False),
+            ("cpu", "AVX512", False, False, False),
+            ("cuda:0", "AVX2", False, False, False),
+        ):
+            with self.subTest(device=device, capability=capability, bf16=bf16, amx=amx):
+                factory = Mock()
+                torch = SimpleNamespace(
+                    float32=object(),
+                    backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: capability)),
+                    cpu=SimpleNamespace(_is_avx512_bf16_supported=lambda: bf16,
+                                        _is_amx_tile_supported=lambda: amx),
+                )
+                transformers = SimpleNamespace(AutoModelForCausalLM=SimpleNamespace(from_pretrained=factory),
+                                                AutoTokenizer=SimpleNamespace(from_pretrained=Mock()))
+                with patch.dict("sys.modules", {"torch": torch, "transformers": transformers}), \
+                     patch("app.retrieval.semantic_models.semantic_runtime_available", return_value=True):
+                    Qwen3RerankerAdapter(device=device, local_files_only=True)._load_runtime()
+                kwargs = factory.call_args.kwargs
+                self.assertEqual(expected_fp32, "torch_dtype" in kwargs)
+                if expected_fp32:
+                    self.assertIs(torch.float32, kwargs["torch_dtype"])
+                self.assertTrue(kwargs["local_files_only"])
+
+    def test_reranker_preserves_dtype_when_cpu_feature_api_is_missing_or_fails(self) -> None:
+        from app.retrieval.semantic_models import _reranker_cpu_load_options
+
+        for cpu in (SimpleNamespace(), SimpleNamespace(_is_avx512_bf16_supported=Mock(side_effect=RuntimeError))):
+            torch = SimpleNamespace(cpu=cpu, backends=SimpleNamespace(
+                cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))
+            with self.subTest(cpu=cpu):
+                self.assertEqual({}, _reranker_cpu_load_options(torch, "cpu"))
 
 
 if __name__ == "__main__":

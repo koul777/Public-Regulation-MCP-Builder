@@ -68,11 +68,17 @@ class OllamaRuntime:
         temperature: float = 0.0,
         max_output_tokens: int = 1024,
         json_schema: dict[str, Any] | str | None = None,
+        context_window: int | None = None,
     ) -> OllamaGeneration:
         normalized_model = str(model or "").strip()
         normalized_prompt = str(prompt or "").strip()
         if not normalized_model or not normalized_prompt:
             raise ValueError("Ollama generation requires model and prompt")
+        if context_window is not None and (
+            isinstance(context_window, bool) or not isinstance(context_window, int)
+            or not 512 <= context_window <= 32768
+        ):
+            raise ValueError("context_window must be an integer between 512 and 32768")
         payload: dict[str, Any] = {
             "model": normalized_model,
             "prompt": normalized_prompt,
@@ -85,6 +91,11 @@ class OllamaRuntime:
                 "num_predict": max(32, min(int(max_output_tokens), 8192)),
             },
         }
+        if context_window is not None:
+            # Local deployments can default to a smaller window than the role's
+            # actual prompt. Keep this explicit; enlarging every model's window
+            # implicitly would change its memory use and device placement.
+            payload["options"]["num_ctx"] = context_window
         if json_schema:
             payload["format"] = json_schema
         started = time.perf_counter()
@@ -112,6 +123,7 @@ class OllamaRuntime:
         timeout_seconds: int,
         temperature: float = 0.0,
         max_output_tokens: int = 1024,
+        context_window: int | None = None,
     ) -> tuple[dict[str, Any], OllamaGeneration]:
         structured_prompt = (
             str(prompt).rstrip()
@@ -127,6 +139,7 @@ class OllamaRuntime:
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 json_schema=schema,
+                context_window=context_window,
             )
         except OllamaRuntimeError as exc:
             # Some Ollama/llama.cpp builds reject valid nested JSON Schema as a
@@ -141,6 +154,7 @@ class OllamaRuntime:
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 json_schema="json",
+                context_window=context_window,
             )
         try:
             decoded = json.loads(generation.response_text)

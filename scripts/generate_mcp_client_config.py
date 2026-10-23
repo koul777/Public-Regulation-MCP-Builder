@@ -34,6 +34,7 @@ from scripts.mcp_bundle_contract import (  # noqa: E402
     ALL_SETUP_BUNDLE_FILES,
     LEGACY_CONNECTION_ARTIFACT_FILENAMES,
     SETUP_BUNDLE_FILES,
+    validate_bundle_archive_sizes,
 )
 from scripts.mcp_client_status import (  # noqa: E402
     create_bundle_status as create_client_connection_status,
@@ -5434,7 +5435,9 @@ def write_mcp_setup_bundle_zip(
     if wheel is not None and wheel.resolve() != zip_path_resolved:
         archive_files.append((wheel, wheel.name))
 
-    total_bytes = sum(path.stat().st_size for path, _arcname in archive_files)
+    archive_sizes = [(arcname, path.stat().st_size) for path, arcname in archive_files]
+    validate_bundle_archive_sizes(archive_sizes + ([("data/", 0)] if include_empty_runtime_directory else []))
+    total_bytes = sum(size for _arcname, size in archive_sizes)
     bytes_written = 0
     if progress_callback is not None:
         progress_callback(0, total_bytes, "압축 준비")
@@ -5467,6 +5470,7 @@ def write_mcp_setup_bundle_zip(
                         if progress_callback is not None:
                             progress_callback(bytes_written, total_bytes, arcname)
         with zipfile.ZipFile(temporary_zip_path, "r") as completed_archive:
+            validate_bundle_archive_sizes((entry.filename, entry.file_size) for entry in completed_archive.infolist())
             if completed_archive.testzip() is not None:
                 raise ValueError("Generated MCP setup ZIP failed its integrity check.")
         os.replace(temporary_zip_path, zip_path)
@@ -10377,6 +10381,23 @@ def _powershell_stdio_launcher_script(
             '  # Do not capture this function call in an assignment. Windows PowerShell 5.1',
             '  # buffers native stdout until the function returns, which deadlocks MCP stdio.',
             '  Invoke-RecordedRuntimeServer $RecordedRuntimePython $ServerArgs',
+            '}',
+            '# Only an explicitly selected interpreter/source pair may override source discovery.',
+            '# A broken explicit pair must not silently fall back to an older installed package.',
+            'if ($env:REG_RAG_PYTHON_PROJECT_ROOT) {',
+            '  $ExplicitRoot = [string]$env:REG_RAG_PYTHON_PROJECT_ROOT',
+            '  if (-not $env:REG_RAG_PYTHON -or -not [System.IO.Path]::IsPathRooted($ExplicitRoot) -or -not (Test-Path -LiteralPath $ExplicitRoot -PathType Container)) {',
+            '    throw "Explicit source runtime requires REG_RAG_PYTHON and an absolute existing REG_RAG_PYTHON_PROJECT_ROOT."',
+            '  }',
+            '  $ExplicitRoot = (Resolve-Path -LiteralPath $ExplicitRoot).Path',
+            '  if (-not (Test-Path -LiteralPath (Join-Path $ExplicitRoot "pyproject.toml") -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $ExplicitRoot "scripts\\run_regulation_mcp.py") -PathType Leaf)) {',
+            '    throw "Explicit source runtime is missing pyproject.toml or scripts\\run_regulation_mcp.py."',
+            '  }',
+            '  if (-not (Test-McpPython $env:REG_RAG_PYTHON "explicit source runtime" $ExplicitRoot)) { throw "Explicit source runtime failed its Python/import probe; refusing packaged fallback." }',
+            '  $env:PYTHONPATH = $ExplicitRoot',
+            '  $env:PYTHONSAFEPATH = "1"',
+            '  & $script:ValidatedMcpPython -m scripts.run_regulation_mcp @ServerArgs',
+            '  exit $LASTEXITCODE',
             '}',
             '$ProjectRoot = Find-ProjectRoot',
             'if (-not $ProjectRoot -and $PreferredProjectRoot) {',

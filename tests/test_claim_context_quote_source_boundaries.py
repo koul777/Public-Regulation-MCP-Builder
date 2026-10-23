@@ -37,7 +37,7 @@ class _Runtime:
 
     def generate_json(self, **kwargs):
         self.calls += 1
-        return {"findings": [{"claim_id": "C1", "supported": True, "evidence_context_ids": ["E1"],
+        return {"answer_supported": True, "findings": [{"claim_id": "C1", "supported": True, "evidence_context_ids": ["E1"],
                               "support_quote": self.quote}]}, SimpleNamespace(duration_ms=1.0)
 
 
@@ -229,6 +229,80 @@ class SourceSpanContractTests(unittest.TestCase):
         span = context.items[0].source_body_spans[2]
         self.assertEqual(third, context.items[0].text[span.start:span.end])
         self.assertEqual("verified", _audit(context, third)[0].status)
+
+
+from dataclasses import replace
+from app.agents.claim_auditor import (
+    _audit_quote_candidates, _validated_quote_map, _AuditQuote, _bind_model_audit, _ModelAuditDraft,
+)
+
+
+class CatalogSpanTests(unittest.TestCase):
+    def test_every_neutralization_clip_boundary_excludes_marker_from_catalog(self):
+        marker = "[모델 제어 토큰 제거]"
+        adjacent = "Approved adjacent source sentence. "
+        for cut in range(0, len(marker) + 3):
+            with self.subTest(cut=cut):
+                prefix = adjacent + "a" * (482 - cut - len(adjacent))
+                context = _context(prefix + "<|system|> \t" + "tail" * 200, budget=500)
+                candidates = _audit_quote_candidates(context, {"E1"})
+                self.assertTrue(candidates)
+                self.assertTrue(all(entry.end <= len(prefix) for entry in candidates))
+                self.assertEqual(len(candidates), len(_validated_quote_map(context, candidates)))
+
+    def test_catalog_preserves_both_original_overlap_bodies(self):
+        first, second, _ = _overlap()
+        context = _context(first, second)
+        candidates = _audit_quote_candidates(context, {"E1"})
+        self.assertEqual([first, second], [entry.text for entry in candidates])
+        self.assertEqual(2, len(_validated_quote_map(context, candidates)))
+
+    def test_overlapping_bridge_offset_candidate_rejected(self):
+        context = _context(*_overlap()[:2])
+        item = context.items[0]
+        bridge = _AuditQuote("E1Q1", "E1", 0, len(item.text), item.text)
+        with self.assertRaises(ValueError):
+            _validated_quote_map(context, (bridge,))
+
+    def test_natural_paragraph_and_all_blankline_forms_stay_selectable(self):
+        for separator in ("\n\n", "\r\n\r\n", "\n\u00a0\n"):
+            context = _context("First source." + separator + "Second source.")
+            candidates = _audit_quote_candidates(context, {"E1"})
+            self.assertEqual(context.items[0].text, candidates[0].text)
+            self.assertEqual(1, len(_validated_quote_map(context, candidates)))
+
+    def test_legacy_blanklines_remain_conservative(self):
+        context = _context("First source.\n\nSecond source.")
+        context = context.model_copy(update={"items": (context.items[0].model_copy(update={"source_body_spans": None}),)})
+        self.assertEqual(["First source.", "Second source."],
+                         [entry.text for entry in _audit_quote_candidates(context, {"E1"})])
+
+    def test_contained_bodies_add_no_redundant_windows(self):
+        body = "Prefix. Approved source sentence. Suffix."
+        context = _context(body, "Approved source sentence.")
+        self.assertEqual([body], [entry.text for entry in _audit_quote_candidates(context, {"E1"})])
+
+    def test_unchanged_slice_and_strict_position_checks_remain(self):
+        context = _context("Approved source sentence.")
+        entry = _audit_quote_candidates(context, {"E1"})[0]
+        for bad in (replace(entry, start=True), replace(entry, text="Changed source sentence."),
+                    replace(entry, quote_id="E2Q1"), replace(entry, end=999)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                _validated_quote_map(context, (bad,))
+
+    def test_production_quote_id_binder_accepts_right_body_and_rejects_bridge(self):
+        first, second, _ = _overlap()
+        context = _context(first, second)
+        candidates = _audit_quote_candidates(context, {"E1"})
+        draft = GroundedAnswerDraft(answer="Synthetic claim. [E1]", answer_mode="grounded_local",
+            claims=(AnswerClaim(claim_id="C1", text="Synthetic claim.", evidence_context_ids=("E1",)),))
+        verdict = _ModelAuditDraft.model_validate({"answer_supported": True,
+            "findings": [{"claim_id": "C1", "supported": True, "evidence_context_ids": ["E1"],
+                          "support_quote_id": candidates[1].quote_id}]})
+        self.assertEqual("verified", _bind_model_audit(draft, context, verdict, 0, quote_candidates=candidates).status)
+        item = context.items[0]
+        bridge = _AuditQuote(candidates[1].quote_id, "E1", 0, len(item.text), item.text)
+        self.assertNotEqual("verified", _bind_model_audit(draft, context, verdict, 0, quote_candidates=(bridge,)).status)
 
 
 if __name__ == "__main__":
