@@ -20,6 +20,12 @@ WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py")
 KORDOC_ERROR_CODE_MAX_LENGTH = 64
 KORDOC_ERROR_CODE_FALLBACK = "kordoc_conversion_failed"
 KORDOC_ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# Kordoc 4.17+ unwraps borderless layout tables into paragraphs by default.
+# Table matching and approved table evidence expect the source table grid.
+KORDOC_KEEP_LAYOUT_TABLES_FLAG = "--keep-layout-tables"
+# Kordoc 4.17+ wraps footnote references such as "1)" in <sup>. Keep the
+# reference text so cells still match the native parser's plain text.
+KORDOC_INLINE_SCRIPT_TAG_PATTERN = re.compile(r"</?su[bp]>", re.IGNORECASE)
 
 
 class KordocTableParser:
@@ -79,15 +85,15 @@ class KordocTableParser:
                     # free of host-specific filesystem details.
                     "error": "ascii_temp_unavailable",
                 })
-        argv = [resolved, *parts[1:], str(run_path), "--format", "json", "--silent"]
-        # Windows npm shims need an explicit shell host when launched from
-        # subprocess with argv-list form.
-        if _is_windows() and resolved.lower().endswith(".ps1"):
-            argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
-        elif _is_windows() and resolved.lower().endswith((".cmd", ".bat")):
-            argv = ["cmd", "/c", *argv]
-        try:
-            completed = subprocess.run(
+        def run_kordoc(layout_flags: list[str]) -> subprocess.CompletedProcess:
+            argv = [resolved, *parts[1:], *layout_flags, str(run_path), "--format", "json", "--silent"]
+            # Windows npm shims need an explicit shell host when launched from
+            # subprocess with argv-list form.
+            if _is_windows() and resolved.lower().endswith(".ps1"):
+                argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
+            elif _is_windows() and resolved.lower().endswith((".cmd", ".bat")):
+                argv = ["cmd", "/c", *argv]
+            return subprocess.run(
                 argv,
                 check=False,
                 capture_output=True,
@@ -97,16 +103,22 @@ class KordocTableParser:
                 timeout=timeout_seconds,
                 **hidden_window_options(),
             )
+
+        layout_tables = "keep"
+        try:
+            completed = run_kordoc([KORDOC_KEEP_LAYOUT_TABLES_FLAG])
+            if _rejected_keep_layout_tables_flag(completed):
+                # Kordoc before 4.17 has no such option, and its default output
+                # already keeps layout tables.
+                layout_tables = "legacy_default"
+                completed = run_kordoc([])
         except subprocess.TimeoutExpired:
-            if temp_dir is not None:
-                temp_dir.cleanup()
             return finish({"status": "timeout", "parser": "kordoc", "table_count": 0, "tables": []})
         except OSError:
+            return finish({"status": "failed", "parser": "kordoc", "table_count": 0, "tables": []})
+        finally:
             if temp_dir is not None:
                 temp_dir.cleanup()
-            return finish({"status": "failed", "parser": "kordoc", "table_count": 0, "tables": []})
-        if temp_dir is not None:
-            temp_dir.cleanup()
         if completed.returncode != 0:
             try:
                 failure_payload = _load_json_payload(completed.stdout or "")
@@ -136,6 +148,7 @@ class KordocTableParser:
             return finish(failure_result)
         max_tables = max(1, int(getattr(self.settings, "kordoc_table_max_tables", 500)))
         result = extract_kordoc_table_inventory(payload, max_tables=max_tables)
+        result["kordoc_layout_tables"] = layout_tables
         if copied_to_ascii_path:
             result["input_path_normalized_for_kordoc"] = True
         return finish(result)
@@ -373,6 +386,13 @@ def _kordoc_failure_result(payload: Any) -> dict[str, Any] | None:
         "tables": [],
         "error_code": _safe_kordoc_error_code(payload.get("code")),
     }
+
+
+def _rejected_keep_layout_tables_flag(completed: subprocess.CompletedProcess) -> bool:
+    if completed.returncode == 0:
+        return False
+    stderr = str(completed.stderr or "")
+    return "unknown option" in stderr.casefold() and KORDOC_KEEP_LAYOUT_TABLES_FLAG in stderr
 
 
 def _safe_kordoc_error_code(value: Any) -> str:
@@ -654,6 +674,10 @@ def _rows_from_matrix_cells(rows: list[list[Any]]) -> list[dict[str, Any]]:
 
 
 def _cell_text(cell: Any) -> str:
+    return KORDOC_INLINE_SCRIPT_TAG_PATTERN.sub("", _raw_cell_text(cell))
+
+
+def _raw_cell_text(cell: Any) -> str:
     if isinstance(cell, dict):
         for key in ("text", "value", "content", "markdown"):
             if cell.get(key) is not None:

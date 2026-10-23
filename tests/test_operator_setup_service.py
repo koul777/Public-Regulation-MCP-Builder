@@ -46,4 +46,4 @@ class OperatorSetupServiceTests(unittest.TestCase):
         self.assertNotEqual(timeout, missing)
         self.assertNotIn("synthetic-secret", str(kordoc_installer_guidance("synthetic-secret")))
         self.assertIn("PATH", kordoc_installer_guidance("installer_command_mismatch")[1])
-        self.assertIn("4.16.0", kordoc_installer_guidance("installer_version_mismatch")[0])
+        self.assertIn("4.24.1", kordoc_installer_guidance("installer_version_mismatch")[0])

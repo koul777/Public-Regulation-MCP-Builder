@@ -669,13 +669,13 @@ class PackagingEntrypointTests(unittest.TestCase):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
         self.assertIn("Get-Command npm", installer)
-        self.assertIn('$KordocPackage = "kordoc@4.16.0"', installer)
+        self.assertIn('$KordocPackage = "kordoc@4.24.1"', installer)
         self.assertIn("install -g $KordocPackage", installer)
         self.assertIn("npm prefix -g", installer)
         self.assertIn('Join-Path $npmGlobal "kordoc.cmd"', installer)
         self.assertIn("Get-Command kordoc -CommandType Application", installer)
         self.assertIn("& $kordocShim --version", installer)
-        self.assertIn("$Matches[1] -ne '4.16.0'", installer)
+        self.assertIn("$Matches[1] -ne '4.24.1'", installer)
         self.assertIn("재처리 -> 사람 승인 -> 승인하고 색인", installer)
         self.assertIn("recursive-include packaging *.py *.spec *.txt *.ps1", manifest)
         self.assertEqual(
@@ -703,7 +703,7 @@ class PackagingEntrypointTests(unittest.TestCase):
                     timeout=15, creationflags=subprocess.CREATE_NO_WINDOW,
                 )
 
-            shim.write_text('@echo off\r\necho 4.16.0\r\n', encoding="ascii")
+            shim.write_text('@echo off\r\necho 4.24.1\r\n', encoding="ascii")
             first = verify()
             self.assertEqual(0, first.returncode, first.stderr)
             self.assertIn("Kordoc 준비 완료", first.stdout)

@@ -241,6 +241,104 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(result["kordoc_timeout_seconds"], 10)
         self.assertGreaterEqual(result["kordoc_elapsed_ms"], 0)
 
+    def test_parse_file_requests_source_layout_table_grid(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"blocks": []}), stderr="")
+
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run
+        ):
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-5:], ["--keep-layout-tables", "sample.hwp", "--format", "json", "--silent"])
+        self.assertEqual(result["kordoc_layout_tables"], "keep")
+
+    def test_parse_file_retries_without_layout_flag_for_kordoc_before_4_17(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        payload = {"blocks": [{"type": "table", "rows": [{"cells": [{"text": "구분"}, {"text": "기준"}]}]}]}
+        responses = [
+            SimpleNamespace(returncode=1, stdout="", stderr="error: unknown option '--keep-layout-tables'\n"),
+            SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
+        ]
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return responses[len(calls) - 1]
+
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run
+        ):
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--keep-layout-tables", calls[0])
+        self.assertNotIn("--keep-layout-tables", calls[1])
+        self.assertEqual(calls[1][-4:], ["sample.hwp", "--format", "json", "--silent"])
+        self.assertEqual(result["status"], "parsed")
+        self.assertEqual(result["table_count"], 1)
+        self.assertEqual(result["kordoc_layout_tables"], "legacy_default")
+
+    def test_parse_file_does_not_retry_other_kordoc_failures(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run",
+            return_value=SimpleNamespace(returncode=1, stdout="", stderr="conversion failed"),
+        ) as run:
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(result["status"], "failed")
+
+    def test_footnote_superscript_markup_is_removed_from_cells(self) -> None:
+        payload = {
+            "blocks": [
+                {
+                    "type": "table",
+                    "table": {
+                        "rows": 2,
+                        "cols": 2,
+                        "cells": [
+                            [{"text": "구분"}, {"text": "자격"}],
+                            [{"text": "5급"}, {"text": "정사서 자격요건<sup>1)</sup>, H<SUB>2</SUB>O"}],
+                        ],
+                    },
+                }
+            ]
+        }
+
+        table = extract_kordoc_table_inventory(payload)["tables"][0]
+
+        self.assertEqual(table["cell_rows"][1]["cells"], ["5급", "정사서 자격요건1), H2O"])
+        self.assertNotIn("<sup>", table["markdown"])
+        self.assertNotIn("<SUB>", table["markdown"])
+
     def test_parse_file_copies_non_ascii_input_path_before_running_kordoc(self) -> None:
         from types import SimpleNamespace
 
