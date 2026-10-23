@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,8 @@ from app.core.config import Settings
 from app.core.security_primitives import AuthContext
 from app.ingestion.vector_adapter import stable_content_hash
 from app.mcp_server import regulation_tools as mcp
+from app.processors.answer_profile import append_answer_profile_to_retrieval_text
+from app.processors.chunker import Chunker
 from app.services import approved_source_witness as witnesses
 
 
@@ -79,6 +82,28 @@ class McpSourceBodyWitnessTests(unittest.TestCase):
         connector = mcp.chatgpt_data_fetch_output(mcp._mcp_fetch_result(public))
         self.assertEqual("", connector.text)
         self.assertEqual("unavailable", connector.metadata["source_text_status"])
+
+    def test_repository_body_absorbing_generated_annotations_is_not_published(self) -> None:
+        metadata = {**self.metadata, "answer_intents": ["duration"], "answer_keywords": ["Synthetic weekly"],
+                    "answer_facts": [{"type": "duration", "value": "Synthetic generated fact"}],
+                    "reference_edges": [{"type": "article", "value": "Synthetic article 9"}]}
+        text = Chunker()._retrieval_text("Synthetic rule", "Synthetic chapter", self.body)
+        text = append_answer_profile_to_retrieval_text(text, metadata)
+        holder = SimpleNamespace(retrieval_text=text)
+        Chunker()._append_reference_retrieval_text(holder, metadata["reference_edges"])
+        record = {**self.record, "text": holder.retrieval_text, "metadata": metadata,
+                  "content_hash": stable_content_hash(holder.retrieval_text, metadata)}
+        self.assertEqual(self.body, self._resolve(record).text)
+        tampered = holder.retrieval_text.split("[본문]\n", 1)[1]
+        self._write([{**self.row, "normalized_text": tampered}])
+        public = mcp._public_mcp_record(record, 1.0, settings=self.settings, auth=self.auth)
+        for output in (mcp._mcp_search_result(public), mcp._mcp_fetch_result(public)):
+            self.assertEqual("", output["text"])
+            self.assertEqual("", output["verbatim_text"])
+            self.assertEqual("", output["verbatim"]["text"])
+            self.assertEqual("unavailable", output["metadata"]["source_text_status"])
+            for marker in ("[답변분류]", "[참조]"):
+                self.assertNotIn(marker, json.dumps(output, ensure_ascii=False))
 
     def test_table_review_flags_keep_native_types_and_connector_string_contract(self) -> None:
         metadata = {**self.record["metadata"], "table_like": True, "table_review_required": True,
