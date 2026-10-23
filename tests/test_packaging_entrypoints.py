@@ -232,6 +232,28 @@ class PackagingEntrypointTests(unittest.TestCase):
         )
         self.assertIn('@("--qwen-chat", "--help")', build_script)
 
+    def test_portable_probe_failure_keeps_self_check_json_when_stderr_is_empty(self) -> None:
+        build_script = (ROOT / "scripts" / "build_windows_portable.ps1").read_text(encoding="utf-8-sig")
+        probe = build_script[
+            build_script.index("function Invoke-PortableExecutableProbe")
+            : build_script.index("function Write-PortableArtifactBinding")
+        ]
+
+        # A [string] cast of Get-Content's empty result can stay null on
+        # Windows PowerShell 5.1 and hide the real self-check failure.
+        self.assertNotIn("([string]$StderrText).Trim()", probe)
+        self.assertIn('$FailureDetail = "$StderrText".Trim()', probe)
+        self.assertIn('$FailureDetail = "$StdoutText".Trim()', probe)
+        self.assertLess(
+            probe.index('"$StderrText".Trim()'),
+            probe.index('"$StdoutText".Trim()'),
+        )
+
+    def test_portable_build_keeps_pymupdf_below_major_version_two(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertIn('"pymupdf>=1.24,<2"', pyproject)
+
     def test_portable_self_check_exercises_pymupdf_and_pdf_parser_without_runtime_setup(
         self,
     ) -> None:

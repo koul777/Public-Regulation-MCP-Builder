@@ -293,7 +293,13 @@ function Invoke-PortableExecutableProbe {
             Get-Content -LiteralPath $ProbeStderr -Raw
         } else { "" }
         if ($ProbeProcess.ExitCode -ne 0) {
-            $FailureDetail = ([string]$StderrText).Trim()
+            # Get-Content -Raw yields AutomationNull for an empty file, which a
+            # [string] cast does not turn into "" on Windows PowerShell 5.1.
+            # The self-check reports its failure JSON on stdout, so keep it.
+            $FailureDetail = "$StderrText".Trim()
+            if ([string]::IsNullOrWhiteSpace($FailureDetail)) {
+                $FailureDetail = "$StdoutText".Trim()
+            }
             if ([string]::IsNullOrWhiteSpace($FailureDetail)) {
                 throw "Executable $ProbeName probe failed with exit code $($ProbeProcess.ExitCode)."
             }
