@@ -12,7 +12,7 @@ from unittest.mock import patch
 from app.ingestion.vector_adapter import stable_content_hash
 from app.processors.answer_profile import append_answer_profile_to_retrieval_text
 from app.processors.chunker import Chunker
-from app.services.approved_source_text import SourceText, source_text_from_verified_record
+from app.services.approved_source_text import SOURCE_UNAVAILABLE, SourceText, source_text_from_verified_record
 from app.services import regulation_rag_runtime as runtime
 
 
@@ -94,15 +94,34 @@ class ApprovedSourceTextTests(unittest.TestCase):
         self.assertEqual(body, result.text)
         self.assertEqual("unavailable", source_text_from_verified_record(record, body_witness=body, table_witness="잘못된 표").status)
 
-    def test_literal_body_markers_and_terminal_suffix_are_not_stripped(self) -> None:
+    def test_literal_body_markers_are_not_stripped(self) -> None:
+        body = "제7조\n[표]\n이 표기는 원문이다.\n[본문]\n계속되는 본문"
+        self.assertEqual(body, source_text_from_verified_record(self.record(body), body_witness=body).text)
+
+    def test_body_with_generated_suffix_marker_is_ambiguous_and_unavailable(self) -> None:
+        # These stored strings are identical to a "제7조" body whose generated
+        # profile or reference lines were moved into the repository body.
         for body in (
-            "제7조\n[표]\n이 표기는 원문이다.\n[본문]\n계속되는 본문",
             "제7조\n[답변분류]\n의도: payment\n키워드: 지급\n- payment: 100원",
             "제7조\n[참조]\n- 조문: 제8조",
         ):
             with self.subTest(body=body):
                 record = self.record(body)
-                self.assertEqual(body, source_text_from_verified_record(record, body_witness=body).text)
+                self.assertEqual(SOURCE_UNAVAILABLE, source_text_from_verified_record(record, body_witness=body))
+
+    def test_witness_absorbing_generated_suffixes_is_unavailable(self) -> None:
+        body = "제7조 지급 기준\n8시간 이내에는 100원을 지급한다."
+        record = self.record(body)
+        stored_after_body_marker = record["text"].split("[본문]\n", 1)[1]
+        profile_only = stored_after_body_marker.split("\n[참조]\n", 1)[0]
+        self.assertIn("[답변분류]", stored_after_body_marker)
+        self.assertIn("[참조]", stored_after_body_marker)
+        for witness in (stored_after_body_marker, profile_only):
+            with self.subTest(witness=witness[-20:]):
+                result = source_text_from_verified_record(record, body_witness=witness, expected_tenant_id="tenant-a")
+                self.assertEqual(SOURCE_UNAVAILABLE, result)
+        self.assertEqual(SourceText(body, "verified_reconstruction"),
+                         source_text_from_verified_record(record, body_witness=body, expected_tenant_id="tenant-a"))
 
     def test_unknown_augmented_format_and_missing_witness_fail_closed(self) -> None:
         self.assertEqual("unavailable", source_text_from_verified_record(self.record()).status)

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from app.ingestion.vector_adapter import stable_content_hash
-from app.processors.answer_profile import append_answer_profile_to_retrieval_text
+from app.processors.answer_profile import ANSWER_PROFILE_MARKER, append_answer_profile_to_retrieval_text
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,9 @@ class SourceText:
 
 SOURCE_UNAVAILABLE = SourceText("", "unavailable")
 _AUGMENTATION_PREFIXES = ("[문서명]", "[위치]", "[본문]", "[답변분류]", "[참조]")
+# Generated suffix markers. Each suffix helper skips its marker when it is
+# already present, so reconstruction must never feed them one.
+_DERIVED_SUFFIX_MARKERS = (ANSWER_PROFILE_MARKER, "[참조]")
 
 
 def looks_like_augmented_text(text: str) -> bool:
@@ -74,6 +77,9 @@ def source_text_from_verified_record(
     metadata. Neither a source_text flag nor repository metadata can replace
     those fields. No whitespace-normalized comparison or marker splitting is
     used. Unknown formats and failed witnesses are unavailable for citation.
+    A witness that contains a generated suffix marker is also unavailable:
+    the idempotent suffix helpers would otherwise let it carry the answer
+    profile or reference lines and still rebuild the record exactly.
     """
     metadata = record.get("metadata")
     text = record.get("text")
@@ -111,6 +117,8 @@ def source_text_from_verified_record(
             rebuilt = f"[문서명] {title}\n[위치] {path}\n[본문]\n{body_witness}"
             if table:
                 rebuilt += f"\n[표]\n{table}"
+            if any(marker in rebuilt for marker in _DERIVED_SUFFIX_MARKERS):
+                return SOURCE_UNAVAILABLE
             try:
                 rebuilt = append_answer_profile_to_retrieval_text(rebuilt, metadata)
                 rebuilt = _reference_text(rebuilt, metadata)
