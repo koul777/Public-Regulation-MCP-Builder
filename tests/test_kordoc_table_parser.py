@@ -316,6 +316,55 @@ class KordocTableParserTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(result["status"], "failed")
 
+    def test_legacy_retry_uses_only_the_remaining_timeout_budget(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        responses = [
+            SimpleNamespace(returncode=1, stdout="", stderr="error: unknown option '--keep-layout-tables'"),
+            SimpleNamespace(returncode=0, stdout=json.dumps({"blocks": []}), stderr=""),
+        ]
+        timeouts: list[float] = []
+
+        def fake_run(argv, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            return responses[len(timeouts) - 1]
+
+        # Deadline at 100 + 4; the first run starts at 100, the retry at 103.5.
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run", side_effect=fake_run
+        ), patch("app.processors.kordoc_table_parser.time.monotonic", side_effect=[100.0, 100.0, 103.5]):
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(result["status"], "parsed")
+        self.assertEqual(timeouts, [4.0, 0.5])
+
+    def test_legacy_retry_times_out_when_the_budget_is_spent(self) -> None:
+        from types import SimpleNamespace
+
+        settings = Settings(
+            data_dir=Path("data"),
+            enable_kordoc_table_parser=True,
+            kordoc_table_command="kordoc",
+            kordoc_table_timeout_seconds=4,
+        )
+        with patch("app.processors.kordoc_table_parser.shutil.which", return_value="kordoc"), patch(
+            "app.processors.kordoc_table_parser.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="error: unknown option '--keep-layout-tables'"
+            ),
+        ) as run, patch("app.processors.kordoc_table_parser.time.monotonic", side_effect=[100.0, 100.0, 104.0]):
+            result = KordocTableParser(settings).parse_file(Path("sample.hwp"))
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["kordoc_timeout_seconds"], 4)
+
     def test_footnote_superscript_markup_is_removed_from_cells(self) -> None:
         payload = {
             "blocks": [

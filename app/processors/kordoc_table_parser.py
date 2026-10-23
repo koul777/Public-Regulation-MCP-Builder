@@ -85,6 +85,9 @@ class KordocTableParser:
                     # free of host-specific filesystem details.
                     "error": "ascii_temp_unavailable",
                 })
+        # The legacy retry shares one budget so the reported timeout holds.
+        deadline = time.monotonic() + timeout_seconds
+
         def run_kordoc(layout_flags: list[str]) -> subprocess.CompletedProcess:
             argv = [resolved, *parts[1:], *layout_flags, str(run_path), "--format", "json", "--silent"]
             # Windows npm shims need an explicit shell host when launched from
@@ -93,6 +96,9 @@ class KordocTableParser:
                 argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
             elif _is_windows() and resolved.lower().endswith((".cmd", ".bat")):
                 argv = ["cmd", "/c", *argv]
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
             return subprocess.run(
                 argv,
                 check=False,
@@ -100,7 +106,7 @@ class KordocTableParser:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout_seconds,
+                timeout=remaining_seconds,
                 **hidden_window_options(),
             )
 
