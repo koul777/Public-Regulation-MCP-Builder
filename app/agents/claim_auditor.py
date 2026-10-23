@@ -27,10 +27,20 @@ _MAX_ANSWER_SENTENCES = 24
 # A period between digits ("2018. 8. 31.") does not end a sentence.
 _SENTENCE_SPLIT = re.compile(r"\n+|(?<=[!?。．？！…])\s+|(?<=[^\d]\.)\s+|(?<=\d\.)\s+(?![\s\d])")
 _MARKER_PATTERN = re.compile(r"\[E\d+\]")
-_NUMBER_TOKEN_PATTERN = re.compile(r"\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)*")
+# A number keeps its decimal part after a thousands separator (1,000.5) and its
+# magnitude syllables (10만), so 1,000.5 is not 1,000 and 10만 is not 10.
+_NUMBER_TOKEN_PATTERN = re.compile(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)*[백천만억]*")
 _THOUSANDS_SEPARATOR = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 _DOTTED_DATE_PATTERN = re.compile(r"(?<!\d)(\d{2,4})\.\s+(\d{1,2})\.\s+(\d{1,2})(?!\d)")
-_UNIT_PATTERN = re.compile(r"[가-힣A-Za-z%]")
+# A unit is compared whole: a Latin run (meters is not miles, mm is not m; a trailing
+# 2 or 3 keeps NFKC ㎡ apart from m), % or a degree sign, and a listed longer Hangul
+# unit before its first syllable (개월 is not 개, 시간 is not 시). Other Hangul
+# units are one syllable, so a particle after the unit (7일간, 7일 이내) still matches.
+_UNIT_PATTERN = re.compile(
+    r"[A-Za-z]+(?:[23](?!\d))?|%|°[A-Za-z]?"
+    r"|개월|개년|개소|시간|분기|호봉|주년|학년|학기|세대|등급|차례|회차|번째"
+    r"|(?:킬로|밀리|센티)(?:미터|그램|리터)|[가-힣]"
+)
 _ARTICLE_REFERENCE_PATTERN = re.compile(r"제\s*(\d+)\s*조(?:\s*의\s*(\d+))?")
 _CIRCLED_NUMBERS = {chr(0x2460 + index): f"제{index + 1}항 " for index in range(20)}
 _CIRCLED_PATTERN = re.compile("[" + "".join(_CIRCLED_NUMBERS) + "]")
@@ -406,6 +416,11 @@ def _bind_model_audit(
         verified.append(claim.claim_id)
         for item in matching_items:
             citations.append(_exact_citation(item, quote if item.context_id == quote_item.context_id else ""))
+    # Citations come from claim findings only. Every evidence marked in the answer, which
+    # includes each sentence's support quote evidence, must be among them before the
+    # answer can be verified; otherwise a marked sentence would lose its citation.
+    if not rejected and cited_ids - {citation.context_id for citation in citations}:
+        return _audit_review_required(draft, "answer_evidence_not_cited", duration_ms)
     # Separate claims can select different exact spans in the same evidence.
     # Keep each span so a later claim cannot erase an earlier claim's quote.
     unique_citations = {(citation.context_id, citation.support_quote): citation for citation in citations}
@@ -503,7 +518,7 @@ def _cited_evidence_view(cited: list[ContextEvidence]) -> str:
 
 
 def _number_unit_pairs(value: str) -> list[tuple[str, str]]:
-    """Numbers with their unit: the next non-space character when it is Hangul, a Latin letter or %."""
+    """Numbers with their unit: the _UNIT_PATTERN match after any spaces that follow the number."""
     # The branch of "제3조의2" is an article number, whatever particle follows it.
     branches = {match.start(2) for match in _ARTICLE_REFERENCE_PATTERN.finditer(value) if match.group(2)}
     pairs = []
@@ -511,8 +526,8 @@ def _number_unit_pairs(value: str) -> list[tuple[str, str]]:
         end = match.end()
         while end < len(value) and value[end].isspace():
             end += 1
-        following = value[end:end + 1]
-        unit = "조" if match.start() in branches else following if _UNIT_PATTERN.fullmatch(following) else ""
+        following = _UNIT_PATTERN.match(value, end)
+        unit = "조" if match.start() in branches else following.group() if following else ""
         pairs.append((match.group().replace(",", ""), unit))
     return pairs
 

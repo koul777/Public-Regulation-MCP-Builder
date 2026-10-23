@@ -1076,5 +1076,130 @@ class SyntheticMarkerEvidenceTests(unittest.TestCase):
                 self.assertEqual("answer_sentence_terms_not_in_evidence", result.reason_code)
 
 
+class NumberValueAndUnitIdentityTests(unittest.TestCase):
+    """A number keeps its decimal part, magnitude and whole unit through the number gate."""
+
+    def _assert_number_gate_rejects(self, result, runtime) -> None:
+        self.assertEqual(("rejected", "answer_number_not_in_evidence"), (result.status, result.reason_code))
+        self.assertEqual("deterministic_gate", result.audit_mode)
+        self.assertEqual((), result.citations)
+        self.assertEqual(0, runtime.calls)
+
+    def test_decimal_after_thousands_separator_stays_part_of_the_number(self) -> None:
+        english = "The monthly travel allowance amount is 1,000.5 won."
+        runtime = _Runtime([_finding()])
+        result = ClaimAuditAgent(runtime).audit(
+            draft=_single_claim_draft("The monthly travel allowance amount is 1,000 won. [E1]", english),
+            context=_context(english))
+        self._assert_number_gate_rejects(result, runtime)
+        for answer, text in (("건물 연면적은 12,345㎡이다. [E1]", "건물 연면적은 12,345.6㎡이다."),
+                             ("출장 일비는 1,000원이다. [E1]", "출장 일비는 1,000.5원이다."),
+                             ("출장 일비는 1000원이다. [E1]", "출장 일비 기준표\n일비 1,000.5")):
+            with self.subTest(answer=answer, text=text):
+                self._assert_number_gate_rejects(*_ko_audit(answer, text))
+        runtime = _Runtime([_finding()])
+        same = ClaimAuditAgent(runtime).audit(
+            draft=_single_claim_draft("The monthly travel allowance amount is 1,000.5 won. [E1]", english),
+            context=_context(english))
+        self.assertEqual("verified", same.status)
+        self.assertEqual(1, runtime.calls)
+        result, runtime = _ko_audit("건물 연면적은 12345.6㎡이다. [E1]", "건물 연면적은 12,345.6㎡이다.")
+        self.assertEqual("verified", result.status)
+        self.assertEqual(1, runtime.calls)
+
+    def test_units_sharing_a_first_letter_or_syllable_do_not_match(self) -> None:
+        english = "The distance limit is 10 meters."
+        runtime = _Runtime([_finding()])
+        result = ClaimAuditAgent(runtime).audit(
+            draft=_single_claim_draft("The distance limit is 10 miles. [E1]", english), context=_context(english))
+        self._assert_number_gate_rejects(result, runtime)
+        for answer, text in (("포상금은 1인당 10만명 이내로 한다. [E1]", "포상금은 1인당 10만원 이내로 한다."),
+                             ("수습 기간은 6개로 한다. [E1]", "수습 기간은 6개월로 한다."),
+                             ("신청은 출장 2시 전까지 한다. [E1]", "신청은 출장 2시간 전까지 한다."),
+                             ("실적은 2분 이내에 보고한다. [E1]", "실적은 2분기 이내에 보고한다."),
+                             ("승급은 4호로 한다. [E1]", "승급은 4호봉으로 한다."),
+                             ("배수로 폭은 50m 이상으로 한다. [E1]", "배수로 폭은 50mm 이상으로 한다."),
+                             ("운송 한도는 5kg 이내로 한다. [E1]", "운송 한도는 5km 이내로 한다."),
+                             ("창고 기준은 100m 이상으로 한다. [E1]", "창고 기준은 100㎡ 이상으로 한다.")):
+            with self.subTest(answer=answer, text=text):
+                self._assert_number_gate_rejects(*_ko_audit(answer, text))
+        for answer, text in (("포상금은 1인당 10만 원 이내로 한다. [E1]", "포상금은 1인당 10만원 이내로 한다."),
+                             ("수습 기간은 6개월간이다. [E1]", "수습 기간은 6개월로 한다."),
+                             ("운송 한도는 5 km 이내로 한다. [E1]", "운송 한도는 5km 이내로 한다."),
+                             ("창고 기준은 100㎡ 이상으로 한다. [E1]", "창고 기준은 100㎡ 이상으로 한다.")):
+            with self.subTest(answer=answer, text=text):
+                result, runtime = _ko_audit(answer, text)
+                self.assertEqual("verified", result.status)
+                self.assertEqual(1, runtime.calls)
+
+    def test_number_unit_pairs_compare_value_magnitude_and_unit(self) -> None:
+        def outside(answer, evidence):
+            return _answer_has_number_outside_evidence(_gate_text(answer), _gate_text(evidence))
+
+        for answer, evidence in (("1,000원", "1,000.5원"), ("1000원", "1,000.5"), ("12,345㎡", "12,345.6㎡"),
+                                 ("10 miles", "10 meters"), ("10만명", "10만원"), ("10만 명", "10만원"),
+                                 ("2천명", "2천원"), ("10", "10만원"), ("10만원", "합계 10"),
+                                 ("100000원", "10만원"), ("6개", "6개월"),
+                                 ("2시", "2시간"), ("2분", "2분기"), ("4호", "4호봉"), ("2학기", "2학년"),
+                                 ("50m", "50mm"), ("5kg", "5km"), ("100m", "100㎡"), ("26%", "26℃")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.assertTrue(outside(answer, evidence))
+        for answer, evidence in (("1,000.5원", "1000.5원"), ("12345.6㎡", "12,345.6㎡"), ("10만 원", "10만원"),
+                                 ("5천만원", "5천만 원"), ("6개월간", "6개월"), ("1주일", "1주"), ("5 km", "5km"),
+                                 ("100㎡", "100 m²"), ("26℃", "26 ℃"), ("10만원", "합계 10만")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.assertFalse(outside(answer, evidence))
+
+
+class SentenceEvidenceCitationTests(unittest.TestCase):
+    """A verified answer cites every evidence its audited sentences rest on."""
+
+    sources = ("Annual leave lasts 5 days.", "Sick leave lasts 10 days.")
+    answer = "Annual leave lasts 5 days. [E1] Sick leave lasts 10 days. [E2]"
+    sentences = [{"sentence_id": "S1", "support_quote_id": "E1Q1", "supported": True},
+                 {"sentence_id": "S2", "support_quote_id": "E2Q1", "supported": True}]
+
+    def _results(self, claims, findings, answer=None, sentences=None):
+        context = _context(*self.sources)
+        sentences = self.sentences if sentences is None else sentences
+        draft = GroundedAnswerDraft(answer=answer or self.answer, answer_mode="grounded_local", claims=claims)
+        runtime = _Runtime(findings, sentences=sentences)
+        public = ClaimAuditAgent(runtime).audit(draft=draft, context=context)
+        direct = _bind_model_audit(draft, context, _model_draft(draft, context, findings, sentences=sentences), 1.0)
+        self.assertEqual(1, runtime.calls)
+        return public, direct
+
+    def test_sentence_evidence_missing_from_claim_citations_is_not_verified(self) -> None:
+        claims = (AnswerClaim(claim_id="C1", text="Annual leave lasts 5 days.",
+                              evidence_context_ids=("E1", "E2")),)
+        # The second case marks E2 on a sentence whose support quote comes from E1.
+        for answer, sentences in ((None, None),
+                                  ("Annual leave lasts 5 days. [E1] [E2]", self.sentences[:1])):
+            for value in self._results(claims, [_finding()], answer, sentences):
+                with self.subTest(answer=answer or self.answer):
+                    cited = {citation.context_id for citation in value.citations}
+                    self.assertFalse(value.status == "verified" and not {"E1", "E2"} <= cited,
+                                     "a verified answer lost the citation of a sentence's evidence")
+                    self.assertEqual("review_required", value.status)
+                    self.assertEqual("answer_evidence_not_cited", value.reason_code)
+                    self.assertEqual("local_model", value.audit_mode)
+                    self.assertEqual((), value.citations)
+                    self.assertEqual((), value.verified_claim_ids)
+
+    def test_every_sentence_evidence_cited_by_a_claim_stays_verified(self) -> None:
+        one_claim = (AnswerClaim(claim_id="C1", text="Annual leave lasts 5 days.",
+                                 evidence_context_ids=("E1", "E2")),)
+        two_claims = (AnswerClaim(claim_id="C1", text="Annual leave lasts 5 days.", evidence_context_ids=("E1",)),
+                      AnswerClaim(claim_id="C2", text="Sick leave lasts 10 days.", evidence_context_ids=("E2",)))
+        for claims, findings in (
+            (one_claim, [_finding(evidence_context_ids=["E1", "E2"])]),
+            (two_claims, [_finding(), _finding(claim_id="C2", evidence_context_ids=["E2"], support_quote_id="E2Q1")]),
+        ):
+            with self.subTest(claims=len(claims)):
+                for value in self._results(claims, findings):
+                    self.assertEqual("verified", value.status)
+                    self.assertEqual({"E1", "E2"}, {citation.context_id for citation in value.citations})
+
+
 if __name__ == "__main__":
     unittest.main()
