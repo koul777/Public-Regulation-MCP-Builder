@@ -5430,7 +5430,7 @@ $Parsed = (($Capture.Output | Out-String) | ConvertFrom-Json -ErrorAction Stop)
 
         self.assertTrue(hinted)
         self.assertEqual({pinned.group(1)}, set(hinted))
-        self.assertEqual("4.16.0", pinned.group(1))
+        self.assertEqual("4.24.1", pinned.group(1))
 
     def test_runtime_bundle_exports_only_selected_document_set(self) -> None:
         records = [

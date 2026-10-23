@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = "Stop"
 # Keep Korean status readable when Windows PowerShell output is redirected.
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$KordocPackage = "kordoc@4.16.0"
+$KordocPackage = "kordoc@4.24.1"
 
 function Fail-KordocSetup([string]$Message, [int]$ExitCode = 1) {
     [Console]::Error.WriteLine($Message)
@@ -20,7 +20,7 @@ if (-not $npm) {
 }
 
 if (-not $SkipInstall) {
-    Write-Host "검증된 Kordoc 4.16.0 고정 버전을 현재 사용자 환경에 전역 설치·업데이트합니다..."
+    Write-Host "검증된 Kordoc 4.24.1 고정 버전을 현재 사용자 환경에 전역 설치·업데이트합니다..."
     & $npm.Source install -g $KordocPackage
     if ($LASTEXITCODE -ne 0) {
         Fail-KordocSetup "npm install -g $KordocPackage가 실패했습니다. 위 npm 오류를 확인하세요."
@@ -58,8 +58,8 @@ if ($versionExitCode -ne 0) {
 }
 $versionOutput = $versionLines | Select-Object -First 1
 $actualVersion = ([string]$versionOutput).Trim()
-if ($actualVersion -notmatch '^(?:kordoc\s+)?v?(\d+\.\d+\.\d+)$' -or $Matches[1] -ne '4.16.0') {
-    Fail-KordocSetup "설치된 Kordoc 버전이 검증된 4.16.0과 다릅니다. 다시 설치한 뒤 확인하세요." 11
+if ($actualVersion -notmatch '^(?:kordoc\s+)?v?(\d+\.\d+\.\d+)$' -or $Matches[1] -ne '4.24.1') {
+    Fail-KordocSetup "설치된 Kordoc 버전이 검증된 4.24.1과 다릅니다. 다시 설치한 뒤 확인하세요." 11
 }
 if ($PersistUserPath) {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
