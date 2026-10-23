@@ -20,6 +20,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.report_metadata import current_repo_commit  # noqa: E402
+from scripts.mcp_bundle_contract import (  # noqa: E402
+    MAX_BUNDLE_ARCHIVE_ENTRIES,
+    MAX_BUNDLE_ARCHIVE_ENTRY_BYTES,
+    MAX_BUNDLE_ARCHIVE_TOTAL_BYTES,
+    validate_bundle_archive_sizes,
+)
 from scripts.generate_mcp_client_config import (  # noqa: E402
     OMISSION_DISPOSITION_SNAPSHOT_FILENAME,
     validate_mcp_runtime_data_bundle_integrity,
@@ -65,7 +71,15 @@ def run_mcp_bundle_zip_extract_smoke(
         part for part in (interpreter_bin, inherited_path) if part
     )
     child_env["REG_RAG_PYTHON"] = str(Path(sys.executable).resolve())
-    child_env["REG_RAG_PYTHON_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    if (PROJECT_ROOT / "pyproject.toml").is_file() and (PROJECT_ROOT / "scripts" / "run_regulation_mcp.py").is_file():
+        child_env["REG_RAG_PYTHON_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    else:
+        # Installed wheels live under site-packages, which is not a source
+        # checkout. Keep their selected interpreter independent of an inherited
+        # developer checkout instead of sending an invalid explicit source pair.
+        child_env.pop("REG_RAG_PYTHON_PROJECT_ROOT", None)
+        child_env.pop("PYTHONPATH", None)
+        child_env["PYTHONSAFEPATH"] = "1"
 
     required_console_scripts = (
         "reg-rag-mcp-client-config-smoke",
@@ -151,17 +165,20 @@ def _extract_archive_safely(
     archive_path: Path,
     destination: Path,
     *,
-    max_entries: int = 2048,
-    max_entry_bytes: int = 64 * 1024 * 1024,
-    max_total_bytes: int = 256 * 1024 * 1024,
+    max_entries: int = MAX_BUNDLE_ARCHIVE_ENTRIES,
+    max_entry_bytes: int = MAX_BUNDLE_ARCHIVE_ENTRY_BYTES,
+    max_total_bytes: int = MAX_BUNDLE_ARCHIVE_TOTAL_BYTES,
 ) -> None:
     """Extract only regular, bounded members into the requested directory."""
     destination = destination.resolve()
     with zipfile.ZipFile(archive_path) as archive:
         members = archive.infolist()
-        if len(members) > max_entries:
-            raise ValueError(f"Bundle archive has too many entries: {len(members)} > {max_entries}.")
-        total_bytes = 0
+        validate_bundle_archive_sizes(
+            ((member.filename, member.file_size) for member in members),
+            max_entries=max_entries,
+            max_entry_bytes=max_entry_bytes,
+            max_total_bytes=max_total_bytes,
+        )
         seen_targets: set[Path] = set()
         for member in members:
             posix_name = PurePosixPath(member.filename)
@@ -179,13 +196,6 @@ def _extract_archive_safely(
             mode = (member.external_attr >> 16) & 0o170000
             if stat.S_ISLNK(mode):
                 raise ValueError(f"Symlink bundle archive member is not allowed: {member.filename}")
-            if member.file_size > max_entry_bytes:
-                raise ValueError(
-                    f"Bundle archive member is too large: {member.filename} ({member.file_size} bytes)."
-                )
-            total_bytes += member.file_size
-            if total_bytes > max_total_bytes:
-                raise ValueError(f"Bundle archive exceeds the uncompressed size limit ({max_total_bytes} bytes).")
             target = (destination / Path(*posix_name.parts)).resolve()
             if target != destination and destination not in target.parents:
                 raise ValueError(f"Bundle archive member escapes extraction directory: {member.filename}")

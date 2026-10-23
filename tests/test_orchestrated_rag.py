@@ -1,15 +1,174 @@
 from __future__ import annotations
 
+import re
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.agents.claim_auditor import ClaimAuditResult, ClaimFinding, ExactCitation
-from app.agents.grounded_qa import AnswerClaim, GroundedAnswerDraft
+from app.agents.grounded_qa import TABLE_STRUCTURE_REVIEW_REASON, AnswerClaim, GroundedAnswerDraft
 from app.agents.query_agents import deterministic_query_rewrite
 from app.api import routes_rag
 from app.core.config import Settings
 from app.core.security import AuthContext
+from app.rag.context_builder import ContextBuilder, ContextEvidence, GroundingContext
+from scripts.evaluate_live_local_llm import score_case
+
+
+def _fallback_results() -> list[dict[str, object]]:
+    def record(chunk_id: str, article_no: str, text: str, score: float, content_hash: str) -> dict[str, object]:
+        item: dict[str, object] = {
+            "chunk_id": chunk_id,
+            "document_id": "doc-1",
+            "text": text,
+            "approval_status": "approved",
+            "approval_id": f"approval-{chunk_id[6:]}",
+            "regulation_title": "정보보안업무규정",
+            "regulation_version": "3.2",
+            "article_no": article_no,
+            "article_title": "접근통제",
+            "source_page_start": 14,
+            "source_page_end": 14,
+            "score": score,
+        }
+        if content_hash:
+            item["approved_content_hash"] = content_hash
+        return item
+
+    return [
+        record("chunk-1", "제2조", "제2조 접근권한은 분기마다 검토한다.", 0.9, "a" * 64),
+        record("chunk-1b", "제2조", "제2조 검토 결과는 기록한다.", 0.85, "c" * 64),
+        record("chunk-2", "제3조", "제3조 퇴직자 계정은 즉시 폐쇄한다.", 0.8, "b" * 64),
+        record("chunk-3", "제4조", "제4조 외부 접속은 승인을 받는다.", 0.7, ""),
+    ]
+
+
+def _rejected_audit() -> ClaimAuditResult:
+    return ClaimAuditResult(
+        status="rejected",
+        findings=(
+            ClaimFinding(
+                claim_id="C1",
+                status="unsupported",
+                evidence_context_ids=("E1",),
+                reason_code="not_entailed",
+            ),
+        ),
+        rejected_claim_ids=("C1",),
+        model="qwen3:4b",
+        audit_mode="local_model",
+        reason_code="unsupported_claims",
+    )
+
+
+def _verified_audit() -> ClaimAuditResult:
+    return ClaimAuditResult(
+        status="verified",
+        verified_claim_ids=("C1",),
+        citations=(
+            ExactCitation(
+                context_id="E1",
+                evidence_ids=("chunk-1",),
+                document_id="doc-1",
+                regulation_title="정보보안업무규정",
+                regulation_version="3.2",
+                article_no="제2조",
+                approval_ids=("approval-1",),
+                content_hashes=("a" * 64,),
+                support_quote="접근권한은 분기마다 검토한다.",
+            ),
+        ),
+        model="qwen3:4b",
+        audit_mode="local_model",
+    )
+
+
+def _model_draft() -> GroundedAnswerDraft:
+    return GroundedAnswerDraft(
+        answer="접근권한은 매달 검토합니다. [E1]",
+        claims=(
+            AnswerClaim(
+                claim_id="C1",
+                text="접근권한은 매달 검토합니다.",
+                evidence_context_ids=("E1",),
+            ),
+        ),
+        answer_mode="grounded_local",
+        model="qwen3:8b",
+    )
+
+
+def _answer_with_real_extractive_fallback():
+    """Return the model draft first and the real extractive draft for prefer_model=False."""
+
+    original = routes_rag.GroundedQwenAnswerAgent.answer
+
+    def answer(self, **kwargs):
+        if kwargs.get("prefer_model", True):
+            return _model_draft()
+        return original(self, **kwargs)
+
+    return answer
+
+
+def _run_rejected_audit_fallback(query: str, results: list[dict[str, object]]) -> dict[str, object]:
+    with patch(
+        "app.api.routes_rag.GroundedQwenAnswerAgent.answer",
+        new=_answer_with_real_extractive_fallback(),
+    ), patch("app.api.routes_rag.ClaimAuditAgent.audit", return_value=_rejected_audit()):
+        return routes_rag._orchestrated_chat_answer(
+            Settings(data_dir=Path("data"), rag_llm_endpoint="http://127.0.0.1:11434"),
+            query,
+            results,
+        )
+
+
+def _table_review_results() -> list[dict[str, object]]:
+    record = _fallback_results()[0]
+    record.update(
+        {"table_like": True, "table_review_required": True, "table_review_flags": ["unstable_column_count"]}
+    )
+    return [record]
+
+
+def _chat_through_route(
+    audit: ClaimAuditResult,
+    *,
+    role: str = "admin",
+    metadata_profile: str = "full",
+    results: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Call the public chat route with search and the two local models stubbed."""
+
+    visible_results = _fallback_results() if results is None else results
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = Settings(
+            data_dir=Path(tmp) / "data",
+            artifact_root=Path(tmp),
+            rag_llm_backend="ollama",
+            rag_llm_endpoint="http://127.0.0.1:11434",
+            rag_llm_model="qwen3:8b",
+            rag_trace_enabled=False,
+        )
+        auth = AuthContext(actor="tester", tenant_id="tenant-a", auth_mode="api_token", role=role)
+        search_trace = {"trace_id": "rag_search_test", "tenant_id": "tenant-a", "pipeline_trace": {"stages": []}}
+        with patch.object(routes_rag, "get_settings", return_value=settings), patch.object(
+            routes_rag, "local_llm_available", return_value=True
+        ), patch.object(
+            routes_rag, "search_rag_records", return_value=(visible_results, search_trace)
+        ), patch(
+            "app.api.routes_rag.GroundedQwenAnswerAgent.answer",
+            new=_answer_with_real_extractive_fallback(),
+        ), patch("app.api.routes_rag.ClaimAuditAgent.audit", return_value=audit):
+            return routes_rag.rag_chat(
+                routes_rag.RagChatRequest(
+                    query="접근권한 검토 주기는?",
+                    orchestration_mode="multi_model",
+                    metadata_profile=metadata_profile,
+                ),
+                auth,
+            )
 
 
 class OrchestratedRagTests(unittest.TestCase):
@@ -305,18 +464,18 @@ class OrchestratedRagTests(unittest.TestCase):
         score.assert_not_called()
         reranker.assert_not_called()
 
-    def test_cached_reranker_reuses_one_loaded_adapter(self) -> None:
+    def test_cached_reranker_reuses_lightweight_isolated_adapter(self) -> None:
         routes_rag._cached_qwen3_reranker.cache_clear()
         adapter = object()
         try:
-            with patch.object(routes_rag, "Qwen3RerankerAdapter", return_value=adapter) as factory:
+            with patch.object(routes_rag, "IsolatedQwen3RerankerAdapter", return_value=adapter) as factory:
                 first = routes_rag._cached_qwen3_reranker("")
                 second = routes_rag._cached_qwen3_reranker("")
         finally:
             routes_rag._cached_qwen3_reranker.cache_clear()
 
         self.assertIs(first, second)
-        factory.assert_called_once()
+        factory.assert_called_once_with(device="cpu", local_files_only=True, model_path=None)
 
     def test_general_query_reranks_only_a_bounded_candidate_set(self) -> None:
         records = [
@@ -727,6 +886,297 @@ class OrchestratedRagTests(unittest.TestCase):
         self.assertEqual("fallback_from_rejected", result["claim_audit_status"])
         self.assertEqual("qwen3:8b", result["attempted_answer_model"])
         self.assertEqual("chunk-1", result["citations"][0]["chunk_id"])
+
+    def test_fallback_citations_bind_context_marker_and_approved_hash(self) -> None:
+        query = "접근권한 검토 주기는?"
+        results = _fallback_results()
+        result = _run_rejected_audit_fallback(query, results)
+
+        self.assertEqual("grounded_extractive", result["answer_mode"])
+        self.assertEqual("verified", result["citation_verification_status"])
+        context = ContextBuilder().build(results, query=query)
+        context_id_by_chunk = {
+            evidence_id: item.context_id
+            for item in context.items
+            for evidence_id in item.evidence_ids
+        }
+        markers = set(re.findall(r"\[(E\d+)\]", result["answer"]))
+        citations = {item["chunk_id"]: item for item in result["citations"]}
+        self.assertEqual({"chunk-1", "chunk-1b", "chunk-2", "chunk-3"}, set(citations))
+        self.assertEqual(markers, {item["context_id"] for item in citations.values()})
+        for chunk_id, citation in citations.items():
+            with self.subTest(chunk_id=chunk_id):
+                self.assertEqual(context_id_by_chunk[chunk_id], citation["context_id"])
+                self.assertEqual([chunk_id], citation["evidence_ids"])
+                self.assertEqual(chunk_id, citation["evidence_id"])
+                self.assertEqual([f"approval-{chunk_id[6:]}"], citation["approval_ids"])
+                self.assertNotIn("support_quote", citation)
+        # One article merged from two approved chunks shares one context marker.
+        self.assertEqual(citations["chunk-1"]["context_id"], citations["chunk-1b"]["context_id"])
+        self.assertEqual(["a" * 64], citations["chunk-1"]["content_hashes"])
+        self.assertEqual(["c" * 64], citations["chunk-1b"]["content_hashes"])
+        self.assertEqual(["b" * 64], citations["chunk-2"]["content_hashes"])
+        # A hash is never invented: an approved record without one stays without one.
+        self.assertNotIn("content_hashes", citations["chunk-3"])
+
+    def test_fallback_citations_keep_existing_keys_and_add_only_identity_fields(self) -> None:
+        result = _run_rejected_audit_fallback("접근권한 검토 주기는?", _fallback_results())
+
+        existing = {
+            "approval_id", "article_no", "article_title", "chunk_id", "citation_id",
+            "document_id", "document_title", "evidence_id", "regulation_version",
+            "source_page_end", "source_page_start",
+        }
+        added = {"context_id", "evidence_ids", "approval_ids", "content_hashes"}
+        for citation in result["citations"]:
+            self.assertTrue(existing.issubset(citation))
+            self.assertTrue(set(citation).issubset(existing | added))
+
+    def test_chat_route_returns_citation_status_for_fallback_and_model_audited_answers(self) -> None:
+        fallback = _chat_through_route(_rejected_audit())
+        verified = _chat_through_route(_verified_audit())
+
+        self.assertEqual("fallback_from_rejected", fallback["orchestration"]["claim_audit_status"])
+        self.assertEqual("grounded_extractive", fallback["orchestration"]["answer_mode"])
+        self.assertEqual("verified", fallback["orchestration"]["citation_verification_status"])
+        markers = set(re.findall(r"\[(E\d+)\]", fallback["answer"]))
+        self.assertTrue(markers)
+        self.assertEqual(markers, {item["context_id"] for item in fallback["citations"]})
+        self.assertTrue(all(item["content_hashes"] for item in fallback["citations"][:2]))
+        self.assertEqual("verified", verified["orchestration"]["claim_audit_status"])
+        self.assertEqual("verified", verified["orchestration"]["citation_verification_status"])
+        self.assertEqual("E1", verified["citations"][0]["context_id"])
+
+    def test_fallback_citations_pass_live_evaluator_identity_and_marker_checks(self) -> None:
+        query = "접근권한 검토 주기는?"
+        results = _fallback_results()[:2]
+        result = _run_rejected_audit_fallback(query, results)
+        spec = {
+            "id": "fallback-trace",
+            "query": query,
+            "required_facts": ["분기마다"],
+            "allowed_citations": [
+                {
+                    "document_id": record["document_id"],
+                    "chunk_id": record["chunk_id"],
+                    "approval_id": record["approval_id"],
+                    "approved_content_hash": record["approved_content_hash"],
+                    "article_no": record["article_no"],
+                    "regulation_title": record["regulation_title"],
+                    "source_page_start": 14,
+                    "source_page_end": 14,
+                    "source_text": record["text"],
+                }
+                for record in results
+            ],
+        }
+        response = {
+            "answer": result["answer"],
+            "citations": result["citations"],
+            "orchestration": {
+                key: result.get(key)
+                for key in (
+                    "answer_model", "attempted_answer_model", "answer_mode",
+                    "claim_audit_status", "citation_verification_status",
+                )
+            },
+        }
+
+        scored = score_case(spec, response, http_status=200, events=[], duration_ms=0)
+
+        self.assertTrue(scored["citation_checks"]["all_verified"])
+        self.assertEqual("verified", scored["answer_citation_context"]["status"])
+        self.assertEqual(
+            {"verified"}, {item["content_hash_status"] for item in scored["citation_checks"]["checks"]}
+        )
+        self.assertNotIn("citation_not_verified", scored["errors"])
+        self.assertNotIn("answer_citation_context_not_verified", scored["errors"])
+        self.assertNotIn("citation_verification_not_accepted", scored["errors"])
+        # A fallback is still not a verified final model answer.
+        self.assertIn("final_model_generation_not_verified", scored["errors"])
+        self.assertTrue(scored["fallback"])
+
+    def test_fallback_citation_omits_identity_when_chunk_id_is_duplicated(self) -> None:
+        base = _fallback_results()
+        changed = {**base[0], "text": "제2조 다른 본문이다.", "approved_content_hash": "d" * 64,
+                   "approval_id": "approval-other"}
+        for name, duplicate in (("identical", dict(base[0])), ("different_record", changed)):
+            with self.subTest(duplicate=name):
+                result = _run_rejected_audit_fallback("접근권한 검토 주기는?", [*base, duplicate])
+
+                duplicated = [item for item in result["citations"] if item["chunk_id"] == "chunk-1"]
+                self.assertEqual(2, len(duplicated))
+                for citation in duplicated:
+                    self.assertEqual(["chunk-1"], citation["evidence_ids"])
+                    for key in ("context_id", "approval_ids", "content_hashes"):
+                        self.assertNotIn(key, citation)
+                # Unambiguous chunks keep the binding.
+                other = next(item for item in result["citations"] if item["chunk_id"] == "chunk-2")
+                self.assertEqual(["b" * 64], other["content_hashes"])
+                self.assertIn("context_id", other)
+
+    def test_fallback_citation_omits_identity_when_two_context_items_claim_the_chunk(self) -> None:
+        def item(context_id: str) -> ContextEvidence:
+            return ContextEvidence(
+                context_id=context_id, evidence_ids=("chunk-1",), document_id="doc-1",
+                regulation_title="정보보안업무규정", regulation_version="3.2", text="접근권한은 분기마다 검토한다.",
+            )
+
+        context = GroundingContext(
+            items=(item("E1"), item("E2")), prompt_context="x", input_evidence_count=2,
+            deduplicated_evidence_count=2, omitted_evidence_count=0, character_count=1,
+            estimated_tokens=1, max_context_chars=500,
+        )
+        record = _fallback_results()[0]
+        citation = {"evidence_id": "chunk-1", "chunk_id": "chunk-1", "approval_id": "approval-1"}
+
+        bound = routes_rag._fallback_citations_with_context_identity(
+            [citation], context=context, supporting_context_ids={"E1", "E2"}, supporting_results=[record],
+        )[0]
+
+        for key in ("context_id", "approval_ids", "content_hashes"):
+            self.assertNotIn(key, bound)
+        self.assertEqual(["chunk-1"], bound["evidence_ids"])
+        # Only one of the two items is supporting: the binding is unambiguous again.
+        single = routes_rag._fallback_citations_with_context_identity(
+            [citation], context=context, supporting_context_ids={"E2"}, supporting_results=[record],
+        )[0]
+        self.assertEqual("E2", single["context_id"])
+
+    def test_fallback_citation_omits_identity_when_record_approval_id_disagrees(self) -> None:
+        query = "접근권한 검토 주기는?"
+        record = _fallback_results()[0]
+        context = ContextBuilder().build([record], query=query)
+        for citation_approval, bound_expected in (("approval-other", False), ("approval-1", True), ("", True)):
+            with self.subTest(citation_approval=citation_approval):
+                citation = {"evidence_id": "chunk-1", "chunk_id": "chunk-1", "approval_id": citation_approval}
+
+                bound = routes_rag._fallback_citations_with_context_identity(
+                    [citation], context=context, supporting_context_ids={"E1"}, supporting_results=[record],
+                )[0]
+
+                self.assertEqual(bound_expected, "context_id" in bound)
+                self.assertEqual(bound_expected, "approval_ids" in bound)
+                self.assertEqual(bound_expected, "content_hashes" in bound)
+                self.assertEqual(["chunk-1"], bound["evidence_ids"])
+                if bound_expected:
+                    self.assertEqual(["approval-1"], bound["approval_ids"])
+
+    def test_fallback_citation_never_promotes_its_own_approval_id_over_an_idless_record(self) -> None:
+        query = "접근권한 검토 주기는?"
+        shapes = {
+            "key_absent": lambda record: record.pop("approval_id"),
+            "empty_top_level": lambda record: record.update(approval_id=""),
+            "empty_top_level_and_metadata": lambda record: record.update(approval_id="", metadata={"approval_id": ""}),
+        }
+        for shape, strip_approval in shapes.items():
+            record = _fallback_results()[0]
+            strip_approval(record)
+            context = ContextBuilder().build([record], query=query)
+            for citation_approval in ("foreign-id", ""):
+                with self.subTest(record=shape, citation_approval=citation_approval):
+                    citation = {"evidence_id": "chunk-1", "chunk_id": "chunk-1", "approval_id": citation_approval}
+
+                    bound = routes_rag._fallback_citations_with_context_identity(
+                        [citation], context=context, supporting_context_ids={"E1"}, supporting_results=[record],
+                    )[0]
+
+                    for key in ("context_id", "approval_ids", "content_hashes"):
+                        self.assertNotIn(key, bound)
+                    self.assertEqual(["chunk-1"], bound["evidence_ids"])
+                    self.assertEqual(citation_approval, bound["approval_id"])
+
+    def test_fallback_answer_leaves_citation_unbound_when_approved_record_has_no_approval_id(self) -> None:
+        results = _fallback_results()
+        del results[0]["approval_id"]
+
+        result = _run_rejected_audit_fallback("접근권한 검토 주기는?", results)
+
+        citations = {item["chunk_id"]: item for item in result["citations"]}
+        for key in ("context_id", "approval_ids", "content_hashes"):
+            self.assertNotIn(key, citations["chunk-1"])
+        self.assertEqual(["approval-2"], citations["chunk-2"]["approval_ids"])
+        self.assertIn("context_id", citations["chunk-2"])
+
+    def test_fallback_hash_follows_context_builder_precedence_for_every_record_shape(self) -> None:
+        query = "접근권한 검토 주기는?"
+        approved, projected = "e" * 64, "f" * 64
+        variants = (
+            ("top_approved_hash", {"approved_content_hash": approved}, [approved]),
+            ("top_content_hash_only", {"content_hash": projected}, [projected]),
+            ("nested_approved_hash_only", {"metadata": {"approved_content_hash": approved}}, [approved]),
+            ("nested_content_hash_only", {"metadata": {"content_hash": projected}}, [projected]),
+            ("approved_beats_content_hash", {"approved_content_hash": approved, "content_hash": projected}, [approved]),
+            ("nested_approved_beats_top_content_hash",
+             {"content_hash": projected, "metadata": {"approved_content_hash": approved}}, [approved]),
+            ("no_hash_anywhere", {}, None),
+        )
+        for name, fields, expected in variants:
+            with self.subTest(shape=name):
+                record = _fallback_results()[0]
+                del record["approved_content_hash"]
+                record.update(fields)
+
+                result = _run_rejected_audit_fallback(query, [record])
+
+                citation = result["citations"][0]
+                context_item = ContextBuilder().build([record], query=query).items[0]
+                self.assertEqual("E1", citation["context_id"])
+                if expected is None:
+                    self.assertNotIn("content_hashes", citation)
+                    self.assertEqual((), context_item.content_hashes)
+                else:
+                    self.assertEqual(expected, citation["content_hashes"])
+                    self.assertEqual(tuple(expected), context_item.content_hashes)
+
+    def test_fallback_approval_id_found_only_in_nested_metadata_is_bound(self) -> None:
+        record = _fallback_results()[0]
+        del record["approval_id"]
+        record["metadata"] = {"approval_id": "approval-nested"}
+
+        citation = _run_rejected_audit_fallback("접근권한 검토 주기는?", [record])["citations"][0]
+
+        self.assertEqual("", citation["approval_id"])
+        self.assertEqual(["approval-nested"], citation["approval_ids"])
+
+    def test_read_only_role_and_external_profiles_get_same_fallback_citation_fields(self) -> None:
+        visible = [_fallback_results()[0], _fallback_results()[2]]
+        admin = _chat_through_route(_rejected_audit(), results=visible)
+        model_audited_keys = set(_chat_through_route(_verified_audit(), role="viewer")["citations"][0])
+        identity_keys = {"context_id", "evidence_ids", "approval_ids", "content_hashes"}
+        self.assertTrue(identity_keys.issubset(model_audited_keys))
+
+        for profile in ("full", "external", "chatgpt-data"):
+            with self.subTest(profile=profile):
+                viewer = _chat_through_route(
+                    _rejected_audit(), role="viewer", metadata_profile=profile, results=visible
+                )
+
+                self.assertEqual(admin["citations"], viewer["citations"])
+                self.assertEqual({"chunk-1", "chunk-2"}, {item["chunk_id"] for item in viewer["citations"]})
+                self.assertNotIn("chunk-3", str(viewer))
+                for citation in viewer["citations"]:
+                    self.assertTrue(identity_keys.issubset(citation))
+                    self.assertNotIn("support_quote", citation)
+                    self.assertFalse(routes_rag._INTERNAL_RAG_RESPONSE_METADATA_KEYS & set(citation))
+
+    def test_chat_route_reports_citation_status_for_abstained_and_table_review_paths(self) -> None:
+        model_abstained = ClaimAuditResult(status="abstained", audit_mode="abstained", model="qwen3:4b")
+        audit_table_review = ClaimAuditResult(
+            status="review_required", audit_mode="deterministic_gate", reason_code=TABLE_STRUCTURE_REVIEW_REASON
+        )
+        cases = (
+            ("model_abstained", model_abstained, None, "abstained"),
+            ("audit_table_review", audit_table_review, None, "deterministic_review_required"),
+            ("draft_table_review", _verified_audit(), _table_review_results(), "deterministic_review_required"),
+        )
+        for name, audit, results, audit_status in cases:
+            with self.subTest(path=name):
+                response = _chat_through_route(audit, results=results)
+
+                self.assertEqual("abstained", response["orchestration"]["citation_verification_status"])
+                self.assertEqual(audit_status, response["orchestration"]["claim_audit_status"])
+                self.assertEqual([], response["citations"])
 
 
 if __name__ == "__main__":

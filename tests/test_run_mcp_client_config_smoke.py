@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import asyncio
+from contextlib import asynccontextmanager
 import io
 import os
 import tempfile
@@ -15,6 +16,7 @@ from scripts.run_mcp_client_config_smoke import (
     _exception_message,
     _has_external_tool_contract,
     _remote_unauthenticated_request_is_rejected,
+    _run_client_entry,
     _search_with_fallback,
     _successful_tool_payload,
     _valid_fetch_payload,
@@ -27,6 +29,27 @@ from scripts.run_mcp_client_config_smoke import (
 
 
 class RunMcpClientConfigSmokeTests(unittest.TestCase):
+    def test_stdio_preserves_only_the_matching_explicit_runtime_source_pair(self) -> None:
+        captured = []
+
+        @asynccontextmanager
+        async def capture(params):
+            captured.append(params.env)
+            raise RuntimeError("captured environment")
+            yield
+
+        inherited = {"REG_RAG_PYTHON": "selected-python", "REG_RAG_PYTHON_PROJECT_ROOT": "selected-source"}
+        cases = [
+            ({}, inherited),
+            ({"REG_RAG_PYTHON": "other-python"}, {"REG_RAG_PYTHON": "other-python"}),
+            ({"REG_RAG_PYTHON_PROJECT_ROOT": "client-source"}, {**inherited, "REG_RAG_PYTHON_PROJECT_ROOT": "client-source"}),
+        ]
+        with patch.dict(os.environ, inherited), patch("scripts.run_mcp_client_config_smoke.stdio_client", capture):
+            for configured, expected in cases:
+                with self.subTest(configured=configured), self.assertRaisesRegex(RuntimeError, "captured"):
+                    asyncio.run(_run_client_entry(command="python", args=[], env=configured, query="synthetic"))
+                self.assertEqual(expected, captured[-1])
+
     def test_exception_group_message_includes_nested_cause(self) -> None:
         message = _exception_message(ExceptionGroup("unhandled errors in a TaskGroup", [FileNotFoundError("server")]))
 

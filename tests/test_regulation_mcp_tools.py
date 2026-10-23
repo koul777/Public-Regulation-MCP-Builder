@@ -2210,6 +2210,7 @@ print(json.dumps({
                     side_effect=[
                         ("approval-stable",),
                         ("approval-stable",),
+                        ("approval-stable",),
                     ],
                 ) as approval_identity,
                 patch.object(
@@ -2236,7 +2237,7 @@ print(json.dumps({
                 )
 
         self.assertIsNotNone(result)
-        self.assertEqual(2, approval_identity.call_count)
+        self.assertEqual(3, approval_identity.call_count)
         self.assertEqual(
             ("index-stable",),
             visible_units.call_args.kwargs["prevalidated_index_signature"],
@@ -2246,7 +2247,7 @@ print(json.dumps({
             visible_units.call_args.kwargs["prevalidated_source_identity"],
         )
 
-    def test_search_read_context_checks_each_identity_twice_per_call(self) -> None:
+    def test_search_read_context_checks_identity_before_retrieval_and_after_projection(self) -> None:
         query = SimpleNamespace(
             profile_id="profile-a",
             query="approved policy",
@@ -2328,14 +2329,14 @@ print(json.dumps({
 
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
-        self.assertEqual(4, approval_identity.call_count)
+        self.assertEqual(6, approval_identity.call_count)
         self.assertEqual(
             Counter(
                 {
-                    manifest_path: 4,
-                    index_path: 4,
-                    vector_path: 4,
-                    bm25_path: 4,
+                    manifest_path: 6,
+                    index_path: 6,
+                    vector_path: 6,
+                    bm25_path: 6,
                 }
             ),
             Counter(
@@ -2350,6 +2351,8 @@ print(json.dumps({
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             auth = mcp_auth_context(tenant_id="tenant-a")
+            # Keep authority paths real while this test isolates profile selection.
+            JsonRepository(settings)
             with (
                 patch.object(
                     regulation_tools,
@@ -2440,6 +2443,8 @@ print(json.dumps({
                 api_audit_enabled=False,
             )
             auth = mcp_auth_context(tenant_id="tenant-a")
+            # Keep authority paths real while this test isolates profile selection.
+            JsonRepository(settings)
             with (
                 patch.object(
                     regulation_tools,
@@ -2529,6 +2534,8 @@ print(json.dumps({
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(data_dir=Path(tmp) / "data")
             auth = mcp_auth_context(tenant_id="tenant-a")
+            # Keep authority paths real while this test isolates profile selection.
+            JsonRepository(settings)
             with (
                 patch.object(
                     regulation_tools,
@@ -4596,6 +4603,9 @@ print(json.dumps({
                 api_audit_enabled=False,
             )
             auth = mcp_auth_context(tenant_id="tenant-a")
+            # Visibility is mocked below; still provide the stable repository
+            # path used by the public fetch materialization guard.
+            JsonRepository(settings)
             with (
                 patch.object(
                     regulation_tools,
@@ -7854,6 +7864,7 @@ def _approve_and_index_test_chunks(
     chunks: list[Chunk],
     auth: AuthContext,
     approval_id: str,
+    review_flags_acknowledged: bool = False,
 ) -> None:
     approval_settings = replace(settings, artifact_root=root)
     evidence = _write_approval_evidence(
@@ -7870,6 +7881,7 @@ def _approve_and_index_test_chunks(
                 chunk_ids=[chunk.chunk_id for chunk in chunks],
                 approval_id=approval_id,
                 security_level="internal",
+                review_flags_acknowledged=review_flags_acknowledged,
                 **evidence,
             ),
             auth,

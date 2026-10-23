@@ -5,7 +5,7 @@ from datetime import date, datetime
 import importlib
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from app.services.regulation_catalog_service import (
@@ -92,7 +92,13 @@ def to_rag_search_request(query: RegulationQuery) -> Any:
     )
 
 
-def search_records(*, query: RegulationQuery, auth, settings):
+def search_records(
+    *,
+    query: RegulationQuery,
+    auth,
+    settings,
+    retrieval_text_observer: Callable[[list[str]], None] | None = None,
+):
     validate_query_security_scope(query=query, auth=auth)
     routes_rag = _load_routes_rag()
     request = to_rag_search_request(query)
@@ -142,9 +148,17 @@ def search_records(*, query: RegulationQuery, auth, settings):
     )
     timing_ms["scoring_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
     step_started_at = time.perf_counter()
+    selected = scored[: request.top_k]
+    if retrieval_text_observer is not None:
+        # Internal MCP guard input only. Raw augmentation never enters the
+        # public result or trace, and source projection cannot change the guard.
+        retrieval_text_observer([str(record.get("text") or "") for _score, record in selected])
     results = [
-        public_search_result(record, score, related_records=visible_records)
-        for score, record in scored[: request.top_k]
+        public_search_result(
+            record, score, related_records=visible_records,
+            source_text_result=_runtime.approved_source_text_for_record(record, settings=settings, auth=auth),
+        )
+        for score, record in selected
     ]
     timing_ms["public_results_elapsed_ms"] = routes_rag._perf_elapsed_ms(step_started_at)
     timing_ms["total_before_trace_write_elapsed_ms"] = routes_rag._perf_elapsed_ms(total_started_at)

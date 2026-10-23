@@ -48,7 +48,11 @@ from app.core.tenant_access import (
 )
 from app.agents.citation_verifier import CitationVerifierAgent
 from app.agents.claim_auditor import ClaimAuditAgent
-from app.agents.grounded_qa import GroundedAnswerDraft, GroundedQwenAnswerAgent
+from app.agents.grounded_qa import (
+    TABLE_STRUCTURE_REVIEW_REASON,
+    GroundedAnswerDraft,
+    GroundedQwenAnswerAgent,
+)
 from app.agents.grounded_answer_agent import GroundedAnswerAgent
 from app.agents.model_router import (
     QWEN3_ANSWER_MODEL,
@@ -74,6 +78,7 @@ from app.rag.local_llm import (
     probe_local_llm,
 )
 from app.rag.context_builder import ContextBuilder, GroundingContext
+from app.rag.evidence_quality import requires_table_structure_review
 from app.rag.output_filter import sanitize_rag_answer
 from app.rag.extractive_answer import (
     NO_EVIDENCE_ANSWER,
@@ -90,7 +95,7 @@ from app.retrieval.bm25_index import (
     source_content_hashes,
 )
 from app.retrieval.searcher import search as search_retrieval_records
-from app.retrieval.semantic_models import Qwen3RerankerAdapter
+from app.retrieval.isolated_reranker import IsolatedQwen3RerankerAdapter, RerankerWorkerError
 from app.retrieval.semantic_models import semantic_runtime_available
 from app.parsers.paddle_ocr import paddle_ocr_available
 from app.services.review_decision_service import APPROVAL_WORKLIST_METADATA_KEYS, approval_worklist_metadata
@@ -395,7 +400,11 @@ def search_rag_records(
             reranker_status = "completed"
         except Exception as exc:
             reranker_status = "degraded"
-            reranker_reason = f"reranker_{type(exc).__name__}"[:120]
+            reranker_reason = (
+                exc.reason_code
+                if isinstance(exc, RerankerWorkerError)
+                else f"reranker_{type(exc).__name__}"[:120]
+            )
         timing_ms["reranker_elapsed_ms"] = _perf_elapsed_ms(step_started_at)
     retrieval.update(
         {
@@ -413,7 +422,10 @@ def search_rag_records(
     )
     step_started_at = time.perf_counter()
     results = [
-        _public_search_result(record, score, related_records=visible_records)
+        _public_search_result(
+            record, score, related_records=visible_records,
+            source_text_result=rag_runtime.approved_source_text_for_record(record, settings=settings, auth=auth),
+        )
         for score, record in scored[: request.top_k]
     ]
     context_summary: dict[str, Any] = {"context_status": "not_requested"}
@@ -699,6 +711,9 @@ def rag_chat(request: RagChatRequest, auth_context: AuthContext = Depends(get_au
                     "claim_audit_model": orchestrated.get("claim_audit_model"),
                     "claim_audit_status": orchestrated.get("claim_audit_status"),
                     "claim_audit_reason": orchestrated.get("claim_audit_reason"),
+                    "citation_verification_status": orchestrated.get(
+                        "citation_verification_status"
+                    ),
                     "roles": _qa_orchestration_role_trace(
                         search_trace=search_trace,
                         orchestration=orchestrated,
@@ -2118,10 +2133,10 @@ def _is_exact_article_locator_query(analysis: QueryAnalysis) -> bool:
 
 
 @lru_cache(maxsize=2)
-def _cached_qwen3_reranker(local_model_path: str) -> Qwen3RerankerAdapter:
-    """Reuse the CPU reranker instead of loading its weights for every question."""
+def _cached_qwen3_reranker(local_model_path: str) -> IsolatedQwen3RerankerAdapter:
+    """Cache configuration while each worker releases weights before generation."""
 
-    return Qwen3RerankerAdapter(
+    return IsolatedQwen3RerankerAdapter(
         device="cpu",
         local_files_only=True,
         model_path=Path(local_model_path) if local_model_path else None,
@@ -2799,6 +2814,103 @@ def _chat_search_query(
     return _contextualized_chat_query(current, history)
 
 
+def _table_structure_review_blocks_draft(draft: GroundedAnswerDraft, context: GroundingContext) -> bool:
+    if draft.fallback_reason == TABLE_STRUCTURE_REVIEW_REASON:
+        return True
+    referenced = {context_id for claim in draft.claims for context_id in claim.evidence_context_ids}
+    referenced.update(re.findall(r"\[(E\d+)\]", draft.answer))
+    return any(item.context_id in referenced and requires_table_structure_review(item) for item in context.items)
+
+
+def _table_structure_review_response(draft: GroundedAnswerDraft) -> dict[str, Any]:
+    """Keep unresolved table relationships out of both generated and fallback answers."""
+    return {
+        "answer": NO_EVIDENCE_ANSWER,
+        "citations": [],
+        "answer_model": draft.model,
+        "answer_mode": "abstained",
+        "claim_count": 0,
+        "claim_audit_model": None,
+        "claim_audit_status": "deterministic_review_required",
+        "claim_audit_reason": TABLE_STRUCTURE_REVIEW_REASON,
+        "citation_verification_status": "abstained",
+    }
+
+
+def _approved_record_value(record: dict[str, Any], key: str) -> str:
+    """Read one approved-record field with the same precedence as ContextBuilder."""
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    direct = record.get(key)
+    value = direct if direct not in (None, "") else metadata.get(key)
+    return str(value or "").strip()
+
+
+def _fallback_citations_with_context_identity(
+    citations: list[dict[str, Any]],
+    *,
+    context: GroundingContext,
+    supporting_context_ids: set[str],
+    supporting_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind extractive-fallback citations to the answer's context markers.
+
+    The identity verifier builds one public citation per approved chunk. The
+    fallback answer prints [E<n>] markers, so each citation also names the
+    context item that owns its chunk, plus list-shaped approval and content
+    hash fields under the same names the model-audited citations use. Values
+    come only from the approved records; a missing hash stays missing, and no
+    source text is added. An ambiguous binding is never guessed: when one
+    evidence ID maps to several supporting records or context items, or the
+    record's approval ID is missing or disagrees with the citation's own, the
+    citation keeps only its original keys and the evaluator then reports it as
+    unverified. The approval ID is taken only from the approved record.
+    """
+
+    context_ids_by_evidence_id: dict[str, set[str]] = defaultdict(set)
+    for item in context.items:
+        if item.context_id not in supporting_context_ids:
+            continue
+        for evidence_id in item.evidence_ids:
+            context_ids_by_evidence_id[evidence_id].add(item.context_id)
+    records_by_evidence_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for result in supporting_results:
+        evidence_id = str(result.get("chunk_id") or result.get("document_id") or "").strip()
+        if evidence_id:
+            records_by_evidence_id[evidence_id].append(result)
+    bound: list[dict[str, Any]] = []
+    for citation in citations:
+        payload = dict(citation)
+        evidence_id = str(payload.get("evidence_id") or "").strip()
+        if evidence_id:
+            payload["evidence_ids"] = [evidence_id]
+        records = records_by_evidence_id.get(evidence_id, [])
+        context_ids = context_ids_by_evidence_id.get(evidence_id, set())
+        if len(records) != 1 or len(context_ids) != 1:
+            bound.append(payload)
+            continue
+        record = records[0]
+        # The approval ID comes only from the approved record. A record without
+        # one cannot verify the binding, and the citation's own value is never
+        # promoted in its place.
+        record_approval_id = _approved_record_value(record, "approval_id")
+        citation_approval_id = str(payload.get("approval_id") or "").strip()
+        if not record_approval_id or (
+            citation_approval_id and record_approval_id != citation_approval_id
+        ):
+            bound.append(payload)
+            continue
+        payload["context_id"] = next(iter(context_ids))
+        payload["approval_ids"] = [record_approval_id]
+        content_hash = _approved_record_value(
+            record, "approved_content_hash"
+        ) or _approved_record_value(record, "content_hash")
+        if content_hash:
+            payload["content_hashes"] = [content_hash]
+        bound.append(payload)
+    return bound
+
+
 def _orchestrated_chat_answer(
     settings: Settings,
     query: str,
@@ -2836,6 +2948,8 @@ def _orchestrated_chat_answer(
                 strict_model=False,
             )
         )
+        if _table_structure_review_blocks_draft(draft, context):
+            return _table_structure_review_response(draft)
         if not use_model_claim_audit:
             _emit_rag_chat_progress(
                 "deterministic_audit",
@@ -2858,6 +2972,8 @@ def _orchestrated_chat_answer(
             status_code=503,
             detail=f"Multi-model local QA execution failed: {type(exc).__name__}",
         ) from exc
+    if audit.reason_code == TABLE_STRUCTURE_REVIEW_REASON:
+        return _table_structure_review_response(draft)
     if audit.status == "abstained":
         _emit_rag_chat_progress(
             "citation_verify",
@@ -2886,6 +3002,8 @@ def _orchestrated_chat_answer(
             history=history,
             prefer_model=False,
         )
+        if _table_structure_review_blocks_draft(fallback, context):
+            return _table_structure_review_response(fallback)
         supporting_context_ids = {
             context_id
             for claim in fallback.claims
@@ -2926,7 +3044,12 @@ def _orchestrated_chat_answer(
             "answer": _sanitize_rag_answer(
                 str(fallback_verification.get("verified_answer") or fallback.answer)
             ),
-            "citations": list(fallback_verification.get("citations") or []),
+            "citations": _fallback_citations_with_context_identity(
+                list(fallback_verification.get("citations") or []),
+                context=context,
+                supporting_context_ids=supporting_context_ids,
+                supporting_results=supporting_results,
+            ),
             "answer_model": fallback.model,
             "attempted_answer_model": draft.model,
             "answer_mode": fallback.answer_mode,
@@ -2981,6 +3104,8 @@ def _deterministic_chat_draft_verification(
 ) -> dict[str, Any]:
     """Verify fast-chat evidence identity without loading a second Ollama model."""
 
+    if _table_structure_review_blocks_draft(draft, context):
+        return _table_structure_review_response(draft)
     _emit_rag_chat_progress(
         "citation_verify",
         90,
@@ -3047,10 +3172,26 @@ def _qa_orchestration_role_trace(
 ) -> list[dict[str, Any]]:
     """Return a path-free explanation of the roles used for one QA answer."""
 
+    stages = [
+        stage for stage in ((search_trace.get("pipeline_trace") or {}).get("stages") or [])
+        if isinstance(stage, dict)
+    ]
     stage_statuses = {
         str(stage.get("stage_id")): str(stage.get("status"))
-        for stage in ((search_trace.get("pipeline_trace") or {}).get("stages") or [])
-        if isinstance(stage, dict)
+        for stage in stages
+    }
+    # A retrieval stage may finish successfully after an optional model fails.
+    # Report the matching role's outcome rather than the enclosing stage result.
+    known_role_statuses = {
+        "pending", "running", "completed", "skipped", "degraded",
+        "review_required", "blocked", "failed",
+    }
+    role_statuses = {
+        (str(stage.get("stage_id")), str(role.get("role_id"))): role["status"]
+        for stage in stages
+        for role in (stage.get("agent_role_statuses") or [])
+        if isinstance(role, dict) and isinstance(role.get("status"), str)
+        and role["status"] in known_role_statuses
     }
     stage_to_role = {
         "orchestrator": "completed",
@@ -3096,6 +3237,10 @@ def _qa_orchestration_role_trace(
         else:
             status = stage_to_role.get(role.role_id, "completed")
             stage_id = role_stage_ids.get(role.role_id)
+            if role.role_id in {
+                "query_analyst", "query_rewriter", "retrieval_guard", "reranker", "context_builder",
+            }:
+                status = role_statuses.get((stage_id, role.role_id), status)
         trace.append(
             {
                 "role_id": role.role_id,
@@ -3120,6 +3265,14 @@ def _chat_answer(
     *,
     history: list[dict[str, str]] | None = None,
 ) -> tuple[str, list[str]]:
+    from app.services.approved_source_text import source_text_status_unavailable
+
+    # The legacy answer path does not use ContextBuilder. Do not let rejected
+    # source bodies re-enter through derived answer metadata or agent fallbacks.
+    results = [
+        result for result in results
+        if not source_text_status_unavailable(result) and not requires_table_structure_review(result)
+    ]
     if backend == "extractive":
         answer = _sanitize_rag_answer(_extractive_answer(query, results))
         if answer == NO_EVIDENCE_ANSWER:

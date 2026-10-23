@@ -205,10 +205,16 @@ class Qwen3RerankerAdapter:
             import torch
 
             with torch.no_grad():
-                logits = model(**padded).logits[:, -1, :]
+                # Qwen3 scores only the final yes/no token. Projecting every
+                # input position into the vocabulary can allocate gigabytes of
+                # unused logits, and a one-shot score never reuses a KV cache.
+                logits = model(**padded, logits_to_keep=1, use_cache=False).logits[:, -1, :]
                 pair_logits = torch.stack((logits[:, false_id], logits[:, true_id]), dim=1)
                 probabilities = torch.nn.functional.softmax(pair_logits, dim=1)[:, 1]
-            scores.extend(float(value) for value in probabilities.detach().cpu().tolist())
+            batch_scores = [float(value) for value in probabilities.detach().cpu().tolist()]
+            if any(not math.isfinite(value) for value in batch_scores):
+                raise RuntimeError("Qwen3 reranker returned a non-finite probability")
+            scores.extend(batch_scores)
         return [round(max(0.0, min(score, 1.0)), 8) for score in scores]
 
     def rerank(
@@ -240,6 +246,7 @@ class Qwen3RerankerAdapter:
         if not semantic_runtime_available():
             raise RuntimeError("transformers and torch are required for Qwen3 reranking")
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_source,
@@ -251,8 +258,30 @@ class Qwen3RerankerAdapter:
             self.model_source,
             trust_remote_code=True,
             local_files_only=self.local_files_only,
+            **_reranker_cpu_load_options(torch, self.device),
         ).to(self.device).eval()
         return self._tokenizer, self._model
+
+
+def _reranker_cpu_load_options(torch: Any, device: str) -> dict[str, Any]:
+    """Use FP32 on the measured AVX2 path with no native BF16 acceleration.
+
+    BF16 emulation can be much slower than FP32 on these CPUs. FP32 roughly
+    doubles weight memory, so leave GPUs, other CPU capabilities and unknown
+    capability APIs at the original model dtype. Never change global defaults.
+    """
+    if str(device).split(":", 1)[0] != "cpu":
+        return {}
+    try:
+        if torch.backends.cpu.get_cpu_capability() != "AVX2":
+            return {}
+        if torch.cpu._is_avx512_bf16_supported() is not False:
+            return {}
+        if torch.cpu._is_amx_tile_supported() is not False:
+            return {}
+        return {"torch_dtype": torch.float32}
+    except (AttributeError, RuntimeError, TypeError):
+        return {}
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

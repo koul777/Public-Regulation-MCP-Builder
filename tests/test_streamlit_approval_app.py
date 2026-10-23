@@ -152,6 +152,10 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             self.assertFalse(retry.disabled)
             repository = JsonRepository(settings)
             self.assertEqual(1, len(repository.list_approval_records("doc_streamlit_approval")))
+            # AppTest 1.50 retains removed widgets after the approval rerun.
+            # Render current state without resubmitting the obsolete widget tree.
+            app._run()
+            retry = next(b for b in app.button if b.label == "이미 승인된 내용 AI에 등록만 실행")
             retry.click().run()
             self.assertFalse(app.exception)
             self.assertFalse(app.error)
@@ -2036,12 +2040,15 @@ class StreamlitApprovalAppTests(unittest.TestCase):
             service_area.set_value(edited).run()
             _confirm_rendered_approval_rows(app)
             app.button(key="approval-batch-entry-doc_streamlit_approval").click().run()
+            # Finish the queued page transition before interacting with its controls.
+            app._run()
             self.assertFalse(app.exception)
             approve = app.button(key="workflow-approve-index-doc_streamlit_approval")
             self.assertEqual("선택한 규정 전체 승인·색인", approve.label)
             self.assertFalse(approve.disabled)
             approve.click().run()
 
+            self.assertFalse(app.error, [error.value for error in app.error])
             repository = JsonRepository(settings)
             service_chunks = repository.get_chunks("doc_streamlit_service")
             personnel_chunks = repository.get_chunks("doc_streamlit_approval")

@@ -31,6 +31,16 @@ class AgentModelRouterTests(unittest.TestCase):
     def test_deterministic_role_has_no_model_profile(self) -> None:
         self.assertIsNone(model_profile_for_role("security_guard"))
 
+    def test_answer_and_claim_context_limits_do_not_expand_structure_review(self) -> None:
+        answer = model_profile_for_role("grounded_answerer")
+        audit = model_profile_for_role("claim_auditor")
+        self.assertEqual((16_384, 180), (answer.max_input_units, answer.timeout_seconds))
+        self.assertEqual((16_384, 45), (audit.max_input_units, audit.timeout_seconds))
+        for role in ("structure_reviewer", "table_reviewer"):
+            profile = model_profile_for_role(role)
+            self.assertEqual((8_192, 45), (profile.max_input_units, profile.timeout_seconds))
+            self.assertNotEqual(audit.profile_id, profile.profile_id)
+
     def test_endpoint_guard_rejects_external_and_credentialed_urls(self) -> None:
         for endpoint in (
             "https://example.com",

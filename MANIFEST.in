@@ -12,6 +12,8 @@ include docs/mcp_performance_quality_gate_ko.md
 include docs/operator_quickstart_ko.md
 include docs/harness_engineering_plan_ko.md
 include docs/hermes_engineering_plan_ko.md
+include docs/real_regulation_regression_ko.md
+include docs/real_regulation_mcp_local_llm_10hour_plan_ko.md
 include docs/agent_orchestration_roles_ko.md
 include docs/authoring_beginner_improvement_backlog_ko.md
 include docs/authoring_beginner_pilot_facilitator_script_ko.md
@@ -50,6 +52,7 @@ recursive-include frontend/assets *.js *.css
 recursive-include tests *.py
 include tests/fixtures/sample_regulation.md
 recursive-include scripts *.ps1
+include scripts/policies/*.json
 recursive-include packaging *.py *.spec *.txt *.ps1
 prune build
 prune data

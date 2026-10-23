@@ -101,7 +101,7 @@ class ApprovalGovernanceTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["ai_review_confirmed", "human_review_confirmed", "approved_without_review"],
+            ["ai_review_confirmed", "human_review_confirmed", "approved"],
             [event["event"] for event in events],
         )
         self.assertEqual(1, events[0]["ai_action_required"])
@@ -114,6 +114,65 @@ class ApprovalGovernanceTests(unittest.TestCase):
         self.assertEqual("kordoc", events[0]["source_of_truth"]["table_source"])
         self.assertTrue(events[0]["source_of_truth"]["kordoc_table_promoted"])
         self.assertEqual("urgent approved by offline review", events[-1]["override_reason"])
+
+    def test_partial_ai_review_override_preserves_actual_human_signoff(self) -> None:
+        from app.api.routes_documents import ApprovalRequest
+
+        events = build_approval_review_events(
+            chunk_id="reviewed-chunk",
+            actor="reviewer",
+            item_ids=["unresolved-ai-finding"],
+            ai_decisions={},
+            human_confirmed=True,
+            approve_event="approved",
+            override_reason="Operator waived the remaining AI finding",
+        )
+        request = ApprovalRequest(
+            chunk_ids=["reviewed-chunk"],
+            review_flags_acknowledged=False,
+            review_decision_events=events,
+            approval_override_reason="Operator waived the remaining AI finding",
+        )
+
+        self.assertEqual(
+            ["human_review_confirmed", "approved"],
+            [event["event"] for event in request.review_decision_events],
+        )
+        self.assertEqual(
+            request.approval_override_reason,
+            request.review_decision_events[-1]["override_reason"],
+        )
+
+    def test_mixed_review_batch_keeps_signoff_and_override_on_their_own_chunks(self) -> None:
+        from app.api.routes_documents import ApprovalRequest
+
+        events = []
+        for chunk_id, human_confirmed in (("reviewed", True), ("unreviewed", False)):
+            events.extend(build_approval_review_events(
+                chunk_id=chunk_id,
+                actor="reviewer",
+                item_ids=["finding"],
+                ai_decisions={},
+                human_confirmed=human_confirmed,
+                approve_event="approved",
+                override_reason="Explicit local operator override",
+            ))
+        request = ApprovalRequest(
+            chunk_ids=["reviewed", "unreviewed"],
+            review_decision_events=events,
+            approval_override_reason="Explicit local operator override",
+        )
+
+        self.assertEqual(
+            {"reviewed"},
+            {event["chunk_id"] for event in request.review_decision_events
+             if event["event"] == "human_review_confirmed"},
+        )
+        self.assertEqual(
+            {"unreviewed"},
+            {event["chunk_id"] for event in request.review_decision_events
+             if event["event"] == "approved_without_review"},
+        )
 
     def test_state_transition_records_required_reviewed_step(self) -> None:
         transition = approval_state_transition(["draft", "needs_review"])

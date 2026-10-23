@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.mcp_server.regulation_tools import mcp_auth_context, search_regulations, settings_for_mcp_project
+from scripts.holdout_spec_guard import HoldoutSpecRefused, refuse_holdout_spec
 from scripts.benchmark_mcp_queries import _verified_runtime_target_ids
 from scripts.report_metadata import (
     capture_mcp_performance_source_state,
@@ -207,6 +208,7 @@ def normalize_query_specs(query_specs: list[dict[str, Any]]) -> list[dict[str, A
 def load_query_specs(path: Path) -> list[dict[str, Any]]:
     """Load query specifications from a list or a queries/items wrapper object."""
     payload = json.loads(path.read_text(encoding="utf-8"))
+    refuse_holdout_spec(payload)
     if isinstance(payload, dict):
         if "queries" in payload:
             payload = payload["queries"]
@@ -288,11 +290,16 @@ def run(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> i
         tenant_storage_isolation = True
     elif args.flat_storage:
         tenant_storage_isolation = False
+    try:
+        query_specs = load_query_specs(query_spec_source)
+    except HoldoutSpecRefused as exc:
+        stdout.write(json.dumps({"passed": False, "reason_code": str(exc)}) + "\n")
+        return 2
     report = evaluate_mcp_retrieval_quality(
         data_dir=Path(args.data_dir),
         tenant_id=args.tenant_id,
         profile_id=args.profile_id,
-        query_specs=load_query_specs(query_spec_source),
+        query_specs=query_specs,
         top_k=args.top_k,
         security_levels=args.security_level,
         department_ids=args.department_id,

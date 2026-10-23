@@ -172,6 +172,21 @@ def _run_smoke_with_data_dir(
         / "approved_vectors.jsonl"
     )
     vector_records = load_vector_records_jsonl(vector_path)
+    # Declared MCP runtimes require a manifest-pinned full-content approval
+    # witness for table rows, even when every document is synthetic.
+    from scripts.generate_mcp_client_config import _write_runtime_approval_snapshot_sidecar
+
+    approval_snapshot_path = _write_runtime_approval_snapshot_sidecar(
+        runtime_data_dir=repository_settings.data_dir,
+        tenant_id=tenant_id,
+        document_ids=["doc_mcp_smoke_v1", "doc_mcp_smoke_v2"],
+        records=vector_records,
+        auth=auth,
+    )
+    approval_snapshot_relative_path = approval_snapshot_path.relative_to(
+        repository_settings.data_dir
+    ).as_posix()
+    approval_snapshot_sha256 = _sha256_file(approval_snapshot_path)
     hierarchy_summary = build_hierarchical_runtime_index(
         hierarchical_index_path(repository_settings.data_dir),
         vector_records,
@@ -198,6 +213,11 @@ def _run_smoke_with_data_dir(
                     "synthetic_runtime": True,
                     "provenance": "run_mcp_smoke",
                     "hierarchical_index_status": "ready",
+                    "runtime_data_reuse": {
+                        "file_sha256": {
+                            approval_snapshot_relative_path: approval_snapshot_sha256,
+                        },
+                    },
                     "files": {
                         "hierarchical_index_sha256": hierarchy_summary["sha256"],
                     },

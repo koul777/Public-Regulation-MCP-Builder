@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from app.agents.claim_auditor import ClaimAuditAgent
-from app.agents.grounded_qa import AnswerClaim, GroundedAnswerDraft, GroundedQwenAnswerAgent
+from app.agents.grounded_qa import AnswerClaim, GroundedAnswerDraft, GroundedQwenAnswerAgent, TABLE_STRUCTURE_REVIEW_REASON
 from app.rag.context_builder import ContextBuilder
 from app.rag.extractive_answer import NO_EVIDENCE_ANSWER
 
@@ -48,7 +48,149 @@ def _context():
     )
 
 
+def _table_context(*, include_safe=True, required=True, flags=("unstable_column_count",)):
+    records = [{"chunk_id": "synthetic-table", "document_id": "synthetic-table-document",
+                "text": "합성 표의 행과 열 순서는 재검토가 필요하다.", "approval_status": "approved",
+                "approval_id": "synthetic-table-approval", "approved_content_hash": "a" * 64,
+                "regulation_title": "합성 표 규정", "table_like": True,
+                "table_review_required": required, "table_review_flags": list(flags)}]
+    if include_safe:
+        records.append({"chunk_id": "synthetic-safe", "document_id": "synthetic-safe-document",
+                        "text": "합성 신청서는 매월 제출한다.", "approval_status": "approved",
+                        "approval_id": "synthetic-safe-approval", "approved_content_hash": "b" * 64,
+                        "regulation_title": "합성 정상 규정"})
+    return ContextBuilder().build(records)
+
+
 class GroundedQATests(unittest.TestCase):
+    def test_model_answer_markers_equal_declared_claim_evidence_union(self) -> None:
+        context = _table_context(required=False, flags=())
+        for fast in (False, True):
+            for answer, ids in (
+                ("Synthetic claim. [E1] Undeclared claim. [E2]", ["E1"]),
+                ("Synthetic claim. [E1] Unknown claim. [E99]", ["E1"]),
+                ("Synthetic claim. [E1]", ["E1", "E2"]),
+            ):
+                with self.subTest(fast=fast, answer=answer, ids=ids):
+                    payload = {"answer": answer, "abstained": False}
+                    payload.update({"evidence_context_ids": ids} if fast else {"claims": [
+                        {"claim_id": "C1", "text": "Synthetic claim.", "evidence_context_ids": ids},
+                    ]})
+                    agent = GroundedQwenAnswerAgent(_Runtime(payload))
+                    method = agent.answer_fast if fast else agent.answer
+                    with self.assertRaises(ValueError):
+                        method(query="Synthetic question", context=context, strict_model=True)
+                    result = method(query="Synthetic question", context=context)
+                    self.assertEqual("grounded_extractive", result.answer_mode)
+                    self.assertEqual("model_ValueError", result.fallback_reason)
+                    self.assertNotIn("Undeclared claim", result.answer)
+                    self.assertNotIn("[E99]", result.answer)
+
+    def test_multiple_markers_accept_single_or_multiple_claims(self) -> None:
+        context = _table_context(required=False, flags=())
+        for bindings in ((["E1", "E2"],), (["E1"], ["E2"]), (["E1"], ["E1", "E2"])):
+            with self.subTest(bindings=bindings):
+                answer = "First synthetic claim. [E1] Second synthetic claim. [E2] [E1]"
+                payload = {"answer": answer, "claims": [
+                    {"claim_id": f"C{index}", "text": "Synthetic claim.", "evidence_context_ids": ids}
+                    for index, ids in enumerate(bindings, start=1)
+                ]}
+                result = GroundedQwenAnswerAgent(_Runtime(payload)).answer(
+                    query="Synthetic question", context=context, strict_model=True)
+                self.assertEqual("grounded_local", result.answer_mode)
+                self.assertEqual(answer, result.answer)
+                self.assertEqual(len(bindings), len(result.claims))
+
+    def test_fast_undeclared_risky_marker_fallback_uses_only_safe_evidence(self) -> None:
+        agent = GroundedQwenAnswerAgent(_Runtime({
+            "answer": "Unsafe table claim. [E1] Safe claim. [E2]", "abstained": False,
+            "evidence_context_ids": ["E2"],
+        }))
+        with self.assertRaises(ValueError):
+            agent.answer_fast(query="Synthetic question", context=_table_context(), strict_model=True)
+        result = agent.answer_fast(query="Synthetic question", context=_table_context())
+        self.assertEqual("grounded_extractive", result.answer_mode)
+        self.assertEqual("model_ValueError", result.fallback_reason)
+        self.assertEqual(("E2",), result.claims[0].evidence_context_ids)
+        self.assertNotIn("[E1]", result.answer)
+        self.assertNotIn("Unsafe table claim", result.answer)
+
+    def test_canonical_abstention_discards_untrusted_answer_markers(self) -> None:
+        for fast in (False, True):
+            with self.subTest(fast=fast):
+                payload = {"answer": "Unused model text. [E99]", "abstained": True}
+                payload.update({"evidence_context_ids": ["E1"]} if fast else {"claims": [
+                    {"claim_id": "C1", "text": "Unused claim.", "evidence_context_ids": ["E1"]},
+                ]})
+                agent = GroundedQwenAnswerAgent(_Runtime(payload))
+                result = (agent.answer_fast if fast else agent.answer)(
+                    query="Synthetic question", context=_context(), strict_model=True)
+                self.assertTrue(result.abstained)
+                self.assertEqual(NO_EVIDENCE_ANSWER, result.answer)
+                self.assertEqual((), result.claims)
+
+    def test_risky_table_binding_abstains_standard_and_fast_even_with_safe_context(self) -> None:
+        for fast in (False, True):
+            for ids in (["E1"], ["E1", "E2"]):
+                with self.subTest(fast=fast, ids=ids):
+                    answer = "합성 표의 단정적인 답변. " + " ".join(f"[{value}]" for value in ids)
+                    payload = {"answer": answer, "abstained": False}
+                    if fast:
+                        payload["evidence_context_ids"] = ids
+                    else:
+                        payload["claims"] = [{"claim_id": f"C{index}", "text": "합성 주장.", "evidence_context_ids": [value]}
+                                             for index, value in enumerate(ids, start=1)]
+                    runtime = _Runtime(payload)
+                    agent = GroundedQwenAnswerAgent(runtime)
+                    result = (agent.answer_fast if fast else agent.answer)(query="합성 질문", context=_table_context())
+                    self.assertTrue(runtime.last_kwargs)
+                    self.assertTrue(result.abstained)
+                    self.assertEqual(NO_EVIDENCE_ANSWER, result.answer)
+                    self.assertEqual((), result.claims)
+                    self.assertEqual(TABLE_STRUCTURE_REVIEW_REASON, result.fallback_reason)
+
+    def test_risky_unreferenced_table_does_not_block_safe_binding(self) -> None:
+        for fast in (False, True):
+            payload = {"answer": "합성 신청서는 매월 제출한다. [E2]", "abstained": False}
+            payload.update({"evidence_context_ids": ["E2"]} if fast else {
+                "claims": [{"claim_id": "C1", "text": "합성 신청서는 매월 제출한다.", "evidence_context_ids": ["E2"]}]})
+            agent = GroundedQwenAnswerAgent(_Runtime(payload))
+            result = (agent.answer_fast if fast else agent.answer)(query="합성 질문", context=_table_context())
+            self.assertFalse(result.abstained)
+            self.assertEqual("grounded_local", result.answer_mode)
+            self.assertEqual(("E2",), result.claims[0].evidence_context_ids)
+
+    def test_table_gate_requires_both_review_required_and_unstable_columns(self) -> None:
+        for required, flags in ((False, ("unstable_column_count",)), (True, ("possible_truncated_cell",)), (False, ())):
+            with self.subTest(required=required, flags=flags):
+                agent = GroundedQwenAnswerAgent(_Runtime({"answer": "합성 근거 답변. [E1]",
+                    "claims": [{"claim_id": "C1", "text": "합성 근거 답변.", "evidence_context_ids": ["E1"]}]}))
+                result = agent.answer(query="합성 질문", context=_table_context(required=required, flags=flags))
+                self.assertFalse(result.abstained)
+
+    def test_all_risky_context_abstains_before_model_and_cannot_revive_as_fallback(self) -> None:
+        for fast in (False, True):
+            runtime = _Runtime({}, available=False)
+            agent = GroundedQwenAnswerAgent(runtime)
+            result = (agent.answer_fast if fast else agent.answer)(query="합성 질문", context=_table_context(include_safe=False))
+            self.assertEqual({}, runtime.last_kwargs)
+            self.assertEqual(NO_EVIDENCE_ANSWER, result.answer)
+            self.assertEqual(TABLE_STRUCTURE_REVIEW_REASON, result.fallback_reason)
+            self.assertIsNone(result.model)
+        agent = GroundedQwenAnswerAgent(_Runtime({}))
+        result = agent.answer(query="합성 질문", context=_table_context(), prefer_model=False)
+        self.assertEqual("grounded_extractive", result.answer_mode)
+        self.assertEqual(("E2",), result.claims[0].evidence_context_ids)
+        self.assertNotIn("[E1]", result.answer)
+        self.assertNotIn("행과 열", result.answer)
+
+    def test_undeclared_risky_marker_cannot_hide_behind_safe_claim(self) -> None:
+        agent = GroundedQwenAnswerAgent(_Runtime({"answer": "합성 표 주장. [E1] 정상 주장. [E2]",
+            "claims": [{"claim_id": "C1", "text": "정상 주장.", "evidence_context_ids": ["E2"]}]}))
+        result = agent.answer(query="합성 질문", context=_table_context())
+        self.assertTrue(result.abstained)
+        self.assertEqual(TABLE_STRUCTURE_REVIEW_REASON, result.fallback_reason)
+
     def test_missing_information_is_abstention_even_with_valid_citation_id(self) -> None:
         for answer in (
             "이 규정에서는 보증금 금액을 명시하고 있지 않습니다. [E1]",
@@ -116,6 +258,8 @@ class GroundedQATests(unittest.TestCase):
 
         self.assertEqual("grounded_local", result.answer_mode)
         self.assertEqual("qwen3:8b", result.model)
+        self.assertEqual(16_384, runtime.last_kwargs["context_window"])
+        self.assertEqual(180, runtime.last_kwargs["timeout_seconds"])
 
     def test_qwen_answer_with_unknown_evidence_falls_back(self) -> None:
         runtime = _Runtime(
@@ -153,6 +297,7 @@ class GroundedQATests(unittest.TestCase):
         self.assertEqual("grounded_local", result.answer_mode)
         self.assertEqual(("E1",), result.claims[0].evidence_context_ids)
         self.assertEqual(420, runtime.last_kwargs["max_output_tokens"])
+        self.assertEqual(16_384, runtime.last_kwargs["context_window"])
         schema_properties = runtime.last_kwargs["schema"]["properties"]
         self.assertEqual(
             {"answer", "evidence_context_ids", "abstained"},
@@ -213,17 +358,24 @@ class GroundedQATests(unittest.TestCase):
                         "claim_id": "C1",
                         "supported": True,
                         "evidence_context_ids": ["E1"],
-                        "support_quote": "접근권한을 분기마다 검토하여야 한다.",
+                        "support_quote_id": "E1Q1",
                         "reason_code": "",
                     }
-                ]
+                ],
+                "sentences": [{"sentence_id": "S1", "support_quote_id": "E1Q1", "supported": True}],
             }
         )
 
         result = ClaimAuditAgent(runtime=runtime).audit(draft=draft, context=_context())
 
         self.assertEqual("verified", result.status)
+        self.assertEqual(
+            "제2조(권한관리) 정보시스템 관리자는 접근권한을 분기마다 검토하여야 한다.",
+            result.citations[0].support_quote,
+        )
         self.assertEqual("qwen3:4b", result.model)
+        self.assertEqual(16_384, runtime.last_kwargs["context_window"])
+        self.assertEqual(45, runtime.last_kwargs["timeout_seconds"])
         self.assertEqual("정보보안업무규정", result.citations[0].regulation_title)
         self.assertEqual("제2장 접근통제", result.citations[0].chapter_title)
         self.assertEqual("제2조", result.citations[0].article_no)
@@ -231,7 +383,7 @@ class GroundedQATests(unittest.TestCase):
         self.assertEqual(14, result.citations[0].source_page_start)
         self.assertEqual(("chunk-1",), result.citations[0].evidence_ids)
 
-    def test_claim_auditor_requires_exact_support_quote(self) -> None:
+    def test_claim_auditor_rejects_free_quote_that_conflicts_with_selected_span(self) -> None:
         draft = GroundedAnswerDraft(
             answer="접근권한을 검토합니다. [E1]",
             claims=(
@@ -250,17 +402,19 @@ class GroundedQATests(unittest.TestCase):
                         "claim_id": "C1",
                         "supported": True,
                         "evidence_context_ids": ["E1"],
+                        "support_quote_id": "E1Q1",
                         "support_quote": "원문에 없는 인용",
                         "reason_code": "",
                     }
-                ]
+                ],
+                "sentences": [{"sentence_id": "S1", "support_quote_id": "E1Q1", "supported": True}],
             }
         )
 
         result = ClaimAuditAgent(runtime=runtime).audit(draft=draft, context=_context())
 
         self.assertEqual("review_required", result.status)
-        self.assertEqual("support_quote_not_exact", result.reason_code)
+        self.assertEqual("model_quote_reference_conflict", result.reason_code)
 
     def test_claim_auditor_rejects_answer_missing_marker_before_model(self) -> None:
         draft = GroundedAnswerDraft(

@@ -36,5 +36,45 @@ class OllamaRuntimeLocalTransportTests(unittest.TestCase):
         self.assertEqual(1, len(seen))
 
 
+class OllamaRuntimeContextWindowTests(unittest.TestCase):
+    def test_window_is_explicit_and_does_not_change_default_requests(self) -> None:
+        runtime = OllamaRuntime(LOOPBACK_URL)
+        with patch.object(runtime, "_request_json", return_value={"response": "synthetic answer"}) as request:
+            runtime.generate(model="synthetic-model", prompt="synthetic prompt", timeout_seconds=3)
+            self.assertNotIn("num_ctx", request.call_args.args[2]["options"])
+            runtime.generate(model="synthetic-model", prompt="synthetic prompt", timeout_seconds=3,
+                             context_window=8192)
+            payload = request.call_args.args[2]
+        self.assertEqual(8192, payload["options"]["num_ctx"])
+        self.assertEqual(0, payload["options"]["seed"])
+        self.assertFalse(payload["think"])
+        self.assertFalse(payload["stream"])
+
+    def test_invalid_context_window_fails_before_transport(self) -> None:
+        runtime = OllamaRuntime(LOOPBACK_URL)
+        for value in (True, 0, 511, 32769, 8192.0, "8192"):
+            with self.subTest(value=value), patch.object(runtime, "_request_json") as request:
+                with self.assertRaisesRegex(ValueError, "context_window"):
+                    runtime.generate(model="synthetic-model", prompt="synthetic prompt",
+                                     timeout_seconds=3, context_window=value)
+                request.assert_not_called()
+
+    def test_schema_grammar_retry_preserves_explicit_window_and_prompt(self) -> None:
+        runtime = OllamaRuntime(LOOPBACK_URL)
+        schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+        with patch.object(runtime, "_request_json", side_effect=[
+            OllamaRuntimeError("failed to parse grammar"), {"response": '{"answer": "synthetic answer"}'},
+        ]) as request:
+            payload, _ = runtime.generate_json(model="synthetic-model", prompt="synthetic prompt",
+                                                schema=schema, timeout_seconds=3, context_window=8192)
+        self.assertEqual("synthetic answer", payload["answer"])
+        first, second = [call.args[2] for call in request.call_args_list]
+        self.assertEqual(schema, first["format"])
+        self.assertEqual("json", second["format"])
+        self.assertEqual(first["options"], second["options"])
+        self.assertEqual(8192, second["options"]["num_ctx"])
+        self.assertEqual(first["prompt"], second["prompt"])
+
+
 if __name__ == "__main__":
     unittest.main()

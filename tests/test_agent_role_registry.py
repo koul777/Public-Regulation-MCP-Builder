@@ -16,6 +16,15 @@ class AgentRoleRegistryTests(unittest.TestCase):
     def test_registry_is_valid(self) -> None:
         validate_role_registry()
 
+    def test_claim_auditor_role_manifest_matches_runtime_profile(self) -> None:
+        from app.agents.claim_auditor import ClaimAuditAgent
+        from app.agents.model_router import model_profile_for_role
+
+        role = get_agent_role("claim_auditor")
+        profile = model_profile_for_role("claim_auditor")
+        self.assertEqual(role.model_profile, profile.profile_id)
+        self.assertEqual(profile, ClaimAuditAgent().profile)
+
     def test_qwen3_8b_is_the_grounded_answerer_model(self) -> None:
         role = get_agent_role("grounded_answerer")
         self.assertEqual(role.primary_model, QWEN3_8B_MODEL)

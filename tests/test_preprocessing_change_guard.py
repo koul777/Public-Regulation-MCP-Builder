@@ -297,6 +297,32 @@ class PreprocessingChangeGuardTests(unittest.TestCase):
         )
         self.assertTrue(justified["passed"])
 
+    def test_kpi_guardrail_policy_is_a_protected_baseline(self) -> None:
+        policy = {"path": "scripts/policies/real_regulation_kpi_guardrails.v1.json", "status": "modified"}
+        unrelated_test = evaluate_guard(
+            [policy, {"path": "tests/test_pdf_parser.py", "status": "modified"}],
+            pr_body=completed_body(baseline_change="재현율 하한 변경"),
+            labels=["preprocessing-reviewed"],
+        )
+        self.assertFalse(unrelated_test["passed"])
+        self.assertIn("scripts/policies/real_regulation_kpi_guardrails.v1.json", unrelated_test["baseline_files"])
+
+        unjustified = evaluate_guard(
+            [policy, {"path": "tests/test_real_regulation_kpi_guardrails.py", "status": "modified"}],
+            pr_body=completed_body(baseline_change="없음"),
+            labels=["preprocessing-reviewed"],
+        )
+        self.assertIn("baseline-change-unjustified", {item["code"] for item in unjustified["failures"]})
+
+        justified = evaluate_guard(
+            [policy, {"path": "tests/test_real_regulation_kpi_guardrails.py", "status": "modified"}],
+            pr_body=completed_body(
+                baseline_change="보류셋 60문항 기준 Recall@5 하한을 0.95에서 0.97로 올렸고 기준선 0.98을 확인했습니다."
+            ),
+            labels=["preprocessing-reviewed"],
+        )
+        self.assertTrue(justified["passed"])
+
     def test_guard_implementation_change_requires_guard_test(self) -> None:
         report = evaluate_guard(
             [{"path": "scripts/check_preprocessing_change_guard.py", "status": "modified"}],

@@ -139,7 +139,14 @@ def build_approval_review_events(
             }
         )
     if approve_event:
-        event_name = "approved_without_review" if override_reason else approve_event
+        # An override can waive an unresolved AI finding even after explicit
+        # human sign-off. Keep that sign-off and its waiver reason without
+        # also claiming that the same chunk was approved without human review.
+        event_name = (
+            "approved_without_review"
+            if override_reason and not human_confirmed
+            else approve_event
+        )
         events.append(
             {
                 "event": event_name,

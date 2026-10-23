@@ -14,7 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import parse_qsl, quote, urlsplit
 
 from starlette.exceptions import HTTPException
@@ -46,8 +46,10 @@ from app.services.regulation_catalog_service import (
 from app.services.regulation_rag_runtime import (
     RepositoryPathDescriptor,
     repository_path_descriptor,
+    runtime_approval_identity_chunk_paths,
 )
-from app.retrieval.tokenizer import tokenize
+from app.services.approved_source_witness import source_text_from_current_witness
+from app.retrieval.tokenizer import FALLBACK_TOKENIZER_MODEL, tokenize
 from app.retrieval.hierarchical_index import (
     HIERARCHICAL_INDEX_SCHEMA_VERSION,
     VerifiedVectorCacheNamespace,
@@ -88,6 +90,154 @@ MCP_ANSWER_GROUNDING_GUIDANCE = (
 _FETCH_CHUNK_INDEX_CACHE_MAX_SIZE = 32
 _FETCH_CHUNK_INDEX_LOCK = threading.Lock()
 _FETCH_CHUNK_INDEX_CACHE: dict[Path, tuple[Any, dict[tuple[str, str], dict[str, Any]]]] = {}
+
+def _public_mcp_record(record: dict[str, Any], score: float, *, settings: Settings, auth: AuthContext,
+                       related_records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return routes_rag.public_search_result(
+        record, score, related_records=related_records,
+        source_text_result=source_text_from_current_witness(settings=settings, auth=auth, record=record),
+    )
+
+
+_MCP_PROJECTION_CHANGED_MESSAGE = "Approved MCP content changed or became unavailable during materialization."
+
+
+def _mcp_projection_path_identity(path: Path) -> tuple[Any, ...]:
+    """Distinguish absent authority from inaccessible/linked authority."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return ("missing",)
+    except OSError as exc:
+        raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE) from exc
+    if any(part.is_symlink() or bool(getattr(part, "is_junction", lambda: False)())
+           for part in (path, *path.parents)) or not path.is_file():
+        raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE)
+    signature = routes_rag.path_signature(path)
+    if signature is None:
+        raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE)
+    return ("file", signature)
+
+
+def _mcp_projection_source_identity(
+    *, settings: Settings, auth: AuthContext, document_ids: tuple[str, ...] | None,
+) -> tuple[Any, ...]:
+    """Capture only read authority; no JSON model expansion or runtime writes."""
+    paths = repository_path_descriptor(settings)
+    if paths.root.is_symlink() or bool(getattr(paths.root, "is_junction", lambda: False)()):
+        raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE)
+    chunk_paths = runtime_approval_identity_chunk_paths(paths, document_ids=document_ids)
+    if chunk_paths is None:
+        raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE)
+    hierarchy_path = hierarchical_index_path(Path(settings.data_dir))
+    authority_paths = [
+        paths.manifest_path, paths.legacy_path,
+        paths.root / "approval_snapshot.json",
+        paths.root / "journals" / "approvals.jsonl",
+        paths.root / "journals" / "approvals.jsonl.gz",
+        paths.root / "journals" / "review_decisions.jsonl",
+        paths.root / "journals" / "review_decisions.jsonl.gz",
+        Path(settings.data_dir) / "mcp_runtime_manifest.json",
+        routes_rag.local_vector_path(settings, auth), hierarchy_path,
+        Path(str(hierarchy_path) + "-wal"),
+    ]
+    registry_path = str(getattr(settings, "institution_profiles_path", "") or "").strip()
+    if registry_path:
+        authority_paths.append(Path(registry_path))
+    snapshot_root = paths.root / "review_snapshots"
+    if snapshot_root.is_symlink() or bool(getattr(snapshot_root, "is_junction", lambda: False)()):
+        raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE)
+    snapshot_paths = sorted(snapshot_root.glob("*.jsonl")) if snapshot_root.exists() else []
+    return (
+        tuple((str(path), _mcp_projection_path_identity(path)) for path in authority_paths),
+        tuple((path.name, _mcp_projection_path_identity(path)) for path in chunk_paths),
+        tuple((path.name, _mcp_projection_path_identity(path)) for path in snapshot_paths),
+    )
+
+
+@dataclass(frozen=True)
+class _McpProjectionReadGuard:
+    """Bind approval before visibility to the fully materialized public result."""
+
+    settings: Settings
+    auth: AuthContext
+    document_ids: tuple[str, ...] | None
+    identity: tuple[Any, ...]
+
+    @classmethod
+    def capture(cls, *, settings: Settings, auth: AuthContext, document_id: str | None) -> "_McpProjectionReadGuard":
+        document_ids = (document_id,) if document_id else None
+        try:
+            identity = _mcp_projection_source_identity(settings=settings, auth=auth, document_ids=document_ids)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE) from None
+        return cls(settings, auth, document_ids, identity)
+
+    def require_current(self) -> None:
+        try:
+            current = _mcp_projection_source_identity(settings=self.settings, auth=self.auth, document_ids=self.document_ids)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE) from None
+        if self.identity != current:
+            raise ValueError(_MCP_PROJECTION_CHANGED_MESSAGE)
+
+
+def _declared_mcp_runtime(repository: Any) -> bool:
+    return any(os.path.lexists(os.fspath(path)) for path in (
+        repository.root.parent / "mcp_runtime_manifest.json",
+        repository.root / "approval_snapshot.json",
+        hierarchical_index_path(repository.root.parent),
+    ))
+
+
+def _table_content_has_current_approval(
+    *, record: dict[str, Any], chunk: Any, document: Any, repository: Any,
+    auth: AuthContext, authority_cache: dict[str, Any],
+) -> bool:
+    """Rows include metadata outside vector text and need full-content authority."""
+    document_id = str(chunk.document_id)
+    if _declared_mcp_runtime(repository):
+        if document_id not in authority_cache:
+            authority_cache[document_id] = routes_rag.load_cached_runtime_approval_snapshot(
+                repository, [document_id], auth,
+            )
+        snapshot = authority_cache[document_id]
+        if not isinstance(snapshot, dict):
+            return False
+        approved = snapshot.get((document_id, str(chunk.chunk_id)))
+        metadata = record.get("metadata") or {}
+        if not isinstance(approved, dict):
+            return False
+        for key in ("approval_id", "approved_content_hash", "content_hash"):
+            actual = record.get(key) if key == "content_hash" else metadata.get(key)
+            if not str(approved.get(key) or "") or str(approved.get(key)) != str(actual or ""):
+                return False
+        if str(approved.get("security_level") or "").lower() != str(metadata.get("security_level") or "").lower():
+            return False
+        if routes_rag.department_acl_set(approved.get("department_acl")) != routes_rag.department_acl_set(metadata.get("department_acl")):
+            return False
+        if approved.get("document_profile_id") and str(approved["document_profile_id"]).casefold() != str(document.profile_id or "").casefold():
+            return False
+        return True
+    from app.services.approval_validation import (
+        build_repository_approval_validation_context,
+        validate_repository_approval_content,
+    )
+    try:
+        if document_id not in authority_cache:
+            authority_cache[document_id] = build_repository_approval_validation_context(
+                repository, document_id=document_id, tenant_id=auth.tenant_id,
+            )
+        validate_repository_approval_content(
+            repository, chunk, document, tenant_id=auth.tenant_id,
+            context=authority_cache[document_id],
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+
 _HIERARCHICAL_FETCH_RECORD_CACHE_MAX_ENTRIES = 1024
 _HIERARCHICAL_FETCH_RECORD_CACHE_LOCK = threading.Lock()
 _HIERARCHICAL_FETCH_RECORD_CACHE: OrderedDict[
@@ -456,6 +606,10 @@ _CHATGPT_DATA_FETCH_METADATA_KEYS = (
     "source_page_end",
     "approval_status",
     "approved_content_hash",
+    "source_text_status",
+    "table_like",
+    "table_review_required",
+    "table_review_flags",
 )
 
 
@@ -685,6 +839,7 @@ def search_regulations(
     metadata_profile: str = "full",
     as_of_date: str | None = None,
 ) -> dict[str, Any]:
+    projection_guard: _McpProjectionReadGuard | None = None
     try:
         normalized_metadata_profile = _normalize_mcp_metadata_profile(metadata_profile)
         hierarchy_required = _mcp_search_requires_verified_hierarchy(
@@ -711,17 +866,20 @@ def search_regulations(
             as_of_date=normalized_as_of_date,
         )
         _validate_mcp_security_scope(query_request, auth)
+        retrieval_texts: list[str] = []
         hierarchical = (
             _search_hierarchical_runtime(
                 settings=settings,
                 auth=auth,
                 query=query_request,
                 runtime_token=runtime_token,
+                retrieval_text_observer=retrieval_texts.extend,
             )
             if runtime_token is not None
             else None
         )
         if hierarchical is None:
+            retrieval_texts.clear()
             if hierarchy_required:
                 raise ValueError(
                     _CONNECTOR_HIERARCHY_REQUIRED_MESSAGE
@@ -730,6 +888,9 @@ def search_regulations(
                     )
                     else _OFFICIAL_RUNTIME_HIERARCHY_REQUIRED_MESSAGE
                 )
+            projection_guard = _McpProjectionReadGuard.capture(
+                settings=settings, auth=auth, document_id=document_id,
+            )
             fallback_profile_id = _resolve_mcp_flat_fallback_profile_scope(
                 settings=settings,
                 auth=auth,
@@ -739,7 +900,10 @@ def search_regulations(
                 query_request,
                 profile_id=fallback_profile_id,
             )
-            results, trace = routes_rag.search_records(query=query_request, auth=auth, settings=settings)
+            results, trace = routes_rag.search_records(
+                query=query_request, auth=auth, settings=settings,
+                retrieval_text_observer=retrieval_texts.extend,
+            )
             if (
                 _resolve_mcp_flat_fallback_profile_scope(
                     settings=settings,
@@ -754,7 +918,15 @@ def search_regulations(
             profile_id = fallback_profile_id
         else:
             results, trace = hierarchical
-        relevance_guard = _mcp_relevance_guard(query, results)
+        # Ranking and refusal use the exact verified retrieval text. Source-body
+        # recovery affects only public evidence, never the relevance decision.
+        if retrieval_texts and len(retrieval_texts) != len(results):
+            raise ValueError("Retrieval text/result identity mismatch.")
+        guard_results = [
+            {**result, "text": retrieval_texts[index]} if retrieval_texts else result
+            for index, result in enumerate(results)
+        ]
+        relevance_guard = _mcp_relevance_guard(query, guard_results)
         if relevance_guard["refused"]:
             results = []
         else:
@@ -800,6 +972,12 @@ def search_regulations(
         "results": [_mcp_search_result(result, metadata_profile=normalized_metadata_profile) for result in results],
         "metadata": metadata,
     }
+    if projection_guard is not None:
+        try:
+            projection_guard.require_current()
+        except ValueError as exc:
+            _audit_mcp_exception(settings, auth, action="mcp.search", exc=exc, document_id=document_id)
+            raise
     audit_api_event(
         settings,
         auth,
@@ -959,6 +1137,7 @@ def _search_hierarchical_runtime(
     auth: AuthContext,
     query: Any,
     runtime_token: _VerifiedHierarchicalRuntimeToken | None = None,
+    retrieval_text_observer: Callable[[list[str]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
     profile_id = str(query.profile_id or "").strip() or None
     repository_paths = repository_path_descriptor(settings)
@@ -1046,6 +1225,8 @@ def _search_hierarchical_runtime(
         )
     ][: int(query.top_k or 5)]
     related_records = [record for _score, record in visible_scored]
+    if retrieval_text_observer is not None:
+        retrieval_text_observer([str(record.get("text") or "") for _score, record in visible_scored])
     governing_article_candidates = _fetch_governing_article_candidates(
         settings=settings,
         auth=auth,
@@ -1054,9 +1235,11 @@ def _search_hierarchical_runtime(
         records=related_records,
     )
     results = [
-        routes_rag.public_search_result(
+        _public_mcp_record(
             record,
             score,
+            settings=settings,
+            auth=auth,
             related_records=governing_article_candidates.get(
                 _record_chunk_key(record),
                 related_records,
@@ -1064,6 +1247,8 @@ def _search_hierarchical_runtime(
         )
         for score, record in visible_scored
     ]
+    if not read_context.postflight_is_current():
+        return None
     elapsed_ms = _elapsed_ms(started_at)
     trace = {
         "trace_id": f"hier-{uuid.uuid4().hex}",
@@ -2139,6 +2324,9 @@ def fetch_regulation(
         chunk_id = str(decoded.get("chunk_id") or "")
         if not document_id or not chunk_id:
             raise ValueError("Invalid regulation result id.")
+        projection_guard = _McpProjectionReadGuard.capture(
+            settings=settings, auth=auth, document_id=document_id,
+        )
         record, related_records = _visible_record_with_related_by_chunk(
             settings=settings,
             auth=auth,
@@ -2154,10 +2342,15 @@ def fetch_regulation(
     except ValueError as exc:
         _audit_mcp_exception(settings, auth, action="mcp.fetch", exc=exc, document_id=document_id or None)
         raise
-    public = routes_rag.public_search_result(record, score=1.0, related_records=related_records)
+    public = _public_mcp_record(record, score=1.0, settings=settings, auth=auth, related_records=related_records)
     response = _mcp_fetch_result(public, metadata_profile=normalized_metadata_profile)
     response["metadata"]["answer_guidance"] = MCP_ANSWER_GROUNDING_GUIDANCE
     response["metadata"]["as_of_date"] = normalized_as_of_date
+    try:
+        projection_guard.require_current()
+    except ValueError as exc:
+        _audit_mcp_exception(settings, auth, action="mcp.fetch", exc=exc, document_id=document_id)
+        raise
     audit_api_event(
         settings,
         auth,
@@ -2909,7 +3102,7 @@ def get_regulation_article(
         )
     ]
     articles = [
-        _mcp_fetch_result(routes_rag.public_search_result(record, score=1.0, related_records=visible))
+        _mcp_fetch_result(_public_mcp_record(record, score=1.0, settings=settings, auth=auth, related_records=visible))
         for record in visible
     ]
     if (
@@ -3099,6 +3292,9 @@ def get_document(
         max_chars=MAX_MCP_IDENTIFIER_CHARS,
     )
     normalized_as_of_date = _normalize_optional_as_of_date(as_of_date)
+    projection_guard = _McpProjectionReadGuard.capture(
+        settings=settings, auth=auth, document_id=requested_document_id,
+    )
     records = _visible_records(
         settings=settings,
         auth=auth,
@@ -3110,7 +3306,7 @@ def get_document(
     )
     records = sorted(records, key=_document_record_sort_key)
     chunks = [
-        _mcp_fetch_result(routes_rag.public_search_result(record, score=1.0, related_records=records))
+        _mcp_fetch_result(_public_mcp_record(record, score=1.0, settings=settings, auth=auth, related_records=records))
         for record in records
     ]
     document_title = ""
@@ -3122,6 +3318,7 @@ def get_document(
         institution_name = str(first_metadata.get("institution_name") or "")
         resolved_profile_id = str(first_metadata.get("profile_id") or resolved_profile_id)
     text = "\n\n".join(str(chunk.get("text") or "") for chunk in chunks if str(chunk.get("text") or "").strip())
+    projection_guard.require_current()
     audit_api_event(
         settings,
         auth,
@@ -3168,6 +3365,9 @@ def get_article(
     )
     normalized_article_no = " ".join(requested_article_no.split())
     normalized_as_of_date = _normalize_optional_as_of_date(as_of_date)
+    projection_guard = _McpProjectionReadGuard.capture(
+        settings=settings, auth=auth, document_id=requested_document_id,
+    )
     matches: list[dict[str, Any]] = []
     for record in _visible_records(
         settings=settings,
@@ -3178,9 +3378,10 @@ def get_article(
         profile_id=profile_id,
         as_of_date=normalized_as_of_date,
     ):
-        public = routes_rag.public_search_result(record, score=1.0)
+        public = _public_mcp_record(record, score=1.0, settings=settings, auth=auth)
         if " ".join(str(public.get("article_no") or "").split()) == normalized_article_no:
             matches.append(_mcp_fetch_result(public))
+    projection_guard.require_current()
     audit_api_event(
         settings,
         auth,
@@ -3465,11 +3666,14 @@ def _kordoc_inventory_table_result(
             table_id=table_id,
             title=title,
             text=verbatim_text,
-            metadata=metadata,
+            metadata={**metadata, "approval_id": chunk.approval_id or "",
+                      "source_text_status": "verified_reconstruction"},
         ),
         "rows": rows,
         "metadata": {
             "approval_id": chunk.approval_id or "",
+            "source_text_status": "verified_reconstruction",
+            "table_content_status": "verified_approved_content",
             "security_level": chunk.security_level or "",
             "source_page_start": chunk.source_page_start,
             "source_page_end": chunk.source_page_end,
@@ -3503,6 +3707,7 @@ def get_table(
     # part of the latency-sensitive search/fetch path, so defer that import
     # until this tool is actually called.
     from app.processors.exporter import Exporter
+    from app.rag.evidence_quality import table_review_metadata
 
     requested_table_id = require_bounded_text(
         table_id,
@@ -3518,22 +3723,39 @@ def get_table(
             required=False,
         ) or None
     normalized_as_of_date = _normalize_optional_as_of_date(as_of_date)
+    projection_guard = _McpProjectionReadGuard.capture(
+        settings=settings, auth=auth, document_id=requested_document_id,
+    )
     repository = _json_repository(settings)
     repository_cache = routes_rag.repository_cache(repository)
     tables: list[dict[str, Any]] = []
+    table_authority_cache: dict[str, Any] = {}
     seen_kordoc_inventory_tables: set[tuple[str, str]] = set()
     kordoc_inventory_satisfied_aliases: set[str] = set()
     normalized_requested_table_id = _normalize_table_lookup_id(requested_table_id)
-    for record in _visible_records(
-        settings=settings,
-        auth=auth,
-        security_levels=security_levels,
-        department_ids=department_ids,
-        document_id=requested_document_id,
-        profile_id=profile_id,
-        as_of_date=normalized_as_of_date,
-        use_cached_approval_snapshot=False,
-    ):
+    declared_runtime = _declared_mcp_runtime(repository)
+    document_scopes: list[str | None] = [requested_document_id]
+    if declared_runtime and requested_document_id is None:
+        # Generated bundles omit source review snapshots. Their verified
+        # hierarchy and immutable approval sidecar are the authority instead.
+        chunk_paths = runtime_approval_identity_chunk_paths(repository, document_ids=None)
+        document_scopes = [path.name[:-len("_chunks.json")] for path in (chunk_paths or [])]
+    visible_records = (
+        record
+        for scope_document_id in document_scopes
+        for record in _visible_records(
+            settings=settings,
+            auth=auth,
+            security_levels=security_levels,
+            department_ids=department_ids,
+            document_id=scope_document_id,
+            profile_id=profile_id,
+            as_of_date=normalized_as_of_date,
+            use_cached_approval_snapshot=declared_runtime,
+            allow_live_approval_fallback=not declared_runtime,
+        )
+    )
+    for record in visible_records:
         metadata = record.get("metadata") or {}
         current_document_id = str(record.get("document_id") or metadata.get("document_id") or "")
         chunk_id = str(record.get("chunk_id") or metadata.get("chunk_id") or "")
@@ -3553,6 +3775,12 @@ def get_table(
             auth=auth,
         ):
             continue
+        if not _table_content_has_current_approval(
+            record=record, chunk=chunk, document=document, repository=repository,
+            auth=auth, authority_cache=table_authority_cache,
+        ):
+            continue
+        table_review = table_review_metadata(metadata)
         inventory_matched = False
         for inventory_table in _kordoc_inventory_tables(chunk):
             if not _kordoc_inventory_table_matches(requested_table_id, chunk, inventory_table):
@@ -3568,6 +3796,7 @@ def get_table(
             )
             if table_result is None:
                 continue
+            table_result["metadata"].update(table_review)
             inventory_matched = True
             seen_kordoc_inventory_tables.add(inventory_key)
             kordoc_inventory_satisfied_aliases.update(_kordoc_inventory_table_aliases(chunk, inventory_table))
@@ -3582,6 +3811,7 @@ def get_table(
         rows = Exporter().table_rows([chunk])
         if not rows and not chunk.metadata.get("table_like") and chunk.chunk_type not in {"appendix", "form", "table"}:
             continue
+        source_text = source_text_from_current_witness(settings=settings, auth=auth, record=record)
         tables.append(
             {
                 "table_id": chunk_table_id,
@@ -3593,8 +3823,8 @@ def get_table(
                     or chunk.metadata.get("article_title")
                     or chunk_table_id
                 ),
-                "text": chunk.retrieval_text or chunk.normalized_text or chunk.text,
-                "verbatim_text": chunk.retrieval_text or chunk.normalized_text or chunk.text,
+                "text": source_text.text,
+                "verbatim_text": source_text.text,
                 "verbatim": _mcp_table_verbatim_block(
                     document_id=chunk.document_id,
                     chunk_id=chunk.chunk_id,
@@ -3605,19 +3835,23 @@ def get_table(
                         or chunk.metadata.get("article_title")
                         or chunk_table_id
                     ),
-                    text=chunk.retrieval_text or chunk.normalized_text or chunk.text,
-                    metadata=chunk.metadata,
+                    text=source_text.text,
+                    metadata={**chunk.metadata, "approval_id": chunk.approval_id or "",
+                              "source_text_status": source_text.status},
                 ),
                 "rows": rows,
                 "metadata": {
+                    **table_review,
                     "approval_id": chunk.approval_id or "",
                     "security_level": chunk.security_level or "",
                     "source_page_start": chunk.source_page_start,
                     "source_page_end": chunk.source_page_end,
-                    "table_like": bool(chunk.metadata.get("table_like")),
+                    "source_text_status": source_text.status,
+                    "table_content_status": "verified_approved_content",
                 },
             }
         )
+    projection_guard.require_current()
     audit_api_event(
         settings,
         auth,
@@ -3651,6 +3885,7 @@ def _mcp_table_verbatim_block(
         "source_page_start": metadata.get("source_page_start"),
         "source_page_end": metadata.get("source_page_end"),
         "approval_id": str(metadata.get("approval_id") or ""),
+        "source_text_status": str(metadata.get("source_text_status") or ""),
         "display_guidance": "Display this table text and rows as approved regulation evidence; do not invent missing cells.",
     }
 
@@ -3712,6 +3947,10 @@ def compare_versions(
         field_name="target_document_id",
         max_chars=MAX_MCP_IDENTIFIER_CHARS,
     )
+    projection_guards = [
+        _McpProjectionReadGuard.capture(settings=settings, auth=auth, document_id=document_id)
+        for document_id in (requested_base_document_id, requested_target_document_id)
+    ]
     base_items = _comparison_items(
         settings=settings,
         auth=auth,
@@ -3758,6 +3997,8 @@ def compare_versions(
             for key in changed[:20]
         ],
     }
+    for projection_guard in projection_guards:
+        projection_guard.require_current()
     audit_api_event(
         settings,
         auth,
@@ -4038,7 +4279,7 @@ def _comparison_items(
         profile_id=profile_id,
         latest_only=latest_only,
     ):
-        public = routes_rag.public_search_result(record, score=1.0)
+        public = _public_mcp_record(record, score=1.0, settings=settings, auth=auth)
         key = str(public.get("article_no") or public.get("chunk_id") or "")
         chunk = routes_rag.current_repository_chunk(
             repository,
@@ -4558,6 +4799,7 @@ def _visible_records(
     use_cached_approval_snapshot: bool = True,
     latest_only: bool = True,
     article_candidates_only: bool = False,
+    allow_live_approval_fallback: bool = True,
 ) -> list[dict[str, Any]]:
     profile_id = _resolve_mcp_profile_scope(
         settings=settings,
@@ -4699,14 +4941,39 @@ def _visible_records(
                         include_legacy=True,
                     )
                 return visible_records
-    visible_records = routes_rag.get_visible_records(
-        query=query_request,
-        auth=auth,
-        settings=settings,
-        repository=repository,
-        use_cached_approval_snapshot=use_cached_approval_snapshot,
-        latest_only=latest_only,
-    )
+    if not allow_live_approval_fallback:
+        if _mcp_search_requires_verified_hierarchy(settings=settings, metadata_profile="full"):
+            return []
+        # Older immutable bundles did not declare a hierarchy. Preserve that
+        # format only with a verified sidecar; never rebuild live approvals.
+        approval_snapshot = routes_rag.load_cached_runtime_approval_snapshot(
+            repository, [str(document_id)] if document_id else [], auth,
+        )
+        if approval_snapshot is None:
+            return []
+        repository_cache = routes_rag.repository_cache(repository)
+        requested_departments = routes_rag.requested_department_ids(query_request, auth)
+        visible_records = [
+            record for record in routes_rag.load_local_vector_records(settings, auth)
+            if routes_rag.is_record_visible(
+                record, request=query_request, auth=auth, repository=repository,
+                repository_cache=repository_cache, approval_snapshot=approval_snapshot,
+                requested_department_ids=requested_departments,
+            )
+        ]
+        if latest_only:
+            visible_records = filter_to_latest_active_versions(
+                visible_records, as_of=as_of_date, include_legacy=True,
+            )
+    else:
+        visible_records = routes_rag.get_visible_records(
+            query=query_request,
+            auth=auth,
+            settings=settings,
+            repository=repository,
+            use_cached_approval_snapshot=use_cached_approval_snapshot,
+            latest_only=latest_only,
+        )
     if not article_candidates_only:
         return visible_records
     return [
@@ -5105,6 +5372,76 @@ def _document_record_sort_key(record: dict[str, Any]) -> tuple[int, str, str]:
 
 
 def _mcp_relevance_guard(query: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+    scope = _mcp_named_regulation_scope(query)
+    if not results or not scope:
+        return _mcp_lexical_relevance_guard(query, results)
+    indices = [
+        index for index, candidate in enumerate(results[:5])
+        if _mcp_result_supports_named_scope(scope, candidate)
+    ]
+    if not indices:
+        return {
+            "refused": True,
+            "refusal_reason": "insufficient_relevance",
+            "refusal_detail": "named_regulation_scope_mismatch",
+            "named_scope_token_count": len(scope["tokens"]),
+        }
+    # Matching a rule name cannot substitute for evidence about the question.
+    # Keep article/appendix locators in this check, and map any rescue back to
+    # the original authorized candidate list used by the search response.
+    scoped = [results[index] for index in indices]
+    guard = _mcp_lexical_relevance_guard(scope["question"], scoped)
+    if not guard.get("refused"):
+        source_index = indices[int(guard.get("promote_result_index") or 0)]
+        if source_index:
+            guard["promote_result_index"] = source_index
+        else:
+            guard.pop("promote_result_index", None)
+    return guard
+
+
+def _mcp_named_regulation_scope(query: str) -> dict[str, Any]:
+    text = re.sub(r"^\s*이\s*규정집의\s+", "", str(query or ""))
+    match = re.match(
+        r'^\s*[「『"“]?\s*(?P<title>[가-힣A-Za-z0-9·ㆍ\s]{2,72}?(?:규정|세칙|지침|학칙|규칙|정관))'
+        r'\s*[」』"”]?\s*(?:의\s*|에서\s*|에\s*따(?:르면|라)\s*|(?P<locator>제\s*\d+\s*조|별표|별지))',
+        text,
+    )
+    if not match:
+        return {}
+    title = match.group("title").strip()
+    if re.search(
+        r"(?:^|\s)(?:때|경우|어떤|어느|있는|없는|적용되는|해당하는|관련된|정해진|승인된)(?:\s|$)",
+        title,
+    ):
+        return {}
+    base_title = re.sub(r"(?:규정|세칙|지침|학칙|규칙|정관)$", "", title).strip()
+    tokens = _mcp_meaningful_query_tokens(base_title)
+    quoted = text.lstrip().startswith(("「", "『", '"', "“"))
+    if not quoted and len(tokens) < 2:
+        return {}
+    question_start = match.start("locator") if match.group("locator") else match.end()
+    return {"title": title, "tokens": tokens, "question": text[question_start:], "quoted": quoted}
+
+
+def _mcp_result_supports_named_scope(scope: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    title = str(
+        candidate.get("regulation_title") or metadata.get("regulation_title")
+        or candidate.get("document_name") or metadata.get("document_name") or ""
+    )
+    if not title:
+        return False
+    if scope["quoted"]:
+        return re.sub(r"\s+", "", scope["title"]) == re.sub(r"\s+", "", title)
+    # An unquoted shortened name may omit qualifiers or use an established
+    # synonym, but a cross-reference in an unrelated body is not its title.
+    title = re.sub(r"(?:규정|세칙|지침|학칙|규칙|정관)$", "", title).strip()
+    values = _mcp_result_tokens({"regulation_title": title})
+    return all(_mcp_token_matches(token, values) for token in scope["tokens"])
+
+
+def _mcp_lexical_relevance_guard(query: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     if not results:
         return {"refused": False}
     query_tokens = _mcp_meaningful_query_tokens(query)
@@ -5175,7 +5512,9 @@ def _mcp_meaningful_query_tokens(query: str) -> list[str]:
     for term in compound_terms:
         if term not in tokens:
             tokens.append(term)
-    for token in tokenize(query, prefer_regex_if_kiwi_cold=True):
+    # Guard decisions must not change when a background tokenizer warms up.
+    # Retrieval ranking keeps its own tokenizer policy.
+    for token in tokenize(query, tokenizer_model=FALLBACK_TOKENIZER_MODEL):
         normalized = str(token or "").strip().lower()
         normalized = _mcp_normalize_query_token(normalized)
         if len(normalized) < 2 or normalized in _MCP_COMMON_QUERY_TOKENS:
@@ -5276,7 +5615,7 @@ def _mcp_result_tokens(result: dict[str, Any]) -> set[str]:
         if isinstance(value, dict):
             values.extend(value.values())
             continue
-        tokens.update(tokenize(str(value or ""), prefer_regex_if_kiwi_cold=True))
+        tokens.update(tokenize(str(value or ""), tokenizer_model=FALLBACK_TOKENIZER_MODEL))
         # OCR table headers often arrive as spaced syllables (e.g. "겸 직 자
         # 명 부"). Keep a compact form for relevance guarding so a precise
         # table hit is not rejected before fetch returns its verbatim text.
@@ -5393,6 +5732,13 @@ def chatgpt_data_fetch_output(response: dict[str, Any]) -> ChatGPTDataFetchOutpu
     raw_metadata = response.get("metadata") if isinstance(response.get("metadata"), dict) else {}
     metadata: dict[str, str] = {}
     for key in _CHATGPT_DATA_FETCH_METADATA_KEYS:
+        if key in {"table_like", "table_review_required"}:
+            metadata[key] = "true" if raw_metadata.get(key) is True else "false"
+            continue
+        if key == "table_review_flags":
+            flags = raw_metadata.get(key)
+            metadata[key] = json.dumps([flag for flag in flags if isinstance(flag, str)] if isinstance(flags, list) else [], ensure_ascii=False)
+            continue
         normalized = (
             _user_openable_http_url(response.get("url"))
             if key == "source_url"
@@ -5423,6 +5769,7 @@ def _mcp_verbatim_block(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "text": text,
         "is_verbatim": bool(text),
+        "source_text_status": str(result.get("source_text_status") or ""),
         "source": "approved_local_regulation_chunk",
         "document_id": str(result.get("document_id") or ""),
         "chunk_id": str(result.get("chunk_id") or ""),
@@ -5461,6 +5808,10 @@ def _citation_metadata(
         "content_hash": str(result.get("content_hash") or ""),
         "approved_content_hash": str(result.get("approved_content_hash") or ""),
         "document_name": str(result.get("document_name") or ""),
+        "source_text_status": str(result.get("source_text_status") or ""),
+        "table_like": result.get("table_like") is True,
+        "table_review_required": result.get("table_review_required") is True,
+        "table_review_flags": [flag for flag in (result.get("table_review_flags") or []) if isinstance(flag, str)],
         "institution_name": str(result.get("institution_name") or ""),
         "apba_id": str(result.get("apba_id") or ""),
         "source_system": str(result.get("source_system") or ""),

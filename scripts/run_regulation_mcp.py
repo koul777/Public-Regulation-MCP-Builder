@@ -80,7 +80,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip startup cache warmup. By default the server preloads approved vectors, approval snapshots, and BM25.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--no-background-tokenizer-warmup",
+        action="store_true",
+        help=(
+            "Skip optional background tokenizer initialization. Requires --no-warm-cache; "
+            "the first query that needs the tokenizer may still initialize it."
+        ),
+    )
+    args = parser.parse_args()
+    if args.no_background_tokenizer_warmup and not args.no_warm_cache:
+        parser.error("--no-background-tokenizer-warmup requires --no-warm-cache")
+    return args
 
 
 def main() -> int:
@@ -109,6 +120,7 @@ def main() -> int:
         allowed_http_origins=args.allowed_http_origin,
         tool_profile=args.tool_profile,
         warm_cache=not args.no_warm_cache,
+        background_tokenizer_warmup=not args.no_background_tokenizer_warmup,
     )
     server.run(transport=args.transport)
     return 0

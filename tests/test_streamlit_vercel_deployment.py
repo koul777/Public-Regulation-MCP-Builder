@@ -69,6 +69,10 @@ class StreamlitVercelDeploymentTests(unittest.TestCase):
             next(button for button in app.button if button.label == "Vercel에 배포하고 연결 검사").click().run()
             self.assertFalse(app.exception)
             start.assert_called_once()
+            # Render the queued transition to the running-job fragment.
+            app._run()
+            self.assertFalse(app.exception)
+            start.assert_called_once()
             self.assertNotIn("Vercel에 배포하고 연결 검사", [button.label for button in app.button])
 
     def test_invalid_or_existing_new_project_name_cannot_publish(self):
