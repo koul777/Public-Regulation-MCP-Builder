@@ -80,7 +80,7 @@ Kordoc 증거·승인 journal·현재 내용 hash 조건을 충족하지 못한 
 
 - `list_regulations(query?, page?, page_size?)`는 승인되어 MCP에 보이는 규정의 **조문 체계 카탈로그**입니다. 규정명으로 중복을 제거해 반환하고, 응답에는 규정명·규정 구분·규정 번호·개정일·시행일·상태, `total_count`, 다음 페이지 정보가 포함됩니다. 반환된 `regulation_unit_id`를 다음 목차·정확 조문 조회에 사용합니다.
 - `get_regulation_toc(regulation_unit_id)`는 해당 규정의 장·절·조·별표·서식 계층을 반환합니다.
-- `get_regulation_article(regulation_unit_id, article_no)`는 `제16조`와 같은 정확 조문을 승인 원문 근거로 반환합니다.
+- `get_regulation_article(regulation_unit_id, article_no)`는 `제16조`와 같은 정확 조문을 승인 원문 근거로 반환합니다. 정확히 일치하는 조문이 없을 때만 목차 label(`제16조 목적`), 인용형(`제16조(목적)`), 숫자(`16`)를 `제16조` 형태로 바꿔 다시 찾습니다.
 - `get_regulation_references(regulation_unit_id, direction?, status?, page?, page_size?)`는 다른 규정·조문으로 향하는 참조와 해당 규정으로 들어오는 참조를 반환합니다.
 - `list_regulation_reference_cycles(regulation_unit_id?, page?, page_size?)`는 승인된 현행 규정 그래프에서 확인된 순환참조 묶음을 반환합니다.
 - `search(query)`는 입력을 검색어 하나로 제한하며 결과 항목은 `id`, `title`, `url`만 반환합니다.
