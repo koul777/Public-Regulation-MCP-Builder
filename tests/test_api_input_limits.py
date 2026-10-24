@@ -16,6 +16,7 @@ from app.core.config import Settings, get_settings
 from app.core.input_limits import (
     MAX_IDENTIFIER_CHARS,
     MAX_MCP_ARTICLE_NO_CHARS,
+    MAX_MCP_AS_OF_DATE_CHARS,
     MAX_MCP_DEPARTMENT_IDS,
     MAX_MCP_IDENTIFIER_CHARS,
     MAX_MCP_PAGE,
@@ -265,6 +266,55 @@ class McpInputLimitTests(unittest.TestCase):
 
         self.assertIn("at most", str(raised.exception))
         self.assertIn(str(MAX_MCP_QUERY_CHARS), str(raised.exception))
+
+    def test_mcp_as_of_date_is_bounded_on_every_tool_that_accepts_it(self) -> None:
+        server = create_regulation_mcp_server(
+            data_dir="data",
+            tenant_id="input-limit-test",
+            warm_cache=False,
+        )
+        tools = server._tool_manager._tools
+        dated_tools = sorted(
+            name for name, tool in tools.items() if "as_of_date" in tool.parameters["properties"]
+        )
+
+        self.assertEqual(
+            [
+                "fetch",
+                "get_article",
+                "get_document",
+                "get_regulation_article",
+                "get_regulation_history",
+                "get_regulation_toc",
+                "get_table",
+                "lookup",
+                "search",
+            ],
+            dated_tools,
+        )
+        for name in dated_tools:
+            with self.subTest(tool=name):
+                self.assertEqual(
+                    {
+                        "anyOf": [
+                            {"maxLength": MAX_MCP_AS_OF_DATE_CHARS, "type": "string"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "title": "As Of Date",
+                    },
+                    tools[name].parameters["properties"]["as_of_date"],
+                )
+
+        with self.assertRaises(Exception) as raised:
+            asyncio.run(
+                tools["search"].run(
+                    {"query": "q", "as_of_date": "2" * (MAX_MCP_AS_OF_DATE_CHARS + 1)}
+                )
+            )
+
+        self.assertIn("at most", str(raised.exception))
+        self.assertIn(str(MAX_MCP_AS_OF_DATE_CHARS), str(raised.exception))
 
     def test_direct_mcp_service_rejects_oversized_inputs_before_retrieval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
