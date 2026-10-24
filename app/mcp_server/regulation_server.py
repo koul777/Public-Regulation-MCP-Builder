@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 
 from app.core.mcp_input_schemas import (
     McpArticleNo,
+    McpAsOfDate,
     McpDepartmentIds,
     McpIdentifier,
     McpOptionalIdentifier,
@@ -79,6 +80,7 @@ Tool flow:
 - Use get_regulation_article for an exact article when regulation_unit_id is known.
 - Use get_regulation_references to follow resolved incoming/outgoing citations and inspect unresolved or ambiguous citations.
 - Use list_regulation_reference_cycles to inspect circular dependencies among current approved regulations.
+- Use list_documents to list approved documents and their document IDs.
 - Use lookup when a document ID is known: it performs exact approved document/article lookup first and falls back to RAG only on a miss.
 - Use fetch with a returned search id before drafting a final evidence-backed answer.
 - Use get_document when the user explicitly asks to load the whole approved document.
@@ -321,7 +323,8 @@ def create_regulation_mcp_server(
             name="get_regulation_references",
             title="Get cross-regulation references",
             description=(
-                "Return current approved incoming or outgoing references for a regulation_unit_id, including "
+                "Return current approved incoming or outgoing references for a regulation_unit_id returned by "
+                "list_regulations, including "
                 "resolved exact articles, ambiguous targets, unresolved targets, and cycle membership."
             ),
             annotations=READ_ONLY_TOOL_ANNOTATIONS,
@@ -434,7 +437,7 @@ def create_regulation_mcp_server(
         department_ids: McpDepartmentIds | None = None,
         document_id: McpOptionalIdentifier | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return search_regulations(
@@ -469,7 +472,7 @@ def create_regulation_mcp_server(
         security_levels: McpSecurityLevels | None = None,
         department_ids: McpDepartmentIds | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return lookup_regulation(
@@ -504,7 +507,7 @@ def create_regulation_mcp_server(
         security_levels: McpSecurityLevels | None = None,
         department_ids: McpDepartmentIds | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return fetch_regulation(
@@ -571,8 +574,8 @@ def create_regulation_mcp_server(
         name="get_regulation_toc",
         title="Get regulation table of contents",
         description=(
-            "Return the chapter, section, article, appendix, and form hierarchy for one regulation_unit_id. "
-            "Pass as_of_date to inspect the version effective on a historical date."
+            "Return the chapter, section, article, appendix, and form hierarchy for one regulation_unit_id "
+            "returned by list_regulations. Pass as_of_date to inspect the version effective on a historical date."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         structured_output=True,
@@ -580,7 +583,7 @@ def create_regulation_mcp_server(
     def get_regulation_toc_tool(
         regulation_unit_id: McpIdentifier,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return get_regulation_toc_result(
@@ -595,7 +598,8 @@ def create_regulation_mcp_server(
         name="get_regulation_references",
         title="Get cross-regulation references",
         description=(
-            "Return paginated incoming/outgoing current approved references for one regulation_unit_id. "
+            "Return paginated incoming/outgoing current approved references for one regulation_unit_id "
+            "returned by list_regulations. "
             "Resolved references include the exact target article locator; unresolved and ambiguous references "
             "include explicit reason codes. The response also reports circular-reference membership."
         ),
@@ -626,7 +630,7 @@ def create_regulation_mcp_server(
         name="list_regulation_reference_cycles",
         title="List circular regulation references",
         description=(
-            "List deterministic Tarjan SCC circular-reference groups among current approved regulations. "
+            "List deterministic circular-reference groups among current approved regulations. "
             "Optionally restrict the result to cycles containing one regulation_unit_id."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
@@ -652,8 +656,8 @@ def create_regulation_mcp_server(
         name="get_regulation_article",
         title="Get exact article from a regulation",
         description=(
-            "Return an exact approved article using regulation_unit_id plus article number without scanning other "
-            "institution regulations. Pass as_of_date for a historical revision."
+            "Return an exact approved article using a regulation_unit_id from list_regulations and an article "
+            "number such as 제16조 from get_regulation_toc. Pass as_of_date for a historical revision."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         structured_output=True,
@@ -664,7 +668,7 @@ def create_regulation_mcp_server(
         security_levels: McpSecurityLevels | None = None,
         department_ids: McpDepartmentIds | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return get_regulation_article_result(
@@ -682,8 +686,8 @@ def create_regulation_mcp_server(
         name="get_regulation_history",
         title="Get regulation version history",
         description=(
-            "Return version, lifecycle status, effective dates, and predecessor metadata for one "
-            "tenant-scoped regulation family. This tool does not return raw regulation text."
+            "Return version, lifecycle status, effective dates, and predecessor metadata for one regulation "
+            "family. Use regulation_id from search or fetch metadata. This tool does not return raw regulation text."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         structured_output=True,
@@ -691,7 +695,7 @@ def create_regulation_mcp_server(
     def get_regulation_history_tool(
         regulation_id: McpIdentifier,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return get_regulation_history_result(
@@ -706,7 +710,8 @@ def create_regulation_mcp_server(
         name="get_document",
         title="Get full approved document",
         description=(
-            "Return the full approved MCP-visible text for a document ID. Each chunk includes verbatim_text "
+            "Return the full approved MCP-visible text for a document ID from list_documents or search metadata. "
+            "Each chunk includes verbatim_text "
             "and a verbatim evidence block; pass as_of_date for historical effectiveness."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
@@ -717,7 +722,7 @@ def create_regulation_mcp_server(
         security_levels: McpSecurityLevels | None = None,
         department_ids: McpDepartmentIds | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return get_document_result(
@@ -734,7 +739,8 @@ def create_regulation_mcp_server(
         name="get_article",
         title="Get regulation article",
         description=(
-            "Return approved regulation evidence for a specific document ID and article number, including "
+            "Return approved regulation evidence for a document ID from list_documents or search metadata and "
+            "an article number, including "
             "verbatim_text/verbatim evidence; pass as_of_date for historical effectiveness."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
@@ -746,7 +752,7 @@ def create_regulation_mcp_server(
         security_levels: McpSecurityLevels | None = None,
         department_ids: McpDepartmentIds | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return get_article_result(
@@ -764,7 +770,8 @@ def create_regulation_mcp_server(
         name="get_table",
         title="Get regulation table",
         description=(
-            "Return an approved table or appendix by table ID or chunk ID, including verbatim table evidence "
+            "Return an approved table or appendix by table ID or chunk ID from search or fetch metadata, "
+            "including verbatim table evidence "
             "and structured rows; pass as_of_date for historical effectiveness."
         ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
@@ -776,7 +783,7 @@ def create_regulation_mcp_server(
         security_levels: McpSecurityLevels | None = None,
         department_ids: McpDepartmentIds | None = None,
         profile_id: McpOptionalIdentifier | None = None,
-        as_of_date: str | None = None,
+        as_of_date: McpAsOfDate | None = None,
     ) -> dict[str, Any]:
         effective_profile_id = _resolve_profile_scope(profile_id, default_profile_id)
         return get_table_result(
@@ -793,7 +800,10 @@ def create_regulation_mcp_server(
     @server.tool(
         name="compare_versions",
         title="Compare regulation versions",
-        description="Compare approved regulation evidence between two document IDs.",
+        description=(
+            "Compare approved regulation evidence between two document IDs returned by "
+            "get_regulation_history or list_documents."
+        ),
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         structured_output=True,
     )

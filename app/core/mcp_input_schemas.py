@@ -8,6 +8,7 @@ from pydantic import Field
 
 from app.core.input_limits import (
     MAX_MCP_ARTICLE_NO_CHARS,
+    MAX_MCP_AS_OF_DATE_CHARS,
     MAX_MCP_DEPARTMENT_IDS,
     MAX_MCP_IDENTIFIER_CHARS,
     MAX_MCP_PAGE,
@@ -22,6 +23,7 @@ from app.core.input_limits import (
 
 __all__ = [
     "McpArticleNo",
+    "McpAsOfDate",
     "McpDepartmentIds",
     "McpIdentifier",
     "McpOptionalIdentifier",
@@ -57,6 +59,10 @@ McpOptionalIdentifier: TypeAlias = Annotated[
 McpArticleNo: TypeAlias = Annotated[
     str,
     Field(min_length=1, max_length=MAX_MCP_ARTICLE_NO_CHARS),
+]
+McpAsOfDate: TypeAlias = Annotated[
+    str,
+    Field(max_length=MAX_MCP_AS_OF_DATE_CHARS),
 ]
 McpScopeValue: TypeAlias = Annotated[
     str,

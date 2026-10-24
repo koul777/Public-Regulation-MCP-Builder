@@ -144,5 +144,26 @@ class StreamlitMcpBundleFormTests(unittest.TestCase):
                 writer.assert_not_called()
 
 
+class StreamlitMcpBundleQaGateStageTests(unittest.TestCase):
+    def test_final_build_qa_gate_runs_on_the_written_bundle_before_zip_and_completion(self) -> None:
+        source = (REPO_ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+        setup = source.index("lambda _report: write_mcp_setup_bundle(")
+        gate = source.index("lambda _report: run_mcp_build_qa_gate(")
+        refusal = source.index('if not qa_gate_report.get("passed"):')
+        zip_write = source.index("zip_path, zip_fallback_used = _write_operator_mcp_bundle_zip(")
+        completion = source.index('"qa_gate": {')
+
+        self.assertLess(setup, gate)
+        self.assertLess(gate, refusal)
+        self.assertLess(refusal, zip_write)
+        self.assertLess(zip_write, completion)
+        gate_call = source[gate:refusal]
+        self.assertIn("data_dir=mcp_runtime_data_dir", gate_call)
+        self.assertIn("bundle_dir=mcp_bundle_output_dir", gate_call)
+        self.assertIn("profile_id=selected_profile_id", gate_call)
+        self.assertIn("raise RuntimeError(", source[refusal:zip_write])
+        self.assertIn("최종 빌드 QA 게이트를 통과하지 못해", source[refusal:zip_write])
+
+
 if __name__ == "__main__":
     unittest.main()
