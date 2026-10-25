@@ -149,6 +149,7 @@ from scripts.generate_mcp_client_config import (
     write_mcp_setup_bundle,
     write_mcp_setup_bundle_zip,
 )
+from scripts.mcp_build_qa_gate import describe_findings_ko, run_mcp_build_qa_gate
 from scripts.analyze_regulation_corpus import (
     GOLDSET_COMPLETE_LABEL_STATUSES,
     GOLDSET_SCORE_SPECS,
@@ -15212,6 +15213,35 @@ def _page_connect(
                     stdio_command=str(local_server.get("command") or sys.executable or "python"),
                     stdio_args=[str(arg) for arg in (local_server.get("args") or [])],
                 )
+                _bundle_stage(88, "최종 빌드 QA 게이트 확인")
+                qa_gate_report = _run_background_operation_with_progress(
+                    lambda _report: run_mcp_build_qa_gate(
+                        data_dir=mcp_runtime_data_dir,
+                        tenant_id=document_tenant_id,
+                        profile_id=selected_profile_id,
+                        bundle_dir=mcp_bundle_output_dir,
+                        tenant_storage_isolation=False,
+                    ),
+                    progress_bar=bundle_progress,
+                    detail_box=bundle_detail,
+                    status_box=bundle_status,
+                    start_percent=88,
+                    end_percent=90,
+                    label="최종 빌드 QA 게이트",
+                    estimated_seconds=15.0,
+                )
+                if not qa_gate_report.get("passed"):
+                    raise RuntimeError(
+                        "최종 빌드 QA 게이트를 통과하지 못해 묶음을 완료로 표시하지 않습니다. "
+                        f"차단 {qa_gate_report.get('blocker_count', 0)}건: "
+                        + "; ".join(describe_findings_ko(qa_gate_report, limit=5))
+                    )
+                qa_gate_full = (qa_gate_report.get("profiles") or {}).get("full") or {}
+                st.caption(
+                    f"최종 빌드 QA 게이트 통과 · 도구 {qa_gate_full.get('tool_count', 0)}개 · "
+                    f"도구 설명 약 {int(qa_gate_full.get('surface_tokens_estimate') or 0):,}토큰 · "
+                    f"설계 목표 미달 {qa_gate_report.get('target_gap_count', 0)}건"
+                )
                 zip_path = None
                 zip_fallback_used = False
                 if mcp_save_mode == "folder-and-zip":
@@ -15325,6 +15355,12 @@ def _page_connect(
                     "connect_wizard": files.get("connect"),
                     "install_script": files.get("install"),
                     "usage_guide": files.get("usage_guide"),
+                    "qa_gate": {
+                        "schema_version": qa_gate_report.get("schema_version"),
+                        "passed": True,
+                        "targets_met": bool(qa_gate_report.get("targets_met")),
+                        "target_gap_count": int(qa_gate_report.get("target_gap_count") or 0),
+                    },
                 }
                 bundle_progress.progress(100, text="MCP 파일 묶음 생성 완료 · 100%")
                 bundle_status.update(label="MCP 파일 묶음 생성 완료", state="complete")

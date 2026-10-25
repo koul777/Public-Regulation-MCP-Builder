@@ -826,6 +826,28 @@ def _normalize_optional_as_of_date(value: str | None) -> str | None:
         raise ValueError("as_of_date must be an ISO date in YYYY-MM-DD format.") from exc
 
 
+_ARTICLE_LOCATOR_RE = re.compile(r"^제?\s*(\d+)\s*조(?:\s*의\s*(\d+))?")
+_BARE_ARTICLE_NUMBER_RE = re.compile(r"^(\d+)$")
+
+
+def _canonical_article_no(value: str) -> str:
+    """Reduce TOC labels and citations such as "제16조(목적)" to "제16조".
+
+    Small tool-calling models often pass the TOC label or a citation instead of
+    the bare locator. Values without a leading article locator stay unchanged,
+    and callers try the exact value first.
+    """
+    text = " ".join(str(value or "").split())
+    bare = _BARE_ARTICLE_NUMBER_RE.match(text)
+    if bare is not None:
+        return f"제{int(bare.group(1))}조"
+    match = _ARTICLE_LOCATOR_RE.match(text)
+    if match is None:
+        return text
+    locator = f"제{int(match.group(1))}조"
+    return f"{locator}의{int(match.group(2))}" if match.group(2) else locator
+
+
 def search_regulations(
     *,
     settings: Settings,
@@ -3082,6 +3104,7 @@ def get_regulation_article(
     )
     if requested_unit_id not in allowed_unit_ids:
         raise ValueError("The requested regulation is not available in the caller's security scope.")
+    matched_article_no = requested_article_no
     records = load_hierarchical_article_records(
         paths[0],
         paths[1],
@@ -3089,6 +3112,16 @@ def get_regulation_article(
         article_no=requested_article_no,
         as_of_date=normalized_as_of,
     )
+    canonical_article_no = _canonical_article_no(requested_article_no)
+    if not records and canonical_article_no != requested_article_no:
+        matched_article_no = canonical_article_no
+        records = load_hierarchical_article_records(
+            paths[0],
+            paths[1],
+            regulation_unit_id=requested_unit_id,
+            article_no=canonical_article_no,
+            as_of_date=normalized_as_of,
+        )
     visible = [
         record
         for record in records
@@ -3132,7 +3165,7 @@ def get_regulation_article(
     )
     return {
         "regulation_unit_id": requested_unit_id,
-        "article_no": requested_article_no,
+        "article_no": matched_article_no,
         "as_of_date": normalized_as_of,
         "articles": articles,
     }
@@ -3364,11 +3397,13 @@ def get_article(
         max_chars=MAX_MCP_ARTICLE_NO_CHARS,
     )
     normalized_article_no = " ".join(requested_article_no.split())
+    canonical_article_no = _canonical_article_no(normalized_article_no)
     normalized_as_of_date = _normalize_optional_as_of_date(as_of_date)
     projection_guard = _McpProjectionReadGuard.capture(
         settings=settings, auth=auth, document_id=requested_document_id,
     )
     matches: list[dict[str, Any]] = []
+    canonical_matches: list[dict[str, Any]] = []
     for record in _visible_records(
         settings=settings,
         auth=auth,
@@ -3379,8 +3414,13 @@ def get_article(
         as_of_date=normalized_as_of_date,
     ):
         public = _public_mcp_record(record, score=1.0, settings=settings, auth=auth)
-        if " ".join(str(public.get("article_no") or "").split()) == normalized_article_no:
+        record_article_no = " ".join(str(public.get("article_no") or "").split())
+        if record_article_no == normalized_article_no:
             matches.append(_mcp_fetch_result(public))
+        elif record_article_no and _canonical_article_no(record_article_no) == canonical_article_no:
+            canonical_matches.append(_mcp_fetch_result(public))
+    if not matches:
+        matches = canonical_matches
     projection_guard.require_current()
     audit_api_event(
         settings,
